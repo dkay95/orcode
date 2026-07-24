@@ -1,6 +1,7 @@
 import { confirm } from "@inquirer/prompts";
 import chalk from "chalk";
 import type { ApprovalMode, ToolCallPreview, ToolRisk } from "./types.js";
+import { truncate } from "./utils.js";
 
 export class PermissionDeniedError extends Error {}
 
@@ -94,8 +95,4 @@ function riskLabel(risk: ToolRisk): string {
     return chalk.yellow("[EDIT]");
   }
   return chalk.green("[READ]");
-}
-
-function truncate(value: string, maximum: number): string {
-  return value.length <= maximum ? value : `${value.slice(0, maximum)}\n… gekürzt …`;
 }

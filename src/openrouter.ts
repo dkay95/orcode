@@ -14,6 +14,7 @@ import {
   type ConnectionEvent,
   type ConnectionEventListener,
 } from "./reconnect.js";
+import { errorMessage, isRecord } from "./utils.js";
 
 const API_BASE = "https://openrouter.ai/api/v1";
 const APP_TITLE = "RouterCode";
@@ -519,7 +520,7 @@ function redact(value: string, secret: string | null): string {
 }
 
 function safeError(error: unknown, secret: string | null): string {
-  return redact(error instanceof Error ? error.message : String(error), secret);
+  return redact(errorMessage(error), secret);
 }
 
 function requireRecord(value: unknown, message: string): Record<string, unknown> {
@@ -527,10 +528,6 @@ function requireRecord(value: unknown, message: string): Record<string, unknown>
     throw new Error(message);
   }
   return value;
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 function stringOf(value: unknown): string | undefined {

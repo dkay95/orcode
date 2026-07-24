@@ -15,6 +15,7 @@ import fg from "fast-glob";
 import { tool } from "@openrouter/agent";
 import { z } from "zod";
 import { ApprovalManager } from "./approval.js";
+import { hasCode, truncate } from "./utils.js";
 
 const MAX_FILE_BYTES = 1_500_000;
 const MAX_TOOL_OUTPUT = 80_000;
@@ -491,10 +492,6 @@ function runProcess(
   });
 }
 
-function truncate(value: string, maximum: number): string {
-  return value.length <= maximum ? value : `${value.slice(0, maximum)}\n… gekürzt …`;
-}
-
 function appendBounded(
   current: string,
   chunk: string,
@@ -511,10 +508,6 @@ function appendBounded(
     value: current + chunk.slice(0, available),
     truncated: true,
   };
-}
-
-function hasCode(error: unknown, code: string): boolean {
-  return typeof error === "object" && error !== null && "code" in error && error.code === code;
 }
 
 export function isWithinWorkspace(root: string, candidate: string): boolean {

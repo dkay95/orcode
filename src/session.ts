@@ -17,6 +17,7 @@ import {
   type ReasoningSetting,
   type SessionData,
 } from "./types.js";
+import { hasCode, isRecord } from "./utils.js";
 
 const MAX_TURNS = 80;
 const DEFAULT_TITLE = "Neuer Chat";
@@ -570,14 +571,6 @@ function isReasoningSetting(value: unknown): value is ReasoningSetting {
     Number(value.maxTokens) > 0 &&
     Number(value.maxTokens) <= 1_000_000
   );
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-function hasCode(error: unknown, code: string): boolean {
-  return typeof error === "object" && error !== null && "code" in error && error.code === code;
 }
 
 export function redactSensitive(value: string): string {

@@ -53,6 +53,7 @@ import type {
 import { APPROVAL_MODES } from "./types.js";
 import { approvalDescription } from "./approval.js";
 import { sanitizedEnvironment } from "./workspace.js";
+import { errorMessage, formatUsd } from "./utils.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -973,10 +974,6 @@ System-Schlüsselbund gespeichert. Ein --key-Argument gibt es absichtlich nicht.
 `);
 }
 
-function formatUsd(value: number): string {
-  return `$${value.toFixed(value < 0.01 ? 5 : 3)}`;
-}
-
 function printRunFooter(result: {
   costUsd: number;
   selectedModel: string;
@@ -1311,9 +1308,7 @@ async function loadStoredCredential(
       chalk.yellow(
         `Gespeicherter ${
           kind === "inference" ? "API-Key" : "Management-Key"
-        } konnte nicht geladen werden: ${
-          error instanceof Error ? error.message : String(error)
-        }`,
+        } konnte nicht geladen werden: ${errorMessage(error)}`,
       ),
     );
     return null;
@@ -1419,6 +1414,6 @@ function isPromptExit(error: unknown): boolean {
 }
 
 void main().catch((error) => {
-  console.error(chalk.red(error instanceof Error ? error.message : String(error)));
+  console.error(chalk.red(errorMessage(error)));
   process.exitCode = 1;
 });

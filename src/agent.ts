@@ -29,6 +29,7 @@ import {
   SDK_RETRY_CODES,
   formatConnectionEvent,
 } from "./reconnect.js";
+import { errorMessage, formatUsd, hasCode } from "./utils.js";
 
 export interface AgentRunResult {
   text: string;
@@ -301,7 +302,7 @@ export class RouterCodeAgent {
                   number,
                   name: toolName,
                   input: toolInput,
-                  error: error instanceof Error ? error.message : String(error),
+                  error: errorMessage(error),
                   durationMs: pending ? Date.now() - pending.startedAt : 0,
                   timestamp: Date.now(),
                 });
@@ -678,12 +679,4 @@ async function loadProjectInstructions(workspace: string): Promise<string> {
     }
   }
   return sections.join("\n\n");
-}
-
-function formatUsd(value: number): string {
-  return `$${value.toFixed(value < 0.01 ? 5 : 3)}`;
-}
-
-function hasCode(error: unknown, code: string): boolean {
-  return typeof error === "object" && error !== null && "code" in error && error.code === code;
 }

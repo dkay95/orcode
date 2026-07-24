@@ -1,4 +1,5 @@
 import { AsyncEntry } from "@napi-rs/keyring";
+import { errorMessage } from "./utils.js";
 
 export type CredentialKind = "inference" | "management";
 
@@ -92,7 +93,7 @@ function credentialError(
   error: unknown,
   secret?: string,
 ): CredentialStoreError {
-  const rawDetail = error instanceof Error ? error.message : String(error);
+  const rawDetail = errorMessage(error);
   const detail = secret
     ? rawDetail.split(secret).join("[REDACTED]")
     : rawDetail;

@@ -31,6 +31,7 @@ import {
   setReasoningSetting,
   validateReasoningSetting,
 } from "./reasoning.js";
+import { errorMessage, hasCode, truncate } from "./utils.js";
 
 export interface CommandContext {
   config: RouterCodeConfig;
@@ -986,14 +987,6 @@ function compactNumber(value: number): string {
   return Intl.NumberFormat("en", { notation: "compact", maximumFractionDigits: 1 }).format(value);
 }
 
-function truncate(value: string, maximum: number): string {
-  return value.length <= maximum ? value : `${value.slice(0, maximum)}\n… gekürzt …`;
-}
-
-function hasCode(error: unknown, code: string): boolean {
-  return typeof error === "object" && error !== null && "code" in error && error.code === code;
-}
-
 async function selectModel(
   model: ModelInfo,
   context: CommandContext,
@@ -1206,9 +1199,7 @@ async function persistCredential(
   } catch (error) {
     console.log(
       chalk.yellow(
-        `Der Key ist gültig, konnte aber nicht dauerhaft gespeichert werden: ${
-          error instanceof Error ? error.message : String(error)
-        }`,
+        `Der Key ist gültig, konnte aber nicht dauerhaft gespeichert werden: ${errorMessage(error)}`,
       ),
     );
     return false;
@@ -1222,7 +1213,7 @@ export function shouldReplaceCredential(error: unknown): boolean {
   ) {
     return true;
   }
-  const message = error instanceof Error ? error.message : String(error);
+  const message = errorMessage(error);
   return /aufgebraucht|abgelaufen/i.test(message);
 }
 

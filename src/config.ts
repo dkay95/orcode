@@ -10,6 +10,7 @@ import {
   type ReasoningSetting,
   type RouterCodeConfig,
 } from "./types.js";
+import { errorMessage, hasCode, isRecord } from "./utils.js";
 
 export const APP_HOME = join(homedir(), ".routercode");
 export const CONFIG_PATH = join(APP_HOME, "config.json");
@@ -31,13 +32,13 @@ export async function loadConfig(): Promise<RouterCodeConfig> {
     const raw = JSON.parse(await readFile(CONFIG_PATH, "utf8")) as Partial<RouterCodeConfig>;
     return validateConfig({ ...DEFAULT_CONFIG, ...raw });
   } catch (error) {
-    if (isMissing(error)) {
+    if (hasCode(error, "ENOENT")) {
       return {
         ...DEFAULT_CONFIG,
         reasoningByModel: {},
       };
     }
-    throw new Error(`Konfiguration konnte nicht gelesen werden: ${messageOf(error)}`);
+    throw new Error(`Konfiguration konnte nicht gelesen werden: ${errorMessage(error)}`);
   }
 }
 
@@ -141,16 +142,4 @@ function validateReasoningByModel(
     }
   }
   return result;
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-function isMissing(error: unknown): boolean {
-  return typeof error === "object" && error !== null && "code" in error && error.code === "ENOENT";
-}
-
-function messageOf(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
 }
