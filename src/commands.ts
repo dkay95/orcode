@@ -23,7 +23,7 @@ import {
   OpenRouterService,
   type KeyOrigin,
 } from "./openrouter.js";
-import { SessionStore } from "./session.js";
+import { rankChatMatches, SessionStore } from "./session.js";
 import { getGitDiff } from "./workspace.js";
 import {
   getReasoningSetting,
@@ -671,34 +671,78 @@ async function chatCommand(
   }
 
   if (action === "open" || action === "switch") {
-    const query = args.slice(1).join(" ").trim().toLowerCase();
+    const query = args.slice(1).join(" ").trim();
     if (!query) {
       throw new Error("Verwendung: /chat open <ID oder Titel>");
     }
     const chats = await SessionStore.list(context.workspace);
-    const matches = chats.filter(
-      (chat) =>
-        chat.id.toLowerCase() === query ||
-        chat.id.toLowerCase().startsWith(query) ||
-        chat.title.toLowerCase() === query,
-    );
-    if (matches.length !== 1) {
+    const matches = rankChatMatches(chats, query);
+    if (!matches.length) {
+      throw new Error(`Kein Chat gefunden: ${query}`);
+    }
+    const best = matches[0]!;
+    const contested = matches.length > 1 && matches[1]!.score === best.score;
+    if (!contested) {
+      await replaceSession(
+        context,
+        await SessionStore.openById(context.workspace, best.chat.id),
+      );
+      printCurrentChat(context.session);
+      return;
+    }
+    if (!process.stdout.isTTY) {
       throw new Error(
-        matches.length
-          ? `Chat-Auswahl ist nicht eindeutig: ${matches.map((chat) => chat.title).join(", ")}`
-          : `Kein Chat gefunden: ${query}`,
+        `Chat-Auswahl ist nicht eindeutig: ${matches.map((match) => match.chat.title).join(", ")}`,
       );
     }
-    await replaceSession(
-      context,
-      await SessionStore.openById(context.workspace, matches[0]!.id),
-    );
+    const selected = await search({
+      message: `Mehrere Chats passen zu „${query}“`,
+      source: async () =>
+        matches.map((match) => ({
+          name: `${match.chat.id === context.session.data.id ? "●" : "○"} ${match.chat.title}`,
+          value: match.chat.id,
+          description: `${match.chat.turnCount} Nachrichten · ${usd(match.chat.costUsd)} · ${formatChatDate(match.chat.updatedAt)} · ${match.chat.id}`,
+        })),
+    });
+    if (selected !== context.session.data.id) {
+      await replaceSession(
+        context,
+        await SessionStore.openById(context.workspace, selected),
+      );
+    }
     printCurrentChat(context.session);
     return;
   }
 
+  if (action === "search") {
+    const query = args.slice(1).join(" ").trim();
+    if (!query) {
+      throw new Error("Verwendung: /chat search <Suchbegriff>");
+    }
+    const hits = await SessionStore.search(context.workspace, query);
+    if (!hits.length) {
+      console.log(`Keine Chats gefunden für: ${query}`);
+      return;
+    }
+    const shown = hits.slice(0, 10);
+    for (const hit of shown) {
+      const marker = hit.chat.id === context.session.data.id ? chalk.green("●") : "○";
+      console.log(
+        `${marker} ${hit.chat.title} · ${hit.chat.turnCount} Nachrichten · ${usd(hit.chat.costUsd)} · ${formatChatDate(hit.chat.updatedAt)} · ${hit.chat.id}`,
+      );
+      if (hit.snippet) {
+        console.log(`  ${chalk.dim(hit.snippet)}`);
+      }
+    }
+    if (hits.length > shown.length) {
+      console.log(chalk.dim(`… und ${hits.length - shown.length} weitere Treffer.`));
+    }
+    console.log(chalk.dim("Öffnen mit /chat open <ID oder Titel>"));
+    return;
+  }
+
   throw new Error(
-    "Verwendung: /chat [list|new [Titel]|open <ID|Titel>|rename <Titel>|fork [Titel]|current]",
+    "Verwendung: /chat [list|new [Titel]|open <ID|Titel>|search <Begriff>|rename <Titel>|fork [Titel]|current]",
   );
 }
 

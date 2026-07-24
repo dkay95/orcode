@@ -93,48 +93,41 @@ export class SessionStore {
     workspace: string,
     appHome = APP_HOME,
   ): Promise<ChatSummary[]> {
-    const directory = chatDirectory(appHome, workspace);
-    let files: string[];
-    try {
-      files = await readdir(directory);
-    } catch (error) {
-      if (hasCode(error, "ENOENT")) {
-        return [];
-      }
-      throw error;
-    }
+    const sessions = await loadAllSessions(workspace, appHome);
+    return sessions.map(toSummary);
+  }
 
-    const chats: ChatSummary[] = [];
-    for (const file of files) {
-      if (!file.endsWith(".json")) {
+  static async search(
+    workspace: string,
+    query: string,
+    appHome = APP_HOME,
+  ): Promise<ChatSearchHit[]> {
+    const normalized = query.trim().toLowerCase();
+    if (!normalized) {
+      return [];
+    }
+    const sessions = await loadAllSessions(workspace, appHome);
+    const hits: ChatSearchHit[] = [];
+    for (const data of sessions) {
+      const titleMatch = data.title.toLowerCase().includes(normalized);
+      const turn = data.turns.find((candidate) =>
+        candidate.content.toLowerCase().includes(normalized),
+      );
+      if (!titleMatch && !turn) {
         continue;
       }
-      const id = file.slice(0, -5);
-      try {
-        assertChatId(id);
-        const parsed = normalizeSession(
-          JSON.parse(await readFile(join(directory, file), "utf8")),
-          workspace,
-          id,
-        );
-        if (parsed) {
-          chats.push(toSummary(parsed));
-        }
-      } catch {
-        // A damaged chat must not make every other chat inaccessible.
-      }
+      hits.push({
+        chat: toSummary(data),
+        titleMatch,
+        snippet: turn ? buildSnippet(turn.content, normalized) : "",
+      });
     }
-    const legacyId = `legacy-${workspaceHash(workspace)}`;
-    if (!chats.some((chat) => chat.id === legacyId)) {
-      const migrated = await migrateLegacySession(workspace, appHome);
-      if (migrated) {
-        chats.push(toSummary(migrated.data));
+    return hits.sort((left, right) => {
+      if (left.titleMatch !== right.titleMatch) {
+        return left.titleMatch ? -1 : 1;
       }
-    }
-    return chats.sort(
-      (left, right) =>
-        Date.parse(right.updatedAt) - Date.parse(left.updatedAt),
-    );
+      return Date.parse(right.chat.updatedAt) - Date.parse(left.chat.updatedAt);
+    });
   }
 
   get data(): Readonly<SessionData> {
@@ -237,6 +230,126 @@ export class SessionStore {
     await rename(temporary, this.path);
     await chmod(this.path, 0o600);
   }
+}
+
+export interface ChatSearchHit {
+  chat: ChatSummary;
+  titleMatch: boolean;
+  snippet: string;
+}
+
+export interface ChatMatch {
+  chat: ChatSummary;
+  score: number;
+}
+
+const SCORE_EXACT_ID = 100;
+const SCORE_EXACT_TITLE = 90;
+const SCORE_ID_PREFIX = 70;
+const SCORE_TITLE_PREFIX = 60;
+const SCORE_TITLE_CONTAINS = 40;
+
+export function rankChatMatches(
+  chats: ChatSummary[],
+  query: string,
+): ChatMatch[] {
+  const normalized = query.trim().toLowerCase();
+  if (!normalized) {
+    return [];
+  }
+  const matches: ChatMatch[] = [];
+  for (const chat of chats) {
+    const id = chat.id.toLowerCase();
+    const title = chat.title.toLowerCase();
+    let score = 0;
+    if (id === normalized) {
+      score = SCORE_EXACT_ID;
+    } else if (title === normalized) {
+      score = SCORE_EXACT_TITLE;
+    } else if (id.startsWith(normalized)) {
+      score = SCORE_ID_PREFIX;
+    } else if (title.startsWith(normalized)) {
+      score = SCORE_TITLE_PREFIX;
+    } else if (title.includes(normalized)) {
+      score = SCORE_TITLE_CONTAINS;
+    }
+    if (score > 0) {
+      matches.push({ chat, score });
+    }
+  }
+  return matches.sort(
+    (left, right) =>
+      right.score - left.score ||
+      Date.parse(right.chat.updatedAt) - Date.parse(left.chat.updatedAt),
+  );
+}
+
+async function loadAllSessions(
+  workspace: string,
+  appHome: string,
+): Promise<SessionData[]> {
+  const directory = chatDirectory(appHome, workspace);
+  let files: string[];
+  try {
+    files = await readdir(directory);
+  } catch (error) {
+    if (hasCode(error, "ENOENT")) {
+      files = [];
+    } else {
+      throw error;
+    }
+  }
+
+  const sessions: SessionData[] = [];
+  for (const file of files) {
+    if (!file.endsWith(".json")) {
+      continue;
+    }
+    const id = file.slice(0, -5);
+    try {
+      assertChatId(id);
+      const parsed = normalizeSession(
+        JSON.parse(await readFile(join(directory, file), "utf8")),
+        workspace,
+        id,
+      );
+      if (parsed) {
+        sessions.push(parsed);
+      }
+    } catch {
+      // A damaged chat must not make every other chat inaccessible.
+    }
+  }
+  const legacyId = `legacy-${workspaceHash(workspace)}`;
+  if (!sessions.some((chat) => chat.id === legacyId)) {
+    const migrated = await migrateLegacySession(workspace, appHome);
+    if (migrated) {
+      sessions.push(migrated.data);
+    }
+  }
+  return sessions.sort(
+    (left, right) => Date.parse(right.updatedAt) - Date.parse(left.updatedAt),
+  );
+}
+
+function buildSnippet(
+  content: string,
+  normalizedQuery: string,
+  radius = 60,
+): string {
+  const collapsed = content.replace(/\s+/g, " ").trim();
+  const index = collapsed.toLowerCase().indexOf(normalizedQuery);
+  if (index < 0) {
+    return "";
+  }
+  const start = Math.max(0, index - radius);
+  const end = Math.min(
+    collapsed.length,
+    index + normalizedQuery.length + radius,
+  );
+  const prefix = start > 0 ? "…" : "";
+  const suffix = end < collapsed.length ? "…" : "";
+  return `${prefix}${collapsed.slice(start, end)}${suffix}`;
 }
 
 function emptySession(
