@@ -16,6 +16,7 @@ import {
 import { composeLine, fitSpans, wrapSpans, type Segment } from "./compose.js";
 import { renderHunks } from "./diff-view.js";
 import { markdownToLines } from "./markdown.js";
+import { renderPanel } from "./panel-view.js";
 import { span, type Line, type Span } from "./spans.js";
 import { spinnerFrame, type Theme } from "./theme.js";
 
@@ -332,6 +333,12 @@ export function renderBlock(
       }
       return lines;
     }
+
+    case "panel":
+      return renderPanel(block.result, usable, theme, {
+        expandedIndex: block.expandedIndex,
+        judgment: block.judgment,
+      });
 
     default:
       return [];

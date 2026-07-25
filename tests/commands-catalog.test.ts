@@ -25,6 +25,21 @@ test("slash catalog exposes image attachments", () => {
   assert.equal(rankSlashCommands("/attach")[0]?.name, "image");
 });
 
+test("slash catalog exposes /panel use", () => {
+  const panel = rankSlashCommands("/panel")[0];
+  assert.equal(panel?.name, "panel");
+  assert.match(panel?.usage ?? "", /use <n>/);
+});
+
+test("slash catalog exposes /resume", () => {
+  const resume = rankSlashCommands("/resume")[0];
+  assert.equal(resume?.name, "resume");
+  assert.match(resume?.description ?? "", /abgebrochen/i);
+  assert.match(resume?.usage ?? "", /fortsetzen/);
+  assert.match(resume?.usage ?? "", /undo/);
+  assert.match(resume?.usage ?? "", /verwerfen/);
+});
+
 test("slash catalog exposes voice input under /whisper and /voice", () => {
   const whisper = rankSlashCommands("/whisper")[0];
   assert.equal(whisper?.name, "whisper");

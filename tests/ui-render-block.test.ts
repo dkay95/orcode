@@ -81,10 +81,42 @@ function sampleBlocks(): ChatBlock[] {
         { key: "m", label: "Modell wechseln" },
       ],
     },
+    {
+      kind: "panel",
+      id: "pn1",
+      at: AT,
+      result: {
+        question: "Welche Cache-Strategie passt hier am besten?",
+        answers: [
+          {
+            model: "anthropic/claude-opus-5",
+            text: "Nutze einen Write-Through-Cache mit kurzer TTL, weil sich die Daten selten ändern.",
+            costUsd: 0.004,
+            durationMs: 1800,
+            inputTokens: 120,
+            outputTokens: 60,
+            error: null,
+          },
+          {
+            model: "openai/gpt-5.1-codex-mini",
+            text: "",
+            costUsd: 0,
+            durationMs: 900,
+            inputTokens: 0,
+            outputTokens: 0,
+            error: "OpenRouter HTTP 429: Rate-Limit erreicht.",
+          },
+        ],
+        totalCostUsd: 0.004,
+        durationMs: 1800,
+      },
+      judgment: null,
+      expandedIndex: null,
+    },
   ];
 }
 
-test("renderBlock hält für alle sieben Blockarten jede Breite ein", () => {
+test("renderBlock hält für alle acht Blockarten jede Breite ein", () => {
   for (const block of sampleBlocks()) {
     for (const width of WIDTHS) {
       const lines = renderBlock(block, width, theme, { last: true, now: AT + 7000 });
@@ -189,8 +221,14 @@ test("ASCII-Theme kommt ohne Nicht-ASCII aus", () => {
     for (const item of renderBlock(block, 60, ascii, { last: true, now: AT })) {
       const text = plainText(item);
       const foreign = Array.from(text).filter((character) => character.codePointAt(0)! > 0x7e);
-      // Nutzertext und Modellantwort dürfen Umlaute enthalten, Chrome nicht.
-      if (block.kind !== "user" && block.kind !== "assistant" && block.kind !== "approval") {
+      // Nutzertext und Modellantwort (auch aus dem Panel) dürfen Umlaute
+      // enthalten, Chrome nicht.
+      if (
+        block.kind !== "user" &&
+        block.kind !== "assistant" &&
+        block.kind !== "approval" &&
+        block.kind !== "panel"
+      ) {
         assert.deepEqual(foreign.filter((c) => !/[äöüÄÖÜßé–]/.test(c)), [], text);
       }
     }

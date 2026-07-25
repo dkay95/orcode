@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import type { AgentRunEvent } from "../src/types.js";
+import type { PanelResult } from "../src/panel.js";
 import { diffText } from "../src/workspace.js";
 import { RUNNING_TAIL_LINES, TAIL_CAPACITY, type ChatBlock } from "../src/ui/blocks.js";
 import { RunViewModel, selectTail } from "../src/ui/view-model.js";
@@ -250,6 +251,55 @@ test("Freigabeblöcke verschwinden wieder, sobald sie beantwortet sind", () => {
   assert.equal(model.dropApproval(block.id), true);
   assert.equal(model.blocks.length, 0);
   assert.equal(model.dropApproval(block.id), false);
+});
+
+function samplePanelResult(): PanelResult {
+  return {
+    question: "Welcher Ansatz ist robuster?",
+    answers: [
+      {
+        model: "a/one",
+        text: "Antwort A",
+        costUsd: 0.001,
+        durationMs: 10,
+        inputTokens: 5,
+        outputTokens: 5,
+        error: null,
+      },
+      {
+        model: "b/two",
+        text: "Antwort B",
+        costUsd: 0.002,
+        durationMs: 20,
+        inputTokens: 5,
+        outputTokens: 5,
+        error: null,
+      },
+    ],
+    totalCostUsd: 0.003,
+    durationMs: 20,
+  };
+}
+
+test("pushPanel legt bei jedem Aufruf einen frischen Block an, statt einen bestehenden zu verändern", () => {
+  const model = new RunViewModel();
+  const result = samplePanelResult();
+  const first = model.pushPanel(result, null, null, AT) as Extract<ChatBlock, { kind: "panel" }>;
+  assert.equal(model.blocks.length, 1);
+  assert.equal(first.kind, "panel");
+  assert.equal(first.result, result);
+  assert.equal(first.expandedIndex, null);
+
+  // A later "/panel show <n>" for the same result appends its own block —
+  // the first one is untouched, exactly like every other command output.
+  const second = model.pushPanel(result, null, 1, AT + 10) as Extract<ChatBlock, { kind: "panel" }>;
+  assert.equal(model.blocks.length, 2);
+  assert.notEqual(second.id, first.id);
+  assert.equal(first.expandedIndex, null, "der erste Block darf sich nicht rückwirkend ändern");
+  assert.equal(second.expandedIndex, 1);
+
+  const lines = renderBlock(second, 80, theme).map(plainText);
+  assert.ok(lines.some((line) => line.includes("vollständig")));
 });
 
 test("selectTail bevorzugt bei Fehlern die Fehlerzeilen, sonst die letzten", () => {

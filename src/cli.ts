@@ -52,6 +52,7 @@ import {
   type CredentialKind,
 } from "./credentials.js";
 import { OpenRouterService } from "./openrouter.js";
+import type { PanelJudgment, PanelResult } from "./panel.js";
 import {
   buildResumePrompt,
   findInterruptedRun,
@@ -375,6 +376,14 @@ interface RuntimeContext {
   ruleStore: RuleStore;
   /** `/ssh`'s remembered target — read by the dashboard header, mutated by `sshCommand` in commands.ts. */
   sshSession: SshSession;
+  /** See `CommandContext.seedNextMessage` in commands.ts — set by `runPlainLoop`/`runDashboard` below, used by `/resume fortsetzen` and `/panel use <n>`. */
+  seedNextMessage?: (text: string) => void;
+  /** See `CommandContext.onPanelResult` in commands.ts — set by `runDashboard` only; the plain loop leaves it unset. */
+  onPanelResult?: (
+    result: PanelResult,
+    judgment: PanelJudgment | null,
+    expandedIndex: number | null,
+  ) => void;
 }
 
 async function runPlainLoop(
@@ -386,6 +395,12 @@ async function runPlainLoop(
   // resume context is prepended to the very next message the user actually
   // sends, then cleared — never sent on its own, never repeated.
   let pendingSeed = await checkInterruptedRunPlain(context, resumeOptions);
+  // `/resume fortsetzen` and `/panel use <n>` (handleSlashCommand, below) seed
+  // the same variable through this one hook — no separate insertion path for
+  // a command reached mid-session vs. the one offered at startup above.
+  context.seedNextMessage = (text) => {
+    pendingSeed = text;
+  };
   while (true) {
     let value: string;
     try {
@@ -722,6 +737,14 @@ async function runDashboard(
   });
   const dashboardOut = new BufferedCommandOutput();
   context.out = dashboardOut;
+  // Same two seams as the plain loop above, wired to this UI instead:
+  // `/resume fortsetzen` and `/panel use <n>` land their text in the input
+  // line exactly like the interrupted-run "Fortsetzen" choice already does
+  // (`ui.insertInputText`, see `checkInterruptedRunTui` below), and a
+  // `/panel` result becomes its own block instead of flattened command text.
+  context.seedNextMessage = (text) => ui.insertInputText(text);
+  context.onPanelResult = (result, judgment, expandedIndex) =>
+    ui.addPanelResult(result, judgment, expandedIndex);
   ui.loadTurns(context.session.recentTurns(12));
   context.approvals.setPromptHandler((preview) => ui.confirmApproval(preview));
   ui.start();

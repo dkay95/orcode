@@ -6,6 +6,11 @@ import { join } from "node:path";
 import test from "node:test";
 import { ApprovalManager } from "../src/approval.js";
 import { OrcodeAgent } from "../src/agent.js";
+import {
+  handleSlashCommand,
+  type CommandContext,
+  type CommandOutput,
+} from "../src/commands.js";
 import { DEFAULT_CONFIG, type OrcodeConfigWithBudget } from "../src/config.js";
 import type { OpenRouterService } from "../src/openrouter.js";
 import { createRunId, RunLog, runsDir } from "../src/runlog.js";
@@ -529,6 +534,243 @@ test("findInterruptedRun, summarizeRun, and checkRunFileDrift never modify anyth
     await readFile(join(runsDir(home, chatId), `${runId}.ndjson`), "utf8"),
     rawLogBefore,
   );
+});
+
+// ---------------------------------------------------------------------------
+// /resume slash command (src/commands.ts) — the interactive shell around
+// resume.ts, reachable at any point in the session, not only at startup.
+// Reuses every helper above (`sandbox`, `writeInterruptedRun`,
+// `createCodingTools`) exactly as the direct resume.ts tests do; only the
+// entry point (`handleSlashCommand`) changes.
+// ---------------------------------------------------------------------------
+
+function collectResumeOutput(): { out: CommandOutput; lines: string[] } {
+  const lines: string[] = [];
+  return {
+    lines,
+    out: {
+      text(value: string): void {
+        lines.push(value);
+      },
+      error(value: string, hint?: string): void {
+        lines.push(hint ? `${value}\n${hint}` : value);
+      },
+    },
+  };
+}
+
+/**
+ * A `CommandContext` for `/resume` alone: real `session`/`agent.journal`/
+ * `agent.guard`/`approvals` (everything `resumeCommand` actually touches),
+ * everything else stubbed since `/resume` never reads it.
+ */
+function resumeCommandContext(options: {
+  home: string;
+  chatId: string;
+  guard: WorkspaceGuard;
+  journal?: ChangeJournal;
+  approvals?: ApprovalManager;
+}): { context: CommandContext; lines: string[] } {
+  const { out, lines } = collectResumeOutput();
+  const journal = options.journal ?? new ChangeJournal({ appHome: options.home, chatId: options.chatId });
+  const approvals = options.approvals ?? new ApprovalManager("allow-all");
+  const session = {
+    appHome: options.home,
+    data: { id: options.chatId },
+  } as unknown as CommandContext["session"];
+  const agent = { journal, guard: options.guard } as unknown as CommandContext["agent"];
+  const context: CommandContext = {
+    config: {} as CommandContext["config"],
+    approvals,
+    openRouter: {} as CommandContext["openRouter"],
+    session,
+    agent,
+    workspace: options.guard.root,
+    credentials: {} as CommandContext["credentials"],
+    out,
+    ruleStore: {} as CommandContext["ruleStore"],
+  };
+  return { context, lines };
+}
+
+test("/resume with nothing interrupted reports that plainly and changes nothing", async () => {
+  const home = await appHome("cmd-none");
+  const box = await sandbox(home, "chat-1", "cmd-none-ws");
+  const { context, lines } = resumeCommandContext({ home, chatId: "chat-1", guard: box.guard });
+
+  await handleSlashCommand("/resume", context);
+  assert.ok(lines.some((line) => /Kein abgebrochener Lauf gefunden/.test(line)));
+});
+
+test("/resume with no argument shows the notice and all three possibilities, without acting", async () => {
+  const home = await appHome("cmd-bare");
+  const chatId = "chat-1";
+  const runId = createRunId();
+  const box = await sandbox(home, chatId, "cmd-bare-ws");
+  await writeInterruptedRun(home, chatId, runId, [
+    { type: "run-start", model: "vendor/model", maxSteps: 40, prompt: "Nur ansehen, bitte", timestamp: 1 },
+  ]);
+  const { context, lines } = resumeCommandContext({ home, chatId, guard: box.guard });
+
+  await handleSlashCommand("/resume", context);
+  const joined = lines.join("\n");
+  assert.match(joined, /nicht sauber beendet/);
+  assert.match(joined, /Nur ansehen, bitte/);
+  assert.match(joined, /fortsetzen/);
+  assert.match(joined, /undo/);
+  assert.match(joined, /verwerfen/);
+
+  // A bare `/resume` is read-only: the run must still be reported next time.
+  const still = await findInterruptedRun(home, chatId);
+  assert.ok(still);
+  assert.equal(still.runId, runId);
+});
+
+test("/resume verwerfen marks the run reviewed and touches no files", async () => {
+  const home = await appHome("cmd-discard");
+  const chatId = "chat-1";
+  const runId = createRunId();
+  const box = await sandbox(home, chatId, "cmd-discard-ws");
+  await writeInterruptedRun(home, chatId, runId, [
+    { type: "run-start", model: "vendor/model", maxSteps: 40, timestamp: 1 },
+  ]);
+  const { context, lines } = resumeCommandContext({ home, chatId, guard: box.guard });
+
+  await handleSlashCommand("/resume verwerfen", context);
+  assert.ok(lines.some((line) => /Verworfen/.test(line)));
+  assert.equal(await findInterruptedRun(home, chatId), null);
+});
+
+test("/resume fortsetzen seeds the resume prompt via seedNextMessage and marks the run reviewed", async () => {
+  const home = await appHome("cmd-continue");
+  const chatId = "chat-1";
+  const runId = createRunId();
+  const box = await sandbox(home, chatId, "cmd-continue-ws");
+  await writeInterruptedRun(home, chatId, runId, [
+    { type: "run-start", model: "vendor/model", maxSteps: 40, prompt: "Räum b.ts auf", timestamp: 1 },
+  ]);
+  const { context, lines } = resumeCommandContext({ home, chatId, guard: box.guard });
+  const seeded: string[] = [];
+  context.seedNextMessage = (text) => seeded.push(text);
+
+  await handleSlashCommand("/resume fortsetzen", context);
+  assert.equal(seeded.length, 1);
+  assert.match(seeded[0]!, /NEUER Lauf/);
+  assert.match(seeded[0]!, /Räum b\.ts auf/);
+  assert.ok(lines.some((line) => /wird der nächsten Nachricht vorangestellt/.test(line)));
+  assert.equal(await findInterruptedRun(home, chatId), null);
+});
+
+test("/resume fortsetzen prints the resume prompt directly when seedNextMessage is unset", async () => {
+  const home = await appHome("cmd-continue-fallback");
+  const chatId = "chat-1";
+  const runId = createRunId();
+  const box = await sandbox(home, chatId, "cmd-continue-fallback-ws");
+  await writeInterruptedRun(home, chatId, runId, [
+    { type: "run-start", model: "vendor/model", maxSteps: 40, prompt: "Räum b.ts auf", timestamp: 1 },
+  ]);
+  const { context, lines } = resumeCommandContext({ home, chatId, guard: box.guard });
+
+  await handleSlashCommand("/resume fortsetzen", context);
+  assert.ok(lines.some((line) => /NEUER Lauf/.test(line) && /Räum b\.ts auf/.test(line)));
+});
+
+test("/resume undo restores the interrupted run's files and marks it reviewed — using undoInterruptedRun, no second path", async () => {
+  const home = await appHome("cmd-undo");
+  const chatId = "chat-1";
+  const runId = createRunId();
+  const producing = await sandbox(home, chatId, "cmd-undo-produce");
+  await writeFile(join(producing.root, "one.txt"), "original\n", "utf8");
+  const tools = createCodingTools(producing.guard, producing.approvals, producing.journal, { runId });
+  const writeFileTool = tools.find((tool) => tool.function.name === "write_file")!;
+  await writeFileTool.function.execute(
+    { path: "one.txt", content: "vom abgebrochenen lauf geändert\n" } as never,
+    {} as never,
+  );
+  await writeFileTool.function.execute(
+    { path: "two.txt", content: "vom abgebrochenen lauf neu angelegt\n" } as never,
+    {} as never,
+  );
+  await writeInterruptedRun(home, chatId, runId, [
+    { type: "run-start", model: "vendor/model", maxSteps: 40, timestamp: 1 },
+  ]);
+
+  // A brand new, empty journal — the precondition undoInterruptedRun documents
+  // and resumeCommand's own guard enforces — reusing producing.guard so the
+  // undo writes land in the same workspace the "crash" wrote to.
+  const { context, lines } = resumeCommandContext({ home, chatId, guard: producing.guard });
+  assert.equal(context.agent.journal.size, 0);
+
+  await handleSlashCommand("/resume undo", context);
+  assert.ok(lines.some((line) => /wiederhergestellt/.test(line)));
+  assert.equal(await readFile(join(producing.root, "one.txt"), "utf8"), "original\n");
+  assert.equal(existsSync(join(producing.root, "two.txt")), false);
+  assert.equal(await findInterruptedRun(home, chatId), null);
+});
+
+test("/resume undo refuses once this session's own journal already holds a change, and leaves everything untouched", async () => {
+  const home = await appHome("cmd-undo-guard");
+  const chatId = "chat-1";
+  const crashRunId = createRunId();
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  const ownRunId = createRunId();
+
+  // A stale crash from before this session started.
+  const crashProducing = await sandbox(home, chatId, "cmd-undo-guard-crash");
+  const crashTools = createCodingTools(
+    crashProducing.guard,
+    crashProducing.approvals,
+    crashProducing.journal,
+    { runId: crashRunId },
+  );
+  const crashWriteFile = crashTools.find((tool) => tool.function.name === "write_file")!;
+  await crashWriteFile.function.execute(
+    { path: "crashed.txt", content: "vom abgebrochenen lauf\n" } as never,
+    {} as never,
+  );
+  await writeInterruptedRun(home, chatId, crashRunId, [
+    { type: "run-start", model: "vendor/model", maxSteps: 40, timestamp: 1 },
+  ]);
+
+  // This session's own journal already has a real entry from a tool call it
+  // made itself — the exact situation undoInterruptedRun's doc comment warns
+  // about: hydrating on top of it would make undoLastRun's "last run" this
+  // session's own, not the crash's.
+  const box = await sandbox(home, chatId, "cmd-undo-guard-own");
+  const ownJournal = new ChangeJournal({ appHome: home, chatId });
+  const ownTools = createCodingTools(box.guard, box.approvals, ownJournal, { runId: ownRunId });
+  const ownWriteFile = ownTools.find((tool) => tool.function.name === "write_file")!;
+  await ownWriteFile.function.execute(
+    { path: "own.txt", content: "von dieser sitzung selbst\n" } as never,
+    {} as never,
+  );
+  assert.equal(ownJournal.size, 1);
+
+  const { context } = resumeCommandContext({ home, chatId, guard: box.guard, journal: ownJournal });
+
+  await assert.rejects(handleSlashCommand("/resume undo", context), /nur sicher/);
+
+  // Nothing was touched: the own session's journal entry survives untouched,
+  // and the crash is still reported as interrupted (not marked reviewed).
+  assert.equal(ownJournal.size, 1);
+  assert.equal(await readFile(join(box.root, "own.txt"), "utf8"), "von dieser sitzung selbst\n");
+  const still = await findInterruptedRun(home, chatId);
+  assert.ok(still);
+  assert.equal(still.runId, crashRunId);
+});
+
+test("/resume with an unknown subcommand reports usage instead of doing anything", async () => {
+  const home = await appHome("cmd-unknown");
+  const chatId = "chat-1";
+  const runId = createRunId();
+  const box = await sandbox(home, chatId, "cmd-unknown-ws");
+  await writeInterruptedRun(home, chatId, runId, [
+    { type: "run-start", model: "vendor/model", maxSteps: 40, timestamp: 1 },
+  ]);
+  const { context } = resumeCommandContext({ home, chatId, guard: box.guard });
+
+  await assert.rejects(handleSlashCommand("/resume klingonisch", context), /Verwendung: \/resume/);
+  assert.ok(await findInterruptedRun(home, chatId));
 });
 
 // ---------------------------------------------------------------------------

@@ -842,6 +842,117 @@ test("/panel show rejects an out-of-range index with a clear message", async () 
   }
 });
 
+test("/panel show renders as a block via onPanelResult instead of plain text, when the hook is set", async () => {
+  const { context, lines, appHome } = await panelHarness();
+  try {
+    context.lastPanelResult = {
+      question: "Testfrage",
+      answers: [successAnswer("a/one", "Kurze Antwort A"), successAnswer("b/two", "Kurze Antwort B")],
+      totalCostUsd: 0.002,
+      durationMs: 500,
+    };
+    const calls: Array<{ result: PanelResult; judgment: PanelJudgment | null; expandedIndex: number | null }> = [];
+    context.onPanelResult = (result, judgment, expandedIndex) => {
+      calls.push({ result, judgment, expandedIndex });
+    };
+    await handleSlashCommand("/panel show 2", context);
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0]!.expandedIndex, 1);
+    assert.equal(calls[0]!.result, context.lastPanelResult);
+    // The command's own out.text lines never carry the rendered panel text
+    // once onPanelResult takes over — only the small "full answer" hint may.
+    assert.ok(lines.every((line) => !/Kurze Antwort/.test(line)));
+  } finally {
+    await rm(appHome, { recursive: true, force: true });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// /panel use <n> (src/commands.ts) — hands one answer over to the normal chat
+// as context, via the same `seedNextMessage` seam cli.ts's own interrupted-run
+// "Fortsetzen" choice uses for `ui.insertInputText`/the plain loop's pending
+// seed.
+// ---------------------------------------------------------------------------
+
+test("/panel use without a prior run explains itself instead of throwing", async () => {
+  const { context, lines, appHome } = await panelHarness();
+  try {
+    await handleSlashCommand("/panel use 1", context);
+    assert.ok(lines.some((line) => /Noch kein Panel-Lauf/.test(line)));
+  } finally {
+    await rm(appHome, { recursive: true, force: true });
+  }
+});
+
+test("/panel use rejects an out-of-range index with a clear message", async () => {
+  const { context, appHome } = await panelHarness();
+  try {
+    context.lastPanelResult = {
+      question: "Testfrage",
+      answers: [successAnswer("a/one", "A"), successAnswer("b/two", "B")],
+      totalCostUsd: 0.002,
+      durationMs: 500,
+    };
+    await assert.rejects(handleSlashCommand("/panel use 5", context), /1-2/);
+  } finally {
+    await rm(appHome, { recursive: true, force: true });
+  }
+});
+
+test("/panel use rejects an answer that failed or came back empty", async () => {
+  const { context, appHome } = await panelHarness();
+  try {
+    context.lastPanelResult = {
+      question: "Testfrage",
+      answers: [failedAnswer("a/one", "HTTP 500"), { ...successAnswer("b/two", ""), text: "" }],
+      totalCostUsd: 0,
+      durationMs: 500,
+    };
+    await assert.rejects(handleSlashCommand("/panel use 1", context), /keinen verwendbaren Text/);
+    await assert.rejects(handleSlashCommand("/panel use 2", context), /keinen verwendbaren Text/);
+  } finally {
+    await rm(appHome, { recursive: true, force: true });
+  }
+});
+
+test("/panel use seeds the answer, labelled by its model, into the next message via seedNextMessage", async () => {
+  const { context, lines, appHome } = await panelHarness();
+  try {
+    context.lastPanelResult = {
+      question: "Testfrage",
+      answers: [successAnswer("a/one", "Kurze Antwort A"), successAnswer("b/two", "Kurze Antwort B")],
+      totalCostUsd: 0.002,
+      durationMs: 500,
+    };
+    const seeded: string[] = [];
+    context.seedNextMessage = (text) => seeded.push(text);
+    await handleSlashCommand("/panel use 2", context);
+    assert.equal(seeded.length, 1);
+    assert.match(seeded[0]!, /^Antwort von b\/two/);
+    assert.match(seeded[0]!, /Kurze Antwort B/);
+    // Confirms the seam was used, not a silent no-op.
+    assert.ok(lines.some((line) => /wird der nächsten Nachricht vorangestellt/.test(line)));
+  } finally {
+    await rm(appHome, { recursive: true, force: true });
+  }
+});
+
+test("/panel use prints the labelled answer directly when seedNextMessage is unset", async () => {
+  const { context, lines, appHome } = await panelHarness();
+  try {
+    context.lastPanelResult = {
+      question: "Testfrage",
+      answers: [successAnswer("a/one", "Kurze Antwort A")],
+      totalCostUsd: 0.001,
+      durationMs: 500,
+    };
+    await handleSlashCommand("/panel use 1", context);
+    assert.ok(lines.some((line) => /^Antwort von a\/one/.test(line) && /Kurze Antwort A/.test(line)));
+  } finally {
+    await rm(appHome, { recursive: true, force: true });
+  }
+});
+
 // Sanity check that the exported bounds actually match what askPanel enforces.
 test("PANEL_MIN_MODELS/PANEL_MAX_MODELS are 2 and 5", () => {
   assert.equal(PANEL_MIN_MODELS, 2);

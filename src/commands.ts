@@ -66,6 +66,15 @@ import {
 import { renderPanel } from "./ui/panel-view.js";
 import { renderLines } from "./ui/compose.js";
 import { createTheme } from "./ui/theme.js";
+import {
+  buildResumePrompt,
+  findInterruptedRun,
+  formatInterruptedRunNotice,
+  formatUndoOutcome,
+  markRunReviewed,
+  summarizeRun,
+  undoInterruptedRun,
+} from "./resume.js";
 import { rankChatMatches, SessionStore, workspaceSpend } from "./session.js";
 import { getGitDiff, runProcess, writeApprovalRequest } from "./workspace.js";
 import {
@@ -140,6 +149,29 @@ export interface CommandContext {
    * the only seam between `/panel` and an actual network call.
    */
   panelCall?: PanelCall;
+  /**
+   * Hook back to the active input surface: seeds the *next* message the user
+   * sends without sending anything automatically — visible and editable in
+   * the fullscreen TUI (wired to `ui.insertInputText`), prepended silently in
+   * the plain loop (wired to its own pending-seed variable), exactly like
+   * cli.ts's interrupted-run "Fortsetzen" choice already does at startup.
+   * `/resume fortsetzen` and `/panel use <n>` both go through this one seam.
+   * Unset in `-p`/`--json` and in every test that does not exercise either.
+   */
+  seedNextMessage?: (text: string) => void;
+  /**
+   * When set, `/panel`'s result is handed to this callback instead of being
+   * rendered as plain lines via `out.text` — the fullscreen TUI uses this to
+   * push a proper `"panel"` block onto the chat stream (see `src/ui/blocks.ts`)
+   * instead of flattening the result into a generic notice block. Unset in
+   * the plain loop and in every test that does not exercise it, where the
+   * existing text rendering is preserved exactly.
+   */
+  onPanelResult?: (
+    result: PanelResult,
+    judgment: PanelJudgment | null,
+    expandedIndex: number | null,
+  ) => void;
 }
 
 /** Every command that persists `context.config` goes through this, never a bare `saveConfig(context.config)` — see `CommandContext.configPath`. */
@@ -269,6 +301,9 @@ export async function handleSlashCommand(
           dryRun: args.includes("--dry-run"),
         }),
       );
+      return "continue";
+    case "resume":
+      await resumeCommand(args, context);
       return "continue";
     case "config":
       context.out.text(chalk.bold(CONFIG_PATH));
@@ -687,6 +722,81 @@ async function modelsCommand(args: string[], context: CommandContext): Promise<v
 }
 
 // ---------------------------------------------------------------------------
+// /resume — review, continue, discard, or undo an interrupted previous run,
+// reachable at any point in the session, not only at startup. Every actual
+// effect (`buildResumePrompt`, `undoInterruptedRun`, `markRunReviewed`,
+// `formatInterruptedRunNotice`, `formatUndoOutcome`) comes straight from
+// resume.ts — the same functions cli.ts's own startup flow
+// (`checkInterruptedRunPlain`/`checkInterruptedRunTui`) uses, so there is only
+// ever one way an interrupted run gets resumed, discarded, or undone.
+// ---------------------------------------------------------------------------
+
+async function resumeCommand(args: string[], context: CommandContext): Promise<void> {
+  const sub = (args[0] ?? "").toLowerCase();
+  const run = await findInterruptedRun(context.session.appHome, context.session.data.id);
+  if (!run) {
+    context.out.text("Kein abgebrochener Lauf gefunden.");
+    return;
+  }
+  const summary = summarizeRun(run.events);
+
+  if (!sub) {
+    context.out.text(formatInterruptedRunNotice(summary, run.fileDrift));
+    context.out.text(
+      chalk.dim(
+        "Verwendung: /resume fortsetzen (Zusammenfassung der nächsten Nachricht voranstellen) · " +
+          "/resume undo (Dateiänderungen dieses Laufs zurücknehmen) · " +
+          "/resume verwerfen (nicht mehr melden, nichts wird zurückgenommen)",
+      ),
+    );
+    return;
+  }
+
+  if (sub === "undo") {
+    // Mirrors the precondition `undoInterruptedRun` documents: hydrating a
+    // journal that already holds this session's own, later entries would
+    // make `undoLastRun`'s "last run" ambiguous (see resume.ts). At startup
+    // that is guaranteed by construction; reachable mid-session as this
+    // command is, it has to be checked explicitly instead.
+    if (context.agent.journal.size > 0) {
+      throw new Error(
+        "/resume undo ist nur sicher, solange diese Sitzung noch keine eigene Dateiänderung vorgenommen hat. " +
+          "Nutze /undo für den letzten eigenen Lauf, oder starte orcode neu, um den abgebrochenen Lauf zurückzunehmen.",
+      );
+    }
+    const outcome = await undoInterruptedRun(
+      context.agent.journal,
+      context.agent.guard,
+      context.approvals,
+      run,
+    );
+    await markRunReviewed(context.session.appHome, context.session.data.id, run);
+    context.out.text(formatUndoOutcome(outcome));
+    return;
+  }
+
+  if (sub === "verwerfen") {
+    await markRunReviewed(context.session.appHome, context.session.data.id, run);
+    context.out.text("Verworfen. Die bisherigen Dateiänderungen dieses Laufs bleiben unverändert.");
+    return;
+  }
+
+  if (sub === "fortsetzen") {
+    await markRunReviewed(context.session.appHome, context.session.data.id, run);
+    const prompt = buildResumePrompt(summary);
+    if (context.seedNextMessage) {
+      context.seedNextMessage(prompt);
+      context.out.text(chalk.dim("Zusammenfassung wird der nächsten Nachricht vorangestellt."));
+    } else {
+      context.out.text(prompt);
+    }
+    return;
+  }
+
+  throw new Error("Verwendung: /resume [fortsetzen|undo|verwerfen]");
+}
+
+// ---------------------------------------------------------------------------
 // /panel — model panel: ask several models the same question in parallel and
 // compare the answers. Core orchestration is `askPanel`/`synthesize` in
 // panel.ts; this is just the interactive shell around it (proposal, cost
@@ -714,6 +824,10 @@ async function panelCommand(args: string[], context: CommandContext): Promise<vo
     panelShowCommand(args.slice(1), context);
     return;
   }
+  if (sub === "use") {
+    panelUseCommand(args.slice(1), context);
+    return;
+  }
   // Anything else — including empty input — is treated as the question, the
   // same fallback `/verify` already uses for its literal-command case: a
   // small, fixed set of reserved words up front, free text after that.
@@ -735,7 +849,7 @@ function printPanelStatus(context: CommandContext): void {
   context.out.text(`Panel-Richter: ${context.config.panelJudge ? "an" : "aus"}`);
   context.out.text(
     chalk.dim(
-      "Verwendung: /panel <frage> · /panel models <a>,<b>,… · /panel judge on|off · /panel show <n>",
+      "Verwendung: /panel <frage> · /panel models <a>,<b>,… · /panel judge on|off · /panel show <n> · /panel use <n>",
     ),
   );
 }
@@ -789,6 +903,40 @@ function panelShowCommand(args: string[], context: CommandContext): void {
     throw new Error(`Verwendung: /panel show <1-${last.answers.length}>`);
   }
   printPanelResult(context, last, context.lastPanelJudgment ?? null, index - 1);
+}
+
+/**
+ * Hands one panel answer's text over to the normal chat as context. Seeded
+ * into the next message via `context.seedNextMessage` — the exact same
+ * mechanism cli.ts's interrupted-run "Fortsetzen" choice already uses
+ * (`ui.insertInputText` in the fullscreen TUI, the plain loop's own
+ * pending-seed variable otherwise) — never a second way of stuffing text into
+ * the next turn. The answer's model is folded into the seeded text itself, so
+ * the transcript later still shows where it came from.
+ */
+function panelUseCommand(args: string[], context: CommandContext): void {
+  const last = context.lastPanelResult;
+  if (!last) {
+    context.out.text("Noch kein Panel-Lauf in dieser Sitzung. Starte mit /panel <frage>.");
+    return;
+  }
+  const index = Number(args[0]);
+  if (!Number.isInteger(index) || index < 1 || index > last.answers.length) {
+    throw new Error(`Verwendung: /panel use <1-${last.answers.length}>`);
+  }
+  const answer = last.answers[index - 1]!;
+  if (answer.error || !answer.text.trim()) {
+    throw new Error(`Antwort ${index} (${answer.model}) hat keinen verwendbaren Text.`);
+  }
+  const seeded = `Antwort von ${answer.model} (Panel):\n\n${answer.text.trim()}`;
+  if (context.seedNextMessage) {
+    context.seedNextMessage(seeded);
+    context.out.text(
+      chalk.dim(`Antwort ${index} (${answer.model}) wird der nächsten Nachricht vorangestellt.`),
+    );
+  } else {
+    context.out.text(seeded);
+  }
 }
 
 async function panelAskCommand(question: string, context: CommandContext): Promise<void> {
@@ -883,11 +1031,18 @@ function printPanelResult(
   judgment: PanelJudgment | null,
   expandedIndex: number | null,
 ): void {
-  const theme = createTheme();
-  const width = Math.max(40, Math.min(process.stdout.columns || 100, 120));
-  const lines = renderPanel(result, width, theme, { expandedIndex, judgment });
-  for (const line of renderLines(lines, theme)) {
-    context.out.text(line);
+  if (context.onPanelResult) {
+    // Fullscreen TUI: render as its own block (src/ui/blocks.ts) instead of
+    // flattening the result into command-output text — see src/tui.ts's
+    // `addPanelResult`.
+    context.onPanelResult(result, judgment, expandedIndex);
+  } else {
+    const theme = createTheme();
+    const width = Math.max(40, Math.min(process.stdout.columns || 100, 120));
+    const lines = renderPanel(result, width, theme, { expandedIndex, judgment });
+    for (const line of renderLines(lines, theme)) {
+      context.out.text(line);
+    }
   }
   if (expandedIndex === null && result.answers.length > 0) {
     context.out.text(

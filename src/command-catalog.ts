@@ -96,7 +96,7 @@ export const SLASH_COMMANDS: readonly SlashCommandDefinition[] = [
   },
   {
     name: "panel",
-    usage: "/panel <frage> | models <a>,<b>,… | judge on|off | show <n>",
+    usage: "/panel <frage> | models <a>,<b>,… | judge on|off | show <n> | use <n>",
     description: "Mehrere Modelle parallel befragen und Antworten vergleichen",
     acceptsArguments: true,
   },
@@ -177,6 +177,12 @@ export const SLASH_COMMANDS: readonly SlashCommandDefinition[] = [
     name: "undo",
     usage: "/undo [--dry-run]",
     description: "Letzten orcode-Lauf als Einheit zurücknehmen",
+    acceptsArguments: true,
+  },
+  {
+    name: "resume",
+    usage: "/resume [fortsetzen|undo|verwerfen]",
+    description: "Abgebrochenen vorherigen Lauf prüfen, fortsetzen, zurücknehmen oder verwerfen",
     acceptsArguments: true,
   },
   {

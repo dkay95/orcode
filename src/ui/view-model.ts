@@ -5,6 +5,7 @@
  * tool name and no output field name is spelled out here a second time.
  */
 
+import type { PanelJudgment, PanelResult } from "../panel.js";
 import type { AgentRunEvent, ToolRisk } from "../types.js";
 import { toolMetadata, type TextDiff } from "../workspace.js";
 import {
@@ -252,6 +253,30 @@ export class RunViewModel {
     };
     if (diff) block.diff = diff;
     return this.#push(block);
+  }
+
+  /**
+   * Pushes a `/panel` result as its own block instead of the generic notice
+   * text `addMessage` would otherwise produce (see `CommandContext.onPanelResult`
+   * in commands.ts). Every call — including a later `/panel show <n>` for the
+   * same result — appends a fresh block, exactly like `pushDiff`/`pushNotice`
+   * already do; nothing here is mutated in place.
+   */
+  pushPanel(
+    result: PanelResult,
+    judgment: PanelJudgment | null,
+    expandedIndex: number | null,
+    at = Date.now(),
+  ): ChatBlock {
+    this.#assistantId = null;
+    return this.#push({
+      kind: "panel",
+      id: this.#id("panel"),
+      at,
+      result,
+      judgment,
+      expandedIndex,
+    });
   }
 
   /** Removes a pending approval block once it has been answered. */

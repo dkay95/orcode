@@ -5,6 +5,7 @@
  * knows its own state; no renderer ever re-derives meaning from text.
  */
 
+import type { PanelJudgment, PanelResult } from "../panel.js";
 import type { ToolRisk } from "../types.js";
 import type { DiffHunkView } from "./diff-view.js";
 
@@ -77,6 +78,13 @@ export type ChatBlock =
       title: string;
       cause: string[];
       actions: Array<{ key: string; label: string }>;
+    })
+  | (BlockBase & {
+      kind: "panel";
+      result: PanelResult;
+      judgment: PanelJudgment | null;
+      /** Index into `result.answers` shown in full; `null` collapses every answer to its teaser (see `renderPanel`). */
+      expandedIndex: number | null;
     });
 
 export type BlockKind = ChatBlock["kind"];

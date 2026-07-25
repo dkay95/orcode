@@ -22,6 +22,7 @@ import {
 } from "./command-catalog.js";
 import type { AgentRunEvent, ChatTurn, ModelInfo, ToolCallPreview } from "./types.js";
 import type { ImageAttachment } from "./attachments.js";
+import type { PanelJudgment, PanelResult } from "./panel.js";
 import { approvalRiskLabel } from "./approval.js";
 import { TAIL, type ChatBlock, type Viewport } from "./ui/blocks.js";
 import { renderLines } from "./ui/compose.js";
@@ -303,6 +304,22 @@ export class TerminalUi {
       const cause = rest.join("\n");
       this.#vm.pushNotice(role === "error" ? "error" : "info", title, cause ? [cause] : []);
     }
+    this.scheduleRender();
+  }
+
+  /**
+   * Renders a `/panel` result as its own block in the chat stream instead of
+   * flattening it into a text notice — see `CommandContext.onPanelResult` in
+   * commands.ts, which calls this when the fullscreen TUI is active. Every
+   * call, including a later `/panel show <n>` for the same result, appends a
+   * fresh block, exactly like every other command result already does.
+   */
+  addPanelResult(
+    result: PanelResult,
+    judgment: PanelJudgment | null,
+    expandedIndex: number | null,
+  ): void {
+    this.#vm.pushPanel(result, judgment, expandedIndex);
     this.scheduleRender();
   }
 
