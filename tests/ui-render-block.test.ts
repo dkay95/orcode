@@ -6,7 +6,7 @@ import type { BlockState, ChatBlock } from "../src/ui/blocks.js";
 import { BLOCK_STATES, RUNNING_TAIL_LINES } from "../src/ui/blocks.js";
 import { parseUnifiedDiff, renderDiff, splitHunks } from "../src/ui/diff-view.js";
 import { buildFrame } from "../src/ui/render-frame.js";
-import { renderBlock } from "../src/ui/render-block.js";
+import { APPROVAL_DETAIL_LINES, renderBlock } from "../src/ui/render-block.js";
 import { lineWidth, plainText } from "../src/ui/spans.js";
 import { createTheme } from "../src/ui/theme.js";
 
@@ -312,4 +312,31 @@ test("zurückgescrollt zeigt der Rahmen den Scroll-Indikator", () => {
     true,
   );
   assert.equal(frame.maxScrollOffset > 0, true);
+});
+
+test("a huge pending change never crowds out the approval question", () => {
+  // Writing a 600-line file used to render 600 lines, pushing the question and
+  // its key hints out of the terminal — the run looked frozen while it was
+  // waiting for an answer nobody could see.
+  const theme = createTheme({ level: 0 });
+  const block: ChatBlock = {
+    kind: "approval",
+    id: "ap1",
+    at: AT,
+    risk: "edit",
+    summary: "Datei schreiben: index.html",
+    details: Array.from({ length: 600 }, (_, i) => `<div class="z-${i}">Inhalt ${i}</div>`),
+    waitingSince: AT,
+    rememberHint: "keine gemerkte Regel für diese Aktion",
+  };
+
+  const lines = renderBlock(block, 100, theme, { last: true });
+
+  assert.ok(
+    lines.length <= APPROVAL_DETAIL_LINES + 4,
+    `approval block grew to ${lines.length} lines`,
+  );
+  const text = lines.map((line) => plainText(line)).join("\n");
+  assert.match(text, /… 590 weitere Zeilen/);
+  assert.match(text, /Datei schreiben: index\.html/);
 });

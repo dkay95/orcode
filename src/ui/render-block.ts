@@ -19,6 +19,13 @@ import { markdownToLines } from "./markdown.js";
 import { span, type Line, type Span } from "./spans.js";
 import { spinnerFrame, type Theme } from "./theme.js";
 
+/**
+ * How much of a pending change an approval shows inline. The question and its
+ * key hints must never leave the viewport — a decision the user cannot see is
+ * a decision they cannot make.
+ */
+export const APPROVAL_DETAIL_LINES = 10;
+
 export interface RenderBlockOptions {
   /** Spinner tick; exactly one block may spin (R7). */
   tick?: number;
@@ -277,8 +284,18 @@ export function renderBlock(
       if (block.diff && block.diff.length > 0) {
         lines.push(...renderHunks(block.diff, usable, theme));
       } else {
-        for (const detail of block.details) {
+        // An approval must stay readable at a glance. Writing a 600-line file
+        // used to render 600 lines here, pushing the actual question — and the
+        // key hints below it — out of the viewport, so the run looked frozen
+        // while it was really waiting for an answer nobody could see.
+        for (const detail of block.details.slice(0, APPROVAL_DETAIL_LINES)) {
           lines.push(body(theme, usable, detail, "text"));
+        }
+        const hidden = block.details.length - APPROVAL_DETAIL_LINES;
+        if (hidden > 0) {
+          lines.push(
+            body(theme, usable, `… ${hidden} weitere Zeilen · Ctrl+O zeigt alles`, "muted"),
+          );
         }
       }
       if (block.rememberHint) {

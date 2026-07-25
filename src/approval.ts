@@ -287,6 +287,11 @@ export function approvalRiskLabel(risk: ApprovalRisk): string {
       return "GEHEIMNIS";
     case "read":
       return "READ";
+    default:
+      // A risk level added later must never surface as "undefined" in an
+      // approval header. Unknown means unclassified, which is the cautious
+      // reading, not the harmless one.
+      return "UNBEKANNT";
   }
 }
 
