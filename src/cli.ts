@@ -114,6 +114,13 @@ import { errorMessage, formatUsd } from "./utils.js";
 const execFileAsync = promisify(execFile);
 
 /**
+ * How many past turns the dashboard shows when a chat opens. One value for
+ * every entry point — startup used to show 12 and a chat switch 40, so the
+ * same chat looked different depending on how you got there.
+ */
+const VISIBLE_TURNS = 40;
+
+/**
  * K8: a "Bedienfehler" — bad CLI usage, caught by `main()`'s top-level
  * handler and reported with exit code 2. Distinct from a runtime failure
  * (network, model, tool), which is exit code 1.
@@ -745,7 +752,12 @@ async function runDashboard(
   context.seedNextMessage = (text) => ui.insertInputText(text);
   context.onPanelResult = (result, judgment, expandedIndex) =>
     ui.addPanelResult(result, judgment, expandedIndex);
-  ui.loadTurns(context.session.recentTurns(12));
+  // Showing a transcript behind the chat chooser contradicts the question it
+  // asks: the user is picking a chat while already looking at one. Load only
+  // once the choice is settled.
+  if (!context.showChatPickerOnStart) {
+    ui.loadTurns(context.session.recentTurns(VISIBLE_TURNS));
+  }
   context.approvals.setPromptHandler((preview) => ui.confirmApproval(preview));
   ui.start();
   try {
@@ -753,6 +765,10 @@ async function runDashboard(
       const switched = await pickDashboardChat(ui, context, true);
       if (switched) {
         startingSessionCost = context.session.data.costs.totalUsd;
+      } else {
+        // Chooser dismissed — we stay in the current chat, so its transcript
+        // still has to appear. `pickDashboardChat` loads it only on a switch.
+        ui.loadTurns(context.session.recentTurns(VISIBLE_TURNS));
       }
     }
     const startupModel = context.config.mainModel;
@@ -1154,7 +1170,7 @@ async function runDashboard(
           const captured = dashboardOut.flush();
           if (context.session !== sessionBefore) {
             startingSessionCost = context.session.data.costs.totalUsd;
-            ui.loadTurns(context.session.recentTurns(40));
+            ui.loadTurns(context.session.recentTurns(VISIBLE_TURNS));
             pendingImages = [];
             ui.setImageAttachments([]);
             resolvedModel = "";
@@ -1413,7 +1429,7 @@ async function pickDashboardChat(
   context.agent.setSession(next);
   await saveDashboardSessionPreferences(context, ui);
   await saveConfig(context.config);
-  ui.loadTurns(next.recentTurns(40));
+  ui.loadTurns(next.recentTurns(VISIBLE_TURNS));
   ui.setStatus(`Chat geöffnet: ${next.data.title}`, false);
   return true;
 }

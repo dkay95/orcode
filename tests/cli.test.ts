@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import test from "node:test";
 import {
   CliUsageError,
@@ -76,4 +77,38 @@ test("runOutcomeExitCode maps the documented five codes (K8)", () => {
   // Forward-compatible with A4's future "unverified" outcome (exit 3) even
   // though `AgentRunOutcome` does not carry that member yet.
   assert.equal(runOutcomeExitCode("unverified" as never), 3);
+});
+
+test("the visible-turn count is one value, not three", () => {
+  // Startup loaded 12 turns, a chat switch 40, and loadTurns capped at 12 on
+  // top of that — so the same chat looked different depending on how you
+  // opened it, and the 40 was never honoured at all.
+  const cli = readFileSync(new URL("../src/cli.ts", import.meta.url), "utf8");
+  const tui = readFileSync(new URL("../src/tui.ts", import.meta.url), "utf8");
+
+  assert.equal(
+    /recentTurns\(\s*\d+\s*\)/.test(cli),
+    false,
+    "cli.ts must not hardcode a turn count; use VISIBLE_TURNS",
+  );
+  const declared = /const VISIBLE_TURNS = (\d+)/.exec(cli);
+  assert.ok(declared, "VISIBLE_TURNS must be declared in cli.ts");
+  const capped = /loadTurns\([^)]*maximum = (\d+)/.exec(tui);
+  assert.ok(capped, "loadTurns must state its cap");
+  assert.equal(
+    declared![1],
+    capped![1],
+    "loadTurns would silently drop turns the caller asked for",
+  );
+});
+
+test("the chat chooser does not show a transcript behind itself", () => {
+  // Loading the previous chat before the chooser contradicts the question it
+  // asks — and picking "new chat" then made the text vanish again.
+  const cli = readFileSync(new URL("../src/cli.ts", import.meta.url), "utf8");
+  const guard = cli.indexOf("if (!context.showChatPickerOnStart) {");
+  const load = cli.indexOf("ui.loadTurns", guard);
+  const start = cli.indexOf("ui.start()");
+  assert.ok(guard > 0, "the startup load must be guarded by the chooser flag");
+  assert.ok(load > guard && load < start, "the guarded load belongs before ui.start()");
 });

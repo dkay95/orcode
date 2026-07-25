@@ -266,7 +266,12 @@ export class TerminalUi {
     return this.#active;
   }
 
-  loadTurns(turns: readonly ChatTurn[], maximum = 12): void {
+  /**
+   * `maximum` used to default to 12 while callers passed `recentTurns(40)`,
+   * so the extra 28 turns were silently dropped here. The default now matches
+   * what the callers ask for; pass a smaller value to cap deliberately.
+   */
+  loadTurns(turns: readonly ChatTurn[], maximum = 40): void {
     this.#clearSuggestedReplies();
     this.#vm.clear();
     for (const turn of turns.slice(-maximum)) {
