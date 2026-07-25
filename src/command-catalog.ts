@@ -95,6 +95,12 @@ export const SLASH_COMMANDS: readonly SlashCommandDefinition[] = [
     acceptsArguments: true,
   },
   {
+    name: "panel",
+    usage: "/panel <frage> | models <a>,<b>,… | judge on|off | show <n>",
+    description: "Mehrere Modelle parallel befragen und Antworten vergleichen",
+    acceptsArguments: true,
+  },
+  {
     name: "cost",
     usage: "/cost",
     description: "Kosten dieser Workspace-Sitzung anzeigen",

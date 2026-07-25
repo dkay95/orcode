@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-import { input, confirm } from "@inquirer/prompts";
+import { input, confirm, select } from "@inquirer/prompts";
 import chalk from "chalk";
 import { execFile } from "node:child_process";
 import { readFileSync, realpathSync } from "node:fs";
@@ -52,6 +52,17 @@ import {
   type CredentialKind,
 } from "./credentials.js";
 import { OpenRouterService } from "./openrouter.js";
+import {
+  buildResumePrompt,
+  findInterruptedRun,
+  formatInterruptedRunNotice,
+  formatUndoOutcome,
+  markRunReviewed,
+  summarizeRun,
+  undoInterruptedRun,
+  type InterruptedRun,
+  type RunSummary,
+} from "./resume.js";
 import {
   getReasoningSetting,
   reasoningChoiceValue,
@@ -122,6 +133,10 @@ export interface CliOptions {
   plain: boolean;
   /** K8: NDJSON run events on stdout, non-interactive, machine-readable. */
   json: boolean;
+  /** Resume an interrupted run's context without asking (see src/resume.ts). */
+  resume: boolean;
+  /** Never mention an interrupted run this start. */
+  noResume: boolean;
 }
 
 /**
@@ -270,6 +285,8 @@ async function main(): Promise<void> {
         storedInferenceKey && environmentInferenceKey
           ? environmentInferenceKey
           : undefined,
+      resumeFlag: options.resume,
+      noResumeFlag: options.noResume,
     });
     return;
   }
@@ -304,29 +321,46 @@ async function main(): Promise<void> {
         "Kein Prompt: --json braucht -p/--prompt oder eine nicht-interaktive stdin.",
       );
     }
-    process.exitCode = await runNonInteractive(agent, prompt, { json: true });
+    // Human-readable, so it goes to stderr — stdout is reserved for the
+    // NDJSON event stream in --json mode (see createStderrCommandOutput).
+    const effectivePrompt = await applyInterruptedRunNonInteractive(
+      session,
+      options,
+      out,
+      prompt,
+    );
+    process.exitCode = await runNonInteractive(agent, effectivePrompt, { json: true });
     return;
   }
 
   if (options.prompt) {
     await printBalance(startupBalance, out);
-    process.exitCode = await runNonInteractive(agent, options.prompt, { json: false });
+    const effectivePrompt = await applyInterruptedRunNonInteractive(
+      session,
+      options,
+      out,
+      options.prompt,
+    );
+    process.exitCode = await runNonInteractive(agent, effectivePrompt, { json: false });
     return;
   }
 
   await printBalance(startupBalance, out);
-  await runPlainLoop({
-    workspace,
-    config,
-    approvals,
-    openRouter,
-    session,
-    agent,
-    credentials,
-    out,
-    ruleStore,
-    sshSession,
-  });
+  await runPlainLoop(
+    {
+      workspace,
+      config,
+      approvals,
+      openRouter,
+      session,
+      agent,
+      credentials,
+      out,
+      ruleStore,
+      sshSession,
+    },
+    options,
+  );
 }
 
 interface RuntimeContext {
@@ -343,8 +377,15 @@ interface RuntimeContext {
   sshSession: SshSession;
 }
 
-async function runPlainLoop(context: RuntimeContext): Promise<void> {
+async function runPlainLoop(
+  context: RuntimeContext,
+  resumeOptions: Pick<CliOptions, "resume" | "noResume">,
+): Promise<void> {
   console.log(chalk.dim("Schreibe eine Aufgabe oder /help. Ctrl+C beendet.\n"));
+  // Set once, if the interrupted-run flow below resolves to "resume": the
+  // resume context is prepended to the very next message the user actually
+  // sends, then cleared — never sent on its own, never repeated.
+  let pendingSeed = await checkInterruptedRunPlain(context, resumeOptions);
   while (true) {
     let value: string;
     try {
@@ -370,7 +411,9 @@ async function runPlainLoop(context: RuntimeContext): Promise<void> {
         }
         continue;
       }
-      const result = await context.agent.run(trimmed);
+      const effective = pendingSeed ? `${pendingSeed}\n\n${trimmed}` : trimmed;
+      pendingSeed = undefined;
+      const result = await context.agent.run(effective);
       printRunFooter(result);
     } catch (error) {
       console.error(chalk.red(context.openRouter.safeMessage(error)));
@@ -396,6 +439,216 @@ async function runPlainLoop(context: RuntimeContext): Promise<void> {
 
   await context.session.save();
   console.log("Bis bald.");
+}
+
+// ---------------------------------------------------------------------------
+// Interrupted-run detection at startup (src/resume.ts)
+//
+// Honesty constraint (see resume.ts's module doc): a real "continue mid-run"
+// is impossible, since the SDK state of an interrupted run was deliberately
+// never committed. What all three call sites below offer instead is a new
+// run seeded with a factual summary of what happened — and only ever after
+// the user explicitly says so. `--no-resume` skips the check outright;
+// without either flag, an interactive session asks and a non-interactive one
+// (`-p`/`--json`) only reports, never acts, never blocks.
+// ---------------------------------------------------------------------------
+
+type ResumeChoice = "resume" | "discard" | "undo" | null;
+
+/**
+ * Executes one already-made decision. Shared by every call site so the
+ * *effect* of each choice — reuse `ChangeJournal.undoLastRun` for "undo" via
+ * `undoInterruptedRun`, mark the run reviewed so it is not reported again —
+ * is defined in exactly one place. `null` ("später entscheiden" / Escape /
+ * Ctrl+C) does nothing at all, not even marking the run reviewed, so it is
+ * reported again next start.
+ */
+async function applyResumeChoice(
+  choice: ResumeChoice,
+  context: RuntimeContext,
+  run: InterruptedRun,
+  summary: RunSummary,
+  report: (text: string) => void,
+): Promise<string | undefined> {
+  if (choice === null) {
+    return undefined;
+  }
+  if (choice === "discard") {
+    await markRunReviewed(context.session.appHome, context.session.data.id, run);
+    report("Verworfen. Die bisherigen Dateiänderungen dieses Laufs bleiben unverändert.");
+    return undefined;
+  }
+  if (choice === "undo") {
+    const outcome = await undoInterruptedRun(
+      context.agent.journal,
+      context.agent.guard,
+      context.approvals,
+      run,
+    );
+    await markRunReviewed(context.session.appHome, context.session.data.id, run);
+    report(formatUndoOutcome(outcome));
+    return undefined;
+  }
+  await markRunReviewed(context.session.appHome, context.session.data.id, run);
+  return buildResumePrompt(summary);
+}
+
+/** Plain (`--plain` or non-TTY-fallback) loop: asks via `@inquirer/prompts`' `select`, defaulting to "später entscheiden". */
+async function askResumeChoicePlain(): Promise<ResumeChoice> {
+  try {
+    return await select<ResumeChoice>({
+      message: "Was tun mit dem abgebrochenen Lauf?",
+      choices: [
+        {
+          name: "Später entscheiden (nichts verändern, beim nächsten Start erneut fragen)",
+          value: null,
+        },
+        {
+          name: "Fortsetzen (Zusammenfassung wird deiner nächsten Nachricht vorangestellt)",
+          value: "resume",
+        },
+        {
+          name: "Verwerfen (nicht mehr fragen, nichts wird zurückgenommen)",
+          value: "discard",
+        },
+        { name: "Dateiänderungen dieses Laufs zurücknehmen (wie /undo)", value: "undo" },
+      ],
+      default: null,
+    });
+  } catch (error) {
+    if (isPromptExit(error)) {
+      return null;
+    }
+    throw error;
+  }
+}
+
+/**
+ * Runs the interrupted-run check for the plain (non-TUI) interactive loop.
+ * Returns text to prepend to the user's next message when they chose to
+ * resume, `undefined` otherwise. Never blocks and never acts without an
+ * explicit choice from the user (`--no-resume` skips entirely; `--resume`
+ * still prints what it is doing, since silence would be its own kind of
+ * surprise).
+ */
+async function checkInterruptedRunPlain(
+  context: RuntimeContext,
+  options: Pick<CliOptions, "resume" | "noResume">,
+): Promise<string | undefined> {
+  if (options.noResume) {
+    return undefined;
+  }
+  const run = await findInterruptedRun(context.session.appHome, context.session.data.id);
+  if (!run) {
+    return undefined;
+  }
+  const summary = summarizeRun(run.events);
+  const notice = formatInterruptedRunNotice(summary, run.fileDrift);
+  if (options.resume) {
+    console.log(chalk.dim(notice));
+    console.log(chalk.dim("Wird ohne Rückfrage fortgesetzt (--resume)."));
+    return applyResumeChoice("resume", context, run, summary, (text) =>
+      console.log(chalk.dim(text)),
+    );
+  }
+  console.log(chalk.yellow(notice));
+  const choice = await askResumeChoicePlain();
+  return applyResumeChoice(choice, context, run, summary, (text) => console.log(chalk.dim(text)));
+}
+
+/**
+ * TUI variant of the same check: shows the notice as a system message and,
+ * without `--resume`, offers the three-way choice through `ui.pickChoice`
+ * (Escape resolves to `null`, i.e. "später entscheiden" — same safe default
+ * as everywhere else). A "resume" choice lands in the input line via
+ * `insertInputText` — visible, editable, never auto-sent.
+ */
+async function checkInterruptedRunTui(
+  ui: TerminalUi,
+  context: RuntimeContext & { resumeFlag?: boolean; noResumeFlag?: boolean },
+): Promise<string | undefined> {
+  if (context.noResumeFlag) {
+    return undefined;
+  }
+  const run = await findInterruptedRun(context.session.appHome, context.session.data.id);
+  if (!run) {
+    return undefined;
+  }
+  const summary = summarizeRun(run.events);
+  const notice = formatInterruptedRunNotice(summary, run.fileDrift);
+  const report = (text: string) => ui.addMessage("system", text, "Wiederaufnahme");
+
+  if (context.resumeFlag) {
+    report(`${notice}\nWird ohne Rückfrage fortgesetzt (--resume).`);
+    return applyResumeChoice("resume", context, run, summary, report);
+  }
+
+  report(notice);
+  const picked = await ui.pickChoice(
+    "Abgebrochener Lauf",
+    [
+      {
+        value: "later",
+        label: "Später entscheiden",
+        description: "Nichts wird verändert; die Meldung erscheint beim nächsten Start erneut.",
+      },
+      {
+        value: "resume",
+        label: "Fortsetzen",
+        description:
+          "Zusammenfassung wird in die Eingabezeile gelegt — du entscheidest, ob und wann du sie abschickst.",
+      },
+      {
+        value: "discard",
+        label: "Verwerfen",
+        description: "Nichts wird zurückgenommen; nicht mehr melden.",
+      },
+      {
+        value: "undo",
+        label: "Änderungen zurücknehmen",
+        description: "Macht die Dateiänderungen dieses Laufs rückgängig (wie /undo).",
+      },
+    ],
+    "later",
+    "later",
+  );
+  const choice: ResumeChoice =
+    picked && picked.value !== "later" ? (picked.value as "resume" | "discard" | "undo") : null;
+  return applyResumeChoice(choice, context, run, summary, report);
+}
+
+/**
+ * Non-interactive (`-p`/`--json`): only ever acts on an explicit `--resume`
+ * (combining the resume context with the actual prompt) or `--no-resume`
+ * (silence). Without either flag the safe default applies — report and do
+ * nothing, since there is no one to ask and a non-interactive run must never
+ * block on input.
+ */
+async function applyInterruptedRunNonInteractive(
+  session: SessionStore,
+  options: Pick<CliOptions, "resume" | "noResume">,
+  out: CommandOutput,
+  prompt: string,
+): Promise<string> {
+  if (options.noResume) {
+    return prompt;
+  }
+  const run = await findInterruptedRun(session.appHome, session.data.id);
+  if (!run) {
+    return prompt;
+  }
+  const summary = summarizeRun(run.events);
+  const notice = formatInterruptedRunNotice(summary, run.fileDrift);
+  if (!options.resume) {
+    out.text(
+      `${notice}\nNicht interaktiv, kein --resume/--no-resume: Es wird nichts verändert. ` +
+        "Mit --resume automatisch übernehmen, mit --no-resume nicht mehr melden.",
+    );
+    return prompt;
+  }
+  out.text(`${notice}\nWird ohne Rückfrage fortgesetzt (--resume).`);
+  await markRunReviewed(session.appHome, session.data.id, run);
+  return `${buildResumePrompt(summary)}\n\n${prompt}`;
 }
 
 /**
@@ -430,6 +683,8 @@ async function runDashboard(
   context: RuntimeContext & {
     initialKeyFallback?: string;
     showChatPickerOnStart?: boolean;
+    resumeFlag?: boolean;
+    noResumeFlag?: boolean;
   },
 ): Promise<void> {
   let balance: BalanceInfo | null = null;
@@ -528,6 +783,15 @@ async function runDashboard(
         `OpenRouter-Startprüfung fehlgeschlagen: ${context.openRouter.safeMessage(error)}`,
       );
     }
+
+    // Checked here (after a possible startup chat switch above, so it looks
+    // at whichever chat is actually open) rather than before `runDashboard`
+    // is even called.
+    const seed = await checkInterruptedRunTui(ui, context);
+    if (seed) {
+      ui.insertInputText(seed);
+    }
+
     ui.setStatus("Bereit", false);
 
     while (true) {
@@ -1209,6 +1473,8 @@ export function parseArgs(args: string[]): CliOptions {
     version: false,
     plain: false,
     json: false,
+    resume: false,
+    noResume: false,
   };
   for (let index = 0; index < args.length; index += 1) {
     const argument = args[index];
@@ -1234,6 +1500,10 @@ export function parseArgs(args: string[]): CliOptions {
       options.newChat = true;
     } else if (argument === "--continue") {
       options.continueChat = true;
+    } else if (argument === "--resume") {
+      options.resume = true;
+    } else if (argument === "--no-resume") {
+      options.noResume = true;
     } else if (argument === "--chat") {
       options.chatId = requireValue(args, ++index, argument);
     } else if (argument.startsWith("-")) {
@@ -1254,6 +1524,9 @@ export function parseArgs(args: string[]): CliOptions {
   ].filter(Boolean).length;
   if (chatModes > 1) {
     throw new CliUsageError("--new, --continue und --chat können nicht kombiniert werden.");
+  }
+  if (options.resume && options.noResume) {
+    throw new CliUsageError("--resume und --no-resume können nicht kombiniert werden.");
   }
   return options;
 }
@@ -1292,6 +1565,10 @@ Optionen:
       --new                 Direkt einen neuen Chat beginnen
       --continue            Zuletzt verwendeten Chat fortsetzen
       --chat <id>           Einen bestimmten Chat öffnen
+      --resume              Abgebrochenen vorherigen Lauf ohne Rückfrage als
+                             Kontext für den nächsten Lauf übernehmen
+      --no-resume           Abgebrochenen vorherigen Lauf bei diesem Start
+                             nicht melden
       --plain               Klassische Ausgabe ohne Fullscreen-TUI
       --json                NDJSON-Ereignisstrom auf stdout; Prompt aus -p
                              oder, wenn stdin kein TTY ist, aus stdin

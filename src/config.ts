@@ -19,6 +19,7 @@ import {
   type ReasoningSetting,
   type OrcodeConfig,
 } from "./types.js";
+import { PANEL_MAX_MODELS, PANEL_MIN_MODELS } from "./panel.js";
 import { errorMessage, formatUsd, hasCode, isRecord } from "./utils.js";
 
 export const APP_HOME = join(homedir(), ".orcode");
@@ -81,6 +82,10 @@ export interface OrcodeConfigWithBudget extends OrcodeConfig {
   web: WebMode;
   verify: VerifyConfig;
   contextBudgetRatio: number;
+  /** `/panel`'s persisted model selection (2 to 5 ids), or `[]` when unset — see `panel.ts`. */
+  panelModels: string[];
+  /** `/panel judge`: run an extra judge round after every panel call. Off by default — not free, and not automatically an improvement. */
+  panelJudge: boolean;
 }
 
 /** Anything that may be handed to `validateConfig`/`saveConfig`. */
@@ -91,6 +96,8 @@ export type ConfigInput = OrcodeConfig & {
   web?: unknown;
   verify?: unknown;
   contextBudgetRatio?: unknown;
+  panelModels?: unknown;
+  panelJudge?: unknown;
 };
 
 export const DEFAULT_BUDGET: BudgetConfig = {
@@ -132,6 +139,8 @@ export const DEFAULT_CONFIG: OrcodeConfigWithBudget = {
   web: "auto",
   verify: { ...DEFAULT_VERIFY },
   contextBudgetRatio: 0.7,
+  panelModels: [],
+  panelJudge: false,
 };
 
 export interface ConfigLoadOutcome {
@@ -371,6 +380,8 @@ export function validateConfig(value: ConfigInput): OrcodeConfigWithBudget {
       1,
       DEFAULT_CONFIG.contextBudgetRatio,
     ),
+    panelModels: validatePanelModels(value.panelModels),
+    panelJudge: value.panelJudge === true,
   };
 }
 
@@ -385,6 +396,84 @@ export function validateFallbackModels(value: unknown): string[] {
     }
   }
   return result;
+}
+
+/**
+ * Silent/lossy validator for the persisted `panelModels` field — used while
+ * *loading* a config, where throwing would break startup on a stale or
+ * hand-edited file (`loadConfigDetailed` must never throw). Keeps at most
+ * `PANEL_MAX_MODELS` non-empty, de-duplicated ids; anything else (too many,
+ * wrong type, duplicates) is silently trimmed rather than rejected — a config
+ * with 7 stale entries should still let orcode start, just with a shorter
+ * list. Interactive validation with clear rejection messages for `/panel
+ * models …` is `validatePanelModelSelection` below.
+ */
+export function validatePanelModels(value: unknown): string[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  const seen = new Set<string>();
+  const result: string[] = [];
+  for (const item of value) {
+    if (typeof item !== "string") {
+      continue;
+    }
+    const trimmed = item.trim();
+    if (!trimmed || seen.has(trimmed)) {
+      continue;
+    }
+    seen.add(trimmed);
+    result.push(trimmed);
+    if (result.length >= PANEL_MAX_MODELS) {
+      break;
+    }
+  }
+  return result;
+}
+
+/**
+ * Throwing, user-facing validator for `/panel models <a>,<b>,…`. Unlike
+ * `validatePanelModels` above, this must give the user a clear reason when a
+ * selection is rejected instead of quietly reinterpreting it: too few models,
+ * too many, or an id OpenRouter does not know.
+ *
+ * `knownModelIds` is the caller's current OpenRouter catalogue (ids and
+ * canonical slugs) passed in as plain strings rather than this function
+ * reaching for `OpenRouterService` itself — that keeps this a pure,
+ * synchronous function the config layer can unit-test without a network.
+ */
+export function validatePanelModelSelection(
+  candidates: readonly string[],
+  knownModelIds: readonly string[],
+): string[] {
+  const seen = new Set<string>();
+  const deduped: string[] = [];
+  for (const candidate of candidates) {
+    const trimmed = candidate.trim();
+    if (!trimmed || seen.has(trimmed)) {
+      continue;
+    }
+    seen.add(trimmed);
+    deduped.push(trimmed);
+  }
+  if (deduped.length < PANEL_MIN_MODELS) {
+    throw new Error(
+      `Panel braucht mindestens ${PANEL_MIN_MODELS} unterschiedliche Modelle, erhalten: ${deduped.length}.`,
+    );
+  }
+  if (deduped.length > PANEL_MAX_MODELS) {
+    throw new Error(
+      `Panel erlaubt höchstens ${PANEL_MAX_MODELS} Modelle, erhalten: ${deduped.length}.`,
+    );
+  }
+  const known = new Set(knownModelIds.map((id) => id.toLowerCase()));
+  const unknown = deduped.filter((model) => !known.has(model.toLowerCase()));
+  if (unknown.length > 0) {
+    throw new Error(
+      `Unbekannte Modell-ID(s): ${unknown.join(", ")}. Prüfe die Schreibweise mit /models <suche>.`,
+    );
+  }
+  return deduped;
 }
 
 export function validateProvider(value: unknown): ProviderConfig {
@@ -509,6 +598,7 @@ function defaults(): OrcodeConfigWithBudget {
     fallbackModels: [],
     provider: { ...DEFAULT_PROVIDER },
     verify: { ...DEFAULT_VERIFY },
+    panelModels: [],
   };
 }
 

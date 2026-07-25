@@ -29,6 +29,7 @@ import {
   isBudgetAction,
   isCompressionMode,
   saveConfig,
+  validatePanelModelSelection,
   validateProvider,
   validateVerify,
   type BudgetConfig,
@@ -46,9 +47,25 @@ import type { CredentialStoreLike } from "./credentials.js";
 import {
   OpenRouterHttpError,
   OpenRouterService,
+  createPanelCall,
+  estimatePanelModelCostUsd,
+  modelCapabilities,
+  proposePanelModels,
   type BalanceReport,
   type KeyOrigin,
 } from "./openrouter.js";
+import {
+  PANEL_MIN_MODELS,
+  askPanel,
+  estimatePanelCost,
+  synthesize,
+  type PanelCall,
+  type PanelJudgment,
+  type PanelResult,
+} from "./panel.js";
+import { renderPanel } from "./ui/panel-view.js";
+import { renderLines } from "./ui/compose.js";
+import { createTheme } from "./ui/theme.js";
 import { rankChatMatches, SessionStore, workspaceSpend } from "./session.js";
 import { getGitDiff, runProcess, writeApprovalRequest } from "./workspace.js";
 import {
@@ -109,6 +126,20 @@ export interface CommandContext {
    * fake `sshRunner`.
    */
   sshAppHome?: string;
+  /**
+   * `/panel`'s last result in this session, so `/panel show <n>` can expand
+   * one answer without re-running the (paid) panel call. Optional — a
+   * session that never ran `/panel` simply never sets it.
+   */
+  lastPanelResult?: PanelResult;
+  /** The judge's synthesis for `lastPanelResult`, if `/panel judge` was on for that run. `null` when it ran but produced nothing usable. */
+  lastPanelJudgment?: PanelJudgment | null;
+  /**
+   * Injectable `PanelCall` for `/panel` — defaults to the real
+   * `createPanelCall(context.openRouter)`. Tests MUST override this; it is
+   * the only seam between `/panel` and an actual network call.
+   */
+  panelCall?: PanelCall;
 }
 
 /** Every command that persists `context.config` goes through this, never a bare `saveConfig(context.config)` — see `CommandContext.configPath`. */
@@ -209,6 +240,9 @@ export async function handleSlashCommand(
       context.out.text(
         "Spracheingabe ist in der Fullscreen-TUI verfügbar: /whisper.",
       );
+      return "continue";
+    case "panel":
+      await panelCommand(args, context);
       return "continue";
     case "cost":
     case "costs":
@@ -649,6 +683,216 @@ async function modelsCommand(args: string[], context: CommandContext): Promise<v
   }
   if (models.length > 30) {
     context.out.text(chalk.dim(`${models.length - 30} weitere; Suche mit /models <begriff> eingrenzen.`));
+  }
+}
+
+// ---------------------------------------------------------------------------
+// /panel — model panel: ask several models the same question in parallel and
+// compare the answers. Core orchestration is `askPanel`/`synthesize` in
+// panel.ts; this is just the interactive shell around it (proposal, cost
+// preview, confirmation, rendering).
+// ---------------------------------------------------------------------------
+
+/**
+ * `/panel <frage>` reuses the main-agent per-run cost limit
+ * (`config.maxCostUsd`) as the panel's own budget guard rather than adding a
+ * second, separately-configured limit — one number the user already knows
+ * about, applied to "this one panel call" the same way it already applies to
+ * "this one agent run".
+ */
+async function panelCommand(args: string[], context: CommandContext): Promise<void> {
+  const sub = (args[0] ?? "").toLowerCase();
+  if (sub === "models") {
+    await panelModelsCommand(args.slice(1), context);
+    return;
+  }
+  if (sub === "judge") {
+    await panelJudgeCommand(args.slice(1), context);
+    return;
+  }
+  if (sub === "show") {
+    panelShowCommand(args.slice(1), context);
+    return;
+  }
+  // Anything else — including empty input — is treated as the question, the
+  // same fallback `/verify` already uses for its literal-command case: a
+  // small, fixed set of reserved words up front, free text after that.
+  const question = args.join(" ").trim();
+  if (!question) {
+    printPanelStatus(context);
+    return;
+  }
+  await panelAskCommand(question, context);
+}
+
+function printPanelStatus(context: CommandContext): void {
+  const models = context.config.panelModels;
+  context.out.text(
+    models.length
+      ? `Panel-Modelle: ${models.join(", ")}`
+      : "Panel-Modelle: keine konfiguriert — /panel <frage> schlägt welche aus dem Katalog vor.",
+  );
+  context.out.text(`Panel-Richter: ${context.config.panelJudge ? "an" : "aus"}`);
+  context.out.text(
+    chalk.dim(
+      "Verwendung: /panel <frage> · /panel models <a>,<b>,… · /panel judge on|off · /panel show <n>",
+    ),
+  );
+}
+
+async function panelModelsCommand(args: string[], context: CommandContext): Promise<void> {
+  const raw = args.join(" ").trim();
+  if (!raw) {
+    context.out.text(
+      context.config.panelModels.length
+        ? `Panel-Modelle: ${context.config.panelModels.join(", ")}`
+        : "Keine Panel-Modelle konfiguriert.",
+    );
+    return;
+  }
+  const candidates = raw
+    .split(",")
+    .map((entry) => entry.trim())
+    .filter(Boolean);
+  const catalog = await context.openRouter.loadModels();
+  const knownIds = catalog.flatMap((entry) =>
+    entry.canonicalSlug ? [entry.id, entry.canonicalSlug] : [entry.id],
+  );
+  const selection = validatePanelModelSelection(candidates, knownIds);
+  context.config.panelModels = selection;
+  await saveContextConfig(context);
+  context.out.text(chalk.green(`Panel-Modelle: ${selection.join(", ")}`));
+}
+
+async function panelJudgeCommand(args: string[], context: CommandContext): Promise<void> {
+  const value = (args[0] ?? "").toLowerCase();
+  if (!value) {
+    context.out.text(`Panel-Richter: ${context.config.panelJudge ? "an" : "aus"}`);
+    return;
+  }
+  if (value !== "on" && value !== "off") {
+    throw new Error("Verwendung: /panel judge on|off");
+  }
+  context.config.panelJudge = value === "on";
+  await saveContextConfig(context);
+  context.out.text(chalk.green(`Panel-Richter: ${context.config.panelJudge ? "an" : "aus"}`));
+}
+
+function panelShowCommand(args: string[], context: CommandContext): void {
+  const last = context.lastPanelResult;
+  if (!last) {
+    context.out.text("Noch kein Panel-Lauf in dieser Sitzung. Starte mit /panel <frage>.");
+    return;
+  }
+  const index = Number(args[0]);
+  if (!Number.isInteger(index) || index < 1 || index > last.answers.length) {
+    throw new Error(`Verwendung: /panel show <1-${last.answers.length}>`);
+  }
+  printPanelResult(context, last, context.lastPanelJudgment ?? null, index - 1);
+}
+
+async function panelAskCommand(question: string, context: CommandContext): Promise<void> {
+  let models = context.config.panelModels;
+  if (models.length < PANEL_MIN_MODELS) {
+    const catalog = await context.openRouter.listModels("", false);
+    const proposal = proposePanelModels(catalog, 3);
+    if (proposal.length < PANEL_MIN_MODELS) {
+      throw new Error(
+        "Nicht genug unterschiedliche Modelle im Katalog für einen Panel-Vorschlag gefunden. Setze sie manuell mit /panel models <a>,<b>,…",
+      );
+    }
+    models = proposal.map((model) => model.id);
+    context.out.text(
+      chalk.bold(
+        `Kein Panel konfiguriert — Vorschlag aus verschiedenen Anbietern: ${models.join(", ")}`,
+      ),
+    );
+    context.out.text(
+      chalk.dim(`Dauerhaft übernehmen: /panel models ${models.join(",")}`),
+    );
+  }
+
+  const catalog = await context.openRouter.loadModels();
+  const catalogById = new Map(catalog.map((model) => [model.id, model]));
+  const promptChars = question.length;
+  const estimateForModel = (model: string): number | null => {
+    const info = catalogById.get(model);
+    return info ? estimatePanelModelCostUsd(modelCapabilities(info), promptChars) : null;
+  };
+  const estimate = estimatePanelCost(models, estimateForModel);
+
+  context.out.text(
+    `${models.length} Modelle × geschätzt ≈ ${usd(estimate.totalUsd)} gesamt${
+      estimate.unknownCount > 0
+        ? ` (Preis für ${estimate.unknownCount} Modell(e) unbekannt, nicht eingerechnet)`
+        : ""
+    }.`,
+  );
+  for (const entry of estimate.perModelUsd) {
+    context.out.text(
+      `  ${entry.model.padEnd(40)} ${entry.usd === null ? "Preis unbekannt" : usd(entry.usd)}`,
+    );
+  }
+
+  const proceed = await confirm({
+    message: `${models.length} Modelle parallel befragen (≈ ${usd(estimate.totalUsd)})?`,
+    default: false,
+  });
+  if (!proceed) {
+    context.out.text("Panel abgebrochen.");
+    return;
+  }
+
+  const callModel = context.panelCall ?? createPanelCall(context.openRouter);
+  const result = await askPanel({
+    question,
+    models,
+    callModel,
+    maxCostUsd: context.config.maxCostUsd,
+    estimateCostUsd: estimateForModel,
+  });
+  // Counted as "main" spend so it counts toward the workspace budget
+  // (/budget) like every other model call — the session type has no
+  // dedicated "panel" cost category, and adding one is out of scope here.
+  context.session.addCost("main", result.totalCostUsd);
+  context.lastPanelResult = result;
+
+  let judgment: PanelJudgment | null = null;
+  if (context.config.panelJudge) {
+    try {
+      judgment = await synthesize({
+        question,
+        answers: result.answers,
+        judgeModel: context.config.mainModel,
+        callModel,
+      });
+      context.session.addCost("main", judgment.costUsd);
+    } catch (error) {
+      context.out.text(chalk.yellow(`Auswertung übersprungen: ${errorMessage(error)}`));
+    }
+  }
+  context.lastPanelJudgment = judgment;
+  await context.session.save();
+
+  printPanelResult(context, result, judgment, null);
+}
+
+function printPanelResult(
+  context: CommandContext,
+  result: PanelResult,
+  judgment: PanelJudgment | null,
+  expandedIndex: number | null,
+): void {
+  const theme = createTheme();
+  const width = Math.max(40, Math.min(process.stdout.columns || 100, 120));
+  const lines = renderPanel(result, width, theme, { expandedIndex, judgment });
+  for (const line of renderLines(lines, theme)) {
+    context.out.text(line);
+  }
+  if (expandedIndex === null && result.answers.length > 0) {
+    context.out.text(
+      chalk.dim(`Volle Antwort ansehen: /panel show <1-${result.answers.length}>`),
+    );
   }
 }
 

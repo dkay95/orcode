@@ -154,6 +154,13 @@ export type AgentRunEvent =
       type: "run-start";
       model: string;
       maxSteps: number;
+      /**
+       * The user's prompt for this run. Optional so older run logs (written
+       * before this field existed) still deserialize; a resume flow that
+       * cannot find it simply omits the "which task" line instead of
+       * guessing.
+       */
+      prompt?: string;
       timestamp: number;
     }
   | {
@@ -182,6 +189,18 @@ export type AgentRunEvent =
       type: "reasoning";
       model: string;
       step: number;
+      delta: string;
+      timestamp: number;
+    }
+  | {
+      /**
+       * A chunk of the final, visible answer (quick-reply markup already
+       * stripped) — the same text `onText` streams to the UI, mirrored here
+       * so the run log has a record of how much of the answer existed
+       * before an interrupted run (crash, kill) never got to persist it
+       * anywhere else.
+       */
+      type: "text";
       delta: string;
       timestamp: number;
     }

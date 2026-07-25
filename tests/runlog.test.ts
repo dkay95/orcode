@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readdir, stat } from "node:fs/promises";
+import { appendFile, mkdtemp, readdir, readFile, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -11,7 +11,13 @@ async function appHome(prefix: string): Promise<string> {
 }
 
 const SAMPLE_EVENTS: AgentRunEvent[] = [
-  { type: "run-start", model: "anthropic/example", maxSteps: 10, timestamp: 1 },
+  {
+    type: "run-start",
+    model: "anthropic/example",
+    maxSteps: 10,
+    prompt: "Bitte die Tests reparieren",
+    timestamp: 1,
+  },
   { type: "model-start", model: "anthropic/example", step: 1, timestamp: 2 },
   {
     type: "model-end",
@@ -26,6 +32,7 @@ const SAMPLE_EVENTS: AgentRunEvent[] = [
     timestamp: 3,
   },
   { type: "reasoning", model: "anthropic/example", step: 1, delta: "denke nach", timestamp: 4 },
+  { type: "text", delta: "Alles ", timestamp: 4.5 },
   {
     type: "tool-start",
     id: "t1",
@@ -161,4 +168,76 @@ test("RunLog.prune with 60 files keeps exactly the 50 most recent", async () => 
 test("RunLog.prune on a chat with no runs directory does nothing", async () => {
   const home = await appHome("prune-empty");
   await assert.doesNotReject(RunLog.prune(home, "no-such-chat", 50));
+});
+
+// --- resilience: a crash can leave a half-written last line ---------------
+
+test("RunLog.read skips a truncated (half-written) trailing line instead of throwing", async () => {
+  const home = await appHome("half-written");
+  const chatId = "chat-crash";
+  const runId = createRunId();
+
+  const log = await RunLog.open(home, chatId, runId);
+  log.write(SAMPLE_EVENTS[0]!);
+  log.write(SAMPLE_EVENTS[1]!);
+  await log.close();
+  // Simulate the process dying mid-`appendFile` of the next event: a
+  // syntactically broken JSON fragment with no trailing newline.
+  await appendFile(runLogPath(home, chatId, runId), '{"type":"model-end","step":1,"dur');
+
+  const read: AgentRunEvent[] = [];
+  await assert.doesNotReject(async () => {
+    for await (const event of RunLog.read(home, chatId, runId)) {
+      read.push(event);
+    }
+  });
+  assert.deepEqual(read, [SAMPLE_EVENTS[0], SAMPLE_EVENTS[1]]);
+});
+
+test("RunLog.read skips a line that parses as JSON but is not a plausible event", async () => {
+  const home = await appHome("garbage-json");
+  const chatId = "chat-garbage";
+  const runId = createRunId();
+
+  const log = await RunLog.open(home, chatId, runId);
+  log.write(SAMPLE_EVENTS[0]!);
+  await log.close();
+  await appendFile(
+    runLogPath(home, chatId, runId),
+    `${JSON.stringify({ not: "an event" })}\n${JSON.stringify(null)}\n${JSON.stringify(42)}\n`,
+  );
+
+  const read: AgentRunEvent[] = [];
+  for await (const event of RunLog.read(home, chatId, runId)) {
+    read.push(event);
+  }
+  assert.deepEqual(read, [SAMPLE_EVENTS[0]]);
+});
+
+test("RunLog.appendRunEvent appends to an already-closed log without a live RunLog instance", async () => {
+  const home = await appHome("append");
+  const chatId = "chat-append";
+  const runId = createRunId();
+
+  const log = await RunLog.open(home, chatId, runId);
+  log.write(SAMPLE_EVENTS[0]!);
+  await log.close();
+
+  const runEnd: AgentRunEvent = {
+    type: "run-end",
+    outcome: "cancelled",
+    durationMs: 0,
+    toolCount: 0,
+    timestamp: 99,
+  };
+  await RunLog.appendRunEvent(home, chatId, runId, runEnd);
+
+  const read: AgentRunEvent[] = [];
+  for await (const event of RunLog.read(home, chatId, runId)) {
+    read.push(event);
+  }
+  assert.deepEqual(read, [SAMPLE_EVENTS[0], runEnd]);
+
+  const raw = await readFile(runLogPath(home, chatId, runId), "utf8");
+  assert.equal(raw.split("\n").filter(Boolean).length, 2);
 });

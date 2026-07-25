@@ -55,6 +55,19 @@ test("parseArgs rejects combining --new with --continue", () => {
   );
 });
 
+test("parseArgs accepts --resume and --no-resume independently", () => {
+  assert.equal(parseArgs(["--resume"]).resume, true);
+  assert.equal(parseArgs(["--resume"]).noResume, false);
+  assert.equal(parseArgs(["--no-resume"]).noResume, true);
+  assert.equal(parseArgs(["--no-resume"]).resume, false);
+  assert.equal(parseArgs([]).resume, false);
+  assert.equal(parseArgs([]).noResume, false);
+});
+
+test("parseArgs rejects combining --resume with --no-resume", () => {
+  assert.throws(() => parseArgs(["--resume", "--no-resume"]), CliUsageError);
+});
+
 test("runOutcomeExitCode maps the documented five codes (K8)", () => {
   assert.equal(runOutcomeExitCode("completed"), 0);
   assert.equal(runOutcomeExitCode("error"), 1);

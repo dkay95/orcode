@@ -10,6 +10,7 @@ import {
 import {
   RETRY_POLICY,
   SDK_RECONNECT_POLICY,
+  SDK_RETRY_CODES,
   SdkReconnectMonitor,
   abortError,
   fetchWithReconnect,
@@ -20,6 +21,7 @@ import {
   type FetchLike,
   type RetryClock,
 } from "./reconnect.js";
+import type { PanelCall } from "./panel.js";
 import { errorMessage, isRecord } from "./utils.js";
 
 const API_BASE = "https://openrouter.ai/api/v1";
@@ -1179,6 +1181,133 @@ export interface WebSearchPluginField {
 
 export function webSearchPlugin(maxResults = 5): WebSearchPluginField {
   return { id: "web", maxResults };
+}
+
+// --------------------------------------------------------------------------
+// Model panel — real wiring for `panel.ts`'s `PanelCall`, plus the model
+// selection and cost-estimate helpers `/panel` (commands.ts) needs to show
+// "n models cost n times" before anything runs.
+// --------------------------------------------------------------------------
+
+const PANEL_INSTRUCTIONS =
+  "You are one independent participant in orcode's model panel: several models answer the same question in parallel so a developer can compare perspectives. Answer directly and completely from your own reasoning. You have no tools and cannot read, run, or modify anything — never claim to have done so. If the question depends on project files or state you cannot see, say what you would need instead of guessing.";
+
+/**
+ * Real `PanelCall`: one plain, tool-less `client.callModel()` per invocation,
+ * mirroring the compressor's one-shot call in `compressor.ts`. Deliberately
+ * does not pass `tools` — the panel's "no side effects" guarantee has to hold
+ * here, not just in `askPanel`'s contract.
+ */
+export function createPanelCall(service: OpenRouterService): PanelCall {
+  return async ({ model, question, context, signal }) => {
+    try {
+      const client = service.client();
+      let observedCost = 0;
+      let inputTokens = 0;
+      let outputTokens = 0;
+      const result = client.callModel(
+        {
+          model,
+          instructions: PANEL_INSTRUCTIONS,
+          input: context ? `${context}\n\n---\n\n${question}` : question,
+          hooks: {
+            PostModelCall: [
+              {
+                handler: ({ usage }) => {
+                  observedCost += usage?.cost ?? 0;
+                  if (usage?.inputTokens) inputTokens = usage.inputTokens;
+                  if (usage?.outputTokens) outputTokens = usage.outputTokens;
+                },
+              },
+            ],
+          },
+        },
+        {
+          ...(signal ? { signal } : {}),
+          retryCodes: [...SDK_RETRY_CODES],
+        },
+      );
+      const text = (await result.getText()).trim();
+      const response = await result.getResponse();
+      return {
+        text,
+        costUsd: observedCost || response.usage?.cost || 0,
+        inputTokens: inputTokens || response.usage?.inputTokens || 0,
+        outputTokens: outputTokens || response.usage?.outputTokens || 0,
+      };
+    } catch (error) {
+      // Same redaction/translation every other OpenRouter call gets — a
+      // panel error column is exactly the kind of place a raw key leak would
+      // otherwise end up.
+      throw new Error(service.safeMessage(error));
+    }
+  };
+}
+
+/** Rough tokens-per-character ratio for upfront panel cost estimates — same heuristic as the compressor's. */
+const PANEL_CHARS_PER_TOKEN = 4;
+/** Assumed output budget per panel answer, used only for the upfront estimate. */
+export const PANEL_ESTIMATE_OUTPUT_TOKENS = 1_500;
+
+/**
+ * Upfront per-model cost estimate for a panel call: `promptChars` (the
+ * question, plus any context) at ~4 chars/token, plus a fixed output-token
+ * allowance. `null` when the model's pricing is dynamic (`variablePricing`)
+ * and therefore unknowable ahead of the call — callers must treat that as
+ * "unknown", never as free (see `estimatePanelCost` in `panel.ts`).
+ */
+export function estimatePanelModelCostUsd(
+  capabilities: ModelCapabilities,
+  promptChars: number,
+): number | null {
+  if (capabilities.variablePricing) {
+    return null;
+  }
+  const inputTokens = Math.ceil(Math.max(0, promptChars) / PANEL_CHARS_PER_TOKEN);
+  return (
+    (inputTokens / 1_000_000) * capabilities.promptPricePerMillion +
+    (PANEL_ESTIMATE_OUTPUT_TOKENS / 1_000_000) * capabilities.completionPricePerMillion
+  );
+}
+
+/**
+ * Default model proposal for `/panel` when nothing is configured yet: the
+ * best-ranked model (by Artificial Analysis intelligence index, falling back
+ * to id order) from each of `count` distinct provider families — "anthropic",
+ * "openai", "google", … (the `id` prefix before the first `/`). Skips models
+ * with dynamic (`variablePricing`) pricing and free models, since neither
+ * gives a meaningful cost estimate or a fair comparison of a paid tier.
+ */
+export function proposePanelModels(
+  models: readonly ModelInfo[],
+  count = 3,
+): ModelInfo[] {
+  const candidates = models.filter((model) => {
+    const capabilities = modelCapabilities(model);
+    return !capabilities.variablePricing && !capabilities.free;
+  });
+  const ranked = [...candidates].sort((left, right) => {
+    const byIntelligence = (right.intelligenceIndex ?? -1) - (left.intelligenceIndex ?? -1);
+    return byIntelligence !== 0 ? byIntelligence : left.id.localeCompare(right.id);
+  });
+  const seenFamilies = new Set<string>();
+  const proposal: ModelInfo[] = [];
+  for (const model of ranked) {
+    const family = providerFamily(model.id);
+    if (seenFamilies.has(family)) {
+      continue;
+    }
+    seenFamilies.add(family);
+    proposal.push(model);
+    if (proposal.length >= count) {
+      break;
+    }
+  }
+  return proposal;
+}
+
+function providerFamily(modelId: string): string {
+  return modelId.split("/")[0] ?? modelId;
 }
 
 function operationFromPath(path: string): string {

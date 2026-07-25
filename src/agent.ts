@@ -1,5 +1,4 @@
 import { readFile } from "node:fs/promises";
-import { randomUUID } from "node:crypto";
 import { join } from "node:path";
 import chalk from "chalk";
 import { maxCost, stepCountIs } from "@openrouter/agent";
@@ -21,6 +20,7 @@ import {
 } from "./compressor.js";
 import { ConversationStore } from "./conversation.js";
 import { OpenRouterService } from "./openrouter.js";
+import { createRunId, RunLog } from "./runlog.js";
 import { SessionStore, workspaceSpend } from "./session.js";
 import type {
   AgentRunEvent,
@@ -213,10 +213,24 @@ export class OrcodeAgent {
     // A rejection budget is per run, not per process: without this every later
     // run would inherit the locks of the previous one.
     this.approvals.beginRun();
-    observer.onEvent?.({
+    // Same id for the run log (`~/.orcode/runs/<chat>/<runId>.ndjson`) and the
+    // change journal's checkpoint file (`~/.orcode/checkpoints/<chat>/<runId>.json`)
+    // — resume.ts correlates the two by this id after a crash.
+    const runId = createRunId();
+    const runLog = await this.#openRunLog(runId);
+    // Every event this run produces goes through here: to the caller's
+    // observer exactly as before, and — best effort, never fatal to the run
+    // itself — appended to the run log so an interrupted run leaves a
+    // reconstructable trail even if the process never reaches `finally`.
+    const emit = (event: AgentRunEvent): void => {
+      runLog?.write(event);
+      observer.onEvent?.(event);
+    };
+    emit({
       type: "run-start",
       model: this.config.mainModel,
       maxSteps: this.config.maxSteps,
+      prompt,
       timestamp: startedAt,
     });
     const stopListening = this.openRouter.onConnectionEvent((event) => {
@@ -229,13 +243,14 @@ export class OrcodeAgent {
     try {
       const result = await this.#run(
         prompt,
-        observer,
+        { ...observer, onEvent: emit },
         (count) => {
           toolCount = count;
         },
         attachments,
+        runId,
       );
-      observer.onEvent?.({
+      emit({
         type: "run-end",
         outcome:
           result.outcome === "completed" ? "complete" : result.outcome,
@@ -249,7 +264,7 @@ export class OrcodeAgent {
         error instanceof AgentRunError
           ? error.outcome === "cancelled"
           : Boolean(observer.signal?.aborted);
-      observer.onEvent?.({
+      emit({
         type: "run-end",
         outcome: cancelled ? "cancelled" : "error",
         durationMs: Date.now() - startedAt,
@@ -259,6 +274,27 @@ export class OrcodeAgent {
       throw error;
     } finally {
       stopListening();
+      await this.#closeRunLog(runLog);
+    }
+  }
+
+  /** Best effort: a run log that cannot be opened (disk full, permissions) must never block the run it would have recorded. */
+  async #openRunLog(runId: string): Promise<RunLog | null> {
+    try {
+      return await RunLog.open(this.#session.appHome, this.#session.data.id, runId);
+    } catch {
+      return null;
+    }
+  }
+
+  async #closeRunLog(runLog: RunLog | null): Promise<void> {
+    if (!runLog) {
+      return;
+    }
+    try {
+      await runLog.close();
+    } catch {
+      // Diagnostic trail only — never surfaces as a run failure.
     }
   }
 
@@ -267,6 +303,7 @@ export class OrcodeAgent {
     observer: AgentRunObserver,
     updateToolCount: (count: number) => void,
     attachments: readonly ImageAttachment[],
+    runId: string,
   ): Promise<AgentRunResult> {
     throwIfAborted(observer.signal);
     validateImageAttachmentSet(attachments);
@@ -333,10 +370,9 @@ export class OrcodeAgent {
     );
     // The signal has to reach the tools, otherwise Esc/Ctrl+C leaves a running
     // shell command behind.
-    // K3/A5: one runId per agent run, so every tool call within this run
-    // shares the same undo unit instead of createCodingTools minting a new
-    // one per call.
-    const runId = randomUUID();
+    // K3/A5: one runId per agent run (now handed in by `run()`, shared with
+    // the run log), so every tool call within this run shares the same undo
+    // unit instead of createCodingTools minting a new one per call.
     const tools = createCodingTools(this.guard, this.approvals, this.journal, {
       ...(observer.signal ? { signal: observer.signal } : {}),
       registry: this.#readRegistry,
@@ -615,6 +651,10 @@ export class OrcodeAgent {
       if (!visible) {
         return;
       }
+      // Mirrored into the run log (via `observer.onEvent`) so an interrupted
+      // run leaves a record of how much of the answer already existed — the
+      // only place that survives a crash, since `onText` itself never does.
+      observer.onEvent?.({ type: "text", delta: visible, timestamp: Date.now() });
       if (observer.onText) {
         observer.onText(visible, answer.visibleText);
       } else {

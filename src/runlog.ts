@@ -1,12 +1,12 @@
 import { randomBytes } from "node:crypto";
-import { open, readdir, rm } from "node:fs/promises";
+import { appendFile, open, readdir, rm } from "node:fs/promises";
 import type { FileHandle } from "node:fs/promises";
 import { createInterface } from "node:readline";
 import { createReadStream } from "node:fs";
 import { join } from "node:path";
 import { APP_HOME, ensureSecureDirectory, SECURE_FILE_MODE } from "./config.js";
 import type { AgentRunEvent } from "./types.js";
-import { hasCode } from "./utils.js";
+import { hasCode, isRecord } from "./utils.js";
 
 export const DEFAULT_KEEP_RUNS = 50;
 
@@ -85,6 +85,13 @@ export class RunLog {
     }
   }
 
+  /**
+   * A line that fails to parse, or parses but is not a plausible
+   * `AgentRunEvent` (missing `type`), is skipped rather than raised — the
+   * last line of a log a process died mid-write to is exactly this kind of
+   * half-written garbage, and a resume flow reading it must not itself
+   * crash on the very evidence it is trying to recover.
+   */
   static async *read(
     appHome: string,
     chatId: string,
@@ -99,12 +106,41 @@ export class RunLog {
         if (trimmed.length === 0) {
           continue;
         }
-        yield JSON.parse(trimmed) as AgentRunEvent;
+        let parsed: unknown;
+        try {
+          parsed = JSON.parse(trimmed);
+        } catch {
+          continue;
+        }
+        if (isRecord(parsed) && typeof parsed.type === "string") {
+          yield parsed as AgentRunEvent;
+        }
       }
     } finally {
       lines.close();
       stream.close();
     }
+  }
+
+  /**
+   * Appends one event to an existing run log without needing a live
+   * `RunLog` instance (`open()` uses `wx` and refuses to touch a file that
+   * already exists). Used to close out a run whose own process never
+   * reached its `run-end` write — e.g. marking an interrupted run as
+   * reviewed once the user has decided what to do with it, so it is not
+   * reported as interrupted again on the next start.
+   */
+  static async appendRunEvent(
+    appHome: string,
+    chatId: string,
+    runId: string,
+    event: AgentRunEvent,
+  ): Promise<void> {
+    const path = runLogPath(appHome, chatId, runId);
+    await appendFile(path, `${JSON.stringify(event)}\n`, {
+      encoding: "utf8",
+      mode: SECURE_FILE_MODE,
+    });
   }
 
   /** Deletes every run log for `chatId` except the `keep` most recent. */

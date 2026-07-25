@@ -25,7 +25,7 @@ import { ReadRegistry, sha256Hex } from "./read-registry.js";
 import { findSshHost, loadSshHosts, type SshHost } from "./ssh-config.js";
 import { execSshCommand, type RunSsh } from "./ssh.js";
 import type { ToolRisk } from "./types.js";
-import { hasCode, truncate } from "./utils.js";
+import { hasCode, isRecord, truncate } from "./utils.js";
 
 const MAX_FILE_BYTES = 1_500_000;
 const MAX_TOOL_OUTPUT = 80_000;
@@ -42,7 +42,8 @@ const DIFF_LCS_BUDGET = 2_000_000;
 /** Directories that never contain search hits worth showing. */
 const SEARCH_IGNORES = ["**/.git/**", "**/node_modules/**"] as const;
 
-interface ChangeEntry {
+/** Exported so a fresh process (resume after a crash) can validate and load a persisted run's entries without duplicating this shape. */
+export interface ChangeEntry {
   path: string;
   before: string | null;
   after: string;
@@ -56,6 +57,22 @@ export interface ChangeJournalOptions {
   appHome?: string;
   /** Chat this journal belongs to. Checkpoints are namespaced per chat. */
   chatId?: string;
+}
+
+/** Where one run's checkpoint entries live. Shared so a fresh process can find the same file `ChangeJournal` itself would write to. */
+export function checkpointRunPath(appHome: string, chatId: string, runId: string): string {
+  return join(appHome, "checkpoints", chatId, `${runId}.json`);
+}
+
+function isChangeEntry(value: unknown): value is ChangeEntry {
+  return (
+    isRecord(value) &&
+    typeof value.path === "string" &&
+    (value.before === null || typeof value.before === "string") &&
+    typeof value.after === "string" &&
+    typeof value.createdAt === "string" &&
+    typeof value.runId === "string"
+  );
 }
 
 export interface UndoRunOutcome {
@@ -91,12 +108,58 @@ export class ChangeJournal {
   }
 
   #runFile(runId: string): string {
-    return join(this.#appHome, "checkpoints", this.#chatId, `${runId}.json`);
+    return checkpointRunPath(this.#appHome, this.#chatId, runId);
   }
 
   async #persistRun(runId: string): Promise<void> {
     const entries = this.#entries.filter((entry) => entry.runId === runId);
     await writeFileAtomicSecure(this.#runFile(runId), JSON.stringify(entries));
+  }
+
+  /**
+   * Loads one run's persisted checkpoint entries from disk into memory, so
+   * `undoLastRun`/`undoLast` can act on a run recorded by a *previous*
+   * process (e.g. one that crashed) instead of only entries this instance
+   * itself recorded. Meant to be called on a freshly constructed, still
+   * empty journal, right before `undoLastRun` — that is what makes the
+   * hydrated run the one `undoLastRun` picks via `#entries.at(-1)`.
+   *
+   * Returns the entries that were loaded; empty when the checkpoint file is
+   * missing, unreadable, or does not parse into a plausible entry list —
+   * never throws on any of that, since a resume flow reading crash evidence
+   * must not itself crash on it.
+   */
+  async hydrateRun(runId: string): Promise<ChangeEntry[]> {
+    let raw: string;
+    try {
+      raw = await readFile(this.#runFile(runId), "utf8");
+    } catch {
+      return [];
+    }
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      return [];
+    }
+    if (!Array.isArray(parsed)) {
+      return [];
+    }
+    const valid = parsed.filter(isChangeEntry).filter((entry) => entry.runId === runId);
+    if (valid.length === 0) {
+      return [];
+    }
+    const known = new Set(
+      this.#entries.map((entry) => `${entry.runId}|${entry.path}|${entry.createdAt}`),
+    );
+    for (const entry of valid) {
+      const key = `${entry.runId}|${entry.path}|${entry.createdAt}`;
+      if (!known.has(key)) {
+        this.#entries.push(entry);
+        known.add(key);
+      }
+    }
+    return valid;
   }
 
   /**
