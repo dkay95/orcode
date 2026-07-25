@@ -1,18 +1,45 @@
 {
-  "name": "routercode",
+  "name": "orcode",
   "version": "0.3.0",
-  "description": "A local, approval-aware coding agent CLI powered by OpenRouter.",
+  "description": "A local, terminal-based coding agent CLI that runs against any tool-capable model on OpenRouter, with per-workspace cost tracking, explicit approval modes, and a separate compressor model for long context.",
+  "keywords": [
+    "openrouter",
+    "cli",
+    "coding-agent",
+    "ai-agent",
+    "llm",
+    "terminal",
+    "tui",
+    "developer-tools"
+  ],
+  "homepage": "https://github.com/dkay95/orcode#readme",
+  "bugs": {
+    "url": "https://github.com/dkay95/orcode/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/dkay95/orcode.git"
+  },
+  "license": "Apache-2.0",
+  "author": "Dogancan Kaya <dogancan.kaya424@gmail.com>",
   "type": "module",
   "bin": {
-    "routercode": "./dist/cli.js"
+    "orcode": "./dist/cli.js"
   },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE",
+    "NOTICE"
+  ],
   "scripts": {
     "build": "tsc -p tsconfig.json && node -e \"require('node:fs').chmodSync('dist/cli.js', 0o755)\"",
     "dev": "tsx src/cli.ts",
     "start": "node dist/cli.js",
     "test": "node --import tsx --test tests/*.test.ts",
     "check": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.tests.json --noEmit && npm test",
-    "install:user": "npm run build && node scripts/install-user.mjs"
+    "install:user": "npm run build && node scripts/install-user.mjs",
+    "prepublishOnly": "npm run check && npm run build"
   },
   "engines": {
     "node": ">=22"

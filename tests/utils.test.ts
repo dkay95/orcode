@@ -35,15 +35,20 @@ test("errorMessage extrahiert Nachrichten aus beliebigen Werten", () => {
 test("truncate lässt kurze Texte unverändert", () => {
   assert.equal(truncate("kurz", 10), "kurz");
   assert.equal(truncate("genau zehn!", 11), "genau zehn!");
+  assert.equal(truncate("", 0), "");
 });
 
 test("truncate kürzt lange Texte mit Hinweiszeile", () => {
   const long = "x".repeat(100);
   assert.equal(truncate(long, 10), `${"x".repeat(10)}\n… gekürzt …`);
+  assert.equal(truncate("abc", 0), "\n… gekürzt …");
 });
 
 test("formatUsd formatiert Beträge mit adaptiver Genauigkeit", () => {
   assert.equal(formatUsd(1.23456), "$1.235");
   assert.equal(formatUsd(0.001), "$0.00100");
   assert.equal(formatUsd(0), "$0.00000");
+  assert.equal(formatUsd(0.01), "$0.010");
+  assert.equal(formatUsd(-0.5), "$-0.500");
+  assert.equal(formatUsd(-0.001), "$-0.00100");
 });

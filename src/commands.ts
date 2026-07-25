@@ -1,8 +1,11 @@
 import { confirm, password, search } from "@inquirer/prompts";
 import { readFile, writeFile } from "node:fs/promises";
-import { join } from "node:path";
 import chalk from "chalk";
-import { RouterCodeAgent, assertSpendAvailable } from "./agent.js";
+import {
+  SpendUnavailableError,
+  assertSpendAvailable,
+  type OrcodeAgent,
+} from "./agent.js";
 import { SLASH_COMMANDS } from "./command-catalog.js";
 import {
   APPROVAL_MODES,
@@ -13,34 +16,119 @@ import {
   type ModelInfo,
   type ReasoningEffort,
   type ReasoningSetting,
-  type RouterCodeConfig,
+  type OrcodeConfig,
 } from "./types.js";
-import { CONFIG_PATH, isApprovalMode, isCompressionMode, saveConfig } from "./config.js";
+import {
+  CONFIG_PATH,
+  DATA_COLLECTIONS,
+  PROVIDER_SORTS,
+  VERIFY_MAX_ROUNDS,
+  VERIFY_MODES,
+  WEB_MODES,
+  isApprovalMode,
+  isBudgetAction,
+  isCompressionMode,
+  saveConfig,
+  validateProvider,
+  validateVerify,
+  type BudgetConfig,
+  type DataCollectionPreference,
+  type ProviderSortPreference,
+  type OrcodeConfigWithBudget,
+  type VerifyMode,
+  type WebMode,
+} from "./config.js";
 import { approvalDescription, ApprovalManager } from "./approval.js";
+import { RuleStore } from "./rules.js";
+import { loadSshHosts } from "./ssh-config.js";
+import { checkHost, closeSshControl, createSshSession, type RunSsh, type SshSession } from "./ssh.js";
 import type { CredentialStoreLike } from "./credentials.js";
 import {
   OpenRouterHttpError,
   OpenRouterService,
+  type BalanceReport,
   type KeyOrigin,
 } from "./openrouter.js";
-import { rankChatMatches, SessionStore } from "./session.js";
-import { getGitDiff } from "./workspace.js";
+import { rankChatMatches, SessionStore, workspaceSpend } from "./session.js";
+import { getGitDiff, runProcess, writeApprovalRequest } from "./workspace.js";
 import {
   getReasoningSetting,
   reasoningLabel,
   setReasoningSetting,
   validateReasoningSetting,
 } from "./reasoning.js";
+import { suggestVerifyCommands } from "./verify.js";
 import { errorMessage, hasCode, truncate } from "./utils.js";
 
+/** Sink for command output — replaces the direct `console.log`/`console.error` calls. */
+export interface CommandOutput {
+  text(value: string): void;
+  error(value: string, hint?: string): void;
+}
+
 export interface CommandContext {
-  config: RouterCodeConfig;
+  config: OrcodeConfigWithBudget;
   approvals: ApprovalManager;
   openRouter: OpenRouterService;
   session: SessionStore;
-  agent: RouterCodeAgent;
+  agent: OrcodeAgent;
   workspace: string;
   credentials: CredentialStoreLike;
+  out: CommandOutput;
+  ruleStore: RuleStore;
+  /**
+   * Where `/model`, `/approval`, `/budget`, `/verify`, `/web`, `/provider`,
+   * `/fallback`, … persist `config`. Defaults to the real
+   * `~/.orcode/config.json` (`saveConfig`'s own default) when unset —
+   * tests MUST set this to a tmp path, or every config-mutating command in
+   * this file writes straight into the real user config.
+   */
+  configPath?: string;
+  /**
+   * `/ssh`'s remembered target: which host alias `ssh_command` should be
+   * used against. Optional so existing fixtures/tests that never touch SSH
+   * stay valid; `sshCommand` below creates one on first use if it is unset.
+   */
+  sshSession?: SshSession;
+  /**
+   * Test-only seam for `/ssh`, mirroring `configPath` above: unset means the
+   * real `~/.ssh/config`. Tests MUST set this to a tmp path — `/ssh` must
+   * never read the real file.
+   */
+  sshConfigPath?: string;
+  /**
+   * Test-only seam for `/ssh`: unset means the real `ssh` binary via
+   * `runProcess`. Tests MUST set this instead of ever spawning a real `ssh`.
+   */
+  sshRunner?: RunSsh;
+  /**
+   * Test-only seam for `/ssh`: where the `ControlMaster` socket directory
+   * lives. Unset means the real `~/.orcode/ssh` (`checkHost`'s/
+   * `closeSshControl`'s own default) — tests MUST set this to a tmp path,
+   * since `checkHost` creates this directory as a side effect even with a
+   * fake `sshRunner`.
+   */
+  sshAppHome?: string;
+}
+
+/** Every command that persists `context.config` goes through this, never a bare `saveConfig(context.config)` — see `CommandContext.configPath`. */
+function saveContextConfig(context: CommandContext): Promise<void> {
+  return saveConfig(context.config, context.configPath);
+}
+
+/** Writes straight to stdout/stderr — the `--plain` and non-TTY sink. */
+export function createPlainCommandOutput(): CommandOutput {
+  return {
+    text(value: string): void {
+      console.log(value);
+    },
+    error(value: string, hint?: string): void {
+      console.error(chalk.red(value));
+      if (hint) {
+        console.error(chalk.dim(hint));
+      }
+    },
+  };
 }
 
 export async function handleSlashCommand(
@@ -54,7 +142,7 @@ export async function handleSlashCommand(
     case "":
     case "help":
     case "?":
-      printHelp();
+      printHelp(context.out);
       return "continue";
     case "quit":
     case "exit":
@@ -68,12 +156,17 @@ export async function handleSlashCommand(
       return "continue";
     case "balance":
     case "credits":
-      await printBalance(await context.openRouter.checkBalance());
+      await printBalance(await context.openRouter.checkBalance(), context.out);
       return "continue";
-    case "reconnect":
-      await printBalance(await context.openRouter.reconnect());
-      console.log(chalk.green("OpenRouter-Verbindung ist wieder erreichbar."));
+    case "reconnect": {
+      const report = await context.openRouter.reconnect();
+      await printBalance(report, context.out);
+      for (const step of report.steps) {
+        context.out.text(chalk.dim(`· ${step}`));
+      }
+      context.out.text(chalk.green("OpenRouter-Verbindung ist wieder erreichbar."));
       return "continue";
+    }
     case "model":
       await modelCommand(args, context);
       return "continue";
@@ -105,9 +198,21 @@ export async function handleSlashCommand(
     case "compressor":
       await compressorCommand(args, context);
       return "continue";
+    case "image":
+    case "attach":
+      context.out.text(
+        "Bildanhänge sind in der Fullscreen-TUI verfügbar: /image oder /image <pfad>",
+      );
+      return "continue";
+    case "whisper":
+    case "voice":
+      context.out.text(
+        "Spracheingabe ist in der Fullscreen-TUI verfügbar: /whisper.",
+      );
+      return "continue";
     case "cost":
     case "costs":
-      printCosts(context.session);
+      printCosts(context.session, context.out);
       return "continue";
     case "max-cost":
       await maxCostCommand(args, context);
@@ -116,26 +221,56 @@ export async function handleSlashCommand(
       await stepsCommand(args, context);
       return "continue";
     case "history":
-      printHistory(context.session, args);
+      printHistory(context.session, args, context.out);
       return "continue";
     case "clear":
-      await clearSession(context.session);
+      await clearSession(context.session, context.agent, context.out);
       return "continue";
     case "diff":
-      console.log(await getGitDiff(context.workspace));
+      context.out.text(await getGitDiff(context.workspace));
       return "continue";
     case "undo":
-      console.log(await context.agent.journal.undoLast(context.agent.guard, context.approvals));
+      context.out.text(
+        await context.agent.journal.undoLast(context.agent.guard, context.approvals, {
+          dryRun: args.includes("--dry-run"),
+        }),
+      );
       return "continue";
     case "config":
-      console.log(chalk.bold(CONFIG_PATH));
-      console.log(JSON.stringify(context.config, null, 2));
+      context.out.text(chalk.bold(CONFIG_PATH));
+      context.out.text(JSON.stringify(context.config, null, 2));
+      return "continue";
+    case "export":
+      await exportCommand(args, context);
+      return "continue";
+    case "checkpoint":
+    case "checkpoints":
+      await checkpointCommand(args, context);
+      return "continue";
+    case "budget":
+      await budgetCommand(args, context);
+      return "continue";
+    case "verify":
+      await verifyCommand(args, context);
+      return "continue";
+    case "web":
+      await webCommand(args, context);
+      return "continue";
+    case "provider":
+      await providerCommand(args, context);
+      return "continue";
+    case "fallback":
+    case "fallbacks":
+      await fallbackCommand(args, context);
       return "continue";
     case "init":
       await initInstructions(context);
       return "continue";
+    case "ssh":
+      await sshCommand(args, context);
+      return "continue";
     default:
-      console.log(chalk.red(`Unbekannter Befehl: /${command}. Nutze /help.`));
+      context.out.error(`Unbekannter Befehl: /${command}.`, "Nutze /help.");
       return "continue";
   }
 }
@@ -143,11 +278,12 @@ export async function handleSlashCommand(
 export async function promptForValidKey(
   openRouter: OpenRouterService,
   credentials: CredentialStoreLike,
+  out: CommandOutput,
   fallback?: {
     key: string;
     origin: Exclude<KeyOrigin, "none">;
   },
-): Promise<BalanceInfo> {
+): Promise<BalanceReport> {
   let nextFallback = fallback;
   while (true) {
     if (openRouter.hasKey) {
@@ -161,10 +297,11 @@ export async function promptForValidKey(
             credentials,
             "inference",
             activeKey,
+            out,
           );
           if (saved) {
             openRouter.setKey(activeKey, "keychain");
-            console.log(
+            out.text(
               chalk.green(
                 `API-Key gültig und sicher im ${credentials.location} gespeichert.`,
               ),
@@ -183,7 +320,7 @@ export async function promptForValidKey(
           try {
             removedFromKeychain = await credentials.delete("inference");
           } catch (deleteError) {
-            console.log(
+            out.text(
               chalk.yellow(
                 `Der abgelehnte Key konnte nicht aus dem Schlüsselbund entfernt werden: ${
                   deleteError instanceof Error
@@ -199,14 +336,10 @@ export async function promptForValidKey(
             `${originLabel(origin)} wurde abgelehnt: ${message}. Setze einen gültigen Key.`,
           );
         }
-        console.log(
-          chalk.red(
-            `${originLabel(origin)} wurde abgelehnt${
-              removedFromKeychain
-                ? " und aus dem Schlüsselbund entfernt"
-                : ""
-            }: ${message}`,
-          ),
+        out.error(
+          `${originLabel(origin)} wurde abgelehnt${
+            removedFromKeychain ? " und aus dem Schlüsselbund entfernt" : ""
+          }: ${message}`,
         );
         if (
           nextFallback &&
@@ -236,9 +369,10 @@ export async function promptForValidKey(
         credentials,
         "inference",
         candidate,
+        out,
       );
       openRouter.setKey(candidate, saved ? "keychain" : "interactive");
-      console.log(
+      out.text(
         chalk.green(
           saved
             ? `API-Key gültig und sicher im ${credentials.location} gespeichert.`
@@ -247,89 +381,126 @@ export async function promptForValidKey(
       );
       return balance;
     } catch (error) {
-      console.log(chalk.red(temporary.safeMessage(error)));
+      out.error(temporary.safeMessage(error));
     }
   }
 }
 
 export async function printBalance(
   balance: Awaited<ReturnType<OpenRouterService["checkBalance"]>>,
+  out: CommandOutput,
 ): Promise<void> {
-  console.log(chalk.bold("OpenRouter-Status"));
-  console.log(`Key gültig: ${chalk.green("ja")}`);
-  console.log(`Tarif: ${balance.key.isFreeTier ? "Free Tier" : "bezahlt/individuell"}`);
+  out.text(chalk.bold("OpenRouter-Status"));
+  out.text(`Key gültig: ${chalk.green("ja")}`);
+  out.text(`Tarif: ${balance.key.isFreeTier ? "Free Tier" : "bezahlt/individuell"}`);
   if (balance.key.limit !== null && balance.key.limit !== undefined) {
-    console.log(
+    out.text(
       `Key-Limit: ${usd(balance.key.limit)} · verbleibend ${usd(balance.key.limitRemaining ?? 0)}`,
     );
   } else {
-    console.log(`Key-Nutzung: ${usd(balance.key.usage ?? 0)} · kein eigenes Key-Limit`);
+    out.text(`Key-Nutzung: ${usd(balance.key.usage ?? 0)} · kein eigenes Key-Limit`);
   }
   if (balance.credits) {
-    console.log(
+    out.text(
       `Kontoguthaben: ${usd(balance.credits.remaining)} verbleibend · ${usd(balance.credits.totalUsage)} genutzt`,
     );
+  } else if (balance.capabilities?.creditsSource === "none") {
+    // No failed request happened here — the round was skipped on purpose.
+    out.text(
+      chalk.yellow(
+        `Kontoguthaben unbekannt: ${balance.creditsUnavailableReason ?? balance.capabilities.summary}`,
+      ),
+    );
   } else if (balance.creditsUnavailableReason) {
-    console.log(chalk.yellow(balance.creditsUnavailableReason));
+    out.text(chalk.yellow(balance.creditsUnavailableReason));
+  }
+  if (balance.capabilities) {
+    out.text(chalk.dim(`Key-Fähigkeiten: ${balance.capabilities.summary}`));
   }
   if (balance.key.expiresAt) {
-    console.log(`Key läuft ab: ${balance.key.expiresAt}`);
+    out.text(`Key läuft ab: ${balance.key.expiresAt}`);
   }
 }
 
-function printHelp(): void {
-  console.log(`\n${chalk.bold("RouterCode Befehle")}`);
+function printHelp(out: CommandOutput): void {
+  out.text(`\n${chalk.bold("orcode Befehle")}`);
   const width = Math.max(...SLASH_COMMANDS.map((command) => command.usage.length));
   for (const command of SLASH_COMMANDS) {
-    console.log(`  ${command.usage.padEnd(width)}  ${command.description}`);
+    out.text(`  ${command.usage.padEnd(width)}  ${command.description}`);
   }
-  console.log();
+  out.text("");
 }
 
 function printStatus(context: CommandContext): void {
-  console.log(chalk.bold("RouterCode Status"));
-  console.log(`Workspace: ${context.workspace}`);
-  console.log(`Main-Modell: ${context.config.mainModel}`);
-  console.log(
+  context.out.text(chalk.bold("orcode Status"));
+  context.out.text(`Workspace: ${context.workspace}`);
+  context.out.text(`Main-Modell: ${context.config.mainModel}`);
+  context.out.text(
     `Thinking: ${reasoningLabel(getReasoningSetting(context.config))}`,
   );
-  console.log(
+  context.out.text(
     `Kompressor: ${context.config.compressionMode} · ${context.config.compressorModel} · Schwelle ${context.config.compressionThresholdChars} Zeichen`,
   );
-  console.log(
+  context.out.text(
     `Approval: ${context.approvals.mode} · ${approvalDescription(context.approvals.mode)}`,
   );
-  console.log(
+  context.out.text(
     `Grenzen: ${context.config.maxSteps} Tool-Schritte · ${usd(context.config.maxCostUsd)} Main · ${usd(context.config.compressorMaxCostUsd)} Kompressor`,
   );
-  console.log(
+  context.out.text(chalk.dim(compressorLimitNote(context.config.compressorModel)));
+  context.out.text(`Budget: ${budgetSummary(context.config.budget)}`);
+  context.out.text(
     `API-Key: ${keyStatusLabel(context.openRouter.keyOrigin, context.credentials.location)}`,
   );
-  console.log(
+  context.out.text(
     `Management-Key: ${keyStatusLabel(context.openRouter.managementKeyOrigin, context.credentials.location)}`,
   );
-  printCosts(context.session);
+  printCosts(context.session, context.out);
+}
+
+/**
+ * The compressor limit is enforced before the call — but only when a price for
+ * the model is known. A dynamic route has no price, so the limit can only be
+ * checked afterwards; saying otherwise would be a promise we cannot keep.
+ */
+function compressorLimitNote(compressorModel: string): string {
+  return compressorModel.startsWith("openrouter/")
+    ? `Für ${compressorModel} liegt kein fester Preis vor: das Kompressorlimit kann erst nach dem Aufruf kontrolliert werden.`
+    : "Das Kompressorlimit wird vor dem Aufruf geprüft, sofern OpenRouter einen Preis für das Modell meldet.";
+}
+
+function budgetSummary(budget: BudgetConfig): string {
+  const parts = [
+    budget.dailyLimitUsd === null
+      ? "kein Tageslimit"
+      : `Tag ${usd(budget.dailyLimitUsd)}`,
+    budget.totalLimitUsd === null
+      ? "kein Gesamtlimit"
+      : `Gesamt ${usd(budget.totalLimitUsd)}`,
+  ];
+  const action = budget.onExceed === "block" ? "blockiert" : "warnt";
+  return `${parts.join(" · ")} · bei Überschreitung ${action}`;
 }
 
 async function keyCommand(args: string[], context: CommandContext): Promise<void> {
   const action = (args[0] ?? "status").toLowerCase();
   if (action === "status") {
     const stored = await context.credentials.has("inference");
-    console.log(`Aktiver API-Key: ${keyStatusLabel(context.openRouter.keyOrigin, context.credentials.location)}`);
-    console.log(
+    context.out.text(`Aktiver API-Key: ${keyStatusLabel(context.openRouter.keyOrigin, context.credentials.location)}`);
+    context.out.text(
       `Gespeicherter API-Key: ${
         stored ? `ja, im ${context.credentials.location}` : "nein"
       }`,
     );
     if (context.openRouter.hasKey) {
-      await printBalance(await context.openRouter.checkBalance());
+      await printBalance(await context.openRouter.checkBalance(), context.out);
     }
     return;
   }
   if (action === "forget") {
     const removed = await context.credentials.delete("inference");
     context.openRouter.forgetKey();
-    console.log(
+    context.out.text(
       removed
         ? `API-Key aus Prozessspeicher und ${context.credentials.location} entfernt.`
         : "API-Key aus dem Prozessspeicher entfernt; im Schlüsselbund war keiner gespeichert.",
@@ -343,24 +514,24 @@ async function keyCommand(args: string[], context: CommandContext): Promise<void
       validate: (value) => value.trim().length >= 20 || "Der Key ist zu kurz.",
     });
     const balance = await validateAndStoreInferenceKey(candidate, context);
-    console.log(
+    context.out.text(
       chalk.green(
         `Neuer Key ist gültig und im ${context.credentials.location} gespeichert.`,
       ),
     );
-    await printBalance(balance);
+    await printBalance(balance, context.out);
     return;
   }
   if (action === "management") {
     const managementAction = (args[1] ?? "status").toLowerCase();
     if (managementAction === "status") {
       const stored = await context.credentials.has("management");
-      console.log(
+      context.out.text(
         context.openRouter.hasManagementKey
           ? `Management-Key aktiv: ${keyStatusLabel(context.openRouter.managementKeyOrigin, context.credentials.location)}.`
           : "Kein Management-Key aktiv; /balance prüft nur das Limit des Inference-Keys.",
       );
-      console.log(
+      context.out.text(
         `Gespeicherter Management-Key: ${
           stored ? `ja, im ${context.credentials.location}` : "nein"
         }`,
@@ -370,7 +541,7 @@ async function keyCommand(args: string[], context: CommandContext): Promise<void
     if (managementAction === "forget") {
       await context.credentials.delete("management");
       context.openRouter.forgetManagementKey();
-      console.log(
+      context.out.text(
         `Management-Key aus Prozessspeicher und ${context.credentials.location} entfernt.`,
       );
       return;
@@ -382,17 +553,17 @@ async function keyCommand(args: string[], context: CommandContext): Promise<void
         validate: (value) => value.trim().length >= 20 || "Der Key ist zu kurz.",
       });
       const credits = await validateAndStoreManagementKey(candidate, context);
-      console.log(
+      context.out.text(
         chalk.green(
           `Management-Key gültig und im ${context.credentials.location} gespeichert. Kontoguthaben: ${usd(credits.remaining)} verbleibend.`,
         ),
       );
       return;
     }
-    console.log("Verwendung: /key management set | status | forget");
+    context.out.text("Verwendung: /key management set | status | forget");
     return;
   }
-  console.log(
+  context.out.text(
     "Verwendung: /key set | status | forget | /key management set | status | forget",
   );
 }
@@ -401,7 +572,7 @@ export async function validateAndStoreInferenceKey(
   candidate: string,
   context: Pick<CommandContext, "credentials" | "openRouter">,
   signal?: AbortSignal,
-): Promise<BalanceInfo> {
+): Promise<BalanceReport> {
   const temporary = new OpenRouterService(candidate);
   const balance = await temporary.checkBalance(signal);
   assertSpendAvailable(balance);
@@ -433,9 +604,9 @@ async function modelCommand(args: string[], context: CommandContext): Promise<vo
     const models = await context.openRouter.listModels(context.config.mainModel, true);
     const current = models.find((model) => model.id === context.config.mainModel);
     if (current) {
-      printModelDetails(current, false);
+      printModelDetails(current, false, context.out);
     } else {
-      console.log(`Aktive Modellroute: ${context.config.mainModel}`);
+      context.out.text(`Aktive Modellroute: ${context.config.mainModel}`);
     }
     return;
   }
@@ -458,8 +629,8 @@ async function modelCommand(args: string[], context: CommandContext): Promise<vo
       context.config.mainModel,
       getReasoningSetting(context.config),
     );
-    await Promise.all([saveConfig(context.config), context.session.save()]);
-    console.log(chalk.green(`Main-Modell: ${id}`));
+    await Promise.all([saveContextConfig(context), context.session.save()]);
+    context.out.text(chalk.green(`Main-Modell: ${id}`));
   }
 }
 
@@ -467,17 +638,17 @@ async function modelsCommand(args: string[], context: CommandContext): Promise<v
   const query = args.join(" ");
   const models = await context.openRouter.listModels(query, true);
   if (!models.length) {
-    console.log("Keine passenden tool-fähigen Modelle gefunden.");
+    context.out.text("Keine passenden tool-fähigen Modelle gefunden.");
     return;
   }
-  console.log(chalk.bold(`Tool-fähige Modelle${query ? ` für „${query}“` : ""}`));
+  context.out.text(chalk.bold(`Tool-fähige Modelle${query ? ` für „${query}“` : ""}`));
   for (const model of models.slice(0, 30)) {
-    console.log(
+    context.out.text(
       `${model.id.padEnd(52)} in ${formatPricePerMillion(model.promptPrice).padStart(11)} · out ${formatPricePerMillion(model.completionPrice).padStart(11)} · ctx ${compactNumber(model.contextLength)}`,
     );
   }
   if (models.length > 30) {
-    console.log(chalk.dim(`${models.length - 30} weitere; Suche mit /models <begriff> eingrenzen.`));
+    context.out.text(chalk.dim(`${models.length - 30} weitere; Suche mit /models <begriff> eingrenzen.`));
   }
 }
 
@@ -489,11 +660,11 @@ async function reasoningCommand(
   const current = getReasoningSetting(context.config);
   const action = (args[0] ?? "").toLowerCase();
   if (!action) {
-    console.log(
+    context.out.text(
       `Thinking für ${context.config.mainModel}: ${reasoningLabel(current)}`,
     );
     if (model?.reasoning?.supportedEfforts) {
-      console.log(
+      context.out.text(
         `Unterstützte Stufen: ${model.reasoning.supportedEfforts.join(", ")}`,
       );
     } else if (
@@ -501,12 +672,12 @@ async function reasoningCommand(
       !model.id.startsWith("openrouter/") &&
       !model.supportedParameters.includes("reasoning")
     ) {
-      console.log("Dieses Modell meldet keine Reasoning-Unterstützung.");
+      context.out.text("Dieses Modell meldet keine Reasoning-Unterstützung.");
     } else {
-      console.log(`Gateway-Stufen: ${REASONING_EFFORTS.join(", ")}`);
+      context.out.text(`Gateway-Stufen: ${REASONING_EFFORTS.join(", ")}`);
     }
     if (model?.reasoning?.supportsMaxTokens || model?.id.startsWith("openrouter/")) {
-      console.log("Token-Budget wird unterstützt: /think budget <Tokens>");
+      context.out.text("Token-Budget wird unterstützt: /think budget <Tokens>");
     }
     return;
   }
@@ -540,8 +711,8 @@ async function reasoningCommand(
   validateReasoningSetting(setting, model);
   setReasoningSetting(context.config, setting);
   context.session.setPreferences(context.config.mainModel, setting);
-  await Promise.all([saveConfig(context.config), context.session.save()]);
-  console.log(
+  await Promise.all([saveContextConfig(context), context.session.save()]);
+  context.out.text(
     chalk.green(
       `Thinking für ${context.config.mainModel}: ${reasoningLabel(setting)}`,
     ),
@@ -549,10 +720,51 @@ async function reasoningCommand(
 }
 
 async function approvalCommand(args: string[], context: CommandContext): Promise<void> {
-  const mode = (args[0] ?? "").toLowerCase();
+  const sub = (args[0] ?? "").toLowerCase();
+  if (sub === "list") {
+    const rules = context.ruleStore.list(context.workspace);
+    if (!rules.length) {
+      context.out.text("Keine gemerkten Regeln für diesen Workspace.");
+      return;
+    }
+    for (const rule of rules) {
+      const subject =
+        rule.match.kind === "any" ? "(beliebig)" : rule.match.value;
+      context.out.text(
+        `${rule.decision === "allow" ? chalk.green("allow") : chalk.red("deny")} ${chalk.dim(rule.tool)} ${subject} · ${rule.id.slice(0, 8)}`,
+      );
+    }
+    return;
+  }
+  if (sub === "forget") {
+    const target = (args[1] ?? "").toLowerCase();
+    if (!target) {
+      throw new Error("Verwendung: /allow forget <id>|all");
+    }
+    if (target === "all") {
+      const rules = context.ruleStore.list(context.workspace);
+      for (const rule of rules) {
+        await context.ruleStore.forget(rule.id);
+      }
+      context.out.text(
+        chalk.green(`${rules.length} Regel(n) für diesen Workspace vergessen.`),
+      );
+      return;
+    }
+    const rules = context.ruleStore.list(context.workspace);
+    const match = rules.find((rule) => rule.id === target || rule.id.startsWith(target));
+    if (!match) {
+      context.out.text(`Keine Regel mit ID „${target}“ in diesem Workspace.`);
+      return;
+    }
+    await context.ruleStore.forget(match.id);
+    context.out.text(chalk.green(`Regel vergessen: ${match.id.slice(0, 8)}`));
+    return;
+  }
+  const mode = sub;
   if (!mode) {
     for (const candidate of APPROVAL_MODES) {
-      console.log(
+      context.out.text(
         `${candidate === context.approvals.mode ? chalk.green("●") : "○"} ${candidate}: ${approvalDescription(candidate)}`,
       );
     }
@@ -568,14 +780,14 @@ async function approvalCommand(args: string[], context: CommandContext): Promise
       default: false,
     });
     if (!accepted) {
-      console.log("Approval-Modus unverändert.");
+      context.out.text("Approval-Modus unverändert.");
       return;
     }
   }
   context.approvals.mode = mode;
   context.config.approvalMode = mode;
-  await saveConfig(context.config);
-  console.log(chalk.green(`Approval-Modus: ${mode}`));
+  await saveContextConfig(context);
+  context.out.text(chalk.green(`Approval-Modus: ${mode}`));
 }
 
 async function chatCommand(
@@ -617,19 +829,19 @@ async function chatCommand(
         await SessionStore.openById(context.workspace, selected),
       );
     }
-    printCurrentChat(context.session);
+    printCurrentChat(context.session, context.out);
     return;
   }
 
   if (action === "list") {
     const chats = await SessionStore.list(context.workspace);
     if (!chats.length) {
-      console.log("Noch keine gespeicherten Chats in diesem Workspace.");
+      context.out.text("Noch keine gespeicherten Chats in diesem Workspace.");
       return;
     }
     for (const chat of chats) {
       const marker = chat.id === context.session.data.id ? chalk.green("●") : "○";
-      console.log(
+      context.out.text(
         `${marker} ${chat.title} · ${chat.turnCount} Nachrichten · ${usd(chat.costUsd)} · ${formatChatDate(chat.updatedAt)} · ${chat.id}`,
       );
     }
@@ -637,7 +849,7 @@ async function chatCommand(
   }
 
   if (action === "current") {
-    printCurrentChat(context.session);
+    printCurrentChat(context.session, context.out);
     return;
   }
 
@@ -647,7 +859,7 @@ async function chatCommand(
       context,
       SessionStore.create(context.workspace, undefined, title),
     );
-    printCurrentChat(context.session);
+    printCurrentChat(context.session, context.out);
     return;
   }
 
@@ -658,7 +870,7 @@ async function chatCommand(
     }
     context.session.rename(title);
     await context.session.save();
-    printCurrentChat(context.session);
+    printCurrentChat(context.session, context.out);
     return;
   }
 
@@ -667,7 +879,7 @@ async function chatCommand(
     const title = args.slice(1).join(" ").trim() ||
       `${context.session.data.title} (Fork)`;
     await replaceSession(context, await context.session.fork(title));
-    printCurrentChat(context.session);
+    printCurrentChat(context.session, context.out);
     return;
   }
 
@@ -688,7 +900,7 @@ async function chatCommand(
         context,
         await SessionStore.openById(context.workspace, best.chat.id),
       );
-      printCurrentChat(context.session);
+      printCurrentChat(context.session, context.out);
       return;
     }
     if (!process.stdout.isTTY) {
@@ -711,7 +923,7 @@ async function chatCommand(
         await SessionStore.openById(context.workspace, selected),
       );
     }
-    printCurrentChat(context.session);
+    printCurrentChat(context.session, context.out);
     return;
   }
 
@@ -722,23 +934,23 @@ async function chatCommand(
     }
     const hits = await SessionStore.search(context.workspace, query);
     if (!hits.length) {
-      console.log(`Keine Chats gefunden für: ${query}`);
+      context.out.text(`Keine Chats gefunden für: ${query}`);
       return;
     }
     const shown = hits.slice(0, 10);
     for (const hit of shown) {
       const marker = hit.chat.id === context.session.data.id ? chalk.green("●") : "○";
-      console.log(
+      context.out.text(
         `${marker} ${hit.chat.title} · ${hit.chat.turnCount} Nachrichten · ${usd(hit.chat.costUsd)} · ${formatChatDate(hit.chat.updatedAt)} · ${hit.chat.id}`,
       );
       if (hit.snippet) {
-        console.log(`  ${chalk.dim(hit.snippet)}`);
+        context.out.text(`  ${chalk.dim(hit.snippet)}`);
       }
     }
     if (hits.length > shown.length) {
-      console.log(chalk.dim(`… und ${hits.length - shown.length} weitere Treffer.`));
+      context.out.text(chalk.dim(`… und ${hits.length - shown.length} weitere Treffer.`));
     }
-    console.log(chalk.dim("Öffnen mit /chat open <ID oder Titel>"));
+    context.out.text(chalk.dim("Öffnen mit /chat open <ID oder Titel>"));
     return;
   }
 
@@ -761,18 +973,14 @@ async function replaceSession(
   if (next.data.reasoning) {
     setReasoningSetting(context.config, next.data.reasoning);
   }
-  context.agent = await RouterCodeAgent.create({
-    openRouter: context.openRouter,
-    approvals: context.approvals,
-    session: next,
-    config: context.config,
-    workspace: context.workspace,
-  });
+  // Swapping the chat keeps the cached model resolution, the compressor price
+  // cache and the change journal; rebuilding the agent threw all of that away.
+  context.agent.setSession(next);
   next.setPreferences(
     context.config.mainModel,
     getReasoningSetting(context.config),
   );
-  await Promise.all([next.save(), saveConfig(context.config)]);
+  await Promise.all([next.save(), saveContextConfig(context)]);
 }
 
 async function saveSessionPreferences(context: CommandContext): Promise<void> {
@@ -783,8 +991,8 @@ async function saveSessionPreferences(context: CommandContext): Promise<void> {
   await context.session.save();
 }
 
-function printCurrentChat(session: SessionStore): void {
-  console.log(
+function printCurrentChat(session: SessionStore, out: CommandOutput): void {
+  out.text(
     chalk.green(
       `Chat: ${session.data.title} · ${session.data.turns.length} Nachrichten · ${session.data.id}`,
     ),
@@ -801,7 +1009,7 @@ function formatChatDate(value: string): string {
 async function compressorCommand(args: string[], context: CommandContext): Promise<void> {
   const action = (args[0] ?? "").toLowerCase();
   if (!action) {
-    console.log(
+    context.out.text(
       `Kompressor: ${context.config.compressionMode} · ${context.config.compressorModel} · Schwelle ${context.config.compressionThresholdChars} Zeichen`,
     );
     return;
@@ -850,8 +1058,8 @@ async function compressorCommand(args: string[], context: CommandContext): Promi
       `Verwendung: /compress ${COMPRESSION_MODES.join("|")} | /compress model <id> | /compress threshold <zeichen> | /compress max-cost <USD>`,
     );
   }
-  await saveConfig(context.config);
-  console.log(
+  await saveContextConfig(context);
+  context.out.text(
     chalk.green(
       `Kompressor: ${context.config.compressionMode} · ${context.config.compressorModel} · ${context.config.compressionThresholdChars} Zeichen`,
     ),
@@ -860,7 +1068,7 @@ async function compressorCommand(args: string[], context: CommandContext): Promi
 
 async function maxCostCommand(args: string[], context: CommandContext): Promise<void> {
   if (!args[0]) {
-    console.log(`Main-Kostenlimit pro Lauf: ${usd(context.config.maxCostUsd)}`);
+    context.out.text(`Main-Kostenlimit pro Lauf: ${usd(context.config.maxCostUsd)}`);
     return;
   }
   const value = Number(args[0]);
@@ -868,13 +1076,13 @@ async function maxCostCommand(args: string[], context: CommandContext): Promise<
     throw new Error("Kostenlimit muss zwischen 0.001 und 1000 USD liegen.");
   }
   context.config.maxCostUsd = value;
-  await saveConfig(context.config);
-  console.log(chalk.green(`Main-Kostenlimit: ${usd(value)}`));
+  await saveContextConfig(context);
+  context.out.text(chalk.green(`Main-Kostenlimit: ${usd(value)}`));
 }
 
 async function stepsCommand(args: string[], context: CommandContext): Promise<void> {
   if (!args[0]) {
-    console.log(`Maximale Tool-Schritte: ${context.config.maxSteps}`);
+    context.out.text(`Maximale Tool-Schritte: ${context.config.maxSteps}`);
     return;
   }
   const value = Number(args[0]);
@@ -882,33 +1090,37 @@ async function stepsCommand(args: string[], context: CommandContext): Promise<vo
     throw new Error("Tool-Schritte müssen zwischen 1 und 100 liegen.");
   }
   context.config.maxSteps = value;
-  await saveConfig(context.config);
-  console.log(chalk.green(`Maximale Tool-Schritte: ${value}`));
+  await saveContextConfig(context);
+  context.out.text(chalk.green(`Maximale Tool-Schritte: ${value}`));
 }
 
-function printCosts(session: SessionStore): void {
+function printCosts(session: SessionStore, out: CommandOutput): void {
   const costs = session.data.costs;
-  console.log(
-    `Sitzungskosten: Main ${usd(costs.mainUsd)} · Kompressor ${usd(costs.compressorUsd)} · Gesamt ${usd(costs.totalUsd)}`,
+  out.text(
+    `Sitzungskosten: Main ${usd(costs.mainUsd)} · Kompressor ${usd(costs.compressorUsd)} · Transkription ${usd(costs.voiceUsd)} · Gesamt ${usd(costs.totalUsd)}`,
   );
 }
 
-function printHistory(session: SessionStore, args: string[]): void {
+function printHistory(session: SessionStore, args: string[], out: CommandOutput): void {
   const requested = Number(args[0] ?? 10);
   const count = Number.isInteger(requested) ? Math.min(Math.max(requested, 1), 50) : 10;
   const turns = session.recentTurns(count);
   if (!turns.length) {
-    console.log("Kein Gesprächsverlauf.");
+    out.text("Kein Gesprächsverlauf.");
     return;
   }
   for (const turn of turns) {
-    console.log(
-      `\n${chalk.bold(turn.role === "user" ? "Du" : "RouterCode")} ${chalk.dim(turn.createdAt)}\n${truncate(turn.content, 2_000)}`,
+    out.text(
+      `\n${chalk.bold(turn.role === "user" ? "Du" : "orcode")} ${chalk.dim(turn.createdAt)}\n${truncate(turn.content, 2_000)}`,
     );
   }
 }
 
-async function clearSession(session: SessionStore): Promise<void> {
+async function clearSession(
+  session: SessionStore,
+  agent: OrcodeAgent,
+  out: CommandOutput,
+): Promise<void> {
   const accepted = await confirm({
     message: "Gesprächskontext und aufgezeichnete Sitzungskosten zurücksetzen?",
     default: false,
@@ -917,30 +1129,412 @@ async function clearSession(session: SessionStore): Promise<void> {
     return;
   }
   session.clear();
+  agent.resetConversationMemory();
   await session.save();
-  console.log("Sitzung zurückgesetzt.");
+  out.text("Sitzung zurückgesetzt.");
+}
+
+async function exportCommand(
+  args: string[],
+  context: CommandContext,
+): Promise<void> {
+  const markdown = context.session.exportMarkdown();
+  const requested = args.join(" ").trim();
+  if (!requested) {
+    context.out.text(markdown);
+    return;
+  }
+  const target = await context.agent.guard.resolvePath(requested);
+  const display = context.agent.guard.display(target);
+  // Same policy as the write tools: `/export .git/config` must not be a way
+  // around the deny list.
+  await context.approvals.authorize(
+    writeApprovalRequest("export", display, {
+      summary: `Chat als Markdown schreiben: ${display}`,
+      details: `${context.session.data.turns.length} Nachrichten · ${markdown.length} Zeichen`,
+    }),
+  );
+  await writeFile(target, markdown, { encoding: "utf8", mode: 0o600 });
+  context.out.text(chalk.green(`Chat exportiert: ${target}`));
+}
+
+async function checkpointCommand(
+  args: string[],
+  context: CommandContext,
+): Promise<void> {
+  const action = (args[0] ?? "list").toLowerCase();
+  if (action === "list") {
+    const checkpoints = context.session.listCheckpoints();
+    if (!checkpoints.length) {
+      context.out.text("Keine Checkpoints in diesem Chat. Anlegen mit /checkpoint new [Name].");
+      return;
+    }
+    for (const checkpoint of checkpoints) {
+      context.out.text(
+        `${checkpoint.label} · nach ${checkpoint.turnIndex} Nachrichten · ${usd(checkpoint.costUsd)} · ${formatChatDate(checkpoint.createdAt)} · ${checkpoint.id.slice(0, 8)}`,
+      );
+    }
+    return;
+  }
+  if (action === "new" || action === "add" || action === "create") {
+    const checkpoint = context.session.createCheckpoint(
+      args.slice(1).join(" ").trim(),
+    );
+    await context.session.save();
+    context.out.text(
+      chalk.green(
+        `Checkpoint angelegt: ${checkpoint.label} (${checkpoint.id.slice(0, 8)})`,
+      ),
+    );
+    return;
+  }
+  if (action === "restore" || action === "back") {
+    const reference = args.slice(1).join(" ").trim();
+    if (!reference) {
+      throw new Error("Verwendung: /checkpoint restore <ID oder Name>");
+    }
+    const checkpoint = context.session.restoreCheckpoint(reference);
+    context.agent.resetConversationMemory();
+    await context.session.save();
+    context.out.text(
+      chalk.green(
+        `Zurückgesetzt auf ${checkpoint.label}: ${context.session.data.turns.length} Nachrichten. Kosten bleiben verbucht.`,
+      ),
+    );
+    return;
+  }
+  throw new Error("Verwendung: /checkpoint [list|new [Name]|restore <ID|Name>]");
+}
+
+async function budgetCommand(
+  args: string[],
+  context: CommandContext,
+): Promise<void> {
+  const action = (args[0] ?? "").toLowerCase();
+  if (!action) {
+    // Same store the agent enforces against — not the process-wide default.
+    const spend = await workspaceSpend(
+      context.workspace,
+      context.session.appHome,
+    );
+    context.out.text(`Budget: ${budgetSummary(context.config.budget)}`);
+    context.out.text(
+      `Verbraucht in diesem Workspace: heute ${usd(spend.dayUsd)} · gesamt ${usd(spend.totalUsd)} über ${spend.chatCount} Chat(s)`,
+    );
+    context.out.text(
+      chalk.dim(
+        "Setzen: /budget day <USD|off> · /budget total <USD|off> · /budget on-exceed warn|block",
+      ),
+    );
+    return;
+  }
+  if (action === "day" || action === "total") {
+    const raw = (args[1] ?? "").toLowerCase();
+    const limit = raw === "off" || raw === "aus" || raw === "none"
+      ? null
+      : parseBudgetLimit(raw);
+    if (action === "day") {
+      context.config.budget.dailyLimitUsd = limit;
+    } else {
+      context.config.budget.totalLimitUsd = limit;
+    }
+  } else if (action === "on-exceed" || action === "action") {
+    const value = (args[1] ?? "").toLowerCase();
+    if (!isBudgetAction(value)) {
+      throw new Error("Verwendung: /budget on-exceed warn|block");
+    }
+    context.config.budget.onExceed = value;
+  } else {
+    throw new Error(
+      "Verwendung: /budget [day <USD|off>|total <USD|off>|on-exceed warn|block]",
+    );
+  }
+  await saveContextConfig(context);
+  context.out.text(chalk.green(`Budget: ${budgetSummary(context.config.budget)}`));
+}
+
+function parseBudgetLimit(raw: string): number {
+  const value = Number(raw);
+  if (!Number.isFinite(value) || value < 0.01 || value > 100_000) {
+    throw new Error(
+      "Budgetgrenze muss zwischen 0.01 und 100000 USD liegen, oder „off“ für kein Limit.",
+    );
+  }
+  return value;
+}
+
+// ---------------------------------------------------------------------------
+// A4 — /verify. Config-only: the retry-with-model loop this drives lives in
+// agent.ts and is not wired in yet (see the needsElsewhere note in the task
+// report). Setting the config here is what a future agent.ts pass reads.
+// ---------------------------------------------------------------------------
+
+async function verifyCommand(args: string[], context: CommandContext): Promise<void> {
+  const action = (args[0] ?? "").toLowerCase();
+  if (!action) {
+    printVerifyStatus(context);
+    return;
+  }
+  if (action === "on" || action === "off") {
+    const mode: VerifyMode = action === "on" ? "on-edit" : "off";
+    context.config.verify = validateVerify({ ...context.config.verify, mode });
+    await saveContextConfig(context);
+    context.out.text(chalk.green(`Verify: ${mode}`));
+    return;
+  }
+  if (action === "now") {
+    if (!context.config.verify.commands.length) {
+      context.out.text(
+        "Keine Verify-Kommandos konfiguriert. /verify <befehl> zum Hinzufügen.",
+      );
+      return;
+    }
+    const { runVerify } = await import("./verify.js");
+    const outcome = await runVerify(
+      context.config.verify.commands,
+      context.agent.guard,
+      undefined,
+      () => {},
+    );
+    if (outcome.status === "passed") {
+      context.out.text(chalk.green("Verify: alle Kommandos grün."));
+    } else if (outcome.status === "failed") {
+      context.out.error(
+        `Verify fehlgeschlagen: ${outcome.command} (exit ${outcome.exitCode})`,
+      );
+      context.out.text(outcome.distilled);
+    } else {
+      context.out.text("Verify abgebrochen.");
+    }
+    return;
+  }
+  if (action === "suggest") {
+    let packageJson: unknown;
+    try {
+      const raw = await readFile(
+        await context.agent.guard.resolvePath("package.json"),
+        "utf8",
+      );
+      packageJson = JSON.parse(raw);
+    } catch {
+      context.out.text("Kein lesbares package.json im Workspace gefunden.");
+      return;
+    }
+    const suggested = suggestVerifyCommands(packageJson);
+    if (!suggested.length) {
+      context.out.text("Keine check/test/build-Skripte in package.json gefunden.");
+      return;
+    }
+    context.config.verify = validateVerify({
+      ...context.config.verify,
+      commands: suggested,
+    });
+    await saveContextConfig(context);
+    context.out.text(
+      chalk.green(`Verify-Kommandos übernommen: ${suggested.join(", ")}`),
+    );
+    return;
+  }
+  if (action === "clear") {
+    context.config.verify = validateVerify({ ...context.config.verify, commands: [] });
+    await saveContextConfig(context);
+    context.out.text(chalk.green("Verify-Kommandos geleert."));
+    return;
+  }
+  if (action === "rounds") {
+    const rounds = Number(args[1]);
+    if (!Number.isInteger(rounds) || rounds < 1 || rounds > VERIFY_MAX_ROUNDS) {
+      throw new Error(`/verify rounds muss zwischen 1 und ${VERIFY_MAX_ROUNDS} liegen.`);
+    }
+    context.config.verify = validateVerify({ ...context.config.verify, maxRounds: rounds });
+    await saveContextConfig(context);
+    context.out.text(chalk.green(`Verify-Runden: ${rounds}`));
+    return;
+  }
+  // Anything else is treated as a literal command to add, e.g. `/verify npm run check`.
+  const command = args.join(" ").trim();
+  if (!command) {
+    throw new Error(
+      `Verwendung: /verify [on|off|now|suggest|clear|rounds <1-${VERIFY_MAX_ROUNDS}>|<befehl>]`,
+    );
+  }
+  context.config.verify = validateVerify({
+    ...context.config.verify,
+    commands: [...context.config.verify.commands, command],
+  });
+  await saveContextConfig(context);
+  context.out.text(chalk.green(`Verify-Kommando hinzugefügt: ${command}`));
+}
+
+function printVerifyStatus(context: CommandContext): void {
+  const verify = context.config.verify;
+  context.out.text(
+    `Verify: ${verify.mode} · ${verify.maxRounds} Runde(n) · ${verify.commands.length} Kommando(s)`,
+  );
+  for (const command of verify.commands) {
+    context.out.text(`  ${command}`);
+  }
+  context.out.text(
+    chalk.dim(
+      "Setzen: /verify on|off · /verify <befehl> · /verify suggest · /verify clear · /verify rounds <n> · /verify now",
+    ),
+  );
+}
+
+// ---------------------------------------------------------------------------
+// A2 — /web. Config-only: `shouldEnableWebSearch`/`webSearchPlugin` from
+// openrouter.ts are not yet spread into the `callModel` request (agent.ts),
+// see the needsElsewhere note in the task report.
+// ---------------------------------------------------------------------------
+
+async function webCommand(args: string[], context: CommandContext): Promise<void> {
+  const mode = (args[0] ?? "").toLowerCase();
+  if (!mode) {
+    context.out.text(`Websuche: ${context.config.web}`);
+    context.out.text(chalk.dim(`Setzen: /web ${WEB_MODES.join("|")}`));
+    return;
+  }
+  if (!includesValue(WEB_MODES, mode)) {
+    throw new Error(`Ungültiger Web-Modus. Erlaubt: ${WEB_MODES.join(", ")}`);
+  }
+  context.config.web = mode as WebMode;
+  await saveContextConfig(context);
+  context.out.text(chalk.green(`Websuche: ${mode}`));
+}
+
+// ---------------------------------------------------------------------------
+// A3 — /provider and /fallback. Config-only: `providerField`/`modelsField`
+// from openrouter.ts are not yet spread into the `callModel` request, see the
+// needsElsewhere note in the task report.
+// ---------------------------------------------------------------------------
+
+async function providerCommand(args: string[], context: CommandContext): Promise<void> {
+  const action = (args[0] ?? "").toLowerCase();
+  if (!action) {
+    printProviderStatus(context);
+    return;
+  }
+  if (action === "sort") {
+    const value = (args[1] ?? "").toLowerCase();
+    if (value === "off" || value === "none") {
+      const { sort: _drop, ...rest } = context.config.provider;
+      context.config.provider = validateProvider(rest);
+    } else if (includesValue(PROVIDER_SORTS, value)) {
+      context.config.provider = validateProvider({
+        ...context.config.provider,
+        sort: value as ProviderSortPreference,
+      });
+    } else {
+      throw new Error(`/provider sort erlaubt: off, ${PROVIDER_SORTS.join(", ")}`);
+    }
+  } else if (action === "deny" || action === "allow") {
+    const dataCollection: DataCollectionPreference = action === "deny" ? "deny" : "allow";
+    context.config.provider = validateProvider({
+      ...context.config.provider,
+      dataCollection,
+    });
+  } else if (action === "only" || action === "ignore") {
+    const providers = args.slice(1);
+    context.config.provider = validateProvider({
+      ...context.config.provider,
+      [action]: providers.length ? providers : undefined,
+    });
+  } else if (action === "clear" || action === "reset") {
+    context.config.provider = validateProvider({});
+  } else {
+    throw new Error(
+      "Verwendung: /provider [sort <off|price|throughput|latency>|allow|deny|only <a> <b>…|ignore <a> <b>…|clear]",
+    );
+  }
+  await saveContextConfig(context);
+  printProviderStatus(context);
+}
+
+function printProviderStatus(context: CommandContext): void {
+  const provider = context.config.provider;
+  context.out.text(
+    [
+      `Sortierung: ${provider.sort ?? "Standard (Preis/Verfügbarkeit)"}`,
+      `Datenweitergabe: ${provider.dataCollection ?? DATA_COLLECTIONS[1]}`,
+      provider.only?.length ? `Nur: ${provider.only.join(", ")}` : "",
+      provider.ignore?.length ? `Ausgeschlossen: ${provider.ignore.join(", ")}` : "",
+    ]
+      .filter(Boolean)
+      .join(" · "),
+  );
+}
+
+async function fallbackCommand(args: string[], context: CommandContext): Promise<void> {
+  const action = (args[0] ?? "").toLowerCase();
+  if (!action) {
+    context.out.text(
+      context.config.fallbackModels.length
+        ? `Fallback-Kette: ${context.config.mainModel} → ${context.config.fallbackModels.join(" → ")}`
+        : `Fallback-Kette: ${context.config.mainModel} (keine Fallbacks)`,
+    );
+    context.out.text(chalk.dim("Setzen: /fallback +<modell> · /fallback -<modell> · /fallback clear"));
+    return;
+  }
+  if (action === "clear") {
+    context.config.fallbackModels = [];
+  } else if (args[0]?.startsWith("+")) {
+    const model = args[0].slice(1).trim();
+    if (!model) {
+      throw new Error("Verwendung: /fallback +<anbieter/modell>");
+    }
+    const next = new Set(context.config.fallbackModels);
+    next.add(model);
+    context.config.fallbackModels = [...next];
+  } else if (args[0]?.startsWith("-")) {
+    const model = args[0].slice(1).trim();
+    context.config.fallbackModels = context.config.fallbackModels.filter(
+      (entry) => entry !== model,
+    );
+  } else {
+    throw new Error("Verwendung: /fallback [+<modell>|-<modell>|clear]");
+  }
+  await saveContextConfig(context);
+  context.out.text(
+    context.config.fallbackModels.length
+      ? chalk.green(`Fallback-Kette: ${context.config.mainModel} → ${context.config.fallbackModels.join(" → ")}`)
+      : chalk.green("Fallback-Kette geleert."),
+  );
+}
+
+function includesValue<T extends readonly string[]>(list: T, value: string): value is T[number] {
+  return (list as readonly string[]).includes(value);
 }
 
 async function initInstructions(context: CommandContext): Promise<void> {
-  const target = join(context.workspace, "ROUTERCODE.md");
-  try {
-    await readFile(target, "utf8");
-    console.log("ROUTERCODE.md existiert bereits und wurde nicht überschrieben.");
-    return;
-  } catch (error) {
-    if (!hasCode(error, "ENOENT")) {
-      throw error;
+  const target = await context.agent.guard.resolvePath("ORCODE.md");
+  // Also refuse to overwrite a pre-rename `ROUTERCODE.md`: creating a second,
+  // redundant instructions file next to it would be more confusing than
+  // helpful, and `loadProjectNotes` already reads both if both exist.
+  const legacyTarget = await context.agent.guard.resolvePath("ROUTERCODE.md");
+  for (const [existing, label] of [
+    [target, "ORCODE.md"],
+    [legacyTarget, "ROUTERCODE.md"],
+  ] as const) {
+    try {
+      await readFile(existing, "utf8");
+      context.out.text(`${label} existiert bereits und wurde nicht überschrieben.`);
+      return;
+    } catch (error) {
+      if (!hasCode(error, "ENOENT")) {
+        throw error;
+      }
     }
   }
-  await context.approvals.authorize({
-    name: "init",
-    risk: "edit",
-    summary: "ROUTERCODE.md im Workspace anlegen",
-    details: "Projektbefehle, Konventionen, Grenzen und Definition-of-Done können dort dauerhaft eingetragen werden.",
-  });
+  await context.approvals.authorize(
+    writeApprovalRequest("init", context.agent.guard.display(target), {
+      summary: "ORCODE.md im Workspace anlegen",
+      details:
+        "Projektbefehle, Konventionen, Grenzen und Definition-of-Done können dort dauerhaft eingetragen werden.",
+    }),
+  );
   await writeFile(
     target,
-    `# RouterCode project instructions
+    `# orcode project instructions
 
 ## Project
 
@@ -966,7 +1560,81 @@ async function initInstructions(context: CommandContext): Promise<void> {
 `,
     { encoding: "utf8", mode: 0o644 },
   );
-  console.log(chalk.green(`Angelegt: ${target}`));
+  context.out.text(chalk.green(`Angelegt: ${target}`));
+}
+
+/**
+ * `/ssh`: lists hosts from `~/.ssh/config`, checks one, or ends the
+ * remembered session. Never asks for or forwards a password — reachability
+ * and auth both ride on `ssh -o BatchMode=yes`, so a missing key comes back
+ * as a clear message instead of a hang. See `src/ssh.ts`/`src/ssh-config.ts`.
+ */
+async function sshCommand(args: string[], context: CommandContext): Promise<void> {
+  const runSsh: RunSsh =
+    context.sshRunner ??
+    ((sshArgs, runOptions) => runProcess("ssh", sshArgs, runOptions));
+  // `checkHost`/`closeSshControl` create the ControlMaster socket directory
+  // as a side effect even with a fake `runSsh` — this MUST stay overridable,
+  // or a test without `sshAppHome` silently touches the real ~/.orcode.
+  const runtime = context.sshAppHome ? { appHome: context.sshAppHome } : {};
+  const first = (args[0] ?? "").toLowerCase();
+
+  if (first === "off") {
+    const active = context.sshSession?.active ?? null;
+    if (!active) {
+      context.out.text("Keine aktive SSH-Sitzung.");
+      return;
+    }
+    await closeSshControl(active, runSsh, runtime);
+    context.sshSession!.active = null;
+    context.out.text(chalk.green(`SSH-Sitzung zu „${active}“ getrennt.`));
+    return;
+  }
+
+  if (first === "status") {
+    const active = context.sshSession?.active ?? null;
+    if (!active) {
+      context.out.text("Kein aktives SSH-Ziel. Verwendung: /ssh <alias>");
+      return;
+    }
+    const hosts = await loadSshHosts({ configPath: context.sshConfigPath });
+    const result = await checkHost(active, hosts, runSsh, runtime);
+    context.out.text(`Aktives SSH-Ziel: ${active} — ${result.message}`);
+    return;
+  }
+
+  const hosts = await loadSshHosts({ configPath: context.sshConfigPath });
+  if (!first) {
+    if (!hosts.length) {
+      context.out.text("Keine benannten Hosts in ~/.ssh/config gefunden.");
+      return;
+    }
+    context.out.text(chalk.bold("SSH-Hosts aus ~/.ssh/config"));
+    const active = context.sshSession?.active;
+    for (const host of hosts) {
+      const marker = active === host.alias ? chalk.green(" (aktiv)") : "";
+      context.out.text(
+        `  ${host.alias}${marker} → ${host.hostName}${host.user ? ` (${host.user})` : ""}`,
+      );
+    }
+    context.out.text("Verwendung: /ssh <alias> | /ssh status | /ssh off");
+    return;
+  }
+
+  const alias = args[0]!;
+  const result = await checkHost(alias, hosts, runSsh, runtime);
+  if (result.status === "reachable") {
+    if (!context.sshSession) {
+      context.sshSession = createSshSession();
+    }
+    context.sshSession.active = alias;
+    context.out.text(chalk.green(result.message));
+    context.out.text(
+      `SSH-Ziel gesetzt: ${alias}. ssh_command läuft ab jetzt gegen diesen Host, bis /ssh off.`,
+    );
+    return;
+  }
+  context.out.text(result.status === "no-auth" ? chalk.yellow(result.message) : chalk.red(result.message));
 }
 
 function tokenize(value: string): string[] {
@@ -996,8 +1664,8 @@ async function selectModel(
     context.config.mainModel,
     getReasoningSetting(context.config),
   );
-  await Promise.all([saveConfig(context.config), context.session.save()]);
-  printModelDetails(model, true);
+  await Promise.all([saveContextConfig(context), context.session.save()]);
+  printModelDetails(model, true, context.out);
 }
 
 export function rankModels(
@@ -1080,13 +1748,13 @@ export function modelChoiceDescription(model: ModelInfo): string {
     .join("\n");
 }
 
-function printModelDetails(model: ModelInfo, selected: boolean): void {
-  console.log(chalk.bold.green(selected ? "\nModell ausgewählt" : "\nAktives Modell"));
-  console.log(`Name: ${model.name}`);
-  console.log(`ID: ${chalk.cyan(model.id)}`);
-  console.log(`Anbieter: ${model.id.split("/")[0] ?? "unbekannt"} · Routing: OpenRouter`);
-  console.log(`Preis: ${priceSummary(model)}`);
-  console.log(
+function printModelDetails(model: ModelInfo, selected: boolean, out: CommandOutput): void {
+  out.text(chalk.bold.green(selected ? "\nModell ausgewählt" : "\nAktives Modell"));
+  out.text(`Name: ${model.name}`);
+  out.text(`ID: ${chalk.cyan(model.id)}`);
+  out.text(`Anbieter: ${model.id.split("/")[0] ?? "unbekannt"} · Routing: OpenRouter`);
+  out.text(`Preis: ${priceSummary(model)}`);
+  out.text(
     `Kontext: ${model.contextLength.toLocaleString("de-DE")} Tokens${
       model.maxCompletionTokens
         ? ` · maximale Ausgabe ${model.maxCompletionTokens.toLocaleString("de-DE")}`
@@ -1095,13 +1763,13 @@ function printModelDetails(model: ModelInfo, selected: boolean): void {
   );
   const capabilities = capabilityLabels(model);
   if (capabilities.length) {
-    console.log(`Fähigkeiten: ${capabilities.join(", ")}`);
+    out.text(`Fähigkeiten: ${capabilities.join(", ")}`);
   }
   if (model.reasoning?.supportedEfforts?.length) {
-    console.log(`Reasoning-Stufen: ${model.reasoning.supportedEfforts.join(", ")}`);
+    out.text(`Reasoning-Stufen: ${model.reasoning.supportedEfforts.join(", ")}`);
   }
   if (model.reasoning?.supportsMaxTokens) {
-    console.log("Reasoning-Token-Budget: unterstützt");
+    out.text("Reasoning-Token-Budget: unterstützt");
   }
   const scores = [
     model.intelligenceIndex === undefined ? "" : `Intelligenz ${model.intelligenceIndex}`,
@@ -1109,12 +1777,12 @@ function printModelDetails(model: ModelInfo, selected: boolean): void {
     model.agenticIndex === undefined ? "" : `Agentisch ${model.agenticIndex}`,
   ].filter(Boolean);
   if (scores.length) {
-    console.log(`Artificial-Analysis-Indizes: ${scores.join(" · ")}`);
+    out.text(`Artificial-Analysis-Indizes: ${scores.join(" · ")}`);
   }
   if (model.description) {
-    console.log(`Info: ${truncate(model.description, 700)}`);
+    out.text(`Info: ${truncate(model.description, 700)}`);
   }
-  console.log();
+  out.text("");
 }
 
 async function findCurrentModel(
@@ -1192,12 +1860,13 @@ async function persistCredential(
   credentials: CredentialStoreLike,
   kind: "inference" | "management",
   secret: string,
+  out: CommandOutput,
 ): Promise<boolean> {
   try {
     await credentials.set(kind, secret);
     return true;
   } catch (error) {
-    console.log(
+    out.text(
       chalk.yellow(
         `Der Key ist gültig, konnte aber nicht dauerhaft gespeichert werden: ${errorMessage(error)}`,
       ),
@@ -1206,15 +1875,22 @@ async function persistCredential(
   }
 }
 
+/**
+ * Should the stored key be thrown away and replaced?
+ *
+ * Only for credentials the server actually rejected (401/403) or a key whose
+ * validity has run out. Empty credit and an exhausted spending limit are money
+ * problems with a perfectly valid key — the old regex on the German message
+ * deleted exactly those keys from the keychain (B3).
+ */
 export function shouldReplaceCredential(error: unknown): boolean {
-  if (
+  if (error instanceof SpendUnavailableError) {
+    return error.reason === "key-expired";
+  }
+  return (
     error instanceof OpenRouterHttpError &&
     (error.status === 401 || error.status === 403)
-  ) {
-    return true;
-  }
-  const message = errorMessage(error);
-  return /aufgebraucht|abgelaufen/i.test(message);
+  );
 }
 
 function originLabel(origin: KeyOrigin): string {

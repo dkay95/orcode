@@ -3,11 +3,30 @@
 import { input, confirm } from "@inquirer/prompts";
 import chalk from "chalk";
 import { execFile } from "node:child_process";
-import { basename, resolve } from "node:path";
-import { format as formatValue, promisify } from "node:util";
-import { RouterCodeAgent, assertSpendAvailable } from "./agent.js";
-import { ApprovalManager } from "./approval.js";
+import { readFileSync, realpathSync } from "node:fs";
+import { basename, dirname, join, resolve } from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
+import { promisify } from "node:util";
 import {
+  AgentRunError,
+  OrcodeAgent,
+  assertSpendAvailable,
+  isAbortError,
+  type AgentRunOutcome,
+  type AgentRunResult,
+} from "./agent.js";
+import {
+  attachmentPromptSummary,
+  formatBytes,
+  inspectImageAttachment,
+  validateImageAttachmentSet,
+  type ImageAttachment,
+} from "./attachments.js";
+import { ApprovalManager } from "./approval.js";
+import { RuleStore } from "./rules.js";
+import { createSshSession, type SshSession } from "./ssh.js";
+import {
+  createPlainCommandOutput,
   handleSlashCommand,
   printBalance,
   promptForValidKey,
@@ -16,12 +35,17 @@ import {
   shouldReplaceCredential,
   validateAndStoreInferenceKey,
   validateAndStoreManagementKey,
+  type CommandContext,
+  type CommandOutput,
 } from "./commands.js";
 import {
+  consumeConfigWarning,
   isApprovalMode,
   isCompressionMode,
   loadConfig,
+  migrateAppHome,
   saveConfig,
+  type OrcodeConfigWithBudget,
 } from "./config.js";
 import {
   CredentialStore,
@@ -36,28 +60,55 @@ import {
   setReasoningSetting,
   validateReasoningSetting,
 } from "./reasoning.js";
-import { SessionStore } from "./session.js";
+import {
+  SessionStore,
+  migrateLegacySession,
+  type SaveOutcome,
+} from "./session.js";
 import {
   TerminalUi,
   UiExitError,
+  runOutcomeLabel,
   sanitizeTerminalText,
   type DashboardState,
 } from "./tui.js";
 import type {
+  AgentRunEvent,
   ApprovalMode,
   BalanceInfo,
   ChatSummary,
   ModelInfo,
-  RouterCodeConfig,
 } from "./types.js";
 import { APPROVAL_MODES } from "./types.js";
 import { approvalDescription } from "./approval.js";
-import { sanitizedEnvironment } from "./workspace.js";
+import { transcribeAudio } from "./transcribe.js";
+import {
+  createAudioRecorders,
+  deleteRecordedAudio,
+  ensureVoiceConsent,
+  selectAudioRecorder,
+  type AudioRecorder,
+  type RecordedAudio,
+  type RecordingHandle,
+  type RecordingStopReason,
+} from "./voice.js";
+import {
+  catastrophicGuardNotice,
+  pruneCheckpoints,
+  sanitizedEnvironment,
+} from "./workspace.js";
 import { errorMessage, formatUsd } from "./utils.js";
 
 const execFileAsync = promisify(execFile);
 
-interface CliOptions {
+/**
+ * K8: a "Bedienfehler" — bad CLI usage, caught by `main()`'s top-level
+ * handler and reported with exit code 2. Distinct from a runtime failure
+ * (network, model, tool), which is exit code 1.
+ */
+export class CliUsageError extends Error {}
+
+export interface CliOptions {
   workspace: string;
   prompt?: string;
   model?: string;
@@ -67,29 +118,67 @@ interface CliOptions {
   newChat: boolean;
   continueChat: boolean;
   help: boolean;
+  version: boolean;
   plain: boolean;
+  /** K8: NDJSON run events on stdout, non-interactive, machine-readable. */
+  json: boolean;
+}
+
+/**
+ * Reads the version from package.json so it is stated in exactly one place.
+ * Works from both src/ (tsx) and dist/ because both sit one level below the root.
+ */
+function readPackageVersion(): string {
+  try {
+    const here = dirname(fileURLToPath(import.meta.url));
+    const raw = readFileSync(join(here, "..", "package.json"), "utf8");
+    const parsed: unknown = JSON.parse(raw);
+    if (
+      typeof parsed === "object" &&
+      parsed !== null &&
+      typeof (parsed as { version?: unknown }).version === "string"
+    ) {
+      return (parsed as { version: string }).version;
+    }
+  } catch {
+    // Fall through to the placeholder below.
+  }
+  return "unbekannt";
 }
 
 async function main(): Promise<void> {
   const options = parseArgs(process.argv.slice(2));
+  if (options.version) {
+    process.stdout.write(`orcode ${readPackageVersion()}\n`);
+    return;
+  }
   if (options.help) {
     printUsage();
     return;
   }
 
+  // A5: startup cleanup, best-effort — a failed prune must never block a run.
+  void pruneCheckpoints().catch(() => undefined);
+
   const config = await loadConfig();
+  // loadConfig never throws any more; a broken file is reported instead of
+  // silently replaced by defaults.
+  const configWarning = consumeConfigWarning();
+  if (configWarning) {
+    console.log(chalk.yellow(configWarning));
+  }
   if (options.model) {
     config.mainModel = options.model;
   }
   if (options.approval) {
     if (!isApprovalMode(options.approval)) {
-      throw new Error(`Ungültiger Approval-Modus: ${options.approval}`);
+      throw new CliUsageError(`Ungültiger Approval-Modus: ${options.approval}`);
     }
     config.approvalMode = options.approval;
   }
   if (options.compression) {
     if (!isCompressionMode(options.compression)) {
-      throw new Error(`Ungültiger Kompressor-Modus: ${options.compression}`);
+      throw new CliUsageError(`Ungültiger Kompressor-Modus: ${options.compression}`);
     }
     config.compressionMode = options.compression;
   }
@@ -116,11 +205,17 @@ async function main(): Promise<void> {
     },
   );
   const approvals = new ApprovalManager(config.approvalMode);
+  const ruleStore = await RuleStore.load();
+  approvals.setRuleStore(ruleStore, workspace);
+  const sshSession = createSshSession();
   let session: SessionStore;
-  if (options.newChat) {
-    session = SessionStore.create(workspace);
-  } else if (options.chatId) {
-    session = await SessionStore.openById(workspace, options.chatId);
+  if (options.newChat || options.chatId) {
+    // `SessionStore.open()` migrates on its own; the explicit start modes have
+    // to ask for it, otherwise an old v1 chat stays invisible after `--new`.
+    await migrateLegacySession(workspace);
+    session = options.chatId
+      ? await SessionStore.openById(workspace, options.chatId)
+      : SessionStore.create(workspace);
   } else {
     session = await SessionStore.open(workspace);
   }
@@ -134,7 +229,7 @@ async function main(): Promise<void> {
     config.mainModel,
     getReasoningSetting(config),
   );
-  const agent = await RouterCodeAgent.create({
+  const agent = await OrcodeAgent.create({
     openRouter,
     approvals,
     session,
@@ -145,10 +240,16 @@ async function main(): Promise<void> {
   const useTui = Boolean(
     !options.prompt &&
     !options.plain &&
+    !options.json &&
     process.stdin.isTTY &&
     process.stdout.isTTY,
   );
-  if (!useTui) {
+  // The dashboard sink is created once `ui` exists (inside `runDashboard`) and
+  // overwrites this placeholder before any command output happens. In --json
+  // mode stdout is reserved for the NDJSON event stream, so every
+  // human-readable status line goes to stderr instead.
+  const out = options.json ? createStderrCommandOutput() : createPlainCommandOutput();
+  if (!useTui && !options.json) {
     printBanner(workspace, config.mainModel);
   }
   if (useTui) {
@@ -160,6 +261,9 @@ async function main(): Promise<void> {
       session,
       agent,
       credentials,
+      out,
+      ruleStore,
+      sshSession,
       showChatPickerOnStart:
         !options.newChat && !options.continueChat && !options.chatId,
       initialKeyFallback:
@@ -170,7 +274,7 @@ async function main(): Promise<void> {
     return;
   }
 
-  if (approvals.mode === "allow-all" && process.stdin.isTTY) {
+  if (approvals.mode === "allow-all" && process.stdin.isTTY && !options.json) {
     const keep = await confirm({
       message: "allow-all ist gespeichert. Für diese Sitzung wirklich ohne Rückfragen arbeiten?",
       default: false,
@@ -184,6 +288,7 @@ async function main(): Promise<void> {
   const startupBalance = await promptForValidKey(
     openRouter,
     credentials,
+    out,
     storedInferenceKey && environmentInferenceKey
       ? {
           key: environmentInferenceKey,
@@ -192,14 +297,24 @@ async function main(): Promise<void> {
       : undefined,
   );
 
-  if (options.prompt) {
-    await printBalance(startupBalance);
-    const result = await agent.run(options.prompt);
-    printRunFooter(result);
+  if (options.json) {
+    const prompt = options.prompt ?? (!process.stdin.isTTY ? await readStdinPrompt() : "");
+    if (!prompt.trim()) {
+      throw new CliUsageError(
+        "Kein Prompt: --json braucht -p/--prompt oder eine nicht-interaktive stdin.",
+      );
+    }
+    process.exitCode = await runNonInteractive(agent, prompt, { json: true });
     return;
   }
 
-  await printBalance(startupBalance);
+  if (options.prompt) {
+    await printBalance(startupBalance, out);
+    process.exitCode = await runNonInteractive(agent, options.prompt, { json: false });
+    return;
+  }
+
+  await printBalance(startupBalance, out);
   await runPlainLoop({
     workspace,
     config,
@@ -208,17 +323,24 @@ async function main(): Promise<void> {
     session,
     agent,
     credentials,
+    out,
+    ruleStore,
+    sshSession,
   });
 }
 
 interface RuntimeContext {
   workspace: string;
-  config: RouterCodeConfig;
+  config: OrcodeConfigWithBudget;
   approvals: ApprovalManager;
   openRouter: OpenRouterService;
   session: SessionStore;
-  agent: RouterCodeAgent;
+  agent: OrcodeAgent;
   credentials: CredentialStore;
+  out: CommandOutput;
+  ruleStore: RuleStore;
+  /** `/ssh`'s remembered target — read by the dashboard header, mutated by `sshCommand` in commands.ts. */
+  sshSession: SshSession;
 }
 
 async function runPlainLoop(context: RuntimeContext): Promise<void> {
@@ -252,6 +374,10 @@ async function runPlainLoop(context: RuntimeContext): Promise<void> {
       printRunFooter(result);
     } catch (error) {
       console.error(chalk.red(context.openRouter.safeMessage(error)));
+      if (error instanceof AgentRunError) {
+        // The fragment is already in the chat file; name what it cost.
+        printRunFooter(error.result);
+      }
       if (
         !context.openRouter.hasKey ||
         shouldReplaceCredential(error)
@@ -260,7 +386,9 @@ async function runPlainLoop(context: RuntimeContext): Promise<void> {
           await promptForValidKey(
             context.openRouter,
             context.credentials,
+            context.out,
           ),
+          context.out,
         );
       }
     }
@@ -268,6 +396,34 @@ async function runPlainLoop(context: RuntimeContext): Promise<void> {
 
   await context.session.save();
   console.log("Bis bald.");
+}
+
+/**
+ * Collects everything written during one command instead of writing it
+ * immediately — the dashboard renders the whole result as a single block once
+ * the command has finished (`flush`), which is what `captureConsole` used to
+ * do by monkey-patching `console.log`/`console.error` globally.
+ */
+class BufferedCommandOutput implements CommandOutput {
+  #lines: string[] = [];
+  #level: "info" | "error" = "info";
+
+  text(value: string): void {
+    this.#lines.push(value);
+  }
+
+  error(value: string, hint?: string): void {
+    this.#level = "error";
+    this.#lines.push(hint ? `${value}\n${hint}` : value);
+  }
+
+  flush(): { output: string; level: "info" | "error" } {
+    const output = sanitizeTerminalText(this.#lines.join("\n")).trim();
+    const level = this.#level;
+    this.#lines = [];
+    this.#level = "info";
+    return { output, level };
+  }
 }
 
 async function runDashboard(
@@ -282,6 +438,7 @@ async function runDashboard(
   let projectStatus = `${basename(context.workspace)} · Workspace wird geprüft …`;
   let modelDetails = "Modellmetadaten werden geladen …";
   let currentModelInfo: ModelInfo | null = null;
+  let pendingImages: ImageAttachment[] = [];
   let startingSessionCost = context.session.data.costs.totalUsd;
   const ui = new TerminalUi((): DashboardState => {
     const spentSinceStart = Math.max(
@@ -305,8 +462,11 @@ async function runDashboard(
       maxCost: formatUsd(context.config.maxCostUsd),
       maxSteps: context.config.maxSteps,
       keyStatus: dashboardKeyStatus(context.openRouter.keyOrigin),
+      sshHost: context.sshSession.active ?? undefined,
     };
   });
+  const dashboardOut = new BufferedCommandOutput();
+  context.out = dashboardOut;
   ui.loadTurns(context.session.recentTurns(12));
   context.approvals.setPromptHandler((preview) => ui.confirmApproval(preview));
   ui.start();
@@ -335,7 +495,7 @@ async function runDashboard(
         "Gespeichertes allow-all für diese Sitzung verwenden?",
         "Dateiänderungen und Shell-Befehle würden ohne Rückfrage ausgeführt.",
       );
-      if (!keep) {
+      if (!keep.accepted) {
         context.approvals.mode = "ask";
         ui.addMessage(
           "system",
@@ -386,6 +546,7 @@ async function runDashboard(
       }
 
       let runController: AbortController | null = null;
+      let submittedImages: ImageAttachment[] = [];
       try {
         if (trimmed.startsWith("/")) {
           ui.setStatus("Befehl wird ausgeführt");
@@ -393,6 +554,67 @@ async function runDashboard(
           const completedCommand = commandName(trimmed);
           const commandArgs = commandArguments(trimmed);
           const sessionBefore = context.session;
+
+          if (
+            completedCommand === "image" ||
+            completedCommand === "attach"
+          ) {
+            const action = commandTail(trimmed);
+            if (action.toLowerCase() === "clear") {
+              pendingImages = [];
+              ui.setImageAttachments([]);
+              ui.addMessage(
+                "system",
+                "Alle ausstehenden Bildanhänge wurden entfernt.",
+                "/image",
+              );
+            } else if (action.toLowerCase() === "list") {
+              ui.addMessage(
+                "system",
+                pendingImages.length
+                  ? attachmentPromptSummary(pendingImages)
+                  : "Keine Bilder für die nächste Nachricht angehängt.",
+                "/image",
+              );
+            } else {
+              const chosenPath =
+                !action || action.toLowerCase() === "choose"
+                  ? await chooseDashboardImage(ui)
+                  : action;
+              if (chosenPath) {
+                const attachment = await inspectImageAttachment(
+                  chosenPath,
+                  context.workspace,
+                );
+                const withoutDuplicate = pendingImages.filter(
+                  (candidate) => candidate.path !== attachment.path,
+                );
+                const next = [...withoutDuplicate, attachment];
+                validateImageAttachmentSet(next);
+                pendingImages = next;
+                ui.setImageAttachments(pendingImages);
+                ui.addMessage(
+                  "system",
+                  `${attachment.name} wurde für die nächste Nachricht angehängt.\n${attachment.mimeType} · ${formatBytes(attachment.sizeBytes)}`,
+                  "/image",
+                );
+              } else {
+                ui.addMessage(
+                  "system",
+                  "Bildauswahl abgebrochen.",
+                  "/image",
+                );
+              }
+            }
+            ui.setStatus("Bereit", false);
+            continue;
+          }
+
+          if (completedCommand === "whisper" || completedCommand === "voice") {
+            await runVoiceCapture(ui, context);
+            ui.setStatus("Bereit", false);
+            continue;
+          }
 
           if (completedCommand === "model" && commandArgs.length === 0) {
             const selected = await pickDashboardModel(ui, context);
@@ -517,10 +739,12 @@ async function runDashboard(
               const mode = selected.value as ApprovalMode;
               let accepted = true;
               if (mode === "allow-all") {
-                accepted = await ui.confirmAction(
-                  "allow-all aktivieren?",
-                  "Dateiänderungen und Shell-Befehle laufen ohne weitere Rückfrage. Katastrophale Befehle bleiben blockiert.",
-                );
+                accepted = (
+                  await ui.confirmAction(
+                    "allow-all aktivieren?",
+                    `Dateiänderungen und Shell-Befehle laufen ohne weitere Rückfrage. ${catastrophicGuardNotice()}`,
+                  )
+                ).accepted;
               }
               if (accepted) {
                 const previous = context.approvals.mode;
@@ -594,12 +818,13 @@ async function runDashboard(
           }
 
           if (completedCommand === "clear" && commandArgs.length === 0) {
-            const accepted = await ui.confirmAction(
+            const { accepted } = await ui.confirmAction(
               "Gespräch und Sitzungskosten zurücksetzen?",
               "Der gespeicherte Chat-Kontext und die Kostenstatistik dieses Workspaces werden gelöscht.",
             );
             if (accepted) {
               context.session.clear();
+              context.agent.resetConversationMemory();
               await context.session.save();
               ui.loadTurns([]);
               ui.addMessage("system", "Sitzung zurückgesetzt.", "/clear");
@@ -614,9 +839,9 @@ async function runDashboard(
             isApprovalCommand(completedCommand) &&
             commandArgs[0]?.toLowerCase() === "allow-all"
           ) {
-            const accepted = await ui.confirmAction(
+            const { accepted } = await ui.confirmAction(
               "allow-all aktivieren?",
-              "Dateiänderungen und Shell-Befehle werden dann ohne weitere Nachfrage ausgeführt.",
+              `Dateiänderungen und Shell-Befehle werden dann ohne weitere Nachfrage ausgeführt. ${catastrophicGuardNotice()}`,
             );
             if (accepted) {
               context.approvals.mode = "allow-all";
@@ -638,14 +863,13 @@ async function runDashboard(
             continue;
           }
 
-          let captured: Awaited<ReturnType<typeof captureConsole<"continue" | "exit">>>;
-          captured = await captureConsole(
-            () => handleSlashCommand(trimmed, context),
-            false,
-          );
+          const outcome = await handleSlashCommand(trimmed, context);
+          const captured = dashboardOut.flush();
           if (context.session !== sessionBefore) {
             startingSessionCost = context.session.data.costs.totalUsd;
             ui.loadTurns(context.session.recentTurns(40));
+            pendingImages = [];
+            ui.setImageAttachments([]);
             resolvedModel = "";
           }
           if (captured.output) {
@@ -691,48 +915,118 @@ async function runDashboard(
             projectStatus = nextProjectStatus;
             ui.refresh();
           });
-          if (captured.value === "exit") {
+          if (outcome === "exit") {
             break;
           }
           ui.setStatus("Bereit", false);
           continue;
         }
 
-        ui.addMessage("user", trimmed);
+        if (pendingImages.length) {
+          if (!currentModelInfo) {
+            const snapshot = await loadModelSnapshot(
+              context.openRouter,
+              context.config.mainModel,
+            );
+            currentModelInfo = snapshot.model;
+            modelDetails = snapshot.details;
+          }
+          if (
+            currentModelInfo &&
+            !currentModelInfo.inputModalities.includes("image")
+          ) {
+            ui.addMessage(
+              "error",
+              `Das aktive Modell ${context.config.mainModel} unterstützt laut OpenRouter keine Bilder. Wähle mit /model ein Modell mit „Bilder“-Fähigkeit; die Anhänge bleiben erhalten.`,
+              "Bilder",
+            );
+            ui.setStatus("Bereit", false);
+            continue;
+          }
+        }
+        submittedImages = pendingImages.map((attachment) => ({
+          ...attachment,
+        }));
+        pendingImages = [];
+        ui.setImageAttachments([]);
+        const imageSummary = attachmentPromptSummary(submittedImages);
+        ui.addMessage(
+          "user",
+          imageSummary ? `${trimmed}\n\n🖼 ${imageSummary}` : trimmed,
+        );
         ui.beginAssistant(context.config.mainModel);
         runController = new AbortController();
         ui.setCancelHandler(() => {
           runController?.abort(new Error("Der aktuelle Lauf wurde vom Benutzer abgebrochen."));
         });
-        const result = await context.agent.run(trimmed, {
-          onStatus: (status) => ui.setStatus(status),
-          onText: (delta) => ui.appendAssistant(delta),
-          onEvent: (event) => ui.handleRunEvent(event),
-          signal: runController.signal,
-        });
+        const result = await context.agent.run(
+          trimmed,
+          {
+            onStatus: (status) => ui.setStatus(status),
+            onText: (delta) => ui.appendAssistant(delta),
+            onEvent: (event) => {
+              ui.handleRunEvent(event);
+              // A7: the context-fill header segment is fed from outside —
+              // model-end is the only event carrying a fresh inputTokens
+              // measurement, ModelInfo.contextLength comes from the model
+              // picker's last snapshot.
+              if (event.type === "model-end" && currentModelInfo?.contextLength) {
+                ui.setContextPercent(
+                  (event.inputTokens / currentModelInfo.contextLength) * 100,
+                );
+              }
+            },
+            signal: runController.signal,
+          },
+          submittedImages,
+        );
+        submittedImages = [];
         ui.setCancelHandler();
         resolvedModel = result.resolvedModel;
         ui.finishAssistant(result.text);
         ui.setSuggestedReplies(result.suggestions);
+        for (const notice of result.notices) {
+          ui.addMessage("system", notice, "Hinweis");
+        }
         ui.addMessage(
           "system",
-          `Lauf beendet · ${formatUsd(result.costUsd)} · ${formatRouting(result.selectedModel, result.resolvedModel)}`,
+          `${runResultLabel(result.outcome)} · ${formatRunCost(result)} · ${formatRouting(result.selectedModel, result.resolvedModel)}`,
         );
         void inspectWorkspace(context.workspace).then((nextProjectStatus) => {
           projectStatus = nextProjectStatus;
           ui.refresh();
         });
       } catch (error) {
+        const partial = error instanceof AgentRunError ? error.result : null;
         const cancelled =
-          Boolean(runController?.signal.aborted) || isCancellationError(error);
+          error instanceof AgentRunError
+            ? error.outcome === "cancelled"
+            : Boolean(runController?.signal.aborted) ||
+              isAbortError(error);
         ui.setCancelHandler();
-        ui.finishAssistant();
+        // The fragment is already persisted; discarding it in the UI would only
+        // hide what the model actually said before it stopped.
+        ui.finishAssistant(partial?.text);
+        if (submittedImages.length) {
+          pendingImages = [...submittedImages, ...pendingImages];
+          validateImageAttachmentSet(pendingImages);
+          ui.setImageAttachments(pendingImages);
+        }
+        for (const notice of partial?.notices ?? []) {
+          ui.addMessage("system", notice, "Hinweis");
+        }
         ui.addMessage(
           cancelled ? "system" : "error",
           cancelled
-            ? "Lauf abgebrochen. Bereits ausgeführte Tool-Aktionen wurden nicht automatisch zurückgenommen."
+            ? "Lauf abgebrochen. Bereits ausgeführte Tool-Aktionen wurden nicht automatisch zurückgenommen; der Teiltext wurde gespeichert."
             : context.openRouter.safeMessage(error),
         );
+        if (partial && partial.costUsd > 0) {
+          ui.addMessage(
+            "system",
+            `${runResultLabel(partial.outcome)} · ${formatRunCost(partial)}`,
+          );
+        }
         if (
           !cancelled &&
           (!context.openRouter.hasKey || shouldReplaceCredential(error))
@@ -786,7 +1080,7 @@ async function pickDashboardChat(
   context: RuntimeContext,
   preferNew: boolean,
 ): Promise<boolean> {
-  await saveDashboardSessionPreferences(context);
+  await saveDashboardSessionPreferences(context, ui);
   const chats = await SessionStore.list(context.workspace);
   const items = [
     {
@@ -827,14 +1121,10 @@ async function pickDashboardChat(
   }
 
   context.session = next;
-  context.agent = await RouterCodeAgent.create({
-    openRouter: context.openRouter,
-    approvals: context.approvals,
-    session: next,
-    config: context.config,
-    workspace: context.workspace,
-  });
-  await saveDashboardSessionPreferences(context);
+  // Reuse the agent: rebuilding it dropped the cached model resolution, the
+  // compressor price cache and the undo journal on every chat switch.
+  context.agent.setSession(next);
+  await saveDashboardSessionPreferences(context, ui);
   await saveConfig(context.config);
   ui.loadTurns(next.recentTurns(40));
   ui.setStatus(`Chat geöffnet: ${next.data.title}`, false);
@@ -877,28 +1167,59 @@ function formatChatAge(value: string): string {
 
 async function saveDashboardSessionPreferences(
   context: RuntimeContext,
+  ui?: TerminalUi,
 ): Promise<void> {
   context.session.setPreferences(
     context.config.mainModel,
     getReasoningSetting(context.config),
   );
-  await context.session.save();
+  reportSaveOutcome(await context.session.save(), ui);
 }
 
-function parseArgs(args: string[]): CliOptions {
+/**
+ * A second orcode window writing the same chat is resolved by a merge, not
+ * by a silent overwrite — but the user should learn that it happened.
+ */
+function reportSaveOutcome(outcome: SaveOutcome, ui?: TerminalUi): void {
+  if (!outcome.merged && !outcome.conflictBackupPath) {
+    return;
+  }
+  const lines = [
+    outcome.merged
+      ? "Chat wurde mit den Änderungen einer zweiten orcode-Instanz zusammengeführt."
+      : "",
+    outcome.conflictBackupPath
+      ? `Eine unlesbare Chat-Datei wurde gesichert: ${outcome.conflictBackupPath}`
+      : "",
+  ].filter(Boolean);
+  const message = lines.join("\n");
+  if (ui) {
+    ui.addMessage("system", message, "Chat");
+  } else {
+    console.log(chalk.yellow(message));
+  }
+}
+
+export function parseArgs(args: string[]): CliOptions {
   const options: CliOptions = {
     workspace: process.cwd(),
     newChat: false,
     continueChat: false,
     help: false,
+    version: false,
     plain: false,
+    json: false,
   };
   for (let index = 0; index < args.length; index += 1) {
     const argument = args[index];
     if (argument === "--help" || argument === "-h") {
       options.help = true;
+    } else if (argument === "--version" || argument === "-v") {
+      options.version = true;
     } else if (argument === "--plain") {
       options.plain = true;
+    } else if (argument === "--json") {
+      options.json = true;
     } else if (argument === "--cwd" || argument === "-C") {
       options.workspace = requireValue(args, ++index, argument);
     } else if (argument === "--prompt" || argument === "-p") {
@@ -916,11 +1237,14 @@ function parseArgs(args: string[]): CliOptions {
     } else if (argument === "--chat") {
       options.chatId = requireValue(args, ++index, argument);
     } else if (argument.startsWith("-")) {
-      throw new Error(`Unbekannte Option: ${argument}`);
-    } else if (!options.prompt) {
-      options.prompt = argument;
+      throw new CliUsageError(`Unbekannte Option: ${argument}`);
     } else {
-      options.prompt += ` ${argument}`;
+      // K8: a bare positional argument used to be silently absorbed into the
+      // prompt — that turns a typo ("orcode status") into an unnoticed,
+      // paid run. It is rejected instead, with a pointer to -p/--prompt.
+      throw new CliUsageError(
+        `Unerwartetes Argument „${argument}“. Ein Prompt braucht -p/--prompt "…" (oder --json und stdin).`,
+      );
     }
   }
   const chatModes = [
@@ -929,7 +1253,7 @@ function parseArgs(args: string[]): CliOptions {
     Boolean(options.chatId),
   ].filter(Boolean).length;
   if (chatModes > 1) {
-    throw new Error("--new, --continue und --chat können nicht kombiniert werden.");
+    throw new CliUsageError("--new, --continue und --chat können nicht kombiniert werden.");
   }
   return options;
 }
@@ -937,24 +1261,27 @@ function parseArgs(args: string[]): CliOptions {
 function requireValue(args: string[], index: number, option: string): string {
   const value = args[index];
   if (!value) {
-    throw new Error(`${option} benötigt einen Wert.`);
+    throw new CliUsageError(`${option} benötigt einen Wert.`);
   }
   return value;
 }
 
 function printBanner(workspace: string, model: string): void {
-  console.log(chalk.bold.cyan("\nRouterCode 0.3"));
+  console.log(chalk.bold.cyan("\norcode 0.3"));
   console.log(`${chalk.dim("Workspace")} ${workspace}`);
   console.log(`${chalk.dim("Main")}      ${model}`);
 }
 
 function printUsage(): void {
   console.log(`
-RouterCode – lokaler Coding-Agent über OpenRouter
+orcode – lokaler Coding-Agent über OpenRouter
 
 Verwendung:
-  routercode [optionen] [aufgabe]
-  routercode -C /pfad/zum/projekt
+  orcode [optionen] -p "aufgabe"
+  orcode -C /pfad/zum/projekt
+
+Ein bloßes Positionsargument (z. B. „orcode status") wird abgelehnt —
+das wäre sonst ein stiller, kostenpflichtiger Lauf. Nutze -p/--prompt.
 
 Optionen:
   -C, --cwd <pfad>          Arbeitsverzeichnis
@@ -966,7 +1293,13 @@ Optionen:
       --continue            Zuletzt verwendeten Chat fortsetzen
       --chat <id>           Einen bestimmten Chat öffnen
       --plain               Klassische Ausgabe ohne Fullscreen-TUI
+      --json                NDJSON-Ereignisstrom auf stdout; Prompt aus -p
+                             oder, wenn stdin kein TTY ist, aus stdin
   -h, --help                Hilfe
+  -v, --version             Version anzeigen
+
+Exit-Codes: 0 erfolgreich · 1 Laufzeitfehler · 2 Bedienfehler ·
+3 unverifiziert · 124 Schritt-/Kostenlimit erreicht.
 
 Der API-Key wird ausschließlich über OPENROUTER_API_KEY oder die verdeckte
 Eingabe beim Start angenommen und nach erfolgreicher Prüfung sicher im
@@ -974,20 +1307,110 @@ System-Schlüsselbund gespeichert. Ein --key-Argument gibt es absichtlich nicht.
 `);
 }
 
-function printRunFooter(result: {
-  costUsd: number;
-  selectedModel: string;
-  resolvedModel: string;
-}): void {
-  const routing =
-    result.resolvedModel === result.selectedModel
-      ? result.selectedModel
-      : `${result.selectedModel} → ${result.resolvedModel}`;
+/** K8: reads the whole of stdin as the prompt for `--json` when it is a pipe, not a TTY. */
+async function readStdinPrompt(): Promise<string> {
+  const chunks: Buffer[] = [];
+  for await (const chunk of process.stdin) {
+    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+  }
+  return Buffer.concat(chunks).toString("utf8").trim();
+}
+
+/** K8: same shape as `createPlainCommandOutput`, but never writes to stdout — for `--json`. */
+function createStderrCommandOutput(): CommandOutput {
+  return {
+    text(value: string): void {
+      console.error(value);
+    },
+    error(value: string, hint?: string): void {
+      console.error(chalk.red(value));
+      if (hint) {
+        console.error(chalk.dim(hint));
+      }
+    },
+  };
+}
+
+/**
+ * K8 exit-code matrix: 0 erfolgreich · 1 Laufzeitfehler · 3 unverifiziert ·
+ * 124 Schritt-/Kostenlimit. (2 Bedienfehler is thrown as `CliUsageError`
+ * before any run starts, see the top-level `catch` below; `cancelled` is not
+ * one of the five documented codes and uses the conventional SIGINT code.)
+ */
+export function runOutcomeExitCode(outcome: AgentRunOutcome): number {
+  switch (outcome) {
+    case "completed":
+      return 0;
+    case "step-limit":
+    case "cost-limit":
+      return 124;
+    case "cancelled":
+      return 130;
+    case "error":
+      return 1;
+    default:
+      // Forward-compatible: once `AgentRunOutcome` grows A4's "unverified"
+      // outcome, it lands on exit 3 without another edit here.
+      return (outcome as string) === "unverified" ? 3 : 1;
+  }
+}
+
+/**
+ * Runs one prompt to completion outside the TUI/plain-loop, either printing
+ * the human footer or streaming NDJSON run events (K8), and returns the exit
+ * code for that run.
+ */
+async function runNonInteractive(
+  agent: OrcodeAgent,
+  prompt: string,
+  options: { json: boolean },
+): Promise<number> {
+  try {
+    const result = await agent.run(prompt, {
+      onEvent: options.json
+        ? (event: AgentRunEvent) => {
+            process.stdout.write(`${JSON.stringify(event)}\n`);
+          }
+        : undefined,
+    });
+    if (!options.json) {
+      printRunFooter(result);
+    }
+    return runOutcomeExitCode(result.outcome);
+  } catch (error) {
+    // `agent.run` already emitted its `run-end` event on this path (K8
+    // testkriterium 3: the last NDJSON line is always `run-end`) before
+    // rethrowing — nothing more to write to stdout here.
+    if (!options.json) {
+      console.error(chalk.red(errorMessage(error)));
+    }
+    if (error instanceof AgentRunError) {
+      return runOutcomeExitCode(error.outcome);
+    }
+    return 1;
+  }
+}
+
+function printRunFooter(result: AgentRunResult): void {
+  for (const notice of result.notices) {
+    console.log(chalk.yellow(notice));
+  }
   console.log(
     chalk.dim(
-      `Main-Kosten dieses Laufs: ${formatUsd(result.costUsd)} · Modell: ${routing}`,
+      `${runResultLabel(result.outcome)} · Kosten dieses Laufs: ${formatRunCost(result)} · Schritte: ${result.modelSteps} · Modell: ${formatRouting(result.selectedModel, result.resolvedModel)}`,
     ),
   );
+}
+
+/** German label for an `AgentRunResult.outcome`. */
+function runResultLabel(outcome: AgentRunOutcome): string {
+  return runOutcomeLabel(outcome === "completed" ? "complete" : outcome);
+}
+
+function formatRunCost(result: AgentRunResult): string {
+  return result.compressorCostUsd > 0
+    ? `${formatUsd(result.costUsd)} (Main ${formatUsd(result.mainCostUsd)} · Kompressor ${formatUsd(result.compressorCostUsd)})`
+    : formatUsd(result.costUsd);
 }
 
 function formatRouting(selectedModel: string, resolvedModel: string): string {
@@ -1015,6 +1438,183 @@ function commandName(raw: string): string {
 
 function commandArguments(raw: string): string[] {
   return raw.slice(1).trim().split(/\s+/).slice(1);
+}
+
+function commandTail(raw: string): string {
+  return raw.match(/^\/\S+(?:\s+([\s\S]*))?$/)?.[1]?.trim() ?? "";
+}
+
+function recordingLimitLabel(reason: RecordingStopReason): string {
+  return reason === "duration-limit"
+    ? "Zeitlimit (120s) erreicht"
+    : "Größenlimit (25 MB) erreicht";
+}
+
+/**
+ * `/whisper` (`/voice`): asks for one-time consent, picks a recording
+ * provider for this machine, runs the record → stop/cancel → transcribe →
+ * insert-into-input-line flow. Every failure is reported through
+ * `ui.addMessage("error", …)` instead of throwing, so a broken microphone or
+ * a rejected model never crashes the dashboard loop.
+ */
+async function runVoiceCapture(ui: TerminalUi, context: RuntimeContext): Promise<void> {
+  const consented = await ensureVoiceConsent(
+    context.config,
+    async () => {
+      const decision = await ui.confirmAction(
+        "Mikrofonaufnahme an OpenRouter senden?",
+        "orcode nimmt dein Mikrofon auf und schickt die Aufnahme zur Transkription an ein Modell auf OpenRouter. Diese Zustimmung wird gespeichert und danach nicht erneut abgefragt.",
+      );
+      return decision.accepted;
+    },
+    () => saveConfig(context.config),
+  );
+  if (!consented) {
+    ui.addMessage("system", "Spracheingabe abgebrochen: keine Einwilligung erteilt.", "/whisper");
+    return;
+  }
+
+  let recorder: AudioRecorder;
+  try {
+    recorder = await selectAudioRecorder(createAudioRecorders());
+  } catch (error) {
+    ui.addMessage("error", errorMessage(error), "/whisper");
+    return;
+  }
+
+  let handle: RecordingHandle;
+  try {
+    handle = await recorder.start();
+  } catch (error) {
+    ui.addMessage("error", `Aufnahme konnte nicht gestartet werden: ${errorMessage(error)}`, "/whisper");
+    return;
+  }
+
+  const startedAt = handle.startedAt;
+  const tick = (): void => {
+    const seconds = Math.floor((Date.now() - startedAt) / 1_000);
+    ui.updateRecordingStatus(`Aufnahme läuft · ${seconds}s · Enter stoppt · Esc bricht ab`);
+  };
+  const timer = setInterval(tick, 1_000);
+
+  type ControlOutcome =
+    | { via: "user"; action: "stop" | "cancel" }
+    | { via: "limit"; reason: RecordingStopReason; audio: RecordedAudio };
+  let outcome: ControlOutcome;
+  try {
+    outcome = await Promise.race<ControlOutcome>([
+      ui
+        .awaitRecordingControl("Aufnahme läuft · 0s · Enter stoppt · Esc bricht ab")
+        .then((action) => ({ via: "user", action })),
+      handle.autoStopped.then(({ reason, audio }) => ({ via: "limit", reason, audio })),
+    ]);
+  } finally {
+    clearInterval(timer);
+  }
+
+  if (outcome.via === "limit") {
+    // The keypress promise above is still pending — this ends "recording"
+    // mode as if Enter had been pressed, without signalling the recorder
+    // again (it already stopped itself).
+    ui.triggerRecordingControl("stop");
+    ui.addMessage(
+      "system",
+      `Aufnahme automatisch beendet: ${recordingLimitLabel(outcome.reason)}.`,
+      "/whisper",
+    );
+    await transcribeAndInsert(ui, context, outcome.audio);
+    return;
+  }
+
+  if (outcome.action === "cancel") {
+    await handle.cancel();
+    ui.addMessage("system", "Aufnahme abgebrochen.", "/whisper");
+    return;
+  }
+
+  let audio: RecordedAudio;
+  try {
+    audio = await handle.stop();
+  } catch (error) {
+    ui.addMessage("error", errorMessage(error), "/whisper");
+    return;
+  }
+  await transcribeAndInsert(ui, context, audio);
+}
+
+/** Sends the recording to `config.transcriptionModel`, inserts the result into the input line, and always deletes the temp file. */
+async function transcribeAndInsert(
+  ui: TerminalUi,
+  context: RuntimeContext,
+  audio: RecordedAudio,
+): Promise<void> {
+  if (audio.quiet) {
+    ui.addMessage(
+      "system",
+      "Die Aufnahme wirkt sehr leise. Bringt die Erkennung nichts, versuche es lauter oder näher am Mikrofon erneut.",
+      "/whisper",
+    );
+  }
+  ui.setStatus("Aufnahme wird erkannt …");
+  try {
+    const result = await transcribeAudio({
+      client: context.openRouter.client({ scope: "voice" }),
+      openRouter: context.openRouter,
+      modelId: context.config.transcriptionModel,
+      audio,
+    });
+    if (!result.text) {
+      ui.addMessage(
+        "system",
+        "Die Erkennung hat keinen Text geliefert — die Aufnahme war vermutlich zu leise oder unverständlich.",
+        "/whisper",
+      );
+    } else {
+      ui.insertInputText(result.text);
+      ui.addMessage("system", `Erkannt: „${result.text}“ — steht jetzt in der Eingabezeile.`, "/whisper");
+    }
+    if (result.costUsd > 0) {
+      context.session.addCost("voice", result.costUsd);
+      await context.session.save();
+    }
+  } catch (error) {
+    ui.addMessage("error", `Transkription fehlgeschlagen: ${context.openRouter.safeMessage(error)}`, "/whisper");
+  } finally {
+    await deleteRecordedAudio(audio);
+  }
+}
+
+async function chooseDashboardImage(
+  ui: TerminalUi,
+): Promise<string | null> {
+  if (process.platform !== "darwin") {
+    throw new Error(
+      "Automatische Dateiauswahl ist hier nicht verfügbar. Verwende /image <pfad>.",
+    );
+  }
+  return ui.suspend(async () => {
+    try {
+      const { stdout } = await execFileAsync(
+        "osascript",
+        [
+          "-e",
+          'POSIX path of (choose file with prompt "Bild für orcode auswählen" of type {"public.image"})',
+        ],
+        {
+          encoding: "utf8",
+          timeout: 120_000,
+          maxBuffer: 100_000,
+        },
+      );
+      return stdout.trim() || null;
+    } catch (error) {
+      const message = errorMessage(error);
+      if (/canceled|cancelled|-128/i.test(message)) {
+        return null;
+      }
+      throw error;
+    }
+  });
 }
 
 async function initializeDashboardKey(
@@ -1047,7 +1647,7 @@ async function initializeDashboardKey(
     }
     return currentBalance;
   } catch (error) {
-    if (controller.signal.aborted || isCancellationError(error)) {
+    if (controller.signal.aborted || isAbortError(error)) {
       return null;
     }
     if (!shouldReplaceCredential(error)) {
@@ -1076,7 +1676,7 @@ async function initializeDashboardKey(
         fallbackController.signal,
       );
     } catch (error) {
-      if (fallbackController.signal.aborted || isCancellationError(error)) {
+      if (fallbackController.signal.aborted || isAbortError(error)) {
         return null;
       }
       if (!shouldReplaceCredential(error)) {
@@ -1183,7 +1783,7 @@ async function promptDashboardInferenceKey(
         controller.signal,
       );
     } catch (error) {
-      if (controller.signal.aborted || isCancellationError(error)) {
+      if (controller.signal.aborted || isAbortError(error)) {
         ui.addMessage("system", "Key-Prüfung abgebrochen.", "/key");
         return null;
       }
@@ -1230,7 +1830,7 @@ async function promptDashboardManagementKey(
       );
       return true;
     } catch (error) {
-      if (controller.signal.aborted || isCancellationError(error)) {
+      if (controller.signal.aborted || isAbortError(error)) {
         ui.addMessage("system", "Management-Key-Prüfung abgebrochen.", "/key");
         return false;
       }
@@ -1252,48 +1852,6 @@ async function discardRejectedInferenceKey(
     } catch {
       // A replacement can still be used in memory if Keychain cleanup fails.
     }
-  }
-}
-
-function isCancellationError(error: unknown): boolean {
-  return error instanceof Error && (
-    error.name === "AbortError" ||
-    error.name === "RequestAbortedError" ||
-    /abgebrochen|abort/i.test(error.message)
-  );
-}
-
-async function captureConsole<T>(
-  operation: () => Promise<T>,
-  passthrough: boolean,
-): Promise<{ value: T; output: string; level: "info" | "error" }> {
-  const originalLog = console.log;
-  const originalError = console.error;
-  const lines: string[] = [];
-  let level: "info" | "error" = "info";
-  console.log = (...args: unknown[]): void => {
-    lines.push(formatValue(...args));
-    if (passthrough) {
-      originalLog(...args);
-    }
-  };
-  console.error = (...args: unknown[]): void => {
-    level = "error";
-    lines.push(formatValue(...args));
-    if (passthrough) {
-      originalError(...args);
-    }
-  };
-  try {
-    const value = await operation();
-    return {
-      value,
-      output: sanitizeTerminalText(lines.join("\n")).trim(),
-      level,
-    };
-  } finally {
-    console.log = originalLog;
-    console.error = originalError;
   }
 }
 
@@ -1413,7 +1971,39 @@ function isPromptExit(error: unknown): boolean {
   );
 }
 
-void main().catch((error) => {
-  console.error(chalk.red(errorMessage(error)));
-  process.exitCode = 1;
-});
+// Only run `main()` when this file is the actual process entrypoint (`node
+// dist/cli.js` / the `orcode` bin) — not when a test imports pure helpers
+// like `parseArgs` or `runOutcomeExitCode` from this module.
+// `argv[1]` keeps the path the user typed, while the module URL is always
+// symlink-resolved. The installed `orcode` bin *is* a symlink, so comparing
+// the two verbatim never matches and `main()` would silently never run.
+export function isEntrypoint(
+  moduleUrl: string,
+  argv1: string | undefined,
+  resolvePath: (path: string) => string = realpathSync,
+): boolean {
+  if (!argv1) {
+    return false;
+  }
+  if (moduleUrl === pathToFileURL(argv1).href) {
+    return true;
+  }
+  try {
+    return moduleUrl === pathToFileURL(resolvePath(argv1)).href;
+  } catch {
+    // A deleted or unreadable entrypoint is simply not this module.
+    return false;
+  }
+}
+
+const isMainModule = isEntrypoint(import.meta.url, process.argv[1]);
+
+if (isMainModule) {
+  void main().catch((error) => {
+    console.error(chalk.red(errorMessage(error)));
+    // K8: a usage error (bad option, bare positional argument, invalid
+    // --approval/--compress) never even starts a run — it is a
+    // "Bedienfehler", exit 2, distinct from a runtime failure (exit 1).
+    process.exitCode = error instanceof CliUsageError ? 2 : 1;
+  });
+}

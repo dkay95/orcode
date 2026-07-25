@@ -1,0 +1,22 @@
+orcode
+Copyright 2026 Dogancan Kaya
+
+This product is licensed under the Apache License, Version 2.0. See the
+LICENSE file for the full license text.
+
+This product includes third-party open-source software, each under its own
+license, installed as ordinary npm dependencies rather than bundled or
+modified in this repository. At the time of writing, the direct runtime
+dependencies and their licenses are:
+
+  @inquirer/prompts    MIT
+  @napi-rs/keyring     MIT
+  @openrouter/agent    Apache License, Version 2.0
+  chalk                MIT
+  fast-glob            MIT
+  zod                  MIT
+
+The authoritative list of dependencies and their versions is
+package.json / package-lock.json; the authoritative license for each
+dependency is the LICENSE file inside that package as published on npm.
+No modifications have been made to any of these third-party packages.

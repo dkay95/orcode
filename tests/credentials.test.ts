@@ -49,6 +49,13 @@ test("credential store rejects malformed keys before touching the keychain", asy
   assert.equal(values.size, 0);
 });
 
+test("deleting a key that was never stored reports false", async () => {
+  const { store, values } = fakeStore();
+  assert.equal(await store.delete("management"), false);
+  assert.equal(await store.has("management"), false);
+  assert.equal(values.size, 0);
+});
+
 test("credential store errors never include the secret", async () => {
   const { store } = fakeStore({ failOnSet: true });
   const secret = "sk-or-v1-secret-that-must-not-leak-123";

@@ -22,5 +22,6 @@ export function truncate(value: string, maximum: number): string {
 }
 
 export function formatUsd(value: number): string {
-  return `$${value.toFixed(value < 0.01 ? 5 : 3)}`;
+  const rendered = value.toFixed(Math.abs(value) < 0.01 ? 5 : 3);
+  return "$" + rendered;
 }

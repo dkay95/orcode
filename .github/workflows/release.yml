@@ -1,0 +1,42 @@
+name: Release
+
+# Triggered by pushing a tag like v0.4.0. Building and testing happens again
+# here (not just trusted from CI on main) so a release can never ship from an
+# untested tree, and `prepublishOnly` in package.json is a second, local
+# enforcement of the same rule for anyone publishing by hand.
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    name: Build, verify, and publish to npm
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write # required for npm provenance
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: "https://registry.npmjs.org"
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build and verify
+        run: npm run build && npm run check
+
+      - name: Publish to npm
+        run: npm publish --provenance --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

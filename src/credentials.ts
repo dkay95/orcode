@@ -19,6 +19,15 @@ interface KeyringEntry {
 
 type EntryFactory = (service: string, account: string) => KeyringEntry;
 
+// Deliberately still "routercode", not "orcode": this is the OS keychain
+// service identifier the app was published under before the rename. It is
+// never shown to the user in orcode's own UI, so there is no branding cost to
+// leaving it as is — but changing it would mean a stored key filed under the
+// old identifier can no longer be found, forcing every existing user to
+// re-enter their API key. Keeping it exactly as it was is the zero-risk
+// choice; see the rename task notes for the alternative (an on-first-run
+// keychain migration) that was considered and rejected as unnecessary risk
+// for no user-visible benefit.
 const SERVICE = "de.routercode.openrouter";
 const ACCOUNTS: Record<CredentialKind, string> = {
   inference: "inference-api-key",

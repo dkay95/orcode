@@ -18,6 +18,20 @@ test("slash catalog exposes manual reconnect", () => {
   assert.match(reconnect?.description ?? "", /Verbindung/);
 });
 
+test("slash catalog exposes image attachments", () => {
+  const image = rankSlashCommands("/image")[0];
+  assert.equal(image?.name, "image");
+  assert.match(image?.description ?? "", /Bild/);
+  assert.equal(rankSlashCommands("/attach")[0]?.name, "image");
+});
+
+test("slash catalog exposes voice input under /whisper and /voice", () => {
+  const whisper = rankSlashCommands("/whisper")[0];
+  assert.equal(whisper?.name, "whisper");
+  assert.match(whisper?.description ?? "", /Sprach/);
+  assert.equal(rankSlashCommands("/voice")[0]?.name, "whisper");
+});
+
 test("slash catalog ranks partial command names and aliases", () => {
   assert.deepEqual(
     rankSlashCommands("/th").map((command) => command.name),

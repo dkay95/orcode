@@ -1,20 +1,29 @@
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
 import type { ReadStream, WriteStream } from "node:tty";
 import {
   TerminalUi,
-  buildDashboardLayout,
+  buildDashboardFrame,
   sanitizeTerminalText,
-  wrapPlainText,
+  type DashboardFrameInput,
   type DashboardState,
-  type UiMessage,
 } from "../src/tui.js";
+import type { ChatBlock } from "../src/ui/blocks.js";
+import { lineWidth, plainText, type Line } from "../src/ui/spans.js";
+import { createTheme } from "../src/ui/theme.js";
+import { RunViewModel } from "../src/ui/view-model.js";
 import type { ModelInfo } from "../src/types.js";
+
+const theme = createTheme({ level: 0 });
+const NOW = 1_700_000_000_000;
 
 const state: DashboardState = {
   workspace: "/Users/demo/projects/robopet",
-  projectStatus: "robopet · Git main · 3 Änderungen · 12 Chat-Nachrichten",
+  projectStatus: "robopet · Git main*3 · 12 Chat-Nachrichten",
   model: "openrouter/auto",
   modelDetails: "Kontext 1M · dynamischer Preis · Tools, Reasoning",
   resolvedModel: "moonshotai/kimi-k3",
@@ -29,15 +38,40 @@ const state: DashboardState = {
   keyStatus: "im Speicher",
 };
 
-function messages(count: number): UiMessage[] {
-  return Array.from({ length: count }, (_, index) => ({
-    role: index % 2 === 0 ? "user" : "assistant",
-    content: `Nachricht ${index}: ${"langer Chatinhalt ".repeat(5)}`,
-    createdAt: "2026-07-24T12:34:00.000Z",
-  }));
+function text(lines: readonly Line[]): string {
+  return lines.map((line) => plainText(line)).join("\n");
 }
 
-function model(id: string, name = id): ModelInfo {
+function input(overrides: Partial<DashboardFrameInput> = {}): DashboardFrameInput {
+  return {
+    width: 100,
+    height: 28,
+    theme,
+    state,
+    blocks: [],
+    mode: "input",
+    input: "",
+    cursor: 0,
+    status: "Bereit",
+    now: NOW,
+    ...overrides,
+  };
+}
+
+function chat(count: number): ChatBlock[] {
+  const model = new RunViewModel();
+  for (let index = 0; index < count; index += 1) {
+    model.pushUser(`Frage ${index}`, 0, NOW + index);
+    model.appendAssistant(
+      `Antwort ${index}: ${"ausführlicher Text ".repeat(4)}`,
+      NOW + index,
+    );
+    model.finishAssistant();
+  }
+  return [...model.blocks];
+}
+
+function modelInfo(id: string, name = id): ModelInfo {
   return {
     id,
     name,
@@ -88,327 +122,264 @@ class FakeOutput extends EventEmitter {
   }
 }
 
-test("dashboard fills one screen and keeps status elements at fixed rows", () => {
-  const layout = buildDashboardLayout({
-    width: 100,
-    height: 28,
-    state,
-    messages: messages(10),
-    input: "Bitte prüfe die Tests",
-    cursor: 22,
-    scrollOffset: 0,
-    status: "Bereit",
-    busy: false,
-  });
-
-  assert.equal(layout.lines.length, 28);
-  assert.match(layout.lines[0], /ROUTERCODE 0\.3/);
-  assert.match(layout.lines[1], /WORKSPACE.*robopet/);
-  assert.match(layout.lines[2], /Git main.*3 Änderungen/);
-  assert.match(layout.lines[3], /openrouter\/auto.*moonshotai\/kimi-k3/);
-  assert.match(layout.lines[4], /Kontext 1M.*Tools/);
-  assert.match(layout.lines[5], /APPROVAL ask.*THINK auto.*KOMP auto/);
-  assert.match(layout.lines.at(-4) ?? "", /● Bereit/);
-  assert.match(layout.lines.at(-3) ?? "", /MAIN openrouter\/auto.*THINK auto/);
-  assert.match(layout.lines.at(-2) ?? "", /Bitte prüfe die Tests/);
-  assert.match(layout.lines.at(-1) ?? "", /\/ Befehle.*PgUp\/Dn Chat/);
-});
-
-test("scroll offset changes only the chat viewport", () => {
-  const common = {
-    width: 90,
-    height: 24,
-    state,
-    messages: messages(20),
-    input: "",
-    cursor: 0,
-    status: "Bereit",
-    busy: false,
-  };
-  const bottom = buildDashboardLayout({ ...common, scrollOffset: 0 });
-  const older = buildDashboardLayout({ ...common, scrollOffset: 12 });
-
-  assert.deepEqual(bottom.lines.slice(0, 7), older.lines.slice(0, 7));
-  assert.deepEqual(bottom.lines.slice(-5), older.lines.slice(-5));
-  assert.notDeepEqual(
-    bottom.lines.slice(7, -5),
-    older.lines.slice(7, -5),
+function ui(stdin: FakeInput, stdout: FakeOutput): TerminalUi {
+  return new TerminalUi(
+    () => state,
+    stdin as unknown as ReadStream,
+    stdout as unknown as WriteStream,
+    theme,
   );
-  assert.match(older.lines[7], /neuere Chat-Zeilen unterhalb/);
+}
+
+function press(stdin: FakeInput, name: string, character = "", extra: Record<string, unknown> = {}): void {
+  stdin.emit("keypress", character, { name, ctrl: false, meta: false, ...extra });
+}
+
+function type(stdin: FakeInput, value: string): void {
+  for (const character of value) {
+    press(stdin, character.toLowerCase(), character);
+  }
+}
+
+test("frame fills the screen and keeps chrome, divider and input in place", () => {
+  const frame = buildDashboardFrame(input({ blocks: chat(6), input: "Bitte prüfe die Tests", cursor: 21 }));
+
+  assert.equal(frame.lines.length, 28);
+  assert.match(plainText(frame.lines[0]!), /openrouter\/auto → moonshotai\/kimi-k3/);
+  assert.match(plainText(frame.lines[0]!), /ask/);
+  const divider = frame.lines.findIndex((line) => /^─{10,}$/.test(plainText(line)));
+  assert.ok(divider > 0);
+  assert.match(plainText(frame.lines.at(-1)!), /^▌ Bitte prüfe die Tests/);
+  assert.deepEqual(frame.cursor, { row: 28, col: 24 });
 });
 
-test("approval appears in the fixed footer without replacing the chat", () => {
-  const layout = buildDashboardLayout({
-    width: 88,
-    height: 22,
-    state,
-    messages: messages(4),
-    input: "",
-    cursor: 0,
-    scrollOffset: 0,
-    status: "Freigabe erforderlich",
-    busy: true,
-    confirm: {
-      title: "⚠ SHELL Tests ausführen",
-      details: "npm test",
-    },
-  });
+test("a 10-line prompt shows 6 rows and 6/10 (Bauplan A6)", () => {
+  const prompt = Array.from({ length: 10 }, (_, index) => `Zeile ${index}`).join("\n");
+  const frame = buildDashboardFrame(input({ input: prompt, cursor: prompt.length }));
+  const inputArea = frame.lines.slice(-6).map(plainText);
 
-  assert.match(layout.lines.at(-4) ?? "", /SHELL Tests ausführen.*npm test/);
-  assert.match(layout.lines.at(-2) ?? "", /\[y\] Ja.*\[n\/Enter\] Nein/);
+  assert.equal(inputArea.length, 6);
+  assert.match(inputArea.join("\n"), /6\/10/);
+  assert.match(inputArea.at(-1)!, /Zeile 9/);
 });
 
-test("plain wrapping keeps every line within the requested width", () => {
-  const wrapped = wrapPlainText(
-    "Ein sehrlangerwertohneleerzeichen und normaler Text",
-    12,
+test("Kontextfüllstand wird ab 80% in Rolle warn angezeigt (Bauplan A7)", () => {
+  const below = buildDashboardFrame(input({ contextPercent: 79 }));
+  const atThreshold = buildDashboardFrame(input({ contextPercent: 80 }));
+  const belowSpan = below.lines[0]!.spans.find((item) => item.text.includes("79%"));
+  const atSpan = atThreshold.lines[0]!.spans.find((item) => item.text.includes("80%"));
+
+  assert.equal(belowSpan?.role, "muted");
+  assert.equal(atSpan?.role, "warn");
+});
+
+test("secret label stays visible at 200 characters (Bauplan A6)", () => {
+  const secret = "x".repeat(200);
+  const frame = buildDashboardFrame(
+    input({ mode: "secret", input: secret, cursor: secret.length, secretLabel: "OpenRouter API-Key" }),
   );
-  assert.ok(wrapped.length > 2);
-  assert.ok(wrapped.every((line) => Array.from(line).length <= 12));
+  const maskedRows = frame.lines.filter((item) => plainText(item).includes(theme.glyph("mask")));
+
+  assert.ok(maskedRows.length > 0);
+  for (const row of maskedRows) {
+    assert.match(plainText(row), /OpenRouter API-Key/);
+  }
+  assert.doesNotMatch(text(frame.lines), /xxxxx/);
 });
 
-test("wide chat uses a readable centered column and normalizes Markdown", () => {
-  const layout = buildDashboardLayout({
-    width: 170,
-    height: 30,
-    state,
-    messages: [
-      {
-        role: "assistant",
-        content:
-          "## Ergebnis\n- **Tests** laufen mit `npm test` erfolgreich und bleiben gut lesbar.",
-        createdAt: "2026-07-24T12:34:00.000Z",
+test("at rest only header, hint, divider and prompt are on screen", () => {
+  const frame = buildDashboardFrame(input({ mode: "idle", status: "" }));
+  const lines = frame.lines.map((line) => plainText(line));
+  const divider = lines.findIndex((line) => /^─{10,}$/.test(line));
+
+  assert.equal(lines.length, 28);
+  assert.match(lines[divider - 1]!, /Schreib eine Aufgabe/);
+  assert.equal(lines.at(-1), "▌ ");
+  assert.equal(lines.filter((line) => line.trim().length > 0).length, 4);
+});
+
+test("no rendered line is wider than the usable width", () => {
+  for (const width of [40, 60, 100, 170]) {
+    const frame = buildDashboardFrame(
+      input({ width, blocks: chat(4), input: "x".repeat(300), cursor: 300 }),
+    );
+    for (const line of frame.lines) {
+      assert.ok(lineWidth(line) <= width - 1, `width ${width}: ${plainText(line)}`);
+    }
+  }
+});
+
+test("a scrolled viewport adds an indicator line without eating a chat line", () => {
+  const blocks = chat(12);
+  const tail = buildDashboardFrame(input({ height: 24, blocks }));
+  const anchor = { anchor: { blockId: blocks[0]!.id, lineOffset: 0 } };
+  const scrolled = buildDashboardFrame(
+    input({ height: 24, blocks, viewport: anchor, newLinesBelow: 12 }),
+  );
+
+  assert.equal(tail.lines.length, scrolled.lines.length);
+  assert.deepEqual(plainText(tail.lines[0]!), plainText(scrolled.lines[0]!));
+  assert.match(plainText(scrolled.lines[1]!), /↑ .*Zeilen darüber.*End springt ans Ende/);
+  // The first chat line is still visible: the indicator is an extra row.
+  assert.match(plainText(scrolled.lines[2]!), /Frage 0/);
+  assert.match(text(scrolled.lines), /↓ 12 neue Zeilen/);
+});
+
+test("an approval keeps its details once on screen and offers j and n", () => {
+  const model = new RunViewModel();
+  model.pushApproval({
+    risk: "shell",
+    summary: "SHELL · Tests ausführen",
+    details: ["npm test", "in ~/projekt/routercode"],
+    rememberHint: "keine gemerkte Regel für „npm“",
+  });
+  const frame = buildDashboardFrame(
+    input({ mode: "confirm", blocks: [...model.blocks], waitingSince: NOW - 14_000 }),
+  );
+  const screen = text(frame.lines);
+
+  assert.match(screen, /⚠ Freigabe · SHELL · Tests ausführen/);
+  assert.equal(screen.match(/npm test/g)?.length, 1);
+  assert.match(screen, /wartet seit 00:14/);
+  assert.match(plainText(frame.lines.at(-1)!), /j ja · n nein · Enter = nein/);
+});
+
+test("assistant Markdown is translated instead of stripped", () => {
+  const model = new RunViewModel();
+  model.appendAssistant(
+    "## Ergebnis\n- **Tests** laufen mit `npm test` erfolgreich.",
+    NOW,
+  );
+  const frame = buildDashboardFrame(input({ blocks: [...model.blocks] }));
+  const screen = text(frame.lines);
+
+  assert.match(screen, /Ergebnis/);
+  assert.match(screen, /– Tests laufen mit npm test/);
+  assert.doesNotMatch(screen, /\*\*|## /);
+});
+
+test("the expansion area lists commands aligned on the longest visible name", () => {
+  const frame = buildDashboardFrame(
+    input({
+      input: "/m",
+      cursor: 2,
+      list: {
+        entries: [
+          { name: "/model", description: "Main-Modell auswählen" },
+          { name: "/max-cost", description: "Kostenlimit setzen" },
+        ],
+        selectedIndex: 1,
       },
-    ],
-    input: "",
-    cursor: 0,
-    scrollOffset: 0,
-    status: "Bereit",
-    busy: false,
-  });
-
-  const transcript = layout.lines.slice(7, -5).join("\n");
-  const authorLine = layout.lines.find((line) => line.includes("ROUTERCODE ·"));
-  assert.ok((authorLine?.indexOf("ROUTERCODE") ?? 0) > 20);
-  assert.match(transcript, /• Tests laufen mit ‹npm test›/);
-  assert.doesNotMatch(transcript, /\*\*|## Ergebnis/);
-});
-
-test("quick replies remain selectable above a free-form input", () => {
-  const layout = buildDashboardLayout({
-    width: 120,
-    height: 30,
-    state,
-    messages: messages(2),
-    input: "",
-    cursor: 0,
-    scrollOffset: 0,
-    status: "Bereit",
-    busy: false,
-    quickReplies: {
-      items: ["Zeig mir den Diff", "Tests erneut ausführen"],
-      selectedIndex: 1,
-    },
-  });
-
-  const screen = layout.lines.join("\n");
-  assert.match(screen, /ANTWORTVORSCHLÄGE/);
-  assert.match(screen, /› Tests erneut ausführen/);
-  assert.match(layout.lines.at(-2) ?? "", /Eigene Antwort/);
-  assert.match(
-    layout.lines.at(-1) ?? "",
-    /Vorschlag.*eigene Antwort tippen/,
+    }),
   );
+  const lines = frame.lines.map((line) => plainText(line));
+  const first = lines.find((line) => line.includes("/model"))!;
+  const second = lines.find((line) => line.includes("/max-cost"))!;
+
+  assert.equal(first.indexOf("Main-Modell"), second.indexOf("Kostenlimit"));
+  assert.match(second, /^› \/max-cost/);
+  assert.match(second, /2 von 2/);
+  assert.match(lines.at(-1)!, /Tab einsetzen · Enter vervollständigen · Esc Liste schließen/);
 });
 
-test("reasoning panel shows provider text compactly and expands without moving the footer", () => {
-  const layout = buildDashboardLayout({
-    width: 110,
-    height: 30,
-    state,
-    messages: messages(6),
-    input: "",
-    cursor: 0,
-    scrollOffset: 0,
-    status: "Modell denkt",
-    busy: true,
-    reasoningPanel: {
-      model: "moonshotai/kimi-k3",
-      text: "Ich prüfe zuerst die Projektstruktur.\nDanach führe ich gezielt die Tests aus.",
-      tokenCount: 1_240,
-      expanded: false,
-      live: true,
-      truncated: false,
-    },
-  });
-
-  const screen = layout.lines.join("\n");
-  assert.equal(layout.lines.length, 30);
-  assert.match(screen, /DENKEN \[T aufklappen\].*LIVE.*kimi-k3/);
-  assert.match(screen, /Danach führe ich gezielt die Tests aus/);
-  assert.match(screen, /1240 Reasoning-Tokens/);
-  assert.match(layout.lines.at(-1) ?? "", /T Denken/);
-
-  const expanded = buildDashboardLayout({
-    ...{
-      width: 110,
-      height: 30,
-      state,
-      messages: messages(6),
-      input: "",
-      cursor: 0,
-      scrollOffset: 0,
-      status: "Bereit",
-      busy: false,
-    },
-    reasoningPanel: {
-      model: "moonshotai/kimi-k3",
-      text: "Erster Gedankenschritt.\nZweiter Gedankenschritt.",
-      tokenCount: 250,
-      expanded: true,
-      live: false,
-      truncated: false,
-    },
-  });
-  assert.equal(expanded.lines.length, 30);
-  assert.match(expanded.lines.join("\n"), /DENKEN \[T zuklappen\].*LETZTER LAUF/);
-  assert.match(expanded.lines.join("\n"), /Erster Gedankenschritt/);
-  assert.match(expanded.lines.join("\n"), /Zweiter Gedankenschritt/);
-  assert.match(expanded.lines.at(-4) ?? "", /Bereit/);
+test("pending image attachments are reported in the status line", () => {
+  const frame = buildDashboardFrame(input({ blocks: chat(2), attachmentCount: 2 }));
+  assert.match(text(frame.lines), /2 Bilder bereit/);
 });
 
-test("reasoning tokens without provider text are explained instead of faking thoughts", () => {
-  const layout = buildDashboardLayout({
-    width: 100,
-    height: 24,
-    state,
-    messages: [],
-    input: "",
-    cursor: 0,
-    scrollOffset: 0,
-    status: "Bereit",
-    busy: false,
-    reasoningPanel: {
-      model: "provider/model",
-      text: "",
-      tokenCount: 800,
-      expanded: false,
-      live: false,
-      truncated: false,
-    },
+test("reasoning collapses to one line and expands on Ctrl+T", () => {
+  const model = new RunViewModel();
+  model.apply({
+    type: "reasoning",
+    model: "moonshotai/kimi-k3",
+    step: 1,
+    delta: "Ich prüfe zuerst die Projektstruktur. Danach die Tests.",
+    timestamp: NOW,
   });
+  const collapsed = buildDashboardFrame(input({ blocks: [...model.blocks] }));
+  assert.match(text(collapsed.lines), /denkt · 0 Tokens · Ctrl\+T aufklappen/);
 
-  assert.match(
-    layout.lines.join("\n"),
-    /liefert aber keinen lesbaren Text/,
+  model.toggle(model.blocks[0]!.id);
+  const expanded = buildDashboardFrame(input({ blocks: [...model.blocks] }));
+  assert.match(text(expanded.lines), /Ctrl\+T einklappen/);
+  assert.match(text(expanded.lines), /Ich prüfe zuerst die Projektstruktur/);
+});
+
+test("reasoning tokens without provider text never fake thoughts", () => {
+  const model = new RunViewModel();
+  model.apply({ type: "reasoning", model: "p/m", step: 1, delta: "   ", timestamp: NOW });
+  const frame = buildDashboardFrame(input({ blocks: [...model.blocks] }));
+  const shown = frame.lines.map((line) => plainText(line)).filter((line) => line.includes("denkt"));
+
+  assert.equal(shown.length, 1);
+  assert.match(shown[0]!, /denkt · 0 Tokens/);
+});
+
+test("small terminals drop chrome instead of the stream, tiny ones refuse", () => {
+  const small = buildDashboardFrame(input({ width: 60, height: 12, blocks: chat(4) }));
+  assert.equal(small.lines.length, 12);
+  assert.ok(small.chatHeight >= 5);
+
+  const short = buildDashboardFrame(input({ width: 60, height: 8, blocks: chat(4) }));
+  assert.ok(short.chatHeight >= 5);
+  assert.doesNotMatch(plainText(short.lines[0]!), /openrouter/);
+
+  const tiny = buildDashboardFrame(input({ width: 39, height: 8 }));
+  assert.equal(tiny.lines.length, 1);
+  assert.match(plainText(tiny.lines[0]!), /Terminal zu klein \(mindestens 40×8/);
+});
+
+test("a running tool shows exactly one spinner, phase, step and cost", () => {
+  const model = new RunViewModel();
+  model.apply({ type: "run-start", model: "m", maxSteps: 12, timestamp: NOW });
+  model.apply({
+    type: "tool-start",
+    id: "t1",
+    number: 1,
+    name: "run_command",
+    input: { command: "npm run check" },
+    timestamp: NOW,
+  });
+  const frame = buildDashboardFrame(
+    input({
+      mode: "busy",
+      blocks: [...model.blocks],
+      now: NOW + 7_000,
+      run: {
+        phase: "Tool läuft",
+        startedAt: NOW,
+        lastEventAt: NOW + 5_000,
+        step: 4,
+        maxSteps: 12,
+        costUsd: 0.043,
+        running: true,
+      },
+    }),
   );
-});
+  const screen = text(frame.lines);
 
-test("small terminals use the compact header and retain the complete footer", () => {
-  const layout = buildDashboardLayout({
-    width: 60,
-    height: 12,
-    state,
-    messages: [],
-    input: "/help",
-    cursor: 5,
-    scrollOffset: 0,
-    status: "Bereit",
-    busy: false,
-  });
-
-  assert.equal(layout.lines.length, 12);
-  assert.match(layout.lines[0], /ROUTERCODE 0\.3/);
-  assert.doesNotMatch(layout.lines.join("\n"), /DETAILS/);
-  assert.match(layout.lines.at(-4) ?? "", /Bereit/);
-  assert.match(layout.lines.at(-2) ?? "", /\/help/);
-  assert.match(layout.lines.at(-1) ?? "", /Ctrl\+C/);
-});
-
-test("model picker keeps the dashboard fixed and shows search details", () => {
-  const layout = buildDashboardLayout({
-    width: 100,
-    height: 28,
-    state,
-    messages: messages(8),
-    input: "",
-    cursor: 0,
-    scrollOffset: 0,
-    status: "Modell auswählen",
-    busy: false,
-    picker: {
-      title: "Modell auswählen",
-      query: "k",
-      cursor: 1,
-      models: [
-        model("moonshotai/kimi-k3", "Kimi K3"),
-        model("qwen/qwen3-coder", "Qwen Coder"),
-      ],
-      selectedIndex: 0,
-      currentModel: "openrouter/auto",
-    },
-  });
-
-  assert.match(layout.lines[0], /ROUTERCODE 0\.3/);
-  assert.match(layout.lines.join("\n"), /MODELL AUSWÄHLEN/);
-  assert.match(layout.lines.join("\n"), /moonshotai\/kimi-k3/);
-  assert.match(layout.lines.join("\n"), /Kontext 131\.1K/);
-  assert.match(layout.lines.at(-2) ?? "", /Suche.*k/);
-  assert.match(layout.lines.at(-1) ?? "", /Enter übernehmen.*Esc abbrechen/);
-});
-
-test("slash input replaces the chat viewport with described command suggestions", () => {
-  const layout = buildDashboardLayout({
-    width: 100,
-    height: 28,
-    state,
-    messages: messages(8),
-    input: "/th",
-    cursor: 3,
-    scrollOffset: 0,
-    status: "Bereit",
-    busy: false,
-    commandPalette: {
-      input: "/th",
-      commands: [
-        {
-          name: "think",
-          usage: "/think [auto|off|Stufe|budget Tokens]",
-          description: "Reasoning-Stufe oder Thinking-Budget steuern",
-          acceptsArguments: true,
-        },
-      ],
-      selectedIndex: 0,
-    },
-  });
-
-  assert.match(layout.lines.join("\n"), /BEFEHLE/);
-  assert.match(layout.lines.join("\n"), /\/think/);
-  assert.match(layout.lines.join("\n"), /Thinking-Budget steuern/);
-  assert.doesNotMatch(layout.lines.join("\n"), /Nachricht 7/);
-  assert.match(layout.lines.at(-2) ?? "", /\/th/);
-  assert.match(layout.lines.at(-1) ?? "", /Tab einsetzen.*Enter ausführen/);
+  assert.match(screen, /Tool läuft/);
+  assert.match(screen, /00:07/);
+  assert.match(screen, /Schritt 4\/12/);
+  assert.match(screen, /\$0\.0430/);
+  assert.match(screen, /npm run check/);
 });
 
 test("secret entry never renders the actual API key", () => {
   const secret = "sk-or-v1-this-must-never-be-rendered";
-  const layout = buildDashboardLayout({
-    width: 90,
-    height: 24,
-    state,
-    messages: [],
-    input: secret,
-    cursor: secret.length,
-    scrollOffset: 0,
-    status: "Key",
-    busy: false,
-    secret: { label: "OpenRouter API-Key" },
-  });
-  const rendered = layout.lines.join("\n");
+  const frame = buildDashboardFrame(
+    input({
+      mode: "secret",
+      input: secret,
+      cursor: secret.length,
+      secretLabel: "OpenRouter API-Key",
+    }),
+  );
+  const screen = text(frame.lines);
 
-  assert.doesNotMatch(rendered, /this-must-never-be-rendered/);
-  assert.match(rendered, /Key › •+/);
-  assert.match(rendered, /Eingabe bleibt verdeckt/);
+  assert.doesNotMatch(screen, /this-must-never-be-rendered/);
+  assert.match(screen, /▌ •+/);
+  assert.match(screen, /Eingabe bleibt verdeckt/);
 });
 
 test("terminal sanitizer removes CSI, OSC, DCS, and unsafe controls", () => {
@@ -425,220 +396,201 @@ test("terminal sanitizer removes CSI, OSC, DCS, and unsafe controls", () => {
   assert.equal(sanitizeTerminalText(unsafe), "vorrotnach");
 });
 
-test("active run footer shows phase, elapsed time, last event, step, and tool", () => {
-  const layout = buildDashboardLayout({
-    width: 150,
-    height: 30,
-    state: {
-      ...state,
-      reasoning: "max",
-      model: "moonshotai/kimi-k3",
-      resolvedModel: "",
-    },
-    messages: messages(3),
-    input: "",
-    cursor: 0,
-    scrollOffset: 0,
-    status: "SHELL läuft",
-    busy: true,
-    queuedCount: 1,
-    run: {
-      model: "moonshotai/kimi-k3",
-      phase: "SHELL läuft",
-      startedAt: 1_000,
-      lastEventAt: 35_000,
-      step: 4,
-      maxSteps: 12,
-      toolCount: 3,
-      activeTools: [
-        {
-          id: "tool-3",
-          name: "run_command",
-          summary: "./.venv/bin/python -m pytest tests/ -q",
-          startedAt: 32_000,
-        },
-      ],
-      inputTokens: 20_000,
-      outputTokens: 4_000,
-      reasoningTokens: 2_000,
-      costUsd: 0.043,
-      now: 39_000,
-    },
-  });
-
-  assert.match(
-    layout.lines.at(-4) ?? "",
-    /AKTIV.*SHELL läuft.*00:38.*letztes Ereignis vor 00:04.*Schritt 4\/12.*1 vorgemerkt/,
-  );
-  assert.match(
-    layout.lines.at(-3) ?? "",
-    /TOOL SHELL.*pytest.*läuft 00:07/,
-  );
-  assert.match(layout.lines.at(-1) ?? "", /Enter vormerken.*Ctrl\+C Abbruch/);
-});
-
 test("interactive picker filters typed text and selects with arrow keys", async () => {
   const stdin = new FakeInput();
   const stdout = new FakeOutput();
-  const ui = new TerminalUi(
-    () => state,
-    stdin as unknown as ReadStream,
-    stdout as unknown as WriteStream,
-  );
-  const models = [
-    model("alpha/default"),
-    model("moonshotai/kimi-k3"),
-    model("kilo/code"),
-  ];
+  const terminal = ui(stdin, stdout);
+  const models = [modelInfo("alpha/default"), modelInfo("moonshotai/kimi-k3"), modelInfo("kilo/code")];
 
-  ui.start();
+  terminal.start();
   try {
-    const selection = ui.pickModel(
+    const selection = terminal.pickModel(
       (query) => models.filter((item) => item.id.includes(query.toLowerCase())),
       "alpha/default",
       "Kompressor-Modell auswählen",
     );
-    stdin.emit("keypress", "k", { name: "k", ctrl: false, meta: false });
-    stdin.emit("keypress", "", { name: "down", ctrl: false, meta: false });
-    stdin.emit("keypress", "", { name: "return", ctrl: false, meta: false });
+    press(stdin, "k", "k");
+    press(stdin, "down");
+    press(stdin, "return");
 
     assert.equal((await selection)?.id, "kilo/code");
-    const beforeReady = stdout.output.length;
-    ui.setStatus("Bereit", false);
-    await new Promise((resolve) => setTimeout(resolve, 40));
-    assert.match(stdout.output, /KOMPRESSOR-MODELL AUSWÄHLEN/);
-    assert.match(stdout.output, /Suche › k/);
-    assert.match(stdout.output.slice(beforeReady), /● Bereit/);
+    assert.match(stdout.output, /kilo\/code/);
+    assert.match(stdout.output, /▌ k/);
   } finally {
-    ui.stop();
+    terminal.stop();
   }
   assert.equal(stdin.isRaw, false);
 });
 
-test("ordinary f and F keys are accepted as text input", async () => {
+test("ordinary f, F and T keys are accepted as text input", async () => {
   const stdin = new FakeInput();
   const stdout = new FakeOutput();
-  const ui = new TerminalUi(
-    () => state,
-    stdin as unknown as ReadStream,
-    stdout as unknown as WriteStream,
-  );
+  const terminal = ui(stdin, stdout);
 
-  ui.start();
+  terminal.start();
   try {
-    const input = ui.readInput();
-    stdin.emit("keypress", "f", {
-      name: "f",
-      ctrl: false,
-      meta: false,
-      shift: false,
-    });
-    stdin.emit("keypress", "F", {
-      name: "f",
-      ctrl: false,
-      meta: false,
-      shift: true,
-    });
-    stdin.emit("keypress", "", { name: "return", ctrl: false, meta: false });
-    assert.equal(await input, "fF");
+    const value = terminal.readInput();
+    press(stdin, "f", "f");
+    press(stdin, "f", "F", { shift: true });
+    press(stdin, "t", "T", { shift: true });
+    press(stdin, "return");
+    assert.equal(await value, "fFT");
   } finally {
-    ui.stop();
+    terminal.stop();
   }
 });
 
 test("editor inserts text at the logical cursor position", async () => {
   const stdin = new FakeInput();
   const stdout = new FakeOutput();
-  const ui = new TerminalUi(
-    () => state,
-    stdin as unknown as ReadStream,
-    stdout as unknown as WriteStream,
-  );
+  const terminal = ui(stdin, stdout);
 
-  ui.start();
+  terminal.start();
   try {
-    const input = ui.readInput();
-    for (const character of ["H", "l", "l", "o"]) {
-      stdin.emit("keypress", character, {
-        name: character.toLowerCase(),
-        ctrl: false,
-        meta: false,
-      });
-    }
-    for (let index = 0; index < 3; index += 1) {
-      stdin.emit("keypress", "", { name: "left", ctrl: false, meta: false });
-    }
-    stdin.emit("keypress", "a", { name: "a", ctrl: false, meta: false });
-    stdin.emit("keypress", "", { name: "return", ctrl: false, meta: false });
-    assert.equal(await input, "Hallo");
+    const value = terminal.readInput();
+    type(stdin, "Hllo");
+    for (let index = 0; index < 3; index += 1) press(stdin, "left");
+    press(stdin, "a", "a");
+    press(stdin, "return");
+    assert.equal(await value, "Hallo");
   } finally {
-    ui.stop();
+    terminal.stop();
+  }
+});
+
+test("Ctrl+A/E, Ctrl+U/K and Ctrl+W edit the current line only (Bauplan A6)", async () => {
+  const stdin = new FakeInput();
+  const stdout = new FakeOutput();
+  const terminal = ui(stdin, stdout);
+
+  terminal.start();
+  try {
+    const value = terminal.readInput();
+    type(stdin, "erste Zeile");
+    press(stdin, "return", "", { shift: true });
+    type(stdin, "zweite Zeile");
+    // Ctrl+A must land at the start of the *current* (second) line.
+    press(stdin, "a", "a", { ctrl: true });
+    press(stdin, "x", "x");
+    terminal.refresh();
+    assert.match(stdout.output, /xzweite Zeile/);
+
+    // Ctrl+K clears from the cursor to the end of the current line.
+    press(stdin, "k", "k", { ctrl: true });
+    terminal.refresh();
+    assert.ok(
+      stdout.output.lastIndexOf("▌ x[K") > stdout.output.lastIndexOf("zweite"),
+      "the line should be cleared after the cursor",
+    );
+
+    // Ctrl+E jumps to line end, then Ctrl+W deletes the previous word.
+    press(stdin, "e", "e", { ctrl: true });
+    press(stdin, "w", "w", { ctrl: true });
+    press(stdin, "return");
+    assert.equal(await value, "erste Zeile");
+  } finally {
+    terminal.stop();
   }
 });
 
 test("submitted input clears immediately and busy typing is queued FIFO", async () => {
   const stdin = new FakeInput();
   const stdout = new FakeOutput();
-  const ui = new TerminalUi(
-    () => state,
-    stdin as unknown as ReadStream,
-    stdout as unknown as WriteStream,
-  );
+  const terminal = ui(stdin, stdout);
 
-  ui.start();
+  terminal.start();
   try {
-    const first = ui.readInput();
-    for (const character of "Erste Aufgabe") {
-      stdin.emit("keypress", character, {
-        name: character.toLowerCase(),
-        ctrl: false,
-        meta: false,
-      });
-    }
+    const first = terminal.readInput();
+    type(stdin, "Erste Aufgabe");
     await new Promise((resolve) => setTimeout(resolve, 40));
     const beforeSubmit = stdout.output.length;
-    stdin.emit("keypress", "", { name: "return", ctrl: false, meta: false });
+    press(stdin, "return");
     assert.equal(await first, "Erste Aufgabe");
-    const submittedFrame = stdout.output.slice(beforeSubmit);
-    assert.doesNotMatch(submittedFrame, /Erste Aufgabe/);
-    assert.match(submittedFrame, /› █/);
+    assert.doesNotMatch(stdout.output.slice(beforeSubmit), /Erste Aufgabe/);
 
-    for (const character of "Zweite Aufgabe") {
-      stdin.emit("keypress", character, {
-        name: character.toLowerCase(),
-        ctrl: false,
-        meta: false,
-      });
-    }
-    stdin.emit("keypress", "", { name: "return", ctrl: false, meta: false });
+    type(stdin, "Zweite Aufgabe");
+    press(stdin, "return");
     assert.match(stdout.output, /1 Nachricht vorgemerkt/);
-    assert.equal(await ui.readInput(), "Zweite Aufgabe");
+    assert.equal(await terminal.readInput(), "Zweite Aufgabe");
   } finally {
-    ui.stop();
+    terminal.stop();
   }
 });
 
-test("resize performs a complete clear-screen redraw at the new geometry", () => {
+test("bracketed multiline paste is inserted once and only submits on a later Enter", async () => {
   const stdin = new FakeInput();
   const stdout = new FakeOutput();
-  const ui = new TerminalUi(
-    () => state,
-    stdin as unknown as ReadStream,
-    stdout as unknown as WriteStream,
-  );
+  const terminal = ui(stdin, stdout);
 
-  ui.start();
+  terminal.start();
+  try {
+    const value = terminal.readInput();
+    let settled = false;
+    void value.then(() => {
+      settled = true;
+    });
+    press(stdin, "paste-start");
+    type(stdin, "Erste Zeile");
+    press(stdin, "enter", "\n");
+    type(stdin, "Zweite Zeile");
+    press(stdin, "paste-end");
+    await Promise.resolve();
+
+    assert.equal(settled, false);
+    assert.match(stdout.output, /2 Zeilen eingefügt/);
+    assert.match(stdout.output, /Erste Zeile/);
+    assert.match(stdout.output, /\u001b\[\?2004h/);
+
+    press(stdin, "return");
+    assert.equal(await value, "Erste Zeile\nZweite Zeile");
+  } finally {
+    terminal.stop();
+  }
+  assert.match(stdout.output, /\u001b\[\?2004l/);
+});
+
+test("a paste without its end marker still lets Ctrl+C through", () => {
+  const stdin = new FakeInput();
+  const stdout = new FakeOutput();
+  const terminal = ui(stdin, stdout);
+  let cancellations = 0;
+
+  terminal.start();
+  try {
+    terminal.setStatus("Modell arbeitet");
+    terminal.setCancelHandler(() => {
+      cancellations += 1;
+    });
+    press(stdin, "paste-start");
+    type(stdin, "halb eingefügt");
+    press(stdin, "c", "", { ctrl: true });
+
+    assert.equal(cancellations, 1);
+    assert.match(stdout.output, /Abbruch angefordert/);
+  } finally {
+    terminal.stop();
+  }
+});
+
+test("resize redraws without a full clear and repositions the real cursor", () => {
+  const stdin = new FakeInput();
+  const stdout = new FakeOutput();
+  const terminal = ui(stdin, stdout);
+
+  terminal.start();
   try {
     const beforeResize = stdout.output.length;
     stdout.columns = 175;
     stdout.rows = 55;
     process.emit("SIGWINCH");
     const redraw = stdout.output.slice(beforeResize);
-    assert.match(redraw, /^\u001b\[2J\u001b\[H/);
-    assert.match(redraw, /ROUTERCODE 0\.3/);
-    assert.match(redraw, /\r\n/);
+
+    assert.doesNotMatch(redraw, /\u001b\[2J/);
+    assert.match(redraw, /^\u001b\[\?25l\u001b\[H/);
+    assert.match(redraw, /\u001b\[K\r\n/);
+    assert.match(redraw, /\u001b\[J\u001b\[\d+;\d+H\u001b\[\?25h$/);
   } finally {
-    ui.stop();
+    terminal.stop();
   }
 });
 
@@ -646,254 +598,245 @@ test("assistant text after a tool is rendered after the completed tool card", ()
   const stdin = new FakeInput();
   const stdout = new FakeOutput();
   stdout.rows = 40;
-  const ui = new TerminalUi(
-    () => state,
-    stdin as unknown as ReadStream,
-    stdout as unknown as WriteStream,
-  );
+  const terminal = ui(stdin, stdout);
 
-  ui.start();
+  terminal.start();
   try {
-    const startedAt = Date.now();
-    ui.beginAssistant("moonshotai/kimi-k3");
-    ui.handleRunEvent({
-      type: "run-start",
-      model: "moonshotai/kimi-k3",
-      maxSteps: 12,
-      timestamp: startedAt,
-    });
-    ui.appendAssistant("Text vor dem Tool.");
-    ui.handleRunEvent({
+    terminal.beginAssistant("moonshotai/kimi-k3");
+    terminal.handleRunEvent({ type: "run-start", model: "m", maxSteps: 12, timestamp: NOW });
+    terminal.appendAssistant("Text vor dem Tool.");
+    terminal.handleRunEvent({
       type: "tool-start",
       id: "tool-1",
       number: 1,
       name: "run_command",
-      input: {
-        command: "./.venv/bin/python -m pytest tests/ -q",
-      },
-      timestamp: startedAt + 100,
+      input: { command: "python -m pytest" },
+      timestamp: NOW + 100,
     });
-    ui.handleRunEvent({
+    terminal.handleRunEvent({
       type: "tool-end",
       id: "tool-1",
       number: 1,
       name: "run_command",
-      input: {
-        command: "./.venv/bin/python -m pytest tests/ -q",
-      },
-      output: {
-        exitCode: 0,
-        stdout: "116 passed in 0.47s\n",
-        stderr: "",
-        truncated: false,
-      },
+      input: { command: "python -m pytest" },
+      output: { exitCode: 0, stdout: "116 passed in 0.47s\n", stderr: "", truncated: false },
       durationMs: 470,
-      timestamp: startedAt + 570,
+      timestamp: NOW + 570,
     });
-    ui.handleRunEvent({
-      type: "model-start",
-      model: "moonshotai/kimi-k3",
-      step: 2,
-      timestamp: startedAt + 571,
-    });
-    ui.appendAssistant("Text nach dem Tool.");
+    terminal.appendAssistant("Text nach dem Tool.");
 
-    const beforeResize = stdout.output.length;
-    stdout.columns = 120;
-    process.emit("SIGWINCH");
-    const frame = stdout.output.slice(beforeResize);
-    const beforeIndex = frame.indexOf("Text vor dem Tool.");
-    const toolIndex = frame.indexOf("SHELL beendet");
-    const afterIndex = frame.indexOf("Text nach dem Tool.");
+    const screen = text(terminal.frame().lines);
+    const before = screen.indexOf("Text vor dem Tool.");
+    const tool = screen.indexOf("python -m pytest");
+    const after = screen.indexOf("Text nach dem Tool.");
 
-    assert.ok(beforeIndex >= 0);
-    assert.ok(toolIndex > beforeIndex);
-    assert.ok(afterIndex > toolIndex);
-    assert.match(frame, /Exit 0.*116 passed in 0\.47s/);
+    assert.ok(before >= 0);
+    assert.ok(tool > before);
+    assert.ok(after > tool);
+    // exit 0 earns the verified glyph, everything else would only get `~`.
+    assert.match(screen, /✓ python -m pytest/);
   } finally {
-    ui.stop();
+    terminal.stop();
   }
 });
 
-test("uppercase T expands live provider reasoning while lowercase t remains text input", async () => {
+test("Ctrl+T toggles the reasoning block, a bare T does not", async () => {
   const stdin = new FakeInput();
   const stdout = new FakeOutput();
   stdout.rows = 34;
-  const ui = new TerminalUi(
-    () => state,
-    stdin as unknown as ReadStream,
-    stdout as unknown as WriteStream,
-  );
+  const terminal = ui(stdin, stdout);
 
-  ui.start();
+  terminal.start();
   try {
-    const startedAt = Date.now();
-    ui.beginAssistant("moonshotai/kimi-k3");
-    ui.handleRunEvent({
-      type: "run-start",
-      model: "moonshotai/kimi-k3",
-      maxSteps: 12,
-      timestamp: startedAt,
-    });
-    ui.handleRunEvent({
+    terminal.handleRunEvent({ type: "run-start", model: "m", maxSteps: 12, timestamp: NOW });
+    terminal.handleRunEvent({
       type: "reasoning",
-      model: "moonshotai/kimi-k3",
+      model: "m",
       step: 1,
-      delta: "Ich untersuche zunächst die betroffenen Dateien.\nDanach prüfe ich die Tests.",
-      timestamp: startedAt + 10,
+      delta: "Ich untersuche zunächst die betroffenen Dateien.",
+      timestamp: NOW + 10,
     });
+    assert.match(text(terminal.frame().lines), /Ctrl\+T aufklappen/);
 
-    const beforeToggle = stdout.output.length;
-    stdin.emit("keypress", "T", {
-      name: "t",
-      ctrl: false,
-      meta: false,
-      shift: true,
-    });
-    const expandedFrame = stdout.output.slice(beforeToggle);
-    assert.match(expandedFrame, /DENKEN \[T zuklappen\]/);
-    assert.match(expandedFrame, /Ich untersuche zunächst/);
+    press(stdin, "t", "", { ctrl: true });
+    const expanded = text(terminal.frame().lines);
+    assert.match(expanded, /Ctrl\+T einklappen/);
+    assert.match(expanded, /Ich untersuche zunächst/);
 
-    ui.finishAssistant("Fertig.");
-    const input = ui.readInput();
-    stdin.emit("keypress", "t", {
-      name: "t",
-      ctrl: false,
-      meta: false,
-      shift: false,
-    });
-    stdin.emit("keypress", "", { name: "return", ctrl: false, meta: false });
-    assert.equal(await input, "t");
+    terminal.finishAssistant("Fertig.");
+    const value = terminal.readInput();
+    press(stdin, "t", "T", { shift: true });
+    press(stdin, "return");
+    assert.equal(await value, "T");
   } finally {
-    ui.stop();
+    terminal.stop();
   }
 });
 
-test("slash palette completes a partial command with Enter", async () => {
+test("Enter in the command list completes first and executes only afterwards", async () => {
   const stdin = new FakeInput();
   const stdout = new FakeOutput();
-  const ui = new TerminalUi(
-    () => state,
-    stdin as unknown as ReadStream,
-    stdout as unknown as WriteStream,
-  );
+  const terminal = ui(stdin, stdout);
 
-  ui.start();
+  terminal.start();
   try {
-    const input = ui.readInput();
-    for (const character of ["/", "m", "o"]) {
-      stdin.emit("keypress", character, {
-        name: character,
-        ctrl: false,
-        meta: false,
-      });
-    }
-    stdin.emit("keypress", "", { name: "return", ctrl: false, meta: false });
-    assert.equal(await input, "/model");
-    assert.match(stdout.output, /BEFEHLE/);
-    assert.match(stdout.output, /Main-Modell suchen/);
+    const value = terminal.readInput();
+    type(stdin, "/mo");
+    let settled = false;
+    void value.then(() => {
+      settled = true;
+    });
+    press(stdin, "return");
+    await Promise.resolve();
+    assert.equal(settled, false);
+    assert.match(stdout.output, /▌ \/model/);
+
+    press(stdin, "return");
+    assert.equal(await value, "/model");
   } finally {
-    ui.stop();
+    terminal.stop();
   }
 });
 
-test("slash palette uses arrows and Tab without recalling chat history", async () => {
+test("Esc closes the command list and keeps the typed text", async () => {
   const stdin = new FakeInput();
   const stdout = new FakeOutput();
-  const ui = new TerminalUi(
-    () => state,
-    stdin as unknown as ReadStream,
-    stdout as unknown as WriteStream,
-  );
+  const terminal = ui(stdin, stdout);
 
-  ui.start();
+  terminal.start();
   try {
-    const input = ui.readInput();
-    stdin.emit("keypress", "/", { name: "/", ctrl: false, meta: false });
-    stdin.emit("keypress", "", { name: "down", ctrl: false, meta: false });
-    stdin.emit("keypress", "", { name: "tab", ctrl: false, meta: false });
-    for (const character of ["h", "i", "g", "h"]) {
-      stdin.emit("keypress", character, {
-        name: character,
-        ctrl: false,
-        meta: false,
-      });
-    }
-    stdin.emit("keypress", "", { name: "return", ctrl: false, meta: false });
-    assert.equal(await input, "/think high");
+    const value = terminal.readInput();
+    type(stdin, "/mo");
+    assert.match(stdout.output, /Main-Modell/);
+    press(stdin, "escape");
+    const afterEscape = stdout.output.length;
+    terminal.refresh();
+    assert.doesNotMatch(stdout.output.slice(afterEscape), /Esc Liste schließen/);
+
+    press(stdin, "return");
+    assert.equal(await value, "/mo");
   } finally {
-    ui.stop();
+    terminal.stop();
   }
 });
 
-test("compress palette selects the interactive model subcommand", async () => {
+test("command list uses arrows and Tab without recalling chat history", async () => {
   const stdin = new FakeInput();
   const stdout = new FakeOutput();
-  const ui = new TerminalUi(
-    () => state,
+  const terminal = ui(stdin, stdout);
+
+  terminal.start();
+  try {
+    const value = terminal.readInput();
+    press(stdin, "/", "/");
+    press(stdin, "down");
+    press(stdin, "tab");
+    type(stdin, "high");
+    press(stdin, "return");
+    assert.equal(await value, "/think high");
+  } finally {
+    terminal.stop();
+  }
+});
+
+test("@ opens fuzzy file completion and Tab inserts the relative path", async () => {
+  const workspace = mkdtempSync(join(tmpdir(), "routercode-at-"));
+  writeFileSync(join(workspace, "compressor.ts"), "// stub");
+  const stdin = new FakeInput();
+  const stdout = new FakeOutput();
+  const localState: DashboardState = { ...state, workspace };
+  const terminal = new TerminalUi(
+    () => localState,
     stdin as unknown as ReadStream,
     stdout as unknown as WriteStream,
+    theme,
   );
 
-  ui.start();
+  terminal.start();
   try {
-    const input = ui.readInput();
-    for (const character of "/compress") {
-      stdin.emit("keypress", character, {
-        name: character,
-        ctrl: false,
-        meta: false,
-      });
-    }
+    const value = terminal.readInput();
+    type(stdin, "sieh dir @compr");
+    terminal.refresh();
+    assert.match(stdout.output, /compressor\.ts/);
+    press(stdin, "tab");
+    type(stdin, "an");
+    press(stdin, "return");
+    assert.equal(await value, "sieh dir compressor.ts an");
+  } finally {
+    terminal.stop();
+    rmSync(workspace, { recursive: true, force: true });
+  }
+});
+
+test("Ctrl+R searches the own history; Tab inserts, Esc leaves the buffer alone", async () => {
+  const stdin = new FakeInput();
+  const stdout = new FakeOutput();
+  const terminal = ui(stdin, stdout);
+
+  terminal.start();
+  try {
+    const first = terminal.readInput();
+    type(stdin, "npm test ausführen");
+    press(stdin, "return");
+    assert.equal(await first, "npm test ausführen");
+
+    const second = terminal.readInput();
+    press(stdin, "r", "r", { ctrl: true });
+    type(stdin, "npm");
+    terminal.refresh();
+    assert.match(stdout.output, /npm test ausführen/);
+    press(stdin, "tab");
+    press(stdin, "return");
+    assert.equal(await second, "npm test ausführen");
+  } finally {
+    terminal.stop();
+  }
+});
+
+test("compress list selects the interactive model subcommand", async () => {
+  const stdin = new FakeInput();
+  const stdout = new FakeOutput();
+  const terminal = ui(stdin, stdout);
+
+  terminal.start();
+  try {
+    const value = terminal.readInput();
+    type(stdin, "/compress");
     assert.match(stdout.output, /\/compress model/);
-    assert.match(stdout.output, /interaktiv suchen und auswählen/);
-    stdin.emit("keypress", "", { name: "down", ctrl: false, meta: false });
-    stdin.emit("keypress", "", { name: "return", ctrl: false, meta: false });
-    assert.equal(await input, "/compress model");
+    press(stdin, "down");
+    press(stdin, "return");
+    press(stdin, "return");
+    assert.equal(await value, "/compress model");
   } finally {
-    ui.stop();
+    terminal.stop();
   }
 });
 
 test("Tab keeps the primary /allow command instead of rewriting it", async () => {
   const stdin = new FakeInput();
   const stdout = new FakeOutput();
-  const ui = new TerminalUi(
-    () => state,
-    stdin as unknown as ReadStream,
-    stdout as unknown as WriteStream,
-  );
+  const terminal = ui(stdin, stdout);
 
-  ui.start();
+  terminal.start();
   try {
-    const input = ui.readInput();
-    for (const character of "/allow") {
-      stdin.emit("keypress", character, {
-        name: character,
-        ctrl: false,
-        meta: false,
-      });
-    }
-    stdin.emit("keypress", "", { name: "tab", ctrl: false, meta: false });
-    stdin.emit("keypress", "", { name: "return", ctrl: false, meta: false });
-    assert.equal(await input, "/allow");
+    const value = terminal.readInput();
+    type(stdin, "/allow");
+    press(stdin, "tab");
+    press(stdin, "return");
+    assert.equal(await value, "/allow");
   } finally {
-    ui.stop();
+    terminal.stop();
   }
 });
 
 test("generic choice picker filters and returns the selected option", async () => {
   const stdin = new FakeInput();
   const stdout = new FakeOutput();
-  const ui = new TerminalUi(
-    () => state,
-    stdin as unknown as ReadStream,
-    stdout as unknown as WriteStream,
-  );
+  const terminal = ui(stdin, stdout);
 
-  ui.start();
+  terminal.start();
   try {
-    const selection = ui.pickChoice(
+    const selection = terminal.pickChoice(
       "Thinking",
       [
         { value: "auto", label: "Automatisch", description: "Modellvorgabe" },
@@ -901,88 +844,218 @@ test("generic choice picker filters and returns the selected option", async () =
       ],
       "auto",
     );
-    stdin.emit("keypress", "h", { name: "h", ctrl: false, meta: false });
-    stdin.emit("keypress", "", { name: "return", ctrl: false, meta: false });
+    press(stdin, "h", "h");
+    press(stdin, "return");
     assert.equal((await selection)?.value, "high");
-    assert.match(stdout.output, /THINKING/);
     assert.match(stdout.output, /Mehr Reasoning/);
   } finally {
-    ui.stop();
+    terminal.stop();
   }
 });
 
-test("arrow keys submit a selected quick reply", async () => {
+test("arrow keys submit a selected quick reply, typing overrides it", async () => {
   const stdin = new FakeInput();
   const stdout = new FakeOutput();
-  const ui = new TerminalUi(
-    () => state,
-    stdin as unknown as ReadStream,
-    stdout as unknown as WriteStream,
-  );
+  const terminal = ui(stdin, stdout);
 
-  ui.start();
+  terminal.start();
   try {
-    ui.setSuggestedReplies([
-      "Zeig mir den Diff",
-      "Tests erneut ausführen",
-    ]);
-    const input = ui.readInput();
-    stdin.emit("keypress", "", { name: "down", ctrl: false, meta: false });
-    stdin.emit("keypress", "", { name: "return", ctrl: false, meta: false });
-    assert.equal(await input, "Tests erneut ausführen");
-    assert.match(stdout.output, /ANTWORTVORSCHLÄGE/);
+    terminal.setSuggestedReplies(["Zeig mir den Diff", "Tests erneut ausführen"]);
+    const first = terminal.readInput();
+    press(stdin, "down");
+    press(stdin, "return");
+    assert.equal(await first, "Tests erneut ausführen");
+    assert.match(stdout.output, /Zeig mir den Diff/);
+
+    terminal.setSuggestedReplies(["Zeig mir den Diff"]);
+    const second = terminal.readInput();
+    type(stdin, "Mein eigener Kommentar");
+    press(stdin, "return");
+    assert.equal(await second, "Mein eigener Kommentar");
   } finally {
-    ui.stop();
+    terminal.stop();
   }
 });
 
-test("typing submits a custom reply instead of the selected suggestion", async () => {
+test("an approval accepts j as well as y and answers unbound keys", async () => {
   const stdin = new FakeInput();
   const stdout = new FakeOutput();
-  const ui = new TerminalUi(
-    () => state,
-    stdin as unknown as ReadStream,
-    stdout as unknown as WriteStream,
-  );
+  const terminal = ui(stdin, stdout);
 
-  ui.start();
+  terminal.start();
   try {
-    ui.setSuggestedReplies(["Zeig mir den Diff", "Tests erneut ausführen"]);
-    const input = ui.readInput();
-    for (const character of "Mein eigener Kommentar") {
-      stdin.emit("keypress", character, {
-        name: character,
-        ctrl: false,
-        meta: false,
-      });
+    const first = terminal.confirmApproval({
+      name: "run_command",
+      risk: "shell",
+      summary: "rm -rf build",
+      details: "rm -rf build dist",
+    });
+    press(stdin, "q", "q");
+    assert.match(stdout.output, /Nicht belegt · j ja · n nein/);
+    press(stdin, "j", "j");
+    assert.deepEqual(await first, { accepted: true });
+
+    const second = terminal.confirmAction("Sitzung löschen", "alles weg");
+    press(stdin, "n", "n");
+    assert.deepEqual(await second, { accepted: false });
+  } finally {
+    terminal.stop();
+  }
+});
+
+test("a immer remembers allow, d nie remembers deny, g asks for a reason", async () => {
+  const stdin = new FakeInput();
+  const stdout = new FakeOutput();
+  const terminal = ui(stdin, stdout);
+
+  terminal.start();
+  try {
+    const allow = terminal.confirmAction("SHELL · npm test", "npm test");
+    press(stdin, "a", "a");
+    assert.deepEqual(await allow, { accepted: true, remember: "allow" });
+
+    const deny = terminal.confirmAction("SHELL · rm -rf", "rm -rf build");
+    press(stdin, "d", "d");
+    assert.deepEqual(await deny, { accepted: false, remember: "deny" });
+
+    const reasoned = terminal.confirmAction("SHELL · curl", "curl example.com");
+    press(stdin, "g", "g");
+    assert.match(stdout.output, /Begründung eingeben/);
+    type(stdin, "sieht verdächtig aus");
+    press(stdin, "return");
+    assert.deepEqual(await reasoned, { accepted: false, reason: "sieht verdächtig aus" });
+  } finally {
+    terminal.stop();
+  }
+});
+
+test("scrolling back survives new tool output and End returns to the tail", () => {
+  const stdin = new FakeInput();
+  const stdout = new FakeOutput();
+  stdout.rows = 20;
+  const terminal = ui(stdin, stdout);
+
+  terminal.start();
+  try {
+    for (const turn of chat(8)) {
+      if (turn.kind === "user") terminal.addMessage("user", turn.text);
+      else if (turn.kind === "assistant") terminal.addMessage("assistant", turn.text);
     }
-    stdin.emit("keypress", "", { name: "return", ctrl: false, meta: false });
-    assert.equal(await input, "Mein eigener Kommentar");
+    press(stdin, "pageup");
+    const before = plainText(terminal.frame().lines[2]!);
+    assert.match(plainText(terminal.frame().lines[1]!), /Zeilen darüber/);
+
+    terminal.handleRunEvent({ type: "run-start", model: "m", maxSteps: 12, timestamp: NOW });
+    terminal.handleRunEvent({
+      type: "tool-start",
+      id: "tool-1",
+      number: 1,
+      name: "run_command",
+      input: { command: "npm test" },
+      timestamp: NOW,
+    });
+
+    // R9: new content must not yank a scrolled-back viewport to the end.
+    assert.equal(plainText(terminal.frame().lines[2]!), before);
+    assert.match(text(terminal.frame().lines), /neue Zeilen/);
+
+    press(stdin, "end");
+    assert.doesNotMatch(plainText(terminal.frame().lines[1]!), /Zeilen darüber/);
   } finally {
-    ui.stop();
+    terminal.stop();
   }
 });
 
 test("Ctrl+C requests cancellation during a busy run and restores raw mode on stop", () => {
   const stdin = new FakeInput();
   const stdout = new FakeOutput();
-  const ui = new TerminalUi(
-    () => state,
-    stdin as unknown as ReadStream,
-    stdout as unknown as WriteStream,
-  );
+  const terminal = ui(stdin, stdout);
   let cancellations = 0;
 
-  ui.start();
-  ui.setStatus("Modell arbeitet");
-  ui.setCancelHandler(() => {
+  terminal.start();
+  terminal.setStatus("Modell arbeitet");
+  terminal.setCancelHandler(() => {
     cancellations += 1;
   });
-  stdin.emit("keypress", "\u0003", { name: "c", ctrl: true, meta: false });
+  press(stdin, "c", "", { ctrl: true });
 
   assert.equal(cancellations, 1);
   assert.match(stdout.output, /Abbruch angefordert/);
-  ui.stop();
+  terminal.stop();
   assert.equal(stdin.isRaw, false);
   assert.match(stdout.output, /\u001b\[\?25h\u001b\[\?1049l/);
+});
+
+test("Enter stops a /whisper recording, Escape cancels it", async () => {
+  const stdin = new FakeInput();
+  const stdout = new FakeOutput();
+  const terminal = ui(stdin, stdout);
+
+  terminal.start();
+  try {
+    const stopped = terminal.awaitRecordingControl("Aufnahme läuft · 0s · Enter stoppt · Esc bricht ab");
+    terminal.updateRecordingStatus("Aufnahme läuft · 3s · Enter stoppt · Esc bricht ab");
+    assert.match(stdout.output, /Aufnahme läuft · 3s/);
+    press(stdin, "return");
+    assert.equal(await stopped, "stop");
+
+    const cancelled = terminal.awaitRecordingControl("Aufnahme läuft · 0s");
+    press(stdin, "escape");
+    assert.equal(await cancelled, "cancel");
+  } finally {
+    terminal.stop();
+  }
+});
+
+test("Ctrl+C during a recording cancels it instead of exiting", async () => {
+  const stdin = new FakeInput();
+  const stdout = new FakeOutput();
+  const terminal = ui(stdin, stdout);
+
+  terminal.start();
+  try {
+    const recording = terminal.awaitRecordingControl("Aufnahme läuft · 0s");
+    press(stdin, "c", "", { ctrl: true });
+    assert.equal(await recording, "cancel");
+  } finally {
+    terminal.stop();
+  }
+});
+
+test("triggerRecordingControl ends the recording programmatically, e.g. on a hard limit", async () => {
+  const stdin = new FakeInput();
+  const stdout = new FakeOutput();
+  const terminal = ui(stdin, stdout);
+
+  terminal.start();
+  try {
+    const recording = terminal.awaitRecordingControl("Aufnahme läuft · 0s");
+    terminal.triggerRecordingControl("stop");
+    assert.equal(await recording, "stop");
+    // A no-op once the mode has already moved on -- must not throw or hang.
+    terminal.triggerRecordingControl("stop");
+  } finally {
+    terminal.stop();
+  }
+});
+
+test("insertInputText lands text in the input line, appending rather than replacing", () => {
+  const stdin = new FakeInput();
+  const stdout = new FakeOutput();
+  const terminal = ui(stdin, stdout);
+
+  terminal.start();
+  try {
+    void terminal.readInput().catch(() => {});
+    terminal.insertInputText("Hallo Welt");
+    assert.match(text(terminal.frame().lines), /Hallo Welt/);
+
+    type(stdin, " bitte");
+    assert.match(text(terminal.frame().lines), /Hallo Welt bitte/);
+
+    terminal.insertInputText("und noch mehr");
+    assert.match(text(terminal.frame().lines), /Hallo Welt bitte und noch mehr/);
+  } finally {
+    terminal.stop();
+  }
 });

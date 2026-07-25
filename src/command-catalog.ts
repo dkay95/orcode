@@ -22,8 +22,8 @@ export const SLASH_COMMANDS: readonly SlashCommandDefinition[] = [
   },
   {
     name: "allow",
-    usage: "/allow [Modus]",
-    description: "Freigaben interaktiv von read-only bis allow-all wählen",
+    usage: "/allow [Modus|list|forget <id>|forget all]",
+    description: "Freigaben wählen; gemerkte Regeln (K6) auflisten oder vergessen",
     aliases: ["approval", "approvals", "permissions"],
     acceptsArguments: true,
   },
@@ -52,6 +52,19 @@ export const SLASH_COMMANDS: readonly SlashCommandDefinition[] = [
     description: "Kompressor-Modell interaktiv wählen oder Modus konfigurieren",
     aliases: ["compressor"],
     acceptsArguments: true,
+  },
+  {
+    name: "image",
+    usage: "/image [Pfad|clear]",
+    description: "Bild auswählen, per Pfad anhängen oder Anhänge leeren",
+    aliases: ["attach"],
+    acceptsArguments: true,
+  },
+  {
+    name: "whisper",
+    usage: "/whisper",
+    description: "Spracheingabe aufnehmen und als Text in die Eingabezeile einfügen",
+    aliases: ["voice"],
   },
   {
     name: "status",
@@ -100,9 +113,53 @@ export const SLASH_COMMANDS: readonly SlashCommandDefinition[] = [
     acceptsArguments: true,
   },
   {
+    name: "budget",
+    usage: "/budget [day <USD>|total <USD>|on-exceed warn|block]",
+    description: "Workspace-Budget anzeigen oder Tages-/Gesamtlimit setzen",
+    acceptsArguments: true,
+  },
+  {
+    name: "verify",
+    usage: "/verify [on|off|now|suggest|clear|rounds <n>|<befehl>]",
+    description: "Verifikationskommandos nach Änderungen konfigurieren (A4)",
+    acceptsArguments: true,
+  },
+  {
+    name: "web",
+    usage: "/web [on|off|auto]",
+    description: "Websuche-Plugin für den Hauptlauf steuern (A2)",
+    acceptsArguments: true,
+  },
+  {
+    name: "provider",
+    usage: "/provider [sort <modus>|allow|deny|only …|ignore …|clear]",
+    description: "OpenRouter-Anbieterpolitik setzen (A3)",
+    acceptsArguments: true,
+  },
+  {
+    name: "fallback",
+    usage: "/fallback [+<modell>|-<modell>|clear]",
+    description: "Fallback-Modellkette hinter dem Main-Modell pflegen (A3)",
+    aliases: ["fallbacks"],
+    acceptsArguments: true,
+  },
+  {
     name: "history",
     usage: "/history [Anzahl]",
     description: "Letzte Gesprächsrunden anzeigen",
+    acceptsArguments: true,
+  },
+  {
+    name: "checkpoint",
+    usage: "/checkpoint [list|new [Name]|restore <ID|Name>]",
+    description: "Stand im Chat markieren oder auf eine Marke zurücksetzen",
+    aliases: ["checkpoints"],
+    acceptsArguments: true,
+  },
+  {
+    name: "export",
+    usage: "/export [Datei]",
+    description: "Chat als Markdown ausgeben oder in eine Datei schreiben",
     acceptsArguments: true,
   },
   {
@@ -112,8 +169,9 @@ export const SLASH_COMMANDS: readonly SlashCommandDefinition[] = [
   },
   {
     name: "undo",
-    usage: "/undo",
-    description: "Letzte RouterCode-Dateiänderung zurücknehmen",
+    usage: "/undo [--dry-run]",
+    description: "Letzten orcode-Lauf als Einheit zurücknehmen",
+    acceptsArguments: true,
   },
   {
     name: "clear",
@@ -123,7 +181,13 @@ export const SLASH_COMMANDS: readonly SlashCommandDefinition[] = [
   {
     name: "init",
     usage: "/init",
-    description: "ROUTERCODE.md im Workspace anlegen",
+    description: "ORCODE.md im Workspace anlegen",
+  },
+  {
+    name: "ssh",
+    usage: "/ssh [<alias>|status|off]",
+    description: "SSH-Ziel aus ~/.ssh/config wählen, prüfen oder trennen",
+    acceptsArguments: true,
   },
   {
     name: "config",
@@ -139,7 +203,7 @@ export const SLASH_COMMANDS: readonly SlashCommandDefinition[] = [
   {
     name: "quit",
     usage: "/quit",
-    description: "RouterCode beenden",
+    description: "orcode beenden",
     aliases: ["exit", "q"],
   },
 ] as const;

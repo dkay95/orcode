@@ -20,7 +20,7 @@ export type ReasoningSetting =
   | { mode: "effort"; effort: ReasoningEffort }
   | { mode: "budget"; maxTokens: number };
 
-export interface RouterCodeConfig {
+export interface OrcodeConfig {
   mainModel: string;
   compressorModel: string;
   compressionMode: CompressionMode;
@@ -30,6 +30,10 @@ export interface RouterCodeConfig {
   maxCostUsd: number;
   compressorMaxCostUsd: number;
   reasoningByModel: Record<string, ReasoningSetting>;
+  /** Model used by `/whisper` (`/voice`) to transcribe recorded audio. Must support `audio` input. */
+  transcriptionModel: string;
+  /** One-time consent: has the user confirmed that a recording is sent to OpenRouter? */
+  voiceConsentGiven: boolean;
 }
 
 export interface KeyInfo {
@@ -88,6 +92,7 @@ export interface ModelInfo {
 export interface CostLedger {
   mainUsd: number;
   compressorUsd: number;
+  voiceUsd: number;
   totalUsd: number;
 }
 
@@ -123,7 +128,19 @@ export interface ChatSummary {
   updatedAt: string;
 }
 
-export type ToolRisk = "read" | "edit" | "shell";
+/**
+ * `secret-read` is a read whose *content* is the damage: the file would be sent
+ * to the model (and, with an active compressor, to a second one) in plain text.
+ * It is separate from `read` because plain reads never ask and secret reads
+ * always do — even in read-only mode, where the call looks harmless.
+ */
+/**
+ * `remote-shell` is a shell command on a host `WorkspaceGuard` cannot see:
+ * there is no sandbox, no undo and no change journal out there, unlike a
+ * local `shell`/`edit`. It therefore always asks — in every mode, including
+ * `auto-edit` — and only `allow-all` waves it through; see `ApprovalManager`.
+ */
+export type ToolRisk = "read" | "secret-read" | "edit" | "shell" | "remote-shell";
 
 export interface ToolCallPreview {
   name: string;
@@ -153,6 +170,11 @@ export type AgentRunEvent =
       inputTokens: number;
       outputTokens: number;
       reasoningTokens: number;
+      /**
+       * Part of `inputTokens` that the provider served from its prompt cache.
+       * `0` when the provider reports nothing — the run log must never guess.
+       */
+      cachedTokens: number;
       costUsd: number;
       timestamp: number;
     }
@@ -192,8 +214,43 @@ export type AgentRunEvent =
       timestamp: number;
     }
   | {
+      type: "tool-output";
+      id: string;
+      number: number;
+      stream: "stdout" | "stderr";
+      text: string;
+      timestamp: number;
+    }
+  | {
+      type: "verify";
+      command: string;
+      round: number;
+      exitCode: number;
+      durationMs: number;
+      timestamp: number;
+    }
+  | {
+      type: "notice";
+      level: "info" | "warn" | "error";
+      code: string;
+      message: string;
+      hint?: string;
+      actions?: Array<{ key: string; label: string }>;
+      timestamp: number;
+    }
+  | {
       type: "run-end";
-      outcome: "complete" | "error" | "cancelled";
+      /**
+       * `step-limit` and `cost-limit` are successful runs that were stopped
+       * early; the answer is complete, the model was not.
+       */
+      outcome:
+        | "complete"
+        | "step-limit"
+        | "cost-limit"
+        | "error"
+        | "cancelled"
+        | "unverified";
       durationMs: number;
       toolCount: number;
       timestamp: number;
