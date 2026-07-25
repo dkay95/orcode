@@ -86,6 +86,15 @@ export interface OrcodeConfigWithBudget extends OrcodeConfig {
   panelModels: string[];
   /** `/panel judge`: run an extra judge round after every panel call. Off by default — not free, and not automatically an improvement. */
   panelJudge: boolean;
+  /**
+   * Explicit path to a Chrome/Edge/Chromium/Brave executable for
+   * `browser_check`/`/browser`. Empty string (the default) means "search the
+   * usual per-platform locations" — see `findBrowserExecutable` in
+   * browser.ts.
+   */
+  browserPath: string;
+  /** Hard timeout for one `browser_check`/`/browser` inspection. Default 30s, capped at 120s — a headless page load that hangs must not hang the agent run. */
+  browserTimeoutSeconds: number;
 }
 
 /** Anything that may be handed to `validateConfig`/`saveConfig`. */
@@ -98,6 +107,8 @@ export type ConfigInput = OrcodeConfig & {
   contextBudgetRatio?: unknown;
   panelModels?: unknown;
   panelJudge?: unknown;
+  browserPath?: unknown;
+  browserTimeoutSeconds?: unknown;
 };
 
 export const DEFAULT_BUDGET: BudgetConfig = {
@@ -141,6 +152,8 @@ export const DEFAULT_CONFIG: OrcodeConfigWithBudget = {
   contextBudgetRatio: 0.7,
   panelModels: [],
   panelJudge: false,
+  browserPath: "",
+  browserTimeoutSeconds: 30,
 };
 
 export interface ConfigLoadOutcome {
@@ -382,7 +395,23 @@ export function validateConfig(value: ConfigInput): OrcodeConfigWithBudget {
     ),
     panelModels: validatePanelModels(value.panelModels),
     panelJudge: value.panelJudge === true,
+    browserPath: validateBrowserPath(value.browserPath),
+    browserTimeoutSeconds: boundedInteger(
+      value.browserTimeoutSeconds,
+      1,
+      120,
+      DEFAULT_CONFIG.browserTimeoutSeconds,
+    ),
   };
+}
+
+/**
+ * Unlike `nonEmpty` (used for `mainModel` etc.), an empty string is the valid,
+ * meaningful default here — "search the usual per-platform locations" — not a
+ * value to fall back away from.
+ */
+export function validateBrowserPath(value: unknown): string {
+  return typeof value === "string" ? value.trim() : DEFAULT_CONFIG.browserPath;
 }
 
 export function validateFallbackModels(value: unknown): string[] {

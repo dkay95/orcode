@@ -202,11 +202,16 @@ export class ApprovalManager {
     if (request.risk === "read") {
       return request.alwaysAsk ? "ask" : "allow";
     }
-    if (request.risk === "secret-read" || request.risk === "remote-shell") {
-      // Neither can be "blocked" by read-only in a meaningful way (a read
-      // cannot be undone by refusing it after the fact; a remote command has
-      // no local sandbox to contain it either way), but neither may slip
-      // through silently — both always ask, and only `allow-all` skips it.
+    if (
+      request.risk === "secret-read" ||
+      request.risk === "remote-shell" ||
+      request.risk === "network-fetch"
+    ) {
+      // None of these can be "blocked" by read-only in a meaningful way (a
+      // read cannot be undone by refusing it after the fact; a remote
+      // command or an outbound fetch has no local sandbox to contain it
+      // either way), but none may slip through silently — all three always
+      // ask, and only `allow-all` skips it.
       return this.#mode === "allow-all" && !request.alwaysAsk ? "allow" : "ask";
     }
     if (this.#mode === "read-only") {
@@ -261,6 +266,11 @@ function toPreview(request: ApprovalRequest): ToolCallPreview {
     // never depend on someone remembering to word the summary well.
     notes.push(`SSH-ZIEL (NICHT LOKAL): ${request.host.toUpperCase()}`);
   }
+  if (request.risk === "network-fetch") {
+    notes.push(
+      "Externe Adresse: der Seiteninhalt (Text, Skripte, Weiterleitungen) stammt von Dritten und ist nicht vertrauenswürdig.",
+    );
+  }
   if (request.alwaysAsk) {
     notes.push(
       `Geschützter Pfad${request.policyRule ? ` (${request.policyRule})` : ""}: Freigabe ist in jedem Modus nötig.`,
@@ -281,6 +291,8 @@ export function approvalRiskLabel(risk: ApprovalRisk): string {
       return "SHELL";
     case "remote-shell":
       return "SSH";
+    case "network-fetch":
+      return "NETZWERK";
     case "edit":
       return "EDIT";
     case "secret-read":
@@ -339,6 +351,9 @@ function riskLabel(risk: ToolRisk): string {
     // Its own, more emphatic look than local `shell` — a glance must be
     // enough to tell "this leaves the machine" apart from "this doesn't".
     return chalk.bgRed.white.bold(" SSH ");
+  }
+  if (risk === "network-fetch") {
+    return chalk.bgBlue.white.bold(" NETZWERK ");
   }
   if (risk === "shell") {
     return chalk.red("[SHELL]");

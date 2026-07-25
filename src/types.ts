@@ -140,7 +140,22 @@ export interface ChatSummary {
  * local `shell`/`edit`. It therefore always asks — in every mode, including
  * `auto-edit` — and only `allow-all` waves it through; see `ApprovalManager`.
  */
-export type ToolRisk = "read" | "secret-read" | "edit" | "shell" | "remote-shell";
+/**
+ * `network-fetch` is an outbound request to an address the user does not
+ * control (`browser_check` on anything but localhost/`file://` inside the
+ * workspace). The danger is not local damage — it is that the fetched page's
+ * content, scripts and redirects are outside anyone's control and, for the
+ * agent tool, flow straight into the model's context (prompt injection,
+ * tracking, exfiltration via query strings). Same treatment as
+ * `remote-shell`: always asks, in every mode, and only `allow-all` skips it.
+ */
+export type ToolRisk =
+  | "read"
+  | "secret-read"
+  | "edit"
+  | "shell"
+  | "remote-shell"
+  | "network-fetch";
 
 export interface ToolCallPreview {
   name: string;

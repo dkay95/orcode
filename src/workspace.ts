@@ -14,18 +14,24 @@ import {
   writeFile,
 } from "node:fs/promises";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { fileURLToPath } from "node:url";
 import fg from "fast-glob";
 import { tool } from "@openrouter/agent";
 import { z } from "zod";
 import type { ApprovalManager, ApprovalRequest } from "./approval.js";
 import { APP_HOME, writeFileAtomicSecure } from "./config.js";
 import { loadIgnore } from "./ignore.js";
+import {
+  inspectUrl,
+  isLocalHttpHost,
+  validateBrowserUrl,
+} from "./browser.js";
 import { assertSafeGlobPattern, classifyPath } from "./policy.js";
 import { ReadRegistry, sha256Hex } from "./read-registry.js";
 import { findSshHost, loadSshHosts, type SshHost } from "./ssh-config.js";
 import { execSshCommand, type RunSsh } from "./ssh.js";
 import type { ToolRisk } from "./types.js";
-import { hasCode, isRecord, truncate } from "./utils.js";
+import { hasCode, isRecord, sanitizedEnvironment, truncate } from "./utils.js";
 
 const MAX_FILE_BYTES = 1_500_000;
 const MAX_TOOL_OUTPUT = 80_000;
@@ -357,6 +363,20 @@ export class WorkspaceGuard {
   }
 }
 
+/**
+ * Marks a string that came from a web page. Page content is data the agent
+ * reads, never instruction it follows — the same framing project notes get in
+ * agent.ts. Keeping the marker in the value means it survives into the model
+ * context even if a caller reformats the surrounding report.
+ */
+function untrustedLine(value: string): string {
+  return `[Seiteninhalt, nicht vertrauenswürdig] ${text_(value)}`;
+}
+
+function text_(value: string): string {
+  return truncate(value.replace(/\s+/g, " ").trim(), 500);
+}
+
 export interface CodingToolOptions {
   /** Cancels running child processes (Esc / Ctrl+C in the UI). */
   signal?: AbortSignal;
@@ -368,6 +388,12 @@ export interface CodingToolOptions {
   onProcessStart?: (handle: object, tool: string, input: Record<string, unknown>) => void;
   /** Fired for every chunk of stdout/stderr a running process produces (K3). */
   onProcessChunk?: (handle: object, stream: "stdout" | "stderr", text: string) => void;
+  /** `browser_check`: explicit browser binary; unset means auto-detection. */
+  browserPath?: string;
+  /** `browser_check`: hard limit for one inspection, browser startup included. */
+  browserTimeoutSeconds?: number;
+  /** `browser_check`: injected in tests so no real browser ever starts. */
+  inspectUrlFn?: typeof inspectUrl;
   /**
    * `ssh_command`'s dependencies. All optional — the tool falls back to a
    * real `~/.ssh/config` and a real `ssh` process when unset, which is what
@@ -759,6 +785,99 @@ export function createCodingTools(
     },
   });
 
+  /**
+   * A target counts as local when nothing leaves this machine: loopback over
+   * http(s), or a file inside the workspace. Everything else is somebody
+   * else's content and needs an explicit yes.
+   */
+  const isLocalBrowserTarget = async (
+    target: URL,
+    workspaceGuard: WorkspaceGuard,
+  ): Promise<boolean> => {
+    if (target.protocol === "file:") {
+      try {
+        await workspaceGuard.resolvePath(fileURLToPath(target));
+        return true;
+      } catch {
+        return false;
+      }
+    }
+    return isLocalHttpHost(target.hostname);
+  };
+
+  const browserCheckTool = tool({
+    name: "browser_check",
+    description:
+      "Load a page in a headless browser and report what actually happened: title, uncaught JavaScript " +
+      "errors, console messages, failed network requests and load time. Use this to verify front-end work " +
+      "instead of asking the user whether the page looks right. Local addresses (localhost, 127.0.0.1, " +
+      "file:// inside the workspace) run without approval; any other address asks first.",
+    inputSchema: z.object({
+      url: z.string().min(1),
+      waitMs: z.number().int().min(0).max(30_000).default(500),
+      viewport: z
+        .object({
+          width: z.number().int().min(200).max(4000),
+          height: z.number().int().min(200).max(4000),
+        })
+        .optional(),
+      fullPage: z.boolean().default(false),
+    }),
+    outputSchema: z.object({
+      url: z.string(),
+      title: z.string(),
+      pageErrors: z.array(z.string()),
+      consoleMessages: z.array(z.string()),
+      failedRequests: z.array(z.string()),
+      loadTimeMs: z.number(),
+      screenshotPath: z.string().nullable(),
+      truncated: z.boolean(),
+    }),
+    execute: async ({ url, waitMs, viewport, fullPage }) => {
+      const target = validateBrowserUrl(url);
+      const local = await isLocalBrowserTarget(target, guard);
+      if (!local) {
+        // Loading a third-party page pulls its content into the model context.
+        // That is the user's call, not the agent's — a page can carry anything,
+        // including text written to steer whoever reads it.
+        await approvals.authorize({
+          name: "browser_check",
+          risk: "network-fetch",
+          summary: `Fremde Seite laden: ${target.href}`,
+          details:
+            "Der Inhalt dieser Seite geht in den Modellkontext. Er stammt von Dritten und ist nicht vertrauenswürdig.",
+        });
+      }
+      const handle: object = {};
+      options.onProcessStart?.(handle, "browser_check", { url: target.href });
+      const inspect = options.inspectUrlFn ?? inspectUrl;
+      const report = await inspect({
+        url: target.href,
+        timeoutMs: (options.browserTimeoutSeconds ?? 30) * 1000,
+        waitMs,
+        fullPage,
+        ...(viewport ? { viewport } : {}),
+        ...(options.browserPath ? { browserPath: options.browserPath } : {}),
+      });
+      return {
+        url: report.url,
+        title: report.title,
+        // Page-controlled strings. They are quoted as data, never presented as
+        // instructions — same framing the project notes get in agent.ts.
+        pageErrors: report.pageErrors.map((item) => untrustedLine(item)),
+        consoleMessages: report.consoleMessages.map((item) =>
+          untrustedLine(`${item.level}: ${item.text}`),
+        ),
+        failedRequests: report.failedRequests.map((item) =>
+          untrustedLine(`${item.status ?? "—"} ${item.url}`),
+        ),
+        loadTimeMs: report.loadTimeMs,
+        screenshotPath: report.screenshotPath,
+        truncated: report.truncated,
+      };
+    },
+  });
+
   const sshCommandTool = tool({
     name: "ssh_command",
     description:
@@ -847,6 +966,7 @@ export function createCodingTools(
     replaceTextTool,
     runCommandTool,
     gitDiffTool,
+    browserCheckTool,
     sshCommandTool,
   ] as const;
 }
@@ -976,6 +1096,23 @@ function metadataEntry(
  * for headers, `risk` for colouring, and the two `summarize*` functions
  * instead of reaching into the output object themselves.
  */
+/** Flattens a browser report into the text the UI and the pager show. */
+function browserReportText(output: Record<string, unknown>): string {
+  const list = (value: unknown): string[] =>
+    Array.isArray(value) ? value.map((item) => String(item)) : [];
+  const lines: string[] = [`${output.title ?? ""} — ${output.url ?? ""}`];
+  const errors = list(output.pageErrors);
+  const failed = list(output.failedRequests);
+  const console_ = list(output.consoleMessages);
+  if (errors.length > 0) lines.push("", "JS-Fehler:", ...errors);
+  if (failed.length > 0) lines.push("", "Fehlgeschlagene Anfragen:", ...failed);
+  if (console_.length > 0) lines.push("", "Konsole:", ...console_);
+  if (errors.length === 0 && failed.length === 0) {
+    lines.push("", "Keine JS-Fehler, keine fehlgeschlagenen Anfragen.");
+  }
+  return lines.join("\n");
+}
+
 export const TOOL_METADATA: Readonly<Record<string, ToolMetadata>> = Object.freeze({
   read_file: metadataEntry(
     "read_file",
@@ -1074,6 +1211,24 @@ export const TOOL_METADATA: Readonly<Record<string, ToolMetadata>> = Object.free
       [`$ ${text(output.command)}`, text(output.stdout), text(output.stderr)]
         .filter(Boolean)
         .join("\n"),
+  ),
+  browser_check: metadataEntry(
+    "browser_check",
+    "BROWSER",
+    "Seitenprüfung",
+    "network-fetch",
+    (input) => String(input.url ?? ""),
+    (output) => {
+      const errors = Array.isArray(output.pageErrors) ? output.pageErrors.length : 0;
+      const failed = Array.isArray(output.failedRequests) ? output.failedRequests.length : 0;
+      const parts = [`${output.loadTimeMs ?? 0}ms`];
+      if (errors > 0) parts.push(`${errors} JS-Fehler`);
+      if (failed > 0) parts.push(`${failed} fehlgeschlagene Anfragen`);
+      if (errors === 0 && failed === 0) parts.push("ohne Fehler");
+      return parts.join(" · ");
+    },
+    (output, opts) => bodyFromText(browserReportText(output), null, opts),
+    (output) => browserReportText(output),
   ),
   git_diff: metadataEntry(
     "git_diff",
@@ -2321,15 +2476,7 @@ export function isWithinWorkspace(root: string, candidate: string): boolean {
   return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
 }
 
-export function sanitizedEnvironment(
-  environment: NodeJS.ProcessEnv = process.env,
-): NodeJS.ProcessEnv {
-  const result: NodeJS.ProcessEnv = {};
-  for (const [name, value] of Object.entries(environment)) {
-    if (/(key|token|secret|password|credential|authorization|cookie)/i.test(name)) {
-      continue;
-    }
-    result[name] = value;
-  }
-  return result;
-}
+// `sanitizedEnvironment` now lives in utils.ts (browser.ts needs it too, and
+// importing it from here would create a workspace.ts <-> browser.ts cycle);
+// re-exported so every existing import of it from workspace.ts keeps working.
+export { sanitizedEnvironment };
