@@ -174,7 +174,7 @@ export function renderBlock(
         : span(theme.glyph("toolHead"), "muted");
       const info = [
         "denkt",
-        `${block.tokens} Tokens`,
+        `${block.estimated && block.tokens > 0 ? "~" : ""}${block.tokens} Tokens`,
         block.expanded ? "Ctrl+T einklappen" : "Ctrl+T aufklappen",
       ].join(theme.glyph("separator"));
       const lines: Line[] = [head(theme, usable, glyph, [span(info, "muted")])];

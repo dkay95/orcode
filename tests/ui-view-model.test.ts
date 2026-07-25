@@ -267,3 +267,60 @@ test("clear setzt das Modell zurück", () => {
   assert.equal(model.blocks.length, 0);
   assert.equal(model.activeSpinnerId, null);
 });
+
+test("a live reasoning panel never shows 0 tokens", () => {
+  // The provider only reports the real count with `model-end`, i.e. after the
+  // thinking is over. Before this was fixed the header read "0 Tokens" for the
+  // entire time the panel was live.
+  const vm = new RunViewModel();
+  vm.apply({
+    type: "reasoning",
+    model: "m",
+    step: 1,
+    delta: "Ich prüfe zuerst die Schnittstellen des Kompressors.",
+    timestamp: 1,
+  });
+  const live = vm.blocks.at(-1)!;
+  assert.equal(live.kind, "reasoning");
+  if (live.kind !== "reasoning") return;
+  assert.ok(live.tokens > 0, "a live panel must show an estimate, not 0");
+  assert.equal(live.estimated, true);
+
+  vm.apply({
+    type: "model-end",
+    model: "m",
+    step: 1,
+    durationMs: 10,
+    inputTokens: 100,
+    outputTokens: 20,
+    reasoningTokens: 640,
+    cachedTokens: 0,
+    costUsd: 0.001,
+    timestamp: 2,
+  });
+  const done = vm.blocks.at(-1)!;
+  if (done.kind !== "reasoning") return;
+  assert.equal(done.tokens, 640, "the provider's real count wins at the end");
+  assert.equal(done.estimated, false);
+});
+
+test("a provider reporting zero reasoning tokens keeps the estimate", () => {
+  const vm = new RunViewModel();
+  vm.apply({ type: "reasoning", model: "m", step: 1, delta: "x".repeat(400), timestamp: 1 });
+  vm.apply({
+    type: "model-end",
+    model: "m",
+    step: 1,
+    durationMs: 10,
+    inputTokens: 100,
+    outputTokens: 20,
+    reasoningTokens: 0,
+    cachedTokens: 0,
+    costUsd: 0.001,
+    timestamp: 2,
+  });
+  const block = vm.blocks.at(-1)!;
+  if (block.kind !== "reasoning") return;
+  assert.ok(block.tokens > 0, "must not fall back to 0 after showing a number");
+  assert.equal(block.estimated, true);
+});

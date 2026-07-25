@@ -30,7 +30,7 @@ function sampleBlocks(): ChatBlock[] {
   return [
     { kind: "user", id: "u1", at: AT, text: "Bau die Suche um: .gitignore respektieren", attachmentCount: 1 },
     { kind: "assistant", id: "a1", at: AT, text: "# Plan\n\n- **erst** lesen\n- dann `schreiben`", costUsd: 0.0123 },
-    { kind: "reasoning", id: "r1", at: AT, text: "Dann prüfe ich die Schnittstellen des Kompressors.", tokens: 912, live: false, expanded: false, truncated: false },
+    { kind: "reasoning", id: "r1", at: AT, text: "Dann prüfe ich die Schnittstellen des Kompressors.", tokens: 912, estimated: false, live: false, expanded: false, truncated: false },
     {
       kind: "tool",
       id: "t1",

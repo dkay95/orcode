@@ -32,6 +32,8 @@ export type ChatBlock =
       kind: "reasoning";
       text: string;
       tokens: number;
+      /** True while `tokens` is a live estimate, not the provider's count. */
+      estimated: boolean;
       live: boolean;
       expanded: boolean;
       truncated: boolean;

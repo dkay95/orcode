@@ -17,6 +17,20 @@ import { splitHunks, type DiffHunkView } from "./diff-view.js";
 
 const ERROR_LINE = /(^|\s)(error|ERROR|FAIL|Fail|✗|panic|Traceback|error TS\d+)/;
 
+/**
+ * Rough live estimate while reasoning streams in. Providers only report the
+ * real count when the model call ends, so without this the panel would sit at
+ * "0 Tokens" for its entire lifetime. Deliberately coarse — the UI marks the
+ * value as an estimate rather than pretending to be exact.
+ */
+export function estimateTokens(text: string): number {
+  const trimmed = text.trim();
+  // Whitespace-only deltas are not thoughts. Reporting "1 token" for them
+  // would invent content the model never produced.
+  if (trimmed.length === 0) return 0;
+  return Math.max(1, Math.round(trimmed.length / 4));
+}
+
 function textLines(value: string): string[] {
   return value
     .replace(/\r\n?/g, "\n")
@@ -263,7 +277,13 @@ export class RunViewModel {
         const reasoning = this.#reasoningId ? this.#index.get(this.#reasoningId) : undefined;
         if (reasoning && reasoning.kind === "reasoning") {
           reasoning.live = false;
-          reasoning.tokens = event.reasoningTokens;
+          // Prefer the provider's real count; some providers report 0 even
+          // though tokens were spent, and dropping back to 0 after showing a
+          // sensible estimate would look like the panel lost its content.
+          if (event.reasoningTokens > 0) {
+            reasoning.tokens = event.reasoningTokens;
+            reasoning.estimated = false;
+          }
         }
         this.#reasoningId = null;
         return;
@@ -273,6 +293,11 @@ export class RunViewModel {
         if (current && current.kind === "reasoning") {
           current.text += event.delta;
           current.truncated = current.text.length > 4000;
+          // The real count only arrives with `model-end`, i.e. after the
+          // thinking is over. Without an estimate the header would read
+          // "0 Tokens" for the entire time the panel is actually live.
+          current.tokens = estimateTokens(current.text);
+          current.estimated = true;
           return;
         }
         const block = this.#push({
@@ -280,7 +305,8 @@ export class RunViewModel {
           id: this.#id("reasoning"),
           at: event.timestamp,
           text: event.delta,
-          tokens: 0,
+          tokens: estimateTokens(event.delta),
+          estimated: true,
           live: true,
           expanded: false,
           truncated: false,

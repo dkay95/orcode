@@ -297,7 +297,10 @@ test("reasoning collapses to one line and expands on Ctrl+T", () => {
     timestamp: NOW,
   });
   const collapsed = buildDashboardFrame(input({ blocks: [...model.blocks] }));
-  assert.match(text(collapsed.lines), /denkt · 0 Tokens · Ctrl\+T aufklappen/);
+  // While the panel is live the provider has not reported a count yet, so the
+  // header shows a marked estimate. A plain "0 Tokens" here would be the bug
+  // this test used to cement.
+  assert.match(text(collapsed.lines), /denkt · ~\d+ Tokens · Ctrl\+T aufklappen/);
 
   model.toggle(model.blocks[0]!.id);
   const expanded = buildDashboardFrame(input({ blocks: [...model.blocks] }));
