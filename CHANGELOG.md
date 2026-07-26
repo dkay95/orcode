@@ -20,6 +20,12 @@ breaking changes.
   release workflow that publishes to npm.
 - Startup warning on stderr when the workspace root is the user's entire
   home directory, pointing to `-C` for scoping orcode to a project folder.
+- Outbound secret scanner (warn-only): the model-bound context is scanned
+  before every API call and every tool result is scanned before it enters
+  the conversation history; common credential patterns (OpenRouter/OpenAI/
+  Anthropic keys, AWS, GitHub, GitLab, Slack, Google, npm tokens, private
+  key blocks) trigger a visible German warning. Nothing is redacted or
+  blocked — the agent legitimately works on files containing tokens.
 
 ### Changed
 

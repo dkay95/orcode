@@ -20,6 +20,7 @@ import {
 } from "./compressor.js";
 import { ConversationStore } from "./conversation.js";
 import { OpenRouterService } from "./openrouter.js";
+import { formatSecretWarning, scanForSecrets } from "./secrets.js";
 import { createRunId, RunLog } from "./runlog.js";
 import { SessionStore, workspaceSpend } from "./session.js";
 import type {
@@ -457,6 +458,14 @@ export class OrcodeAgent {
       attachments,
       runLimitsMessage,
     );
+    // Warn-only: mögliche Zugangsdaten im ausgehenden Kontext sichtbar
+    // melden, bevor sie zu OpenRouter gehen. Nichts wird redigiert.
+    const outboundFindings = scanForSecrets(`${instructions}\n${modelInputText}`);
+    if (outboundFindings.length) {
+      const warning = formatSecretWarning("Der ausgehende Kontext", outboundFindings);
+      notices.push(warning);
+      emitStatus(observer, warning, chalk.yellow);
+    }
     const result = client.callModel(
       {
         model: this.config.mainModel,
@@ -517,6 +526,20 @@ export class OrcodeAgent {
           PostToolUse: [
             {
               handler: ({ toolName, toolInput, toolOutput, durationMs }) => {
+                // Tool-Ergebnisse wandern in die Historie und damit zu
+                // OpenRouter — hier auf Zugangsdaten prüfen (warn-only).
+                const toolOutputText =
+                  typeof toolOutput === "string"
+                    ? toolOutput
+                    : JSON.stringify(toolOutput) ?? "";
+                const toolFindings = scanForSecrets(toolOutputText);
+                if (toolFindings.length) {
+                  emitStatus(
+                    observer,
+                    formatSecretWarning(`Das Ergebnis von ${toolName}`, toolFindings),
+                    chalk.yellow,
+                  );
+                }
                 const pending = shiftPendingTool(
                   pendingTools,
                   toolName,
