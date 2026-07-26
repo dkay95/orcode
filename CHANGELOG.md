@@ -18,6 +18,8 @@ breaking changes.
 - CI workflow that runs the build, both TypeScript checks, and the test
   suite on a Linux/macOS/Windows x Node 22 matrix, plus a tag-triggered
   release workflow that publishes to npm.
+- Startup warning on stderr when the workspace root is the user's entire
+  home directory, pointing to `-C` for scoping orcode to a project folder.
 
 ### Changed
 

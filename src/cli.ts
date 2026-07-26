@@ -4,6 +4,7 @@ import { input, confirm, select } from "@inquirer/prompts";
 import chalk from "chalk";
 import { execFile } from "node:child_process";
 import { readFileSync, realpathSync } from "node:fs";
+import { homedir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { promisify } from "node:util";
@@ -207,6 +208,12 @@ async function main(): Promise<void> {
   }
 
   const workspace = resolve(options.workspace);
+  const homeWarning = homeWorkspaceWarning(workspace);
+  if (homeWarning) {
+    // stderr, damit --json/NDJSON auf stdout ungestört bleibt; gilt für TUI,
+    // Plain- und Prompt-Modus gleichermaßen.
+    console.error(chalk.yellow(homeWarning));
+  }
   const credentials = new CredentialStore();
   const storedInferenceKey = await loadStoredCredential(
     credentials,
@@ -1576,6 +1583,17 @@ function requireValue(args: string[], index: number, option: string): string {
     throw new CliUsageError(`${option} benötigt einen Wert.`);
   }
   return value;
+}
+
+export const HOME_WORKSPACE_WARNING =
+  "Achtung: Der Workspace ist dein gesamtes Home-Verzeichnis — der Agent kann alles darunter lesen. Starte orcode im Projektordner oder mit -C <pfad>.";
+
+/** Warnt, wenn orcode mit dem Home-Verzeichnis als Workspace läuft. `home` ist für Tests injizierbar. */
+export function homeWorkspaceWarning(
+  workspace: string,
+  home: string = homedir(),
+): string | null {
+  return resolve(workspace) === resolve(home) ? HOME_WORKSPACE_WARNING : null;
 }
 
 function printBanner(workspace: string, model: string): void {

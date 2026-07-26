@@ -3,9 +3,17 @@ import { readFileSync } from "node:fs";
 import test from "node:test";
 import {
   CliUsageError,
+  homeWorkspaceWarning,
   parseArgs,
   runOutcomeExitCode,
 } from "../src/cli.js";
+
+test("homeWorkspaceWarning warnt nur bei Workspace === Home-Verzeichnis", () => {
+  const home = "/tmp/orcode-home-test";
+  assert.match(homeWorkspaceWarning(home, home) ?? "", /Home-Verzeichnis/);
+  assert.match(homeWorkspaceWarning(`${home}/`, home) ?? "", /Home-Verzeichnis/);
+  assert.equal(homeWorkspaceWarning(`${home}/projekt`, home), null);
+});
 
 /**
  * K8: CLI usage parsing and the exit-code matrix. `main()` itself is guarded
