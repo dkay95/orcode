@@ -622,10 +622,10 @@ async function searchFixture(prefix: string): Promise<Sandbox> {
   return box;
 }
 
-test("search_files works without ripgrep", { skip: process.platform === "win32" ? "assertions expect POSIX path separators, TODO: make separator-agnostic" : false }, async () => {
+test("search_files works without ripgrep", async () => {
   const { tools } = await searchFixture("search");
   const result = await invoke(tools, "search_files", { query: "foo" });
-  const matches = String(result.matches);
+  const matches = String(result.matches).replaceAll("\\", "/");
 
   assert.match(matches, /src\/a\.ts:1:const Foo = 1;/);
   assert.match(matches, /src\/b\.txt:2:foo bar/);
@@ -791,7 +791,7 @@ test("replace_text rejects oldText copied straight out of read_file's line numbe
   );
 });
 
-test("list_files respects .gitignore: negation, anchoring, and dir-only patterns", { skip: process.platform === "win32" ? "assertions expect POSIX path separators, TODO: make separator-agnostic" : false }, async () => {
+test("list_files respects .gitignore: negation, anchoring, and dir-only patterns", async () => {
   const { root, tools } = await sandbox("read-only", { prefix: "gitignore" });
   await writeFile(
     join(root, ".gitignore"),
