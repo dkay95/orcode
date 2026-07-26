@@ -25,6 +25,18 @@ breaking changes.
   local install path removed and the command list generated from
   `src/command-catalog.ts` instead of hand-copied.
 
+### Security
+
+- Path-policy directory rules now match case-insensitively. On
+  case-insensitive filesystems (macOS APFS, Windows NTFS) a spelling like
+  `.GIT/hooks/pre-commit` resolves to the real `.git/hooks/` on disk but
+  previously bypassed the only hard `deny` rule, and `.SSH/` bypassed the
+  secret-read approval.
+- Secret-file protection extended: `.npmrc`, `.netrc`/`_netrc`,
+  `.git-credentials`, and `*.key`/`*.p12`/`*.pfx`/`*.keystore`/`*.jks` now
+  require approval on read and write (like `.env`); `.gnupg/**`,
+  `.kube/**`, and `.docker/**` now require approval on read (like `.aws`).
+
 ## [0.3.0] - 2026-07-25
 
 This is the first version documented in this changelog. It reflects the

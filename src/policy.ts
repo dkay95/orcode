@@ -67,6 +67,21 @@ const SECRET_READ_DIRECTORIES: Array<{ segments: string[]; rule: string; reason:
     rule: "aws-directory",
     reason: "In .aws/** liegen Zugangsdaten für AWS.",
   },
+  {
+    segments: [".gnupg"],
+    rule: "gnupg-directory",
+    reason: "In .gnupg/** liegen private GPG-Schlüssel.",
+  },
+  {
+    segments: [".kube"],
+    rule: "kube-directory",
+    reason: "In .kube/** liegen Cluster-Zugangsdaten (z. B. Tokens in config).",
+  },
+  {
+    segments: [".docker"],
+    rule: "docker-directory",
+    reason: "In .docker/** liegen Registry-Zugangsdaten (config.json).",
+  },
 ];
 
 interface NameRule {
@@ -75,12 +90,35 @@ interface NameRule {
   test: (name: string) => boolean;
 }
 
-/** `.env*`, `*.pem`, `id_*` — secret on read, protected on write. */
+/** `.env*`, `.npmrc`, `.netrc`/`_netrc`, `*.pem`, `id_*` — secret on read, protected on write. */
 const SECRET_NAME_RULES: NameRule[] = [
   {
     rule: "dotenv",
     reason: "Dateien mit dem Präfix .env enthalten üblicherweise Zugangsdaten.",
     test: (name) => name.toLowerCase().startsWith(".env"),
+  },
+  {
+    rule: "npmrc",
+    reason: ".npmrc enthält üblicherweise Registry-Tokens für npm und kann Registries umlenken.",
+    test: (name) => name.toLowerCase() === ".npmrc",
+  },
+  {
+    rule: "netrc",
+    reason: ".netrc/_netrc enthält üblicherweise Klartext-Passwörter für Remote-Logins.",
+    test: (name) => {
+      const lowered = name.toLowerCase();
+      return lowered === ".netrc" || lowered === "_netrc";
+    },
+  },
+  {
+    rule: "git-credentials",
+    reason: ".git-credentials enthält Klartext-Passwörter für Git-Remotes.",
+    test: (name) => name.toLowerCase() === ".git-credentials",
+  },
+  {
+    rule: "key-file",
+    reason: "Dateien mit dieser Endung enthalten üblicherweise Schlüsselmaterial.",
+    test: (name) => /\.(key|p12|pfx|keystore|jks)$/.test(name.toLowerCase()),
   },
   {
     rule: "pem-file",
@@ -112,14 +150,21 @@ export function pathSegments(relativePath: string): string[] {
     .filter((segment) => segment.length > 0 && segment !== ".");
 }
 
+/**
+ * Case-insensitive on purpose: APFS and NTFS resolve ".GIT" to the real
+ * ".git", so a strict comparison would let a differently-cased path walk
+ * straight past the hook deny-rule on the two most common filesystems.
+ * On case-sensitive filesystems this only over-protects, never under.
+ */
 function containsSequence(segments: string[], sequence: string[]): boolean {
   if (sequence.length === 0) {
     return false;
   }
-  for (let index = 0; index + sequence.length <= segments.length; index += 1) {
+  const lowered = segments.map((segment) => segment.toLowerCase());
+  for (let index = 0; index + sequence.length <= lowered.length; index += 1) {
     let hit = true;
     for (let offset = 0; offset < sequence.length; offset += 1) {
-      if (segments[index + offset] !== sequence[offset]) {
+      if (lowered[index + offset] !== sequence[offset].toLowerCase()) {
         hit = false;
         break;
       }
