@@ -423,7 +423,11 @@ test("K6.5 — RuleStore schreibt mit Modus 0600 und übersteht einen Neustart",
     });
 
     const info = await stat(rulesPath(appHome));
-    assert.equal(info.mode & 0o777, 0o600);
+    // NTFS has no POSIX mode bits — the mode is asserted on POSIX only;
+    // the persistence assertions below still run on Windows.
+    if (process.platform !== "win32") {
+      assert.equal(info.mode & 0o777, 0o600);
+    }
 
     const reopened = await RuleStore.load(appHome);
     assert.equal(reopened.decide("/ws", "run_command", "npm test"), "allow");

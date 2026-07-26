@@ -221,7 +221,10 @@ test("saveConfig writes atomically, leaves no temp file and keeps 0600", async (
   const entries = await readdir(join(path, ".."));
   assert.deepEqual(entries, ["config.json"]);
   const info = await stat(path);
-  assert.equal(info.mode & 0o777, 0o600);
+  // NTFS has no POSIX mode bits — the mode is asserted on POSIX only.
+  if (process.platform !== "win32") {
+    assert.equal(info.mode & 0o777, 0o600);
+  }
 });
 
 test("saveConfig keeps a copy of a config it could not parse", async () => {

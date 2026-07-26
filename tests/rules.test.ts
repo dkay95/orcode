@@ -121,7 +121,11 @@ test("RuleStore: Persistenzdatei ist 0600 und übersteht einen Neustart", async 
 
     const path = rulesPath(appHome);
     const info = await stat(path);
-    assert.equal(info.mode & 0o777, 0o600);
+    // NTFS has no POSIX mode bits — the mode is asserted on POSIX only;
+    // the persistence assertions below still run on Windows.
+    if (process.platform !== "win32") {
+      assert.equal(info.mode & 0o777, 0o600);
+    }
 
     const raw = await readFile(path, "utf8");
     const parsed = JSON.parse(raw) as { version: number; rules: unknown[] };

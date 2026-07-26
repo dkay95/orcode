@@ -137,8 +137,11 @@ test("RunLog.open creates the chat directory with mode 0700 and the file with mo
 
   const dirStat = await stat(runsDir(home, chatId));
   const fileStat = await stat(runLogPath(home, chatId, runId));
-  assert.equal(dirStat.mode & 0o777, 0o700);
-  assert.equal(fileStat.mode & 0o777, 0o600);
+  // NTFS has no POSIX mode bits — the modes are asserted on POSIX only.
+  if (process.platform !== "win32") {
+    assert.equal(dirStat.mode & 0o777, 0o700);
+    assert.equal(fileStat.mode & 0o777, 0o600);
+  }
 });
 
 test("RunLog.prune with 60 files keeps exactly the 50 most recent", async () => {

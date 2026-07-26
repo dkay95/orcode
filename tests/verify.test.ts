@@ -29,11 +29,21 @@ function collect(): { events: VerifyCommandEvent[]; onEvent: (event: VerifyComma
   return { events, onEvent: (event) => events.push(event) };
 }
 
+// runVerify spawns commands via resolveCommandShell() — /bin/sh unless
+// ORCODE_SHELL/ROUTERCODE_SHELL is set. Windows has no native POSIX shell
+// and CI sets no override, so every test that really spawns a command is
+// POSIX-only until the documented Windows shell gap is fixed upstream.
+// Tests that never reach a spawn (empty list, pre-aborted signal) and the
+// pure config/suggestion tests keep running everywhere.
+const needsPosixShell = {
+  skip: process.platform === "win32" ? "needs a POSIX shell (ORCODE_SHELL/ROUTERCODE_SHELL)" : false,
+};
+
 // ---------------------------------------------------------------------------
 // Criterion 3: the verify path never calls ApprovalManager.authorize.
 // ---------------------------------------------------------------------------
 
-test("runVerify never touches ApprovalManager.authorize, even on failure", async () => {
+test("runVerify never touches ApprovalManager.authorize, even on failure", needsPosixShell, async () => {
   const guard = await tempWorkspace();
   const approvals = new ApprovalManager("ask");
   const authorizeSpy = mock.method(approvals, "authorize");
@@ -45,7 +55,7 @@ test("runVerify never touches ApprovalManager.authorize, even on failure", async
   assert.equal(authorizeSpy.mock.callCount(), 0);
 });
 
-test("runVerify never touches ApprovalManager.authorize on a green run", async () => {
+test("runVerify never touches ApprovalManager.authorize on a green run", needsPosixShell, async () => {
   const guard = await tempWorkspace();
   const approvals = new ApprovalManager("ask");
   const authorizeSpy = mock.method(approvals, "authorize");
@@ -62,7 +72,7 @@ test("runVerify never touches ApprovalManager.authorize on a green run", async (
 // written, successful or not.
 // ---------------------------------------------------------------------------
 
-test("RuleStore stays empty after a verify run, pass or fail", async () => {
+test("RuleStore stays empty after a verify run, pass or fail", needsPosixShell, async () => {
   const guard = await tempWorkspace();
   const appHome = await tempAppHome();
   const { onEvent } = collect();
@@ -86,7 +96,7 @@ test("RuleStore stays empty after a verify run, pass or fail", async () => {
 // one; it only ever returns passed/failed/cancelled).
 // ---------------------------------------------------------------------------
 
-test("aborting mid-verify yields cancelled", async () => {
+test("aborting mid-verify yields cancelled", needsPosixShell, async () => {
   const guard = await tempWorkspace();
   const controller = new AbortController();
   const { onEvent, events } = collect();
@@ -112,7 +122,7 @@ test("an already-aborted signal short-circuits before spawning anything", async 
   assert.deepEqual(events, []);
 });
 
-test("aborting between two commands cancels before the second one runs", async () => {
+test("aborting between two commands cancels before the second one runs", needsPosixShell, async () => {
   const guard = await tempWorkspace();
   const controller = new AbortController();
   const { onEvent, events } = collect();
@@ -132,7 +142,7 @@ test("aborting between two commands cancels before the second one runs", async (
 // Behaviour: sequential execution, stop-at-first-failure, event shape.
 // ---------------------------------------------------------------------------
 
-test("runVerify passes when every command exits 0", async () => {
+test("runVerify passes when every command exits 0", needsPosixShell, async () => {
   const guard = await tempWorkspace();
   const { onEvent, events } = collect();
 
@@ -146,7 +156,7 @@ test("runVerify passes when every command exits 0", async () => {
   assert.ok(events.every((event) => typeof event.timestamp === "number"));
 });
 
-test("runVerify stops at the first failing command and does not run the rest", async () => {
+test("runVerify stops at the first failing command and does not run the rest", needsPosixShell, async () => {
   const guard = await tempWorkspace();
   const { onEvent, events } = collect();
 
@@ -175,7 +185,7 @@ test("an empty command list passes trivially", async () => {
   assert.deepEqual(events, []);
 });
 
-test("a failed command's distilled output prefers error-shaped lines", async () => {
+test("a failed command's distilled output prefers error-shaped lines", needsPosixShell, async () => {
   const guard = await tempWorkspace();
   const { onEvent } = collect();
   const script =
@@ -190,7 +200,7 @@ test("a failed command's distilled output prefers error-shaped lines", async () 
   }
 });
 
-test("a failed command with no error-shaped lines falls back to the tail", async () => {
+test("a failed command with no error-shaped lines falls back to the tail", needsPosixShell, async () => {
   const guard = await tempWorkspace();
   const { onEvent } = collect();
   const script = 'node -e "console.log(\'plain failure\'); process.exit(1)"';
