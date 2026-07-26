@@ -636,7 +636,7 @@ test("search_files works without ripgrep", async () => {
   assert.equal(matches.includes("bin.dat"), false, "Binärdateien werden übersprungen");
 });
 
-test("search_files honours case sensitivity, regex, globs, and context", { skip: process.platform === "win32" ? "assertions expect POSIX path separators, TODO: make separator-agnostic" : false }, async () => {
+test("search_files honours case sensitivity, regex, globs, and context", async () => {
   const { tools } = await searchFixture("search2");
 
   const sensitive = await invoke(tools, "search_files", { query: "foo", caseSensitive: true });
@@ -653,9 +653,10 @@ test("search_files honours case sensitivity, regex, globs, and context", { skip:
   assert.equal(scoped.matchCount, 1);
 
   const context = await invoke(tools, "search_files", { query: "foo bar", contextLines: 1 });
-  assert.match(String(context.matches), /src\/b\.txt-1-erste/);
-  assert.match(String(context.matches), /src\/b\.txt:2:foo bar/);
-  assert.match(String(context.matches), /src\/b\.txt-3-dritte/);
+  const contextMatches = String(context.matches).replaceAll("\\", "/");
+  assert.match(contextMatches, /src\/b\.txt-1-erste/);
+  assert.match(contextMatches, /src\/b\.txt:2:foo bar/);
+  assert.match(contextMatches, /src\/b\.txt-3-dritte/);
 
   const limited = await invoke(tools, "search_files", { query: "foo", limit: 1 });
   assert.equal(limited.matchCount, 1);
@@ -808,7 +809,7 @@ test("list_files respects .gitignore: negation, anchoring, and dir-only patterns
   await writeFile(join(root, "kept.txt"), "x", "utf8");
 
   const result = await invoke(tools, "list_files", { pattern: "**/*" });
-  const files = (result.files as string[]).sort();
+  const files = (result.files as string[]).map((f) => f.replaceAll("\\", "/")).sort();
   assert.deepEqual(files, [".gitignore", "dist/keep.txt", "kept.txt", "sub/root-only"]);
   assert.equal(result.ignoreNote, "");
   assert.ok((result.ignoredCount as number) > 0);
