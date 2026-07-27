@@ -20,6 +20,10 @@ breaking changes.
   release workflow that publishes to npm.
 - Startup warning on stderr when the workspace root is the user's entire
   home directory, pointing to `-C` for scoping orcode to a project folder.
+- `/chat delete <ID|Titel>` (alias `rm`): permanently removes a chat via
+  the new `SessionStore.remove`; ambiguous titles always abort instead of
+  guessing, and deleting the active chat switches to a fresh one so
+  auto-save does not resurrect the file.
 - PowerShell support for `run_command`/`runVerify` on Windows: without a
   configured `ORCODE_SHELL`, `powershell.exe -NoProfile -NonInteractive
   -Command` is the default there instead of the nonexistent `/bin/sh`;

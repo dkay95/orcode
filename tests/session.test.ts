@@ -70,6 +70,28 @@ async function writeLegacySession(
   return legacyPath;
 }
 
+test("SessionStore.remove löscht einen Chat endgültig und meldet unbekannte IDs", async () => {
+  const { workspace, appHome } = await workspaceRoot("chat-delete");
+
+  const keep = SessionStore.create(workspace, appHome, "Bleibt");
+  await keep.save();
+  const gone = SessionStore.create(workspace, appHome, "Weg damit");
+  await gone.save();
+  assert.equal((await SessionStore.list(workspace, appHome)).length, 2);
+
+  await SessionStore.remove(workspace, gone.data.id, appHome);
+  const remaining = await SessionStore.list(workspace, appHome);
+  assert.deepEqual(remaining.map((chat) => chat.id), [keep.data.id]);
+  await assert.rejects(
+    SessionStore.openById(workspace, gone.data.id, appHome),
+    /nicht gefunden/,
+  );
+  await assert.rejects(
+    SessionStore.remove(workspace, gone.data.id, appHome),
+    /nicht gefunden/,
+  );
+});
+
 test("workspace can contain multiple independently persisted chats", async () => {
   const { workspace, appHome } = await workspaceRoot("chats");
 

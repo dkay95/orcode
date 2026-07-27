@@ -148,6 +148,34 @@ export class SessionStore {
     throw new Error(`Chat-Datei ist ungültig: ${id}`);
   }
 
+  /**
+   * Deletes a chat file for good (plus a stale lock, if one is around).
+   * There is no trash — the UI layer asks for confirmation before calling.
+   */
+  static async remove(
+    workspace: string,
+    id: string,
+    appHome = APP_HOME,
+  ): Promise<void> {
+    assertChatId(id);
+    const path = chatPath(appHome, workspace, id);
+    try {
+      await unlink(path);
+    } catch (error) {
+      if (hasCode(error, "ENOENT")) {
+        throw new Error(`Chat nicht gefunden: ${id}`);
+      }
+      throw error;
+    }
+    try {
+      await unlink(chatLockPath(path));
+    } catch (error) {
+      if (!hasCode(error, "ENOENT")) {
+        throw error;
+      }
+    }
+  }
+
   /** Read only: listing chats never writes to disk (B15). */
   static async list(
     workspace: string,

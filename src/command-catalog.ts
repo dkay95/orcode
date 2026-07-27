@@ -29,7 +29,7 @@ export const SLASH_COMMANDS: readonly SlashCommandDefinition[] = [
   },
   {
     name: "chat",
-    usage: "/chat [new|list|open|search|rename|fork]",
+    usage: "/chat [new|list|open|search|rename|fork|delete]",
     description: "Chats durchsuchen, auswählen, anlegen, umbenennen oder verzweigen",
     aliases: ["chats", "switch"],
     acceptsArguments: true,

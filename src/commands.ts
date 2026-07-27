@@ -1353,8 +1353,39 @@ async function chatCommand(
     return;
   }
 
+  if (action === "delete" || action === "rm") {
+    const query = args.slice(1).join(" ").trim();
+    if (!query) {
+      throw new Error("Verwendung: /chat delete <ID oder Titel>");
+    }
+    const chats = await SessionStore.list(context.workspace);
+    const matches = rankChatMatches(chats, query);
+    if (!matches.length) {
+      throw new Error(`Kein Chat gefunden: ${query}`);
+    }
+    const best = matches[0]!;
+    const contested = matches.length > 1 && matches[1]!.score === best.score;
+    if (contested) {
+      // Löschen ist endgültig — hier nie raten, auch nicht interaktiv.
+      throw new Error(
+        `Löschen abgebrochen, Auswahl nicht eindeutig: ${matches.map((match) => match.chat.title).join(", ")}`,
+      );
+    }
+    const target = best.chat;
+    const wasActive = target.id === context.session.data.id;
+    await SessionStore.remove(context.workspace, target.id);
+    if (wasActive) {
+      // Sonst legt der nächste Auto-Save die gelöschte Datei neu an.
+      await replaceSession(context, SessionStore.create(context.workspace));
+    }
+    context.out.text(
+      `Chat endgültig gelöscht: ${target.title} (${target.id})${wasActive ? " — neuer leerer Chat gestartet." : ""}`,
+    );
+    return;
+  }
+
   throw new Error(
-    "Verwendung: /chat [list|new [Titel]|open <ID|Titel>|search <Begriff>|rename <Titel>|fork [Titel]|current]",
+    "Verwendung: /chat [list|new [Titel]|open <ID|Titel>|search <Begriff>|rename <Titel>|fork [Titel]|delete <ID|Titel>|current]",
   );
 }
 
