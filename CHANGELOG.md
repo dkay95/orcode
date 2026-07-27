@@ -9,6 +9,8 @@ breaking changes.
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-07-27
+
 ### Added
 
 - Packaging for public npm distribution: `LICENSE` (Apache-2.0), `NOTICE`,

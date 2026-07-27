@@ -1,6 +1,6 @@
 {
   "name": "orcode",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "A local, terminal-based coding agent CLI that runs against any tool-capable model on OpenRouter, with per-workspace cost tracking, explicit approval modes, and a separate compressor model for long context.",
   "keywords": [
     "openrouter",
