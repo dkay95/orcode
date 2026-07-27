@@ -381,8 +381,27 @@ test("ambiguous replacements are refused without replaceAll", async () => {
 // run_command (M1, M2, M4)
 // ---------------------------------------------------------------------------
 
+test("Windows nutzt PowerShell als Default-Shell, Overrides gewinnen überall", () => {
+  const winStandard = resolveCommandShell({}, "win32");
+  assert.equal(winStandard.executable, "powershell.exe");
+  assert.deepEqual(winStandard.args, ["-NoProfile", "-NonInteractive", "-Command"]);
+  assert.ok(winStandard.args.includes("-NoProfile"), "kein Profil sourcing");
+
+  const winPwsh = resolveCommandShell(
+    { ORCODE_SHELL: "C:\\Program Files\\PowerShell\\7\\pwsh.exe" },
+    "win32",
+  );
+  assert.deepEqual(winPwsh.args, ["-NoProfile", "-NonInteractive", "-Command"]);
+
+  const winBashOverride = resolveCommandShell({ ORCODE_SHELL: "C:\\tools\\bash.exe" }, "win32");
+  assert.ok(winBashOverride.args.includes("--norc"));
+
+  const posixPwsh = resolveCommandShell({ ORCODE_SHELL: "/usr/bin/pwsh" }, "darwin");
+  assert.deepEqual(posixPwsh.args, ["-NoProfile", "-NonInteractive", "-Command"]);
+});
+
 test("the command shell is never a login shell and stays configurable", () => {
-  const standard = resolveCommandShell({});
+  const standard = resolveCommandShell({}, "linux");
   assert.equal(standard.executable, "/bin/sh");
   assert.deepEqual(standard.args, ["-c"]);
 

@@ -20,6 +20,10 @@ breaking changes.
   release workflow that publishes to npm.
 - Startup warning on stderr when the workspace root is the user's entire
   home directory, pointing to `-C` for scoping orcode to a project folder.
+- PowerShell support for `run_command`/`runVerify` on Windows: without a
+  configured `ORCODE_SHELL`, `powershell.exe -NoProfile -NonInteractive
+  -Command` is the default there instead of the nonexistent `/bin/sh`;
+  `pwsh`/`powershell` overrides get the correct flags on every platform.
 - Outbound secret scanner (warn-only): the model-bound context is scanned
   before every API call and every tool result is scanned before it enters
   the conversation history; common credential patterns (OpenRouter/OpenAI/

@@ -1762,10 +1762,23 @@ export function changePreview(before: string | null, after: string): string {
  */
 export function resolveCommandShell(
   environment: NodeJS.ProcessEnv = process.env,
+  platform: NodeJS.Platform = process.platform,
 ): { executable: string; args: string[] } {
   const configured = (environment.ORCODE_SHELL ?? environment.ROUTERCODE_SHELL)?.trim();
-  const executable = configured && configured.length > 0 ? configured : "/bin/sh";
-  const name = basename(executable);
+  // Windows hat kein /bin/sh: dort ist PowerShell (immer vorinstalliert) der
+  // Default. Ein konfigurierter Shell-Pfad gewinnt auf jeder Plattform.
+  const executable =
+    configured && configured.length > 0
+      ? configured
+      : platform === "win32"
+        ? "powershell.exe"
+        : "/bin/sh";
+  const name = basename(executable).toLowerCase();
+  if (name.includes("pwsh") || name.includes("powershell")) {
+    // Kein Profil (könnte das Arbeitsverzeichnis oder die Umgebung ändern)
+    // und nicht-interaktiv — PowerShell versteht -c nicht zuverlässig.
+    return { executable, args: ["-NoProfile", "-NonInteractive", "-Command"] };
+  }
   if (name.includes("zsh")) {
     return { executable, args: ["--no-rcs", "-c"] };
   }
