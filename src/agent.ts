@@ -378,14 +378,31 @@ export class OrcodeAgent {
     // K7f: a context-budget overrun measured on the *previous* run forces a
     // compression pass now, even below the char threshold.
     const forceCompress = this.#shouldCutContext();
-    const compression = await this.#compress(observer, forceCompress);
+    let compression = await this.#compress(observer, forceCompress);
     // The compressor call is already paid for even if the run is cancelled
     // later, so book and persist it right away. This write only touches the
     // cost ledger — the destructive part of compression happens after a
     // successful run, in a single save together with the new turns.
     if (compression.costUsd > 0) {
       this.#session.addCost("compressor", compression.costUsd);
-      await this.#session.save();
+      const costSave = await this.#session.save();
+      if (costSave.merged) {
+        conversation.invalidate();
+        const mergedRawContext = uncompressedContext(this.#session);
+        compression = {
+          ...compression,
+          used: false,
+          handoff: mergedRawContext,
+          originalChars: mergedRawContext.length,
+          compressedChars: mergedRawContext.length,
+          savedPercent: 0,
+          skipReason: "failed",
+          warnings: [
+            ...compression.warnings,
+            "Kompression wurde wegen gleichzeitig geänderter Chat-Historie verworfen; der zusammengeführte vollständige Verlauf wird verwendet.",
+          ],
+        };
+      }
     }
     throwIfAborted(observer.signal);
     for (const warning of compression.warnings) {

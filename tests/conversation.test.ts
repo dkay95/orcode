@@ -331,6 +331,45 @@ test("reset(seed) stages a usable fresh state for the same call without touching
   ]);
 });
 
+test("StateAccessor load and save isolate committed state from provider-owned object mutation", async () => {
+  const env = await setup("accessor-clone");
+  const store = await ConversationStore.open(
+    env.appHome,
+    env.session.path,
+    env.session.data.id,
+  );
+  await store.accessor().save(sampleState("ORIGINAL_COMMITTED_SENTINEL"));
+  await store.commit(0);
+  const statePath = ConversationStore.path(env.appHome, env.session.path);
+  const committedBytes = await readFile(statePath, "utf8");
+
+  const providerLoaded = await store.accessor().load();
+  assert.ok(providerLoaded);
+  (providerLoaded.messages[0] as { content: string }).content =
+    "MUTATED_PROVIDER_LOAD_SENTINEL";
+  store.discard();
+
+  assert.equal(await readFile(statePath, "utf8"), committedBytes);
+  assert.deepEqual((await store.accessor().load())?.messages, [
+    { role: "user", content: "ORIGINAL_COMMITTED_SENTINEL" },
+  ]);
+
+  const providerSaved = sampleState("ORIGINAL_BUFFERED_SENTINEL");
+  await store.accessor().save(providerSaved);
+  (providerSaved.messages[0] as { content: string }).content =
+    "MUTATED_PROVIDER_SAVE_SENTINEL";
+  await store.commit(0);
+
+  const reopened = await ConversationStore.open(
+    env.appHome,
+    env.session.path,
+    env.session.data.id,
+  );
+  assert.deepEqual((await reopened.accessor().load())?.messages, [
+    { role: "user", content: "ORIGINAL_BUFFERED_SENTINEL" },
+  ]);
+});
+
 test("transient developer messages are visible for one request but never persisted in SDK state", async () => {
   const env = await setup("transient-state");
   const store = await ConversationStore.open(

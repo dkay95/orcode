@@ -159,10 +159,15 @@ export class ConversationStore {
   accessor(transientDeveloperMessages: readonly string[] = []): StateAccessor {
     const transient = new Set(transientDeveloperMessages.filter(Boolean));
     return {
-      load: async () =>
-        this.#stagedState ?? (this.#usable ? this.#committedState : null),
+      load: async () => {
+        const state =
+          this.#stagedState ?? (this.#usable ? this.#committedState : null);
+        return state === null ? null : cloneConversationState(state);
+      },
       save: async (state) => {
-        this.#buffer = stripTransientDeveloperMessages(state, transient);
+        this.#buffer = cloneConversationState(
+          stripTransientDeveloperMessages(state, transient),
+        );
       },
     };
   }
@@ -316,6 +321,10 @@ function stripTransientDeveloperMessages(
     );
   });
   return messages.length === state.messages.length ? state : { ...state, messages };
+}
+
+function cloneConversationState(state: ConversationState): ConversationState {
+  return deserializeConversationState(serializeConversationState(state));
 }
 
 async function readStateFile(path: string, store: PrivateStore): Promise<StateFile | null> {

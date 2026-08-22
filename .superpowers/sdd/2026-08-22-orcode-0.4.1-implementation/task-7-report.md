@@ -127,3 +127,72 @@ DONE
 - Verification used deterministic fake OpenRouter clients. No live provider
   call or native cross-platform run is claimed; the one full-suite skip is the
   existing platform-only test.
+
+## Fix Round 1
+
+### Review findings reproduced RED
+
+- Review base: `aba773ef6ed61ca4a717e1ff6543fdc0e7747c03`.
+- Before any Fix Round 1 production edit, ran
+  `node --import tsx --test tests/agent.test.ts tests/conversation.test.ts`:
+  exit 1; 70 tests reached, 65 passed and 5 failed. The five failures are the
+  three named behaviors below; the zero-cost parent contains two independently
+  failing subcases.
+- `a compressor cost-save merge discards the stale compressed seed and
+  rebuilds raw merged history` loaded `STALE_COMPRESSED_HANDOFF_SENTINEL` in
+  the main call after the compressor-cost save had merged a concurrent turn.
+- `StateAccessor load and save isolate committed state from provider-owned
+  object mutation` reloaded `MUTATED_PROVIDER_LOAD_SENTINEL` after provider
+  mutation and `discard()`, proving the committed object was exposed by
+  reference.
+- `zero-cost synchronous and streamed main failures are genuine session
+  no-ops` failed in both call paths: each added a zero-valued daily bucket and
+  changed in-memory `updatedAt`, while the disk artifact remained unchanged.
+
+### Root causes and fixes
+
+- The compressor-cost `SessionStore.save()` result was ignored. Its
+  `merged: true` outcome can replace the session history after compression was
+  calculated, leaving an old handoff eligible for a fresh seed and later exact
+  digest commit. The agent now invalidates old SDK coverage, discards the
+  compression success, rebuilds a redacted raw handoff from the merged session,
+  and preserves only the already incurred compressor charge. Consequently the
+  old handoff cannot become the seed, summary or compaction basis.
+- `StateAccessor.load()` returned committed/staged SDK state directly and
+  `save()` retained the caller's object. Both directions now cross a deep
+  serializable clone boundary using the SDK's own
+  serialize/deserialize contract. Provider mutation cannot change committed or
+  buffered state after the accessor call.
+- `SessionStore.addCost()` accepted zero and therefore created a daily bucket
+  and refreshed `updatedAt`. Non-positive and non-finite amounts are now true
+  no-ops; existing positive-cost failure/cancellation tests still require each
+  actual compressor/main charge exactly once.
+
+### GREEN verification
+
+- Individual regression tests passed after their corresponding minimal fixes:
+  merge rebuild 1/1, accessor cloning 1/1, zero-cost failure paths 3/3.
+- Required Task 7 focus passed 110/110 with 0 failures.
+- Both production and test TypeScript no-emit checks passed.
+- Related OpenRouter/session/storage/migration/integration/commands/resume
+  regressions passed 138/138 with 0 failures.
+- Full `npm test` reached 740 tests: 739 passed, 0 failed and 1 existing
+  platform-only skip.
+- Central credential fixture scanner/literal audit and `git diff --check`
+  passed with no findings.
+
+### Fix Round 1 scope and commit
+
+- Production edits are limited to `src/agent.ts`, `src/conversation.ts` and
+  `src/session.ts`; regression edits are limited to `tests/agent.test.ts` and
+  `tests/conversation.test.ts`.
+- Requested commit message:
+  `fix: keep conversation state transactional across merges`.
+
+### Remaining concerns
+
+- The original storage-failure durability limitation remains: if session
+  storage itself stays unwritable, an incurred provider charge cannot be
+  guaranteed durable beyond memory.
+- Tests use deterministic concurrent stores and fake provider calls; no live
+  provider or native cross-platform result is claimed.

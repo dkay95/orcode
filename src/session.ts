@@ -277,7 +277,7 @@ export class SessionStore {
   }
 
   addCost(kind: "main" | "compressor" | "voice", amount: number): void {
-    if (!Number.isFinite(amount) || amount < 0) {
+    if (!Number.isFinite(amount) || amount <= 0) {
       return;
     }
     if (kind === "main") {

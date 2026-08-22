@@ -1013,6 +1013,145 @@ test("an open conversation store rechecks the exact summary epoch before reusing
   assert.match(JSON.stringify(loadedStates[1]), /Extern geänderter Summary-Epoch/);
 });
 
+test("a compressor cost-save merge discards the stale compressed seed and rebuilds raw merged history", async () => {
+  const setup = await createAgent({ compressionMode: "always" });
+  for (let index = 0; index < 3; index += 1) {
+    setup.session.addTurn(
+      "user",
+      `PRE_MERGE_HISTORY_${index} ${"ausführlicher Verlauf ".repeat(4)}`,
+    );
+    setup.session.addTurn(
+      "assistant",
+      `PRE_MERGE_ANSWER_${index} ${"verifizierte Antwort ".repeat(4)}`,
+    );
+  }
+  setup.session.setSummary("PRE_MERGE_SUMMARY_SENTINEL");
+  await setup.session.save();
+  await persistConversationState(setup, "PRE_MERGE_SDK_STATE_SENTINEL");
+  const concurrent = await SessionStore.openById(
+    setup.workspace,
+    setup.session.data.id,
+    setup.appHome,
+  );
+  const concurrentSecret = ["sk", "or", "v1", "M".repeat(16)].join("-");
+  let loadedState: unknown = undefined;
+  const client = fakeClient((request) => {
+    if (request.model === DEFAULT_CONFIG.compressorModel) {
+      return {
+        compressed: "STALE_COMPRESSED_HANDOFF_SENTINEL",
+        response: { usage: { cost: 0.002 } },
+        before: async () => {
+          concurrent.addTurn(
+            "user",
+            `CONCURRENT_MERGED_TURN_SENTINEL ${concurrentSecret}`,
+          );
+          concurrent.addTurn(
+            "assistant",
+            "CONCURRENT_MERGED_ANSWER_SENTINEL",
+          );
+          await concurrent.save();
+        },
+      };
+    }
+    return {
+      text: ["Aktuelle Antwort"],
+      before: async (emit) => {
+        loadedState = await request.state?.load();
+        const loadedMessages =
+          loadedState && typeof loadedState === "object" &&
+          "messages" in loadedState &&
+          Array.isArray((loadedState as { messages?: unknown }).messages)
+            ? (loadedState as { messages: unknown[] }).messages
+            : [];
+        await request.state?.save({
+          ...sampleConversationState("merged-main-result"),
+          messages: [
+            ...loadedMessages,
+            { role: "assistant", content: "merged-main-result" },
+          ],
+        } as never);
+        await emit.modelCall(0, 0.003);
+      },
+    };
+  });
+  const agent = await setup.agent(client.client);
+
+  const result = await agent.run("CURRENT_AFTER_MERGE", { onText: () => {} });
+
+  const loaded = JSON.stringify(loadedState);
+  assert.doesNotMatch(loaded, /STALE_COMPRESSED_HANDOFF_SENTINEL/);
+  assert.match(loaded, /CONCURRENT_MERGED_TURN_SENTINEL/);
+  assert.match(loaded, /\[REDACTED_OPENROUTER_KEY\]/);
+  assert.doesNotMatch(loaded, new RegExp(concurrentSecret));
+  assert.equal(result.compression.used, false);
+  assert.equal(result.compression.costUsd, 0.002);
+  assert.equal(setup.session.data.summary, "PRE_MERGE_SUMMARY_SENTINEL");
+  assert.equal(setup.session.data.turns.length, 10);
+  assert.ok(
+    setup.session.data.turns.some((turn) =>
+      turn.content.includes("CONCURRENT_MERGED_TURN_SENTINEL"),
+    ),
+  );
+  const reopened = await ConversationStore.open(
+    setup.appHome,
+    setup.session.path,
+    setup.session.data.id,
+  );
+  const committed = JSON.stringify(await reopened.accessor().load());
+  assert.doesNotMatch(committed, /STALE_COMPRESSED_HANDOFF_SENTINEL/);
+  assert.match(committed, /CONCURRENT_MERGED_TURN_SENTINEL/);
+});
+
+test("zero-cost synchronous and streamed main failures are genuine session no-ops", async (t) => {
+  const cases = ["synchronous", "streamed"] as const;
+  for (const failureKind of cases) {
+    await t.test(failureKind, async () => {
+      const setup = await createAgent({ compressionMode: "off" });
+      await addHistory(setup.session, `ZERO_COST_${failureKind}_HISTORY`);
+      const beforeData = structuredClone(setup.session.data);
+      const beforeDisk = await readFile(setup.session.path, "utf8");
+      const scripted = fakeClient((request) => ({
+        textError: () => new Error("zero-cost streamed failure"),
+        before: async (emit) => {
+          await request.state?.save(sampleConversationState("discard-zero-cost"));
+          await emit.modelCall(0, 0);
+        },
+      }));
+      const client = failureKind === "streamed"
+        ? scripted.client
+        : {
+            callModel(request: FakeRequest) {
+              for (const entry of request.hooks?.PostModelCall ?? []) {
+                entry.handler({
+                  model: "vendor/echt",
+                  durationMs: 5,
+                  turnNumber: 0,
+                  usage: {
+                    inputTokens: 10,
+                    outputTokens: 5,
+                    totalTokens: 15,
+                    cachedTokens: 0,
+                    reasoningTokens: 0,
+                    cost: 0,
+                  },
+                } as never);
+              }
+              throw new Error("zero-cost synchronous failure");
+            },
+          };
+      const agent = await setup.agent(client);
+
+      await assert.rejects(
+        agent.run("ZERO_COST_CURRENT_REQUEST", { onText: () => {} }),
+        /zero-cost (?:synchronous|streamed) failure/,
+      );
+
+      assert.deepEqual(setup.session.data, beforeData);
+      assert.equal(await readFile(setup.session.path, "utf8"), beforeDisk);
+    });
+  }
+});
+
 test("Task 7 captured-request matrix: every main call uses one history source and commits only on success", async (t) => {
   const prompt = "CURRENT_REQUEST_SENTINEL";
 
