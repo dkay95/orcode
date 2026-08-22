@@ -105,3 +105,70 @@ DONE
 - Terminal/active classification reads registered run logs during pruning; very
   large pre-retention stores therefore incur one linear startup scan before the
   configured byte ceiling is restored.
+
+## Fix Round 1
+
+### Receiving-review verification and RED
+
+- Read the complete round-1 findings and updated implementation ledger, then
+  reproduced all four findings against base
+  `bf80b5a1c9ba426f69e726986e08ef01f6189863` before changing production code.
+  All four were confirmed; no scope expansion was required.
+- Exact named RED command:
+  `node --import tsx --test --test-name-pattern='failed managed-backup cleanup|genuine mapped v1 sessions entry|ages and orders a completed manifest backup|surfaces ENOTDIR from both redacted and exact' tests/commands.test.ts tests/session.test.ts tests/workspace.test.ts`
+- RED result: 4 reached, 0 passed and 4 failed.
+  - Forced managed-backup removal failure left the active binding in memory but
+    the canonical transcript was already missing, making cleanup non-retryable.
+  - The genuine Task-5 `sessions/<workspaceHash>.json` backup entry survived
+    deletion because only registry-shaped `chats/` paths were enumerated.
+  - A backup from a source with a 40-day mtime was deleted immediately even
+    though its validated migration manifest completed at the current time.
+  - Both redacted `runs` and exact `checkpoints` ENOTDIR roots were silently
+    reported as empty instead of surfacing their failures.
+
+### Implementation
+
+- Managed-backup removal now completes before the canonical transcript. Any
+  sidecar, mapped transcript, v1 session or empty-backup removal error returns
+  with the canonical transcript and active binding intact; the same confirmed
+  command can be retried, and a successful retry rebinds before later autosave.
+- Completed manifest maps now recognize Task-5 v1 keys of the form
+  `legacy-<workspaceHash>` and derive the original
+  `sessions/<workspaceHash>.json` entry. Removal still goes through the one
+  app-home-rooted `PrivateStore`; no raw unlink or recursive delete was added.
+- A manifest-owned backup uses a finite parsed `completedAt` for age and
+  oldest-first ordering, bounded to the pruning clock. Missing or malformed
+  completion timestamps are not trusted and fall back to filesystem mtime.
+- Registry top-level directory enumeration now suppresses ENOENT only;
+  ENOTDIR, EACCES and other errors propagate into the existing per-class
+  retention warning boundary.
+
+### GREEN and final gates
+
+- The four named review regressions: 4/4 passed.
+- Required Task 6 focus: 189/189 passed, 0 failed.
+- Related integration/resume/TUI/migration/private-store suites: 132 reached,
+  131 passed, 0 failed and 1 Windows-only skip.
+- `npx tsc -p tsconfig.json --noEmit`: passed.
+- `npx tsc -p tsconfig.tests.json --noEmit`: passed.
+- Full `npm test`: 714 reached, 713 passed, 0 failed and 1 Windows-only skip.
+- Central credential-fixture audit returned no matches.
+- `git diff --check` passed.
+
+### Round-1 self-review and concerns
+
+- Confirmed every mapped/managed-backup operation precedes the canonical retry
+  anchor, including final empty-backup removal, and partial failure never calls
+  the active-session replacement path.
+- Confirmed v1 path derivation is possible only from a validated completed
+  manifest mapping and a 16-hex workspace hash, and deletion remains confined
+  to the manifest backup beneath app home.
+- Confirmed `completedAt` affects only the canonical manifest-owned backup and
+  cannot extend age into the future beyond the current pruning clock.
+- The existing native-Windows DACL integration remains the one expected skip on
+  this macOS host; no native Windows result is claimed in this fix round.
+
+### Commit
+
+- Requested message:
+  `fix: preserve retryable chat cleanup and backup retention`

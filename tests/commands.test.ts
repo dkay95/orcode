@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -12,6 +12,7 @@ import {
 import { OpenRouterHttpError } from "../src/openrouter.js";
 import { SessionStore } from "../src/session.js";
 import { DEFAULT_CONFIG } from "../src/config.js";
+import { migrationManifestPath } from "../src/storage.js";
 
 test("only unusable credentials trigger replacement", () => {
   assert.equal(
@@ -148,4 +149,62 @@ test("accepting deletion of the active chat rebinds before autosave can resurrec
   assert.notEqual(context.session.data.id, oldId);
   assert.deepEqual(rebound, [context.session.data.id]);
   assert.equal((await SessionStore.list(workspace, appHome)).some((chat) => chat.id === oldId), false);
+});
+
+test("failed managed-backup cleanup keeps the active transcript bound and a retry cannot resurrect it", async () => {
+  const root = await mkdtemp(join(tmpdir(), "routercode-command-backup-retry-"));
+  const workspace = join(root, "project");
+  const appHome = join(root, ".orcode");
+  const active = SessionStore.create(workspace, appHome, "Backup-Retry");
+  await active.save();
+  const oldId = active.data.id;
+  const checksum = "d".repeat(64);
+  const backupPath = join(appHome, "migration-backups", `routercode-${checksum.slice(0, 16)}`);
+  const outsideEmpty = join(root, "outside-empty");
+  await mkdir(join(appHome, "migration-backups"), { recursive: true });
+  await mkdir(outsideEmpty);
+  await symlink(outsideEmpty, backupPath);
+  await mkdir(join(appHome, "migrations"), { recursive: true });
+  await writeFile(migrationManifestPath(appHome), JSON.stringify({
+    version: 1,
+    phase: "complete",
+    sourcePath: join(root, ".routercode"),
+    sourceChecksum: checksum,
+    stagingPath: join(appHome, ".migration-staging", checksum),
+    backupPath,
+    chatIdMap: {},
+    destinationPaths: [],
+    isolated: [],
+    complete: true,
+    startedAt: "2026-08-22T11:59:00.000Z",
+    completedAt: "2026-08-22T12:00:00.000Z",
+  }));
+  const rebound: string[] = [];
+  const errors: string[] = [];
+  const context = {
+    workspace,
+    session: active,
+    config: structuredClone(DEFAULT_CONFIG),
+    configPath: join(appHome, "config.json"),
+    agent: { setSession: (session: SessionStore) => rebound.push(session.data.id) },
+    out: { text: () => undefined, error: (value: string) => errors.push(value) },
+    confirmChatDeletion: async () => true,
+  } as unknown as CommandContext;
+
+  await handleSlashCommand(`/chat delete ${oldId}`, context);
+
+  assert.equal(context.session.data.id, oldId, "a failed cleanup keeps the active binding");
+  assert.deepEqual(rebound, []);
+  assert.match(await readFile(active.path, "utf8"), /Backup-Retry/, "the transcript remains the retry anchor");
+  assert.ok(errors.some((value) => /nicht vollständig gelöscht/.test(value)));
+
+  await rm(backupPath);
+  await mkdir(backupPath);
+  await handleSlashCommand(`/chat delete ${oldId}`, context);
+  await context.session.save();
+
+  assert.notEqual(context.session.data.id, oldId);
+  assert.deepEqual(rebound, [context.session.data.id]);
+  assert.equal((await SessionStore.list(workspace, appHome)).some((chat) => chat.id === oldId), false);
+  await assert.rejects(stat(backupPath), /ENOENT/);
 });

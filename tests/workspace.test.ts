@@ -20,6 +20,7 @@ import {
 import type { ApprovalMode, ApprovalSubject, ToolCallPreview } from "../src/types.js";
 import {
   CHAT_ARTIFACT_REGISTRY,
+  migrationManifestPath,
 } from "../src/storage.js";
 import { RunLog } from "../src/runlog.js";
 import {
@@ -275,6 +276,62 @@ test("migration-backup retention keeps one per source, clamps age downward, and 
   assert.equal(existsSync(newest), true);
   assert.equal(existsSync(configOlder), false, "config rewrites keep one backup for their source");
   assert.equal(existsSync(configNewest), true);
+});
+
+test("migration-backup retention ages and orders a completed manifest backup by completedAt", async () => {
+  const { pruneMigrationBackups } = await import("../src/storage.js");
+  const appHome = await mkdtemp(join(tmpdir(), "routercode-backup-completed-at-"));
+  const root = join(appHome, "migration-backups");
+  await mkdir(root, { recursive: true });
+  const now = Date.parse("2026-08-22T12:00:00.000Z");
+  const checksum = "f".repeat(64);
+  const completedBackup = join(root, `routercode-${checksum.slice(0, 16)}`);
+  const otherBackup = join(root, "routercode-other-source-time");
+  await mkdir(completedBackup);
+  await writeFile(join(completedBackup, "payload"), "fresh migration of old source");
+  await utimes(completedBackup, new Date(now - 40 * 86_400_000), new Date(now - 40 * 86_400_000));
+  await mkdir(otherBackup);
+  await writeFile(join(otherBackup, "payload"), "other backup");
+  await utimes(otherBackup, new Date(now - 86_400_000), new Date(now - 86_400_000));
+  await mkdir(join(appHome, "migrations"), { recursive: true });
+  await writeFile(migrationManifestPath(appHome), JSON.stringify({
+    version: 1,
+    phase: "complete",
+    sourcePath: join(appHome, "..", ".routercode"),
+    sourceChecksum: checksum,
+    stagingPath: join(appHome, ".migration-staging", checksum),
+    backupPath: completedBackup,
+    chatIdMap: {},
+    destinationPaths: [],
+    isolated: [],
+    complete: true,
+    startedAt: "2026-08-22T11:59:00.000Z",
+    completedAt: new Date(now).toISOString(),
+  }));
+
+  await pruneMigrationBackups(appHome, { now });
+
+  assert.equal(existsSync(completedBackup), true, "a newly completed migration survives an old source mtime");
+  assert.equal(existsSync(otherBackup), false, "completedAt also determines which source backup is newest");
+});
+
+test("registry retention surfaces ENOTDIR from both redacted and exact top-level roots", async () => {
+  const { pruneExactArtifacts } = await import("../src/storage.js");
+  const redactedHome = await mkdtemp(join(tmpdir(), "routercode-redacted-enotdir-"));
+  const exactHome = await mkdtemp(join(tmpdir(), "routercode-exact-enotdir-"));
+  await writeFile(join(redactedHome, "runs"), "not a directory");
+  await writeFile(join(exactHome, "checkpoints"), "not a directory");
+
+  const results = await Promise.allSettled([
+    RunLog.prune(redactedHome),
+    pruneExactArtifacts(exactHome),
+  ]);
+
+  assert.deepEqual(results.map((result) => result.status), ["rejected", "rejected"]);
+  for (const result of results) {
+    assert.equal(result.status, "rejected");
+    assert.equal((result.reason as NodeJS.ErrnoException).code, "ENOTDIR");
+  }
 });
 
 // ---------------------------------------------------------------------------

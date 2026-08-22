@@ -164,6 +164,38 @@ test("chat deletion removes every registry-owned artifact and mapped legacy side
   assert.equal(await readFile(configBackup, "utf8"), "non-chat-config-backup");
 });
 
+test("chat deletion removes the genuine mapped v1 sessions entry before its canonical transcript", async () => {
+  const { workspace, appHome } = await workspaceRoot("chat-delete-v1-backup");
+  const chat = SessionStore.create(workspace, appHome, "Aus v1 migriert");
+  await chat.save();
+  const checksum = "e".repeat(64);
+  const backupPath = join(appHome, "migration-backups", `routercode-${checksum.slice(0, 16)}`);
+  const legacySession = await writeLegacySession(backupPath, workspace);
+  const workspaceHash = workspaceStorageHash(workspace);
+  await mkdir(dirname(migrationManifestPath(appHome)), { recursive: true });
+  await writeFile(migrationManifestPath(appHome), JSON.stringify({
+    version: 1,
+    phase: "complete",
+    sourcePath: join(dirname(appHome), ".routercode"),
+    sourceChecksum: checksum,
+    stagingPath: join(appHome, ".migration-staging", checksum),
+    backupPath,
+    chatIdMap: { [`legacy-${workspaceHash}`]: chat.data.id },
+    destinationPaths: [],
+    isolated: [],
+    complete: true,
+    startedAt: "2026-08-22T11:59:00.000Z",
+    completedAt: "2026-08-22T12:00:00.000Z",
+  }));
+
+  const deletion = await SessionStore.remove(workspace, chat.data.id, appHome);
+
+  assert.deepEqual(deletion.errors, []);
+  await assert.rejects(readFile(legacySession, "utf8"), /ENOENT/);
+  await assert.rejects(readFile(chat.path, "utf8"), /ENOENT/);
+  await assert.rejects(stat(backupPath), /ENOENT/, "the emptied managed backup is removed before completion");
+});
+
 test("chat deletion keeps the transcript retryable when a sidecar cannot be removed", async () => {
   const { workspace, appHome } = await workspaceRoot("chat-delete-retry");
   const chat = SessionStore.create(workspace, appHome, "Retry");

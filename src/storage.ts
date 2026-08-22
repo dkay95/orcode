@@ -408,6 +408,7 @@ export async function pruneMigrationBackups(
   const active = new Set([...(options.activeBackupPaths ?? [])].map((path) => resolvePath(path)));
   const manifest = await completedOrActiveManifest(appHome);
   if (manifest && !manifest.complete) active.add(resolvePath(manifest.backupPath));
+  const completedManifest = await validatedCompletedManifest(appHome);
   const candidates: Array<RetentionCandidate & { source: string }> = [];
   for (const path of await managedBackupEntries(root)) {
     try {
@@ -417,7 +418,10 @@ export async function pruneMigrationBackups(
         kind: "task-sidecar",
         path,
         chatId: "backup",
-        mtimeMs: info.mtimeMs,
+        mtimeMs: completedManifest !== null && completedManifest.completedAtMs !== null
+          && resolvePath(path) === resolvePath(completedManifest.backupPath)
+          ? Math.min(completedManifest.completedAtMs, now)
+          : info.mtimeMs,
         size: info.isDirectory() ? await treeSize(path) : info.size,
         source: basename(path).startsWith("config-v0-") ? "config" : "legacy-home",
       });
@@ -468,6 +472,11 @@ export async function deleteChatOwnedArtifacts(
     workspace,
     chatId: oldId,
   }));
+  const legacyV1Sessions = manifest
+    ? mapped
+      .map((oldId) => mappedLegacyV1SessionPath(manifest.backupPath, oldId))
+      .filter((path): path is string => path !== null)
+    : [];
   const sidecars = CHAT_ARTIFACT_REGISTRY.entries().filter((entry) => entry.kind !== "chat");
   for (const entry of sidecars) {
     for (const location of [local, ...legacyLocations]) {
@@ -482,6 +491,8 @@ export async function deleteChatOwnedArtifacts(
     }
   }
   if (report.errors.length > 0) return report;
+  for (const path of legacyV1Sessions) await removeOwnedPath(store, path, report);
+  if (report.errors.length > 0) return report;
   // The canonical transcript is the retry anchor: remove it only after every
   // mapped legacy transcript has also been cleared successfully.
   for (const location of legacyLocations) {
@@ -489,11 +500,12 @@ export async function deleteChatOwnedArtifacts(
     for (const path of paths) await removeOwnedPath(store, path, report);
   }
   if (report.errors.length > 0) return report;
-  const transcriptPaths = await CHAT_ARTIFACT_REGISTRY.existing("chat", local);
-  for (const path of transcriptPaths) await removeOwnedPath(store, path, report);
-  if (manifest && report.errors.length === 0 && await treeHasNoFiles(manifest.backupPath)) {
+  if (manifest && await treeHasNoFiles(manifest.backupPath)) {
     await removeOwnedPath(store, manifest.backupPath, report);
   }
+  if (report.errors.length > 0) return report;
+  const transcriptPaths = await CHAT_ARTIFACT_REGISTRY.existing("chat", local);
+  for (const path of transcriptPaths) await removeOwnedPath(store, path, report);
   return report;
 }
 
@@ -1270,8 +1282,9 @@ async function directories(path: string): Promise<string[]> {
       .filter((entry) => entry.isDirectory() && !entry.isSymbolicLink())
       .map((entry) => join(path, entry.name))
       .sort();
-  } catch {
-    return [];
+  } catch (error) {
+    if (hasErrorCode(error, "ENOENT")) return [];
+    throw error;
   }
 }
 
@@ -1436,6 +1449,12 @@ interface DeletionManifest {
   backupPath: string;
   chatIdMap: Record<string, string>;
   complete: boolean;
+  completedAtMs: number | null;
+}
+
+function mappedLegacyV1SessionPath(backupPath: string, oldId: string): string | null {
+  const match = /^legacy-([a-f0-9]{16})$/.exec(oldId);
+  return match ? join(backupPath, "sessions", `${match[1]}.json`) : null;
 }
 
 async function completedOrActiveManifest(appHome: string): Promise<DeletionManifest | null> {
@@ -1451,7 +1470,15 @@ async function completedOrActiveManifest(appHome: string): Promise<DeletionManif
       if (!safeChatId(oldId) || typeof newId !== "string" || !safeChatId(newId)) return null;
       chatIdMap[oldId] = newId;
     }
-    return { backupPath: expectedBackup, chatIdMap, complete: value.complete };
+    const parsedCompletedAt = typeof value.completedAt === "string"
+      ? Date.parse(value.completedAt)
+      : Number.NaN;
+    return {
+      backupPath: expectedBackup,
+      chatIdMap,
+      complete: value.complete,
+      completedAtMs: Number.isFinite(parsedCompletedAt) ? parsedCompletedAt : null,
+    };
   } catch {
     return null;
   }
