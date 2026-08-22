@@ -26,7 +26,12 @@ import {
 } from "./types.js";
 import { redactText, redactValue } from "./redaction.js";
 import { PrivateStore } from "./private-store.js";
-import { CHAT_ARTIFACT_REGISTRY, workspaceStorageHash } from "./storage.js";
+import {
+  CHAT_ARTIFACT_REGISTRY,
+  deleteChatOwnedArtifacts,
+  type ChatDeletionReport,
+  workspaceStorageHash,
+} from "./storage.js";
 import { formatUsd, hasCode, isRecord } from "./utils.js";
 
 const MAX_TURNS = 80;
@@ -159,24 +164,9 @@ export class SessionStore {
     workspace: string,
     id: string,
     appHome = APP_HOME,
-  ): Promise<void> {
+  ): Promise<ChatDeletionReport> {
     assertChatId(id);
-    const path = chatPath(appHome, workspace, id);
-    try {
-      await unlink(path);
-    } catch (error) {
-      if (hasCode(error, "ENOENT")) {
-        throw new Error(`Chat nicht gefunden: ${id}`);
-      }
-      throw error;
-    }
-    try {
-      await unlink(chatLockPath(path));
-    } catch (error) {
-      if (!hasCode(error, "ENOENT")) {
-        throw error;
-      }
-    }
+    return deleteChatOwnedArtifacts(appHome, workspace, id);
   }
 
   /** Read only: listing chats never writes to disk (B15). */

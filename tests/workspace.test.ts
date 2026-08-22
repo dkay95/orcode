@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
-import { chmod, mkdir, mkdtemp, readFile, realpath, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, readdir, realpath, rm, stat, symlink, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { isAbsolute, join } from "node:path";
 import test from "node:test";
@@ -18,6 +18,10 @@ import {
   shellApprovalSubject,
 } from "../src/rules.js";
 import type { ApprovalMode, ApprovalSubject, ToolCallPreview } from "../src/types.js";
+import {
+  CHAT_ARTIFACT_REGISTRY,
+} from "../src/storage.js";
+import { RunLog } from "../src/runlog.js";
 import {
   CATASTROPHIC_GUARD_NOTICE,
   ChangeJournal,
@@ -131,6 +135,147 @@ async function gitAvailable(): Promise<boolean> {
     return false;
   }
 }
+
+test("exact-artifact retention clamps age and terminal-run count downward and excludes an active run", async () => {
+  const { pruneExactArtifacts } = await import("../src/storage.js") as typeof import("../src/storage.js") & {
+    pruneExactArtifacts: (appHome: string, options: Record<string, unknown>) => Promise<void>;
+  };
+  const appHome = await mkdtemp(join(tmpdir(), "routercode-exact-retention-"));
+  const workspace = join(appHome, "project");
+  const chatId = "chat-exact-retention";
+  const now = Date.parse("2026-08-22T12:00:00.000Z");
+  const oldState = CHAT_ARTIFACT_REGISTRY.resolve("conversation-state", {
+    appHome,
+    workspace,
+    chatId,
+  });
+  await mkdir(join(appHome, "chats", createHash("sha256").update(workspace).digest("hex").slice(0, 16)), { recursive: true });
+  await writeFile(oldState, "old-sdk-state");
+  await utimes(oldState, new Date(now - 15 * 86_400_000), new Date(now - 15 * 86_400_000));
+
+  const activeRunId = "active-run";
+  const activePath = CHAT_ARTIFACT_REGISTRY.resolve("checkpoint", {
+    appHome,
+    chatId,
+    artifactId: activeRunId,
+  });
+  await mkdir(join(appHome, "checkpoints", chatId), { recursive: true });
+  await writeFile(activePath, "active");
+  await utimes(activePath, new Date(now - 40 * 86_400_000), new Date(now - 40 * 86_400_000));
+
+  for (let index = 0; index < 22; index += 1) {
+    const runId = `terminal-${String(index).padStart(2, "0")}`;
+    const runLog = await RunLog.open(appHome, chatId, runId);
+    runLog.write({ type: "run-end", outcome: "complete", durationMs: 1, toolCount: 0, timestamp: now + index });
+    await runLog.close();
+    const path = CHAT_ARTIFACT_REGISTRY.resolve("checkpoint", {
+      appHome,
+      chatId,
+      artifactId: runId,
+    });
+    await writeFile(path, `${index}`);
+    await utimes(path, new Date(now - (22 - index) * 1_000), new Date(now - (22 - index) * 1_000));
+    const taskPath = CHAT_ARTIFACT_REGISTRY.resolve("task-sidecar", {
+      appHome,
+      chatId,
+      artifactId: runId,
+    });
+    await mkdir(join(appHome, "tasks", chatId), { recursive: true });
+    await writeFile(taskPath, `task-${index}`);
+    await utimes(taskPath, new Date(now - (22 - index) * 1_000), new Date(now - (22 - index) * 1_000));
+  }
+
+  await pruneExactArtifacts(appHome, {
+    now,
+    maxAgeDays: 365,
+    maxTerminalRunsPerChat: 1_000,
+    maxBytesGlobal: Number.MAX_SAFE_INTEGER,
+    activeRunIds: new Set([activeRunId]),
+  });
+
+  assert.equal(existsSync(oldState), false, "exact artifacts cannot exceed the 14-day ceiling");
+  assert.equal(existsSync(activePath), true, "active checkpoint must never be pruned");
+  assert.equal(
+    (await readdir(join(appHome, "checkpoints", chatId))).filter((name) => name.startsWith("terminal-")).length,
+    20,
+    "exact artifacts cannot exceed 20 terminal runs per chat",
+  );
+  assert.equal(
+    (await readdir(join(appHome, "tasks", chatId))).filter((name) => name.startsWith("terminal-")).length,
+    20,
+    "multiple exact files for one run count as one terminal run, not two files",
+  );
+});
+
+test("exact-artifact retention applies a downward global byte limit across registered future sidecars", async () => {
+  const { pruneExactArtifacts } = await import("../src/storage.js") as typeof import("../src/storage.js") & {
+    pruneExactArtifacts: (appHome: string, options: Record<string, unknown>) => Promise<void>;
+  };
+  const appHome = await mkdtemp(join(tmpdir(), "routercode-exact-global-"));
+  const now = Date.parse("2026-08-22T12:00:00.000Z");
+  const paths: string[] = [];
+  for (let index = 0; index < 3; index += 1) {
+    const chatId = `chat-sidecar-${index}`;
+    const path = CHAT_ARTIFACT_REGISTRY.resolve("task-sidecar", {
+      appHome,
+      chatId,
+      artifactId: `task-${index}`,
+    });
+    await mkdir(join(appHome, "tasks", chatId), { recursive: true });
+    await writeFile(path, `${index}${"x".repeat(700)}`);
+    await utimes(path, new Date(now - (3 - index) * 1_000), new Date(now - (3 - index) * 1_000));
+    paths.push(path);
+  }
+
+  const sizes = await Promise.all(paths.map(async (path) => (await stat(path)).size));
+  await pruneExactArtifacts(appHome, {
+    now,
+    maxBytesGlobal: sizes[1]! + sizes[2]!,
+  });
+
+  assert.equal(existsSync(paths[0]!), false);
+  assert.equal(existsSync(paths[1]!), true);
+  assert.equal(existsSync(paths[2]!), true);
+});
+
+test("migration-backup retention keeps one per source, clamps age downward, and never removes an active migration", async () => {
+  const { pruneMigrationBackups } = await import("../src/storage.js") as typeof import("../src/storage.js") & {
+    pruneMigrationBackups: (appHome: string, options: Record<string, unknown>) => Promise<void>;
+  };
+  const appHome = await mkdtemp(join(tmpdir(), "routercode-backup-retention-"));
+  const root = join(appHome, "migration-backups");
+  await mkdir(root, { recursive: true });
+  const now = Date.parse("2026-08-22T12:00:00.000Z");
+  const active = join(root, "routercode-active");
+  const expired = join(root, "routercode-expired");
+  const older = join(root, "routercode-older");
+  const newest = join(root, "routercode-newest");
+  for (const [path, ageDays] of [[active, 40], [expired, 40], [older, 3], [newest, 1]] as const) {
+    await mkdir(path);
+    await writeFile(join(path, "payload"), path);
+    await utimes(path, new Date(now - ageDays * 86_400_000), new Date(now - ageDays * 86_400_000));
+  }
+  const configOlder = join(root, "config-v0-older.json");
+  const configNewest = join(root, "config-v0-newest.json");
+  await writeFile(configOlder, "old-config");
+  await writeFile(configNewest, "new-config");
+  await utimes(configOlder, new Date(now - 2 * 86_400_000), new Date(now - 2 * 86_400_000));
+  await utimes(configNewest, new Date(now - 1 * 86_400_000), new Date(now - 1 * 86_400_000));
+
+  await pruneMigrationBackups(appHome, {
+    now,
+    maxAgeDays: 365,
+    maxBytesGlobal: Number.MAX_SAFE_INTEGER,
+    activeBackupPaths: new Set([active]),
+  });
+
+  assert.equal(existsSync(active), true, "an active migration backup is excluded from pruning");
+  assert.equal(existsSync(expired), false, "backup age cannot be configured above 30 days");
+  assert.equal(existsSync(older), false, "only the newest terminal backup for a source remains");
+  assert.equal(existsSync(newest), true);
+  assert.equal(existsSync(configOlder), false, "config rewrites keep one backup for their source");
+  assert.equal(existsSync(configNewest), true);
+});
 
 // ---------------------------------------------------------------------------
 // Guard

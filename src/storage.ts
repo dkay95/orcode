@@ -17,6 +17,10 @@ import type { AgentRunEvent } from "./types.js";
 export const STORAGE_SCHEMA_VERSION = 1 as const;
 export const RUN_LOG_ENVELOPE_VERSION = 1 as const;
 export const DEFAULT_MIGRATION_BACKUP_BYTES = 250 * 1_024 * 1_024;
+export const EXACT_RETENTION_MAX_AGE_DAYS = 14;
+export const EXACT_RETENTION_MAX_TERMINAL_RUNS = 20;
+export const EXACT_RETENTION_MAX_BYTES = 250 * 1_024 * 1_024;
+export const MIGRATION_BACKUP_MAX_AGE_DAYS = 30;
 
 export interface StoredConversationStateFile {
   version: 1;
@@ -94,6 +98,13 @@ export interface ChatArtifactLocation {
   conflictId?: string;
 }
 
+export interface RegisteredArtifactFile {
+  kind: ChatArtifactKind;
+  path: string;
+  chatId: string;
+  artifactId?: string;
+}
+
 const ARTIFACTS: readonly ChatArtifactEntry[] = [
   { kind: "chat", privacy: "redacted", retention: "chat", migration: "required", deletion: "file" },
   { kind: "chat-conflict", privacy: "exact", retention: "exact-recovery", migration: "required", deletion: "file" },
@@ -119,6 +130,8 @@ export class ChatArtifactRegistry {
   }
 
   resolve(kind: ChatArtifactKind, location: ChatArtifactLocation): string {
+    const chatId = safeChatId(location.chatId);
+    if (!chatId) throw new Error(`Ungültige Chat-ID für Artefakt: ${location.chatId}`);
     const artifactId = safeArtifactId(location.artifactId);
     switch (kind) {
       case "chat": {
@@ -126,7 +139,8 @@ export class ChatArtifactRegistry {
           location.workspace ? workspaceStorageHash(location.workspace) : null
         );
         if (!hash) throw new Error("Chat-Pfad braucht workspace oder workspaceHash.");
-        return join(location.appHome, "chats", hash, `${location.chatId}.json`);
+        if (!/^[a-f0-9]{16}$/.test(hash)) throw new Error("Ungültiger Workspace-Hash für Chat-Artefakt.");
+        return join(location.appHome, "chats", hash, `${chatId}.json`);
       }
       case "chat-conflict": {
         const conflictId = safeArtifactId(location.conflictId);
@@ -142,10 +156,10 @@ export class ChatArtifactRegistry {
       }
       case "run-log":
         if (!artifactId) throw new Error("Run-Log braucht artifactId.");
-        return join(location.appHome, "runs", location.chatId, `${artifactId}.ndjson`);
+        return join(location.appHome, "runs", chatId, `${artifactId}.ndjson`);
       case "checkpoint":
         if (!artifactId) throw new Error("Checkpoint braucht artifactId.");
-        return join(location.appHome, "checkpoints", location.chatId, `${artifactId}.json`);
+        return join(location.appHome, "checkpoints", chatId, `${artifactId}.json`);
       case "lock": {
         const chatPath = location.chatFilePath ?? this.resolve("chat", location);
         if (artifactId === "chat") return `${chatPath}.lock`;
@@ -154,32 +168,40 @@ export class ChatArtifactRegistry {
       }
       case "task-sidecar":
         if (!artifactId) throw new Error("Task-Sidecar braucht artifactId.");
-        return join(location.appHome, "tasks", location.chatId, `${artifactId}.json`);
+        return join(location.appHome, "tasks", chatId, `${artifactId}.json`);
     }
   }
 
-  /** Enumerate files owned by one chat; task sidecars remain reserved-only. */
+  /** Enumerate files owned by one chat. Reserved kinds claim no producer, but an existing registered file is still owned and deletable. */
   async existing(kind: ChatArtifactKind, location: Omit<ChatArtifactLocation, "artifactId">): Promise<string[]> {
-    if (kind === "task-sidecar") return [];
-    const chatPath = location.chatFilePath ?? this.resolve("chat", location);
     switch (kind) {
-      case "chat":
+      case "chat": {
+        const chatPath = location.chatFilePath ?? this.resolve("chat", location);
         return await pathExists(chatPath) ? [chatPath] : [];
-      case "chat-conflict":
+      }
+      case "chat-conflict": {
+        const chatPath = location.chatFilePath ?? this.resolve("chat", location);
         return filesMatching(dirname(chatPath), (name) =>
           name.startsWith(`${basename(chatPath)}.konflikt-`) && name.endsWith(".json"));
+      }
       case "conversation-state": {
+        const chatPath = location.chatFilePath ?? this.resolve("chat", location);
         const path = this.resolve("conversation-state", { ...location, chatFilePath: chatPath });
         return await pathExists(path) ? [path] : [];
       }
-      case "conversation-conflict":
+      case "conversation-conflict": {
+        const chatPath = location.chatFilePath ?? this.resolve("chat", location);
         return filesMatching(dirname(chatPath), (name) =>
           name.startsWith(`${basename(chatPath)}.state.json.konflikt-`) && name.endsWith(".json"));
+      }
       case "run-log":
         return filesMatching(join(location.appHome, "runs", location.chatId), (name) => name.endsWith(".ndjson"));
       case "checkpoint":
         return filesMatching(join(location.appHome, "checkpoints", location.chatId), (name) => name.endsWith(".json"));
+      case "task-sidecar":
+        return filesMatching(join(location.appHome, "tasks", location.chatId), (name) => name.endsWith(".json"));
       case "lock": {
+        const chatPath = location.chatFilePath ?? this.resolve("chat", location);
         const candidates = [`${chatPath}.lock`, `${chatPath}.state.json.lock`];
         const found: string[] = [];
         for (const path of candidates) if (await pathExists(path)) found.push(path);
@@ -187,9 +209,293 @@ export class ChatArtifactRegistry {
       }
     }
   }
+
+  async all(kind: ChatArtifactKind, appHome: string): Promise<RegisteredArtifactFile[]> {
+    if (kind === "run-log" || kind === "checkpoint" || kind === "task-sidecar") {
+      const rootName = kind === "run-log" ? "runs" : kind === "checkpoint" ? "checkpoints" : "tasks";
+      const suffix = kind === "run-log" ? ".ndjson" : ".json";
+      const found: RegisteredArtifactFile[] = [];
+      for (const chatDir of await directories(join(appHome, rootName))) {
+        const chatId = basename(chatDir);
+        if (!safeChatId(chatId)) continue;
+        for (const path of await filesMatching(chatDir, (name) => name.endsWith(suffix))) {
+          found.push({ kind, path, chatId, artifactId: basename(path).slice(0, -suffix.length) });
+        }
+      }
+      return found.sort(compareArtifactFile);
+    }
+    const found: RegisteredArtifactFile[] = [];
+    for (const workspaceDir of await directories(join(appHome, "chats"))) {
+      for (const path of await filesMatching(workspaceDir, () => true)) {
+        const name = basename(path);
+        const chatId = chatIdFromChatArtifact(kind, name);
+        if (chatId) found.push({ kind, path, chatId });
+      }
+    }
+    return found.sort(compareArtifactFile);
+  }
 }
 
 export const CHAT_ARTIFACT_REGISTRY = new ChatArtifactRegistry();
+
+export class ChatArtifactStore {
+  readonly appHome: string;
+  readonly workspace: string;
+  readonly chatId: string;
+  readonly #privateStore: PrivateStore;
+
+  constructor(appHome: string, workspace: string, chatId: string) {
+    if (!safeChatId(chatId)) throw new Error(`Ungültige Chat-ID für Artefaktbindung: ${chatId}`);
+    this.appHome = appHome;
+    this.workspace = workspace;
+    this.chatId = chatId;
+    this.#privateStore = new PrivateStore({ root: appHome });
+  }
+
+  path(kind: ChatArtifactKind, artifactId?: string): string {
+    return CHAT_ARTIFACT_REGISTRY.resolve(kind, {
+      appHome: this.appHome,
+      workspace: this.workspace,
+      chatId: this.chatId,
+      ...(artifactId ? { artifactId } : {}),
+    });
+  }
+
+  async writeExact(kind: ChatArtifactKind, artifactId: string, content: string): Promise<void> {
+    const entry = CHAT_ARTIFACT_REGISTRY.get(kind);
+    if (entry.privacy !== "exact") throw new Error(`${kind} ist kein exaktes Chat-Artefakt.`);
+    await this.#privateStore.writeTextAtomic(this.path(kind, artifactId), content);
+  }
+}
+
+export interface RetentionError {
+  path: string;
+  message: string;
+}
+
+export interface RetentionReport {
+  removed: string[];
+  errors: RetentionError[];
+}
+
+/** Normalize flat or per-class retention reports without coupling callers to one report shape. */
+export function collectRetentionErrors(value: unknown): RetentionError[] {
+  const found: RetentionError[] = [];
+  const seen = new Set<unknown>();
+  const visit = (candidate: unknown): void => {
+    if (!candidate || typeof candidate !== "object" || seen.has(candidate)) return;
+    seen.add(candidate);
+    if (Array.isArray(candidate)) {
+      for (const entry of candidate) visit(entry);
+      return;
+    }
+    const record = candidate as Record<string, unknown>;
+    if (Array.isArray(record.errors)) {
+      for (const error of record.errors) {
+        if (isRecord(error) && typeof error.path === "string" && typeof error.message === "string") {
+          found.push({ path: error.path, message: error.message });
+        }
+      }
+    }
+    for (const [key, nested] of Object.entries(record)) {
+      if (key !== "errors") visit(nested);
+    }
+  };
+  visit(value);
+  return found;
+}
+
+export interface ExactArtifactRetentionOptions {
+  now?: number;
+  maxAgeDays?: number;
+  maxTerminalRunsPerChat?: number;
+  maxBytesGlobal?: number;
+  activeRunIds?: ReadonlySet<string>;
+  onError?: (error: RetentionError) => void;
+}
+
+export interface MigrationBackupRetentionOptions {
+  now?: number;
+  maxAgeDays?: number;
+  maxBytesGlobal?: number;
+  activeBackupPaths?: ReadonlySet<string>;
+  onError?: (error: RetentionError) => void;
+}
+
+interface RetentionCandidate extends RegisteredArtifactFile {
+  mtimeMs: number;
+  size: number;
+}
+
+export async function pruneExactArtifacts(
+  appHome: string,
+  options: ExactArtifactRetentionOptions = {},
+): Promise<RetentionReport> {
+  const report: RetentionReport = { removed: [], errors: [] };
+  const now = finiteNow(options.now);
+  const maxAgeMs = downwardInteger(options.maxAgeDays, EXACT_RETENTION_MAX_AGE_DAYS) * 86_400_000;
+  const maxRuns = downwardInteger(options.maxTerminalRunsPerChat, EXACT_RETENTION_MAX_TERMINAL_RUNS);
+  const maxBytes = downwardInteger(options.maxBytesGlobal, EXACT_RETENTION_MAX_BYTES);
+  const runStates = await inspectRunStates(appHome, report, options.onError);
+  const explicitActive = options.activeRunIds ?? new Set<string>();
+  const candidates: RetentionCandidate[] = [];
+  for (const entry of CHAT_ARTIFACT_REGISTRY.entries()) {
+    if (entry.retention !== "exact-recovery" || entry.kind === "lock") continue;
+    for (const artifact of await CHAT_ARTIFACT_REGISTRY.all(entry.kind, appHome)) {
+      try {
+        const info = await lstat(artifact.path);
+        if (info.isSymbolicLink() || !info.isFile()) throw new Error("Artefakt ist keine reguläre Datei.");
+        candidates.push({ ...artifact, mtimeMs: info.mtimeMs, size: info.size });
+      } catch (error) {
+        recordRetentionError(report, artifact.path, error, options.onError);
+      }
+    }
+  }
+  const isActive = (candidate: RetentionCandidate): boolean => Boolean(
+    candidate.artifactId && (
+      explicitActive.has(candidate.artifactId)
+      || runStates.active.get(candidate.chatId)?.has(candidate.artifactId)
+    )
+  );
+  const remove = async (candidate: RetentionCandidate): Promise<void> => {
+    if (isActive(candidate) || report.removed.includes(candidate.path)) return;
+    await removeRetentionCandidate(appHome, candidate.path, report, options.onError);
+  };
+
+  for (const candidate of sortedCandidates(candidates)) {
+    if (now - candidate.mtimeMs > maxAgeMs) await remove(candidate);
+  }
+  for (const [chatId, terminalIds] of runStates.terminal) {
+    const terminalCandidates = candidates.filter((candidate) =>
+      candidate.chatId === chatId && candidate.artifactId && terminalIds.has(candidate.artifactId)
+      && !report.removed.includes(candidate.path) && !isActive(candidate));
+    const runs = new Map<string, RetentionCandidate[]>();
+    for (const candidate of terminalCandidates) {
+      const run = runs.get(candidate.artifactId!) ?? [];
+      run.push(candidate);
+      runs.set(candidate.artifactId!, run);
+    }
+    const orderedRuns = [...runs.entries()].sort((left, right) => {
+      const leftTime = Math.min(...left[1].map((candidate) => candidate.mtimeMs));
+      const rightTime = Math.min(...right[1].map((candidate) => candidate.mtimeMs));
+      return leftTime - rightTime || left[0].localeCompare(right[0]);
+    });
+    for (const [, artifacts] of orderedRuns.slice(0, Math.max(0, orderedRuns.length - maxRuns))) {
+      for (const artifact of artifacts) await remove(artifact);
+    }
+  }
+  let total = candidates
+    .filter((candidate) => !report.removed.includes(candidate.path))
+    .reduce((sum, candidate) => sum + candidate.size, 0);
+  for (const candidate of sortedCandidates(candidates)) {
+    if (total <= maxBytes) break;
+    if (isActive(candidate) || report.removed.includes(candidate.path)) continue;
+    await remove(candidate);
+    if (report.removed.includes(candidate.path)) total -= candidate.size;
+  }
+  return report;
+}
+
+export async function pruneMigrationBackups(
+  appHome: string,
+  options: MigrationBackupRetentionOptions = {},
+): Promise<RetentionReport> {
+  const report: RetentionReport = { removed: [], errors: [] };
+  const root = join(appHome, "migration-backups");
+  const now = finiteNow(options.now);
+  const maxAgeMs = downwardInteger(options.maxAgeDays, MIGRATION_BACKUP_MAX_AGE_DAYS) * 86_400_000;
+  const maxBytes = downwardInteger(options.maxBytesGlobal, DEFAULT_MIGRATION_BACKUP_BYTES);
+  const active = new Set([...(options.activeBackupPaths ?? [])].map((path) => resolvePath(path)));
+  const manifest = await completedOrActiveManifest(appHome);
+  if (manifest && !manifest.complete) active.add(resolvePath(manifest.backupPath));
+  const candidates: Array<RetentionCandidate & { source: string }> = [];
+  for (const path of await managedBackupEntries(root)) {
+    try {
+      const info = await lstat(path);
+      if (info.isSymbolicLink() || (!info.isFile() && !info.isDirectory())) throw new Error("Backup ist kein reguläres verwaltetes Objekt.");
+      candidates.push({
+        kind: "task-sidecar",
+        path,
+        chatId: "backup",
+        mtimeMs: info.mtimeMs,
+        size: info.isDirectory() ? await treeSize(path) : info.size,
+        source: basename(path).startsWith("config-v0-") ? "config" : "legacy-home",
+      });
+    } catch (error) {
+      recordRetentionError(report, path, error, options.onError);
+    }
+  }
+  const removable = (candidate: RetentionCandidate): boolean => !active.has(resolvePath(candidate.path));
+  for (const candidate of sortedCandidates(candidates)) {
+    if (removable(candidate) && now - candidate.mtimeMs > maxAgeMs) {
+      await removeRetentionCandidate(appHome, candidate.path, report, options.onError);
+    }
+  }
+  for (const source of new Set(candidates.map((candidate) => candidate.source))) {
+    const sameSource = sortedCandidates(candidates.filter((candidate) =>
+      candidate.source === source && removable(candidate) && !report.removed.includes(candidate.path)));
+    for (const candidate of sameSource.slice(0, -1)) {
+      await removeRetentionCandidate(appHome, candidate.path, report, options.onError);
+    }
+  }
+  let total = candidates.filter((candidate) => !report.removed.includes(candidate.path))
+    .reduce((sum, candidate) => sum + candidate.size, 0);
+  for (const candidate of sortedCandidates(candidates)) {
+    if (total <= maxBytes) break;
+    if (!removable(candidate) || report.removed.includes(candidate.path)) continue;
+    await removeRetentionCandidate(appHome, candidate.path, report, options.onError);
+    if (report.removed.includes(candidate.path)) total -= candidate.size;
+  }
+  return report;
+}
+
+export interface ChatDeletionReport extends RetentionReport {}
+
+export async function deleteChatOwnedArtifacts(
+  appHome: string,
+  workspace: string,
+  chatId: string,
+): Promise<ChatDeletionReport> {
+  const report: ChatDeletionReport = { removed: [], errors: [] };
+  const store = new PrivateStore({ root: appHome });
+  const local = { appHome, workspace, chatId };
+  const manifest = await validatedCompletedManifest(appHome);
+  const mapped = manifest
+    ? Object.entries(manifest.chatIdMap).filter(([, mappedId]) => mappedId === chatId).map(([oldId]) => oldId)
+    : [];
+  const legacyLocations = mapped.map((oldId) => ({
+    appHome: manifest!.backupPath,
+    workspace,
+    chatId: oldId,
+  }));
+  const sidecars = CHAT_ARTIFACT_REGISTRY.entries().filter((entry) => entry.kind !== "chat");
+  for (const entry of sidecars) {
+    for (const location of [local, ...legacyLocations]) {
+      let paths: string[];
+      try {
+        paths = await CHAT_ARTIFACT_REGISTRY.existing(entry.kind, location);
+      } catch (error) {
+        recordRetentionError(report, `${location.appHome}:${entry.kind}`, error);
+        continue;
+      }
+      for (const path of paths) await removeOwnedPath(store, path, report);
+    }
+  }
+  if (report.errors.length > 0) return report;
+  // The canonical transcript is the retry anchor: remove it only after every
+  // mapped legacy transcript has also been cleared successfully.
+  for (const location of legacyLocations) {
+    const paths = await CHAT_ARTIFACT_REGISTRY.existing("chat", location);
+    for (const path of paths) await removeOwnedPath(store, path, report);
+  }
+  if (report.errors.length > 0) return report;
+  const transcriptPaths = await CHAT_ARTIFACT_REGISTRY.existing("chat", local);
+  for (const path of transcriptPaths) await removeOwnedPath(store, path, report);
+  if (manifest && report.errors.length === 0 && await treeHasNoFiles(manifest.backupPath)) {
+    await removeOwnedPath(store, manifest.backupPath, report);
+  }
+  return report;
+}
 
 export function workspaceStorageHash(workspace: string): string {
   return createHash("sha256").update(workspace).digest("hex").slice(0, 16);
@@ -980,12 +1286,197 @@ async function names(path: string): Promise<string[]> {
 async function filesMatching(path: string, accepts: (name: string) => boolean): Promise<string[]> {
   try {
     return (await readdir(path, { withFileTypes: true }))
-      .filter((entry) => entry.isFile() && accepts(entry.name))
+      .filter((entry) => (entry.isFile() || entry.isSymbolicLink()) && accepts(entry.name))
       .map((entry) => join(path, entry.name))
       .sort();
   } catch (error) {
     if (hasErrorCode(error, "ENOENT")) return [];
     throw error;
+  }
+}
+
+function chatIdFromChatArtifact(kind: ChatArtifactKind, name: string): string | null {
+  let match: RegExpExecArray | null = null;
+  switch (kind) {
+    case "chat":
+      if (name.includes(".konflikt-") || name.endsWith(".state.json") || name.endsWith(".lock")) return null;
+      match = /^(.+)\.json$/.exec(name);
+      break;
+    case "chat-conflict":
+      match = /^(.+)\.json\.konflikt-.+\.json$/.exec(name);
+      break;
+    case "conversation-state":
+      match = /^(.+)\.json\.state\.json$/.exec(name);
+      break;
+    case "conversation-conflict":
+      match = /^(.+)\.json\.state\.json\.konflikt-.+\.json$/.exec(name);
+      break;
+    case "lock":
+      match = /^(.+)\.json(?:\.state\.json)?\.lock$/.exec(name);
+      break;
+    default:
+      return null;
+  }
+  return match && safeChatId(match[1]) ? match[1] : null;
+}
+
+function compareArtifactFile(left: RegisteredArtifactFile, right: RegisteredArtifactFile): number {
+  return left.path.localeCompare(right.path);
+}
+
+function sortedCandidates<T extends RetentionCandidate>(candidates: readonly T[]): T[] {
+  return [...candidates].sort((left, right) => left.mtimeMs - right.mtimeMs || left.path.localeCompare(right.path));
+}
+
+function downwardInteger(value: number | undefined, ceiling: number): number {
+  if (value === undefined || !Number.isFinite(value)) return ceiling;
+  return Math.min(ceiling, Math.max(0, Math.floor(value)));
+}
+
+function finiteNow(value: number | undefined): number {
+  return value !== undefined && Number.isFinite(value) ? value : Date.now();
+}
+
+function recordRetentionError(
+  report: RetentionReport,
+  path: string,
+  error: unknown,
+  onError?: (error: RetentionError) => void,
+): void {
+  const entry = { path, message: errorText(error) };
+  report.errors.push(entry);
+  onError?.(entry);
+}
+
+async function removeRetentionCandidate(
+  appHome: string,
+  path: string,
+  report: RetentionReport,
+  onError?: (error: RetentionError) => void,
+): Promise<void> {
+  try {
+    await new PrivateStore({ root: appHome }).removeTree(path);
+    report.removed.push(path);
+  } catch (error) {
+    recordRetentionError(report, path, error, onError);
+  }
+}
+
+async function removeOwnedPath(
+  store: PrivateStore,
+  path: string,
+  report: ChatDeletionReport,
+): Promise<void> {
+  try {
+    await store.removeTree(path);
+    report.removed.push(path);
+  } catch (error) {
+    recordRetentionError(report, path, error);
+  }
+}
+
+async function inspectRunStates(
+  appHome: string,
+  report: RetentionReport,
+  onError?: (error: RetentionError) => void,
+): Promise<{ terminal: Map<string, Set<string>>; active: Map<string, Set<string>> }> {
+  const terminal = new Map<string, Set<string>>();
+  const active = new Map<string, Set<string>>();
+  for (const artifact of await CHAT_ARTIFACT_REGISTRY.all("run-log", appHome)) {
+    const target = terminalEventExists(await readRunLogText(artifact.path, report, onError))
+      ? terminal
+      : active;
+    const ids = target.get(artifact.chatId) ?? new Set<string>();
+    if (artifact.artifactId) ids.add(artifact.artifactId);
+    target.set(artifact.chatId, ids);
+  }
+  return { terminal, active };
+}
+
+async function readRunLogText(
+  path: string,
+  report: RetentionReport,
+  onError?: (error: RetentionError) => void,
+): Promise<string> {
+  try {
+    return await readFile(path, "utf8");
+  } catch (error) {
+    recordRetentionError(report, path, error, onError);
+    return "";
+  }
+}
+
+function terminalEventExists(raw: string): boolean {
+  for (const line of raw.split(/\r?\n/)) {
+    if (!line.trim()) continue;
+    try {
+      const value: unknown = JSON.parse(line);
+      const event = compatibleRunEvent(value);
+      if (event?.type === "run-end") return true;
+    } catch {
+      // A corrupt line does not turn an interrupted run into a terminal run.
+    }
+  }
+  return false;
+}
+
+async function managedBackupEntries(root: string): Promise<string[]> {
+  try {
+    return (await readdir(root, { withFileTypes: true }))
+      .filter((entry) => entry.name.startsWith("routercode-") || entry.name.startsWith("config-v0-"))
+      .map((entry) => join(root, entry.name))
+      .sort();
+  } catch (error) {
+    if (hasErrorCode(error, "ENOENT")) return [];
+    throw error;
+  }
+}
+
+interface DeletionManifest {
+  backupPath: string;
+  chatIdMap: Record<string, string>;
+  complete: boolean;
+}
+
+async function completedOrActiveManifest(appHome: string): Promise<DeletionManifest | null> {
+  try {
+    const value = parseRecord(await readFile(migrationManifestPath(appHome), "utf8"));
+    if (value.version !== STORAGE_SCHEMA_VERSION || typeof value.sourceChecksum !== "string"
+      || !/^[a-f0-9]{64}$/.test(value.sourceChecksum) || typeof value.backupPath !== "string"
+      || !isRecord(value.chatIdMap) || typeof value.complete !== "boolean") return null;
+    const expectedBackup = resolvePath(join(appHome, "migration-backups", `routercode-${value.sourceChecksum.slice(0, 16)}`));
+    if (resolvePath(value.backupPath) !== expectedBackup) return null;
+    const chatIdMap: Record<string, string> = {};
+    for (const [oldId, newId] of Object.entries(value.chatIdMap)) {
+      if (!safeChatId(oldId) || typeof newId !== "string" || !safeChatId(newId)) return null;
+      chatIdMap[oldId] = newId;
+    }
+    return { backupPath: expectedBackup, chatIdMap, complete: value.complete };
+  } catch {
+    return null;
+  }
+}
+
+async function validatedCompletedManifest(appHome: string): Promise<DeletionManifest | null> {
+  try {
+    const raw = parseRecord(await readFile(migrationManifestPath(appHome), "utf8"));
+    if (raw.phase !== "complete") return null;
+  } catch {
+    return null;
+  }
+  const manifest = await completedOrActiveManifest(appHome);
+  return manifest?.complete ? manifest : null;
+}
+
+async function treeHasNoFiles(root: string): Promise<boolean> {
+  try {
+    for (const entry of await readdir(root, { withFileTypes: true })) {
+      if (entry.isSymbolicLink() || entry.isFile()) return false;
+      if (!entry.isDirectory() || !(await treeHasNoFiles(join(root, entry.name)))) return false;
+    }
+    return true;
+  } catch (error) {
+    return hasErrorCode(error, "ENOENT");
   }
 }
 
@@ -1063,6 +1554,12 @@ function mappedChatId(checksum: string, oldId: string): string {
 
 function safeArtifactId(value: string | undefined): string | null {
   return value && /^[a-zA-Z0-9._-]{1,160}$/.test(value) ? value : null;
+}
+
+function safeChatId(value: string | undefined): string | null {
+  return value && value !== "." && value !== ".." && /^[a-zA-Z0-9_-]{1,160}$/.test(value)
+    ? value
+    : null;
 }
 
 function isWithin(root: string, candidate: string): boolean {

@@ -172,6 +172,8 @@ export interface CommandContext {
     judgment: PanelJudgment | null,
     expandedIndex: number | null,
   ) => void;
+  /** One destructive chat-deletion confirmation. Fullscreen UI injects its modal; plain mode uses Inquirer. */
+  confirmChatDeletion?: (title: string, details: string) => Promise<boolean>;
 }
 
 /** Every command that persists `context.config` goes through this, never a bare `saveConfig(context.config)` — see `CommandContext.configPath`. */
@@ -1374,10 +1376,30 @@ async function chatCommand(
     }
     const target = best.chat;
     const wasActive = target.id === context.session.data.id;
-    await SessionStore.remove(context.workspace, target.id, context.session.appHome);
+    const accepted = context.confirmChatDeletion
+      ? await context.confirmChatDeletion(
+        `Chat „${target.title}“ endgültig löschen?`,
+        `Chat-ID: ${target.id}\nTranscript, SDK-Zustand, Run-Logs, Checkpoints, Journale und Task-Sidecars werden gelöscht.`,
+      )
+      : await confirm({
+        message: `Chat „${target.title}“ (${target.id}) samt allen zugehörigen lokalen Artefakten endgültig löschen?`,
+        default: false,
+      });
+    if (!accepted) {
+      context.out.text("Chat unverändert; Löschen abgebrochen.");
+      return;
+    }
+    const deletion = await SessionStore.remove(context.workspace, target.id, context.session.appHome);
+    if (deletion.errors.length > 0) {
+      context.out.error(
+        "Chat konnte nicht vollständig gelöscht werden; der Transcript bleibt für einen sicheren erneuten Versuch erhalten.",
+        deletion.errors.map((error) => `${error.path}: ${error.message}`).join("\n"),
+      );
+      return;
+    }
     if (wasActive) {
       // Sonst legt der nächste Auto-Save die gelöschte Datei neu an.
-      await replaceSession(context, SessionStore.create(context.workspace, context.session.appHome));
+      await replaceDeletedSession(context, SessionStore.create(context.workspace, context.session.appHome));
     }
     context.out.text(
       `Chat endgültig gelöscht: ${target.title} (${target.id})${wasActive ? " — neuer leerer Chat gestartet." : ""}`,
@@ -1388,6 +1410,19 @@ async function chatCommand(
   throw new Error(
     "Verwendung: /chat [list|new [Titel]|open <ID|Titel>|search <Begriff>|rename <Titel>|fork [Titel]|delete <ID|Titel>|current]",
   );
+}
+
+async function replaceDeletedSession(
+  context: CommandContext,
+  next: SessionStore,
+): Promise<void> {
+  context.session = next;
+  context.agent.setSession(next);
+  next.setPreferences(
+    context.config.mainModel,
+    getReasoningSetting(context.config),
+  );
+  await Promise.all([next.save(), saveContextConfig(context)]);
 }
 
 async function replaceSession(

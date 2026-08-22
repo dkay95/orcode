@@ -141,9 +141,13 @@ test("startup awaits migration before config, rules, chats, exact artifacts, key
         order.push("migration-complete");
         return { status: "ready", appHome: "/synthetic/.orcode", warning: null };
       },
+      pruneRunLogs: async (appHome) => {
+        assert.equal(appHome, "/synthetic/.orcode");
+        order.push("redacted-retention");
+      },
       pruneCheckpoints: async (appHome) => {
         assert.equal(appHome, "/synthetic/.orcode");
-        order.push("checkpoints");
+        order.push("exact-retention");
       },
       loadConfig: async (path) => {
         assert.equal(path, "/synthetic/.orcode/config.json");
@@ -174,7 +178,8 @@ test("startup awaits migration before config, rules, chats, exact artifacts, key
     "migration-start",
     "key-and-network-probe-blocked",
     "migration-complete",
-    "checkpoints",
+    "redacted-retention",
+    "exact-retention",
     "config",
     "rules",
     "chats",
@@ -202,6 +207,9 @@ test("declined future or recovery-required migration stops startup before any mu
               appHome: "/synthetic/.routercode",
               warning: `startup stopped: ${status}`,
             } as never;
+          },
+          pruneRunLogs: async () => {
+            calls.push("run-prune");
           },
           pruneCheckpoints: async () => {
             calls.push("prune");
@@ -233,6 +241,7 @@ test("startup exposes the selected app-home config path to every runtime command
     { workspace: "/synthetic/workspace", newChat: false },
     {
       migrateAppHome: async () => ({ status: "ready", appHome, warning: null } as never),
+      pruneRunLogs: async () => undefined,
       pruneCheckpoints: async () => undefined,
       loadConfig: async () => structuredClone(DEFAULT_CONFIG),
       loadRules: async () => ({} as never),
@@ -241,4 +250,66 @@ test("startup exposes the selected app-home config path to every runtime command
   );
 
   assert.equal((result as typeof result & { configPath?: string }).configPath, join(appHome, "config.json"));
+});
+
+test("startup invokes both retention classes best effort and reports each failure before opening stores", async () => {
+  const { initializeStartupStorage } = await import("../src/cli.js");
+  const calls: string[] = [];
+  const result = await initializeStartupStorage(
+    { workspace: "/synthetic/workspace", newChat: false },
+    {
+      migrateAppHome: async () => ({ status: "ready", appHome: "/synthetic/.orcode", warning: null } as never),
+      pruneRunLogs: async () => {
+        calls.push("redacted");
+        throw new Error("run retention unavailable");
+      },
+      pruneCheckpoints: async () => {
+        calls.push("exact");
+        throw new Error("exact retention unavailable");
+      },
+      loadConfig: async () => {
+        calls.push("config");
+        return structuredClone(DEFAULT_CONFIG);
+      },
+      loadRules: async () => {
+        calls.push("rules");
+        return {} as never;
+      },
+      openSession: async (_workspace, appHome) => {
+        calls.push("session");
+        return { appHome, data: { id: "chat-a" } } as never;
+      },
+    },
+  );
+
+  assert.deepEqual(calls, ["redacted", "exact", "config", "rules", "session"]);
+  assert.equal(result.retentionWarnings.length, 2);
+  assert.match(result.retentionWarnings[0]!, /run retention unavailable/);
+  assert.match(result.retentionWarnings[1]!, /exact retention unavailable/);
+});
+
+test("startup surfaces returned per-class retention errors, including nested exact backup reports", async () => {
+  const { initializeStartupStorage } = await import("../src/cli.js");
+  const result = await initializeStartupStorage(
+    { workspace: "/synthetic/workspace", newChat: false },
+    {
+      migrateAppHome: async () => ({ status: "ready", appHome: "/synthetic/.orcode", warning: null } as never),
+      pruneRunLogs: async () => ({
+        removed: [],
+        errors: [{ path: "runs/chat-a/run.ndjson", message: "redacted log remained busy" }],
+      }),
+      pruneCheckpoints: async () => ({
+        exact: { removed: [], errors: [{ path: "tasks/chat-a/state.json", message: "exact state remained busy" }] },
+        backups: { removed: [], errors: [{ path: "migration-backup", message: "backup remained busy" }] },
+      }),
+      loadConfig: async () => structuredClone(DEFAULT_CONFIG),
+      loadRules: async () => ({} as never),
+      openSession: async (_workspace, appHome) => ({ appHome, data: { id: "chat-a" } } as never),
+    },
+  );
+
+  assert.equal(result.retentionWarnings.length, 3);
+  assert.ok(result.retentionWarnings.some((warning) => /redacted log remained busy/.test(warning)));
+  assert.ok(result.retentionWarnings.some((warning) => /exact state remained busy/.test(warning)));
+  assert.ok(result.retentionWarnings.some((warning) => /backup remained busy/.test(warning)));
 });

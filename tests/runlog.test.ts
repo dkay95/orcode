@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { appendFile, mkdtemp, readdir, readFile, stat, writeFile } from "node:fs/promises";
+import { appendFile, mkdtemp, readdir, readFile, stat, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -424,6 +424,83 @@ test("RunLog.prune with 60 files keeps exactly the 50 most recent", async () => 
 test("RunLog.prune on a chat with no runs directory does nothing", async () => {
   const home = await appHome("prune-empty");
   await assert.doesNotReject(RunLog.prune(home, "no-such-chat", 50));
+});
+
+test("RunLog retention clamps age and per-chat configuration downward while excluding an active run", async () => {
+  const home = await appHome("retention-ceilings");
+  const chatId = "chat-retention";
+  const now = Date.parse("2026-08-22T12:00:00.000Z");
+  const activeRunId = "2026-06-01T00-00-00-000-active";
+  const staleRunId = "2026-07-01T00-00-00-000-stale";
+
+  for (const [runId, terminal] of [[activeRunId, false], [staleRunId, true]] as const) {
+    const log = await RunLog.open(home, chatId, runId);
+    log.write({ type: "run-start", model: "vendor/model", maxSteps: 1, prompt: runId, timestamp: now });
+    if (terminal) {
+      log.write({ type: "run-end", outcome: "complete", durationMs: 1, toolCount: 0, timestamp: now + 1 });
+    }
+    await log.close();
+    await utimes(runLogPath(home, chatId, runId), new Date(now - 40 * 86_400_000), new Date(now - 40 * 86_400_000));
+  }
+
+  for (let index = 0; index < 101; index += 1) {
+    const runId = `2026-08-01T00-00-${String(index).padStart(3, "0")}-000-terminal`;
+    const log = await RunLog.open(home, chatId, runId);
+    log.write({ type: "run-end", outcome: "complete", durationMs: 1, toolCount: 0, timestamp: now + index });
+    await log.close();
+    await utimes(runLogPath(home, chatId, runId), new Date(now - (101 - index) * 1_000), new Date(now - (101 - index) * 1_000));
+  }
+
+  await RunLog.prune(home, {
+    now,
+    maxAgeDays: 365,
+    maxRunsPerChat: 1_000,
+    maxBytesGlobal: Number.MAX_SAFE_INTEGER,
+  });
+
+  const remaining = await readdir(runsDir(home, chatId));
+  assert.ok(remaining.includes(`${activeRunId}.ndjson`), "active run must survive age and count pruning");
+  assert.ok(!remaining.includes(`${staleRunId}.ndjson`), "age cannot be configured above 30 days");
+  assert.equal(
+    remaining.filter((name) => name.endsWith("-terminal.ndjson")).length,
+    100,
+    "per-chat retention cannot be configured above 100 terminal runs",
+  );
+});
+
+test("RunLog retention enforces a downward global byte limit oldest first across chats", async () => {
+  const home = await appHome("retention-global");
+  const now = Date.parse("2026-08-22T12:00:00.000Z");
+  const paths: string[] = [];
+  for (let index = 0; index < 3; index += 1) {
+    const chatId = `chat-global-${index}`;
+    const runId = `2026-08-22T00-00-0${index}-000-run`;
+    const log = await RunLog.open(home, chatId, runId);
+    log.write({
+      type: "notice",
+      level: "info",
+      code: "payload",
+      message: `${index}-${"x".repeat(900)}`,
+      timestamp: now + index,
+    });
+    log.write({ type: "run-end", outcome: "complete", durationMs: 1, toolCount: 0, timestamp: now + index + 1 });
+    await log.close();
+    const path = runLogPath(home, chatId, runId);
+    paths.push(path);
+    await utimes(path, new Date(now - (3 - index) * 1_000), new Date(now - (3 - index) * 1_000));
+  }
+
+  const sizes = await Promise.all(paths.map(async (path) => (await stat(path)).size));
+  await RunLog.prune(home, {
+    now,
+    maxAgeDays: 30,
+    maxRunsPerChat: 100,
+    maxBytesGlobal: sizes[1]! + sizes[2]!,
+  });
+
+  await assert.rejects(readFile(paths[0]!, "utf8"), /ENOENT/);
+  assert.match(await readFile(paths[1]!, "utf8"), /run-end/);
+  assert.match(await readFile(paths[2]!, "utf8"), /run-end/);
 });
 
 // --- resilience: a crash can leave a half-written last line ---------------

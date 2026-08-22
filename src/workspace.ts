@@ -26,6 +26,11 @@ import { PrivateStore } from "./private-store.js";
 import {
   CHAT_ARTIFACT_REGISTRY,
   parseCheckpointEntries,
+  pruneExactArtifacts,
+  pruneMigrationBackups,
+  type ExactArtifactRetentionOptions,
+  type MigrationBackupRetentionOptions,
+  type RetentionReport,
   type StoredChangeEntry,
 } from "./storage.js";
 import { loadIgnore } from "./ignore.js";
@@ -262,53 +267,14 @@ function formatUndoSummary(outcome: UndoRunOutcome, dryRun: boolean): string {
  */
 export async function pruneCheckpoints(
   appHome: string = APP_HOME,
-  options: { maxAgeDays?: number; maxBytesPerChat?: number } = {},
-): Promise<void> {
-  const maxAgeMs = (options.maxAgeDays ?? 30) * 24 * 60 * 60 * 1_000;
-  const maxBytes = options.maxBytesPerChat ?? 100 * 1_024 * 1_024;
-  const root = join(appHome, "checkpoints");
-  let chatIds: string[];
-  try {
-    chatIds = await readdir(root);
-  } catch {
-    return;
-  }
-  const now = Date.now();
-  for (const chatId of chatIds) {
-    const dir = join(root, chatId);
-    let files: string[];
-    try {
-      files = await readdir(dir);
-    } catch {
-      continue;
-    }
-    const infos: Array<{ file: string; mtimeMs: number; size: number }> = [];
-    for (const file of files) {
-      const full = join(dir, file);
-      try {
-        const info = await stat(full);
-        infos.push({ file: full, mtimeMs: info.mtimeMs, size: info.size });
-      } catch {
-        // Gone already: nothing to prune.
-      }
-    }
-    for (const info of infos) {
-      if (now - info.mtimeMs > maxAgeMs) {
-        await unlink(info.file).catch(() => undefined);
-      }
-    }
-    const remaining = infos
-      .filter((info) => now - info.mtimeMs <= maxAgeMs)
-      .sort((a, b) => a.mtimeMs - b.mtimeMs);
-    let total = remaining.reduce((sum, info) => sum + info.size, 0);
-    for (const info of remaining) {
-      if (total <= maxBytes) {
-        break;
-      }
-      await unlink(info.file).catch(() => undefined);
-      total -= info.size;
-    }
-  }
+  options: ExactArtifactRetentionOptions & { backups?: MigrationBackupRetentionOptions } = {},
+): Promise<{ exact: RetentionReport; backups: RetentionReport }> {
+  const exact = await pruneExactArtifacts(appHome, options);
+  const backups = await pruneMigrationBackups(appHome, options.backups ?? {
+    ...(options.now !== undefined ? { now: options.now } : {}),
+    ...(options.onError ? { onError: options.onError } : {}),
+  });
+  return { exact, backups };
 }
 
 export class WorkspaceGuard {

@@ -1,8 +1,17 @@
 import assert from "node:assert/strict";
+import { mkdtemp, readFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
 import { SpendUnavailableError, assertSpendAvailable } from "../src/agent.js";
-import { shouldReplaceCredential } from "../src/commands.js";
+import {
+  handleSlashCommand,
+  shouldReplaceCredential,
+  type CommandContext,
+} from "../src/commands.js";
 import { OpenRouterHttpError } from "../src/openrouter.js";
+import { SessionStore } from "../src/session.js";
+import { DEFAULT_CONFIG } from "../src/config.js";
 
 test("only unusable credentials trigger replacement", () => {
   assert.equal(
@@ -77,4 +86,66 @@ test("an expired key is still replaced", () => {
   });
   assert.equal(expired.reason, "key-expired");
   assert.equal(shouldReplaceCredential(expired), true);
+});
+
+test("chat deletion asks exactly once; decline changes nothing and accept deletes the selected chat", async () => {
+  const root = await mkdtemp(join(tmpdir(), "routercode-command-delete-"));
+  const workspace = join(root, "project");
+  const appHome = join(root, ".orcode");
+  const active = SessionStore.create(workspace, appHome, "Aktiv");
+  const target = SessionStore.create(workspace, appHome, "Löschziel");
+  await active.save();
+  await target.save();
+  const output: string[] = [];
+  const confirmations: Array<{ title: string; details: string }> = [];
+  let accepted = false;
+  const context = {
+    workspace,
+    session: active,
+    agent: { setSession: () => undefined },
+    out: { text: (value: string) => output.push(value), error: (value: string) => output.push(value) },
+    confirmChatDeletion: async (title: string, details: string) => {
+      confirmations.push({ title, details });
+      return accepted;
+    },
+  } as unknown as CommandContext;
+
+  await handleSlashCommand(`/chat delete ${target.data.id}`, context);
+  assert.equal(confirmations.length, 1);
+  assert.match(confirmations[0]!.details, new RegExp(target.data.id));
+  assert.match(await readFile(target.path, "utf8"), /Löschziel/);
+  assert.equal((await SessionStore.list(workspace, appHome)).length, 2);
+
+  accepted = true;
+  await handleSlashCommand(`/chat delete ${target.data.id}`, context);
+  assert.equal(confirmations.length, 2, "each delete attempt has one and only one confirmation");
+  await assert.rejects(readFile(target.path, "utf8"), /ENOENT/);
+  assert.deepEqual((await SessionStore.list(workspace, appHome)).map((chat) => chat.id), [active.data.id]);
+  assert.ok(output.some((line) => /endgültig gelöscht/.test(line)));
+});
+
+test("accepting deletion of the active chat rebinds before autosave can resurrect it", async () => {
+  const root = await mkdtemp(join(tmpdir(), "routercode-command-active-delete-"));
+  const workspace = join(root, "project");
+  const appHome = join(root, ".orcode");
+  const active = SessionStore.create(workspace, appHome, "Aktiv löschen");
+  await active.save();
+  const oldId = active.data.id;
+  const rebound: string[] = [];
+  const context = {
+    workspace,
+    session: active,
+    config: structuredClone(DEFAULT_CONFIG),
+    configPath: join(appHome, "config.json"),
+    agent: { setSession: (session: SessionStore) => rebound.push(session.data.id) },
+    out: { text: () => undefined, error: () => undefined },
+    confirmChatDeletion: async () => true,
+  } as unknown as CommandContext;
+
+  await handleSlashCommand(`/chat delete ${oldId}`, context);
+  await context.session.save();
+
+  assert.notEqual(context.session.data.id, oldId);
+  assert.deepEqual(rebound, [context.session.data.id]);
+  assert.equal((await SessionStore.list(workspace, appHome)).some((chat) => chat.id === oldId), false);
 });

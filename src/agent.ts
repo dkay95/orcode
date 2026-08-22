@@ -29,6 +29,11 @@ import {
 import { formatSecretWarning, scanForSecrets } from "./secrets.js";
 import { createRunId, RunLog } from "./runlog.js";
 import { SessionStore, workspaceSpend } from "./session.js";
+import {
+  ChatArtifactStore,
+  collectRetentionErrors,
+  pruneExactArtifacts,
+} from "./storage.js";
 import type {
   AgentRunEvent,
   BalanceInfo,
@@ -112,9 +117,13 @@ const PARTIAL_TURN_MARKER = {
 } as const;
 
 export class OrcodeAgent {
-  readonly journal: ChangeJournal;
   readonly guard: WorkspaceGuard;
-  #session: SessionStore;
+  #binding: {
+    session: SessionStore;
+    journal: ChangeJournal;
+    artifacts: ChatArtifactStore;
+    conversation: ConversationStore | null;
+  };
   #lastResolvedModel: string | null = null;
   #compressorPrice: { model: string; price: CompressorPrice | null } | null = null;
   #mainModelInfo: { model: string; info: ModelInfo | null } | null = null;
@@ -124,8 +133,6 @@ export class OrcodeAgent {
   // fork — both already go through `setSession`); a mutation of the *same*
   // chat file in place (`/clear`, checkpoint restore) needs the caller to
   // call `resetConversationMemory()` explicitly, see that method's doc.
-  #conversation: ConversationStore | null = null;
-  #conversationPath: string | null = null;
   // K7f: the last measured input size, used to decide — before the *next*
   // run even starts — whether the context budget was exceeded. Never read
   // from the (opaque) SDK state itself.
@@ -141,17 +148,13 @@ export class OrcodeAgent {
     session: SessionStore,
     private readonly config: OrcodeConfigWithBudget,
     guard: WorkspaceGuard,
+    private readonly retention: {
+      pruneRunLogs: (appHome: string) => Promise<unknown>;
+      pruneExactArtifacts: (appHome: string) => Promise<unknown>;
+    },
   ) {
-    this.#session = session;
     this.guard = guard;
-    // A5: checkpoints must land under this chat's real app-home/chat-id, not
-    // the 'default' bucket a bare `new ChangeJournal()` would fall back to —
-    // otherwise every test that exercises a write tool leaks into the real
-    // `~/.orcode/checkpoints/default/`.
-    this.journal = new ChangeJournal({
-      appHome: session.appHome,
-      chatId: session.data.id,
-    });
+    this.#binding = createChatBinding(session);
   }
 
   static async create(options: {
@@ -160,6 +163,10 @@ export class OrcodeAgent {
     session: SessionStore;
     config: OrcodeConfigWithBudget;
     workspace: string;
+    retention?: {
+      pruneRunLogs: (appHome: string) => Promise<unknown>;
+      pruneExactArtifacts: (appHome: string) => Promise<unknown>;
+    };
   }): Promise<OrcodeAgent> {
     return new OrcodeAgent(
       options.openRouter,
@@ -167,19 +174,36 @@ export class OrcodeAgent {
       options.session,
       options.config,
       await WorkspaceGuard.create(options.workspace),
+      options.retention ?? {
+        pruneRunLogs: (appHome) => RunLog.prune(appHome),
+        pruneExactArtifacts,
+      },
     );
+  }
+
+  get #session(): SessionStore {
+    return this.#binding.session;
   }
 
   get session(): SessionStore {
     return this.#session;
   }
 
+  get journal(): ChangeJournal {
+    return this.#binding.journal;
+  }
+
+  get artifacts(): ChatArtifactStore {
+    return this.#binding.artifacts;
+  }
+
   /**
-   * Swap the chat this agent writes to. Keeps cached model resolution and the
-   * change journal, so switching chats no longer requires a fresh agent.
+   * Swap every chat-scoped writer atomically while retaining model caches, so
+   * switching chats does not require a fresh agent.
    */
   setSession(session: SessionStore): void {
-    this.#session = session;
+    const next = createChatBinding(session);
+    this.#binding = next;
   }
 
   /**
@@ -195,19 +219,18 @@ export class OrcodeAgent {
    * from.
    */
   resetConversationMemory(seed?: string): void {
-    this.#conversation?.reset(seed);
+    this.#binding.conversation?.reset(seed);
   }
 
   async #conversationFor(): Promise<ConversationStore> {
-    if (!this.#conversation || this.#conversationPath !== this.#session.path) {
-      this.#conversation = await ConversationStore.open(
+    if (!this.#binding.conversation) {
+      this.#binding.conversation = await ConversationStore.open(
         this.#session.appHome,
         this.#session.path,
         this.#session.data.id,
       );
-      this.#conversationPath = this.#session.path;
     }
-    return this.#conversation;
+    return this.#binding.conversation;
   }
 
   async run(
@@ -225,6 +248,8 @@ export class OrcodeAgent {
     // — resume.ts correlates the two by this id after a crash.
     const runId = createRunId();
     const runLog = await this.#openRunLog(runId);
+    const runHome = this.#session.appHome;
+    let successful = false;
     // Every event this run produces goes through here: to the caller's
     // observer exactly as before, and — best effort, never fatal to the run
     // itself — appended to the run log so an interrupted run leaves a
@@ -265,6 +290,7 @@ export class OrcodeAgent {
         toolCount,
         timestamp: Date.now(),
       });
+      successful = true;
       return result;
     } catch (error) {
       const cancelled =
@@ -281,7 +307,10 @@ export class OrcodeAgent {
       throw error;
     } finally {
       stopListening();
-      await this.#closeRunLog(runLog);
+      const runLogClosed = await this.#closeRunLog(runLog);
+      if (successful && runLogClosed) {
+        await this.#pruneAfterSuccessfulRun(runHome, observer);
+      }
     }
   }
 
@@ -294,14 +323,29 @@ export class OrcodeAgent {
     }
   }
 
-  async #closeRunLog(runLog: RunLog | null): Promise<void> {
+  async #closeRunLog(runLog: RunLog | null): Promise<boolean> {
     if (!runLog) {
-      return;
+      return false;
     }
     try {
       await runLog.close();
+      return true;
     } catch {
       // Diagnostic trail only — never surfaces as a run failure.
+      return false;
+    }
+  }
+
+  async #pruneAfterSuccessfulRun(appHome: string, observer: AgentRunObserver): Promise<void> {
+    for (const prune of [this.retention.pruneRunLogs, this.retention.pruneExactArtifacts]) {
+      try {
+        const result = await prune(appHome);
+        for (const error of collectRetentionErrors(result)) {
+          observer.onStatus?.(`Aufbewahrung konnte nicht vollständig bereinigt werden: ${error.message} (${error.path})`);
+        }
+      } catch (error) {
+        observer.onStatus?.(`Aufbewahrung konnte nicht vollständig bereinigt werden: ${errorMessage(error)}`);
+      }
     }
   }
 
@@ -944,6 +988,24 @@ export class OrcodeAgent {
     this.#compressorPrice = { model, price };
     return price;
   }
+}
+
+function createChatBinding(session: SessionStore): {
+  session: SessionStore;
+  journal: ChangeJournal;
+  artifacts: ChatArtifactStore;
+  conversation: ConversationStore | null;
+} {
+  const artifacts = new ChatArtifactStore(
+    session.appHome,
+    session.data.workspace,
+    session.data.id,
+  );
+  const journal = new ChangeJournal({
+    appHome: session.appHome,
+    chatId: session.data.id,
+  });
+  return { session, journal, artifacts, conversation: null };
 }
 
 /**

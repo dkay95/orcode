@@ -112,6 +112,8 @@ import {
   pruneCheckpoints,
 } from "./workspace.js";
 import { errorMessage, formatUsd } from "./utils.js";
+import { RunLog } from "./runlog.js";
+import { collectRetentionErrors } from "./storage.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -151,7 +153,8 @@ export interface CliOptions {
 
 export interface StartupStorageDependencies {
   migrateAppHome: typeof migrateAppHome;
-  pruneCheckpoints: typeof pruneCheckpoints;
+  pruneRunLogs: (appHome: string) => Promise<unknown>;
+  pruneCheckpoints: (appHome: string) => Promise<unknown>;
   loadConfig: typeof loadConfig;
   loadRules: typeof RuleStore.load;
   openSession: (
@@ -165,6 +168,7 @@ export interface StartupStorageResult {
   appHome: string;
   configPath: string;
   migrationWarning: string | null;
+  retentionWarnings: string[];
   config: OrcodeConfigWithBudget;
   ruleStore: RuleStore;
   session: SessionStore;
@@ -177,6 +181,7 @@ export async function initializeStartupStorage(
 ): Promise<StartupStorageResult> {
   const deps: StartupStorageDependencies = {
     migrateAppHome,
+    pruneRunLogs: (appHome) => RunLog.prune(appHome),
     pruneCheckpoints,
     loadConfig,
     loadRules: (appHome) => RuleStore.load(appHome),
@@ -196,7 +201,22 @@ export async function initializeStartupStorage(
     throw new Error(migration.warning ?? `Startup-Speicherstatus: ${migration.status}`);
   }
   const appHome = migration.appHome;
-  await deps.pruneCheckpoints(appHome).catch(() => undefined);
+  const retentionWarnings: string[] = [];
+  for (const [label, prune] of [
+    ["redacted", deps.pruneRunLogs],
+    ["exact", deps.pruneCheckpoints],
+  ] as const) {
+    try {
+      const result = await prune(appHome);
+      for (const error of collectRetentionErrors(result)) {
+        retentionWarnings.push(
+          `Aufbewahrung (${label}) konnte nicht vollständig bereinigt werden: ${error.message} (${error.path})`,
+        );
+      }
+    } catch (error) {
+      retentionWarnings.push(`Aufbewahrung (${label}) konnte nicht vollständig bereinigt werden: ${errorMessage(error)}`);
+    }
+  }
   const config = await deps.loadConfig(configPath(appHome));
   const ruleStore = await deps.loadRules(appHome);
   const session = await deps.openSession(options.workspace, appHome, options);
@@ -204,6 +224,7 @@ export async function initializeStartupStorage(
     appHome,
     configPath: configPath(appHome),
     migrationWarning: migration.warning,
+    retentionWarnings,
     config,
     ruleStore,
     session,
@@ -251,6 +272,9 @@ async function main(): Promise<void> {
   });
   if (startup.migrationWarning) {
     console.error(chalk.yellow(startup.migrationWarning));
+  }
+  for (const warning of startup.retentionWarnings) {
+    console.error(chalk.yellow(warning));
   }
   const { config, configPath: runtimeConfigPath, ruleStore, session } = startup;
   // loadConfig never throws any more; a broken file is reported instead of
@@ -456,6 +480,8 @@ interface RuntimeContext {
     judgment: PanelJudgment | null,
     expandedIndex: number | null,
   ) => void;
+  /** Fullscreen destructive-chat confirmation; plain mode leaves this unset for Inquirer. */
+  confirmChatDeletion?: (title: string, details: string) => Promise<boolean>;
 }
 
 async function runPlainLoop(
@@ -817,6 +843,8 @@ async function runDashboard(
   context.seedNextMessage = (text) => ui.insertInputText(text);
   context.onPanelResult = (result, judgment, expandedIndex) =>
     ui.addPanelResult(result, judgment, expandedIndex);
+  context.confirmChatDeletion = async (title, details) =>
+    (await ui.confirmAction(title, details)).accepted;
   // Showing a transcript behind the chat chooser contradicts the question it
   // asks: the user is picking a chat while already looking at one. Load only
   // once the choice is settled.

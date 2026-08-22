@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { mkdtemp, readdir, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -20,7 +20,10 @@ import {
 } from "../src/config.js";
 import { ConversationStore } from "../src/conversation.js";
 import { OpenRouterService } from "../src/openrouter.js";
+import { RunLog, runLogPath } from "../src/runlog.js";
 import { SessionStore } from "../src/session.js";
+import { CHAT_ARTIFACT_REGISTRY } from "../src/storage.js";
+import { checkpointRunPath } from "../src/workspace.js";
 import type { AgentRunEvent } from "../src/types.js";
 
 const healthy = {
@@ -568,6 +571,152 @@ test("the session can be swapped without rebuilding the agent", async () => {
   assert.equal(second.data.costs.mainUsd, 0.001);
 });
 
+test("setSession atomically rebinds journal, SDK state, run log, checkpoints, and task sidecars", async () => {
+  const setup = await createAgent();
+  const second = SessionStore.create(setup.workspace, setup.appHome, "Zweiter gebundener Chat");
+  await second.save();
+  const client = fakeClient((request) => ({
+    text: ["Gebunden."],
+    before: async (emit) => {
+      await request.state?.save(sampleConversationState("second-chat-state"));
+      await emit.modelCall(0, 0.001);
+    },
+  }));
+  const agent = await setup.agent(client.client);
+
+  agent.setSession(second);
+  await agent.journal.record({
+    path: join(setup.workspace, "bound.txt"),
+    before: null,
+    after: "bound",
+    createdAt: "2026-08-22T12:00:00.000Z",
+    runId: "manual-run",
+  });
+  await agent.artifacts.writeExact("task-sidecar", "task-1", "{}\n");
+  await agent.run("Schreibe gebunden", { onText: () => {} });
+
+  assert.match(await readFile(checkpointRunPath(setup.appHome, second.data.id, "manual-run"), "utf8"), /bound/);
+  await assert.rejects(readFile(checkpointRunPath(setup.appHome, setup.session.data.id, "manual-run"), "utf8"), /ENOENT/);
+  assert.equal(
+    await readFile(CHAT_ARTIFACT_REGISTRY.resolve("task-sidecar", {
+      appHome: setup.appHome,
+      chatId: second.data.id,
+      artifactId: "task-1",
+    }), "utf8"),
+    "{}\n",
+  );
+  await assert.rejects(readFile(CHAT_ARTIFACT_REGISTRY.resolve("task-sidecar", {
+    appHome: setup.appHome,
+    chatId: setup.session.data.id,
+    artifactId: "task-1",
+  }), "utf8"), /ENOENT/);
+  assert.match(await readFile(ConversationStore.path(setup.appHome, second.path), "utf8"), /second-chat-state/);
+  await assert.rejects(readFile(ConversationStore.path(setup.appHome, setup.session.path), "utf8"), /ENOENT/);
+  const runNames = await readdir(join(setup.appHome, "runs", second.data.id));
+  assert.equal(runNames.length, 1);
+  assert.match(await readFile(runLogPath(setup.appHome, second.data.id, runNames[0]!.slice(0, -".ndjson".length)), "utf8"), /run-end/);
+  await assert.rejects(readdir(join(setup.appHome, "runs", setup.session.data.id)), /ENOENT/);
+});
+
+test("setSession keeps the complete old binding when the replacement cannot be bound", async () => {
+  const setup = await createAgent();
+  const client = fakeClient(() => ({ text: ["unused"] }));
+  const agent = await setup.agent(client.client);
+  const invalid = new SessionStore(
+    setup.appHome,
+    join(setup.appHome, "chats", "invalid.json"),
+    { ...structuredClone(setup.session.data), id: "../invalid-chat" },
+  );
+
+  assert.throws(() => agent.setSession(invalid), /Chat-ID|Artefakt|ungültig/i);
+  assert.equal(agent.session, setup.session);
+  await agent.journal.record({
+    path: join(setup.workspace, "still-old.txt"),
+    before: null,
+    after: "old",
+    createdAt: "2026-08-22T12:00:00.000Z",
+    runId: "old-binding-run",
+  });
+  assert.match(await readFile(checkpointRunPath(setup.appHome, setup.session.data.id, "old-binding-run"), "utf8"), /still-old/);
+});
+
+test("successful runs invoke both pruners after run-log close; pruning errors are reported best effort", async () => {
+  const setup = await createAgent();
+  const calls: string[] = [];
+  const statuses: string[] = [];
+  const client = fakeClient((request) => ({
+    text: ["Erledigt."],
+    before: async (emit) => {
+      await request.state?.save(sampleConversationState("committed-before-prune"));
+      await emit.modelCall(0, 0.001);
+    },
+  }));
+  const agent = await setup.agent(client.client, {
+    pruneRunLogs: async (appHome) => {
+      const names = await readdir(join(appHome, "runs", setup.session.data.id));
+      const raw = await readFile(join(appHome, "runs", setup.session.data.id, names[0]!), "utf8");
+      assert.match(raw, /run-end/, "pruning must begin only after the run log is closed");
+      calls.push("redacted");
+      throw new Error("redacted prune unavailable");
+    },
+    pruneExactArtifacts: async () => {
+      assert.match(
+        await readFile(ConversationStore.path(setup.appHome, setup.session.path), "utf8"),
+        /committed-before-prune/,
+        "exact pruning must start after the successful SDK state commit",
+      );
+      calls.push("exact");
+      return {
+        removed: [],
+        errors: [{ path: "tasks/chat-a/state.json", message: "exact sidecar remained busy" }],
+      };
+    },
+  });
+
+  const result = await agent.run("Erfolg", { onText: () => {}, onStatus: (status) => statuses.push(status) });
+
+  assert.equal(result.outcome, "completed");
+  assert.deepEqual(calls, ["redacted", "exact"]);
+  assert.ok(statuses.some((status) => /Aufbewahrung.*redacted prune unavailable/i.test(status)));
+  assert.ok(statuses.some((status) => /Aufbewahrung.*exact sidecar remained busy/i.test(status)));
+});
+
+test("failed runs close their log but never trigger successful-run retention", async () => {
+  const setup = await createAgent();
+  const calls: string[] = [];
+  const client = fakeClient(() => ({ textError: () => new Error("synthetic failure") }));
+  const agent = await setup.agent(client.client, {
+    pruneRunLogs: async () => { calls.push("redacted"); },
+    pruneExactArtifacts: async () => { calls.push("exact"); },
+  });
+
+  await assert.rejects(agent.run("Fehler", { onText: () => {} }), /synthetic failure/);
+  assert.deepEqual(calls, []);
+  const names = await readdir(join(setup.appHome, "runs", setup.session.data.id));
+  assert.match(await readFile(join(setup.appHome, "runs", setup.session.data.id, names[0]!), "utf8"), /"outcome":"error"/);
+});
+
+test("a successful model result does not prune when its run log cannot close", async () => {
+  const setup = await createAgent();
+  const calls: string[] = [];
+  const client = fakeClient(() => ({ text: ["Erledigt."] }));
+  const agent = await setup.agent(client.client, {
+    pruneRunLogs: async () => { calls.push("redacted"); },
+    pruneExactArtifacts: async () => { calls.push("exact"); },
+  });
+  const originalClose = RunLog.prototype.close;
+  RunLog.prototype.close = async () => {
+    throw new Error("synthetic close failure");
+  };
+  try {
+    const result = await agent.run("Erfolg", { onText: () => {} });
+    assert.equal(result.outcome, "completed");
+    assert.deepEqual(calls, []);
+  } finally {
+    RunLog.prototype.close = originalClose;
+  }
+});
+
 test("the tools of a run receive the abort signal", async () => {
   // Without the signal reaching createCodingTools, Esc/Ctrl+C leaves a running
   // shell command behind and this call would take 30 seconds.
@@ -1009,7 +1158,13 @@ interface AgentSetup {
   appHome: string;
   session: SessionStore;
   config: OrcodeConfigWithBudget;
-  agent: (client: unknown) => Promise<OrcodeAgent>;
+  agent: (
+    client: unknown,
+    retention?: {
+      pruneRunLogs: (appHome: string) => Promise<unknown>;
+      pruneExactArtifacts: (appHome: string) => Promise<unknown>;
+    },
+  ) => Promise<OrcodeAgent>;
 }
 
 async function createAgent(
@@ -1030,13 +1185,14 @@ async function createAgent(
     appHome,
     session,
     config,
-    agent: (client) =>
+    agent: (client, retention) =>
       OrcodeAgent.create({
         openRouter: fakeService(client),
         approvals,
         session,
         config,
         workspace,
+        ...(retention ? { retention } : {}),
       }),
   };
 }

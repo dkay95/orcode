@@ -1,5 +1,5 @@
 import { randomBytes } from "node:crypto";
-import { appendFile, open, readdir, rm } from "node:fs/promises";
+import { appendFile, lstat, open, readdir } from "node:fs/promises";
 import type { FileHandle } from "node:fs/promises";
 import { createInterface } from "node:readline";
 import { createReadStream } from "node:fs";
@@ -9,16 +9,31 @@ import { redactRunEvent } from "./redaction.js";
 import {
   CHAT_ARTIFACT_REGISTRY,
   RUN_LOG_ENVELOPE_VERSION,
+  type RetentionError,
+  type RetentionReport,
 } from "./storage.js";
+import { PrivateStore } from "./private-store.js";
 import type { AgentRunEvent } from "./types.js";
 import { hasCode, isRecord } from "./utils.js";
 
 export const DEFAULT_KEEP_RUNS = 50;
+export const RUN_LOG_RETENTION_MAX_AGE_DAYS = 30;
+export const RUN_LOG_RETENTION_MAX_RUNS_PER_CHAT = 100;
+export const RUN_LOG_RETENTION_MAX_BYTES = 500 * 1_024 * 1_024;
 export { RUN_LOG_ENVELOPE_VERSION } from "./storage.js";
 
 export interface RunLogEnvelope {
   version: typeof RUN_LOG_ENVELOPE_VERSION;
   event: AgentRunEvent;
+}
+
+export interface RunLogRetentionOptions {
+  now?: number;
+  maxAgeDays?: number;
+  maxRunsPerChat?: number;
+  maxBytesGlobal?: number;
+  activeRunIds?: ReadonlySet<string>;
+  onError?: (error: RetentionError) => void;
 }
 
 export function runsDir(appHome: string, chatId: string): string {
@@ -162,23 +177,123 @@ export class RunLog {
   /** Deletes every run log for `chatId` except the `keep` most recent. */
   static async prune(
     appHome: string,
-    chatId: string,
+    chatIdOrOptions: string | RunLogRetentionOptions = {},
     keep = DEFAULT_KEEP_RUNS,
-  ): Promise<void> {
+  ): Promise<RetentionReport> {
+    if (typeof chatIdOrOptions !== "string") {
+      return pruneRunLogs(appHome, chatIdOrOptions);
+    }
+    const chatId = chatIdOrOptions;
+    const report: RetentionReport = { removed: [], errors: [] };
     const dir = runsDir(appHome, chatId);
     let entries: string[];
     try {
       entries = await readdir(dir);
     } catch (error) {
       if (hasCode(error, "ENOENT")) {
-        return;
+        return report;
       }
       throw error;
     }
     const runs = entries.filter((name) => name.endsWith(".ndjson")).sort();
     const stale = runs.slice(0, Math.max(0, runs.length - keep));
-    await Promise.all(stale.map((name) => rm(join(dir, name), { force: true })));
+    const store = new PrivateStore({ root: appHome });
+    for (const name of stale) {
+      const path = join(dir, name);
+      try {
+        await store.removeTree(path);
+        report.removed.push(path);
+      } catch (error) {
+        report.errors.push({ path, message: error instanceof Error ? error.message : String(error) });
+      }
+    }
+    return report;
   }
+}
+
+interface RunCandidate {
+  path: string;
+  chatId: string;
+  runId: string;
+  mtimeMs: number;
+  size: number;
+  active: boolean;
+}
+
+async function pruneRunLogs(
+  appHome: string,
+  options: RunLogRetentionOptions,
+): Promise<RetentionReport> {
+  const report: RetentionReport = { removed: [], errors: [] };
+  const now = options.now !== undefined && Number.isFinite(options.now) ? options.now : Date.now();
+  const maxAgeMs = downward(options.maxAgeDays, RUN_LOG_RETENTION_MAX_AGE_DAYS) * 86_400_000;
+  const maxRuns = downward(options.maxRunsPerChat, RUN_LOG_RETENTION_MAX_RUNS_PER_CHAT);
+  const maxBytes = downward(options.maxBytesGlobal, RUN_LOG_RETENTION_MAX_BYTES);
+  const candidates: RunCandidate[] = [];
+  for (const artifact of await CHAT_ARTIFACT_REGISTRY.all("run-log", appHome)) {
+    try {
+      const info = await lstat(artifact.path);
+      if (info.isSymbolicLink() || !info.isFile()) throw new Error("Run-Log ist keine reguläre Datei.");
+      let terminal = false;
+      for await (const event of RunLog.read(appHome, artifact.chatId, artifact.artifactId!)) {
+        if (event.type === "run-end") terminal = true;
+      }
+      candidates.push({
+        path: artifact.path,
+        chatId: artifact.chatId,
+        runId: artifact.artifactId!,
+        mtimeMs: info.mtimeMs,
+        size: info.size,
+        active: options.activeRunIds?.has(artifact.artifactId!) === true || !terminal,
+      });
+    } catch (error) {
+      addRetentionError(report, artifact.path, error, options.onError);
+    }
+  }
+  const ordered = [...candidates].sort((left, right) => left.mtimeMs - right.mtimeMs || left.path.localeCompare(right.path));
+  const store = new PrivateStore({ root: appHome });
+  const remove = async (candidate: RunCandidate): Promise<void> => {
+    if (candidate.active || report.removed.includes(candidate.path)) return;
+    try {
+      await store.removeTree(candidate.path);
+      report.removed.push(candidate.path);
+    } catch (error) {
+      addRetentionError(report, candidate.path, error, options.onError);
+    }
+  };
+  for (const candidate of ordered) {
+    if (now - candidate.mtimeMs > maxAgeMs) await remove(candidate);
+  }
+  for (const chatId of new Set(ordered.map((candidate) => candidate.chatId))) {
+    const terminal = ordered.filter((candidate) =>
+      candidate.chatId === chatId && !candidate.active && !report.removed.includes(candidate.path));
+    for (const candidate of terminal.slice(0, Math.max(0, terminal.length - maxRuns))) await remove(candidate);
+  }
+  let total = ordered.filter((candidate) => !report.removed.includes(candidate.path))
+    .reduce((sum, candidate) => sum + candidate.size, 0);
+  for (const candidate of ordered) {
+    if (total <= maxBytes) break;
+    if (candidate.active || report.removed.includes(candidate.path)) continue;
+    await remove(candidate);
+    if (report.removed.includes(candidate.path)) total -= candidate.size;
+  }
+  return report;
+}
+
+function downward(value: number | undefined, ceiling: number): number {
+  if (value === undefined || !Number.isFinite(value)) return ceiling;
+  return Math.min(ceiling, Math.max(0, Math.floor(value)));
+}
+
+function addRetentionError(
+  report: RetentionReport,
+  path: string,
+  error: unknown,
+  onError?: (error: RetentionError) => void,
+): void {
+  const entry = { path, message: error instanceof Error ? error.message : String(error) };
+  report.errors.push(entry);
+  onError?.(entry);
 }
 
 function serializeRunEvent(event: AgentRunEvent): string {

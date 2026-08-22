@@ -8,10 +8,11 @@ import {
   readFile,
   rm,
   stat,
+  symlink,
   writeFile,
 } from "node:fs/promises";
 import { hostname, tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import test from "node:test";
 import { evaluateBudget } from "../src/config.js";
 import {
@@ -24,6 +25,11 @@ import {
   SessionStore,
   workspaceSpend,
 } from "../src/session.js";
+import {
+  CHAT_ARTIFACT_REGISTRY,
+  migrationManifestPath,
+  workspaceStorageHash,
+} from "../src/storage.js";
 import type { ChatSummary, SessionData } from "../src/types.js";
 
 async function workspaceRoot(prefix: string): Promise<{
@@ -72,7 +78,7 @@ async function writeLegacySession(
   return legacyPath;
 }
 
-test("SessionStore.remove löscht einen Chat endgültig und meldet unbekannte IDs", async () => {
+test("SessionStore.remove löscht einen Chat endgültig und bleibt bei Wiederholung idempotent", async () => {
   const { workspace, appHome } = await workspaceRoot("chat-delete");
 
   const keep = SessionStore.create(workspace, appHome, "Bleibt");
@@ -88,10 +94,189 @@ test("SessionStore.remove löscht einen Chat endgültig und meldet unbekannte ID
     SessionStore.openById(workspace, gone.data.id, appHome),
     /nicht gefunden/,
   );
-  await assert.rejects(
-    SessionStore.remove(workspace, gone.data.id, appHome),
-    /nicht gefunden/,
-  );
+  await assert.doesNotReject(SessionStore.remove(workspace, gone.data.id, appHome));
+});
+
+test("chat deletion removes every registry-owned artifact and mapped legacy sidecar but retains config backups", async () => {
+  const { workspace, appHome } = await workspaceRoot("chat-owned-delete");
+  const chat = SessionStore.create(workspace, appHome, "Alles weg");
+  await chat.save();
+  const chatId = chat.data.id;
+  const workspaceHash = workspaceStorageHash(workspace);
+  const conflictId = "conflict-1";
+  const localPaths = [
+    chat.path,
+    CHAT_ARTIFACT_REGISTRY.resolve("chat-conflict", { appHome, workspace, chatId, conflictId }),
+    CHAT_ARTIFACT_REGISTRY.resolve("conversation-state", { appHome, workspace, chatId }),
+    CHAT_ARTIFACT_REGISTRY.resolve("conversation-conflict", { appHome, workspace, chatId, conflictId }),
+    CHAT_ARTIFACT_REGISTRY.resolve("lock", { appHome, workspace, chatId, artifactId: "chat" }),
+    CHAT_ARTIFACT_REGISTRY.resolve("lock", { appHome, workspace, chatId, artifactId: "conversation-state" }),
+    CHAT_ARTIFACT_REGISTRY.resolve("run-log", { appHome, chatId, artifactId: "run-1" }),
+    CHAT_ARTIFACT_REGISTRY.resolve("checkpoint", { appHome, chatId, artifactId: "run-1" }),
+    CHAT_ARTIFACT_REGISTRY.resolve("task-sidecar", { appHome, chatId, artifactId: "task-1" }),
+  ];
+  for (const path of localPaths.slice(1)) {
+    await mkdir(dirname(path), { recursive: true });
+    await writeFile(path, "owned");
+  }
+
+  const oldId = "legacy-chat-id";
+  const checksum = "a".repeat(64);
+  const managedBackup = join(appHome, "migration-backups", `routercode-${checksum.slice(0, 16)}`);
+  const legacyPaths = [
+    CHAT_ARTIFACT_REGISTRY.resolve("chat", { appHome: managedBackup, workspaceHash, chatId: oldId }),
+    CHAT_ARTIFACT_REGISTRY.resolve("conversation-state", { appHome: managedBackup, workspaceHash, chatId: oldId }),
+    CHAT_ARTIFACT_REGISTRY.resolve("run-log", { appHome: managedBackup, chatId: oldId, artifactId: "run-legacy" }),
+    CHAT_ARTIFACT_REGISTRY.resolve("checkpoint", { appHome: managedBackup, chatId: oldId, artifactId: "run-legacy" }),
+    CHAT_ARTIFACT_REGISTRY.resolve("task-sidecar", { appHome: managedBackup, chatId: oldId, artifactId: "task-legacy" }),
+  ];
+  for (const path of legacyPaths) {
+    await mkdir(dirname(path), { recursive: true });
+    await writeFile(path, "legacy-owned");
+  }
+  await mkdir(dirname(migrationManifestPath(appHome)), { recursive: true });
+  await writeFile(migrationManifestPath(appHome), JSON.stringify({
+    version: 1,
+    phase: "complete",
+    sourcePath: join(dirname(appHome), ".routercode"),
+    sourceChecksum: checksum,
+    stagingPath: join(appHome, ".migration-staging", checksum),
+    backupPath: managedBackup,
+    chatIdMap: { [oldId]: chatId },
+    destinationPaths: [],
+    isolated: [],
+    complete: true,
+    startedAt: "2026-08-20T00:00:00.000Z",
+    completedAt: "2026-08-20T00:01:00.000Z",
+  }));
+  const configBackup = join(appHome, "migration-backups", "config-v0-retained.json");
+  await writeFile(configBackup, "non-chat-config-backup");
+
+  const first = await SessionStore.remove(workspace, chatId, appHome);
+  const second = await SessionStore.remove(workspace, chatId, appHome);
+
+  assert.deepEqual(first.errors, []);
+  assert.deepEqual(second.errors, []);
+  for (const path of [...localPaths, ...legacyPaths]) {
+    await assert.rejects(stat(path), /ENOENT/, `${path} must be deleted`);
+  }
+  await assert.rejects(stat(managedBackup), /ENOENT/, "empty managed legacy backup must be removed");
+  assert.equal(await readFile(configBackup, "utf8"), "non-chat-config-backup");
+});
+
+test("chat deletion keeps the transcript retryable when a sidecar cannot be removed", async () => {
+  const { workspace, appHome } = await workspaceRoot("chat-delete-retry");
+  const chat = SessionStore.create(workspace, appHome, "Retry");
+  await chat.save();
+  const outside = join(dirname(appHome), "outside-owned-by-user.txt");
+  await writeFile(outside, "outside");
+  const trappedSidecar = CHAT_ARTIFACT_REGISTRY.resolve("task-sidecar", {
+    appHome,
+    chatId: chat.data.id,
+    artifactId: "trapped",
+  });
+  await mkdir(dirname(trappedSidecar), { recursive: true });
+  await symlink(outside, trappedSidecar);
+
+  const partial = await SessionStore.remove(workspace, chat.data.id, appHome);
+
+  assert.equal(partial.errors.length, 1);
+  assert.match(await readFile(chat.path, "utf8"), /Retry/, "transcript remains until sidecars are clear");
+  assert.equal(await readFile(outside, "utf8"), "outside", "root-scoped deletion never follows the sidecar symlink");
+
+  await rm(trappedSidecar);
+  const retried = await SessionStore.remove(workspace, chat.data.id, appHome);
+  assert.deepEqual(retried.errors, []);
+  await assert.rejects(readFile(chat.path, "utf8"), /ENOENT/);
+  assert.equal(await readFile(outside, "utf8"), "outside");
+});
+
+test("a mapped legacy transcript failure cannot remove the canonical retry anchor", async () => {
+  const { workspace, appHome } = await workspaceRoot("chat-delete-legacy-retry");
+  const chat = SessionStore.create(workspace, appHome, "Legacy Retry");
+  await chat.save();
+  const oldId = "legacy-retry-chat";
+  const checksum = "c".repeat(64);
+  const backupPath = join(appHome, "migration-backups", `routercode-${checksum.slice(0, 16)}`);
+  const legacyChat = CHAT_ARTIFACT_REGISTRY.resolve("chat", {
+    appHome: backupPath,
+    workspaceHash: workspaceStorageHash(workspace),
+    chatId: oldId,
+  });
+  const outside = join(dirname(appHome), "legacy-transcript-outside.txt");
+  await writeFile(outside, "outside");
+  await mkdir(dirname(legacyChat), { recursive: true });
+  await symlink(outside, legacyChat);
+  await mkdir(dirname(migrationManifestPath(appHome)), { recursive: true });
+  await writeFile(migrationManifestPath(appHome), JSON.stringify({
+    version: 1,
+    phase: "complete",
+    sourcePath: join(dirname(appHome), ".routercode"),
+    sourceChecksum: checksum,
+    stagingPath: join(appHome, ".migration-staging", checksum),
+    backupPath,
+    chatIdMap: { [oldId]: chat.data.id },
+    destinationPaths: [],
+    isolated: [],
+    complete: true,
+    startedAt: "2026-08-20T00:00:00.000Z",
+    completedAt: "2026-08-20T00:01:00.000Z",
+  }));
+
+  const partial = await SessionStore.remove(workspace, chat.data.id, appHome);
+
+  assert.equal(partial.errors.length, 1);
+  assert.match(await readFile(chat.path, "utf8"), /Legacy Retry/);
+  assert.equal(await readFile(outside, "utf8"), "outside");
+
+  await rm(legacyChat);
+  const retried = await SessionStore.remove(workspace, chat.data.id, appHome);
+  assert.deepEqual(retried.errors, []);
+  await assert.rejects(readFile(chat.path, "utf8"), /ENOENT/);
+});
+
+test("mapped legacy deletion trusts only a validated completed manifest and preserves non-chat files", async () => {
+  const { workspace, appHome } = await workspaceRoot("chat-delete-manifest");
+  const chat = SessionStore.create(workspace, appHome, "Manifest");
+  await chat.save();
+  const oldId = "old-manifest-chat";
+  const checksum = "b".repeat(64);
+  const backupPath = join(appHome, "migration-backups", `routercode-${checksum.slice(0, 16)}`);
+  const oldChat = CHAT_ARTIFACT_REGISTRY.resolve("chat", {
+    appHome: backupPath,
+    workspaceHash: workspaceStorageHash(workspace),
+    chatId: oldId,
+  });
+  await mkdir(dirname(oldChat), { recursive: true });
+  await writeFile(oldChat, "legacy-chat");
+  await writeFile(join(backupPath, "config.json"), "legacy-config");
+  await writeFile(join(backupPath, "permissions.json"), "legacy-rules");
+  await mkdir(dirname(migrationManifestPath(appHome)), { recursive: true });
+  const manifest = {
+    version: 1,
+    phase: "complete",
+    sourcePath: join(dirname(appHome), ".routercode"),
+    sourceChecksum: checksum,
+    stagingPath: join(appHome, ".migration-staging", checksum),
+    backupPath,
+    chatIdMap: { [oldId]: chat.data.id },
+    destinationPaths: [],
+    isolated: [],
+    complete: false,
+    startedAt: "2026-08-20T00:00:00.000Z",
+  };
+  await writeFile(migrationManifestPath(appHome), JSON.stringify(manifest));
+
+  await SessionStore.remove(workspace, chat.data.id, appHome);
+  assert.equal(await readFile(oldChat, "utf8"), "legacy-chat", "incomplete manifest maps are ignored");
+
+  manifest.complete = true;
+  await writeFile(migrationManifestPath(appHome), JSON.stringify(manifest));
+  await SessionStore.remove(workspace, chat.data.id, appHome);
+  await assert.rejects(readFile(oldChat, "utf8"), /ENOENT/);
+  assert.equal(await readFile(join(backupPath, "config.json"), "utf8"), "legacy-config");
+  assert.equal(await readFile(join(backupPath, "permissions.json"), "utf8"), "legacy-rules");
+  assert.ok((await stat(backupPath)).isDirectory(), "non-chat backup content keeps the managed backup");
 });
 
 test("SessionStore resolves its redacted transcript path through the central artifact registry", async () => {
