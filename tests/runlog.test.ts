@@ -206,6 +206,62 @@ test("RunLog write/close/read round-trips every sample event in order", async ()
   assert.deepEqual(read, SAMPLE_EVENTS);
 });
 
+test("automatic verification persists only process lifecycle events and one root unverified terminal", async () => {
+  const home = await appHome("task9-auto-verify");
+  const chatId = "chat-task9-auto-verify";
+  const runId = createRunId();
+  const log = await RunLog.open(home, chatId, runId);
+  log.write({
+    type: "process-start",
+    id: "verify-1",
+    name: "verify",
+    input: { command: "npm test" },
+    timestamp: 1,
+  });
+  log.write({
+    type: "process-output",
+    id: "verify-1",
+    name: "verify",
+    stream: "stderr",
+    text: "ERROR failed\n",
+    timestamp: 2,
+  });
+  log.write({
+    type: "process-end",
+    id: "verify-1",
+    name: "verify",
+    input: { command: "npm test" },
+    exitCode: 1,
+    durationMs: 10,
+    truncated: false,
+    timedOut: false,
+    aborted: false,
+    timestamp: 3,
+  });
+  log.write({
+    type: "run-end",
+    outcome: "unverified",
+    durationMs: 20,
+    toolCount: 0,
+    timestamp: 4,
+  });
+  await log.close();
+
+  const events: AgentRunEvent[] = [];
+  for await (const event of RunLog.read(home, chatId, runId)) {
+    events.push(event);
+  }
+  assert.deepEqual(events.map((event) => event.type), [
+    "process-start",
+    "process-output",
+    "process-end",
+    "run-end",
+  ]);
+  assert.equal(events.filter((event) => event.type === "verify").length, 0);
+  assert.equal(events.filter((event) => event.type === "run-end").length, 1);
+  assert.equal(events.find((event) => event.type === "run-end")?.outcome, "unverified");
+});
+
 test("new writes use a versioned envelope and redact a clone of the live event", async () => {
   const home = await appHome("envelope-redaction");
   const chatId = "chat-envelope";

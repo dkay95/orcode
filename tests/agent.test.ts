@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { existsSync } from "node:fs";
 import { mkdir, mkdtemp, readdir, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import test from "node:test";
 import {
   AgentRunError,
@@ -26,6 +26,7 @@ import { SessionStore } from "../src/session.js";
 import { CHAT_ARTIFACT_REGISTRY } from "../src/storage.js";
 import { checkpointRunPath } from "../src/workspace.js";
 import type { AgentRunEvent } from "../src/types.js";
+import { runVerify, type VerifyOutcome } from "../src/verify.js";
 
 const healthy = {
   key: {
@@ -1039,6 +1040,421 @@ test("the run-end event carries the precise outcome, not just 'complete'", async
   assert.equal(end?.outcome, "step-limit");
 });
 
+test("Task 9 edit gate ignores old runs and distinguishes no edit, verify-off, and no-command edits", async (t) => {
+  const cases = [
+    { name: "no current-run edit", edit: false, priorEntry: false, mode: "on-edit" as const, commands: ["check"], outcome: "completed" },
+    { name: "old-run journal entry", edit: false, priorEntry: true, mode: "on-edit" as const, commands: ["check"], outcome: "completed" },
+    { name: "edited while verify is off", edit: true, priorEntry: false, mode: "off" as const, commands: ["check"], outcome: "unverified" },
+    { name: "edited with no configured commands", edit: true, priorEntry: false, mode: "on-edit" as const, commands: [], outcome: "unverified" },
+  ] as const;
+  for (const item of cases) {
+    await t.test(item.name, async () => {
+      const setup = await createAgent({
+        compressionMode: "off",
+        verify: {
+          commands: [...item.commands],
+          mode: item.mode,
+          maxRepairRounds: 1,
+        },
+      }, new ApprovalManager("auto-edit"));
+      const verification = scriptedVerifyRunner([{ status: "passed" }]);
+      const client = fakeClient(() => ({
+        text: ["Phase abgeschlossen."],
+        before: async (emit) => {
+          await emit.modelCall(0, 0.001);
+          if (item.edit) {
+            await emit.tool("write_file", { path: "current.txt", content: "edited" });
+          }
+        },
+      }));
+      const agent = await setup.agent(client.client, undefined, verification.runner);
+      if (item.priorEntry) {
+        await agent.journal.record({
+          path: join(setup.workspace, "old.txt"),
+          before: null,
+          after: "old",
+          createdAt: new Date().toISOString(),
+          runId: "prior-root-run",
+        });
+      }
+
+      const result = await agent.run("CURRENT TASK", { onText: () => {} });
+
+      assert.equal(result.outcome, item.outcome);
+      assert.equal(verification.passes.length, 0);
+    });
+  }
+});
+
+test("Task 9 immediate green completes, while zero repair rounds stops after the first failed pass", async (t) => {
+  const cases = [
+    {
+      name: "immediate green",
+      commands: ["first", "second"],
+      maxRepairRounds: 1,
+      verifyOutcome: { status: "passed" } as VerifyOutcome,
+      outcome: "completed",
+      processes: ["first", "second"],
+    },
+    {
+      name: "zero repair rounds",
+      commands: ["first", "second"],
+      maxRepairRounds: 0,
+      verifyOutcome: {
+        status: "failed",
+        command: "first",
+        exitCode: 1,
+        distilled: "ERROR remains",
+      } as VerifyOutcome,
+      outcome: "unverified",
+      processes: ["first"],
+    },
+  ] as const;
+  for (const item of cases) {
+    await t.test(item.name, async () => {
+      const setup = await createAgent({
+        compressionMode: "off",
+        verify: {
+          commands: [...item.commands],
+          mode: "on-edit",
+          maxRepairRounds: item.maxRepairRounds,
+        },
+      }, new ApprovalManager("auto-edit"));
+      const verification = scriptedVerifyRunner([item.verifyOutcome]);
+      const client = fakeClient(() => ({
+        text: ["edited"],
+        before: async (emit) => {
+          await emit.modelCall(0, 0.01);
+          await emit.tool("write_file", { path: "immediate.txt", content: "edited" });
+        },
+      }));
+      const agent = await setup.agent(client.client, undefined, verification.runner);
+
+      const result = await agent.run("verify immediately", { onText: () => {} });
+
+      assert.equal(result.outcome, item.outcome);
+      assert.equal(client.requests.length, 1);
+      assert.equal(verification.passes.length, 1);
+      assert.deepEqual(verification.processes, item.processes);
+    });
+  }
+});
+
+test("Task 9 failed verification repairs inside one root transaction then commits once after green", async () => {
+  const secret = `${["sk", "or", "v1"].join("-")}-${"r".repeat(40)}`;
+  const setup = await createAgent({
+    compressionMode: "off",
+    maxSteps: 6,
+    maxCostUsd: 1,
+    verify: {
+      commands: ["check-one", "check-two"],
+      mode: "on-edit",
+      maxRepairRounds: 2,
+    },
+  }, new ApprovalManager("auto-edit"));
+  const verification = scriptedVerifyRunner([
+    { status: "failed", command: "check-one", exitCode: 1, distilled: `ERROR ${secret}` },
+    { status: "passed" },
+  ], `ERROR ${secret}\n`);
+  const imagePath = join(setup.workspace, "TASK9_ATTACHMENT.png");
+  const imageBytes = Buffer.from([
+    0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a,
+    0x00, 0x00, 0x00, 0x00,
+  ]);
+  await writeFile(imagePath, imageBytes);
+  const attachment = {
+    path: imagePath,
+    name: "TASK9_ATTACHMENT.png",
+    mimeType: "image/png" as const,
+    sizeBytes: imageBytes.length,
+  };
+  let phase = 0;
+  let repairLoadedState: unknown;
+  const client = fakeClient((request) => {
+    phase += 1;
+    if (phase === 1) {
+      return {
+        text: ["Initial coding phase."],
+        before: async (emit) => {
+          await request.state?.save(sampleConversationState("FIRST_PHASE_SDK_STATE"));
+          await emit.modelCall(0, 0.01);
+          await emit.tool("write_file", { path: "task9.txt", content: "broken" });
+        },
+      };
+    }
+    return {
+      text: ["Repair phase."],
+      before: async (emit) => {
+        repairLoadedState = await request.state?.load();
+        await request.state?.save(sampleConversationState("REPAIR_PHASE_SDK_STATE"));
+        await emit.modelCall(0, 0.02);
+        await emit.tool("write_file", { path: "task9.txt", content: "fixed" });
+      },
+    };
+  });
+  const agent = await setup.agent(client.client, undefined, verification.runner);
+  const events: AgentRunEvent[] = [];
+
+  const result = await agent.run(
+    "TASK9_CURRENT_PROMPT",
+    { onText: () => {}, onEvent: (event) => events.push(event) },
+    [attachment],
+  );
+
+  assert.equal(result.outcome, "completed");
+  assert.equal(result.mainCostUsd, 0.03);
+  assert.equal(result.modelSteps, 2);
+  assert.equal(client.requests.length, 2);
+  assert.deepEqual(verification.passes, [
+    ["check-one", "check-two"],
+    ["check-one", "check-two"],
+  ]);
+  assert.deepEqual(verification.processes, ["check-one", "check-one", "check-two"]);
+  assert.equal(occurrences(inputText(client.requests[0]!), "TASK9_CURRENT_PROMPT"), 1);
+  assert.equal(occurrences(inputText(client.requests[1]!), "TASK9_CURRENT_PROMPT"), 0);
+  assert.match(inputText(client.requests[0]!), /TASK9_ATTACHMENT\.png/);
+  assert.doesNotMatch(inputText(client.requests[1]!), /TASK9_ATTACHMENT|input_image/);
+  assert.deepEqual(
+    (client.requests[1]!.input as FakeInputItem[]).map((item) => item.role),
+    ["developer"],
+  );
+  assert.match(JSON.stringify(repairLoadedState), /FIRST_PHASE_SDK_STATE/);
+  assert.doesNotMatch(inputText(client.requests[1]!), new RegExp(secret));
+  assert.match(inputText(client.requests[1]!), /REDACTED/);
+  assert.deepEqual(
+    events.filter((event) => event.type === "model-start").map((event) => event.step),
+    [1, 2],
+  );
+  assert.deepEqual(
+    events.filter((event) => event.type === "model-end").map((event) => event.step),
+    [1, 2],
+  );
+  assert.deepEqual(
+    events.filter((event) => event.type === "tool-start").map((event) => event.id),
+    ["tool-1", "tool-2"],
+  );
+  assert.equal(events.filter((event) => event.type === "verify").length, 0);
+  assert.equal(events.filter((event) => event.type === "run-end").length, 1);
+  assert.equal(events.find((event) => event.type === "run-end")?.outcome, "complete");
+  assert.doesNotMatch(JSON.stringify(events), new RegExp(secret));
+
+  const checkpointDirectory = dirname(checkpointRunPath(
+    setup.appHome,
+    setup.session.data.id,
+    "placeholder",
+  ));
+  const checkpointFiles = (await readdir(checkpointDirectory)).filter((name) => name.endsWith(".json"));
+  assert.equal(checkpointFiles.length, 1);
+  const checkpoint = JSON.parse(
+    await readFile(join(checkpointDirectory, checkpointFiles[0]!), "utf8"),
+  ) as Array<{ runId: string }>;
+  assert.equal(checkpoint.length, 2);
+  assert.equal(new Set(checkpoint.map((entry) => entry.runId)).size, 1);
+  const rootRunId = checkpoint[0]!.runId;
+  const stateFile = JSON.parse(
+    await readFile(ConversationStore.path(setup.appHome, setup.session.path), "utf8"),
+  ) as { revision: number };
+  assert.equal(stateFile.revision, 1);
+  const runEvents: AgentRunEvent[] = [];
+  for await (const event of RunLog.read(
+    setup.appHome,
+    setup.session.data.id,
+    rootRunId,
+  )) {
+    runEvents.push(event);
+  }
+  assert.equal(runEvents.filter((event) => event.type === "run-end").length, 1);
+  assert.doesNotMatch(
+    await readFile(runLogPath(setup.appHome, setup.session.data.id, rootRunId), "utf8"),
+    new RegExp(secret),
+  );
+});
+
+test("Task 9 repair model failure discards every staged turn/state but persists incurred cost", async () => {
+  const setup = await createAgent({
+    compressionMode: "off",
+    maxSteps: 6,
+    maxCostUsd: 1,
+    verify: { commands: ["check"], mode: "on-edit", maxRepairRounds: 2 },
+  }, new ApprovalManager("auto-edit"));
+  await addHistory(setup.session, "REPAIR_FAILURE_PRIOR_TURN");
+  await persistConversationState(setup, "REPAIR_FAILURE_PRIOR_SDK_STATE");
+  const beforeTurns = structuredClone(setup.session.data.turns);
+  const statePath = ConversationStore.path(setup.appHome, setup.session.path);
+  const beforeState = await readFile(statePath, "utf8");
+  const verification = scriptedVerifyRunner([{
+    status: "failed",
+    command: "check",
+    exitCode: 1,
+    distilled: "ERROR repair requested",
+  }]);
+  let phase = 0;
+  const client = fakeClient((request) => {
+    phase += 1;
+    if (phase === 1) {
+      return {
+        text: ["initial phase"],
+        before: async (emit) => {
+          await request.state?.save(sampleConversationState("INITIAL_STAGED_STATE"));
+          await emit.modelCall(0, 0.01);
+          await emit.tool("write_file", { path: "repair-failure.txt", content: "broken" });
+        },
+      };
+    }
+    return {
+      text: ["repair fragment"],
+      textError: () => new Error("synthetic repair model failure"),
+      before: async (emit) => {
+        await request.state?.save(sampleConversationState("FAILED_REPAIR_STAGED_STATE"));
+        await emit.modelCall(0, 0.02);
+        await emit.tool("write_file", { path: "repair-failure.txt", content: "partial" });
+      },
+    };
+  });
+  const agent = await setup.agent(client.client, undefined, verification.runner);
+  const events: AgentRunEvent[] = [];
+
+  await assert.rejects(
+    agent.run("repair failure", {
+      onText: () => {},
+      onEvent: (event) => events.push(event),
+    }),
+    (error) =>
+      error instanceof AgentRunError &&
+      error.outcome === "error" &&
+      error.result.mainCostUsd === 0.03,
+  );
+
+  assert.equal(client.requests.length, 2);
+  assert.equal(verification.passes.length, 1);
+  assert.deepEqual(setup.session.data.turns, beforeTurns);
+  assert.equal(setup.session.data.costs.mainUsd, 0.03);
+  assert.equal(await readFile(statePath, "utf8"), beforeState);
+  const persisted = JSON.parse(await readFile(setup.session.path, "utf8")) as {
+    costs: { mainUsd: number };
+  };
+  assert.equal(persisted.costs.mainUsd, 0.03);
+  assert.equal(events.filter((event) => event.type === "run-end").length, 1);
+  assert.equal(events.find((event) => event.type === "run-end")?.outcome, "error");
+});
+
+test("Task 9 repair and pass counts stop exactly at the configured hard bounds", async () => {
+  const setup = await createAgent({
+    compressionMode: "off",
+    maxSteps: 10,
+    maxCostUsd: 10,
+    verify: {
+      commands: ["first", "second", "third"],
+      mode: "on-edit",
+      maxRepairRounds: 2,
+    },
+  }, new ApprovalManager("auto-edit"));
+  const verification = scriptedVerifyRunner([
+    { status: "failed", command: "first", exitCode: 1, distilled: "ERROR one" },
+    { status: "failed", command: "first", exitCode: 1, distilled: "ERROR two" },
+    { status: "failed", command: "first", exitCode: 1, distilled: "ERROR three" },
+  ]);
+  let phase = 0;
+  const client = fakeClient((request) => {
+    phase += 1;
+    return {
+      text: [`phase ${phase}`],
+      before: async (emit) => {
+        await request.state?.save(sampleConversationState(`phase-${phase}`));
+        await emit.modelCall(0, 0.01);
+        if (phase === 1) {
+          await emit.tool("write_file", { path: "bounded.txt", content: "broken" });
+        }
+      },
+    };
+  });
+  const agent = await setup.agent(client.client, undefined, verification.runner);
+  const events: AgentRunEvent[] = [];
+
+  const result = await agent.run("bounded repair", {
+    onText: () => {},
+    onEvent: (event) => events.push(event),
+  });
+
+  assert.equal(result.outcome, "unverified");
+  assert.equal(client.requests.length, 3, "initial plus two repair model calls");
+  assert.equal(verification.passes.length, 3, "initial plus two verification passes");
+  assert.equal(verification.processes.length, 3, "fail-fast starts only the first command per pass");
+  assert.ok(verification.processes.length <= (1 + 2) * 3);
+  assert.equal(events.filter((event) => event.type === "run-end").length, 1);
+  assert.equal(events.find((event) => event.type === "run-end")?.outcome, "unverified");
+});
+
+test("Task 9 never starts a repair after root step/cost exhaustion, timeout, or spawn failure", async (t) => {
+  const cases: Array<{
+    name: string;
+    maxSteps: number;
+    maxCostUsd: number;
+    cost: number;
+    verifyOutcome: VerifyOutcome;
+  }> = [
+    { name: "step exhausted", maxSteps: 1, maxCostUsd: 1, cost: 0.01, verifyOutcome: { status: "failed", command: "check", exitCode: 1, distilled: "ERROR" } },
+    { name: "cost exhausted", maxSteps: 5, maxCostUsd: 0.01, cost: 0.01, verifyOutcome: { status: "failed", command: "check", exitCode: 1, distilled: "ERROR" } },
+    { name: "timeout", maxSteps: 5, maxCostUsd: 1, cost: 0.01, verifyOutcome: { status: "timed-out", command: "check" } },
+    { name: "spawn failure", maxSteps: 5, maxCostUsd: 1, cost: 0.01, verifyOutcome: { status: "spawn-failed", command: "check", error: "not found" } },
+  ];
+  for (const item of cases) {
+    await t.test(item.name, async () => {
+      const setup = await createAgent({
+        compressionMode: "off",
+        maxSteps: item.maxSteps,
+        maxCostUsd: item.maxCostUsd,
+        verify: { commands: ["check"], mode: "on-edit", maxRepairRounds: 2 },
+      }, new ApprovalManager("auto-edit"));
+      const verification = scriptedVerifyRunner([item.verifyOutcome]);
+      const client = fakeClient(() => ({
+        text: ["edited"],
+        before: async (emit) => {
+          await emit.modelCall(0, item.cost);
+          await emit.tool("write_file", { path: "bounded.txt", content: "edited" });
+        },
+      }));
+      const agent = await setup.agent(client.client, undefined, verification.runner);
+
+      const result = await agent.run("bounded", { onText: () => {} });
+
+      assert.equal(result.outcome, "unverified");
+      assert.equal(client.requests.length, 1);
+      assert.equal(verification.passes.length, 1);
+    });
+  }
+});
+
+test("Task 9 verification cancellation is the one root cancellation and never repairs", async () => {
+  const setup = await createAgent({
+    compressionMode: "off",
+    verify: { commands: ["check"], mode: "on-edit", maxRepairRounds: 2 },
+  }, new ApprovalManager("auto-edit"));
+  const verification = scriptedVerifyRunner([{ status: "cancelled" }]);
+  const client = fakeClient(() => ({
+    text: ["edited"],
+    before: async (emit) => {
+      await emit.modelCall(0, 0.01);
+      await emit.tool("write_file", { path: "cancelled.txt", content: "edited" });
+    },
+  }));
+  const agent = await setup.agent(client.client, undefined, verification.runner);
+  const events: AgentRunEvent[] = [];
+
+  await assert.rejects(
+    agent.run("cancel verify", {
+      onText: () => {},
+      onEvent: (event) => events.push(event),
+    }),
+    (error) => error instanceof AgentRunError && error.outcome === "cancelled",
+  );
+
+  assert.equal(client.requests.length, 1);
+  assert.equal(verification.passes.length, 1);
+  assert.equal(events.filter((event) => event.type === "run-end").length, 1);
+  assert.equal(events.find((event) => event.type === "run-end")?.outcome, "cancelled");
+});
+
 // --- K7: memory, token budget, cache -------------------------------------
 
 test("K7.4: instructions stay byte-identical across runs with a different approval mode and a resolved model", async () => {
@@ -1974,6 +2390,7 @@ interface AgentSetup {
       pruneRunLogs: (appHome: string) => Promise<unknown>;
       pruneExactArtifacts: (appHome: string) => Promise<unknown>;
     },
+    verifyRunner?: typeof runVerify,
   ) => Promise<OrcodeAgent>;
 }
 
@@ -1995,7 +2412,7 @@ async function createAgent(
     appHome,
     session,
     config,
-    agent: (client, retention) =>
+    agent: (client, retention, verifyRunner) =>
       OrcodeAgent.create({
         openRouter: fakeService(client),
         approvals,
@@ -2003,8 +2420,73 @@ async function createAgent(
         config,
         workspace,
         ...(retention ? { retention } : {}),
+        ...(verifyRunner ? { verifyRunner } : {}),
       }),
   };
+}
+
+function scriptedVerifyRunner(
+  outcomes: readonly VerifyOutcome[],
+  output = "",
+): {
+  runner: typeof runVerify;
+  passes: string[][];
+  processes: string[];
+} {
+  const passes: string[][] = [];
+  const processes: string[] = [];
+  let passIndex = 0;
+  const runner: typeof runVerify = async (
+    commands,
+    _guard,
+    signal,
+    onEvent,
+    callbacks = {},
+  ) => {
+    if (signal?.aborted) return { status: "cancelled" };
+    const outcome = outcomes[Math.min(passIndex, outcomes.length - 1)] ?? {
+      status: "passed",
+    };
+    passIndex += 1;
+    passes.push([...commands]);
+    const attempted = outcome.status === "failed"
+      ? commands.slice(0, Math.max(1, commands.indexOf(outcome.command) + 1))
+      : outcome.status === "passed"
+        ? commands
+        : commands.slice(0, 1);
+    for (const command of attempted) {
+      const id = `verify-process-${processes.length + 1}`;
+      const operation = { id, name: "verify", input: { command } };
+      processes.push(command);
+      callbacks.onProcessStart?.(operation);
+      if (output) callbacks.onProcessChunk?.(operation, "stderr", output);
+      const isTerminalCommand = command === attempted.at(-1);
+      const exitCode = outcome.status === "failed" && isTerminalCommand
+        ? outcome.exitCode
+        : outcome.status === "spawn-failed" && isTerminalCommand
+          ? null
+          : outcome.status === "timed-out" && isTerminalCommand
+            ? 124
+            : outcome.status === "cancelled" && isTerminalCommand
+              ? 130
+              : 0;
+      callbacks.onProcessEnd?.(operation, {
+        exitCode,
+        durationMs: 1,
+        truncated: false,
+        timedOut: outcome.status === "timed-out" && isTerminalCommand,
+        aborted: outcome.status === "cancelled" && isTerminalCommand,
+        ...(outcome.status === "spawn-failed" && isTerminalCommand
+          ? { error: outcome.error }
+          : {}),
+      });
+      if (exitCode !== null && ![124, 130].includes(exitCode)) {
+        onEvent({ command, exitCode, durationMs: 1, timestamp: Date.now() });
+      }
+    }
+    return outcome;
+  };
+  return { runner, passes, processes };
 }
 
 function fakeService(client: unknown): OpenRouterService {

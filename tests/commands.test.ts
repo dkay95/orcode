@@ -144,6 +144,34 @@ test("direct /verify now forwards the live process lifecycle to the active surfa
   assert.ok(processEvents.every((event) => event.name === "verify"));
 });
 
+test("/verify rounds accepts zero, renders repair semantics, and rejects values above two", async () => {
+  const workspace = await mkdtemp(join(tmpdir(), "routercode-command-verify-rounds-"));
+  const output: string[] = [];
+  const config = structuredClone(DEFAULT_CONFIG);
+  const context = {
+    workspace,
+    config,
+    configPath: join(workspace, "config.json"),
+    agent: { guard: { root: workspace } },
+    out: {
+      text: (value: string) => output.push(value),
+      error: (value: string) => output.push(value),
+    },
+  } as unknown as CommandContext;
+
+  await handleSlashCommand("/verify rounds 0", context);
+  assert.equal(context.config.verify.maxRepairRounds, 0);
+  await handleSlashCommand("/verify", context);
+  assert.ok(output.some((line) => /0 Reparaturrunde/.test(line)), output.join("\n"));
+  await assert.rejects(handleSlashCommand("/verify rounds 3", context), /zwischen 0 und 2/);
+
+  const saved = JSON.parse(await readFile(context.configPath!, "utf8")) as {
+    verify: Record<string, unknown>;
+  };
+  assert.equal(saved.verify.maxRepairRounds, 0);
+  assert.equal("maxRounds" in saved.verify, false);
+});
+
 test("chat deletion asks exactly once; decline changes nothing and accept deletes the selected chat", async () => {
   const root = await mkdtemp(join(tmpdir(), "routercode-command-delete-"));
   const workspace = join(root, "project");

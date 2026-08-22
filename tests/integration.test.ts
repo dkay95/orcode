@@ -423,8 +423,8 @@ test("/verify adds a command, then on/off/rounds/clear all persist", async () =>
   assert.equal(context.config.verify.mode, "on-edit");
 
   await handleSlashCommand("/verify rounds 2", context);
-  assert.equal(context.config.verify.maxRounds, 2);
-  await assert.rejects(handleSlashCommand("/verify rounds 9", context), /zwischen 1 und/);
+  assert.equal(context.config.verify.maxRepairRounds, 2);
+  await assert.rejects(handleSlashCommand("/verify rounds 9", context), /zwischen 0 und/);
 
   await handleSlashCommand("/verify clear", context);
   assert.deepEqual(context.config.verify.commands, []);

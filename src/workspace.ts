@@ -131,6 +131,11 @@ export class ChangeJournal {
     return this.#entries.length;
   }
 
+  /** True only when this exact root run recorded at least one workspace mutation. */
+  hasMutations(runId: string): boolean {
+    return this.#entries.some((entry) => entry.runId === runId);
+  }
+
   #runFile(runId: string): string {
     return checkpointRunPath(this.#appHome, this.#chatId, runId);
   }

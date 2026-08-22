@@ -16,17 +16,16 @@
  *   on `AgentRunEvent["verify"]"`, so this module has no dependency on how
  *   `agent.ts` numbers rounds or which conversation state a retry runs in.
  *
- * Deliberately NOT here: wiring into `agent.ts` (deciding *when* to call
- * `runVerify`, driving the retry-with-model loop across `maxRounds`, turning
- * a failure into a second `callModel` call, or the final `"unverified"` run
- * outcome). See the needsElsewhere note in the task report for the exact
- * integration points.
+ * Deliberately NOT here: orchestration policy. `agent.ts` decides *when* to
+ * call `runVerify`, owns the bounded repair-model loop, and produces the one
+ * root terminal outcome; this module owns one typed, fail-fast command pass.
  */
 
 import {
   DEFAULT_VERIFY,
   VERIFY_MAX_ROUNDS,
   VERIFY_MODES,
+  validateVerify,
   type VerifyConfig,
   type VerifyMode,
 } from "./config.js";
@@ -34,10 +33,13 @@ import {
   resolveCommandShell,
   runObservedProcess,
   runProcess,
+  type ProcessResult,
+  type RunProcessOptions,
   type WorkspaceGuard,
 } from "./workspace.js";
 import type { ProcessCallbacks } from "./types.js";
-import { isRecord, truncate } from "./utils.js";
+import { redactText } from "./redaction.js";
+import { errorMessage, isRecord, truncate } from "./utils.js";
 
 // ---------------------------------------------------------------------------
 // Config data model
@@ -45,11 +47,9 @@ import { isRecord, truncate } from "./utils.js";
 // `VerifyConfig`/`VERIFY_MODES`/`VERIFY_MAX_ROUNDS`/the default value are
 // owned by `config.ts` — that is where `OrcodeConfigWithBudget.verify`
 // actually lives and is persisted. This module re-exports them under their
-// original names for backward compatibility, plus its own, deliberately more
-// lenient field-by-field validator (`validateVerifyConfig`, used by the
-// not-yet-wired `/verify` first-run suggestion flow) which clamps an
-// out-of-range `maxRounds` to the nearest bound instead of `validateVerify`'s
-// stricter reject-to-default.
+// original names for backward compatibility. `validateVerifyConfig` is an
+// alias of the persisted canonical validator so command, load and runtime
+// callers can never reinterpret the same object differently.
 // ---------------------------------------------------------------------------
 
 export { VERIFY_MAX_ROUNDS, VERIFY_MODES };
@@ -62,36 +62,7 @@ export const DEFAULT_VERIFY_CONFIG: VerifyConfig = DEFAULT_VERIFY;
  * use in `config.ts`.
  */
 export function validateVerifyConfig(value: unknown): VerifyConfig {
-  if (!isRecord(value)) {
-    return { ...DEFAULT_VERIFY_CONFIG };
-  }
-  return {
-    commands: validateCommands(value.commands),
-    mode: isVerifyMode(value.mode) ? value.mode : DEFAULT_VERIFY_CONFIG.mode,
-    maxRounds: boundedRounds(value.maxRounds),
-  };
-}
-
-function validateCommands(value: unknown): string[] {
-  if (!Array.isArray(value)) {
-    return [];
-  }
-  return value.filter(
-    (entry): entry is string => typeof entry === "string" && entry.trim().length > 0,
-  );
-}
-
-function isVerifyMode(value: unknown): value is VerifyMode {
-  return typeof value === "string" && (VERIFY_MODES as readonly string[]).includes(value);
-}
-
-function boundedRounds(value: unknown): number {
-  const parsed =
-    typeof value === "number" && Number.isFinite(value) ? Math.trunc(value) : NaN;
-  if (Number.isNaN(parsed)) {
-    return DEFAULT_VERIFY_CONFIG.maxRounds;
-  }
-  return Math.min(VERIFY_MAX_ROUNDS, Math.max(1, parsed));
+  return validateVerify(value);
 }
 
 // ---------------------------------------------------------------------------
@@ -135,14 +106,25 @@ export type OnVerifyEvent = (event: VerifyCommandEvent) => void;
 export type VerifyOutcome =
   | { status: "passed" }
   | { status: "failed"; command: string; exitCode: number; distilled: string }
+  | { status: "timed-out"; command: string }
+  | { status: "spawn-failed"; command: string; error: string }
   | { status: "cancelled" };
 
 const VERIFY_TIMEOUT_MS = 120_000;
-const VERIFY_MAX_OUTPUT = 80_000;
+const VERIFY_FAILURE_MAX_CHARS = 4_000;
 
 /** Same pattern the render layer (2.5) uses to pick the informative lines out of red output. */
 const FAILURE_LINE_PATTERN = /(^|\s)(error|ERROR|FAIL|✗|panic|Traceback|error TS\d+)/;
-const DISTILL_MAX_LINES = 20;
+const DISTILL_MAX_LINES = 12;
+
+export interface VerifyExecutionOptions {
+  /** Injectable child boundary for deterministic timeout/spawn tests. */
+  execute?: (
+    executable: string,
+    args: string[],
+    options: RunProcessOptions,
+  ) => Promise<ProcessResult>;
+}
 
 /**
  * Runs `commands` in order against `guard.root`, stopping at the first
@@ -150,7 +132,7 @@ const DISTILL_MAX_LINES = 20;
  * the user aborted mid-verify is `"cancelled"`, never `"failed"`.
  *
  * One call is one verification pass over the full command list — the
- * retry-with-model loop across `VerifyConfig.maxRounds` is the caller's
+ * retry-with-model loop across `VerifyConfig.maxRepairRounds` is the caller's
  * responsibility (see the module doc comment).
  *
  * Execution goes through `runProcess` (`workspace.ts`) — the same shell
@@ -163,26 +145,46 @@ export async function runVerify(
   signal: AbortSignal | undefined,
   onEvent: OnVerifyEvent,
   processCallbacks: ProcessCallbacks = {},
+  execution: VerifyExecutionOptions = {},
 ): Promise<VerifyOutcome> {
   for (const command of commands) {
     if (signal?.aborted) {
       return { status: "cancelled" };
     }
-    const shell = await resolveCommandShell();
     const start = Date.now();
-    const result = await runObservedProcess(
-      "verify",
-      { command },
-      processCallbacks,
-      (onChunk) => runProcess(shell.executable, [...shell.args, command], {
-        cwd: guard.root,
-        timeoutMs: VERIFY_TIMEOUT_MS,
-        signal,
-        onChunk,
-      }),
-    );
+    let result: ProcessResult;
+    try {
+      const shell = await resolveCommandShell();
+      result = await runObservedProcess(
+        "verify",
+        { command },
+        processCallbacks,
+        (onChunk) => (execution.execute ?? runProcess)(
+          shell.executable,
+          [...shell.args, command],
+          {
+            cwd: guard.root,
+            timeoutMs: VERIFY_TIMEOUT_MS,
+            ...(signal ? { signal } : {}),
+            onChunk,
+          },
+        ),
+      );
+    } catch (error) {
+      if (signal?.aborted) {
+        return { status: "cancelled" };
+      }
+      return {
+        status: "spawn-failed",
+        command,
+        error: truncate(redactText(errorMessage(error)), 1_000),
+      };
+    }
     if (result.aborted) {
       return { status: "cancelled" };
+    }
+    if (result.timedOut) {
+      return { status: "timed-out", command };
     }
     onEvent({
       command,
@@ -203,12 +205,17 @@ export async function runVerify(
 }
 
 function distillFailure(stdout: string, stderr: string): string {
-  const combined = `${stdout}\n${stderr}`.trim();
+  const combined = redactText(`${stdout}\n${stderr}`).trim();
   if (combined.length === 0) {
     return "";
   }
   const lines = combined.split("\n");
   const matched = lines.filter((line) => FAILURE_LINE_PATTERN.test(line));
   const chosen = matched.length > 0 ? matched : lines.slice(-DISTILL_MAX_LINES);
-  return truncate(chosen.slice(0, DISTILL_MAX_LINES).join("\n").trim(), VERIFY_MAX_OUTPUT);
+  const report = chosen.slice(0, DISTILL_MAX_LINES).join("\n").trim();
+  if (report.length <= VERIFY_FAILURE_MAX_CHARS) {
+    return report;
+  }
+  const suffix = "\n… gekürzt …";
+  return `${report.slice(0, VERIFY_FAILURE_MAX_CHARS - suffix.length)}${suffix}`;
 }

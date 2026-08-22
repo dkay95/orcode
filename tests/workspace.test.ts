@@ -1662,6 +1662,32 @@ test("run_command's timeout ceiling sits at exactly 1800 seconds", async () => {
   assert.equal(schema.safeParse({ command: "echo hi", timeoutSeconds: 1_801 }).success, false);
 });
 
+test("ChangeJournal mutation queries are scoped to the current root run", async () => {
+  const workspace = await mkdtemp(join(tmpdir(), "routercode-journal-run-scope-"));
+  const appHome = join(workspace, ".orcode");
+  const journal = new ChangeJournal({ appHome, chatId: "chat-run-scope" });
+  const target = join(workspace, "edited.txt");
+  await journal.record({
+    path: target,
+    before: null,
+    after: "old run",
+    createdAt: new Date().toISOString(),
+    runId: "run-old",
+  });
+
+  assert.equal(journal.hasMutations("run-later"), false);
+  assert.equal(journal.hasMutations("run-old"), true);
+
+  await journal.record({
+    path: target,
+    before: "old run",
+    after: "repair in same root",
+    createdAt: new Date().toISOString(),
+    runId: "run-later",
+  });
+  assert.equal(journal.hasMutations("run-later"), true);
+});
+
 // ---------------------------------------------------------------------------
 // A5 — /undo over a whole run
 // ---------------------------------------------------------------------------

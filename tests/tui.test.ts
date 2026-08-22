@@ -716,6 +716,65 @@ test("volatile process events render live and one terminal event does not duplic
   }
 });
 
+test("automatic verification uses one process card and renders the root unverified terminal once", () => {
+  const stdin = new FakeInput();
+  const stdout = new FakeOutput();
+  stdout.rows = 36;
+  const terminal = ui(stdin, stdout);
+  terminal.start();
+  try {
+    terminal.handleRunEvent({
+      type: "run-start",
+      model: "vendor/model",
+      maxSteps: 6,
+      prompt: "edit",
+      timestamp: NOW,
+    });
+    terminal.handleRunEvent({
+      type: "process-start",
+      id: "task9-verify",
+      name: "verify",
+      input: { command: "task9-check" },
+      timestamp: NOW + 1,
+    });
+    terminal.handleRunEvent({
+      type: "process-output",
+      id: "task9-verify",
+      name: "verify",
+      stream: "stderr",
+      text: "ERROR task9-only-tail\n",
+      timestamp: NOW + 2,
+    });
+    terminal.handleRunEvent({
+      type: "process-end",
+      id: "task9-verify",
+      name: "verify",
+      input: { command: "task9-check" },
+      exitCode: 1,
+      durationMs: 20,
+      truncated: false,
+      timedOut: false,
+      aborted: false,
+      timestamp: NOW + 3,
+    });
+    terminal.handleRunEvent({
+      type: "run-end",
+      outcome: "unverified",
+      durationMs: 30,
+      toolCount: 0,
+      timestamp: NOW + 4,
+    });
+
+    const screen = text(terminal.frame().lines);
+    assert.equal(screen.match(/task9-check/g)?.length, 1);
+    assert.equal(screen.match(/task9-only-tail/g)?.length, 1);
+    assert.equal(screen.match(/Lauf beendet · unbestätigt/g)?.length, 1);
+    assert.doesNotMatch(screen, /Prüflauf.*Runde/);
+  } finally {
+    terminal.stop();
+  }
+});
+
 test("fullscreen /diff terminal frames distinguish dirty, clean, and failed repositories without duplicate tails", async (t) => {
   try {
     execFileSync("git", ["--version"], { stdio: "ignore" });

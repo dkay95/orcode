@@ -78,7 +78,8 @@ export const VERIFY_MAX_ROUNDS = 2;
 export interface VerifyConfig {
   commands: string[];
   mode: VerifyMode;
-  maxRounds: number;
+  /** Additional model repair phases after the initial verification pass. */
+  maxRepairRounds: number;
 }
 
 /**
@@ -140,7 +141,7 @@ export const DEFAULT_PROVIDER: ProviderConfig = {
 export const DEFAULT_VERIFY: VerifyConfig = {
   commands: [],
   mode: "on-edit",
-  maxRounds: 1,
+  maxRepairRounds: 1,
 };
 
 export const DEFAULT_CONFIG: OrcodeConfigWithBudget = {
@@ -529,8 +530,21 @@ export function validateVerify(value: unknown): VerifyConfig {
       ).slice(0, 20)
     : [];
   const mode = includes(VERIFY_MODES, value.mode) ? value.mode : DEFAULT_VERIFY.mode;
-  const maxRounds = boundedInteger(value.maxRounds, 1, VERIFY_MAX_ROUNDS, DEFAULT_VERIFY.maxRounds);
-  return { commands, mode, maxRounds };
+  const candidate = Object.hasOwn(value, "maxRepairRounds")
+    ? value.maxRepairRounds
+    : migrateLegacyRepairRounds(value.maxRounds);
+  const maxRepairRounds = boundedInteger(
+    candidate,
+    0,
+    VERIFY_MAX_ROUNDS,
+    DEFAULT_VERIFY.maxRepairRounds,
+  );
+  return { commands, mode, maxRepairRounds };
+}
+
+/** Legacy `maxRounds` counted total verification passes; the new field counts only repairs. */
+function migrateLegacyRepairRounds(value: unknown): unknown {
+  return Number.isInteger(value) ? Math.max(0, Number(value) - 1) : undefined;
 }
 
 function stringListOf(value: unknown): string[] | undefined {

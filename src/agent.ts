@@ -29,7 +29,7 @@ import {
   webSearchPlugin,
 } from "./openrouter.js";
 import { formatSecretWarning, scanForSecrets } from "./secrets.js";
-import { ProcessEventRedactor } from "./redaction.js";
+import { ProcessEventRedactor, redactText } from "./redaction.js";
 import { createRunId, RunLog } from "./runlog.js";
 import {
   SessionStore,
@@ -65,13 +65,16 @@ import {
   throwIfAborted,
 } from "./reconnect.js";
 import { errorMessage, formatUsd, hasCode } from "./utils.js";
+import { runVerify, type VerifyOutcome } from "./verify.js";
 
 /**
- * How a run ended. `step-limit` and `cost-limit` are regular, non-failing
- * outcomes: the answer is complete but the model was stopped early.
+ * How a run ended. `unverified`, `step-limit`, and `cost-limit` are regular,
+ * non-failing outcomes: work may exist, but its gate or model budget did not
+ * reach the fully completed state.
  */
 export type AgentRunOutcome =
   | "completed"
+  | "unverified"
   | "step-limit"
   | "cost-limit"
   | "cancelled"
@@ -165,6 +168,7 @@ export class OrcodeAgent {
       pruneRunLogs: (appHome: string) => Promise<unknown>;
       pruneExactArtifacts: (appHome: string) => Promise<unknown>;
     },
+    private readonly verifyRunner: typeof runVerify,
   ) {
     this.guard = guard;
     this.#binding = createChatBinding(session);
@@ -180,6 +184,7 @@ export class OrcodeAgent {
       pruneRunLogs: (appHome: string) => Promise<unknown>;
       pruneExactArtifacts: (appHome: string) => Promise<unknown>;
     };
+    verifyRunner?: typeof runVerify;
   }): Promise<OrcodeAgent> {
     return new OrcodeAgent(
       options.openRouter,
@@ -191,6 +196,7 @@ export class OrcodeAgent {
         pruneRunLogs: (appHome) => RunLog.prune(appHome),
         pruneExactArtifacts,
       },
+      options.verifyRunner ?? runVerify,
     );
   }
 
@@ -494,8 +500,9 @@ export class OrcodeAgent {
     // K7f: tracks the most recently measured input size of this run, so the
     // *next* run can decide upfront whether the context budget was exceeded.
     let lastInputTokens = 0;
-    let modelStep = 1;
-    let announcedStep = 1;
+    let modelStep = 0;
+    let announcedStep = 0;
+    let phaseStepOffset = 0;
     let pendingModelStep: number | null = null;
     let toolSequence = 0;
     // A closure assignment would not be visible to control-flow analysis, so
@@ -674,12 +681,6 @@ export class OrcodeAgent {
         }
       };
     }
-    observer.onEvent?.({
-      type: "model-start",
-      model: this.config.mainModel,
-      step: modelStep,
-      timestamp: Date.now(),
-    });
     const currentRequestMessage =
       `AUTHORITATIVE CURRENT USER REQUEST:\n${promptForContext}`;
     const modelInputText = [projectNotes, currentRequestMessage, runLimitsMessage]
@@ -714,186 +715,280 @@ export class OrcodeAgent {
     if (historySource.kind === "fresh-seed") {
       conversation.reset(historySource.handoff);
     }
-    let result: ReturnType<typeof client.callModel>;
-    try {
-      result = client.callModel({
-        models,
-        instructions,
-        input: modelInput,
-        ...(reasoning ? { reasoning } : {}),
-        ...(Object.keys(provider).length > 0 ? { provider } : {}),
-        ...(plugins ? { plugins } : {}),
-        tools,
-        // K7e: cache-friendly request fields. `sessionId`/`promptCacheKey`
-        // are the chat id — stable for the lifetime of the chat, so every
-        // request in it routes to the same upstream provider and hits the
-        // same prompt cache.
-        state: conversation.accessor([projectNotes, runLimitsMessage]),
-        cacheControl: { type: "ephemeral" },
-        promptCacheKey: this.#session.data.id,
-        sessionId: this.#session.data.id,
-        stopWhen: [
-          stepCountIs(this.config.maxSteps),
-          maxCost(this.config.maxCostUsd),
-        ],
-        allowFinalResponse:
-          "Tool execution has stopped. Summarize the verified outcome, any remaining blocker, and the most useful next step. Do not claim unverified success.",
-        // The SDK counts a tool execution round as one turn; the model call
-        // that follows it is the next model step. This is the only reliable
-        // source for the step number — tool hooks fire once per tool.
-        onTurnStart: ({ numberOfTurns }) => {
-          pendingModelStep = Math.max(
-            pendingModelStep ?? 0,
-            numberOfTurns + 1,
-          );
-        },
-        hooks: {
-          Stop: [
-            {
-              handler: () => {
-                stopReasons.push(
-                  observedCost >= this.config.maxCostUsd
-                    ? "cost-limit"
-                    : "step-limit",
-                );
-                return {};
-              },
-            },
-          ],
-          PostModelCall: [
-            {
-              handler: ({
-                usage,
-                model,
-                durationMs,
-                turnNumber,
-              }) => {
-                const callCost = usage?.cost ?? 0;
-                observedCost += callCost;
-                if (usage?.inputTokens) {
-                  lastInputTokens = usage.inputTokens;
-                }
-                const step = turnNumber + 1;
-                // A finished step is a hard lower bound for the counter, but
-                // never emits a start event after the fact.
-                announcedStep = Math.max(announcedStep, step);
-                modelStep = Math.max(modelStep, step);
-                observer.onEvent?.({
-                  type: "model-end",
-                  model,
-                  step,
-                  durationMs,
-                  inputTokens: usage?.inputTokens ?? 0,
-                  outputTokens: usage?.outputTokens ?? 0,
-                  reasoningTokens: usage?.reasoningTokens ?? 0,
-                  cachedTokens: usage?.cachedTokens ?? 0,
-                  costUsd: callCost,
-                  timestamp: Date.now(),
-                });
-                this.#session.addCost("main", callCost);
-              },
-            },
-          ],
-        },
-      }, {
-        ...(observer.signal ? { signal: observer.signal } : {}),
-        retryCodes: [...SDK_RETRY_CODES],
-      });
-    } catch (error) {
-      conversation.discard();
-      if (
-        this.#session.data.costs.totalUsd >
-        sessionSnapshot.data.costs.totalUsd
-      ) {
-        await this.#session.save();
-      }
-      throw error;
-    }
-
-    const answer = new SuggestedReplyStreamFilter();
-    let reasoningStreamError: unknown;
-    const reasoningHeartbeat = (async () => {
-      try {
-        for await (const delta of result.getReasoningStream()) {
-          if (!delta) {
-            continue;
-          }
-          observer.onEvent?.({
-            type: "reasoning",
-            model: this.config.mainModel,
-            step: modelStep,
-            delta,
-            timestamp: Date.now(),
-          });
-        }
-      } catch (error) {
-        reasoningStreamError = error;
-      }
-    })();
     if (!observer.onText) {
       process.stdout.write("\n");
     }
-    const show = (visible: string) => {
-      if (!visible) {
-        return;
-      }
-      // Mirrored into the run log (via `observer.onEvent`) so an interrupted
-      // run leaves a record of how much of the answer already existed — the
-      // only place that survives a crash, since `onText` itself never does.
-      observer.onEvent?.({ type: "text", delta: visible, timestamp: Date.now() });
-      if (observer.onText) {
-        observer.onText(visible, answer.visibleText);
-      } else {
-        process.stdout.write(visible);
-      }
-    };
+    let text = "";
+    let suggestions: string[] = [];
+    let resolvedModel = this.config.mainModel;
     let failure: unknown;
-    try {
-      for await (const delta of result.getTextStream()) {
-        show(answer.push(delta));
-      }
-    } catch (error) {
-      failure = error;
-    } finally {
-      show(answer.finish());
-    }
-    await reasoningHeartbeat;
+    let outcome: AgentRunOutcome = "completed";
 
-    // A broken reasoning stream must never destroy a finished answer: it is a
-    // side channel. Only a run without any text at all really failed.
-    if (reasoningStreamError !== undefined && failure === undefined) {
-      if (!answer.visibleText) {
-        failure = reasoningStreamError;
-      } else {
-        const notice = `Der Reasoning-Stream ist abgebrochen (${this.openRouter.safeMessage(reasoningStreamError)}); die Antwort selbst ist vollständig.`;
-        notices.push(notice);
-        emitStatus(observer, notice, chalk.yellow);
-      }
-    }
-
-    let response: Awaited<ReturnType<typeof result.getResponse>> | null = null;
-    if (failure === undefined) {
+    const executeModelPhase = async (
+      input: Item[],
+      transientDeveloperMessages: readonly string[],
+      phasePlugins: typeof plugins,
+    ): Promise<{ failure?: unknown; suggestions: string[] }> => {
+      const costBeforePhase = observedCost;
+      phaseStepOffset = modelStep;
+      pendingModelStep = null;
+      announceModelStep(phaseStepOffset + 1);
+      const remainingSteps = Math.max(1, this.config.maxSteps - phaseStepOffset);
+      const remainingCost = Math.max(
+        Number.EPSILON,
+        this.config.maxCostUsd - observedCost,
+      );
+      let result: ReturnType<typeof client.callModel>;
       try {
-        response = await result.getResponse();
+        result = client.callModel({
+          models,
+          instructions,
+          input,
+          ...(reasoning ? { reasoning } : {}),
+          ...(Object.keys(provider).length > 0 ? { provider } : {}),
+          ...(phasePlugins ? { plugins: phasePlugins } : {}),
+          tools,
+          // Every phase stays on the same chat route and cache key. The
+          // transient developer item is stripped by ConversationStore before
+          // the phase buffer can become the root's one durable commit.
+          state: conversation.accessor(transientDeveloperMessages),
+          cacheControl: { type: "ephemeral" },
+          promptCacheKey: this.#session.data.id,
+          sessionId: this.#session.data.id,
+          // The SDK enforces the remaining root budget for this phase. Global
+          // offsets below keep events and tool ids monotone across phases.
+          stopWhen: [
+            stepCountIs(remainingSteps),
+            maxCost(remainingCost),
+          ],
+          allowFinalResponse:
+            "Tool execution has stopped. Summarize the verified outcome, any remaining blocker, and the most useful next step. Do not claim unverified success.",
+          onTurnStart: ({ numberOfTurns }) => {
+            pendingModelStep = Math.max(
+              pendingModelStep ?? 0,
+              phaseStepOffset + numberOfTurns + 1,
+            );
+          },
+          hooks: {
+            Stop: [
+              {
+                handler: () => {
+                  stopReasons.push(
+                    observedCost >= this.config.maxCostUsd
+                      ? "cost-limit"
+                      : "step-limit",
+                  );
+                  return {};
+                },
+              },
+            ],
+            PostModelCall: [
+              {
+                handler: ({
+                  usage,
+                  model,
+                  durationMs,
+                  turnNumber,
+                }) => {
+                  const callCost = usage?.cost ?? 0;
+                  observedCost += callCost;
+                  if (usage?.inputTokens) {
+                    lastInputTokens = usage.inputTokens;
+                  }
+                  const step = phaseStepOffset + turnNumber + 1;
+                  announcedStep = Math.max(announcedStep, step);
+                  modelStep = Math.max(modelStep, step);
+                  observer.onEvent?.({
+                    type: "model-end",
+                    model,
+                    step,
+                    durationMs,
+                    inputTokens: usage?.inputTokens ?? 0,
+                    outputTokens: usage?.outputTokens ?? 0,
+                    reasoningTokens: usage?.reasoningTokens ?? 0,
+                    cachedTokens: usage?.cachedTokens ?? 0,
+                    costUsd: callCost,
+                    timestamp: Date.now(),
+                  });
+                  this.#session.addCost("main", callCost);
+                },
+              },
+            ],
+          },
+        }, {
+          ...(observer.signal ? { signal: observer.signal } : {}),
+          retryCodes: [...SDK_RETRY_CODES],
+        });
       } catch (error) {
-        if (!answer.visibleText) {
-          failure = error;
+        return { failure: error, suggestions: [] };
+      }
+
+      const answer = new SuggestedReplyStreamFilter();
+      let reasoningStreamError: unknown;
+      const reasoningHeartbeat = (async () => {
+        try {
+          for await (const delta of result.getReasoningStream()) {
+            if (!delta) {
+              continue;
+            }
+            observer.onEvent?.({
+              type: "reasoning",
+              model: this.config.mainModel,
+              step: modelStep,
+              delta,
+              timestamp: Date.now(),
+            });
+          }
+        } catch (error) {
+          reasoningStreamError = error;
+        }
+      })();
+      const show = (visible: string) => {
+        if (!visible) {
+          return;
+        }
+        text += visible;
+        observer.onEvent?.({ type: "text", delta: visible, timestamp: Date.now() });
+        if (observer.onText) {
+          observer.onText(visible, text);
         } else {
-          const notice = `Die Abschlussdaten des Laufs fehlen (${this.openRouter.safeMessage(error)}); die Antwort selbst ist vollständig.`;
+          process.stdout.write(visible);
+        }
+      };
+      let phaseFailure: unknown;
+      try {
+        for await (const delta of result.getTextStream()) {
+          show(answer.push(delta));
+        }
+      } catch (error) {
+        phaseFailure = error;
+      } finally {
+        show(answer.finish());
+      }
+      await reasoningHeartbeat;
+
+      // Reasoning is an observational side stream. It is fatal only when no
+      // visible answer exists for this phase, preserving the Task-7 contract.
+      if (reasoningStreamError !== undefined && phaseFailure === undefined) {
+        if (!answer.visibleText) {
+          phaseFailure = reasoningStreamError;
+        } else {
+          const notice = `Der Reasoning-Stream ist abgebrochen (${this.openRouter.safeMessage(reasoningStreamError)}); die Antwort selbst ist vollständig.`;
           notices.push(notice);
           emitStatus(observer, notice, chalk.yellow);
         }
       }
+
+      let response: Awaited<ReturnType<typeof result.getResponse>> | null = null;
+      if (phaseFailure === undefined) {
+        try {
+          response = await result.getResponse();
+        } catch (error) {
+          if (!answer.visibleText) {
+            phaseFailure = error;
+          } else {
+            const notice = `Die Abschlussdaten des Laufs fehlen (${this.openRouter.safeMessage(error)}); die Antwort selbst ist vollständig.`;
+            notices.push(notice);
+            emitStatus(observer, notice, chalk.yellow);
+          }
+        }
+      }
+      const responseCost = response?.usage?.cost ?? 0;
+      if (observedCost === costBeforePhase && responseCost > 0) {
+        observedCost += responseCost;
+        this.#session.addCost("main", responseCost);
+      }
+      if (response?.model) {
+        resolvedModel = response.model;
+        this.#lastResolvedModel = response.model;
+      }
+      return {
+        ...(phaseFailure === undefined ? {} : { failure: phaseFailure }),
+        suggestions: answer.suggestions,
+      };
+    };
+
+    const initialPhase = await executeModelPhase(
+      modelInput,
+      [projectNotes, runLimitsMessage],
+      plugins,
+    );
+    suggestions = initialPhase.suggestions;
+    failure = initialPhase.failure;
+
+    if (failure === undefined) {
+      if (!this.journal.hasMutations(runId)) {
+        outcome = stopReasons.at(-1) ?? "completed";
+      } else if (
+        this.config.verify.mode !== "on-edit" ||
+        this.config.verify.commands.length === 0
+      ) {
+        outcome = "unverified";
+      } else {
+        let repairs = 0;
+        while (true) {
+          let verification: VerifyOutcome;
+          try {
+            verification = await this.verifyRunner(
+              [...this.config.verify.commands],
+              this.guard,
+              observer.signal,
+              // Process start/output/end are the sole command presentation.
+              // A second verify card would duplicate the same child process.
+              () => {},
+              processCallbacks,
+            );
+          } catch (error) {
+            failure = error;
+            break;
+          }
+          if (verification.status === "passed") {
+            outcome = "completed";
+            break;
+          }
+          if (verification.status === "cancelled") {
+            const abort = new Error("Verifikation wurde abgebrochen.");
+            abort.name = "AbortError";
+            failure = abort;
+            break;
+          }
+          if (
+            verification.status !== "failed" ||
+            repairs >= this.config.verify.maxRepairRounds ||
+            modelStep >= this.config.maxSteps ||
+            observedCost >= this.config.maxCostUsd
+          ) {
+            outcome = "unverified";
+            break;
+          }
+
+          repairs += 1;
+          const repairMessage = buildVerificationRepairMessage(
+            verification,
+            repairs,
+          );
+          // Clone the first phase's latest buffered SDK state for the repair.
+          // No history decision, reset, session write, or durable commit occurs
+          // at this boundary.
+          conversation.stageContinuation();
+          observer.onStatus?.(
+            `${this.config.mainModel} repariert Verifikationsfehler (${repairs}/${this.config.verify.maxRepairRounds})`,
+          );
+          const repairPhase = await executeModelPhase(
+            [{ role: "developer", content: repairMessage }],
+            [repairMessage],
+            undefined,
+          );
+          suggestions = repairPhase.suggestions;
+          if (repairPhase.failure !== undefined) {
+            failure = repairPhase.failure;
+            break;
+          }
+        }
+      }
     }
 
-    const mainCostUsd = observedCost || response?.usage?.cost || 0;
-    if (observedCost === 0 && mainCostUsd > 0) {
-      this.#session.addCost("main", mainCostUsd);
-    }
-    const resolvedModel = response?.model || this.config.mainModel;
-    if (response?.model) {
-      this.#lastResolvedModel = resolvedModel;
-    }
+    const mainCostUsd = observedCost;
     // K7f: recorded regardless of outcome — even a cancelled or failed run
     // may have measured a real input size worth reacting to next time.
     if (lastInputTokens > 0) {
@@ -903,16 +998,12 @@ export class OrcodeAgent {
       };
     }
 
-    const text = answer.visibleText;
     const cancelled =
       failure !== undefined &&
       (Boolean(observer.signal?.aborted) || isAbortError(failure));
-    const outcome: AgentRunOutcome =
-      failure === undefined
-        ? (stopReasons.at(-1) ?? "completed")
-        : cancelled
-          ? "cancelled"
-          : "error";
+    if (failure !== undefined) {
+      outcome = cancelled ? "cancelled" : "error";
+    }
 
     if (failure === undefined) {
       // Compression is destructive, so it is applied only now — together with
@@ -963,12 +1054,13 @@ export class OrcodeAgent {
         }
       }
     } else {
+      this.#session.restoreRunState(sessionSnapshot);
       conversation.discard();
       if (
         this.#session.data.costs.totalUsd >
         sessionSnapshot.data.costs.totalUsd
       ) {
-        await this.#session.save();
+        await this.#session.save().catch(() => {});
       }
     }
 
@@ -978,7 +1070,7 @@ export class OrcodeAgent {
 
     const runResult: AgentRunResult = {
       text,
-      suggestions: answer.suggestions,
+      suggestions,
       outcome,
       costUsd: mainCostUsd + compression.costUsd,
       mainCostUsd,
@@ -1221,6 +1313,33 @@ export function isAbortError(error: unknown): boolean {
       error.name === "RequestAbortedError" ||
       /abgebrochen|abort/i.test(error.message))
   );
+}
+
+/**
+ * Provider-facing repair input is deliberately smaller than the process log:
+ * at most twelve redacted diagnostic lines and a short redacted command. The
+ * caller supplies it as one transient developer item, never as another user
+ * request or attachment.
+ */
+function buildVerificationRepairMessage(
+  failure: Extract<VerifyOutcome, { status: "failed" }>,
+  repairRound: number,
+): string {
+  const command = redactText(failure.command).slice(0, 500);
+  const report = redactText(failure.distilled)
+    .split("\n")
+    .slice(0, 12)
+    .join("\n")
+    .slice(0, 3_000)
+    .trim();
+  return [
+    `AUTOMATIC VERIFICATION REPAIR ${repairRound}`,
+    `Command: ${command}`,
+    `Exit code: ${failure.exitCode}`,
+    "Fix the reported verification failure with the existing tools, then summarize only the repair. Do not repeat the original user request and do not claim success before verification reruns.",
+    "COMPACT REDACTED FAILURE REPORT:",
+    report || "(no diagnostic output)",
+  ].join("\n");
 }
 
 function emitStatus(

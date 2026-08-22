@@ -244,7 +244,11 @@ test("DEFAULT_CONFIG trägt die A2/A3-Defaults", () => {
   assert.deepEqual(DEFAULT_CONFIG.fallbackModels, []);
   assert.deepEqual(DEFAULT_CONFIG.provider, { dataCollection: "deny" });
   assert.equal(DEFAULT_CONFIG.web, "auto");
-  assert.deepEqual(DEFAULT_CONFIG.verify, { commands: [], mode: "on-edit", maxRounds: 1 });
+  assert.deepEqual(DEFAULT_CONFIG.verify, {
+    commands: [],
+    mode: "on-edit",
+    maxRepairRounds: 1,
+  });
   assert.equal(DEFAULT_CONFIG.contextBudgetRatio, 0.7);
 });
 
@@ -275,22 +279,42 @@ test("validateProvider erzwingt dataCollection=deny als Default und filtert Unsi
   });
 });
 
-test("validateVerify begrenzt maxRounds auf 2 und normalisiert den Modus", () => {
+test("validateVerify allows zero through two repair rounds and normalizes the mode", () => {
   assert.deepEqual(
-    validateVerify({ commands: ["npm test", ""], mode: "on-edit", maxRounds: 2 }),
-    { commands: ["npm test"], mode: "on-edit", maxRounds: 2 },
+    validateVerify({ commands: ["npm test", ""], mode: "on-edit", maxRepairRounds: 2 }),
+    { commands: ["npm test"], mode: "on-edit", maxRepairRounds: 2 },
   );
-  assert.deepEqual(validateVerify({ commands: ["x"], mode: "on-edit", maxRounds: 5 }), {
+  assert.deepEqual(validateVerify({ commands: ["x"], mode: "on-edit", maxRepairRounds: 0 }), {
     commands: ["x"],
     mode: "on-edit",
-    maxRounds: 1,
+    maxRepairRounds: 0,
+  });
+  assert.deepEqual(validateVerify({ commands: ["x"], mode: "on-edit", maxRepairRounds: 5 }), {
+    commands: ["x"],
+    mode: "on-edit",
+    maxRepairRounds: 1,
   });
   assert.deepEqual(validateVerify({ mode: "sofort" as never }), {
     commands: [],
     mode: "on-edit",
-    maxRounds: 1,
+    maxRepairRounds: 1,
   });
-  assert.deepEqual(validateVerify("nichts"), { commands: [], mode: "on-edit", maxRounds: 1 });
+  assert.deepEqual(validateVerify("nichts"), {
+    commands: [],
+    mode: "on-edit",
+    maxRepairRounds: 1,
+  });
+});
+
+test("validateVerify migrates legacy total-pass maxRounds without raising the limit", () => {
+  assert.equal(validateVerify({ maxRounds: 1 }).maxRepairRounds, 0);
+  assert.equal(validateVerify({ maxRounds: 2 }).maxRepairRounds, 1);
+  assert.equal(validateVerify({ maxRounds: 3 }).maxRepairRounds, 2);
+  assert.equal(
+    validateVerify({ maxRounds: 1, maxRepairRounds: 2 }).maxRepairRounds,
+    2,
+    "the explicit new field wins over the legacy field",
+  );
 });
 
 test("validateConfig übernimmt fallbackModels/provider/web/verify/contextBudgetRatio", () => {
@@ -299,7 +323,7 @@ test("validateConfig übernimmt fallbackModels/provider/web/verify/contextBudget
     fallbackModels: ["anthropic/x"],
     provider: { sort: "throughput", allowFallbacks: false },
     web: "on",
-    verify: { commands: ["npm run check"], mode: "on-edit", maxRounds: 2 },
+    verify: { commands: ["npm run check"], mode: "on-edit", maxRepairRounds: 2 },
     contextBudgetRatio: 0.5,
   });
   assert.deepEqual(config.fallbackModels, ["anthropic/x"]);
@@ -309,7 +333,11 @@ test("validateConfig übernimmt fallbackModels/provider/web/verify/contextBudget
     allowFallbacks: false,
   });
   assert.equal(config.web, "on");
-  assert.deepEqual(config.verify, { commands: ["npm run check"], mode: "on-edit", maxRounds: 2 });
+  assert.deepEqual(config.verify, {
+    commands: ["npm run check"],
+    mode: "on-edit",
+    maxRepairRounds: 2,
+  });
   assert.equal(config.contextBudgetRatio, 0.5);
 
   const rejected = validateConfig({
@@ -329,7 +357,7 @@ test("saveConfig/loadConfig runden die neuen Felder verlustfrei", async () => {
       fallbackModels: ["anthropic/x", "openai/y"],
       provider: { sort: "price", only: ["anthropic"], allowFallbacks: false },
       web: "off",
-      verify: { commands: ["npm test"], mode: "on-edit", maxRounds: 2 },
+      verify: { commands: ["npm test"], mode: "on-edit", maxRepairRounds: 2 },
       contextBudgetRatio: 0.6,
     },
     path,
@@ -347,9 +375,43 @@ test("saveConfig/loadConfig runden die neuen Felder verlustfrei", async () => {
   assert.deepEqual(written.config.verify, {
     commands: ["npm test"],
     mode: "on-edit",
-    maxRounds: 2,
+    maxRepairRounds: 2,
   });
   assert.equal(written.config.contextBudgetRatio, 0.6);
+});
+
+test("legacy verify config loads idempotently and save writes only maxRepairRounds", async () => {
+  for (const [legacy, expected] of [[1, 0], [2, 1]] as const) {
+    const path = await configPath(`verify-legacy-${legacy}`);
+    await writeFile(path, JSON.stringify({
+      ...DEFAULT_CONFIG,
+      verify: { commands: ["npm test"], mode: "on-edit", maxRounds: legacy },
+    }));
+
+    const loaded = await loadConfigDetailed(path);
+    assert.equal(loaded.source, "file");
+    assert.equal(loaded.config.verify.maxRepairRounds, expected);
+    await saveConfig(loaded.config, path);
+
+    const saved = JSON.parse(await readFile(path, "utf8")) as {
+      verify: Record<string, unknown>;
+    };
+    assert.equal(saved.verify.maxRepairRounds, expected);
+    assert.equal("maxRounds" in saved.verify, false);
+    assert.equal((await loadConfigDetailed(path)).config.verify.maxRepairRounds, expected);
+  }
+
+  const mixedPath = await configPath("verify-mixed");
+  await writeFile(mixedPath, JSON.stringify({
+    ...DEFAULT_CONFIG,
+    verify: {
+      commands: ["npm test"],
+      mode: "on-edit",
+      maxRounds: 1,
+      maxRepairRounds: 2,
+    },
+  }));
+  assert.equal((await loadConfigDetailed(mixedPath)).config.verify.maxRepairRounds, 2);
 });
 
 test("config schema v0 reads as current while unknown future versions are visibly refused", async () => {

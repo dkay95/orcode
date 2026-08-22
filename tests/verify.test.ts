@@ -6,7 +6,7 @@ import { join } from "node:path";
 import test, { mock } from "node:test";
 import { ApprovalManager } from "../src/approval.js";
 import { RuleStore, rulesPath } from "../src/rules.js";
-import { WorkspaceGuard } from "../src/workspace.js";
+import { WorkspaceGuard, type ProcessResult } from "../src/workspace.js";
 import {
   DEFAULT_VERIFY_CONFIG,
   VERIFY_MAX_ROUNDS,
@@ -270,8 +270,89 @@ test("a failed command with no error-shaped lines falls back to the tail", needs
   }
 });
 
+test("timeout is typed and cannot masquerade as an ordinary repairable exit", async () => {
+  const guard = await tempWorkspace();
+  const lifecycle: string[] = [];
+  const outcome = await runVerify(
+    ["synthetic timeout"],
+    guard,
+    undefined,
+    () => undefined,
+    {
+      onProcessStart: () => lifecycle.push("start"),
+      onProcessEnd: () => lifecycle.push("end"),
+    },
+    {
+      execute: async (): Promise<ProcessResult> => ({
+        code: 124,
+        stdout: "",
+        stderr: "Zeitlimit erreicht",
+        truncated: false,
+        timedOut: true,
+        aborted: false,
+      }),
+    },
+  );
+
+  assert.deepEqual(outcome, { status: "timed-out", command: "synthetic timeout" });
+  assert.deepEqual(lifecycle, ["start", "end"]);
+});
+
+test("spawn or shell resolution failure is typed and keeps one terminal process lifecycle", async () => {
+  const guard = await tempWorkspace();
+  const lifecycle: Array<{ type: string; error?: string }> = [];
+  const outcome = await runVerify(
+    ["synthetic spawn"],
+    guard,
+    undefined,
+    () => undefined,
+    {
+      onProcessStart: () => lifecycle.push({ type: "start" }),
+      onProcessEnd: (_operation, completion) => lifecycle.push({
+        type: "end",
+        ...(completion.error ? { error: completion.error } : {}),
+      }),
+    },
+    {
+      execute: async () => {
+        throw new Error("synthetic spawn failure");
+      },
+    },
+  );
+
+  assert.equal(outcome.status, "spawn-failed");
+  if (outcome.status === "spawn-failed") {
+    assert.equal(outcome.command, "synthetic spawn");
+    assert.match(outcome.error, /synthetic spawn failure/);
+  }
+  assert.deepEqual(lifecycle.map((event) => event.type), ["start", "end"]);
+  assert.match(lifecycle[1]?.error ?? "", /synthetic spawn failure/);
+});
+
+test("repair failure reports are centrally redacted and compacted to fixed small bounds", needsPosixShell, async () => {
+  const guard = await tempWorkspace();
+  const secret = `${["sk", "or", "v1"].join("-")}-${"q".repeat(40)}`;
+  const noisy = Array.from(
+    { length: 40 },
+    (_, index) => `ERROR ${String(index).padStart(2, "0")} ${"x".repeat(500)}`,
+  ).join("\n");
+  const script = `${JSON.stringify(process.execPath)} -e ${JSON.stringify(
+    `console.error(${JSON.stringify(`ERROR credential ${secret}\n${noisy}`)}); process.exit(1)`,
+  )}`;
+
+  const outcome = await runVerify([script], guard, undefined, () => undefined);
+
+  assert.equal(outcome.status, "failed");
+  if (outcome.status === "failed") {
+    assert.doesNotMatch(outcome.distilled, new RegExp(secret));
+    assert.match(outcome.distilled, /REDACTED/);
+    assert.ok(outcome.distilled.length <= 4_000, `got ${outcome.distilled.length} chars`);
+    assert.ok(outcome.distilled.split("\n").length <= 12);
+  }
+});
+
 // ---------------------------------------------------------------------------
-// Config data model: verify { commands; mode; maxRounds } with validation.
+// Config data model: verify { commands; mode; maxRepairRounds } with validation.
 // ---------------------------------------------------------------------------
 
 test("validateVerifyConfig falls back to defaults for garbage input", () => {
@@ -285,12 +366,12 @@ test("validateVerifyConfig keeps valid fields and drops invalid ones", () => {
   const result = validateVerifyConfig({
     commands: ["npm run check", "", 42, "npm test"],
     mode: "off",
-    maxRounds: 2,
+    maxRepairRounds: 2,
   });
   assert.deepEqual(result, {
     commands: ["npm run check", "npm test"],
     mode: "off",
-    maxRounds: 2,
+    maxRepairRounds: 2,
   });
 });
 
@@ -299,27 +380,31 @@ test("validateVerifyConfig rejects an unknown mode", () => {
   assert.equal(result.mode, DEFAULT_VERIFY_CONFIG.mode);
 });
 
-test("validateVerifyConfig caps maxRounds at VERIFY_MAX_ROUNDS (2)", () => {
+test("validateVerifyConfig uses the canonical zero-through-two repair bound", () => {
   assert.equal(VERIFY_MAX_ROUNDS, 2);
-  assert.equal(validateVerifyConfig({ maxRounds: 2 }).maxRounds, 2);
-  assert.equal(validateVerifyConfig({ maxRounds: 3 }).maxRounds, 2);
-  assert.equal(validateVerifyConfig({ maxRounds: 1_000 }).maxRounds, 2);
+  assert.equal(validateVerifyConfig({ maxRepairRounds: 0 }).maxRepairRounds, 0);
+  assert.equal(validateVerifyConfig({ maxRepairRounds: 2 }).maxRepairRounds, 2);
+  assert.equal(validateVerifyConfig({ maxRepairRounds: 3 }).maxRepairRounds, 1);
+  assert.equal(validateVerifyConfig({ maxRepairRounds: 1_000 }).maxRepairRounds, 1);
 });
 
-test("validateVerifyConfig floors maxRounds at 1", () => {
-  assert.equal(validateVerifyConfig({ maxRounds: 0 }).maxRounds, 1);
-  assert.equal(validateVerifyConfig({ maxRounds: -5 }).maxRounds, 1);
-  assert.equal(validateVerifyConfig({ maxRounds: "not a number" }).maxRounds, 1);
+test("validateVerifyConfig migrates legacy total passes and prefers the explicit new field", () => {
+  assert.equal(validateVerifyConfig({ maxRounds: 1 }).maxRepairRounds, 0);
+  assert.equal(validateVerifyConfig({ maxRounds: 2 }).maxRepairRounds, 1);
+  assert.equal(
+    validateVerifyConfig({ maxRounds: 1, maxRepairRounds: 2 }).maxRepairRounds,
+    2,
+  );
 });
 
-test("validateVerifyConfig truncates a fractional maxRounds", () => {
-  assert.equal(validateVerifyConfig({ maxRounds: 1.9 }).maxRounds, 1);
+test("validateVerifyConfig rejects invalid repair-round values to the default", () => {
+  assert.equal(validateVerifyConfig({ maxRepairRounds: -5 }).maxRepairRounds, 1);
+  assert.equal(validateVerifyConfig({ maxRepairRounds: "not a number" }).maxRepairRounds, 1);
+  assert.equal(validateVerifyConfig({ maxRepairRounds: 1.9 }).maxRepairRounds, 1);
 });
 
-// Mutation-test guard: if `.max(120)`-style bound above were loosened from 2
-// to something larger (e.g. 3), this test goes red.
-test("mutation guard: maxRounds 3 is rejected down to the 2-round ceiling", () => {
-  assert.notEqual(validateVerifyConfig({ maxRounds: 3 }).maxRounds, 3);
+test("mutation guard: maxRepairRounds 3 never widens the two-repair ceiling", () => {
+  assert.notEqual(validateVerifyConfig({ maxRepairRounds: 3 }).maxRepairRounds, 3);
 });
 
 // ---------------------------------------------------------------------------

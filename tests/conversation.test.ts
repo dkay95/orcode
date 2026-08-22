@@ -331,6 +331,54 @@ test("reset(seed) stages a usable fresh state for the same call without touching
   ]);
 });
 
+test("stageContinuation clones the first model phase buffer for a transient repair phase", async () => {
+  const env = await setup("repair-continuation");
+  const store = await ConversationStore.open(
+    env.appHome,
+    env.session.path,
+    env.session.data.id,
+  );
+  await store.accessor().save(sampleState("committed-before-repair"));
+  await store.commit(env.session.data.turns.length);
+  const statePath = ConversationStore.path(env.appHome, env.session.path);
+  const committedBytes = await readFile(statePath, "utf8");
+
+  await store.accessor().save(sampleState("first-phase-buffer"));
+  assert.equal(store.stageContinuation(), true);
+  const repairLoaded = await store.accessor().load();
+  assert.deepEqual(repairLoaded?.messages, [
+    { role: "user", content: "first-phase-buffer" },
+  ]);
+  repairLoaded!.messages.push({ role: "user", content: "provider-mutation" } as never);
+  assert.deepEqual((await store.accessor().load())?.messages, [
+    { role: "user", content: "first-phase-buffer" },
+  ]);
+  assert.equal(await readFile(statePath, "utf8"), committedBytes);
+});
+
+test("discard after a staged repair continuation restores the prior committed SDK state", async () => {
+  const env = await setup("repair-discard");
+  const store = await ConversationStore.open(
+    env.appHome,
+    env.session.path,
+    env.session.data.id,
+  );
+  await store.accessor().save(sampleState("committed-before-repair"));
+  await store.commit(env.session.data.turns.length);
+  const statePath = ConversationStore.path(env.appHome, env.session.path);
+  const committedBytes = await readFile(statePath, "utf8");
+
+  await store.accessor().save(sampleState("discarded-first-phase"));
+  assert.equal(store.stageContinuation(), true);
+  await store.accessor().save(sampleState("discarded-repair-phase"));
+  store.discard();
+
+  assert.deepEqual((await store.accessor().load())?.messages, [
+    { role: "user", content: "committed-before-repair" },
+  ]);
+  assert.equal(await readFile(statePath, "utf8"), committedBytes);
+});
+
 test("StateAccessor load and save isolate committed state from provider-owned object mutation", async () => {
   const env = await setup("accessor-clone");
   const store = await ConversationStore.open(

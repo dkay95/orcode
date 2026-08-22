@@ -172,6 +172,19 @@ export class ConversationStore {
     };
   }
 
+  /**
+   * Clones the latest buffered SDK state into the transient load slot for the
+   * next model phase. Nothing is committed: a later `discard()` restores the
+   * prior durable state, while the next accessor save replaces the buffer.
+   */
+  stageContinuation(): boolean {
+    if (this.#buffer === null) {
+      return false;
+    }
+    this.#stagedState = cloneConversationState(this.#buffer);
+    return true;
+  }
+
   /** Drops the in-memory buffer. The committed file on disk is untouched. */
   discard(): void {
     this.#buffer = null;

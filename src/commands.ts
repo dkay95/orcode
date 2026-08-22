@@ -1771,9 +1771,8 @@ function parseBudgetLimit(raw: string): number {
 }
 
 // ---------------------------------------------------------------------------
-// A4 — /verify. Config-only: the retry-with-model loop this drives lives in
-// agent.ts and is not wired in yet (see the needsElsewhere note in the task
-// report). Setting the config here is what a future agent.ts pass reads.
+// A4 — /verify. The automatic on-edit lifecycle lives in agent.ts; this
+// command edits the same canonical config and offers an explicit one-shot run.
 // ---------------------------------------------------------------------------
 
 async function verifyCommand(args: string[], context: CommandContext): Promise<void> {
@@ -1814,6 +1813,13 @@ async function verifyCommand(args: string[], context: CommandContext): Promise<v
         `Verify fehlgeschlagen: ${outcome.command} (exit ${outcome.exitCode})`,
       );
       context.out.text(outcome.distilled);
+    } else if (outcome.status === "timed-out") {
+      context.out.error(`Verify-Zeitlimit erreicht: ${outcome.command}`);
+    } else if (outcome.status === "spawn-failed") {
+      context.out.error(
+        `Verify konnte nicht gestartet werden: ${outcome.command}`,
+        outcome.error,
+      );
     } else {
       context.out.text("Verify abgebrochen.");
     }
@@ -1854,10 +1860,13 @@ async function verifyCommand(args: string[], context: CommandContext): Promise<v
   }
   if (action === "rounds") {
     const rounds = Number(args[1]);
-    if (!Number.isInteger(rounds) || rounds < 1 || rounds > VERIFY_MAX_ROUNDS) {
-      throw new Error(`/verify rounds muss zwischen 1 und ${VERIFY_MAX_ROUNDS} liegen.`);
+    if (!Number.isInteger(rounds) || rounds < 0 || rounds > VERIFY_MAX_ROUNDS) {
+      throw new Error(`/verify rounds muss zwischen 0 und ${VERIFY_MAX_ROUNDS} liegen.`);
     }
-    context.config.verify = validateVerify({ ...context.config.verify, maxRounds: rounds });
+    context.config.verify = validateVerify({
+      ...context.config.verify,
+      maxRepairRounds: rounds,
+    });
     await saveContextConfig(context);
     context.out.text(chalk.green(`Verify-Runden: ${rounds}`));
     return;
@@ -1866,7 +1875,7 @@ async function verifyCommand(args: string[], context: CommandContext): Promise<v
   const command = args.join(" ").trim();
   if (!command) {
     throw new Error(
-      `Verwendung: /verify [on|off|now|suggest|clear|rounds <1-${VERIFY_MAX_ROUNDS}>|<befehl>]`,
+      `Verwendung: /verify [on|off|now|suggest|clear|rounds <0-${VERIFY_MAX_ROUNDS}>|<befehl>]`,
     );
   }
   context.config.verify = validateVerify({
@@ -1880,7 +1889,7 @@ async function verifyCommand(args: string[], context: CommandContext): Promise<v
 function printVerifyStatus(context: CommandContext): void {
   const verify = context.config.verify;
   context.out.text(
-    `Verify: ${verify.mode} · ${verify.maxRounds} Runde(n) · ${verify.commands.length} Kommando(s)`,
+    `Verify: ${verify.mode} · ${verify.maxRepairRounds} Reparaturrunde(n) · ${verify.commands.length} Kommando(s)`,
   );
   for (const command of verify.commands) {
     context.out.text(`  ${command}`);
