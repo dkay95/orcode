@@ -35,6 +35,7 @@ import {
   isWithinWorkspace,
   replaceLiteral,
   resolveCommandShell,
+  resolveExecutablePath,
   runHardenedGitRead,
   sanitizedEnvironment,
   toolMetadata,
@@ -490,6 +491,25 @@ test("a bare shell name resolves to an absolute real path and PATH changes its s
     command: "printf fixture",
   });
   assert.notEqual(approvalSubjectFingerprint(firstSubject), approvalSubjectFingerprint(secondSubject));
+});
+
+test("Windows executable lookup accepts mixed-case Path and PathExt without rewriting the environment", async (t) => {
+  const fixtureBin = await mkdtemp(join(tmpdir(), "routercode-windows-path-"));
+  t.after(() => rm(fixtureBin, { recursive: true, force: true }));
+  const executable = join(fixtureBin, "fixture-git.EXE");
+  await writeFile(executable, "synthetic executable fixture\n", { mode: 0o755 });
+  const environment: NodeJS.ProcessEnv = {
+    Path: fixtureBin,
+    PathExt: ".EXE;.CMD",
+    NORMAL_SETTING: "synthetic-value",
+  };
+  const before = { ...environment };
+
+  assert.equal(
+    await resolveExecutablePath("fixture-git", environment, "win32"),
+    await realpath(executable),
+  );
+  assert.deepEqual(environment, before);
 });
 
 test("a configured shell symlink is realpathed before approval and that exact command tuple executes", { skip: process.platform === "win32" ? "POSIX fixture" : false }, async (t) => {

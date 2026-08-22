@@ -1486,9 +1486,18 @@ export async function resolveExecutablePath(
     await access(candidate, fsConstants.X_OK);
     return realpath(candidate);
   }
-  const directories = (environment.PATH ?? "").split(delimiter).filter(Boolean);
+  const environmentValue = (name: "PATH" | "PATHEXT"): string | undefined => {
+    if (platform !== "win32") {
+      return environment[name];
+    }
+    return Object.entries(environment).find(
+      ([candidate, value]) => candidate.toLowerCase() === name.toLowerCase() && value !== undefined,
+    )?.[1];
+  };
+  const pathDelimiter = platform === "win32" ? ";" : delimiter;
+  const directories = (environmentValue("PATH") ?? "").split(pathDelimiter).filter(Boolean);
   const extensions = platform === "win32" && !/\.[^\\/.]+$/.test(executable)
-    ? (environment.PATHEXT ?? ".EXE;.CMD;.BAT;.COM").split(";")
+    ? (environmentValue("PATHEXT") ?? ".EXE;.CMD;.BAT;.COM").split(";")
     : [""];
   for (const directory of directories) {
     for (const extension of extensions) {
