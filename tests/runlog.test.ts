@@ -11,6 +11,7 @@ import {
   type RunLogEnvelope,
 } from "../src/runlog.js";
 import { findInterruptedRun, summarizeRun } from "../src/resume.js";
+import { redactRunEvent } from "../src/redaction.js";
 import type { AgentRunEvent } from "../src/types.js";
 
 async function appHome(prefix: string): Promise<string> {
@@ -325,11 +326,12 @@ test("recognizable credential prefixes split across stream events cannot be reco
   }
   await log.close();
 
-  const read: AgentRunEvent[] = [];
-  for await (const event of RunLog.read(home, chatId, runId)) {
-    read.push(event);
-  }
-  const persistedContent = read
+  const raw = await readFile(runLogPath(home, chatId, runId), "utf8");
+  const persisted = raw
+    .trim()
+    .split("\n")
+    .map((line) => (JSON.parse(line) as RunLogEnvelope).event);
+  const persistedContent = persisted
     .map((event) =>
       event.type === "reasoning"
         ? event.delta
@@ -342,12 +344,38 @@ test("recognizable credential prefixes split across stream events cannot be reco
     .join("");
   assert.ok(!persistedContent.includes(`${prefix}${body}`));
   assert.deepEqual(
-    read.map((event) => event.type),
+    persisted.map((event) => event.type),
     events.map((event) => event.type),
   );
   assert.deepEqual(
-    read.map((event) => event.timestamp),
+    persisted.map((event) => event.timestamp),
     events.map((event) => event.timestamp),
+  );
+});
+
+test("generic sk credential prefixes split across deltas cannot be reconstructed", () => {
+  const prefix = `${["sk", "proj"].join("-")}-`;
+  const body = "g".repeat(32);
+  const events: AgentRunEvent[] = [
+    { type: "reasoning", model: "m", step: 1, delta: prefix, timestamp: 1 },
+    { type: "text", delta: body, timestamp: 2 },
+  ];
+  const before = structuredClone(events);
+  const persisted = events.map((event) => redactRunEvent(event));
+  assert.deepEqual(events, before);
+  const persistedContent = persisted
+    .map((event) =>
+      event.type === "reasoning"
+        ? event.delta
+        : event.type === "text"
+          ? event.delta
+          : "",
+    )
+    .join("");
+  assert.ok(!persistedContent.includes(`${prefix}${body}`));
+  assert.deepEqual(
+    persisted.map((event) => event.type),
+    events.map((event) => event.type),
   );
 });
 

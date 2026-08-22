@@ -28,8 +28,13 @@ test("erkennt AWS-, GitHub- und Slack-Muster mit Trefferzahl", () => {
 });
 
 test("erkennt Private-Key-Header und zählt mehrere Vorkommen", () => {
-  const text =
-    "-----BEGIN OPENSSH PRIVATE KEY-----\nx\n-----END OPENSSH PRIVATE KEY-----\n".repeat(2);
+  const block = [
+    ["-----BEGIN OPENSSH PRIVATE", "KEY-----"].join(" "),
+    "x",
+    ["-----END OPENSSH PRIVATE", "KEY-----"].join(" "),
+    "",
+  ].join("\n");
+  const text = block.repeat(2);
   const findings = scanForSecrets(text);
   assert.deepEqual(findings, [{ kind: "Private Key", count: 2 }]);
 });

@@ -447,7 +447,7 @@ export class SessionStore {
         this.path,
         `${JSON.stringify(persisted, null, 2)}\n`,
       );
-      this.#base = structuredClone(persisted);
+      this.#base = structuredClone(this.#data);
       return { merged, conflictBackupPath, revision: this.#data.revision };
     } finally {
       await release();
@@ -811,7 +811,10 @@ function normalizeSession(
   if (!isRecord(value) || value.version !== 2) {
     return null;
   }
-  if (value.workspace !== workspace || value.id !== id) {
+  if (
+    (value.workspace !== workspace && value.workspace !== redactText(workspace)) ||
+    value.id !== id
+  ) {
     return null;
   }
   const turns = normalizeTurns(value.turns);
@@ -1246,15 +1249,16 @@ async function readForeign(
 
 /** Cheap change detector; covers files written by builds without `revision`. */
 function fingerprint(data: PersistedSessionData): string {
+  const projected = redactValue(data);
   return [
-    data.revision,
-    data.turns.length,
-    data.costs.totalUsd,
-    data.updatedAt,
-    data.checkpoints.length,
-    data.toolCalls.length,
-    data.title,
-    data.summary.length,
+    projected.revision,
+    projected.turns.length,
+    projected.costs.totalUsd,
+    projected.updatedAt,
+    projected.checkpoints.length,
+    projected.toolCalls.length,
+    projected.title,
+    projected.summary.length,
   ].join("|");
 }
 
@@ -1294,7 +1298,8 @@ export function mergeSessions(
       base.toolCalls,
       mine.toolCalls,
       theirs.toolCalls,
-      (call) => `${call.at}|${call.name}|${call.turnIndex}|${call.summary}`,
+      (call) =>
+        `${call.at}|${redactText(call.name)}|${call.turnIndex}|${redactText(call.summary)}`,
       (call) => Date.parse(call.at),
       MAX_TOOL_CALLS,
     ),
@@ -1315,11 +1320,18 @@ export function mergeSessions(
 }
 
 function pickField<T>(base: T, mine: T, theirs: T): T {
-  return JSON.stringify(mine) === JSON.stringify(base) ? theirs : mine;
+  if (!sameRedactedProjection(mine, base)) {
+    return mine;
+  }
+  return sameRedactedProjection(theirs, base) ? mine : theirs;
+}
+
+function sameRedactedProjection(left: unknown, right: unknown): boolean {
+  return JSON.stringify(redactValue(left)) === JSON.stringify(redactValue(right));
 }
 
 function turnKey(turn: ChatTurn): string {
-  return `${turn.createdAt} ${turn.role} ${turn.content}`;
+  return `${turn.createdAt} ${turn.role} ${redactText(turn.content)}`;
 }
 
 function mergeTurns(

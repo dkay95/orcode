@@ -127,6 +127,28 @@ test("workspace can contain multiple independently persisted chats", async () =>
   });
 });
 
+test("a secret-bearing workspace remains listable and reopenable after save", async () => {
+  const root = await mkdtemp(join(tmpdir(), "routercode-workspace-identity-"));
+  const secret = `${["sk", "or", "v1"].join("-")}-${"i".repeat(40)}`;
+  const workspace = join(root, `project-${secret}`);
+  const appHome = join(root, ".routercode");
+  const store = SessionStore.create(workspace, appHome, "Workspace identity");
+  store.addTurn("user", "remember me");
+  await store.save();
+
+  const listed = await SessionStore.list(workspace, appHome);
+  assert.deepEqual(listed.map((chat) => chat.id), [store.data.id]);
+  assert.equal(listed[0]!.workspace, workspace);
+
+  const reopened = await SessionStore.openById(workspace, store.data.id, appHome);
+  assert.equal(reopened.data.workspace, workspace);
+  assert.equal(reopened.data.turns[0]!.content, "remember me");
+
+  const resumed = await SessionStore.open(workspace, appHome);
+  assert.equal(resumed.data.id, store.data.id);
+  assert.equal(resumed.data.workspace, workspace);
+});
+
 test("fork copies context but starts a separate cost ledger", async () => {
   const { workspace, appHome } = await workspaceRoot("fork");
   const source = SessionStore.create(workspace, appHome, "Original");
@@ -220,6 +242,44 @@ test("two instances on the same chat merge instead of overwriting", async () => 
   );
   assert.ok(Math.abs(reopened.data.costs.totalUsd - 0.35) < 1e-9);
   assert.ok(reopened.data.revision >= 3);
+});
+
+test("concurrent merge distinguishes redaction projection from a local edit", async () => {
+  const { workspace, appHome } = await workspaceRoot("redacted-merge");
+  const secret = `${["sk", "or", "v1"].join("-")}-${"m".repeat(40)}`;
+  const windowA = SessionStore.create(workspace, appHome, `Original ${secret}`);
+  windowA.setSummary(`Live summary ${secret}`);
+  windowA.addTurn("user", `Initial ${secret}`);
+  await windowA.save();
+
+  const windowB = await SessionStore.openById(
+    workspace,
+    windowA.data.id,
+    appHome,
+  );
+  windowB.rename("Remote rename");
+  windowB.addTurn("assistant", "Remote turn");
+  await windowB.save();
+
+  windowA.addTurn("assistant", "Local turn");
+  const outcome = await windowA.save();
+  assert.equal(outcome.merged, true);
+  assert.ok(windowA.data.summary.includes(secret));
+
+  const reopened = await SessionStore.openById(
+    workspace,
+    windowA.data.id,
+    appHome,
+  );
+  assert.equal(reopened.data.title, "Remote rename");
+  assert.deepEqual(
+    reopened.data.turns.map((turn) => turn.content),
+    [
+      "Initial [REDACTED_OPENROUTER_KEY]",
+      "Remote turn",
+      "Local turn",
+    ],
+  );
 });
 
 test("simultaneous saves of the same chat lose nothing", async () => {
@@ -561,6 +621,27 @@ test("summaries are redacted before they are persisted", async () => {
 test("redactSensitive covers the common secret formats", () => {
   const openRouterKey = `${["sk", "or", "v1"].join("-")}-${"a".repeat(32)}`;
   const awsAccessKey = `${["A", "K", "I", "A"].join("")}${"D".repeat(16)}`;
+  const anthropicKey = ["sk", "ant", "api03", "abcdefghijklmnopqrstuvwxyz"].join("-");
+  const genericKey = ["sk", "proj", "abcdefghijklmnopqrstuvwxyz01"].join("-");
+  const githubToken = (kind: string): string => `${kind}_${"abcdefghijklmnopqrstuvwxyz0123"}`;
+  const githubPat = `${["github", "pat"].join("_")}_11ABCDEFG0abcdefghijklmnopqrstuvwxyz`;
+  const awsSecretName = ["aws", "secret", "access", "key"].join("_");
+  const awsSecretBody = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY";
+  const googleKey = `${["AI", "za"].join("")}SyA1234567890abcdefghijklmnopqrstuv`;
+  const slackToken = ["xoxb", "123456789012", "abcdefghijkl"].join("-");
+  const bearerToken = "abcdef1234567890abcdef";
+  const bearerValue = `Authorization: ${["Bear", "er"].join("")} ${bearerToken}`;
+  const jwtPayload = "eyJzdWIiOiIxMjM0NTY3ODkwIn0";
+  const jwt = [
+    "eyJhbGciOiJIUzI1NiJ9",
+    jwtPayload,
+    "dBjftJeZ4CVPmB92K27uhbUJU1p1r_wW1gFWFOEjXk",
+  ].join(".");
+  const privateKey = [
+    ["-----BEGIN OPENSSH PRIVATE", "KEY-----"].join(" "),
+    "b3BlbnNzaC1rZXktdjEA",
+    ["-----END OPENSSH PRIVATE", "KEY-----"].join(" "),
+  ].join("\n");
   // [Klartext, erwartete Markierung, Teilstück, das verschwinden muss]
   const cases: [string, RegExp, string][] = [
     [
@@ -569,51 +650,51 @@ test("redactSensitive covers the common secret formats", () => {
       "abcdefghijklmnop",
     ],
     [
-      "sk-ant-api03-abcdefghijklmnopqrstuvwxyz",
+      anthropicKey,
       /\[REDACTED_ANTHROPIC_KEY\]/,
       "api03-abcdefghij",
     ],
     [
-      "sk-proj-abcdefghijklmnopqrstuvwxyz01",
+      genericKey,
       /\[REDACTED_API_KEY\]/,
       "proj-abcdefghijk",
     ],
-    ["ghp_abcdefghijklmnopqrstuvwxyz0123", /\[REDACTED_GITHUB_TOKEN\]/, "ghp_abcdefghij"],
-    ["gho_abcdefghijklmnopqrstuvwxyz0123", /\[REDACTED_GITHUB_TOKEN\]/, "gho_abcdefghij"],
-    ["ghs_abcdefghijklmnopqrstuvwxyz0123", /\[REDACTED_GITHUB_TOKEN\]/, "ghs_abcdefghij"],
+    [githubToken("ghp"), /\[REDACTED_GITHUB_TOKEN\]/, "ghp_abcdefghij"],
+    [githubToken("gho"), /\[REDACTED_GITHUB_TOKEN\]/, "gho_abcdefghij"],
+    [githubToken("ghs"), /\[REDACTED_GITHUB_TOKEN\]/, "ghs_abcdefghij"],
     [
-      "github_pat_11ABCDEFG0abcdefghijklmnopqrstuvwxyz",
+      githubPat,
       /\[REDACTED_GITHUB_TOKEN\]/,
       "11ABCDEFG0abcdef",
     ],
     [awsAccessKey, /\[REDACTED_AWS_KEY_ID\]/, awsAccessKey],
     [
-      'aws_secret_access_key = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"',
+      `${awsSecretName} = "${awsSecretBody}"`,
       /\[REDACTED_AWS_SECRET\]/,
       "wJalrXUtnFEMI",
     ],
     [
-      "AIzaSyA1234567890abcdefghijklmnopqrstuv",
+      googleKey,
       /\[REDACTED_GOOGLE_KEY\]/,
       "AIzaSyA1234567890",
     ],
     [
-      "xoxb-123456789012-abcdefghijkl",
+      slackToken,
       /\[REDACTED_SLACK_TOKEN\]/,
-      "xoxb-123456789012",
+      slackToken.slice(0, 17),
     ],
     [
-      "Authorization: Bearer abcdef1234567890abcdef",
+      bearerValue,
       /Bearer \[REDACTED_TOKEN\]/,
       "abcdef1234567890",
     ],
     [
-      "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dBjftJeZ4CVPmB92K27uhbUJU1p1r_wW1gFWFOEjXk",
+      jwt,
       /\[REDACTED_JWT\]/,
-      "eyJzdWIiOiIxMjM0",
+      jwtPayload.slice(0, 16),
     ],
     [
-      "-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXktdjEA\n-----END OPENSSH PRIVATE KEY-----",
+      privateKey,
       /\[REDACTED_PRIVATE_KEY\]/,
       "b3BlbnNzaC1rZXktdjEA",
     ],

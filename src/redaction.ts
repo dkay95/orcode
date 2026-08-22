@@ -42,6 +42,8 @@ const SECRET_RULES: readonly SecretRule[] = [
     kind: "API-Key (sk-…)",
     pattern: /\bsk-(?!or-|ant-)[A-Za-z0-9_-]{20,}(?![A-Za-z0-9_-])/g,
     replacement: "[REDACTED_API_KEY]",
+    partialPattern:
+      /\bsk-(?!or-|ant-)[A-Za-z0-9]+-(?![A-Za-z0-9_-])/g,
   },
   {
     kind: "AWS-Access-Key",

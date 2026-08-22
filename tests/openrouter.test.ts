@@ -140,8 +140,9 @@ test("management key has separate in-memory lifecycle", () => {
 });
 
 test("session redaction removes pasted API keys", () => {
+  const genericKey = `${["sk", ""].join("-")}${"abcdefghijklmnopqrstuv"}`;
   const redacted = redactSensitive(
-    `one ${TEST_KEY_PREFIX}abcdefghijklmnopqrstuvwxyz and sk-abcdefghijklmnopqrstuv`,
+    `one ${TEST_KEY_PREFIX}abcdefghijklmnopqrstuvwxyz and ${genericKey}`,
   );
   assert.doesNotMatch(redacted, /abcdefghijklmnopqrstuvwxyz/);
   assert.match(redacted, /\[REDACTED_OPENROUTER_KEY\]/);
