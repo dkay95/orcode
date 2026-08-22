@@ -282,6 +282,106 @@ test("concurrent merge distinguishes redaction projection from a local edit", as
   );
 });
 
+test("concurrent merge preserves an exact live scalar edit within one redaction category", async () => {
+  const { workspace, appHome } = await workspaceRoot("redacted-scalar-merge");
+  const secretA = `${["sk", "or", "v1"].join("-")}-${"a".repeat(40)}`;
+  const secretB = `${["sk", "or", "v1"].join("-")}-${"b".repeat(40)}`;
+  const windowA = SessionStore.create(workspace, appHome, "Original title");
+  windowA.setSummary(secretA);
+  await windowA.save();
+
+  const windowB = await SessionStore.openById(
+    workspace,
+    windowA.data.id,
+    appHome,
+  );
+  windowB.setSummary("Remote public summary");
+  windowB.rename("Remote rename");
+  await windowB.save();
+
+  windowA.setSummary(secretB);
+  const outcome = await windowA.save();
+  assert.equal(outcome.merged, true);
+  assert.equal(windowA.data.summary, secretB);
+  assert.equal(windowA.data.title, "Remote rename");
+
+  const reopened = await SessionStore.openById(
+    workspace,
+    windowA.data.id,
+    appHome,
+  );
+  assert.equal(reopened.data.summary, "[REDACTED_OPENROUTER_KEY]");
+  assert.equal(reopened.data.title, "Remote rename");
+});
+
+test("concurrent same-projection turns survive beyond the projected base multiplicity", async () => {
+  const { workspace, appHome } = await workspaceRoot("redacted-turn-merge");
+  const secretA = `${["sk", "or", "v1"].join("-")}-${"c".repeat(40)}`;
+  const secretB = `${["sk", "or", "v1"].join("-")}-${"d".repeat(40)}`;
+  const timestamp = "2026-08-22T09:00:00.000Z";
+  const windowA = SessionStore.create(workspace, appHome, "Concurrent turns");
+  await windowA.save();
+  const windowB = await SessionStore.openById(
+    workspace,
+    windowA.data.id,
+    appHome,
+  );
+
+  windowA.addTurn("user", secretA);
+  windowA.data.turns[0]!.createdAt = timestamp;
+  windowB.addTurn("user", secretB);
+  windowB.data.turns[0]!.createdAt = timestamp;
+  await windowB.save();
+  await windowA.save();
+
+  const reopened = await SessionStore.openById(
+    workspace,
+    windowA.data.id,
+    appHome,
+  );
+  assert.deepEqual(
+    reopened.data.turns.map((turn) => turn.content),
+    [
+      "[REDACTED_OPENROUTER_KEY]",
+      "[REDACTED_OPENROUTER_KEY]",
+    ],
+  );
+});
+
+test("concurrent same-projection tool calls survive beyond the projected base multiplicity", async () => {
+  const { workspace, appHome } = await workspaceRoot("redacted-tool-merge");
+  const secretA = `${["sk", "or", "v1"].join("-")}-${"e".repeat(40)}`;
+  const secretB = `${["sk", "or", "v1"].join("-")}-${"f".repeat(40)}`;
+  const timestamp = "2026-08-22T09:30:00.000Z";
+  const windowA = SessionStore.create(workspace, appHome, "Concurrent tools");
+  await windowA.save();
+  const windowB = await SessionStore.openById(
+    workspace,
+    windowA.data.id,
+    appHome,
+  );
+
+  const callA = windowA.recordToolCall("run_command", secretA);
+  callA.at = timestamp;
+  const callB = windowB.recordToolCall("run_command", secretB);
+  callB.at = timestamp;
+  await windowB.save();
+  await windowA.save();
+
+  const reopened = await SessionStore.openById(
+    workspace,
+    windowA.data.id,
+    appHome,
+  );
+  assert.deepEqual(
+    reopened.data.toolCalls.map((call) => call.summary),
+    [
+      "[REDACTED_OPENROUTER_KEY]",
+      "[REDACTED_OPENROUTER_KEY]",
+    ],
+  );
+});
+
 test("simultaneous saves of the same chat lose nothing", async () => {
   const { workspace, appHome } = await workspaceRoot("simultan");
   const windowA = SessionStore.create(workspace, appHome, "Gleichzeitig");

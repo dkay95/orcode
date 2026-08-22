@@ -1320,10 +1320,14 @@ export function mergeSessions(
 }
 
 function pickField<T>(base: T, mine: T, theirs: T): T {
-  if (!sameRedactedProjection(mine, base)) {
+  if (!sameValue(mine, base)) {
     return mine;
   }
   return sameRedactedProjection(theirs, base) ? mine : theirs;
+}
+
+function sameValue(left: unknown, right: unknown): boolean {
+  return JSON.stringify(left) === JSON.stringify(right);
 }
 
 function sameRedactedProjection(left: unknown, right: unknown): boolean {
@@ -1340,15 +1344,13 @@ function mergeTurns(
   theirs: readonly ChatTurn[],
 ): ChatTurn[] {
   const baseCount = countKeys(base, turnKey);
-  const mineCount = countKeys(mine, turnKey);
   const seen = new Map<string, number>();
   const extras: ChatTurn[] = [];
   for (const turn of theirs) {
     const key = turnKey(turn);
     const index = (seen.get(key) ?? 0) + 1;
     seen.set(key, index);
-    const known = Math.max(baseCount.get(key) ?? 0, mineCount.get(key) ?? 0);
-    if (index > known) {
+    if (index > (baseCount.get(key) ?? 0)) {
       extras.push({ ...turn });
     }
   }
@@ -1413,11 +1415,14 @@ function mergeKeyed<T>(
   order: (item: T) => number,
   limit: number,
 ): T[] {
-  const mineKeys = new Set(mine.map(key));
-  const baseKeys = new Set(base.map(key));
-  const extras = theirs.filter(
-    (item) => !mineKeys.has(key(item)) && !baseKeys.has(key(item)),
-  );
+  const baseCount = countKeys(base, key);
+  const seen = new Map<string, number>();
+  const extras = theirs.filter((item) => {
+    const value = key(item);
+    const index = (seen.get(value) ?? 0) + 1;
+    seen.set(value, index);
+    return index > (baseCount.get(value) ?? 0);
+  });
   return [...mine, ...extras]
     .map((item) => ({ ...item }))
     .sort((left, right) => order(left) - order(right))
