@@ -337,3 +337,115 @@ DONE
 ### Commit
 
 - Requested message: `fix: bind private storage operations to verified roots`
+
+## Fix Round 3
+
+### Receiving-review verification and RED
+
+- Read the complete round-3 findings and updated implementation ledger, then
+  independently reproduced all three Critical findings against base
+  `a6b2e3e2de6cacff3533f2cccdab1aaf59a7072c` before changing production code.
+  All three findings were confirmed; there was no technical pushback and no
+  scope expansion.
+- Feasibility review confirmed that the Windows boundary can remain available
+  without a weaker pathname ACL operation: `CreateFileW` can open the final
+  file or directory without following a final reparse point,
+  `GetFileInformationByHandle` exposes the identity represented by Node's
+  Windows `dev`/`ino`, and `SetSecurityInfo` plus `GetSecurityInfo` operate on
+  that same open handle.
+- Initial combined behavioral RED command:
+  `node --import tsx --test --test-name-pattern='Windows PrivateStore child refuses|temp cleanup never unlinks|pre-open snapshot' tests/private-store.test.ts tests/private-store-identity-races.test.ts`.
+  It reached 5 tests: 0 passed and 5 failed.
+- `Windows PrivateStore child refuses a swapped file ID before changing the
+  outside DACL` failed because the old child changed the currently resolving
+  outside directory to mode 0700 before JavaScript detected the swap.
+- `PrivateStore temp cleanup never unlinks a replacement name after ancestor
+  mismatch` failed because catch cleanup removed the outside same-basename
+  sentinel through the swapped parent.
+- The three `PrivateStore protect/remove/rename compares the pre-open snapshot
+  ... replacement` tests failed because the opened replacement superseded the
+  earlier snapshot: it was respectively chmoded, deleted, and moved.
+- A focused self-review assertion then exposed an open-handle leak on the
+  remove rejection path (`fd` remained 20 instead of closing to -1); the named
+  remove test reached 0/1 before the compare was moved inside `try/finally`.
+- A second in-scope self-review RED,
+  `PrivateStore rename rechecks the opened source after awaited destination
+  inspection`, reached 0/1 because a replacement introduced during the awaited
+  destination check was still moved. It was added before the final source
+  recheck was implemented.
+
+### Implementation
+
+1. The Windows DACL child now uses a C# Win32 interop boundary. It opens the
+   final object once with `CreateFileW`, `FILE_FLAG_BACKUP_SEMANTICS`, and
+   `FILE_FLAG_OPEN_REPARSE_POINT`; rejects a reparse point, kind mismatch, or
+   unexpected volume/file ID before any effect; builds the protected two-ACE
+   current-user-plus-SYSTEM full-control DACL; applies it with
+   `SetSecurityInfo`; and reads and verifies the protected exact DACL with
+   `GetSecurityInfo` on the same `SafeFileHandle`. There is no `Set-Acl` or
+   `Get-Acl` path operation. A nonzero child result remains fail-closed.
+2. All identity-sensitive Node snapshots now use bigint `dev`/`ino`. The
+   expected identity is passed to the encoded child as decimal environment
+   data, never interpolated into the program or argv. Windows directory
+   operations retain a Node identity handle where the runtime can open one;
+   failure to open fails before an effect.
+3. Atomic-write cleanup records both the trusted ancestor chain and exclusive
+   temp-file handle identity before protection. Catch cleanup revalidates the
+   ancestors and the handle-to-name binding, revalidates ancestors again, and
+   unlinks only that still-bound name. Any mismatch leaves the unknown current
+   name untouched and closes the recorded handle.
+4. Protect, file/directory remove, and tree rename compare the pre-open
+   snapshot with the identity obtained from the opened handle before chmod,
+   traversal/deletion, or rename. Handles remain open across awaited checks and
+   close in `finally`; rename additionally rechecks the open source against its
+   current name after awaited destination inspection and immediately before
+   the filesystem operation.
+5. Cross-platform deterministic swaps verify that every replacement and
+   outside sentinel remains unchanged while the operation fails closed. The
+   Windows static boundary test also requires both security calls to receive
+   the same variable named `handle`, in addition to the Windows-only real
+   integration test registered by the earlier round.
+
+### Focused GREEN and final gates
+
+- Round-3 behavioral command including the self-review rename regression: 6/6
+  passed, 0 failed. The outside mode/content stayed unchanged in all swaps.
+- Combined PrivateStore suites: 18 reached, 17 passed, 0 failed, 1 Windows-only
+  skip.
+- Required Task 5 focus plus the new identity-race suite
+  (`app-home-migration`, `private-store`, `private-store-identity-races`,
+  `config`, `session`, `cli`): 106 reached, 105 passed, 0 failed, 1
+  Windows-only skip.
+- Related `runlog`, `conversation`, `workspace`, `rules`, `commands`, `agent`,
+  and `integration` suites: 146/146 passed.
+- `npx tsc -p tsconfig.json --noEmit`: passed.
+- `npx tsc -p tsconfig.tests.json --noEmit`: passed.
+- Full `npm test`: 688 reached, 687 passed, 0 failed, 1 Windows-only skip.
+- Central credential-fixture audit
+  (`rg -n --hidden --glob '!node_modules/**' --glob '!dist/**'
+  'sk-or-|AKIA|glpat-|npm_' tests README.md`): no matches (`rg` exit 1).
+- `git diff --check`: passed.
+
+### Round-3 self-review and concerns
+
+- Rechecked that no Windows child pathname operation can change a DACL: the
+  expected Node file ID is compared after the child opens the object and both
+  the set and verification use that one handle. The existing disposable DACL
+  preflight still runs before any migration destination mutation.
+- Rechecked every temp-cleanup, protect, remove, and rename rejection path for
+  outside survival and handle closure. A changed ancestor or name is treated as
+  unknown and is never cleaned up by name.
+- The Windows-only real-DACL integration remains registered but was skipped on
+  this macOS host. The C#/PowerShell child was not compiled or executed on
+  Windows during this round, so no actual Windows run is claimed; Windows CI is
+  still required for that platform evidence.
+- Node exposes no public `openat`/`unlinkat`/`renameat` API here. The code is
+  handle-bound for permission changes and uses pre-open/opened file-ID equality
+  plus repeated ancestor/name checks for cleanup and rename, but does not claim
+  kernel-atomic protection from a native attacker racing inside the final
+  unlink/rename syscall. Removing that accepted single-syscall boundary would
+  require a native helper and remains outside Task 5.
+
+### Commit
+
+- Requested message: `fix: close private store identity races`

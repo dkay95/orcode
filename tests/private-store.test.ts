@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import {
   chmod,
   type FileHandle,
+  lstat,
   mkdir,
   mkdtemp,
   readFile,
@@ -12,7 +13,7 @@ import {
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import test from "node:test";
 
 test("PrivateStore enforces 0700 directories and 0600 atomic files on POSIX", async () => {
@@ -29,7 +30,7 @@ test("PrivateStore enforces 0700 directories and 0600 atomic files on POSIX", as
   assert.equal((await stat(path)).mode & 0o777, 0o600);
 });
 
-test("Windows PrivateStore applies and verifies the deterministic current-user plus SYSTEM DACL", async () => {
+test("Windows PrivateStore binds every DACL operation to the expected file identity", async () => {
   const { PrivateStore, WindowsPrivateStoreAdapter } = await import("../src/private-store.js");
   const root = await mkdtemp(join(tmpdir(), "orcode-private-windows-"));
   const calls: Array<{ executable: string; args: string[]; environment?: Record<string, string> }> = [];
@@ -51,9 +52,14 @@ test("Windows PrivateStore applies and verifies the deterministic current-user p
     const script = Buffer.from(call.args[3] ?? "", "base64").toString("utf16le");
     assert.match(script, /WindowsIdentity.*GetCurrent/);
     assert.match(script, /S-1-5-18/);
-    assert.match(script, /SetAccessRuleProtection\(\$true, \$false\)/);
-    assert.match(script, /Get-Acl/);
-    assert.match(script, /exit 17/);
+    assert.match(script, /CreateFileW/);
+    assert.match(script, /FileFlagOpenReparsePoint/);
+    assert.match(script, /GetFileInformationByHandle/);
+    assert.match(script, /SetSecurityInfo\(\s*handle,/);
+    assert.match(script, /GetSecurityInfo\(\s*handle,/);
+    assert.doesNotMatch(script, /(?:Set|Get)-Acl/);
+    assert.match(call.environment?.ORCODE_PRIVATE_EXPECTED_DEV ?? "", /^\d+$/);
+    assert.match(call.environment?.ORCODE_PRIVATE_EXPECTED_INO ?? "", /^\d+$/);
   }
   assert.deepEqual(
     calls.map((call) => call.environment?.ORCODE_PRIVATE_KIND),
@@ -63,7 +69,9 @@ test("Windows PrivateStore applies and verifies the deterministic current-user p
 
 test("Windows ACL invocation binds an untrusted path as data through an encoded parser boundary", async () => {
   const { WindowsPrivateStoreAdapter } = await import("../src/private-store.js");
-  const maliciousPath = String.raw`C:\exact\'; Write-Output INJECTED; #\state.json`;
+  const root = await mkdtemp(join(tmpdir(), "orcode-private-windows-injection-"));
+  const maliciousPath = join(root, String.raw`C:\exact\'; Write-Output INJECTED; #\state.json`);
+  await writeFile(maliciousPath, "");
   const captures: Array<{
     args: string[];
     environment?: Record<string, string>;
@@ -97,6 +105,50 @@ test("Windows availability proves disposable directory and file DACL enforceabil
   }));
 
   assert.equal(await adapter.available(), false);
+});
+
+test("Windows PrivateStore child refuses a swapped file ID before changing the outside DACL", async () => {
+  const { PrivateStore, WindowsPrivateStoreAdapter } = await import("../src/private-store.js");
+  const root = await mkdtemp(join(tmpdir(), "orcode-private-windows-child-swap-"));
+  const exact = join(root, "exact");
+  const moved = join(root, "exact-before-swap");
+  const outside = join(root, "outside");
+  await mkdir(exact, { mode: 0o755 });
+  await mkdir(outside, { mode: 0o755 });
+  await chmod(exact, 0o755);
+  await chmod(outside, 0o755);
+  let swapped = false;
+  const adapter = new WindowsPrivateStoreAdapter(async (_executable, _args, options) => {
+    const path = options?.environment?.ORCODE_PRIVATE_PATH;
+    if (!swapped && path === exact) {
+      swapped = true;
+      await rename(exact, moved);
+      await symlink(outside, exact, "dir");
+      const expectedDev = options?.environment?.ORCODE_PRIVATE_EXPECTED_DEV;
+      const expectedIno = options?.environment?.ORCODE_PRIVATE_EXPECTED_INO;
+      if (expectedDev !== undefined && expectedIno !== undefined) {
+        const current = await lstat(exact, { bigint: true });
+        if (current.isSymbolicLink()
+          || current.dev !== BigInt(expectedDev)
+          || current.ino !== BigInt(expectedIno)) {
+          return { code: 18, stdout: "", stderr: "synthetic handle identity refusal" };
+        }
+      }
+      await chmod(exact, 0o700);
+    }
+    return { code: 0, stdout: "", stderr: "" };
+  });
+  const store = new PrivateStore({ adapter, root } as never);
+  let rejected = false;
+
+  try {
+    await store.ensureDirectory(exact);
+  } catch {
+    rejected = true;
+  }
+
+  assert.equal((await stat(outside)).mode & 0o777, 0o755);
+  assert.equal(rejected, true);
 });
 
 test("PrivateStore rolls back a newly-created destination root when protection fails", async () => {
@@ -187,6 +239,35 @@ test("PrivateStore rechecks ancestors after temp protection and before writing e
     readFile(join(moved, name), "utf8").catch(() => "")));
   assert.equal(leaked.some((value) => value.includes(secret)), false);
   await assert.rejects(readFile(join(outside, "state.json")), /ENOENT/);
+});
+
+test("PrivateStore temp cleanup never unlinks a replacement name after ancestor mismatch", async () => {
+  const { PosixPrivateStoreAdapter, PrivateStore } = await import("../src/private-store.js");
+  const root = await mkdtemp(join(tmpdir(), "orcode-private-temp-cleanup-swap-"));
+  const home = join(root, "home");
+  const exact = join(home, "exact");
+  const moved = join(home, "exact-before-swap");
+  const outside = join(root, "outside");
+  await mkdir(exact, { recursive: true });
+  await mkdir(outside);
+  let outsideTemp: string | null = null;
+  class SwappingCleanupAdapter extends PosixPrivateStoreAdapter {
+    override async protectFile(path: string, handle?: FileHandle): Promise<void> {
+      await super.protectFile(path, handle);
+      if (!outsideTemp && path.endsWith(".private.tmp")) {
+        outsideTemp = join(outside, basename(path));
+        await writeFile(outsideTemp, "outside sentinel", { mode: 0o644 });
+        await rename(dirname(path), moved);
+        await symlink(outside, exact, "dir");
+      }
+    }
+  }
+  const store = new PrivateStore({ adapter: new SwappingCleanupAdapter(), root: home } as never);
+
+  await assert.rejects(store.writeTextAtomic(join(exact, "state.json"), "exact bytes"));
+
+  assert.notEqual(outsideTemp, null);
+  assert.equal(await readFile(outsideTemp!, "utf8"), "outside sentinel");
 });
 
 test("PrivateStore protectTree rejects a symlink root without changing its target", async () => {

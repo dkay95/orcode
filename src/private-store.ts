@@ -21,11 +21,25 @@ import { dirname, join, relative, resolve, sep } from "node:path";
 export const PRIVATE_DIRECTORY_MODE = 0o700;
 export const PRIVATE_FILE_MODE = 0o600;
 
+export interface PrivateStoreProtectionIdentity {
+  readonly dev: bigint;
+  readonly ino: bigint;
+  readonly kind: "directory" | "file";
+}
+
 export interface PrivateStoreAdapter {
   readonly name: string;
   available(): Promise<boolean>;
-  protectDirectory(path: string, handle?: FileHandle): Promise<void>;
-  protectFile(path: string, handle?: FileHandle): Promise<void>;
+  protectDirectory(
+    path: string,
+    handle?: FileHandle,
+    identity?: PrivateStoreProtectionIdentity,
+  ): Promise<void>;
+  protectFile(
+    path: string,
+    handle?: FileHandle,
+    identity?: PrivateStoreProtectionIdentity,
+  ): Promise<void>;
 }
 
 export class PosixPrivateStoreAdapter implements PrivateStoreAdapter {
@@ -35,12 +49,20 @@ export class PosixPrivateStoreAdapter implements PrivateStoreAdapter {
     return true;
   }
 
-  async protectDirectory(path: string, handle?: FileHandle): Promise<void> {
+  async protectDirectory(
+    path: string,
+    handle?: FileHandle,
+    _identity?: PrivateStoreProtectionIdentity,
+  ): Promise<void> {
     if (handle) await handle.chmod(PRIVATE_DIRECTORY_MODE);
     else await chmod(path, PRIVATE_DIRECTORY_MODE);
   }
 
-  async protectFile(path: string, handle?: FileHandle): Promise<void> {
+  async protectFile(
+    path: string,
+    handle?: FileHandle,
+    _identity?: PrivateStoreProtectionIdentity,
+  ): Promise<void> {
     if (handle) await handle.chmod(PRIVATE_FILE_MODE);
     else await chmod(path, PRIVATE_FILE_MODE);
   }
@@ -66,29 +88,213 @@ const WINDOWS_DACL_SCRIPT = String.raw`
 $ErrorActionPreference = 'Stop'
 $path = $env:ORCODE_PRIVATE_PATH
 $kind = $env:ORCODE_PRIVATE_KIND
-if ([string]::IsNullOrEmpty($path) -or ($kind -ne 'directory' -and $kind -ne 'file')) { exit 16 }
-$user = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
-$system = New-Object System.Security.Principal.SecurityIdentifier('S-1-5-18')
-if ($kind -eq 'directory') {
-  $acl = New-Object System.Security.AccessControl.DirectorySecurity
-  $rights = [System.Security.AccessControl.FileSystemRights]::FullControl
-  $inheritance = [System.Security.AccessControl.InheritanceFlags]'ContainerInherit, ObjectInherit'
-} else {
-  $acl = New-Object System.Security.AccessControl.FileSecurity
-  $rights = [System.Security.AccessControl.FileSystemRights]::FullControl
-  $inheritance = [System.Security.AccessControl.InheritanceFlags]::None
+$expectedDevText = $env:ORCODE_PRIVATE_EXPECTED_DEV
+$expectedInoText = $env:ORCODE_PRIVATE_EXPECTED_INO
+if ([string]::IsNullOrEmpty($path) -or
+    ($kind -ne 'directory' -and $kind -ne 'file') -or
+    [string]::IsNullOrEmpty($expectedDevText) -or
+    [string]::IsNullOrEmpty($expectedInoText)) { exit 16 }
+[UInt64]$expectedDev = 0
+[UInt64]$expectedIno = 0
+if (-not [UInt64]::TryParse($expectedDevText, [ref]$expectedDev) -or
+    -not [UInt64]::TryParse($expectedInoText, [ref]$expectedIno)) { exit 16 }
+
+Add-Type -TypeDefinition @'
+using System;
+using System.Collections.Generic;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+using System.Security.AccessControl;
+using System.Security.Principal;
+using Microsoft.Win32.SafeHandles;
+
+public static class OrcodePrivateAcl {
+  private const uint ReadControl = 0x00020000;
+  private const uint WriteDac = 0x00040000;
+  private const uint ShareRead = 0x00000001;
+  private const uint ShareWrite = 0x00000002;
+  private const uint ShareDelete = 0x00000004;
+  private const uint OpenExisting = 3;
+  private const uint FileFlagBackupSemantics = 0x02000000;
+  private const uint FileFlagOpenReparsePoint = 0x00200000;
+  private const uint FileAttributeDirectory = 0x00000010;
+  private const uint FileAttributeReparsePoint = 0x00000400;
+  private const uint DaclSecurityInformation = 0x00000004;
+  private const uint ProtectedDaclSecurityInformation = 0x80000000;
+  private const int SeFileObject = 1;
+  private const int FullControl = 0x001F01FF;
+
+  [StructLayout(LayoutKind.Sequential)]
+  private struct FileTime {
+    public uint Low;
+    public uint High;
+  }
+
+  [StructLayout(LayoutKind.Sequential)]
+  private struct ByHandleFileInformation {
+    public uint FileAttributes;
+    public FileTime CreationTime;
+    public FileTime LastAccessTime;
+    public FileTime LastWriteTime;
+    public uint VolumeSerialNumber;
+    public uint FileSizeHigh;
+    public uint FileSizeLow;
+    public uint NumberOfLinks;
+    public uint FileIndexHigh;
+    public uint FileIndexLow;
+  }
+
+  [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+  private static extern SafeFileHandle CreateFileW(
+    string fileName,
+    uint desiredAccess,
+    uint shareMode,
+    IntPtr securityAttributes,
+    uint creationDisposition,
+    uint flagsAndAttributes,
+    IntPtr templateFile);
+
+  [DllImport("kernel32.dll", SetLastError = true)]
+  [return: MarshalAs(UnmanagedType.Bool)]
+  private static extern bool GetFileInformationByHandle(
+    SafeFileHandle file,
+    out ByHandleFileInformation information);
+
+  [DllImport("advapi32.dll", SetLastError = true)]
+  [return: MarshalAs(UnmanagedType.Bool)]
+  private static extern bool GetSecurityDescriptorDacl(
+    IntPtr securityDescriptor,
+    [MarshalAs(UnmanagedType.Bool)] out bool daclPresent,
+    out IntPtr dacl,
+    [MarshalAs(UnmanagedType.Bool)] out bool daclDefaulted);
+
+  [DllImport("advapi32.dll", SetLastError = true)]
+  private static extern uint SetSecurityInfo(
+    SafeFileHandle handle,
+    int objectType,
+    uint securityInformation,
+    IntPtr owner,
+    IntPtr group,
+    IntPtr dacl,
+    IntPtr sacl);
+
+  [DllImport("advapi32.dll", SetLastError = true)]
+  private static extern uint GetSecurityInfo(
+    SafeFileHandle handle,
+    int objectType,
+    uint securityInformation,
+    out IntPtr owner,
+    out IntPtr group,
+    out IntPtr dacl,
+    out IntPtr sacl,
+    out IntPtr securityDescriptor);
+
+  [DllImport("advapi32.dll", SetLastError = true)]
+  private static extern uint GetSecurityDescriptorLength(IntPtr securityDescriptor);
+
+  [DllImport("kernel32.dll")]
+  private static extern IntPtr LocalFree(IntPtr memory);
+
+  public static int Protect(string path, string kind, ulong expectedDev, ulong expectedIno) {
+    bool expectDirectory = kind == "directory";
+    using (SafeFileHandle handle = CreateFileW(
+      path,
+      ReadControl | WriteDac,
+      ShareRead | ShareWrite | ShareDelete,
+      IntPtr.Zero,
+      OpenExisting,
+      FileFlagBackupSemantics | FileFlagOpenReparsePoint,
+      IntPtr.Zero)) {
+      if (handle.IsInvalid) return 20;
+      ByHandleFileInformation information;
+      if (!GetFileInformationByHandle(handle, out information)) return 21;
+      bool isDirectory = (information.FileAttributes & FileAttributeDirectory) != 0;
+      bool isReparsePoint = (information.FileAttributes & FileAttributeReparsePoint) != 0;
+      ulong fileIndex = ((ulong)information.FileIndexHigh << 32) | information.FileIndexLow;
+      if (isReparsePoint || isDirectory != expectDirectory ||
+          information.VolumeSerialNumber != expectedDev || fileIndex != expectedIno) return 18;
+
+      SecurityIdentifier user = WindowsIdentity.GetCurrent().User;
+      if (user == null) return 22;
+      SecurityIdentifier system = new SecurityIdentifier("S-1-5-18");
+      AceFlags flags = expectDirectory
+        ? AceFlags.ContainerInherit | AceFlags.ObjectInherit
+        : AceFlags.None;
+      RawAcl acl = new RawAcl(GenericAcl.AclRevision, 2);
+      acl.InsertAce(0, new CommonAce(flags, AceQualifier.AccessAllowed, FullControl, user, false, null));
+      acl.InsertAce(1, new CommonAce(flags, AceQualifier.AccessAllowed, FullControl, system, false, null));
+      RawSecurityDescriptor descriptor = new RawSecurityDescriptor(
+        ControlFlags.DiscretionaryAclPresent | ControlFlags.DiscretionaryAclProtected,
+        null,
+        null,
+        null,
+        acl);
+      byte[] binary = new byte[descriptor.BinaryLength];
+      descriptor.GetBinaryForm(binary, 0);
+      GCHandle pinned = GCHandle.Alloc(binary, GCHandleType.Pinned);
+      try {
+        bool present;
+        bool defaulted;
+        IntPtr dacl;
+        if (!GetSecurityDescriptorDacl(pinned.AddrOfPinnedObject(), out present, out dacl, out defaulted)
+            || !present || dacl == IntPtr.Zero) return 23;
+        uint setResult = SetSecurityInfo(
+          handle,
+          SeFileObject,
+          DaclSecurityInformation | ProtectedDaclSecurityInformation,
+          IntPtr.Zero,
+          IntPtr.Zero,
+          dacl,
+          IntPtr.Zero);
+        if (setResult != 0) return unchecked((int)setResult);
+      } finally {
+        pinned.Free();
+      }
+
+      IntPtr owner;
+      IntPtr group;
+      IntPtr verifiedDacl;
+      IntPtr sacl;
+      IntPtr verifiedDescriptor;
+      uint getResult = GetSecurityInfo(
+        handle,
+        SeFileObject,
+        DaclSecurityInformation,
+        out owner,
+        out group,
+        out verifiedDacl,
+        out sacl,
+        out verifiedDescriptor);
+      if (getResult != 0) return unchecked((int)getResult);
+      try {
+        uint length = GetSecurityDescriptorLength(verifiedDescriptor);
+        if (length == 0 || length > Int32.MaxValue) return 24;
+        byte[] verifiedBinary = new byte[(int)length];
+        Marshal.Copy(verifiedDescriptor, verifiedBinary, 0, verifiedBinary.Length);
+        RawSecurityDescriptor verified = new RawSecurityDescriptor(verifiedBinary, 0);
+        if ((verified.ControlFlags & ControlFlags.DiscretionaryAclProtected) == 0 ||
+            verified.DiscretionaryAcl == null || verified.DiscretionaryAcl.Count != 2) return 17;
+        HashSet<string> expectedSids = new HashSet<string>(StringComparer.Ordinal) {
+          user.Value,
+          system.Value,
+        };
+        foreach (GenericAce genericAce in verified.DiscretionaryAcl) {
+          CommonAce ace = genericAce as CommonAce;
+          if (ace == null || ace.AceQualifier != AceQualifier.AccessAllowed ||
+              ace.AccessMask != FullControl || ace.AceFlags != flags ||
+              !expectedSids.Remove(ace.SecurityIdentifier.Value)) return 17;
+        }
+        return expectedSids.Count == 0 ? 0 : 17;
+      } finally {
+        if (verifiedDescriptor != IntPtr.Zero) LocalFree(verifiedDescriptor);
+      }
+    }
+  }
 }
-$acl.SetAccessRuleProtection($true, $false)
-$propagation = [System.Security.AccessControl.PropagationFlags]::None
-$allow = [System.Security.AccessControl.AccessControlType]::Allow
-$acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($user, $rights, $inheritance, $propagation, $allow)))
-$acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($system, $rights, $inheritance, $propagation, $allow)))
-Set-Acl -LiteralPath $path -AclObject $acl
-$verified = Get-Acl -LiteralPath $path
-$expected = @($user.Value, 'S-1-5-18') | Sort-Object -Unique
-$actual = @($verified.Access | ForEach-Object { $_.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value }) | Sort-Object -Unique
-$deny = @($verified.Access | Where-Object { $_.AccessControlType -ne $allow }).Count
-if (-not $verified.AreAccessRulesProtected -or $deny -ne 0 -or (Compare-Object $expected $actual)) { exit 17 }
+'@
+
+$result = [OrcodePrivateAcl]::Protect($path, $kind, $expectedDev, $expectedIno)
+exit $result
 `;
 const WINDOWS_DACL_ENCODED = Buffer.from(WINDOWS_DACL_SCRIPT, "utf16le").toString("base64");
 
@@ -115,15 +321,31 @@ export class WindowsPrivateStoreAdapter implements PrivateStoreAdapter {
     }
   }
 
-  async protectDirectory(path: string, _handle?: FileHandle): Promise<void> {
-    await this.protect(path, "directory");
+  async protectDirectory(
+    path: string,
+    _handle?: FileHandle,
+    identity?: PrivateStoreProtectionIdentity,
+  ): Promise<void> {
+    await this.protect(path, "directory", identity);
   }
 
-  async protectFile(path: string, _handle?: FileHandle): Promise<void> {
-    await this.protect(path, "file");
+  async protectFile(
+    path: string,
+    _handle?: FileHandle,
+    identity?: PrivateStoreProtectionIdentity,
+  ): Promise<void> {
+    await this.protect(path, "file", identity);
   }
 
-  private async protect(path: string, kind: "directory" | "file"): Promise<void> {
+  private async protect(
+    path: string,
+    kind: "directory" | "file",
+    suppliedIdentity?: PrivateStoreProtectionIdentity,
+  ): Promise<void> {
+    const identity = suppliedIdentity ?? await protectionIdentity(path, kind);
+    if (identity.kind !== kind) {
+      throw new Error(`PrivateStore-DACL erhielt eine falsche Objektart für ${path}.`);
+    }
     const result = await this.run("powershell.exe", [
       "-NoProfile",
       "-NonInteractive",
@@ -133,6 +355,8 @@ export class WindowsPrivateStoreAdapter implements PrivateStoreAdapter {
       environment: {
         ORCODE_PRIVATE_PATH: path,
         ORCODE_PRIVATE_KIND: kind,
+        ORCODE_PRIVATE_EXPECTED_DEV: identity.dev.toString(),
+        ORCODE_PRIVATE_EXPECTED_INO: identity.ino.toString(),
       },
     });
     if (result.code !== 0) {
@@ -149,11 +373,8 @@ export interface PrivateStoreOptions {
   root?: string;
 }
 
-interface PathIdentity {
+interface PathIdentity extends PrivateStoreProtectionIdentity {
   path: string;
-  dev: number;
-  ino: number;
-  kind: "directory" | "file";
 }
 
 /**
@@ -201,15 +422,25 @@ export class PrivateStore {
     const temporary = `${target}.${randomUUID()}.private.tmp`;
     let handle: Awaited<ReturnType<typeof open>> | null = null;
     let createdDirectories: PathIdentity[] = [];
+    let ancestors: PathIdentity[] = [];
+    let temporaryIdentity: PathIdentity | null = null;
     try {
       createdDirectories = await ensurePrivateDirectoryTree(root, parent, this.adapter);
-      const ancestors = await directoryIdentities(root, parent);
+      ancestors = await directoryIdentities(root, parent);
       handle = await open(temporary, "wx", PRIVATE_FILE_MODE);
-      await protectOpenPath(handle, temporary, "file", this.adapter, ancestors);
+      temporaryIdentity = await assertHandlePathIdentity(handle, temporary, "file");
+      await protectOpenPath(
+        handle,
+        temporary,
+        "file",
+        this.adapter,
+        ancestors,
+        temporaryIdentity,
+      );
       await handle.writeFile(content, "utf8");
       await handle.sync();
       await assertDirectoryIdentities(ancestors);
-      const temporaryIdentity = await assertHandlePathIdentity(handle, temporary, "file");
+      temporaryIdentity = await assertHandlePathIdentity(handle, temporary, "file");
       await handle.close();
       handle = null;
       await assertDirectoryIdentities(ancestors);
@@ -218,8 +449,8 @@ export class PrivateStore {
       await assertDirectoryIdentities(ancestors);
       await assertPathIdentity({ ...temporaryIdentity, path: target });
     } catch (error) {
+      await unlinkBoundTemporary(temporaryIdentity, ancestors, handle);
       await handle?.close().catch(() => undefined);
-      await unlink(temporary).catch(() => undefined);
       await rollbackCreatedDirectories(createdDirectories);
       throw error;
     }
@@ -262,15 +493,17 @@ export class PrivateStore {
     const destinationAncestors = await directoryIdentities(destinationRoot, dirname(destination));
     await assertDirectoryIdentities(sourceAncestors);
     await assertDirectoryIdentities(destinationAncestors);
-    const sourceInfo = await lstat(source);
+    const sourceInfo = await lstat(source, { bigint: true });
     if (sourceInfo.isSymbolicLink() || !sourceInfo.isDirectory()) {
       throw new Error(`PrivateStore verschiebt nur ein echtes Quellverzeichnis: ${source}`);
     }
     const sourceHandle = await openIdentityHandle(source, "directory");
-    let sourceIdentity = pathIdentity(source, sourceInfo, "directory");
+    const preOpenSourceIdentity = pathIdentity(source, sourceInfo, "directory");
+    let sourceIdentity = preOpenSourceIdentity;
     try {
       if (sourceHandle) {
         sourceIdentity = await assertHandlePathIdentity(sourceHandle, source, "directory");
+        assertSameIdentity(preOpenSourceIdentity, sourceIdentity, source);
       } else {
         await assertPathIdentity(sourceIdentity);
       }
@@ -284,6 +517,16 @@ export class PrivateStore {
       }
       await assertDirectoryIdentities(sourceAncestors);
       await assertDirectoryIdentities(destinationAncestors);
+      if (sourceHandle) {
+        const currentSourceIdentity = await assertHandlePathIdentity(
+          sourceHandle,
+          source,
+          "directory",
+        );
+        assertSameIdentity(sourceIdentity, currentSourceIdentity, source);
+      } else {
+        await assertPathIdentity(sourceIdentity);
+      }
       await rename(source, destination);
       await assertDirectoryIdentities(sourceAncestors);
       await assertDirectoryIdentities(destinationAncestors);
@@ -309,7 +552,7 @@ export class PrivateStore {
 
   async #protectTree(path: string, ancestors: readonly PathIdentity[]): Promise<void> {
     await assertDirectoryIdentities(ancestors);
-    const info = await lstat(path);
+    const info = await lstat(path, { bigint: true });
     if (info.isSymbolicLink()) {
       throw new Error(`PrivateStore schützt keine symbolischen Links in exakten Daten: ${path}`);
     }
@@ -375,7 +618,7 @@ async function ensureOneDirectory(
 ): Promise<PathIdentity> {
   let identity: PathIdentity;
   try {
-    const info = await lstat(path);
+    const info = await lstat(path, { bigint: true });
     if (info.isSymbolicLink() || !info.isDirectory()) {
       throw new Error(`PrivateStore-Verzeichnis ist kein echtes Verzeichnis: ${path}`);
     }
@@ -385,7 +628,7 @@ async function ensureOneDirectory(
     await assertDirectoryIdentities(ancestors);
     await mkdir(path, { mode: PRIVATE_DIRECTORY_MODE });
     await assertDirectoryIdentities(ancestors);
-    const info = await lstat(path);
+    const info = await lstat(path, { bigint: true });
     if (info.isSymbolicLink() || !info.isDirectory()) {
       throw new Error(`PrivateStore-Verzeichnis wurde bei der Erstellung ausgetauscht: ${path}`);
     }
@@ -403,7 +646,7 @@ async function ensureOneDirectory(
 async function rollbackCreatedDirectories(paths: readonly PathIdentity[]): Promise<void> {
   for (const identity of [...paths].reverse()) {
     try {
-      const info = await lstat(identity.path);
+      const info = await lstat(identity.path, { bigint: true });
       if (!info.isSymbolicLink() && info.isDirectory()
         && info.dev === identity.dev && info.ino === identity.ino) {
         await rmdir(identity.path);
@@ -428,7 +671,7 @@ async function directoryIdentities(rootPath: string, targetPath: string): Promis
   const identities: PathIdentity[] = [];
   for (const path of paths) {
     await assertDirectoryIdentities(identities);
-    const info = await lstat(path);
+    const info = await lstat(path, { bigint: true });
     await assertDirectoryIdentities(identities);
     if (info.isSymbolicLink() || !info.isDirectory()) {
       throw new Error(`Symbolischer Link oder ungültiger PrivateStore-Pfad: ${path}`);
@@ -441,7 +684,7 @@ async function directoryIdentities(rootPath: string, targetPath: string): Promis
 async function assertDirectoryIdentities(expected: readonly PathIdentity[]): Promise<void> {
   const current = await Promise.all(expected.map(async (identity) => ({
     identity,
-    info: await lstat(identity.path),
+    info: await lstat(identity.path, { bigint: true }),
   })));
   for (const { identity, info } of current) {
     if (info.isSymbolicLink() || !info.isDirectory() || info.dev !== identity.dev || info.ino !== identity.ino) {
@@ -455,7 +698,10 @@ async function assertHandlePathIdentity(
   path: string,
   kind: "directory" | "file",
 ): Promise<PathIdentity> {
-  const [opened, named] = await Promise.all([handle.stat(), lstat(path)]);
+  const [opened, named] = await Promise.all([
+    handle.stat({ bigint: true }),
+    lstat(path, { bigint: true }),
+  ]);
   const validKind = kind === "directory"
     ? opened.isDirectory() && named.isDirectory()
     : opened.isFile() && named.isFile();
@@ -466,7 +712,7 @@ async function assertHandlePathIdentity(
 }
 
 async function assertPathIdentity(expected: PathIdentity): Promise<void> {
-  const info = await lstat(expected.path);
+  const info = await lstat(expected.path, { bigint: true });
   const validKind = expected.kind === "directory" ? info.isDirectory() : info.isFile();
   if (info.isSymbolicLink() || !validKind || info.dev !== expected.dev || info.ino !== expected.ino) {
     throw new Error(`PrivateStore-Pfad wurde ausgetauscht: ${expected.path}`);
@@ -480,25 +726,32 @@ async function protectBoundPath(
   ancestors: readonly PathIdentity[],
 ): Promise<PathIdentity> {
   await assertDirectoryIdentities(ancestors);
-  const before = await lstat(path);
+  const before = await lstat(path, { bigint: true });
   if (before.isSymbolicLink()
     || (kind === "directory" ? !before.isDirectory() : !before.isFile())) {
     throw new Error(`PrivateStore-${kind === "directory" ? "Verzeichnis" : "Datei"} ist ungültig: ${path}`);
   }
+  const preOpenIdentity = pathIdentity(path, before, kind);
   const handle = await openIdentityHandle(path, kind);
   if (!handle) {
-    const identity = pathIdentity(path, before, kind);
     await assertDirectoryIdentities(ancestors);
     await (kind === "directory"
-      ? adapter.protectDirectory(path)
-      : adapter.protectFile(path));
+      ? adapter.protectDirectory(path, undefined, preOpenIdentity)
+      : adapter.protectFile(path, undefined, preOpenIdentity));
     await assertDirectoryIdentities(ancestors);
-    await assertPathIdentity(identity);
-    return identity;
+    await assertPathIdentity(preOpenIdentity);
+    return preOpenIdentity;
   }
   let protectedIdentity: PathIdentity;
   try {
-    protectedIdentity = await protectOpenPath(handle, path, kind, adapter, ancestors);
+    protectedIdentity = await protectOpenPath(
+      handle,
+      path,
+      kind,
+      adapter,
+      ancestors,
+      preOpenIdentity,
+    );
   } finally {
     await handle.close();
   }
@@ -513,13 +766,15 @@ async function protectOpenPath(
   kind: "directory" | "file",
   adapter: PrivateStoreAdapter,
   ancestors: readonly PathIdentity[],
+  preOpenIdentity?: PathIdentity,
 ): Promise<PathIdentity> {
   await assertDirectoryIdentities(ancestors);
   const identity = await assertHandlePathIdentity(handle, path, kind);
+  if (preOpenIdentity) assertSameIdentity(preOpenIdentity, identity, path);
   await assertDirectoryIdentities(ancestors);
   await (kind === "directory"
-    ? adapter.protectDirectory(path, handle)
-    : adapter.protectFile(path, handle));
+    ? adapter.protectDirectory(path, handle, identity)
+    : adapter.protectFile(path, handle, identity));
   await assertDirectoryIdentities(ancestors);
   const protectedIdentity = await assertHandlePathIdentity(handle, path, kind);
   if (!sameIdentity(identity, protectedIdentity)) {
@@ -535,7 +790,7 @@ async function removeBoundTree(
   await assertDirectoryIdentities(ancestors);
   let info: Awaited<ReturnType<typeof lstat>>;
   try {
-    info = await lstat(path);
+    info = await lstat(path, { bigint: true });
   } catch (error) {
     if (hasCode(error, "ENOENT")) return;
     throw error;
@@ -545,11 +800,13 @@ async function removeBoundTree(
     throw new Error(`PrivateStore entfernt keinen symbolischen Link: ${path}`);
   }
   if (info.isFile()) {
+    const preOpenIdentity = pathIdentity(path, info, "file");
     const handle = await openIdentityHandle(path, "file");
-    const identity = handle
-      ? await assertHandlePathIdentity(handle, path, "file")
-      : pathIdentity(path, info, "file");
     try {
+      const identity = handle
+        ? await assertHandlePathIdentity(handle, path, "file")
+        : preOpenIdentity;
+      assertSameIdentity(preOpenIdentity, identity, path);
       await assertDirectoryIdentities(ancestors);
       if (handle) await assertHandlePathIdentity(handle, path, "file");
       else await assertPathIdentity(identity);
@@ -566,12 +823,14 @@ async function removeBoundTree(
   if (!info.isDirectory()) {
     throw new Error(`PrivateStore entfernt nur reguläre Dateien und Verzeichnisse: ${path}`);
   }
+  const preOpenIdentity = pathIdentity(path, info, "directory");
   const handle = await openIdentityHandle(path, "directory");
-  const identity = handle
-    ? await assertHandlePathIdentity(handle, path, "directory")
-    : pathIdentity(path, info, "directory");
-  const tree = [...ancestors, identity];
   try {
+    const identity = handle
+      ? await assertHandlePathIdentity(handle, path, "directory")
+      : preOpenIdentity;
+    assertSameIdentity(preOpenIdentity, identity, path);
+    const tree = [...ancestors, identity];
     await assertDirectoryIdentities(tree);
     const entries = await readdir(path, { withFileTypes: true });
     await assertDirectoryIdentities(tree);
@@ -600,11 +859,31 @@ async function assertMissingPath(path: string): Promise<void> {
   throw new Error(`PrivateStore-Pfad sollte nicht mehr existieren: ${path}`);
 }
 
+async function unlinkBoundTemporary(
+  identity: PathIdentity | null,
+  ancestors: readonly PathIdentity[],
+  handle: FileHandle | null,
+): Promise<void> {
+  if (!identity) return;
+  try {
+    await assertDirectoryIdentities(ancestors);
+    if (handle) {
+      const current = await assertHandlePathIdentity(handle, identity.path, "file");
+      assertSameIdentity(identity, current, identity.path);
+    } else {
+      await assertPathIdentity(identity);
+    }
+    await assertDirectoryIdentities(ancestors);
+    await unlink(identity.path);
+  } catch {
+    // The current name is unknown after an identity mismatch; never unlink it.
+  }
+}
+
 async function openIdentityHandle(
   path: string,
   kind: "directory" | "file",
 ): Promise<FileHandle | null> {
-  if (process.platform === "win32" && kind === "directory") return null;
   const noFollow = process.platform === "win32" ? 0 : fsConstants.O_NOFOLLOW;
   const directory = kind === "directory" ? fsConstants.O_DIRECTORY : 0;
   return open(path, fsConstants.O_RDONLY | noFollow | directory);
@@ -612,14 +891,32 @@ async function openIdentityHandle(
 
 function pathIdentity(
   path: string,
-  info: { dev: number; ino: number },
+  info: { dev: number | bigint; ino: number | bigint },
   kind: "directory" | "file",
 ): PathIdentity {
-  return { path, dev: info.dev, ino: info.ino, kind };
+  return { path, dev: BigInt(info.dev), ino: BigInt(info.ino), kind };
+}
+
+async function protectionIdentity(
+  path: string,
+  kind: "directory" | "file",
+): Promise<PrivateStoreProtectionIdentity> {
+  const info = await lstat(path, { bigint: true });
+  const validKind = kind === "directory" ? info.isDirectory() : info.isFile();
+  if (info.isSymbolicLink() || !validKind) {
+    throw new Error(`PrivateStore-DACL verweigert einen ungültigen Pfad: ${path}`);
+  }
+  return { dev: info.dev, ino: info.ino, kind };
 }
 
 function sameIdentity(left: PathIdentity, right: PathIdentity): boolean {
   return left.dev === right.dev && left.ino === right.ino && left.kind === right.kind;
+}
+
+function assertSameIdentity(expected: PathIdentity, actual: PathIdentity, path: string): void {
+  if (!sameIdentity(expected, actual)) {
+    throw new Error(`PrivateStore-Pfad wurde zwischen Prüfung und Öffnen ausgetauscht: ${path}`);
+  }
 }
 
 function assertContained(rootPath: string, candidatePath: string): void {
