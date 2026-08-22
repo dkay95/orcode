@@ -789,7 +789,11 @@ test("agent binds live process events to the stable tool ID, redacts split crede
   assert.equal(canonicalStdout, `${prefix}${body}\n`, "live redaction must not alter the canonical tool result");
   assert.equal(firstOutputWasLive, true);
   const processEvents = events.filter((event) => event.type.startsWith("process-")) as Array<AgentRunEvent & { id: string; toolId?: string; toolNumber?: number }>;
-  assert.deepEqual(processEvents.map((event) => event.type), ["process-start", "process-output", "process-end"]);
+  assert.equal(processEvents[0]?.type, "process-start");
+  assert.equal(processEvents.at(-1)?.type, "process-end");
+  assert.ok(processEvents.slice(1, -1).length > 0);
+  assert.ok(processEvents.slice(1, -1).every((event) => event.type === "process-output"));
+  assert.equal(processEvents.filter((event) => event.type === "process-end").length, 1);
   assert.equal(new Set(processEvents.map((event) => event.id)).size, 1);
   assert.ok(processEvents.every((event) => event.toolId === "tool-1" && event.toolNumber === 1));
   const visible = processEvents.map((event) => event.type === "process-output" ? (event as AgentRunEvent & { text: string }).text : "").join("");

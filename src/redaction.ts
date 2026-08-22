@@ -57,7 +57,7 @@ const SECRET_RULES: readonly SecretRule[] = [
       /\b(aws[_-]?secret[_-]?access[_-]?key["']?\s*[:=]\s*["']?)[A-Za-z0-9/+=]{40}/gi,
     replacement: "$1[REDACTED_AWS_SECRET]",
     partialPattern:
-      /\b(aws[_-]?secret[_-]?access[_-]?key["']?\s*[:=]\s*["']?)(?![A-Za-z0-9/+=])/gi,
+      /\b(aws[_-]?secret[_-]?access[_-]?key["']?\s*[:=]\s*["']?)(?!\[REDACTED_AWS_SECRET\])(?![A-Za-z0-9/+=])/gi,
     partialReplacement: "$1[REDACTED_AWS_SECRET]",
   },
   {
@@ -219,72 +219,71 @@ export function redactRunEvent(event: AgentRunEvent): AgentRunEvent {
   return redactValueInternal(event, true);
 }
 
+interface AttributedTextSegment {
+  readonly sequence: number;
+  text: string;
+}
+
 /**
  * Redacts one stdout/stderr text stream without treating a chunk boundary as a
- * credential boundary. Complete lines are released immediately. On a partial
- * line only a possible credential introducer/suffix (or a multi-line private
- * key block) is retained; unrelated output stays live.
+ * credential boundary. Retained fragments keep their immutable arrival
+ * sequence so released bytes can return to their original process frame.
  */
 class StreamingTextRedactor {
-  #pending = "";
+  #pending: AttributedTextSegment[] = [];
 
-  get hasPending(): boolean {
-    return this.#pending.length > 0;
+  get pendingSequence(): number | undefined {
+    return this.#pending[0]?.sequence;
   }
 
   get pendingLength(): number {
-    return this.#pending.length;
+    return this.#pending.reduce((total, segment) => total + segment.text.length, 0);
   }
 
-  push(text: string): string {
-    if (!text) return "";
-    this.#pending += text;
-    let output = "";
-    while (this.#pending) {
-      const privateKeyStart = this.#pending.search(PRIVATE_KEY_BEGIN);
+  push(text: string, sequence: number): AttributedTextSegment[] {
+    if (!text) return [];
+    appendAttributed(this.#pending, [{ sequence, text }]);
+    const output: AttributedTextSegment[] = [];
+    while (this.#pending.length > 0) {
+      let pendingText = this.#pendingText();
+      const privateKeyStart = pendingText.search(PRIVATE_KEY_BEGIN);
       if (privateKeyStart >= 0) {
         if (privateKeyStart > 0) {
-          output += redactText(this.#pending.slice(0, privateKeyStart));
-          this.#pending = this.#pending.slice(privateKeyStart);
+          appendAttributed(output, this.#release(privateKeyStart));
+          pendingText = this.#pendingText();
         }
-        const complete = this.#pending.match(PRIVATE_KEY_COMPLETE)?.[0];
+        const complete = pendingText.match(PRIVATE_KEY_COMPLETE)?.[0];
         if (!complete) return output;
-        output += redactText(complete);
-        this.#pending = this.#pending.slice(complete.length);
+        appendAttributed(output, this.#release(complete.length));
         continue;
       }
       const lastBreak = Math.max(
-        this.#pending.lastIndexOf("\n"),
-        this.#pending.lastIndexOf("\r"),
+        pendingText.lastIndexOf("\n"),
+        pendingText.lastIndexOf("\r"),
       );
       if (lastBreak >= 0) {
-        output += redactText(this.#pending.slice(0, lastBreak + 1));
-        this.#pending = this.#pending.slice(lastBreak + 1);
+        appendAttributed(output, this.#release(lastBreak + 1));
         continue;
       }
-      const candidateStart = earliestStreamingSecretStart(this.#pending);
+      const candidateStart = earliestStreamingSecretStart(pendingText);
       if (candidateStart >= 0) {
         if (candidateStart > 0) {
-          output += redactText(this.#pending.slice(0, candidateStart));
-          this.#pending = this.#pending.slice(candidateStart);
+          appendAttributed(output, this.#release(candidateStart));
         }
         return output;
       }
-      const overlap = streamingSecretSuffixLength(this.#pending);
-      const safeLength = this.#pending.length - overlap;
+      const overlap = streamingSecretSuffixLength(pendingText);
+      const safeLength = pendingText.length - overlap;
       if (safeLength > 0) {
-        output += redactText(this.#pending.slice(0, safeLength));
-        this.#pending = this.#pending.slice(safeLength);
+        appendAttributed(output, this.#release(safeLength));
       }
       return output;
     }
     return output;
   }
 
-  flush(): string {
-    const output = redactTextInternal(this.#pending, true);
-    this.#pending = "";
-    return output;
+  flush(): AttributedTextSegment[] {
+    return this.#release(this.pendingLength, true);
   }
 
   /**
@@ -292,10 +291,159 @@ class StreamingTextRedactor {
    * fragment. Future chunks therefore cannot reconstruct it across the
    * bounded-buffer boundary.
    */
-  discardPending(): string {
-    if (!this.#pending) return "";
-    this.#pending = "";
-    return "[REDACTED_STREAM_FRAGMENT]";
+  discardPending(): AttributedTextSegment[] {
+    const sequence = this.pendingSequence;
+    if (sequence === undefined) return [];
+    this.#pending = [];
+    return [{ sequence, text: "[REDACTED_STREAM_FRAGMENT]" }];
+  }
+
+  #pendingText(): string {
+    return this.#pending.map((segment) => segment.text).join("");
+  }
+
+  #release(length: number, includeStreamingPrefixes = false): AttributedTextSegment[] {
+    const source: AttributedTextSegment[] = [];
+    let remaining = length;
+    while (remaining > 0) {
+      const segment = this.#pending[0];
+      if (!segment) break;
+      if (segment.text.length <= remaining) {
+        source.push(segment);
+        this.#pending.shift();
+        remaining -= segment.text.length;
+      } else {
+        source.push({ sequence: segment.sequence, text: segment.text.slice(0, remaining) });
+        this.#pending[0] = {
+          sequence: segment.sequence,
+          text: segment.text.slice(remaining),
+        };
+        remaining = 0;
+      }
+    }
+    return redactAttributedSegments(source, includeStreamingPrefixes);
+  }
+}
+
+function redactAttributedSegments(
+  segments: AttributedTextSegment[],
+  includeStreamingPrefixes: boolean,
+): AttributedTextSegment[] {
+  let result = segments;
+  for (const rule of SECRET_RULES) {
+    result = replaceAttributed(result, rule.pattern, rule.replacement);
+    if (includeStreamingPrefixes && rule.partialPattern) {
+      result = replaceAttributed(
+        result,
+        rule.partialPattern,
+        rule.partialReplacement ?? rule.replacement,
+      );
+    }
+  }
+  return result;
+}
+
+function replaceAttributed(
+  source: AttributedTextSegment[],
+  pattern: RegExp,
+  replacement: string,
+): AttributedTextSegment[] {
+  if (source.length === 0) return source;
+  const value = source.map((segment) => segment.text).join("");
+  const matches = [...value.matchAll(new RegExp(pattern.source, pattern.flags))];
+  if (matches.length === 0) return source;
+
+  const output: AttributedTextSegment[] = [];
+  let cursor = 0;
+  for (const match of matches) {
+    const start = match.index;
+    if (start === undefined) continue;
+    appendAttributed(output, sliceAttributed(source, cursor, start));
+    appendAttributed(output, attributedReplacement(source, start, match, replacement));
+    cursor = start + match[0].length;
+  }
+  appendAttributed(output, sliceAttributed(source, cursor, value.length));
+  return output;
+}
+
+function attributedReplacement(
+  source: AttributedTextSegment[],
+  matchStart: number,
+  match: RegExpMatchArray,
+  replacement: string,
+): AttributedTextSegment[] {
+  const captureToken = replacement.indexOf("$1");
+  if (captureToken < 0 || match[1] === undefined) {
+    return [{ sequence: sequenceAt(source, matchStart), text: replacement }];
+  }
+
+  const captureOffset = match[0].indexOf(match[1]);
+  if (captureOffset < 0) {
+    return [{ sequence: sequenceAt(source, matchStart), text: replacement }];
+  }
+  const captureStart = matchStart + captureOffset;
+  const captureEnd = captureStart + match[1].length;
+  const output: AttributedTextSegment[] = [];
+  const before = replacement.slice(0, captureToken);
+  const after = replacement.slice(captureToken + 2);
+  if (before) {
+    output.push({ sequence: sequenceAt(source, matchStart), text: before });
+  }
+  appendAttributed(output, sliceAttributed(source, captureStart, captureEnd));
+  if (after) {
+    output.push({
+      sequence: sequenceAt(source, Math.max(captureStart, captureEnd - 1)),
+      text: after,
+    });
+  }
+  return output;
+}
+
+function sliceAttributed(
+  source: AttributedTextSegment[],
+  start: number,
+  end: number,
+): AttributedTextSegment[] {
+  if (end <= start) return [];
+  const output: AttributedTextSegment[] = [];
+  let offset = 0;
+  for (const segment of source) {
+    const segmentEnd = offset + segment.text.length;
+    const sliceStart = Math.max(start, offset);
+    const sliceEnd = Math.min(end, segmentEnd);
+    if (sliceEnd > sliceStart) {
+      appendAttributed(output, [{
+        sequence: segment.sequence,
+        text: segment.text.slice(sliceStart - offset, sliceEnd - offset),
+      }]);
+    }
+    offset = segmentEnd;
+    if (offset >= end) break;
+  }
+  return output;
+}
+
+function sequenceAt(source: AttributedTextSegment[], index: number): number {
+  let offset = 0;
+  for (const segment of source) {
+    if (index < offset + segment.text.length) return segment.sequence;
+    offset += segment.text.length;
+  }
+  return source.at(-1)?.sequence ?? 0;
+}
+
+function appendAttributed(
+  target: AttributedTextSegment[],
+  source: readonly AttributedTextSegment[],
+): void {
+  for (const segment of source) {
+    if (!segment.text) continue;
+    const previous = target.at(-1);
+    if (previous?.sequence === segment.sequence) {
+      previous.text += segment.text;
+    } else {
+      target.push({ ...segment });
+    }
   }
 }
 
@@ -363,6 +511,7 @@ interface BufferedProcessOutput {
 interface ProcessOperationState {
   readonly streams: Map<"stdout" | "stderr", ProcessStreamState>;
   readonly queue: BufferedProcessOutput[];
+  readonly entries: Map<number, BufferedProcessOutput>;
   nextSequence: number;
 }
 
@@ -390,6 +539,7 @@ export class ProcessEventRedactor {
         operation = {
           streams: new Map(),
           queue: [],
+          entries: new Map(),
           nextSequence: 0,
         };
       }
@@ -399,26 +549,20 @@ export class ProcessEventRedactor {
       operation.streams.set(event.stream, state);
       this.#operations.set(event.id, operation);
 
-      const previousBarrier = state.barrier;
-      const text = state.redactor.push(event.text);
       const buffered: BufferedProcessOutput = {
         sequence: operation.nextSequence++,
         template: event,
-        text,
+        text: "",
         unresolved: false,
       };
       operation.queue.push(buffered);
+      operation.entries.set(buffered.sequence, buffered);
 
-      if (!state.redactor.hasPending) {
-        if (previousBarrier) previousBarrier.unresolved = false;
-        state.barrier = undefined;
-      } else if (!previousBarrier || text) {
-        // Any released text proves an older ambiguity was consumed. A suffix
-        // still retained after that release begins in this arrival instead.
-        if (previousBarrier) previousBarrier.unresolved = false;
-        buffered.unresolved = true;
-        state.barrier = buffered;
-      }
+      this.#appendSegments(
+        operation,
+        state.redactor.push(event.text, buffered.sequence),
+      );
+      this.#updateBarrier(operation, state);
 
       this.#enforceBounds(operation);
       return this.#drain(operation);
@@ -449,12 +593,8 @@ export class ProcessEventRedactor {
     this.#operations.delete(id);
     if (!operation) return [];
     for (const state of operation.streams.values()) {
-      const text = state.redactor.flush();
-      if (state.barrier) {
-        state.barrier.text += text;
-        state.barrier.unresolved = false;
-        state.barrier = undefined;
-      }
+      this.#appendSegments(operation, state.redactor.flush());
+      this.#updateBarrier(operation, state);
     }
     return this.#drain(operation, terminal);
   }
@@ -472,6 +612,7 @@ export class ProcessEventRedactor {
       }
       if (buffered.unresolved) break;
       operation.queue.shift();
+      operation.entries.delete(buffered.sequence);
     }
     return events;
   }
@@ -513,9 +654,31 @@ export class ProcessEventRedactor {
         (candidate) => candidate.barrier === barrier,
       );
       if (!state) return;
-      barrier.text += state.redactor.discardPending();
-      barrier.unresolved = false;
-      state.barrier = undefined;
+      this.#appendSegments(operation, state.redactor.discardPending());
+      this.#updateBarrier(operation, state);
+    }
+  }
+
+  #appendSegments(
+    operation: ProcessOperationState,
+    segments: readonly AttributedTextSegment[],
+  ): void {
+    for (const segment of segments) {
+      const buffered = operation.entries.get(segment.sequence);
+      if (buffered) buffered.text += segment.text;
+    }
+  }
+
+  #updateBarrier(
+    operation: ProcessOperationState,
+    state: ProcessStreamState,
+  ): void {
+    const sequence = state.redactor.pendingSequence;
+    const next = sequence === undefined ? undefined : operation.entries.get(sequence);
+    if (state.barrier !== next) {
+      if (state.barrier) state.barrier.unresolved = false;
+      if (next) next.unresolved = true;
+      state.barrier = next;
     }
   }
 }

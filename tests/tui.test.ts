@@ -890,6 +890,45 @@ test("TUI keeps later stderr behind an earlier ambiguous stdout prefix", () => {
   }
 });
 
+test("TUI preserves retained stdout provenance when a same-stream chunk resolves mid-process", () => {
+  const stdin = new FakeInput();
+  const stdout = new FakeOutput();
+  stdout.rows = 36;
+  const terminal = ui(stdin, stdout);
+  terminal.start();
+  try {
+    const id = "cross-stream-provenance";
+    terminal.handleRunEvent({ type: "process-start", id, name: "run_command", input: { command: "order" }, timestamp: NOW } as AgentRunEvent);
+    terminal.handleRunEvent({ type: "process-output", id, name: "run_command", stream: "stdout", text: "eyJ", timestamp: NOW + 1 } as AgentRunEvent);
+    terminal.handleRunEvent({ type: "process-output", id, name: "run_command", stream: "stderr", text: "ERR-LATER\n", timestamp: NOW + 2 } as AgentRunEvent);
+    assert.doesNotMatch(text(terminal.frame().lines), /ERR-LATER/);
+    terminal.handleRunEvent({ type: "process-output", id, name: "run_command", stream: "stdout", text: " benign\n", timestamp: NOW + 3 } as AgentRunEvent);
+
+    const screen = text(terminal.frame().lines);
+    const oldStdout = screen.indexOf("eyJ");
+    const interveningStderr = screen.indexOf("ERR-LATER");
+    const currentStdout = screen.indexOf("benign");
+    assert.ok(oldStdout >= 0 && interveningStderr >= 0 && currentStdout >= 0, screen);
+    assert.ok(oldStdout < interveningStderr, screen);
+    assert.ok(interveningStderr < currentStdout, screen);
+
+    terminal.handleRunEvent({
+      type: "process-end",
+      id,
+      name: "run_command",
+      input: { command: "order" },
+      exitCode: 1,
+      durationMs: 4,
+      truncated: false,
+      timedOut: false,
+      aborted: false,
+      timestamp: NOW + 4,
+    } as AgentRunEvent);
+  } finally {
+    terminal.stop();
+  }
+});
+
 test("terminal process deduplication is bounded and eventually releases old operation IDs", () => {
   const stdin = new FakeInput();
   const stdout = new FakeOutput();

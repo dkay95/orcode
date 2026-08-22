@@ -314,3 +314,100 @@ DONE
 ### Fix-round commit
 
 - Requested message: `fix: preserve cross-stream process event order`
+
+---
+
+## Fix round 3
+
+### Review RED
+
+- Read `task-8-findings-round-3.md` and the complete implementation ledger,
+  then reproduced the retained-fragment provenance defect through both actual
+  consumers before changing production code.
+- Actual RunLog readback failed
+  `RunLog preserves retained stdout provenance when a same-stream chunk resolves mid-process`:
+  stdout `eyJ` at timestamp 11 was combined with the resolving stdout frame at
+  timestamp 13, after intervening stderr at timestamp 12. The observed order
+  was stderr 12, then `eyJ benign` as stdout 13 instead of stdout 11, stderr 12,
+  stdout 13.
+- Actual TUI rendering failed
+  `TUI preserves retained stdout provenance when a same-stream chunk resolves mid-process`:
+  the visible running card rendered `ERR-LATER` before the combined
+  `eyJ benign` stdout text.
+- Root cause was `StreamingTextRedactor.push()` returning one un-attributed
+  string. Once an old retained prefix and current bytes were released together,
+  the operation queue could attach only that combined string to the current
+  frame; original frame and timestamp provenance had already been erased.
+
+### Provenance-aware release
+
+- Streaming redaction now retains attributed text segments carrying the
+  immutable process-arrival sequence. Redaction still runs against the
+  concatenated stream, but untouched slices are mapped back to their source
+  segments and released into the original queue entries.
+- The operation-wide barrier is derived from the earliest still-pending
+  attributed segment. Resolving an old stdout prefix therefore makes that old
+  frame ready first; intervening stderr remains next; bytes originating in the
+  resolving stdout arrival remain on the current frame. Stream, original
+  timestamp, global arrival order and byte order are preserved.
+- Terminal flush and bounded-fragment destruction use the same attributed
+  output path. Empty frames remain suppressed, emitted text is cleared before
+  queue removal, and the canonical `ProcessResult` remains unchanged.
+- The existing 2,048-event / 480,000-character operation bound is retained. An
+  adversarial bound probe released one old-frame
+  `[REDACTED_STREAM_FRAGMENT]`, then all 2,050 stderr frames in order, exposed
+  no ambiguous `eyJ` fragment and emitted exactly one terminal event.
+
+### Redaction-marker self-review
+
+- A focused self-review probe first failed
+  `RunLog emits one redaction marker while preserving AWS label provenance`:
+  the attributed AWS `$1` replacement was processed again by the streaming
+  partial rule, producing duplicate redaction markers and assigning one to the
+  resolving frame.
+- The AWS partial rule is now idempotent for its existing marker. Captured label
+  bytes retain their source attribution, the one synthetic marker uses the
+  label's final-byte provenance, sensitive body bytes are discarded and a
+  current-origin newline remains on the current frame.
+- The agent integration assertion now accepts one or more provenance-preserving
+  process-output frames between its start and end, while still requiring one
+  stable operation/tool identity, exactly one terminal, no post-terminal
+  output, complete split-secret redaction and a byte-identical canonical result.
+
+### Fix-round GREEN evidence
+
+- The two exact review probes passed 2/2. The RunLog result is stdout `eyJ` at
+  timestamp 11, stderr at timestamp 12 and current stdout at timestamp 13; the
+  TUI renders the same order and keeps stderr invisible while the earlier
+  stdout ambiguity is unresolved.
+- Every-family/every-split credential probes passed 1/1 through actual TUI and
+  1/1 through actual RunLog. The real-child ordinary non-line liveness barrier
+  passed 1/1, and terminal/bound behavior remained green.
+- Exact Task 8 focus
+  `node --import tsx --test tests/workspace.test.ts tests/verify.test.ts tests/agent.test.ts tests/tui.test.ts tests/runlog.test.ts`
+  passed 225/225 with no failure or skip.
+- Production and test TypeScript checks both passed.
+- Commands/approval/policy passed 38/38 and exact rules passed 11/11. SSH
+  adapter/config/slash passed 47/47 and SSH UI passed 4/4. Routing/config,
+  OpenRouter, models and reasoning passed 62/62.
+- Full `npm test` reached 764 tests: 763 passed, 0 failed and 1 existing
+  platform-only skip.
+- The central scanner returned no credential findings; the literal audit for
+  `sk-or-`, `AKIA`, `glpat-` and `npm_` returned no matches; and
+  `git diff --check` passed.
+
+### Fix-round scope and concerns
+
+- Production changes remain confined to the approved central streaming
+  privacy layer, `src/redaction.ts`; tests changed only the Task 8 agent,
+  RunLog and TUI coverage. RunLog storage, TUI/view-model code, process
+  producers, approvals, remembered rules, private persistence/retention and
+  provider routing remain unchanged.
+- The existing real process timing probes remain POSIX-only, with the same one
+  platform skip in the full suite. SSH remains covered through injected runner
+  and exact policy tests; no remote host was contacted. Broader UI work, Task 9
+  repair and global Task 10 hardening remain out of scope.
+
+### Fix-round commit
+
+- Requested message: `fix: preserve streamed fragment provenance`
