@@ -23,7 +23,11 @@ import { z } from "zod";
 import type { ApprovalManager, ApprovalRequest } from "./approval.js";
 import { APP_HOME } from "./config.js";
 import { PrivateStore } from "./private-store.js";
-import { CHAT_ARTIFACT_REGISTRY } from "./storage.js";
+import {
+  CHAT_ARTIFACT_REGISTRY,
+  parseCheckpointEntries,
+  type StoredChangeEntry,
+} from "./storage.js";
 import { loadIgnore } from "./ignore.js";
 import {
   browserApprovalSubject,
@@ -65,14 +69,7 @@ const DIFF_LCS_BUDGET = 2_000_000;
 const SEARCH_IGNORES = ["**/.git/**", "**/node_modules/**"] as const;
 
 /** Exported so a fresh process (resume after a crash) can validate and load a persisted run's entries without duplicating this shape. */
-export interface ChangeEntry {
-  path: string;
-  before: string | null;
-  after: string;
-  createdAt: string;
-  /** Groups every entry made by one agent run, for run-level undo (A5). */
-  runId: string;
-}
+export interface ChangeEntry extends StoredChangeEntry {}
 
 export interface ChangeJournalOptions {
   /** Root the checkpoint files live under. Defaults to `~/.orcode`. */
@@ -88,17 +85,6 @@ export function checkpointRunPath(appHome: string, chatId: string, runId: string
     chatId,
     artifactId: runId,
   });
-}
-
-function isChangeEntry(value: unknown): value is ChangeEntry {
-  return (
-    isRecord(value) &&
-    typeof value.path === "string" &&
-    (value.before === null || typeof value.before === "string") &&
-    typeof value.after === "string" &&
-    typeof value.createdAt === "string" &&
-    typeof value.runId === "string"
-  );
 }
 
 export interface UndoRunOutcome {
@@ -123,7 +109,7 @@ export class ChangeJournal {
   constructor(options: ChangeJournalOptions = {}) {
     this.#appHome = options.appHome ?? APP_HOME;
     this.#chatId = options.chatId ?? "default";
-    this.#privateStore = new PrivateStore();
+    this.#privateStore = new PrivateStore({ root: this.#appHome });
   }
 
   async record(entry: ChangeEntry): Promise<void> {
@@ -164,16 +150,12 @@ export class ChangeJournal {
     } catch {
       return [];
     }
-    let parsed: unknown;
+    let valid: ChangeEntry[];
     try {
-      parsed = JSON.parse(raw);
+      valid = parseCheckpointEntries(raw, runId);
     } catch {
       return [];
     }
-    if (!Array.isArray(parsed)) {
-      return [];
-    }
-    const valid = parsed.filter(isChangeEntry).filter((entry) => entry.runId === runId);
     if (valid.length === 0) {
       return [];
     }

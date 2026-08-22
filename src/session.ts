@@ -25,6 +25,7 @@ import {
   type SessionData,
 } from "./types.js";
 import { redactText, redactValue } from "./redaction.js";
+import { PrivateStore } from "./private-store.js";
 import { CHAT_ARTIFACT_REGISTRY, workspaceStorageHash } from "./storage.js";
 import { formatUsd, hasCode, isRecord } from "./utils.js";
 
@@ -438,8 +439,17 @@ export class SessionStore {
       } else if (foreign.kind === "unreadable") {
         // Never overwrite a file we could not understand. Keep it next to the
         // chat so the user can look at it instead of losing it silently.
-        conflictBackupPath = `${this.path}.konflikt-${conflictStamp()}.json`;
-        await rename(this.path, conflictBackupPath);
+        conflictBackupPath = CHAT_ARTIFACT_REGISTRY.resolve("chat-conflict", {
+          appHome: this.appHome,
+          workspace: this.#data.workspace,
+          chatId: this.#data.id,
+          chatFilePath: this.path,
+          conflictId: conflictStamp(),
+        });
+        await new PrivateStore({ root: this.appHome }).writeTextAtomic(
+          conflictBackupPath,
+          foreign.raw,
+        );
       }
 
       this.#data.revision = Math.max(this.#data.revision, foreign.revision) + 1;
@@ -1224,7 +1234,7 @@ function delay(ms: number): Promise<void> {
 
 type ForeignState =
   | { kind: "missing"; revision: number }
-  | { kind: "unreadable"; revision: number }
+  | { kind: "unreadable"; revision: number; raw: string }
   | { kind: "data"; revision: number; data: PersistedSessionData };
 
 async function readForeign(
@@ -1249,7 +1259,7 @@ async function readForeign(
   } catch {
     // handled below
   }
-  return { kind: "unreadable", revision: 0 };
+  return { kind: "unreadable", revision: 0, raw };
 }
 
 /** Cheap change detector; covers files written by builds without `revision`. */

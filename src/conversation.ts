@@ -7,7 +7,11 @@ import {
 } from "@openrouter/agent";
 import { SECURE_FILE_MODE } from "./config.js";
 import { PrivateStore } from "./private-store.js";
-import { CHAT_ARTIFACT_REGISTRY } from "./storage.js";
+import {
+  CHAT_ARTIFACT_REGISTRY,
+  parseConversationStateFile,
+  type StoredConversationStateFile,
+} from "./storage.js";
 import { chatLockPath } from "./session.js";
 import { hasCode, isRecord } from "./utils.js";
 
@@ -16,16 +20,7 @@ import { hasCode, isRecord } from "./utils.js";
  * (session.ts) builds a hardcoded object literal and would silently drop any
  * field it does not know about on every merge (K7a).
  */
-export interface StateFile {
-  version: 1;
-  revision: number;
-  chatId: string;
-  /** How many turns the chat file had when this state was committed. */
-  turnCount: number;
-  updatedAt: string;
-  /** Opaque JSON from `serializeConversationState`. Never introspected. */
-  state: string;
-}
+export type StateFile = StoredConversationStateFile;
 
 const LOCK_WAIT_MS = 3_000;
 const LOCK_POLL_MS = 25;
@@ -96,7 +91,7 @@ export class ConversationStore {
     chatId: string,
   ): Promise<ConversationStore> {
     const statePath = ConversationStore.path(appHome, chatFilePath);
-    const privateStore = new PrivateStore();
+    const privateStore = new PrivateStore({ root: appHome });
     const [stateFile, currentTurnCount] = await Promise.all([
       readStateFile(statePath, privateStore),
       readChatTurnCount(chatFilePath),
@@ -234,19 +229,7 @@ async function readStateFile(path: string, store: PrivateStore): Promise<StateFi
     return null;
   }
   try {
-    const parsed: unknown = JSON.parse(raw);
-    if (
-      !isRecord(parsed) ||
-      parsed.version !== 1 ||
-      typeof parsed.revision !== "number" ||
-      typeof parsed.chatId !== "string" ||
-      typeof parsed.turnCount !== "number" ||
-      typeof parsed.updatedAt !== "string" ||
-      typeof parsed.state !== "string"
-    ) {
-      return null;
-    }
-    return parsed as unknown as StateFile;
+    return parseConversationStateFile(raw);
   } catch {
     return null;
   }

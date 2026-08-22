@@ -10,7 +10,7 @@ import {
   rename,
   unlink,
 } from "node:fs/promises";
-import { dirname, join } from "node:path";
+import { dirname, join, relative, resolve, sep } from "node:path";
 
 export const PRIVATE_DIRECTORY_MODE = 0o700;
 export const PRIVATE_FILE_MODE = 0o600;
@@ -44,15 +44,21 @@ export interface PrivateStoreProcessResult {
   stderr: string;
 }
 
+export interface PrivateStoreProcessOptions {
+  environment?: Readonly<Record<string, string>>;
+}
+
 export type PrivateStoreProcessRunner = (
   executable: string,
   args: readonly string[],
+  options?: PrivateStoreProcessOptions,
 ) => Promise<PrivateStoreProcessResult>;
 
 const WINDOWS_DACL_SCRIPT = String.raw`
 $ErrorActionPreference = 'Stop'
-$path = $args[0]
-$kind = $args[1]
+$path = $env:ORCODE_PRIVATE_PATH
+$kind = $env:ORCODE_PRIVATE_KIND
+if ([string]::IsNullOrEmpty($path) -or ($kind -ne 'directory' -and $kind -ne 'file')) { exit 16 }
 $user = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
 $system = New-Object System.Security.Principal.SecurityIdentifier('S-1-5-18')
 if ($kind -eq 'directory') {
@@ -76,6 +82,7 @@ $actual = @($verified.Access | ForEach-Object { $_.IdentityReference.Translate([
 $deny = @($verified.Access | Where-Object { $_.AccessControlType -ne $allow }).Count
 if (-not $verified.AreAccessRulesProtected -or $deny -ne 0 -or (Compare-Object $expected $actual)) { exit 17 }
 `;
+const WINDOWS_DACL_ENCODED = Buffer.from(WINDOWS_DACL_SCRIPT, "utf16le").toString("base64");
 
 export class WindowsPrivateStoreAdapter implements PrivateStoreAdapter {
   readonly name = "windows-current-user-system-dacl";
@@ -104,11 +111,14 @@ export class WindowsPrivateStoreAdapter implements PrivateStoreAdapter {
     const result = await this.run("powershell.exe", [
       "-NoProfile",
       "-NonInteractive",
-      "-Command",
-      WINDOWS_DACL_SCRIPT,
-      path,
-      kind,
-    ]);
+      "-EncodedCommand",
+      WINDOWS_DACL_ENCODED,
+    ], {
+      environment: {
+        ORCODE_PRIVATE_PATH: path,
+        ORCODE_PRIVATE_KIND: kind,
+      },
+    });
     if (result.code !== 0) {
       throw new Error(
         `PrivateStore-DACL konnte für ${path} nicht verifiziert werden (${result.stderr.trim() || `Exit ${result.code}`}).`,
@@ -119,6 +129,14 @@ export class WindowsPrivateStoreAdapter implements PrivateStoreAdapter {
 
 export interface PrivateStoreOptions {
   adapter?: PrivateStoreAdapter;
+  /** Trusted storage boundary. The root itself and every descendant component must be a real directory. */
+  root?: string;
+}
+
+interface DirectoryIdentity {
+  path: string;
+  dev: number;
+  ino: number;
 }
 
 /**
@@ -127,6 +145,7 @@ export interface PrivateStoreOptions {
  */
 export class PrivateStore {
   readonly adapter: PrivateStoreAdapter;
+  readonly #root: string | null;
   #availability: Promise<boolean> | null = null;
 
   constructor(options: PrivateStoreOptions = {}) {
@@ -135,6 +154,7 @@ export class PrivateStore {
         ? new WindowsPrivateStoreAdapter()
         : new PosixPrivateStoreAdapter()
     );
+    this.#root = options.root ? resolve(options.root) : null;
   }
 
   async available(): Promise<boolean> {
@@ -150,25 +170,35 @@ export class PrivateStore {
 
   async ensureDirectory(path: string): Promise<void> {
     await this.assertAvailable();
-    await mkdir(path, { recursive: true, mode: PRIVATE_DIRECTORY_MODE });
-    await this.adapter.protectDirectory(path);
+    const target = resolve(path);
+    const root = this.#root ?? target;
+    await ensurePrivateDirectoryTree(root, target, this.adapter);
   }
 
   async writeTextAtomic(path: string, content: string): Promise<void> {
     await this.assertAvailable();
-    await this.ensureDirectory(dirname(path));
-    const temporary = `${path}.${randomUUID()}.private.tmp`;
+    const target = resolve(path);
+    const parent = dirname(target);
+    const root = this.#root ?? parent;
+    assertContained(root, target);
+    await ensurePrivateDirectoryTree(root, parent, this.adapter);
+    const ancestors = await directoryIdentities(root, parent);
+    const temporary = `${target}.${randomUUID()}.private.tmp`;
     let handle: Awaited<ReturnType<typeof open>> | null = null;
     try {
       handle = await open(temporary, "wx", PRIVATE_FILE_MODE);
       await this.adapter.protectFile(temporary);
+      await assertDirectoryIdentities(ancestors);
+      await assertHandlePathIdentity(handle, temporary);
       await handle.writeFile(content, "utf8");
       await handle.sync();
+      await assertDirectoryIdentities(ancestors);
+      await assertHandlePathIdentity(handle, temporary);
       await handle.close();
       handle = null;
-      await rename(temporary, path);
+      await rename(temporary, target);
       if (this.adapter instanceof PosixPrivateStoreAdapter) {
-        await this.adapter.protectFile(path);
+        await this.adapter.protectFile(target);
       }
     } catch (error) {
       await handle?.close().catch(() => undefined);
@@ -183,7 +213,18 @@ export class PrivateStore {
 
   async protectTree(path: string): Promise<void> {
     await this.assertAvailable();
+    const target = resolve(path);
+    const root = this.#root ?? target;
+    assertContained(root, target);
+    await directoryIdentities(root, target === root ? root : dirname(target));
+    await this.#protectTree(target);
+  }
+
+  async #protectTree(path: string): Promise<void> {
     const info = await lstat(path);
+    if (info.isSymbolicLink()) {
+      throw new Error(`PrivateStore schützt keine symbolischen Links in exakten Daten: ${path}`);
+    }
     if (!info.isDirectory()) {
       await this.adapter.protectFile(path);
       return;
@@ -195,7 +236,7 @@ export class PrivateStore {
         throw new Error(`PrivateStore schützt keine symbolischen Links in exakten Daten: ${child}`);
       }
       if (entry.isDirectory()) {
-        await this.protectTree(child);
+        await this.#protectTree(child);
       } else if (entry.isFile()) {
         await this.adapter.protectFile(child);
       }
@@ -203,14 +244,105 @@ export class PrivateStore {
   }
 }
 
+async function ensurePrivateDirectoryTree(
+  rootPath: string,
+  targetPath: string,
+  adapter: PrivateStoreAdapter,
+): Promise<void> {
+  const root = resolve(rootPath);
+  const target = resolve(targetPath);
+  assertContained(root, target);
+  await ensureOneDirectory(root, adapter);
+  const suffix = relative(root, target);
+  let current = root;
+  for (const component of suffix ? suffix.split(sep) : []) {
+    current = join(current, component);
+    await ensureOneDirectory(current, adapter);
+  }
+}
+
+async function ensureOneDirectory(path: string, adapter: PrivateStoreAdapter): Promise<void> {
+  try {
+    const info = await lstat(path);
+    if (info.isSymbolicLink() || !info.isDirectory()) {
+      throw new Error(`PrivateStore-Verzeichnis ist kein echtes Verzeichnis: ${path}`);
+    }
+  } catch (error) {
+    if (!hasCode(error, "ENOENT")) throw error;
+    await mkdir(path, { mode: PRIVATE_DIRECTORY_MODE });
+  }
+  await adapter.protectDirectory(path);
+  const protectedInfo = await lstat(path);
+  if (protectedInfo.isSymbolicLink() || !protectedInfo.isDirectory()) {
+    throw new Error(`PrivateStore-Verzeichnis wurde während der Absicherung ausgetauscht: ${path}`);
+  }
+}
+
+async function directoryIdentities(rootPath: string, targetPath: string): Promise<DirectoryIdentity[]> {
+  const root = resolve(rootPath);
+  const target = resolve(targetPath);
+  assertContained(root, target);
+  const paths = [root];
+  const suffix = relative(root, target);
+  let current = root;
+  for (const component of suffix ? suffix.split(sep) : []) {
+    current = join(current, component);
+    paths.push(current);
+  }
+  const identities: DirectoryIdentity[] = [];
+  for (const path of paths) {
+    const info = await lstat(path);
+    if (info.isSymbolicLink() || !info.isDirectory()) {
+      throw new Error(`Symbolischer Link oder ungültiger PrivateStore-Pfad: ${path}`);
+    }
+    identities.push({ path, dev: info.dev, ino: info.ino });
+  }
+  return identities;
+}
+
+async function assertDirectoryIdentities(expected: readonly DirectoryIdentity[]): Promise<void> {
+  for (const identity of expected) {
+    const info = await lstat(identity.path);
+    if (info.isSymbolicLink() || !info.isDirectory() || info.dev !== identity.dev || info.ino !== identity.ino) {
+      throw new Error(`PrivateStore-Pfad wurde vor dem Publish ausgetauscht: ${identity.path}`);
+    }
+  }
+}
+
+async function assertHandlePathIdentity(
+  handle: Awaited<ReturnType<typeof open>>,
+  path: string,
+): Promise<void> {
+  const [opened, named] = await Promise.all([handle.stat(), lstat(path)]);
+  if (named.isSymbolicLink() || !named.isFile() || opened.dev !== named.dev || opened.ino !== named.ino) {
+    throw new Error(`PrivateStore-Tempdatei wurde vor dem Publish ausgetauscht: ${path}`);
+  }
+}
+
+function assertContained(rootPath: string, candidatePath: string): void {
+  const root = resolve(rootPath);
+  const candidate = resolve(candidatePath);
+  const value = relative(root, candidate);
+  if (value === ".." || value.startsWith(`..${sep}`)) {
+    throw new Error(`PrivateStore-Ziel liegt außerhalb seiner Root-Grenze: ${candidate}`);
+  }
+}
+
+function hasCode(error: unknown, code: string): boolean {
+  return typeof error === "object" && error !== null && "code" in error
+    && (error as { code?: unknown }).code === code;
+}
+
 async function runPrivateStoreProcess(
   executable: string,
   args: readonly string[],
+  options: PrivateStoreProcessOptions = {},
 ): Promise<PrivateStoreProcessResult> {
   return new Promise((resolve, reject) => {
     const child = spawn(executable, [...args], {
       stdio: ["ignore", "pipe", "pipe"],
       windowsHide: true,
+      env: { ...process.env, ...options.environment },
     });
     let stdout = "";
     let stderr = "";

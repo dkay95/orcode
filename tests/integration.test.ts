@@ -227,6 +227,20 @@ test("/chat operations keep using the app home selected by startup migration", a
   assert.equal(context.session.data.title, "Nach Migration");
 });
 
+test("/config reports and mutations use the config path selected by startup migration", async () => {
+  const { context } = await harness();
+  const { out, lines } = collectOutput();
+  context.out = out;
+  const selectedPath = context.configPath!;
+
+  await handleSlashCommand("/config", context);
+  await handleSlashCommand("/steps 7", context);
+
+  assert.match(lines.join("\n"), new RegExp(selectedPath.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+  const persisted = JSON.parse(await readFile(selectedPath, "utf8")) as { maxSteps: number };
+  assert.equal(persisted.maxSteps, 7);
+});
+
 test("/allow list shows nothing, then a remembered rule, then nothing after forget", async () => {
   const { context } = await harness();
   const { out, lines } = collectOutput();

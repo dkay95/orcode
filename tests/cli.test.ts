@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import test from "node:test";
 import {
   CliUsageError,
@@ -138,7 +139,7 @@ test("startup awaits migration before config, rules, chats, exact artifacts, key
         order.push("migration-start");
         await migrationGate;
         order.push("migration-complete");
-        return { appHome: "/synthetic/.orcode", warning: null };
+        return { status: "ready", appHome: "/synthetic/.orcode", warning: null };
       },
       pruneCheckpoints: async (appHome) => {
         assert.equal(appHome, "/synthetic/.orcode");
@@ -184,4 +185,60 @@ test("startup awaits migration before config, rules, chats, exact artifacts, key
     "key",
     "network",
   ]);
+});
+
+test("declined future or recovery-required migration stops startup before any mutating store opens", async () => {
+  const { initializeStartupStorage } = await import("../src/cli.js");
+  for (const status of ["declined", "future", "recovery-required"] as const) {
+    const calls: string[] = [];
+    await assert.rejects(
+      initializeStartupStorage(
+        { workspace: "/synthetic/workspace", newChat: false },
+        {
+          migrateAppHome: async () => {
+            calls.push("migration");
+            return {
+              status,
+              appHome: "/synthetic/.routercode",
+              warning: `startup stopped: ${status}`,
+            } as never;
+          },
+          pruneCheckpoints: async () => {
+            calls.push("prune");
+          },
+          loadConfig: async () => {
+            calls.push("config");
+            return structuredClone(DEFAULT_CONFIG);
+          },
+          loadRules: async () => {
+            calls.push("rules");
+            return {} as never;
+          },
+          openSession: async () => {
+            calls.push("session");
+            return {} as never;
+          },
+        },
+      ),
+      new RegExp(status),
+    );
+    assert.deepEqual(calls, ["migration"]);
+  }
+});
+
+test("startup exposes the selected app-home config path to every runtime command surface", async () => {
+  const { initializeStartupStorage } = await import("../src/cli.js");
+  const appHome = "/synthetic/custom-or-legacy-home";
+  const result = await initializeStartupStorage(
+    { workspace: "/synthetic/workspace", newChat: false },
+    {
+      migrateAppHome: async () => ({ status: "ready", appHome, warning: null } as never),
+      pruneCheckpoints: async () => undefined,
+      loadConfig: async () => structuredClone(DEFAULT_CONFIG),
+      loadRules: async () => ({} as never),
+      openSession: async () => ({ appHome, data: { id: "chat-a" } } as never),
+    },
+  );
+
+  assert.equal((result as typeof result & { configPath?: string }).configPath, join(appHome, "config.json"));
 });

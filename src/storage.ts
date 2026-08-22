@@ -9,7 +9,8 @@ import {
   rm,
   stat,
 } from "node:fs/promises";
-import { basename, dirname, join, relative, sep } from "node:path";
+import { basename, dirname, join, relative, resolve as resolvePath, sep } from "node:path";
+import { deserializeConversationState } from "@openrouter/agent";
 import { PrivateStore } from "./private-store.js";
 import { redactRunEvent, redactValue } from "./redaction.js";
 import { normalizePermissionRuleFile, type PermissionRule, type RuleFileV2 } from "./rules.js";
@@ -19,19 +20,69 @@ export const STORAGE_SCHEMA_VERSION = 1 as const;
 export const RUN_LOG_ENVELOPE_VERSION = 1 as const;
 export const DEFAULT_MIGRATION_BACKUP_BYTES = 250 * 1_024 * 1_024;
 
+export interface StoredConversationStateFile {
+  version: 1;
+  revision: number;
+  chatId: string;
+  turnCount: number;
+  updatedAt: string;
+  state: string;
+}
+
+export interface StoredChangeEntry {
+  path: string;
+  before: string | null;
+  after: string;
+  createdAt: string;
+  runId: string;
+}
+
+export function parseConversationStateFile(
+  raw: string,
+  expectedChatId?: string,
+): StoredConversationStateFile {
+  const value = parseRecord(raw);
+  if (value.version !== 1 || typeof value.revision !== "number"
+    || typeof value.chatId !== "string" || typeof value.turnCount !== "number"
+    || typeof value.updatedAt !== "string" || typeof value.state !== "string"
+    || (expectedChatId !== undefined && value.chatId !== expectedChatId)) {
+    throw new Error("ungültiger ConversationStore-Zustand");
+  }
+  deserializeConversationState(value.state);
+  return value as unknown as StoredConversationStateFile;
+}
+
+export function parseCheckpointEntries(raw: string, expectedRunId?: string): StoredChangeEntry[] {
+  const value: unknown = JSON.parse(raw);
+  if (!Array.isArray(value) || !value.every((entry) => isStoredChangeEntry(entry)
+    && (expectedRunId === undefined || entry.runId === expectedRunId))) {
+    throw new Error("ungültiges ChangeJournal-Checkpoint");
+  }
+  return value as StoredChangeEntry[];
+}
+
+function isStoredChangeEntry(value: unknown): value is StoredChangeEntry {
+  return isRecord(value) && typeof value.path === "string"
+    && (value.before === null || typeof value.before === "string")
+    && typeof value.after === "string" && typeof value.createdAt === "string"
+    && typeof value.runId === "string";
+}
+
 export type ChatArtifactKind =
   | "chat"
+  | "chat-conflict"
   | "conversation-state"
   | "conversation-conflict"
   | "run-log"
   | "checkpoint"
+  | "lock"
   | "task-sidecar";
 
 export interface ChatArtifactEntry {
   kind: ChatArtifactKind;
   privacy: "redacted" | "exact";
   retention: "chat" | "redacted-run-log" | "exact-recovery";
-  migration: "required" | "reserved";
+  migration: "required" | "reserved" | "never";
   deletion: "file" | "chat-tree";
 }
 
@@ -47,10 +98,12 @@ export interface ChatArtifactLocation {
 
 const ARTIFACTS: readonly ChatArtifactEntry[] = [
   { kind: "chat", privacy: "redacted", retention: "chat", migration: "required", deletion: "file" },
+  { kind: "chat-conflict", privacy: "exact", retention: "exact-recovery", migration: "required", deletion: "file" },
   { kind: "conversation-state", privacy: "exact", retention: "exact-recovery", migration: "required", deletion: "file" },
   { kind: "conversation-conflict", privacy: "exact", retention: "exact-recovery", migration: "required", deletion: "file" },
   { kind: "run-log", privacy: "redacted", retention: "redacted-run-log", migration: "required", deletion: "chat-tree" },
   { kind: "checkpoint", privacy: "exact", retention: "exact-recovery", migration: "required", deletion: "chat-tree" },
+  { kind: "lock", privacy: "exact", retention: "exact-recovery", migration: "never", deletion: "file" },
   { kind: "task-sidecar", privacy: "exact", retention: "exact-recovery", migration: "reserved", deletion: "chat-tree" },
 ];
 
@@ -77,6 +130,11 @@ export class ChatArtifactRegistry {
         if (!hash) throw new Error("Chat-Pfad braucht workspace oder workspaceHash.");
         return join(location.appHome, "chats", hash, `${location.chatId}.json`);
       }
+      case "chat-conflict": {
+        const conflictId = safeArtifactId(location.conflictId);
+        if (!conflictId) throw new Error("Chat-Konfliktartefakt braucht conflictId.");
+        return `${location.chatFilePath ?? this.resolve("chat", location)}.konflikt-${conflictId}.json`;
+      }
       case "conversation-state":
         return `${location.chatFilePath ?? this.resolve("chat", location)}.state.json`;
       case "conversation-conflict": {
@@ -90,16 +148,46 @@ export class ChatArtifactRegistry {
       case "checkpoint":
         if (!artifactId) throw new Error("Checkpoint braucht artifactId.");
         return join(location.appHome, "checkpoints", location.chatId, `${artifactId}.json`);
+      case "lock": {
+        const chatPath = location.chatFilePath ?? this.resolve("chat", location);
+        if (artifactId === "chat") return `${chatPath}.lock`;
+        if (artifactId === "conversation-state") return `${this.resolve("conversation-state", { ...location, chatFilePath: chatPath })}.lock`;
+        throw new Error("Lock-Artefakt braucht artifactId chat oder conversation-state.");
+      }
       case "task-sidecar":
         if (!artifactId) throw new Error("Task-Sidecar braucht artifactId.");
         return join(location.appHome, "tasks", location.chatId, `${artifactId}.json`);
     }
   }
 
-  /** Task sidecars are a reserved schema kind; no 0.4 producer exists. */
-  existing(kind: ChatArtifactKind, _location: Omit<ChatArtifactLocation, "artifactId">): string[] {
+  /** Enumerate files owned by one chat; task sidecars remain reserved-only. */
+  async existing(kind: ChatArtifactKind, location: Omit<ChatArtifactLocation, "artifactId">): Promise<string[]> {
     if (kind === "task-sidecar") return [];
-    return [];
+    const chatPath = location.chatFilePath ?? this.resolve("chat", location);
+    switch (kind) {
+      case "chat":
+        return await pathExists(chatPath) ? [chatPath] : [];
+      case "chat-conflict":
+        return filesMatching(dirname(chatPath), (name) =>
+          name.startsWith(`${basename(chatPath)}.konflikt-`) && name.endsWith(".json"));
+      case "conversation-state": {
+        const path = this.resolve("conversation-state", { ...location, chatFilePath: chatPath });
+        return await pathExists(path) ? [path] : [];
+      }
+      case "conversation-conflict":
+        return filesMatching(dirname(chatPath), (name) =>
+          name.startsWith(`${basename(chatPath)}.state.json.konflikt-`) && name.endsWith(".json"));
+      case "run-log":
+        return filesMatching(join(location.appHome, "runs", location.chatId), (name) => name.endsWith(".ndjson"));
+      case "checkpoint":
+        return filesMatching(join(location.appHome, "checkpoints", location.chatId), (name) => name.endsWith(".json"));
+      case "lock": {
+        const candidates = [`${chatPath}.lock`, `${chatPath}.state.json.lock`];
+        const found: string[] = [];
+        for (const path of candidates) if (await pathExists(path)) found.push(path);
+        return found;
+      }
+    }
   }
 }
 
@@ -121,6 +209,15 @@ export type MigrationPhase =
   | "backed-up"
   | "complete";
 
+const MIGRATION_PHASES = new Set<MigrationPhase>([
+  "planned",
+  "staged",
+  "validated",
+  "committed",
+  "backed-up",
+  "complete",
+]);
+
 export interface StorageMigrationManifest {
   version: typeof STORAGE_SCHEMA_VERSION;
   phase: MigrationPhase;
@@ -137,6 +234,7 @@ export interface StorageMigrationManifest {
 }
 
 export interface AppHomeMigrationResult {
+  status: "ready" | "declined" | "future" | "recovery-required";
   appHome: string;
   warning: string | null;
 }
@@ -155,7 +253,7 @@ export async function migrateStorageHome(
 ): Promise<AppHomeMigrationResult> {
   const newExists = await pathExists(newHome);
   const legacyExists = await pathExists(legacyHome);
-  const privateStore = options.privateStore ?? new PrivateStore();
+  const privateStore = options.privateStore ?? new PrivateStore({ root: newHome });
   const maxBackupBytes = options.maxBackupBytes ?? DEFAULT_MIGRATION_BACKUP_BYTES;
   const manifestPath = migrationManifestPath(newHome);
   const futureManifestVersion = newExists
@@ -163,20 +261,38 @@ export async function migrateStorageHome(
     : null;
   if (futureManifestVersion !== null) {
     return {
+      status: "future",
       appHome: newHome,
       warning: `Migrations-Manifest hat die zukünftige Version ${futureManifestVersion} und wurde nicht überschrieben.`,
     };
   }
 
-  const existingManifest = newExists
-    ? await readManifest(manifestPath)
-    : null;
+  const manifestState = newExists
+    ? await readManifestState(manifestPath, newHome, legacyHome)
+    : { kind: "absent" } as const;
+  if (manifestState.kind === "invalid") {
+    return {
+      status: "recovery-required",
+      appHome: newHome,
+      warning: `Migration braucht manuelle Wiederherstellung: ${manifestState.reason}`,
+    };
+  }
+  const existingManifest = manifestState.kind === "valid" ? manifestState.manifest : null;
   if (existingManifest?.complete) {
+    try {
+      await rm(existingManifest.stagingPath, { recursive: true, force: true });
+    } catch (error) {
+      return {
+        status: "recovery-required",
+        appHome: newHome,
+        warning: `Migrations-Staging konnte nicht bereinigt werden: ${errorText(error)}`,
+      };
+    }
     return migrationResult(newHome, existingManifest);
   }
 
   if (!legacyExists && !existingManifest) {
-    if (!newExists) return { appHome: newHome, warning: null };
+    if (!newExists) return { status: "ready", appHome: newHome, warning: null };
     return migrateCurrentConfig(
       newHome,
       privateStore,
@@ -193,6 +309,7 @@ export async function migrateStorageHome(
   const future = await futureConfigVersion(activeSource);
   if (future !== null) {
     return {
+      status: "future",
       appHome: newExists ? newHome : legacyHome,
       warning: `Speichermigration abgelehnt: ${activeSource}/config.json hat die zukünftige schemaVersion ${future}.`,
     };
@@ -201,21 +318,35 @@ export async function migrateStorageHome(
     const targetFuture = await futureConfigVersion(newHome);
     if (targetFuture !== null) {
       return {
+        status: "future",
         appHome: newHome,
         warning: `Speichermigration abgelehnt: ${newHome}/config.json hat die zukünftige schemaVersion ${targetFuture}.`,
       };
     }
   }
 
-  const sourceSize = await treeSize(activeSource);
-  if (sourceSize > maxBackupBytes) {
+  if (existingManifest && await checksumTree(activeSource) !== existingManifest.sourceChecksum) {
     return {
+      status: "recovery-required",
+      appHome: newHome,
+      warning: "Migrationsquelle stimmt nicht mehr mit dem gespeicherten Checksum überein.",
+    };
+  }
+
+  const sourceSize = await treeSize(activeSource);
+  const managedBackupSize = await optionalTreeSize(join(newHome, "migration-backups"));
+  const configBackupSize = await pendingConfigBackupSize(newHome);
+  const postMigrationBackupSize = sourceSize + managedBackupSize + configBackupSize;
+  if (postMigrationBackupSize > maxBackupBytes) {
+    return {
+      status: "declined",
       appHome: newExists ? newHome : legacyHome,
-      warning: `Migration abgebrochen: Das erforderliche Backup ist zu groß (${sourceSize} Byte). Bitte ${activeSource} manuell archivieren.`,
+      warning: `Migration abgebrochen: Die globalen Backups wären zu groß (${postMigrationBackupSize} Byte). Bitte ${activeSource} manuell archivieren.`,
     };
   }
   if (!(await privateStore.available())) {
     return {
+      status: "declined",
       appHome: newExists ? newHome : legacyHome,
       warning: "Migration abgebrochen: Die private Berechtigungsgrenze für das exakte Backup ist nicht verfügbar.",
     };
@@ -257,6 +388,14 @@ export async function migrateStorageHome(
   await persistManifest(newHome, manifest, privateStore);
   await options.onPhase?.("validated", manifest);
 
+  if (await checksumTree(manifest.sourcePath) !== manifest.sourceChecksum) {
+    return {
+      status: "recovery-required",
+      appHome: newHome,
+      warning: "Migrationsquelle wurde nach der Validierung verändert; Commit wurde nicht ausgeführt.",
+    };
+  }
+
   for (const destination of manifest.destinationPaths) {
     const staged = join(manifest.stagingPath, relative(newHome, destination));
     await privateStore.writeTextAtomic(destination, await readFile(staged, "utf8"));
@@ -264,6 +403,14 @@ export async function migrateStorageHome(
   manifest.phase = "committed";
   await persistManifest(newHome, manifest, privateStore);
   await options.onPhase?.("committed", manifest);
+
+  if (await checksumTree(manifest.sourcePath) !== manifest.sourceChecksum) {
+    return {
+      status: "recovery-required",
+      appHome: newHome,
+      warning: "Migrationsquelle wurde vor dem Backup-Rename verändert; Quelle bleibt erhalten.",
+    };
+  }
 
   if (await pathExists(manifest.sourcePath)) {
     await privateStore.ensureDirectory(dirname(manifest.backupPath));
@@ -277,11 +424,11 @@ export async function migrateStorageHome(
   await persistManifest(newHome, manifest, privateStore);
   await options.onPhase?.("backed-up", manifest);
 
+  await rm(manifest.stagingPath, { recursive: true, force: true });
   manifest.phase = "complete";
   manifest.complete = true;
   manifest.completedAt = new Date().toISOString();
   await persistManifest(newHome, manifest, privateStore);
-  await rm(manifest.stagingPath, { recursive: true, force: true });
   await options.onPhase?.("complete", manifest);
   return migrationResult(newHome, manifest);
 }
@@ -300,7 +447,7 @@ async function buildStaging(
   const chatRoot = join(manifest.sourcePath, "chats");
   for (const workspaceDir of await directories(chatRoot)) {
     for (const name of await names(workspaceDir)) {
-      if (!name.endsWith(".json") || name.includes(".state.json") || name.endsWith(".lock")) continue;
+      if (!name.endsWith(".json") || name.includes(".state.json") || name.includes(".konflikt-") || name.endsWith(".lock")) continue;
       const source = join(workspaceDir, name);
       const oldId = name.slice(0, -".json".length);
       let parsed: Record<string, unknown>;
@@ -319,6 +466,7 @@ async function buildStaging(
         chatId: newId,
       });
       await stageText(manifest, newHome, destination, `${JSON.stringify(redactValue(parsed), null, 2)}\n`, store);
+      await stageChatConflicts(manifest, newHome, source, destination, store);
       await stageConversationArtifacts(manifest, newHome, source, destination, oldId, newId, store);
     }
   }
@@ -330,6 +478,28 @@ async function buildStaging(
   await stageRules(manifest, newHome, store);
   manifest.destinationPaths = [...new Set(manifest.destinationPaths)].sort();
   return manifest;
+}
+
+async function stageChatConflicts(
+  manifest: StorageMigrationManifest,
+  newHome: string,
+  sourceChat: string,
+  destinationChat: string,
+  store: PrivateStore,
+): Promise<void> {
+  const directory = dirname(sourceChat);
+  const prefix = `${basename(sourceChat)}.konflikt-`;
+  for (const name of await names(directory)) {
+    if (!name.startsWith(prefix) || !name.endsWith(".json") || name.endsWith(".lock")) continue;
+    const conflictId = name.slice(prefix.length, -".json".length);
+    const destination = CHAT_ARTIFACT_REGISTRY.resolve("chat-conflict", {
+      appHome: newHome,
+      chatId: "path-derived",
+      chatFilePath: destinationChat,
+      conflictId,
+    });
+    await stageText(manifest, newHome, destination, await readFile(join(directory, name), "utf8"), store);
+  }
 }
 
 async function stageConversationArtifacts(
@@ -348,10 +518,7 @@ async function stageConversationArtifacts(
     if (name.endsWith(".lock")) continue;
     const source = join(directory, name);
     try {
-      const value = parseRecord(await readFile(source, "utf8"));
-      if (value.version !== 1 || typeof value.state !== "string" || value.chatId !== oldId) {
-        throw new Error("ungültiger ConversationStore-Zustand");
-      }
+      const value = parseConversationStateFile(await readFile(source, "utf8"), oldId) as unknown as Record<string, unknown>;
       value.chatId = newId;
       const destination = name === prefix
         ? `${destinationChat}.state.json`
@@ -414,7 +581,11 @@ async function stageMappedTrees(
       const source = join(oldDirectory, name);
       try {
         const content = await readFile(source, "utf8");
-        JSON.parse(content);
+        if (kind === "checkpoint") {
+          parseCheckpointEntries(content, name.slice(0, -".json".length));
+        } else {
+          JSON.parse(content);
+        }
         const destination = CHAT_ARTIFACT_REGISTRY.resolve(kind, {
           appHome: newHome,
           chatId: newId,
@@ -512,13 +683,19 @@ async function stageRules(
   const current = await readRuleFile(destination);
   const incoming = await readRuleFile(sourcePath);
   if (current === null && incoming === null) return;
-  const merged = [...(current?.rules ?? [])];
-  const keys = new Set(merged.map(ruleMergeKey));
-  for (const rule of incoming?.rules ?? []) {
+  const merged: PermissionRule[] = [];
+  const indexes = new Map<string, number>();
+  for (const rule of [...(current?.rules ?? []), ...(incoming?.rules ?? [])]) {
     const key = ruleMergeKey(rule);
-    if (keys.has(key)) continue;
-    keys.add(key);
-    merged.push(rule);
+    const existingIndex = indexes.get(key);
+    if (existingIndex === undefined) {
+      indexes.set(key, merged.length);
+      merged.push(rule);
+      continue;
+    }
+    if (rule.decision === "deny" && merged[existingIndex]!.decision !== "deny") {
+      merged[existingIndex] = rule;
+    }
   }
   await stageText(manifest, newHome, destination, `${JSON.stringify({ version: 2, rules: merged }, null, 2)}\n`, store);
 }
@@ -547,10 +724,14 @@ async function validateStaging(manifest: StorageMigrationManifest, newHome: stri
           throw new Error(`Run-Log-Validierung fehlgeschlagen: ${destination}`);
         }
       }
-    } else {
+    } else if (!isUnreadableChatConflictPath(destination)) {
       JSON.parse(content);
     }
   }
+}
+
+function isUnreadableChatConflictPath(path: string): boolean {
+  return path.includes(".json.konflikt-") && !path.includes(".state.json.konflikt-");
 }
 
 async function migrateCurrentConfig(
@@ -560,33 +741,36 @@ async function migrateCurrentConfig(
   normalizeConfig: AppHomeMigrationOptions["normalizeConfig"],
 ): Promise<AppHomeMigrationResult> {
   const path = join(appHome, "config.json");
-  if (!(await pathExists(path))) return { appHome, warning: null };
+  if (!(await pathExists(path))) return { status: "ready", appHome, warning: null };
   let value: Record<string, unknown>;
   let raw: string;
   try {
     raw = await readFile(path, "utf8");
     value = parseRecord(raw);
   } catch {
-    return { appHome, warning: null };
+    return { status: "ready", appHome, warning: null };
   }
   const version = value.schemaVersion;
   if (typeof version === "number" && version > STORAGE_SCHEMA_VERSION) {
-    return { appHome, warning: `Konfiguration hat die zukünftige schemaVersion ${version}; sie wurde nicht überschrieben.` };
+    return { status: "future", appHome, warning: `Konfiguration hat die zukünftige schemaVersion ${version}; sie wurde nicht überschrieben.` };
   }
-  if (version === STORAGE_SCHEMA_VERSION) return { appHome, warning: null };
-  if (Buffer.byteLength(raw) > maxBackupBytes) {
-    return { appHome, warning: "Config-Migration abgebrochen: Das erforderliche Backup ist zu groß; bitte manuell archivieren." };
-  }
-  if (!(await store.available())) {
-    return { appHome, warning: "Config-Migration abgebrochen: PrivateStore ist nicht verfügbar." };
-  }
+  if (version === STORAGE_SCHEMA_VERSION) return { status: "ready", appHome, warning: null };
   const checksum = createHash("sha256").update(raw).digest("hex");
   const backup = join(appHome, "migration-backups", `config-v0-${checksum.slice(0, 16)}.json`);
+  const managedBackupSize = await optionalTreeSize(join(appHome, "migration-backups"));
+  const postMigrationBackupSize = managedBackupSize
+    + (await pathExists(backup) ? 0 : Buffer.byteLength(raw));
+  if (postMigrationBackupSize > maxBackupBytes) {
+    return { status: "declined", appHome, warning: "Config-Migration abgebrochen: Das erforderliche Backup ist zu groß; bitte manuell archivieren." };
+  }
+  if (!(await store.available())) {
+    return { status: "declined", appHome, warning: "Config-Migration abgebrochen: PrivateStore ist nicht verfügbar." };
+  }
   if (!(await pathExists(backup))) await store.writeTextAtomic(backup, raw);
   value.schemaVersion = STORAGE_SCHEMA_VERSION;
   const normalized = normalizeConfig ? normalizeConfig(value) : value;
   await store.writeTextAtomic(path, `${JSON.stringify(normalized, null, 2)}\n`);
-  return { appHome, warning: null };
+  return { status: "ready", appHome, warning: null };
 }
 
 async function resumeAfterLegacyRename(
@@ -595,21 +779,22 @@ async function resumeAfterLegacyRename(
   onPhase: AppHomeMigrationOptions["onPhase"],
 ): Promise<AppHomeMigrationResult> {
   if (!(await pathExists(manifest.backupPath))) {
-    return { appHome: dirname(dirname(manifest.backupPath)), warning: "Migration ist unvollständig; Quelle und Backup fehlen." };
+    return { status: "recovery-required", appHome: dirname(dirname(manifest.backupPath)), warning: "Migration ist unvollständig; Quelle und Backup fehlen." };
   }
   const appHome = dirname(dirname(manifest.backupPath));
   await store.protectTree(manifest.backupPath);
+  await rm(manifest.stagingPath, { recursive: true, force: true });
   manifest.phase = "complete";
   manifest.complete = true;
   manifest.completedAt = new Date().toISOString();
   await persistManifest(appHome, manifest, store);
-  await rm(manifest.stagingPath, { recursive: true, force: true });
   await onPhase?.("complete", manifest);
   return migrationResult(appHome, manifest);
 }
 
 function migrationResult(appHome: string, manifest: StorageMigrationManifest): AppHomeMigrationResult {
   return {
+    status: "ready",
     appHome,
     warning: manifest.isolated.length > 0
       ? `${manifest.isolated.length} beschädigte Chat-/Run-Artefakte wurden isoliert; andere Daten wurden migriert.`
@@ -621,7 +806,16 @@ async function persistManifest(appHome: string, manifest: StorageMigrationManife
   await store.writeTextAtomic(migrationManifestPath(appHome), `${JSON.stringify(manifest, null, 2)}\n`);
 }
 
-async function readManifest(path: string): Promise<StorageMigrationManifest | null> {
+type ManifestReadState =
+  | { kind: "absent" }
+  | { kind: "invalid"; reason: string }
+  | { kind: "valid"; manifest: StorageMigrationManifest };
+
+async function readManifestState(
+  path: string,
+  newHome: string,
+  legacyHome: string,
+): Promise<ManifestReadState> {
   try {
     const value = parseRecord(await readFile(path, "utf8"));
     if (value.version !== STORAGE_SCHEMA_VERSION || typeof value.sourceChecksum !== "string"
@@ -629,10 +823,34 @@ async function readManifest(path: string): Promise<StorageMigrationManifest | nu
       || typeof value.backupPath !== "string" || typeof value.phase !== "string"
       || !isRecord(value.chatIdMap) || !Array.isArray(value.destinationPaths)
       || !Array.isArray(value.isolated) || typeof value.complete !== "boolean"
-      || typeof value.startedAt !== "string") return null;
-    return value as unknown as StorageMigrationManifest;
-  } catch {
-    return null;
+      || typeof value.startedAt !== "string") {
+      return { kind: "invalid", reason: "Manifest-Struktur ist ungültig." };
+    }
+    if (!MIGRATION_PHASES.has(value.phase as MigrationPhase)) {
+      return { kind: "invalid", reason: `Manifest-Phase ${value.phase} ist ungültig.` };
+    }
+    if (!/^[a-f0-9]{64}$/.test(value.sourceChecksum)) {
+      return { kind: "invalid", reason: "Manifest-Checksum ist ungültig." };
+    }
+    const expectedSource = resolvePath(legacyHome);
+    const expectedStaging = resolvePath(join(newHome, ".migration-staging", value.sourceChecksum));
+    const expectedBackup = resolvePath(join(newHome, "migration-backups", `routercode-${value.sourceChecksum.slice(0, 16)}`));
+    if (resolvePath(value.sourcePath) !== expectedSource
+      || resolvePath(value.stagingPath) !== expectedStaging
+      || resolvePath(value.backupPath) !== expectedBackup) {
+      return { kind: "invalid", reason: "Manifest-Pfade liegen nicht unter den erwarteten Roots." };
+    }
+    if (value.complete !== (value.phase === "complete")) {
+      return { kind: "invalid", reason: "Manifest-Phase und Completion-Marker widersprechen sich." };
+    }
+    if (!value.destinationPaths.every((destination) =>
+      typeof destination === "string" && isWithin(resolvePath(newHome), resolvePath(destination)))) {
+      return { kind: "invalid", reason: "Manifest enthält ein Ziel außerhalb appHome." };
+    }
+    return { kind: "valid", manifest: value as unknown as StorageMigrationManifest };
+  } catch (error) {
+    if (hasErrorCode(error, "ENOENT")) return { kind: "absent" };
+    return { kind: "invalid", reason: `Manifest ist nicht lesbar: ${errorText(error)}` };
   }
 }
 
@@ -646,9 +864,10 @@ async function readRuleFile(path: string): Promise<RuleFileV2 | null> {
 }
 
 function ruleMergeKey(rule: PermissionRule): string {
-  return rule.match.kind === "exact-subject"
+  const subject = rule.match.kind === "exact-subject"
     ? `exact:${rule.match.fingerprint}`
     : `disabled:${rule.id}`;
+  return `${rule.workspace}\0${rule.tool}\0${subject}`;
 }
 
 function compatibleRunEvent(value: unknown): AgentRunEvent | null {
@@ -724,10 +943,50 @@ async function names(path: string): Promise<string[]> {
   }
 }
 
+async function filesMatching(path: string, accepts: (name: string) => boolean): Promise<string[]> {
+  try {
+    return (await readdir(path, { withFileTypes: true }))
+      .filter((entry) => entry.isFile() && accepts(entry.name))
+      .map((entry) => join(path, entry.name))
+      .sort();
+  } catch (error) {
+    if (hasErrorCode(error, "ENOENT")) return [];
+    throw error;
+  }
+}
+
 async function treeSize(root: string): Promise<number> {
   let total = 0;
   for (const file of await treeFiles(root)) total += (await stat(file)).size;
   return total;
+}
+
+async function optionalTreeSize(root: string): Promise<number> {
+  try {
+    const info = await lstat(root);
+    if (info.isSymbolicLink() || !info.isDirectory()) {
+      throw new Error(`Ungültiger verwalteter Backup-Pfad: ${root}`);
+    }
+    return treeSize(root);
+  } catch (error) {
+    if (hasErrorCode(error, "ENOENT")) return 0;
+    throw error;
+  }
+}
+
+async function pendingConfigBackupSize(appHome: string): Promise<number> {
+  const path = join(appHome, "config.json");
+  try {
+    const raw = await readFile(path, "utf8");
+    const value = parseRecord(raw);
+    if (value.schemaVersion === STORAGE_SCHEMA_VERSION) return 0;
+    const checksum = createHash("sha256").update(raw).digest("hex");
+    const backup = join(appHome, "migration-backups", `config-v0-${checksum.slice(0, 16)}.json`);
+    return await pathExists(backup) ? 0 : Buffer.byteLength(raw);
+  } catch (error) {
+    if (hasErrorCode(error, "ENOENT")) return 0;
+    throw error;
+  }
 }
 
 async function checksumTree(root: string): Promise<string> {

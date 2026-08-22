@@ -1,7 +1,16 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, stat } from "node:fs/promises";
+import {
+  chmod,
+  mkdir,
+  mkdtemp,
+  readFile,
+  readdir,
+  rename,
+  stat,
+  symlink,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import test from "node:test";
 
 test("PrivateStore enforces 0700 directories and 0600 atomic files on POSIX", async () => {
@@ -9,7 +18,7 @@ test("PrivateStore enforces 0700 directories and 0600 atomic files on POSIX", as
   const root = await mkdtemp(join(tmpdir(), "orcode-private-posix-"));
   const directory = join(root, "exact", "chat-a");
   const path = join(directory, "state.json");
-  const store = new PrivateStore({ adapter: new PosixPrivateStoreAdapter() });
+  const store = new PrivateStore({ adapter: new PosixPrivateStoreAdapter(), root });
 
   await store.writeTextAtomic(path, "exact recovery state\n");
 
@@ -21,30 +30,143 @@ test("PrivateStore enforces 0700 directories and 0600 atomic files on POSIX", as
 test("Windows PrivateStore applies and verifies the deterministic current-user plus SYSTEM DACL", async () => {
   const { PrivateStore, WindowsPrivateStoreAdapter } = await import("../src/private-store.js");
   const root = await mkdtemp(join(tmpdir(), "orcode-private-windows-"));
-  const calls: Array<{ executable: string; args: string[] }> = [];
-  const adapter = new WindowsPrivateStoreAdapter(async (executable, args) => {
-    calls.push({ executable, args: [...args] });
+  const calls: Array<{ executable: string; args: string[]; environment?: Record<string, string> }> = [];
+  const adapter = new WindowsPrivateStoreAdapter(async (executable, args, options?: {
+    environment?: Record<string, string>;
+  }) => {
+    calls.push({ executable, args: [...args], environment: options?.environment });
     return { code: 0, stdout: "", stderr: "" };
   });
-  const store = new PrivateStore({ adapter });
+  const store = new PrivateStore({ adapter, root });
   const path = join(root, "exact", "state.json");
 
   await store.writeTextAtomic(path, "opaque\n");
 
-  assert.equal(calls.length, 3, "one fail-closed probe plus directory and file DACLs");
+  assert.equal(calls.length, 4, "one fail-closed probe plus root, directory, and file DACLs");
   assert.match(calls[0]!.args[3] ?? "", /WindowsIdentity.*GetCurrent/);
   for (const call of calls.slice(1)) {
     assert.equal(call.executable, "powershell.exe");
-    assert.deepEqual(call.args.slice(0, 3), ["-NoProfile", "-NonInteractive", "-Command"]);
-    const script = call.args[3] ?? "";
+    assert.deepEqual(call.args.slice(0, 3), ["-NoProfile", "-NonInteractive", "-EncodedCommand"]);
+    const script = Buffer.from(call.args[3] ?? "", "base64").toString("utf16le");
     assert.match(script, /WindowsIdentity.*GetCurrent/);
     assert.match(script, /S-1-5-18/);
     assert.match(script, /SetAccessRuleProtection\(\$true, \$false\)/);
     assert.match(script, /Get-Acl/);
     assert.match(script, /exit 17/);
   }
-  assert.equal(calls[1]!.args.at(-1), "directory");
-  assert.equal(calls[2]!.args.at(-1), "file");
+  assert.equal(calls[1]!.environment?.ORCODE_PRIVATE_KIND, "directory");
+  assert.equal(calls[2]!.environment?.ORCODE_PRIVATE_KIND, "directory");
+  assert.equal(calls[3]!.environment?.ORCODE_PRIVATE_KIND, "file");
+});
+
+test("Windows ACL invocation binds an untrusted path as data through an encoded parser boundary", async () => {
+  const { WindowsPrivateStoreAdapter } = await import("../src/private-store.js");
+  const maliciousPath = String.raw`C:\exact\'; Write-Output INJECTED; #\state.json`;
+  const captures: Array<{
+    args: string[];
+    environment?: Record<string, string>;
+  }> = [];
+  const adapter = new WindowsPrivateStoreAdapter(async (_executable, args, options?: {
+    environment?: Record<string, string>;
+  }) => {
+    captures.push({ args: [...args], environment: options?.environment });
+    return { code: 0, stdout: "", stderr: "" };
+  });
+
+  await adapter.protectFile(maliciousPath);
+
+  const captured = captures[0]!;
+  assert.equal(captured.args[2], "-EncodedCommand");
+  const encoded = captured.args[3] ?? "";
+  const script = Buffer.from(encoded, "base64").toString("utf16le");
+  assert.match(script, /ORCODE_PRIVATE_PATH/);
+  assert.doesNotMatch(script, /INJECTED/);
+  assert.equal(captured.environment?.ORCODE_PRIVATE_PATH, maliciousPath);
+  assert.equal(captured.environment?.ORCODE_PRIVATE_KIND, "file");
+  assert.equal(captured.args.includes(maliciousPath), false);
+});
+
+test("Windows PrivateStore real DACL integration", { skip: process.platform !== "win32" }, async () => {
+  const { PrivateStore, WindowsPrivateStoreAdapter } = await import("../src/private-store.js");
+  const root = await mkdtemp(join(tmpdir(), "orcode-private-windows-real-"));
+  const path = join(root, "exact", "state.json");
+  const store = new PrivateStore({ adapter: new WindowsPrivateStoreAdapter(), root } as never);
+
+  await store.writeTextAtomic(path, "opaque\n");
+
+  assert.equal(await readFile(path, "utf8"), "opaque\n");
+});
+
+test("PrivateStore rejects a symlink root and symlinked ancestors before exact content escapes", async () => {
+  const { PosixPrivateStoreAdapter, PrivateStore } = await import("../src/private-store.js");
+  const root = await mkdtemp(join(tmpdir(), "orcode-private-symlink-"));
+  const outside = join(root, "outside");
+  const home = join(root, "home");
+  await mkdir(outside);
+  await mkdir(home);
+  await symlink(outside, join(home, "exact"), "dir");
+  const ancestorStore = new PrivateStore({ adapter: new PosixPrivateStoreAdapter(), root: home } as never);
+
+  await assert.rejects(
+    ancestorStore.writeTextAtomic(join(home, "exact", "state.json"), "must not escape"),
+    /symbol|symlink|link/i,
+  );
+  await assert.rejects(readFile(join(outside, "state.json")), /ENOENT/);
+
+  const linkedHome = join(root, "linked-home");
+  await symlink(outside, linkedHome, "dir");
+  const rootStore = new PrivateStore({ adapter: new PosixPrivateStoreAdapter(), root: linkedHome } as never);
+  await assert.rejects(
+    rootStore.writeTextAtomic(join(linkedHome, "root-state.json"), "must not escape root"),
+    /symbol|symlink|link/i,
+  );
+  await assert.rejects(readFile(join(outside, "root-state.json")), /ENOENT/);
+});
+
+test("PrivateStore rechecks ancestors after temp protection and before writing exact content", async () => {
+  const { PosixPrivateStoreAdapter, PrivateStore } = await import("../src/private-store.js");
+  const root = await mkdtemp(join(tmpdir(), "orcode-private-swap-"));
+  const home = join(root, "home");
+  const exact = join(home, "exact");
+  const moved = join(home, "exact-before-swap");
+  const outside = join(root, "outside");
+  await mkdir(exact, { recursive: true });
+  await mkdir(outside);
+  let swapped = false;
+  class SwappingAdapter extends PosixPrivateStoreAdapter {
+    override async protectFile(path: string): Promise<void> {
+      await super.protectFile(path);
+      if (!swapped && path.endsWith(".private.tmp")) {
+        swapped = true;
+        await rename(dirname(path), moved);
+        await symlink(outside, exact, "dir");
+      }
+    }
+  }
+  const store = new PrivateStore({ adapter: new SwappingAdapter(), root: home } as never);
+  const secret = "exact bytes must never reach swapped storage";
+
+  await assert.rejects(store.writeTextAtomic(join(exact, "state.json"), secret));
+
+  const leaked = await Promise.all((await readdir(moved)).map(async (name) =>
+    readFile(join(moved, name), "utf8").catch(() => "")));
+  assert.equal(leaked.some((value) => value.includes(secret)), false);
+  await assert.rejects(readFile(join(outside, "state.json")), /ENOENT/);
+});
+
+test("PrivateStore protectTree rejects a symlink root without changing its target", async () => {
+  const { PosixPrivateStoreAdapter, PrivateStore } = await import("../src/private-store.js");
+  const root = await mkdtemp(join(tmpdir(), "orcode-private-tree-link-"));
+  const outside = join(root, "outside");
+  const link = join(root, "backup-link");
+  await mkdir(outside, { mode: 0o755 });
+  await chmod(outside, 0o755);
+  await symlink(outside, link, "dir");
+  const store = new PrivateStore({ adapter: new PosixPrivateStoreAdapter(), root } as never);
+
+  await assert.rejects(store.protectTree(link), /symbol|symlink|link/i);
+
+  assert.equal((await stat(outside)).mode & 0o777, 0o755);
 });
 
 test("PrivateStore fails closed and never publishes an exact file when its adapter cannot enforce privacy", async () => {
@@ -52,6 +174,7 @@ test("PrivateStore fails closed and never publishes an exact file when its adapt
   const root = await mkdtemp(join(tmpdir(), "orcode-private-closed-"));
   const path = join(root, "exact", "state.json");
   const store = new PrivateStore({
+    root,
     adapter: {
       name: "unavailable-test-boundary",
       available: async () => false,

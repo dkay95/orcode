@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import {
+  chmod,
   mkdir,
   mkdtemp,
   readdir,
@@ -470,6 +471,7 @@ test("an unreadable chat file is preserved instead of overwritten", async () => 
   await store.save();
 
   await writeFile(store.path, "{ das ist kein JSON");
+  await chmod(store.path, 0o644);
   store.addTurn("assistant", "zweite Antwort");
   const outcome = await store.save();
 
@@ -478,6 +480,17 @@ test("an unreadable chat file is preserved instead of overwritten", async () => 
     await readFile(outcome.conflictBackupPath as string, "utf8"),
     /das ist kein JSON/,
   );
+  const { CHAT_ARTIFACT_REGISTRY } = await import("../src/storage.js");
+  assert.equal(CHAT_ARTIFACT_REGISTRY.get("chat-conflict").privacy, "exact");
+  assert.ok(
+    (await CHAT_ARTIFACT_REGISTRY.existing("chat-conflict", {
+      appHome,
+      workspace,
+      chatId: store.data.id,
+      chatFilePath: store.path,
+    })).includes(outcome.conflictBackupPath as string),
+  );
+  assert.equal((await stat(outcome.conflictBackupPath as string)).mode & 0o777, 0o600);
   const reopened = await SessionStore.openById(workspace, store.data.id, appHome);
   assert.equal(reopened.data.turns.length, 2);
 });

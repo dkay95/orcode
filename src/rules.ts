@@ -281,7 +281,7 @@ export class RuleStore {
   private constructor(appHome: string, rules: PermissionRule[]) {
     this.#appHome = appHome;
     this.#rules = rules;
-    this.#privateStore = new PrivateStore();
+    this.#privateStore = new PrivateStore({ root: appHome });
   }
 
   static async load(appHome: string = RULES_APP_HOME): Promise<RuleStore> {

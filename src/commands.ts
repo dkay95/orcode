@@ -306,7 +306,7 @@ export async function handleSlashCommand(
       await resumeCommand(args, context);
       return "continue";
     case "config":
-      context.out.text(chalk.bold(CONFIG_PATH));
+      context.out.text(chalk.bold(context.configPath ?? CONFIG_PATH));
       context.out.text(JSON.stringify(context.config, null, 2));
       return "continue";
     case "export":

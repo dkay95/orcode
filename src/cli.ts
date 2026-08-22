@@ -163,6 +163,7 @@ export interface StartupStorageDependencies {
 
 export interface StartupStorageResult {
   appHome: string;
+  configPath: string;
   migrationWarning: string | null;
   config: OrcodeConfigWithBudget;
   ruleStore: RuleStore;
@@ -191,6 +192,9 @@ export async function initializeStartupStorage(
     ...dependencies,
   };
   const migration = await deps.migrateAppHome();
+  if (migration.status !== "ready") {
+    throw new Error(migration.warning ?? `Startup-Speicherstatus: ${migration.status}`);
+  }
   const appHome = migration.appHome;
   await deps.pruneCheckpoints(appHome).catch(() => undefined);
   const config = await deps.loadConfig(configPath(appHome));
@@ -198,6 +202,7 @@ export async function initializeStartupStorage(
   const session = await deps.openSession(options.workspace, appHome, options);
   return {
     appHome,
+    configPath: configPath(appHome),
     migrationWarning: migration.warning,
     config,
     ruleStore,
@@ -247,7 +252,7 @@ async function main(): Promise<void> {
   if (startup.migrationWarning) {
     console.error(chalk.yellow(startup.migrationWarning));
   }
-  const { config, ruleStore, session } = startup;
+  const { config, configPath: runtimeConfigPath, ruleStore, session } = startup;
   // loadConfig never throws any more; a broken file is reported instead of
   // silently replaced by defaults.
   const configWarning = consumeConfigWarning();
@@ -335,6 +340,7 @@ async function main(): Promise<void> {
   if (useTui) {
     await runDashboard({
       workspace,
+      configPath: runtimeConfigPath,
       config,
       approvals,
       openRouter,
@@ -414,6 +420,7 @@ async function main(): Promise<void> {
   await runPlainLoop(
     {
       workspace,
+      configPath: runtimeConfigPath,
       config,
       approvals,
       openRouter,
@@ -430,6 +437,7 @@ async function main(): Promise<void> {
 
 interface RuntimeContext {
   workspace: string;
+  configPath: string;
   config: OrcodeConfigWithBudget;
   approvals: ApprovalManager;
   openRouter: OpenRouterService;
@@ -1063,7 +1071,7 @@ async function runDashboard(
                 selected.setting,
               );
               await Promise.all([
-                saveConfig(context.config, configPath(context.session.appHome)),
+                saveConfig(context.config, context.configPath),
                 context.session.save(),
               ]);
               ui.addMessage(
@@ -1110,7 +1118,7 @@ async function runDashboard(
                 const previous = context.approvals.mode;
                 context.approvals.mode = mode;
                 context.config.approvalMode = mode;
-                await saveConfig(context.config, configPath(context.session.appHome));
+                await saveConfig(context.config, context.configPath);
                 ui.addMessage(
                   "system",
                   `✓ Approval geändert: ${previous} → ${mode}\n${approvalDescription(mode)}`,
@@ -1206,7 +1214,7 @@ async function runDashboard(
             if (accepted) {
               context.approvals.mode = "allow-all";
               context.config.approvalMode = "allow-all";
-              await saveConfig(context.config, configPath(context.session.appHome));
+              await saveConfig(context.config, context.configPath);
               ui.addMessage(
                 "system",
                 "Approval-Modus: allow-all. Änderungen und Shell-Befehle laufen ohne Rückfrage.",
@@ -1489,7 +1497,7 @@ async function pickDashboardChat(
   // compressor price cache and the undo journal on every chat switch.
   context.agent.setSession(next);
   await saveDashboardSessionPreferences(context, ui);
-  await saveConfig(context.config, configPath(context.session.appHome));
+  await saveConfig(context.config, context.configPath);
   ui.loadTurns(next.recentTurns(VISIBLE_TURNS));
   ui.setStatus(`Chat geöffnet: ${next.data.title}`, false);
   return true;
@@ -1855,7 +1863,7 @@ async function runVoiceCapture(ui: TerminalUi, context: RuntimeContext): Promise
       );
       return decision.accepted;
     },
-    () => saveConfig(context.config, configPath(context.session.appHome)),
+    () => saveConfig(context.config, context.configPath),
   );
   if (!consented) {
     ui.addMessage("system", "Spracheingabe abgebrochen: keine Einwilligung erteilt.", "/whisper");
@@ -2105,7 +2113,7 @@ async function pickDashboardModel(
     return null;
   }
   context.config.mainModel = selected.id;
-  await saveConfig(context.config, configPath(context.session.appHome));
+  await saveConfig(context.config, context.configPath);
   return selected;
 }
 
@@ -2137,7 +2145,7 @@ async function pickDashboardCompressorModel(
     return null;
   }
   context.config.compressorModel = selected.id;
-  await saveConfig(context.config, configPath(context.session.appHome));
+  await saveConfig(context.config, context.configPath);
   return selected;
 }
 
