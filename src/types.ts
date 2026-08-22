@@ -160,11 +160,54 @@ export type ToolRisk =
   | "remote-shell"
   | "network-fetch";
 
+/** Stable effect classes shared by present and future capability subjects. */
+export type ApprovalEffect =
+  | "read"
+  | "write"
+  | "process"
+  | "network"
+  | "remote"
+  | "git-history";
+
+/**
+ * Serializable authority identity for a remembered approval.
+ *
+ * Each variant carries only the data that changes what can happen. Values of
+ * forwarded environment variables are deliberately absent from structured
+ * processes; only their sorted, deduplicated names are persisted.
+ */
+export type ApprovalSubject =
+  | { kind: "selected-path"; path: string }
+  | { kind: "selected-path-glob"; base: string; pattern: string }
+  | {
+      kind: "shell-string";
+      platform: string;
+      executable: string;
+      mode: string[];
+      cwd: string;
+      command: string;
+    }
+  | {
+      kind: "structured-process";
+      executable: string;
+      argv: string[];
+      cwd: string;
+      environment: string[];
+    }
+  | { kind: "ssh-command"; host: string; command: string }
+  | { kind: "url-operation"; origin: string; operation: string }
+  | { kind: "mcp-tool"; server: string; tool: string; effect: ApprovalEffect }
+  | { kind: "git-mutation"; repository: string; mutation: string };
+
 export interface ToolCallPreview {
   name: string;
   risk: ToolRisk;
   summary: string;
   details?: string;
+  /** Canonical, terminal-safe serialization of the policy subject. */
+  subject?: string;
+  /** True only when `subject` was safely derived from this exact request. */
+  rememberAvailable?: boolean;
 }
 
 export type AgentRunEvent =

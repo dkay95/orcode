@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, readFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -14,7 +14,7 @@ import {
 import { DEFAULT_CONFIG } from "../src/config.js";
 import type { CredentialStoreLike } from "../src/credentials.js";
 import { OpenRouterService } from "../src/openrouter.js";
-import { RuleStore } from "../src/rules.js";
+import { RuleStore, rulesPath, shellApprovalSubject } from "../src/rules.js";
 import { SessionStore } from "../src/session.js";
 import type { ToolCallPreview } from "../src/types.js";
 
@@ -228,7 +228,13 @@ test("/allow list shows nothing, then a remembered rule, then nothing after forg
   const rule = await context.ruleStore.remember({
     workspace: context.workspace,
     tool: "run_command",
-    match: { kind: "command-prefix", value: "npm test" },
+    subject: shellApprovalSubject({
+      platform: "linux",
+      executable: "/bin/sh",
+      mode: ["-c"],
+      cwd: ".",
+      command: "npm test",
+    }),
     decision: "allow",
   });
   lines.length = 0;
@@ -242,18 +248,48 @@ test("/allow list shows nothing, then a remembered rule, then nothing after forg
   assert.equal(context.ruleStore.list(context.workspace).length, 0);
 });
 
+test("/allow list shows why an ambiguous migrated v1 rule is disabled", async () => {
+  const { context } = await harness();
+  const legacyHome = await mkdtemp(join(tmpdir(), "routercode-legacy-rules-"));
+  await writeFile(rulesPath(legacyHome), JSON.stringify({
+    version: 1,
+    rules: [{
+      id: "legacy-prefix",
+      workspace: context.workspace,
+      tool: "run_command",
+      match: { kind: "command-prefix", value: "npm test" },
+      decision: "allow",
+      createdAt: "2026-01-01T00:00:00.000Z",
+    }],
+  }), "utf8");
+  context.ruleStore = await RuleStore.load(legacyHome);
+  const { out, lines } = collectOutput();
+  context.out = out;
+
+  await handleSlashCommand("/allow list", context);
+
+  assert.match(lines.join("\n"), /deaktiviert/);
+  assert.match(lines.join("\n"), /command-prefix war nicht exakt/);
+});
+
 test("/allow forget all clears every rule for this workspace", async () => {
   const { context } = await harness();
   await context.ruleStore.remember({
     workspace: context.workspace,
     tool: "run_command",
-    match: { kind: "command-prefix", value: "npm test" },
+    subject: shellApprovalSubject({
+      platform: "linux",
+      executable: "/bin/sh",
+      mode: ["-c"],
+      cwd: ".",
+      command: "npm test",
+    }),
     decision: "allow",
   });
   await context.ruleStore.remember({
     workspace: context.workspace,
     tool: "write_file",
-    match: { kind: "path-glob", value: "src/**" },
+    subject: { kind: "selected-path-glob", base: "src", pattern: "**" },
     decision: "allow",
   });
   assert.equal(context.ruleStore.list(context.workspace).length, 2);

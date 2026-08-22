@@ -20,7 +20,15 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { ensureSecureDirectory } from "./config.js";
 import { findSshHost, type SshHost } from "./ssh-config.js";
+import type { ApprovalSubject } from "./types.js";
 import type { ProcessResult, RunProcessOptions } from "./workspace.js";
+
+export function sshApprovalSubject(
+  host: string,
+  command: string,
+): Extract<ApprovalSubject, { kind: "ssh-command" }> {
+  return { kind: "ssh-command", host, command };
+}
 
 /** Runs `ssh` with the given arguments. `workspace.ts` supplies the real implementation via `runProcess`; tests supply a fake. */
 export type RunSsh = (

@@ -17,7 +17,16 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { randomUUID } from "node:crypto";
+import type { ApprovalSubject } from "./types.js";
 import { isRecord, sanitizedEnvironment } from "./utils.js";
+
+/** URL authority is the validated origin plus the exact operation, never path/query data. */
+export function browserApprovalSubject(
+  target: URL,
+  operation: string,
+): Extract<ApprovalSubject, { kind: "url-operation" }> {
+  return { kind: "url-operation", origin: target.origin, operation };
+}
 
 // ---------------------------------------------------------------------------
 // Report shape

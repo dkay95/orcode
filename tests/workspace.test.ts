@@ -2,12 +2,14 @@ import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
-import { chmod, mkdir, mkdtemp, readFile, stat, symlink, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { promisify } from "node:util";
 import { ApprovalManager, PermissionDeniedError } from "../src/approval.js";
+import { evaluateGitReadCapability } from "../src/policy.js";
+import { RuleStore } from "../src/rules.js";
 import type { ApprovalMode, ToolCallPreview } from "../src/types.js";
 import {
   CATASTROPHIC_GUARD_NOTICE,
@@ -26,6 +28,7 @@ import {
   isWithinWorkspace,
   replaceLiteral,
   resolveCommandShell,
+  runHardenedGitRead,
   sanitizedEnvironment,
   toolMetadata,
 } from "../src/workspace.js";
@@ -590,6 +593,30 @@ test("git diff is called without external drivers, textconv, or pager", () => {
   assert.ok(gitDiffArgs(true).includes("--cached"));
 });
 
+test("/diff is a central hardened read-only Git capability, never a remembered mutation", async () => {
+  const policy = evaluateGitReadCapability("diff");
+  assert.deepEqual(policy, {
+    id: "git.diff",
+    effect: "read",
+    hardened: true,
+    rememberable: false,
+  });
+
+  const calls: Array<{ executable: string; args: string[]; cwd: string }> = [];
+  const fakeRun = async (executable: string, args: string[], options: { cwd: string }) => {
+    calls.push({ executable, args, cwd: options.cwd });
+    return { code: 0, stdout: "synthetic diff", stderr: "", truncated: false, timedOut: false, aborted: false };
+  };
+  assert.equal(await getGitDiff("/workspace", fakeRun), "synthetic diff");
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0]?.executable.endsWith("git"), true);
+  assert.deepEqual(calls[0]?.args, gitDiffArgs(false));
+
+  const direct = await runHardenedGitRead("/workspace", { operation: "diff", staged: true }, fakeRun);
+  assert.equal(direct.policy.id, "git.diff");
+  assert.ok(direct.invocation.args.includes("--cached"));
+});
+
 test("a repository cannot execute code through git_diff", async (t) => {
   if (!(await gitAvailable())) {
     t.skip("git ist nicht installiert");
@@ -621,6 +648,58 @@ test("a repository cannot execute code through git_diff", async (t) => {
 test("git_diff is priced as a process launch", async () => {
   const { tools } = await sandbox("read-only", { prefix: "gitro" });
   await assert.rejects(invoke(tools, "git_diff", { staged: false }), PermissionDeniedError);
+});
+
+test("shell, Git process, browser, and selected path/glob call sites pass exact subjects", async () => {
+  const shellBox = await sandbox("ask", { answer: false, prefix: "subjects-shell" });
+  const command = "printf '  α  ' | sed 's/α/β/'";
+  await assert.rejects(invoke(shellBox.tools, "run_command", { command }), /abgelehnt/);
+  assert.equal(shellBox.asked[0]?.rememberAvailable, true);
+  assert.match(shellBox.asked[0]?.subject ?? "", /"kind":"shell-string"/);
+  assert.match(shellBox.asked[0]?.subject ?? "", /printf '  α  '/);
+
+  const gitBox = await sandbox("ask", { answer: false, prefix: "subjects-git" });
+  await assert.rejects(invoke(gitBox.tools, "git_diff", { staged: false }), /abgelehnt/);
+  assert.match(gitBox.asked[0]?.subject ?? "", /"kind":"structured-process"/);
+  assert.doesNotMatch(gitBox.asked[0]?.subject ?? "", /GIT_PAGER":"cat/);
+
+  const browserBox = await sandbox("ask", { answer: false, prefix: "subjects-browser" });
+  await assert.rejects(invoke(browserBox.tools, "browser_check", { url: "https://example.com/private?q=ignored" }), /abgelehnt/);
+  assert.equal(
+    browserBox.asked[0]?.subject,
+    '{"kind":"url-operation","origin":"https://example.com","operation":"inspect"}',
+  );
+
+  const appHome = await mkdtemp(join(tmpdir(), "routercode-subject-rules-"));
+  try {
+    const pathBox = await sandbox("allow-all", { prefix: "subjects-path" });
+    await writeFile(join(pathBox.root, "plain.txt"), "synthetic\n", "utf8");
+    const store = await RuleStore.load(appHome);
+    pathBox.approvals.setRuleStore(store, pathBox.root);
+    await store.remember({
+      workspace: pathBox.root,
+      tool: "read_file",
+      subject: { kind: "selected-path", path: "plain.txt" },
+      decision: "deny",
+    });
+    await store.remember({
+      workspace: pathBox.root,
+      tool: "list_files",
+      subject: { kind: "selected-path-glob", base: ".", pattern: "**/*" },
+      decision: "deny",
+    });
+    await store.remember({
+      workspace: pathBox.root,
+      tool: "search_files",
+      subject: { kind: "selected-path-glob", base: ".", pattern: "**/*.txt" },
+      decision: "deny",
+    });
+    await assert.rejects(invoke(pathBox.tools, "read_file", { path: "plain.txt" }), /gespeicherte Regel/);
+    await assert.rejects(invoke(pathBox.tools, "list_files", { path: ".", pattern: "**/*" }), /gespeicherte Regel/);
+    await assert.rejects(invoke(pathBox.tools, "search_files", { query: "synthetic", path: ".", glob: "**/*.txt" }), /gespeicherte Regel/);
+  } finally {
+    await rm(appHome, { recursive: true, force: true });
+  }
 });
 
 // ---------------------------------------------------------------------------

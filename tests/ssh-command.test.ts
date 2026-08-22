@@ -165,6 +165,11 @@ test("ssh_command's approval preview names the target host prominently", async (
     assert.match(preview.summary, /VPS/);
     assert.match(preview.summary, /203\.0\.113\.5/);
     assert.match(preview.details ?? "", /SSH-ZIEL \(NICHT LOKAL\): VPS/);
+    assert.equal(preview.rememberAvailable, true);
+    assert.equal(
+      preview.subject,
+      '{"kind":"ssh-command","host":"vps","command":"systemctl restart nginx"}',
+    );
   } finally {
     await cleanup();
   }

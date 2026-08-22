@@ -203,6 +203,7 @@ export class TerminalUi {
   #confirmResolve: ((decision: ApprovalDecision) => void) | null = null;
   #confirmSince = 0;
   #confirmReasonMode = false;
+  #confirmRememberAvailable = false;
   #approvalBlockId: string | null = null;
   #contextPercent: number | undefined = undefined;
   #historyActive = false;
@@ -529,8 +530,13 @@ export class TerminalUi {
     this.scheduleRender(true);
   }
 
-  confirmAction(title: string, details: string): Promise<ApprovalDecision> {
+  confirmAction(
+    title: string,
+    details: string,
+    rememberAvailable = false,
+  ): Promise<ApprovalDecision> {
     if (!this.#active) return Promise.resolve({ accepted: false });
+    this.#confirmRememberAvailable = rememberAvailable;
     if (!this.#approvalBlockId) {
       this.#approvalBlockId = this.#vm.pushApproval({
         risk: "shell",
@@ -548,13 +554,22 @@ export class TerminalUi {
   confirmApproval(preview: ToolCallPreview): Promise<ApprovalDecision> {
     if (!this.#active) return Promise.resolve({ accepted: false });
     const separator = this.#theme.glyph("separator");
+    const rememberAvailable = preview.rememberAvailable === true && preview.subject !== undefined;
+    const details = [
+      ...(preview.subject
+        ? ["Freigabe-Subjekt (exakt):", preview.subject]
+        : []),
+      ...this.#detailLines(preview.details ?? preview.name),
+    ];
     this.#approvalBlockId = this.#vm.pushApproval({
       risk: preview.risk,
       summary: `${approvalRiskLabel(preview.risk)}${separator}${oneLine(preview.summary)}`,
-      details: this.#detailLines(preview.details ?? preview.name),
-      rememberHint: "keine gemerkte Regel für diese Aktion",
+      details,
+      rememberHint: rememberAvailable
+        ? "a = dieses exakte Subject immer erlauben · d = dieses exakte Subject nie erlauben"
+        : "Immer/Nie ist ohne exaktes Subject nicht verfügbar",
     }).id;
-    return this.confirmAction(preview.summary, preview.details ?? preview.name);
+    return this.confirmAction(preview.summary, preview.details ?? preview.name, rememberAvailable);
   }
 
   /** A7: the context-fill header segment is fed from outside (agent/session). */
@@ -663,6 +678,7 @@ export class TerminalUi {
     if (this.#contextPercent !== undefined) input.contextPercent = this.#contextPercent;
     if (this.#run) input.run = this.#run;
     if (this.#mode === "confirm") input.waitingSince = this.#confirmSince;
+    if (this.#mode === "confirm") input.rememberAvailable = this.#confirmRememberAvailable;
     if (this.#mode === "secret") input.secretLabel = this.#secretLabel;
     const list = this.#listView();
     if (list) input.list = list;
@@ -1025,9 +1041,15 @@ export class TerminalUi {
       // `j`/`y` yes, `a` always allow, `d` never allow, `g` Begründung; an
       // unbound key answers instead of staying silent (Bauplan 2.5).
       if (key.name === "y" || key.name === "j") this.#resolveConfirm({ accepted: true });
-      else if (key.name === "a") this.#resolveConfirm({ accepted: true, remember: "allow" });
-      else if (key.name === "d") this.#resolveConfirm({ accepted: false, remember: "deny" });
-      else if (key.name === "g") {
+      else if (key.name === "a" && this.#confirmRememberAvailable) {
+        this.#resolveConfirm({ accepted: true, remember: "allow" });
+      } else if (key.name === "d" && this.#confirmRememberAvailable) {
+        this.#resolveConfirm({ accepted: false, remember: "deny" });
+      } else if (key.name === "a" || key.name === "d") {
+        this.setStatus("Immer/Nie ist ohne exaktes Subject nicht verfügbar", false);
+        this.#mode = "confirm";
+        this.scheduleRender(true);
+      } else if (key.name === "g") {
         this.#confirmReasonMode = true;
         this.#resetQuery();
         this.setStatus("Begründung eingeben · Enter senden · Esc zurück", false);
@@ -1373,6 +1395,7 @@ export class TerminalUi {
     const resolve = this.#confirmResolve;
     this.#confirmResolve = null;
     this.#confirmReasonMode = false;
+    this.#confirmRememberAvailable = false;
     this.#resetQuery();
     if (this.#approvalBlockId) {
       this.#vm.dropApproval(this.#approvalBlockId);

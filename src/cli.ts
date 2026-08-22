@@ -107,8 +107,8 @@ import {
 } from "./voice.js";
 import {
   catastrophicGuardNotice,
+  getGitStatus,
   pruneCheckpoints,
-  sanitizedEnvironment,
 } from "./workspace.js";
 import { errorMessage, formatUsd } from "./utils.js";
 
@@ -2218,17 +2218,8 @@ function dashboardKeyStatus(
 
 async function inspectWorkspace(workspace: string): Promise<string> {
   try {
-    const { stdout } = await execFileAsync(
-      "git",
-      ["status", "--short", "--branch"],
-      {
-        cwd: workspace,
-        encoding: "utf8",
-        env: sanitizedEnvironment(),
-        timeout: 3_000,
-        maxBuffer: 1_000_000,
-      },
-    );
+    const { stdout, code } = await getGitStatus(workspace);
+    if (code !== 0) throw new Error("git status ist fehlgeschlagen");
     const lines = stdout.trimEnd().split(/\r?\n/);
     const branchLine = lines[0]?.startsWith("## ")
       ? lines.shift()!.slice(3)

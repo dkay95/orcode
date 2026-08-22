@@ -1127,8 +1127,9 @@ async function approvalCommand(args: string[], context: CommandContext): Promise
       return;
     }
     for (const rule of rules) {
-      const subject =
-        rule.match.kind === "any" ? "(beliebig)" : rule.match.value;
+      const subject = rule.match.kind === "exact-subject"
+        ? rule.match.display
+        : `(deaktiviert: ${rule.match.reason})`;
       context.out.text(
         `${rule.decision === "allow" ? chalk.green("allow") : chalk.red("deny")} ${chalk.dim(rule.tool)} ${subject} · ${rule.id.slice(0, 8)}`,
       );

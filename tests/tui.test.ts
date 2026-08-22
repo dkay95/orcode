@@ -233,15 +233,31 @@ test("an approval keeps its details once on screen and offers j and n", () => {
     details: ["npm test", "in ~/projekt/routercode"],
     rememberHint: "keine gemerkte Regel für „npm“",
   });
-  const frame = buildDashboardFrame(
-    input({ mode: "confirm", blocks: [...model.blocks], waitingSince: NOW - 14_000 }),
-  );
+  const frame = buildDashboardFrame(input({
+    mode: "confirm",
+    blocks: [...model.blocks],
+    waitingSince: NOW - 14_000,
+    rememberAvailable: true,
+  }));
   const screen = text(frame.lines);
 
   assert.match(screen, /⚠ Freigabe · SHELL · Tests ausführen/);
   assert.equal(screen.match(/npm test/g)?.length, 1);
   assert.match(screen, /wartet seit 00:14/);
   assert.match(plainText(frame.lines.at(-1)!), /j ja · n nein · Enter = nein/);
+  assert.match(plainText(frame.lines.at(-1)!), /a immer erlauben · d nie erlauben/);
+});
+
+test("the confirm footer hides remember actions when no safe subject exists", () => {
+  const frame = buildDashboardFrame(input({
+    mode: "confirm",
+    waitingSince: NOW - 2_000,
+    rememberAvailable: false,
+  }));
+  const footer = plainText(frame.lines.at(-1)!);
+
+  assert.match(footer, /j ja · n nein · Enter = nein/);
+  assert.doesNotMatch(footer, /immer erlauben|nie erlauben/);
 });
 
 test("assistant Markdown is translated instead of stripped", () => {
@@ -906,20 +922,43 @@ test("an approval accepts j as well as y and answers unbound keys", async () => 
   }
 });
 
-test("a immer remembers allow, d nie remembers deny, g asks for a reason", async () => {
+test("always/never are available only when the same preview carries a safe exact subject", async () => {
   const stdin = new FakeInput();
   const stdout = new FakeOutput();
   const terminal = ui(stdin, stdout);
 
   terminal.start();
   try {
-    const allow = terminal.confirmAction("SHELL · npm test", "npm test");
+    const exactSubject = '{"kind":"selected-path","path":"src/index.ts"}';
+    const allow = terminal.confirmApproval({
+      name: "write_file",
+      risk: "edit",
+      summary: "src/index.ts schreiben",
+      details: "eine synthetische Änderung",
+      subject: exactSubject,
+      rememberAvailable: true,
+    });
+    assert.match(stdout.output, /Freigabe-Subjekt \(exakt\)/);
+    assert.match(stdout.output, /selected-path/);
+    assert.match(stdout.output, /src\/index\.ts/);
     press(stdin, "a", "a");
     assert.deepEqual(await allow, { accepted: true, remember: "allow" });
 
-    const deny = terminal.confirmAction("SHELL · rm -rf", "rm -rf build");
+    const deny = terminal.confirmApproval({
+      name: "write_file",
+      risk: "edit",
+      summary: "src/index.ts schreiben",
+      subject: exactSubject,
+      rememberAvailable: true,
+    });
     press(stdin, "d", "d");
     assert.deepEqual(await deny, { accepted: false, remember: "deny" });
+
+    const unavailable = terminal.confirmAction("Sitzung löschen", "lokale Sitzung");
+    press(stdin, "a", "a");
+    assert.match(stdout.output, /Immer\/Nie ist ohne exaktes Subject nicht verfügbar/);
+    press(stdin, "j", "j");
+    assert.deepEqual(await unavailable, { accepted: true });
 
     const reasoned = terminal.confirmAction("SHELL · curl", "curl example.com");
     press(stdin, "g", "g");

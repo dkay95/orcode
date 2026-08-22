@@ -26,6 +26,26 @@ export interface PathPolicyDecision {
   reason: string;
 }
 
+export type GitReadOperation = "diff" | "status";
+
+export interface GitReadCapabilityPolicy {
+  id: `git.${GitReadOperation}`;
+  effect: "read";
+  hardened: true;
+  /** Read capabilities are declared/evaluated, never stored as mutation rules. */
+  rememberable: false;
+}
+
+/** Central classification used by both slash commands and model Git tools. */
+export function evaluateGitReadCapability(operation: GitReadOperation): GitReadCapabilityPolicy {
+  return {
+    id: `git.${operation}`,
+    effect: "read",
+    hardened: true,
+    rememberable: false,
+  };
+}
+
 const ALLOWED: PathPolicyDecision = { verdict: "allow", rule: "none", reason: "" };
 
 /** Directories whose content must never be written without an explicit yes. */

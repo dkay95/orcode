@@ -1,6 +1,8 @@
 import { spawn } from "node:child_process";
+import { constants as fsConstants } from "node:fs";
 import { randomUUID } from "node:crypto";
 import {
+  access,
   chmod,
   lstat,
   mkdir,
@@ -13,7 +15,7 @@ import {
   unlink,
   writeFile,
 } from "node:fs/promises";
-import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { basename, delimiter, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import fg from "fast-glob";
 import { tool } from "@openrouter/agent";
@@ -22,14 +24,26 @@ import type { ApprovalManager, ApprovalRequest } from "./approval.js";
 import { APP_HOME, writeFileAtomicSecure } from "./config.js";
 import { loadIgnore } from "./ignore.js";
 import {
+  browserApprovalSubject,
   inspectUrl,
   isLocalHttpHost,
   validateBrowserUrl,
 } from "./browser.js";
-import { assertSafeGlobPattern, classifyPath } from "./policy.js";
+import {
+  assertSafeGlobPattern,
+  classifyPath,
+  evaluateGitReadCapability,
+  type GitReadCapabilityPolicy,
+  type GitReadOperation,
+} from "./policy.js";
 import { ReadRegistry, sha256Hex } from "./read-registry.js";
+import {
+  canonicalWorkspaceRelativeCwd,
+  processApprovalSubject,
+  shellApprovalSubject,
+} from "./rules.js";
 import { findSshHost, loadSshHosts, type SshHost } from "./ssh-config.js";
-import { execSshCommand, type RunSsh } from "./ssh.js";
+import { execSshCommand, sshApprovalSubject, type RunSsh } from "./ssh.js";
 import type { ToolRisk } from "./types.js";
 import { hasCode, isRecord, sanitizedEnvironment, truncate } from "./utils.js";
 
@@ -506,6 +520,12 @@ export function createCodingTools(
     execute: async ({ path, pattern, limit, respectGitignore }) => {
       assertSafeGlobPattern(pattern, "Glob-Muster");
       const base = await guard.resolvePath(path);
+      await approvals.authorize({
+        name: "list_files",
+        risk: "read",
+        summary: `Dateien auflisten: ${guard.display(base)} · ${pattern}`,
+        subject: { kind: "selected-path-glob", base: guard.display(base), pattern },
+      });
       const found = await fg(pattern, {
         cwd: base,
         dot: true,
@@ -579,6 +599,16 @@ export function createCodingTools(
         assertSafeGlobPattern(glob, "Glob-Muster");
       }
       const target = await guard.resolvePath(path);
+      await approvals.authorize({
+        name: "search_files",
+        risk: "read",
+        summary: `Text suchen in ${guard.display(target)}${glob ? ` · ${glob}` : ""}`,
+        subject: {
+          kind: "selected-path-glob",
+          base: guard.display(target),
+          pattern: glob ?? "**/*",
+        },
+      });
       const request: WorkspaceSearchOptions = {
         root: guard.root,
         directory: target,
@@ -714,13 +744,21 @@ export function createCodingTools(
           `Der Befehl wurde durch die Katastrophenschutz-Regel blockiert (${verdict.rule}): ${verdict.reason}`,
         );
       }
+      const shell = resolveCommandShell();
+      const cwd = await canonicalWorkspaceRelativeCwd(guard.root, guard.root);
       await approvals.authorize({
         name: "run_command",
         risk: "shell",
         summary: `Shell-Befehl in ${guard.root}`,
         details: command,
+        subject: shellApprovalSubject({
+          platform: process.platform,
+          executable: shell.executable,
+          mode: shell.args,
+          cwd,
+          command,
+        }),
       });
-      const shell = resolveCommandShell();
       const handle: object = {};
       options.onProcessStart?.(handle, "run_command", { command, timeoutSeconds });
       const result = await runProcess(shell.executable, [...shell.args, command], {
@@ -755,25 +793,33 @@ export function createCodingTools(
       truncated: z.boolean(),
     }),
     execute: async ({ staged }) => {
-      // git executes repository-controlled code (diff drivers, textconv,
-      // fsmonitor, pager). Even with all of that switched off below it stays a
-      // process launch, so it is priced as one.
-      await approvals.authorize({
-        name: "git_diff",
-        risk: "shell",
-        summary: `git diff${staged ? " --cached" : ""} in ${guard.root}`,
-        details:
-          "git wird ohne externe Diff-Treiber, ohne textconv, ohne fsmonitor und ohne Pager aufgerufen.",
-      });
       const handle: object = {};
-      options.onProcessStart?.(handle, "git_diff", { staged });
-      const result = await runProcess("git", gitDiffArgs(staged), {
-        cwd: guard.root,
-        timeoutMs: 20_000,
-        env: GIT_SAFE_ENVIRONMENT,
-        ...(signal ? { signal } : {}),
-        onChunk: (stream, text) => options.onProcessChunk?.(handle, stream, text),
-      });
+      const execution = await runHardenedGitRead(
+        guard.root,
+        { operation: "diff", staged },
+        runProcess,
+        async ({ executable, args, cwd, env }) => {
+          await approvals.authorize({
+            name: "git_diff",
+            risk: "shell",
+            summary: `git diff${staged ? " --cached" : ""} in ${guard.root}`,
+            details:
+              "git wird ohne externe Diff-Treiber, ohne textconv, ohne fsmonitor und ohne Pager aufgerufen.",
+            subject: processApprovalSubject({
+              executable,
+              argv: args,
+              cwd: await canonicalWorkspaceRelativeCwd(guard.root, cwd),
+              forwardedEnvironment: env,
+            }),
+          });
+          options.onProcessStart?.(handle, "git_diff", { staged });
+        },
+        {
+          ...(signal ? { signal } : {}),
+          onChunk: (stream, text) => options.onProcessChunk?.(handle, stream, text),
+        },
+      );
+      const result = execution.result;
       if (result.code !== 0) {
         throw new Error(result.stderr || "git diff ist fehlgeschlagen.");
       }
@@ -845,6 +891,7 @@ export function createCodingTools(
           summary: `Fremde Seite laden: ${target.href}`,
           details:
             "Der Inhalt dieser Seite geht in den Modellkontext. Er stammt von Dritten und ist nicht vertrauenswürdig.",
+          subject: browserApprovalSubject(target, "inspect"),
         });
       }
       const handle: object = {};
@@ -919,8 +966,7 @@ export function createCodingTools(
       await approvals.authorize({
         name: "ssh_command",
         risk: "remote-shell",
-        host,
-        command,
+        subject: sshApprovalSubject(resolved.alias, command),
         summary: `SSH-ZIEL: ${host.toUpperCase()} (${resolved.hostName}) — ${oneLine(command, 200)}`,
         details: `Läuft NICHT lokal, sondern auf ${resolved.hostName}${
           resolved.user ? ` als ${resolved.user}` : ""
@@ -1331,6 +1377,7 @@ export function writeApprovalRequest(
     name,
     risk: "edit",
     summary: parts.summary,
+    subject: { kind: "selected-path", path: displayPath },
     ...(details ? { details } : {}),
     ...(decision.verdict === "approve"
       ? { alwaysAsk: true, policyRule: decision.rule }
@@ -1344,18 +1391,20 @@ async function authorizeRead(
   displayPath: string,
 ): Promise<void> {
   const decision = classifyPath(displayPath, "read");
-  if (decision.verdict === "allow") {
-    return;
-  }
   if (decision.verdict === "deny") {
     throw new Error(`${displayPath} ist gesperrt: ${decision.reason}`);
   }
   await approvals.authorize({
     name,
-    risk: "secret-read",
-    summary: `Vertrauliche Datei lesen: ${displayPath}`,
-    details: decision.reason,
-    policyRule: decision.rule,
+    risk: decision.verdict === "approve" ? "secret-read" : "read",
+    summary:
+      decision.verdict === "approve"
+        ? `Vertrauliche Datei lesen: ${displayPath}`
+        : `Datei lesen: ${displayPath}`,
+    subject: { kind: "selected-path", path: displayPath },
+    ...(decision.verdict === "approve"
+      ? { details: decision.reason, policyRule: decision.rule }
+      : {}),
   });
 }
 
@@ -1379,6 +1428,7 @@ const GIT_HARDENING = [
 
 const GIT_SAFE_ENVIRONMENT: NodeJS.ProcessEnv = {
   GIT_EXTERNAL_DIFF: "",
+  GIT_OPTIONAL_LOCKS: "0",
   GIT_PAGER: "cat",
   GIT_TERMINAL_PROMPT: "0",
 };
@@ -1392,16 +1442,94 @@ export function gitDiffArgs(staged: boolean): string[] {
   return args;
 }
 
-export async function getGitDiff(root: string): Promise<string> {
-  const result = await runProcess("git", gitDiffArgs(false), {
+export function gitStatusArgs(): string[] {
+  return [...GIT_HARDENING, "status", "--short", "--branch", "--untracked-files=normal"];
+}
+
+export type RunProcess = (
+  executable: string,
+  args: string[],
+  options: RunProcessOptions,
+) => Promise<ProcessResult>;
+
+export interface HardenedGitInvocation {
+  executable: string;
+  args: string[];
+  cwd: string;
+  env: NodeJS.ProcessEnv;
+}
+
+export interface HardenedGitReadResult {
+  policy: GitReadCapabilityPolicy;
+  invocation: HardenedGitInvocation;
+  result: ProcessResult;
+}
+
+export type HardenedGitReadRequest =
+  | { operation: "diff"; staged: boolean }
+  | { operation: "status" };
+
+export async function resolveExecutablePath(
+  executable: string,
+  environment: NodeJS.ProcessEnv = process.env,
+  platform: NodeJS.Platform = process.platform,
+): Promise<string> {
+  if (isAbsolute(executable) || executable.includes("/") || executable.includes("\\")) {
+    return realpath(resolve(executable));
+  }
+  const directories = (environment.PATH ?? "").split(delimiter).filter(Boolean);
+  const extensions = platform === "win32"
+    ? (environment.PATHEXT ?? ".EXE;.CMD;.BAT;.COM").split(";")
+    : [""];
+  for (const directory of directories) {
+    for (const extension of extensions) {
+      const candidate = join(directory, platform === "win32" ? `${executable}${extension}` : executable);
+      try {
+        await access(candidate, fsConstants.X_OK);
+        return await realpath(candidate);
+      } catch {
+        // Try the next PATH entry.
+      }
+    }
+  }
+  throw new Error(`Ausführbare Datei nicht in PATH gefunden: ${executable}`);
+}
+
+export async function runHardenedGitRead(
+  root: string,
+  request: HardenedGitReadRequest,
+  runner: RunProcess = runProcess,
+  beforeRun?: (invocation: HardenedGitInvocation) => Promise<void>,
+  runtime: Pick<RunProcessOptions, "signal" | "onChunk"> = {},
+): Promise<HardenedGitReadResult> {
+  const operation: GitReadOperation = request.operation;
+  const policy = evaluateGitReadCapability(operation);
+  const invocation: HardenedGitInvocation = {
+    executable: await resolveExecutablePath("git"),
+    args: request.operation === "diff" ? gitDiffArgs(request.staged) : gitStatusArgs(),
     cwd: root,
-    timeoutMs: 20_000,
-    env: GIT_SAFE_ENVIRONMENT,
+    env: { ...GIT_SAFE_ENVIRONMENT },
+  };
+  await beforeRun?.(invocation);
+  const result = await runner(invocation.executable, invocation.args, {
+    cwd: invocation.cwd,
+    timeoutMs: request.operation === "diff" ? 20_000 : 3_000,
+    env: invocation.env,
+    ...runtime,
   });
+  return { policy, invocation, result };
+}
+
+export async function getGitDiff(root: string, runner: RunProcess = runProcess): Promise<string> {
+  const { result } = await runHardenedGitRead(root, { operation: "diff", staged: false }, runner);
   if (result.code !== 0) {
     return result.stderr || "Kein Git-Repository oder git diff ist fehlgeschlagen.";
   }
   return result.stdout || "Keine uncommitteten Änderungen.";
+}
+
+export async function getGitStatus(root: string, runner: RunProcess = runProcess): Promise<ProcessResult> {
+  return (await runHardenedGitRead(root, { operation: "status" }, runner)).result;
 }
 
 // ---------------------------------------------------------------------------

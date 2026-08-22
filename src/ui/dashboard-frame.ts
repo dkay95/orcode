@@ -88,6 +88,8 @@ export interface DashboardFrameInput {
   run?: RunSnapshot;
   list?: ListView;
   waitingSince?: number;
+  /** Whether this exact approval request has a safe persistable subject. */
+  rememberAvailable?: boolean;
   secretLabel?: string;
   helpRequested?: boolean;
   newLinesBelow?: number;
@@ -179,7 +181,9 @@ export function buildListLines(
 /** Bauplan 2.4: the help line only appears on approval, open list or `?`. */
 function helpText(input: DashboardFrameInput): string | undefined {
   if (input.mode === "confirm") {
-    return "j ja · n nein · Enter = nein · a immer erlauben · d nie erlauben · g Begründung";
+    return input.rememberAvailable
+      ? "j ja · n nein · Enter = nein · a immer erlauben · d nie erlauben · g Begründung"
+      : "j ja · n nein · Enter = nein · g Begründung";
   }
   if (input.mode === "model-picker" || input.mode === "choice-picker") {
     return "Tippen filtert · ↑↓ wählen · Enter übernehmen · Esc abbrechen";

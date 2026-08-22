@@ -1,7 +1,12 @@
 import { confirm } from "@inquirer/prompts";
 import chalk from "chalk";
-import { deriveCommandSubject, type RuleStore } from "./rules.js";
-import type { ApprovalMode, ToolCallPreview, ToolRisk } from "./types.js";
+import {
+  approvalSubjectDisplay,
+  exactSubjectMatch,
+  normalizeApprovalSubject,
+  type RuleStore,
+} from "./rules.js";
+import type { ApprovalMode, ApprovalSubject, ToolCallPreview, ToolRisk } from "./types.js";
 import { truncate } from "./utils.js";
 
 export class PermissionDeniedError extends Error {}
@@ -26,23 +31,8 @@ export interface ApprovalRequest {
   alwaysAsk?: boolean;
   /** Policy rule id that caused `alwaysAsk`; shown to the user. */
   policyRule?: string;
-  /**
-   * Raw shell command for `risk: "shell"` requests. Used to derive the rule
-   * subject (`deriveCommandSubject`) — never matched literally, so `npm test`
-   * and `npm test --watch` share a rule.
-   */
-  command?: string;
-  /**
-   * Workspace-relative path for file-tool requests. Used verbatim as the rule
-   * subject (`path-glob` matching).
-   */
-  path?: string;
-  /**
-   * Remote host alias for `risk: "remote-shell"` requests (`ssh_command`).
-   * Folded into the rule subject ahead of `command`/`path` so a remembered
-   * rule for one host can never bleed into another — see `subjectOf`.
-   */
-  host?: string;
+  /** Exact serializable authority identity. Omit when it cannot be derived safely. */
+  subject?: ApprovalSubject;
 }
 
 /** After this many rejections of the same tool the tool is locked for the run. */
@@ -125,17 +115,18 @@ export class ApprovalManager {
   }
 
   async authorize(request: ApprovalRequest): Promise<void> {
-    const subject = subjectOf(request);
+    const subject = request.subject ? normalizeApprovalSubject(request.subject) : null;
+    const subjectDisplay = subject ? approvalSubjectDisplay(subject) : undefined;
 
     // (1) Remembered rules — a `deny` rule beats everything, including
     // `allow-all`.
     const ruleDecision =
-      this.#ruleStore && subject !== undefined
+      this.#ruleStore && subject
         ? this.#ruleStore.decide(this.#workspace, request.name, subject)
         : null;
     if (ruleDecision === "deny") {
       throw new PermissionDeniedError(
-        `${request.name} wurde durch eine gespeicherte Regel abgelehnt (${subject}).`,
+        `${request.name} wurde durch eine gespeicherte Regel abgelehnt (${subjectDisplay}).`,
       );
     }
     // (2) `alwaysAsk` from policy.ts protects a path no matter what a
@@ -160,7 +151,7 @@ export class ApprovalManager {
       throw new PermissionDeniedError(lockedMessage(request.name));
     }
 
-    const preview = toPreview(request);
+    const preview = toPreview(request, subject ?? undefined);
     let result: ApprovalDecision;
     if (this.#promptHandler) {
       result = await this.#promptHandler(preview);
@@ -173,13 +164,11 @@ export class ApprovalManager {
       result = { accepted };
     }
 
-    if (result.remember && this.#ruleStore && subject !== undefined) {
+    if (result.remember && this.#ruleStore && subject && exactSubjectMatch(subject)) {
       await this.#ruleStore.remember({
         workspace: this.#workspace,
         tool: request.name,
-        match: request.command
-          ? { kind: "command-prefix", value: subject }
-          : { kind: "path-glob", value: subject },
+        subject,
         decision: result.remember,
       });
     }
@@ -230,20 +219,6 @@ export class ApprovalManager {
   }
 }
 
-/**
- * Rule-matching subject: derived from `command` for shell risk, `path`
- * otherwise, with `host` folded in ahead of it for `remote-shell` requests —
- * a rule remembered while targeting `vps` must never match the same command
- * against `produktion`.
- */
-function subjectOf(request: ApprovalRequest): string | undefined {
-  const base = request.command ? deriveCommandSubject(request.command) : request.path;
-  if (base === undefined) {
-    return undefined;
-  }
-  return request.host ? `${request.host}: ${base}` : base;
-}
-
 function lockedMessage(name: string): string {
   return `${name} wurde in diesem Lauf ${MAX_DENIALS_PER_RUN}-mal abgelehnt und ist bis zum Ende des Laufs gesperrt. Formuliere die Aufgabe neu oder starte einen neuen Lauf.`;
 }
@@ -252,19 +227,19 @@ function lockedMessage(name: string): string {
  * Map an internal request onto the UI-facing preview. The risk level is passed
  * through unchanged; only the policy hints become readable text.
  */
-function toPreview(request: ApprovalRequest): ToolCallPreview {
+function toPreview(request: ApprovalRequest, subject?: ApprovalSubject): ToolCallPreview {
   const notes: string[] = [];
   if (request.risk === "secret-read") {
     notes.push(
       "Vertraulicher Pfad: der Inhalt würde als Klartext an das Modell gesendet.",
     );
   }
-  if (request.risk === "remote-shell" && request.host) {
+  if (request.risk === "remote-shell" && subject?.kind === "ssh-command") {
     // Structural, not just phrasing in the caller's summary: whatever
     // ssh_command writes as its summary, the host still gets its own,
     // impossible-to-miss line — this is the one piece of chrome that must
     // never depend on someone remembering to word the summary well.
-    notes.push(`SSH-ZIEL (NICHT LOKAL): ${request.host.toUpperCase()}`);
+    notes.push(`SSH-ZIEL (NICHT LOKAL): ${subject.host.toUpperCase()}`);
   }
   if (request.risk === "network-fetch") {
     notes.push(
@@ -282,6 +257,8 @@ function toPreview(request: ApprovalRequest): ToolCallPreview {
     risk: request.risk,
     summary: request.summary,
     ...(details ? { details } : {}),
+    ...(subject ? { subject: approvalSubjectDisplay(subject) } : {}),
+    rememberAvailable: subject !== undefined,
   };
 }
 
@@ -324,6 +301,9 @@ function printPreview(preview: ToolCallPreview): void {
   const risk = riskLabel(preview.risk);
   console.log(`\n${chalk.yellow("Freigabe erforderlich")} ${risk}`);
   console.log(chalk.bold(stripControlCharacters(preview.summary)));
+  if (preview.subject) {
+    console.log(chalk.dim(`Freigabe-Subjekt (exakt): ${stripControlCharacters(preview.subject)}`));
+  }
   if (preview.details) {
     console.log(chalk.dim(stripControlCharacters(truncate(preview.details, 5_000))));
   }
