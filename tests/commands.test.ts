@@ -208,3 +208,66 @@ test("failed managed-backup cleanup keeps the active transcript bound and a retr
   assert.equal((await SessionStore.list(workspace, appHome)).some((chat) => chat.id === oldId), false);
   await assert.rejects(stat(backupPath), /ENOENT/);
 });
+
+test("a managed-backup inspection failure retains the active transcript and retry cannot resurrect it", async () => {
+  const root = await mkdtemp(join(tmpdir(), "routercode-command-backup-inspection-retry-"));
+  const workspace = join(root, "project");
+  const appHome = join(root, ".orcode");
+  const active = SessionStore.create(workspace, appHome, "Inspection-Retry");
+  await active.save();
+  const oldId = active.data.id;
+  const checksum = "a".repeat(64);
+  const backupPath = join(appHome, "migration-backups", `routercode-${checksum.slice(0, 16)}`);
+  await mkdir(join(appHome, "migration-backups"), { recursive: true });
+  await writeFile(backupPath, "not-a-directory");
+  await mkdir(join(appHome, "migrations"), { recursive: true });
+  await writeFile(migrationManifestPath(appHome), JSON.stringify({
+    version: 1,
+    phase: "complete",
+    sourcePath: join(root, ".routercode"),
+    sourceChecksum: checksum,
+    stagingPath: join(appHome, ".migration-staging", checksum),
+    backupPath,
+    chatIdMap: {},
+    destinationPaths: [],
+    isolated: [],
+    complete: true,
+    startedAt: "2026-08-22T11:59:00.000Z",
+    completedAt: "2026-08-22T12:00:00.000Z",
+  }));
+  const rebound: string[] = [];
+  const errors: Array<{ message: string; details: string }> = [];
+  const context = {
+    workspace,
+    session: active,
+    config: structuredClone(DEFAULT_CONFIG),
+    configPath: join(appHome, "config.json"),
+    agent: { setSession: (session: SessionStore) => rebound.push(session.data.id) },
+    out: {
+      text: () => undefined,
+      error: (message: string, details: string) => errors.push({ message, details }),
+    },
+    confirmChatDeletion: async () => true,
+  } as unknown as CommandContext;
+
+  await handleSlashCommand(`/chat delete ${oldId}`, context);
+
+  assert.equal(context.session.data.id, oldId, "inspection failure keeps the active binding");
+  assert.deepEqual(rebound, []);
+  assert.match(await readFile(active.path, "utf8"), /Inspection-Retry/);
+  assert.equal(await readFile(backupPath, "utf8"), "not-a-directory", "the backup remains retryable");
+  assert.equal(errors.length, 1);
+  assert.match(errors[0]!.message, /nicht vollständig gelöscht/);
+  assert.ok(errors[0]!.details.includes(backupPath));
+  assert.match(errors[0]!.details, /ENOTDIR/);
+
+  await rm(backupPath);
+  await mkdir(backupPath);
+  await handleSlashCommand(`/chat delete ${oldId}`, context);
+  await context.session.save();
+
+  assert.notEqual(context.session.data.id, oldId);
+  assert.deepEqual(rebound, [context.session.data.id]);
+  assert.equal((await SessionStore.list(workspace, appHome)).some((chat) => chat.id === oldId), false);
+  await assert.rejects(stat(backupPath), /ENOENT/);
+});

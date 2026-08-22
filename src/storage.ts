@@ -500,8 +500,14 @@ export async function deleteChatOwnedArtifacts(
     for (const path of paths) await removeOwnedPath(store, path, report);
   }
   if (report.errors.length > 0) return report;
-  if (manifest && await treeHasNoFiles(manifest.backupPath)) {
-    await removeOwnedPath(store, manifest.backupPath, report);
+  if (manifest) {
+    try {
+      if (await treeHasNoFiles(manifest.backupPath)) {
+        await removeOwnedPath(store, manifest.backupPath, report);
+      }
+    } catch (error) {
+      recordRetentionError(report, manifest.backupPath, error);
+    }
   }
   if (report.errors.length > 0) return report;
   const transcriptPaths = await CHAT_ARTIFACT_REGISTRY.existing("chat", local);
@@ -1503,7 +1509,8 @@ async function treeHasNoFiles(root: string): Promise<boolean> {
     }
     return true;
   } catch (error) {
-    return hasErrorCode(error, "ENOENT");
+    if (hasErrorCode(error, "ENOENT")) return true;
+    throw error;
   }
 }
 

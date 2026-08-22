@@ -172,3 +172,62 @@ DONE
 
 - Requested message:
   `fix: preserve retryable chat cleanup and backup retention`
+
+## Fix Round 2
+
+### Review verification and RED
+
+- Read the complete round-2 finding and updated progress ledger, then traced
+  deletion from `/chat delete` through `SessionStore.remove`,
+  `deleteChatOwnedArtifacts` and `treeHasNoFiles` against base
+  `0caedc41362540087fb15e5437fd52dad15363a4`.
+- Root cause: `treeHasNoFiles` returned `false` for every non-ENOENT `readdir`
+  error. Its caller therefore could not distinguish a conclusively nonempty
+  backup from a failed inspection and continued to canonical transcript
+  removal without a report error.
+- Exact named RED command:
+  `node --import tsx --test --test-name-pattern='managed-backup inspection failure' tests/commands.test.ts`
+- RED result: 1 reached, 0 passed and 1 failed. A real backup-path file forced
+  deterministic ENOTDIR; the active chat had already rebound to a new ID,
+  proving the canonical retry anchor was removed before the failure surfaced.
+
+### Minimal fix
+
+- `treeHasNoFiles` still treats ENOENT as an idempotently missing backup, but
+  now propagates ENOTDIR, EACCES and every other inspection error.
+- `deleteChatOwnedArtifacts` catches that one backup-inspection boundary,
+  records the existing path/message `ChatDeletionReport` error, and reaches
+  the existing early return before enumerating or deleting the canonical
+  transcript.
+- The real-filesystem regression proves the failed attempt retains the backup,
+  transcript and active binding, surfaces the ENOTDIR details, and a later
+  confirmed retry deletes cleanly, rebinds, and cannot resurrect the old chat
+  through autosave.
+
+### GREEN and final gates
+
+- Named round-2 regression: 1/1 passed.
+- Required Task 6 focus: 190/190 passed, 0 failed.
+- Related integration/resume/TUI/migration/private-store suites: 132 reached,
+  131 passed, 0 failed and 1 Windows-only skip.
+- `npx tsc -p tsconfig.json --noEmit`: passed.
+- `npx tsc -p tsconfig.tests.json --noEmit`: passed.
+- Full `npm test`: 715 reached, 714 passed, 0 failed and 1 Windows-only skip.
+- Central credential-fixture audit returned no matches.
+- `git diff --check` passed.
+
+### Round-2 self-review and concerns
+
+- The production edit is confined to backup inspection/reporting in
+  `src/storage.ts`; no deletion primitive, registry path, manifest trust rule,
+  or unrelated lifecycle behavior changed.
+- Missing backups remain idempotent, conclusively nonempty backups remain
+  preserved without error, and only an inconclusive inspection now blocks
+  transcript deletion.
+- The existing native-Windows DACL integration remains the one expected skip
+  on this macOS host; no native Windows result is claimed in this fix round.
+
+### Commit
+
+- Requested message:
+  `fix: retain chat anchors on backup inspection failure`
