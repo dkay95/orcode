@@ -1,13 +1,24 @@
 import assert from "node:assert/strict";
-import { appendFile, mkdtemp, readdir, readFile, stat } from "node:fs/promises";
+import { appendFile, mkdtemp, readdir, readFile, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { createRunId, runLogPath, runsDir, RunLog } from "../src/runlog.js";
+import {
+  createRunId,
+  runLogPath,
+  runsDir,
+  RunLog,
+  type RunLogEnvelope,
+} from "../src/runlog.js";
+import { findInterruptedRun, summarizeRun } from "../src/resume.js";
 import type { AgentRunEvent } from "../src/types.js";
 
 async function appHome(prefix: string): Promise<string> {
   return mkdtemp(join(tmpdir(), `routercode-runlog-${prefix}-`));
+}
+
+function syntheticCredential(): string {
+  return `${["sk", "or", "v1"].join("-")}-${"z".repeat(40)}`;
 }
 
 const SAMPLE_EVENTS: AgentRunEvent[] = [
@@ -124,6 +135,220 @@ test("RunLog write/close/read round-trips every sample event in order", async ()
     read.push(event);
   }
   assert.deepEqual(read, SAMPLE_EVENTS);
+});
+
+test("new writes use a versioned envelope and redact a clone of the live event", async () => {
+  const home = await appHome("envelope-redaction");
+  const chatId = "chat-envelope";
+  const runId = createRunId();
+  const secret = syntheticCredential();
+  const event: AgentRunEvent = {
+    type: "tool-end",
+    id: "t1",
+    number: 1,
+    name: "run_command",
+    input: { command: `deploy ${secret}` },
+    output: { stdout: secret, exitCode: 0 },
+    durationMs: 17,
+    timestamp: 23,
+  };
+  const liveBefore = structuredClone(event);
+
+  const log = await RunLog.open(home, chatId, runId);
+  log.write(event);
+  await log.close();
+
+  assert.deepEqual(event, liveBefore);
+  const raw = await readFile(runLogPath(home, chatId, runId), "utf8");
+  assert.doesNotMatch(raw, new RegExp(secret));
+  const envelope = JSON.parse(raw) as RunLogEnvelope;
+  assert.equal(envelope.version, 1);
+  assert.equal(envelope.event.type, "tool-end");
+  assert.equal(envelope.event.timestamp, 23);
+  assert.equal(envelope.event.durationMs, 17);
+});
+
+test("appendRunEvent redacts a clone and writes the same versioned envelope", async () => {
+  const home = await appHome("append-redaction");
+  const chatId = "chat-append-redaction";
+  const runId = createRunId();
+  const seed = await RunLog.open(home, chatId, runId);
+  await seed.close();
+  const secret = syntheticCredential();
+  const event: AgentRunEvent = {
+    type: "notice",
+    level: "error",
+    code: "synthetic",
+    message: `failed with ${secret}`,
+    hint: secret,
+    timestamp: 31,
+  };
+  const liveBefore = structuredClone(event);
+
+  await RunLog.appendRunEvent(home, chatId, runId, event);
+
+  assert.deepEqual(event, liveBefore);
+  const raw = await readFile(runLogPath(home, chatId, runId), "utf8");
+  assert.doesNotMatch(raw, new RegExp(secret));
+  const envelope = JSON.parse(raw) as RunLogEnvelope;
+  assert.equal(envelope.version, 1);
+  assert.equal(envelope.event.type, "notice");
+});
+
+test("read accepts versioned and legacy events while isolating future versions", async () => {
+  const home = await appHome("mixed-versions");
+  const chatId = "chat-mixed";
+  const runId = createRunId();
+  const path = runLogPath(home, chatId, runId);
+  const log = await RunLog.open(home, chatId, runId);
+  await log.close();
+  const legacy: AgentRunEvent = {
+    type: "run-start",
+    model: "legacy-model",
+    maxSteps: 7,
+    prompt: "legacy prompt",
+    timestamp: 10,
+  };
+  const modern: AgentRunEvent = {
+    type: "model-end",
+    model: "modern-model",
+    step: 2,
+    durationMs: 80,
+    inputTokens: 100,
+    outputTokens: 20,
+    reasoningTokens: 5,
+    cachedTokens: 40,
+    costUsd: 0.125,
+    timestamp: 20,
+  };
+  const terminal: AgentRunEvent = {
+    type: "run-end",
+    outcome: "cost-limit",
+    durationMs: 900,
+    toolCount: 3,
+    timestamp: 30,
+  };
+  const envelope: RunLogEnvelope = { version: 1, event: modern };
+  await writeFile(
+    path,
+    [
+      JSON.stringify(legacy),
+      JSON.stringify(envelope),
+      JSON.stringify({ version: 99, event: { type: "text", delta: "future", timestamp: 25 } }),
+      JSON.stringify({ version: 1, event: terminal }),
+      "",
+    ].join("\n"),
+  );
+
+  const read: AgentRunEvent[] = [];
+  await assert.doesNotReject(async () => {
+    for await (const event of RunLog.read(home, chatId, runId)) {
+      read.push(event);
+    }
+  });
+  assert.deepEqual(read, [legacy, modern, terminal]);
+});
+
+test("resume reads a mixed legacy and envelope log without losing timing or cost", async () => {
+  const home = await appHome("resume-mixed");
+  const chatId = "chat-resume-mixed";
+  const runId = "2026-08-22T10-00-00-000-resume";
+  const path = runLogPath(home, chatId, runId);
+  const log = await RunLog.open(home, chatId, runId);
+  await log.close();
+  const legacy: AgentRunEvent = {
+    type: "run-start",
+    model: "legacy-model",
+    maxSteps: 5,
+    prompt: "continue safely",
+    timestamp: 100,
+  };
+  const modelEnd: AgentRunEvent = {
+    type: "model-end",
+    model: "legacy-model",
+    step: 1,
+    durationMs: 75,
+    inputTokens: 12,
+    outputTokens: 8,
+    reasoningTokens: 2,
+    cachedTokens: 4,
+    costUsd: 0.25,
+    timestamp: 200,
+  };
+  const partial: AgentRunEvent = {
+    type: "text",
+    delta: "partial answer",
+    timestamp: 300,
+  };
+  await writeFile(
+    path,
+    [
+      JSON.stringify(legacy),
+      JSON.stringify({ version: 1, event: modelEnd } satisfies RunLogEnvelope),
+      JSON.stringify({ version: 1, event: partial } satisfies RunLogEnvelope),
+      "",
+    ].join("\n"),
+  );
+
+  const interrupted = await findInterruptedRun(home, chatId);
+  assert.ok(interrupted);
+  assert.deepEqual(interrupted.events, [legacy, modelEnd, partial]);
+  const summary = summarizeRun(interrupted.events);
+  assert.equal(summary.startedAt, 100);
+  assert.equal(summary.costUsd, 0.25);
+  assert.equal(summary.partialAnswerText, "partial answer");
+  assert.match(summary.brokeOffAt, /Formulieren/);
+});
+
+test("recognizable credential prefixes split across stream events cannot be reconstructed", async () => {
+  const home = await appHome("split-stream");
+  const chatId = "chat-split";
+  const runId = createRunId();
+  const prefix = `${["sk", "or", "v1"].join("-")}-`;
+  const body = "q".repeat(40);
+  const events: AgentRunEvent[] = [
+    { type: "reasoning", model: "m", step: 1, delta: prefix, timestamp: 1 },
+    { type: "text", delta: body, timestamp: 2 },
+    {
+      type: "tool-output",
+      id: "t",
+      number: 1,
+      stream: "stdout",
+      text: prefix,
+      timestamp: 3,
+    },
+    { type: "text", delta: body, timestamp: 4 },
+  ];
+  const log = await RunLog.open(home, chatId, runId);
+  for (const event of events) {
+    log.write(event);
+  }
+  await log.close();
+
+  const read: AgentRunEvent[] = [];
+  for await (const event of RunLog.read(home, chatId, runId)) {
+    read.push(event);
+  }
+  const persistedContent = read
+    .map((event) =>
+      event.type === "reasoning"
+        ? event.delta
+        : event.type === "text"
+          ? event.delta
+          : event.type === "tool-output"
+            ? event.text
+            : "",
+    )
+    .join("");
+  assert.ok(!persistedContent.includes(`${prefix}${body}`));
+  assert.deepEqual(
+    read.map((event) => event.type),
+    events.map((event) => event.type),
+  );
+  assert.deepEqual(
+    read.map((event) => event.timestamp),
+    events.map((event) => event.timestamp),
+  );
 });
 
 test("RunLog.open creates the chat directory with mode 0700 and the file with mode 0600", async () => {

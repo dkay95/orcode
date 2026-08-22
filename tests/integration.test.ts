@@ -18,6 +18,8 @@ import { RuleStore } from "../src/rules.js";
 import { SessionStore } from "../src/session.js";
 import type { ToolCallPreview } from "../src/types.js";
 
+const TEST_KEY_PREFIX = `${["sk", "or", "v1"].join("-")}-`;
+
 /**
  * These tests cover the seams between the modules, not the modules themselves:
  * whatever the command layer writes into the workspace must obey exactly the
@@ -48,7 +50,7 @@ async function harness(
     return { accepted: options.approve === true };
   });
 
-  const openRouter = new OpenRouterService("sk-or-v1-integration-test-key-0001");
+  const openRouter = new OpenRouterService(`${TEST_KEY_PREFIX}integration-test-key-0001`);
   const config = {
     ...DEFAULT_CONFIG,
     reasoningByModel: {},

@@ -5,10 +5,17 @@ import { createInterface } from "node:readline";
 import { createReadStream } from "node:fs";
 import { join } from "node:path";
 import { APP_HOME, ensureSecureDirectory, SECURE_FILE_MODE } from "./config.js";
+import { redactRunEvent } from "./redaction.js";
 import type { AgentRunEvent } from "./types.js";
 import { hasCode, isRecord } from "./utils.js";
 
 export const DEFAULT_KEEP_RUNS = 50;
+export const RUN_LOG_ENVELOPE_VERSION = 1 as const;
+
+export interface RunLogEnvelope {
+  version: typeof RUN_LOG_ENVELOPE_VERSION;
+  event: AgentRunEvent;
+}
 
 export function runsDir(appHome: string, chatId: string): string {
   return join(appHome, "runs", chatId);
@@ -68,7 +75,7 @@ export class RunLog {
     if (this.#closed) {
       return;
     }
-    const line = `${JSON.stringify(event)}\n`;
+    const line = serializeRunEvent(event);
     this.#chain = this.#chain.then(() => this.#handle.appendFile(line));
   }
 
@@ -112,8 +119,9 @@ export class RunLog {
         } catch {
           continue;
         }
-        if (isRecord(parsed) && typeof parsed.type === "string") {
-          yield parsed as AgentRunEvent;
+        const event = readRunEvent(parsed);
+        if (event) {
+          yield event;
         }
       }
     } finally {
@@ -137,7 +145,7 @@ export class RunLog {
     event: AgentRunEvent,
   ): Promise<void> {
     const path = runLogPath(appHome, chatId, runId);
-    await appendFile(path, `${JSON.stringify(event)}\n`, {
+    await appendFile(path, serializeRunEvent(event), {
       encoding: "utf8",
       mode: SECURE_FILE_MODE,
     });
@@ -163,6 +171,32 @@ export class RunLog {
     const stale = runs.slice(0, Math.max(0, runs.length - keep));
     await Promise.all(stale.map((name) => rm(join(dir, name), { force: true })));
   }
+}
+
+function serializeRunEvent(event: AgentRunEvent): string {
+  const envelope: RunLogEnvelope = {
+    version: RUN_LOG_ENVELOPE_VERSION,
+    event: redactRunEvent(event),
+  };
+  return `${JSON.stringify(envelope)}\n`;
+}
+
+function readRunEvent(value: unknown): AgentRunEvent | null {
+  // Read-only compatibility for pre-envelope logs.
+  if (isRecord(value) && typeof value.type === "string") {
+    return value as AgentRunEvent;
+  }
+  if (
+    !isRecord(value) ||
+    value.version !== RUN_LOG_ENVELOPE_VERSION ||
+    !isRecord(value.event) ||
+    typeof value.event.type !== "string"
+  ) {
+    // Includes unknown future envelope versions. Isolation is per line, so a
+    // newer writer cannot make older or unrelated events unreadable.
+    return null;
+  }
+  return value.event as AgentRunEvent;
 }
 
 // Default app home re-exported for convenience; callers should still prefer

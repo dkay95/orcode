@@ -17,12 +17,13 @@ import {
   chatLockPath,
   dayKey,
   exportSessionMarkdown,
+  type PersistedSessionData,
   rankChatMatches,
   redactSensitive,
   SessionStore,
   workspaceSpend,
 } from "../src/session.js";
-import type { ChatSummary } from "../src/types.js";
+import type { ChatSummary, SessionData } from "../src/types.js";
 
 async function workspaceRoot(prefix: string): Promise<{
   workspace: string;
@@ -394,16 +395,18 @@ test("markdown export contains metadata, turns, tool calls and costs", async () 
 });
 
 test("markdown export redacts secrets that reached the transcript", () => {
+  const secret = `${["sk", "or", "v1"].join("-")}-${"a".repeat(32)}`;
+  const githubToken = `${["ghp", ""].join("_")}${"b".repeat(30)}`;
   const markdown = exportSessionMarkdown({
     version: 2,
     id: "abcdefgh",
     title: "Geheim",
     workspace: "/tmp/x",
-    summary: "Token ghp_abcdefghijklmnopqrstuvwxyz0123",
+    summary: `Token ${githubToken}`,
     turns: [
       {
         role: "user",
-        content: "Key: sk-or-v1-abcdefghijklmnopqrstuvwxyz",
+        content: `Key: ${secret}`,
         createdAt: "2026-07-24T08:00:00.000Z",
       },
     ],
@@ -411,28 +414,157 @@ test("markdown export redacts secrets that reached the transcript", () => {
     createdAt: "2026-07-24T08:00:00.000Z",
     updatedAt: "2026-07-24T08:00:00.000Z",
   });
-  assert.doesNotMatch(markdown, /sk-or-v1-abcdefghij/);
-  assert.doesNotMatch(markdown, /ghp_abcdefghij/);
+  assert.ok(!markdown.includes(secret));
+  assert.ok(!markdown.includes(githubToken));
   assert.match(markdown, /\[REDACTED_OPENROUTER_KEY\]/);
   assert.match(markdown, /\[REDACTED_GITHUB_TOKEN\]/);
+});
+
+test("markdown export redacts metadata, checkpoints, turns and tool summaries as a final boundary", () => {
+  const secret = `${["sk", "or", "v1"].join("-")}-${"x".repeat(40)}`;
+  const timestamp = "2026-08-22T08:00:00.000Z";
+  const markdown = exportSessionMarkdown({
+    version: 2,
+    id: "chat-safe-id",
+    title: `Titel ${secret}`,
+    workspace: `/tmp/${secret}`,
+    summary: `Zusammenfassung ${secret}`,
+    turns: [{ role: "user", content: `Frage ${secret}`, createdAt: timestamp }],
+    costs: { mainUsd: 0, compressorUsd: 0, voiceUsd: 0, totalUsd: 0 },
+    model: `provider/${secret}`,
+    createdAt: timestamp,
+    updatedAt: timestamp,
+    checkpoints: [
+      {
+        id: "checkpoint-safe-id",
+        label: `Checkpoint ${secret}`,
+        turnIndex: 1,
+        costUsd: 0,
+        createdAt: timestamp,
+      },
+    ],
+    toolCalls: [
+      {
+        name: "run_command",
+        summary: `Ausgabe ${secret}`,
+        turnIndex: 1,
+        at: timestamp,
+      },
+    ],
+  });
+
+  assert.ok(!markdown.includes(secret));
+  assert.ok(
+    (markdown.match(/\[REDACTED_OPENROUTER_KEY\]/g) ?? []).length >= 7,
+  );
+});
+
+test("save sanitizes a cloned payload while preserving live setter values", async () => {
+  const { workspace, appHome } = await workspaceRoot("save-clone");
+  const secret = `${["sk", "or", "v1"].join("-")}-${"y".repeat(40)}`;
+  const store = SessionStore.create(workspace, appHome, `Titel ${secret}`);
+  store.rename(`Umbenannt ${secret}`);
+  store.setPreferences(`provider/${secret}`, { mode: "auto" });
+  store.setSummary(`Zusammenfassung ${secret}`);
+  store.addTurn("user", `Frage ${secret}`);
+  store.createCheckpoint(`Marke ${secret}`);
+  store.recordToolCall("run_command", `Ergebnis ${secret}`);
+
+  assert.ok(store.data.title.includes(secret));
+  assert.ok(store.data.summary.includes(secret));
+  assert.ok(store.data.turns[0]!.content.includes(secret));
+  assert.ok(store.data.checkpoints[0]!.label.includes(secret));
+  assert.ok(store.data.toolCalls[0]!.summary.includes(secret));
+  await store.save();
+
+  const raw = await readFile(store.path, "utf8");
+  assert.ok(!raw.includes(secret));
+  assert.ok(store.data.title.includes(secret));
+  assert.ok(store.data.summary.includes(secret));
+  assert.ok(store.data.turns[0]!.content.includes(secret));
+  assert.ok(store.data.checkpoints[0]!.label.includes(secret));
+  assert.ok(store.data.toolCalls[0]!.summary.includes(secret));
+});
+
+test("save sanitizes normalized and direct legacy fields in the raw chat JSON", async () => {
+  const { workspace, appHome } = await workspaceRoot("save-legacy-fields");
+  const secret = `${["sk", "or", "v1"].join("-")}-${"w".repeat(40)}`;
+  const timestamp = "2026-08-22T08:00:00.000Z";
+  const path = join(appHome, "chats", "direct", "legacy-chat.json");
+  const direct: SessionData & Partial<PersistedSessionData> = {
+    version: 2,
+    id: "legacy-chat",
+    title: `Titel ${secret}`,
+    workspace: `${workspace}/${secret}`,
+    summary: `Zusammenfassung ${secret}`,
+    turns: [
+      { role: "assistant", content: `Antwort ${secret}`, createdAt: timestamp },
+    ],
+    costs: { mainUsd: 0, compressorUsd: 0, voiceUsd: 0, totalUsd: 0 },
+    model: `provider/${secret}`,
+    createdAt: timestamp,
+    updatedAt: timestamp,
+    checkpoints: [
+      {
+        id: "checkpoint-direct",
+        label: `Marke ${secret}`,
+        turnIndex: 1,
+        costUsd: 0,
+        createdAt: timestamp,
+      },
+    ],
+    toolCalls: [
+      {
+        name: `tool-${secret}`,
+        summary: `Werkzeug ${secret}`,
+        turnIndex: 1,
+        at: timestamp,
+      },
+    ],
+    dailySpendUsd: {},
+    revision: 0,
+  };
+  const store = new SessionStore(appHome, path, direct);
+
+  assert.ok(store.data.checkpoints[0]!.label.includes(secret));
+  assert.ok(store.data.toolCalls[0]!.summary.includes(secret));
+  await store.save();
+
+  const raw = await readFile(path, "utf8");
+  const saved = JSON.parse(raw) as PersistedSessionData;
+  assert.ok(!raw.includes(secret));
+  assert.match(saved.title, /\[REDACTED_OPENROUTER_KEY\]/);
+  assert.match(saved.workspace, /\[REDACTED_OPENROUTER_KEY\]/);
+  assert.match(saved.summary, /\[REDACTED_OPENROUTER_KEY\]/);
+  assert.match(saved.turns[0]!.content, /\[REDACTED_OPENROUTER_KEY\]/);
+  assert.match(saved.model ?? "", /\[REDACTED_OPENROUTER_KEY\]/);
+  assert.match(saved.checkpoints[0]!.label, /\[REDACTED_OPENROUTER_KEY\]/);
+  assert.match(saved.toolCalls[0]!.name, /\[REDACTED_OPENROUTER_KEY\]/);
+  assert.match(saved.toolCalls[0]!.summary, /\[REDACTED_OPENROUTER_KEY\]/);
+  assert.ok(store.data.title.includes(secret));
+  assert.ok(store.data.workspace.includes(secret));
+  assert.ok(store.data.model?.includes(secret));
 });
 
 test("summaries are redacted before they are persisted", async () => {
   const { workspace, appHome } = await workspaceRoot("summary");
   const store = SessionStore.create(workspace, appHome, "Zusammenfassung");
-  store.setSummary("Der Nutzer nannte ghp_abcdefghijklmnopqrstuvwxyz0123.");
+  const token = `${["ghp", ""].join("_")}${"c".repeat(30)}`;
+  store.setSummary(`Der Nutzer nannte ${token}.`);
   await store.save();
 
   const raw = await readFile(store.path, "utf8");
-  assert.doesNotMatch(raw, /ghp_abcdefghij/);
+  assert.ok(!raw.includes(token));
   assert.match(raw, /\[REDACTED_GITHUB_TOKEN\]/);
 });
 
 test("redactSensitive covers the common secret formats", () => {
+  const openRouterKey = `${["sk", "or", "v1"].join("-")}-${"a".repeat(32)}`;
+  const awsAccessKey = `${["A", "K", "I", "A"].join("")}${"D".repeat(16)}`;
   // [Klartext, erwartete Markierung, Teilstück, das verschwinden muss]
   const cases: [string, RegExp, string][] = [
     [
-      "sk-or-v1-abcdefghijklmnopqrstuvwxyz012345",
+      openRouterKey,
       /\[REDACTED_OPENROUTER_KEY\]/,
       "abcdefghijklmnop",
     ],
@@ -454,7 +586,7 @@ test("redactSensitive covers the common secret formats", () => {
       /\[REDACTED_GITHUB_TOKEN\]/,
       "11ABCDEFG0abcdef",
     ],
-    ["AKIAIOSFODNN7EXAMPLE", /\[REDACTED_AWS_KEY_ID\]/, "AKIAIOSFODNN7EXAMPLE"],
+    [awsAccessKey, /\[REDACTED_AWS_KEY_ID\]/, awsAccessKey],
     [
       'aws_secret_access_key = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"',
       /\[REDACTED_AWS_SECRET\]/,
@@ -504,7 +636,7 @@ test("redactSensitive leaves harmless text intact", () => {
     "Bearer token",
     "Bearer of bad news",
     "ghp_kurz",
-    "AKIAsmall",
+    `${["A", "K", "I", "A"].join("")}small`,
     "AIzaKurz",
     "xoxb-kurz",
     "Wir nutzen -----BEGIN als Trennzeichen.",

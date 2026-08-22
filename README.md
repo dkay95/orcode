@@ -237,15 +237,23 @@ full-screen support or for debugging), `--json`, `-h`/`--help`,
   compressed handoffs, timestamps, costs, checkpoints, tool-call records,
   and the append-only run log — lives under `~/.orcode/` on your
   machine (see [Local state](#local-state) below) and is written with
-  user-only file permissions where the OS supports that. Obvious secrets
-  are redacted before anything is written.
-- **The API key never touches disk in plaintext.** It is stored only in
-  your OS's native credential store via `@napi-rs/keyring` — never in
-  `~/.orcode/`, an ordinary file, a session, or a log — and it is never
-  passed to a child process as a command-line argument. Shell commands run
-  by the `run_command` tool receive a sanitized copy of your environment
-  with variables whose names look like keys, tokens, secrets, passwords,
-  credentials, authorization data, or cookies removed.
+  user-only file permissions where the OS supports that. Human-readable
+  chat JSON, run-event logs, and Markdown exports are written from a clone
+  with recognizable credential patterns replaced. This is pattern-based
+  protection, not a guarantee that arbitrary sensitive prose is removed.
+- **Exact recovery artifacts are not redacted:** ChangeJournal checkpoints
+  retain exact before/after file content so `/undo` can restore bytes, and
+  the SDK conversation-state sidecars contain opaque serialized recovery
+  state that orcode does not inspect. Treat `~/.orcode/` as sensitive local
+  data even though its human-readable chats, run events, and exports pass
+  through the redaction boundary.
+- **The configured API key is not written to app state by the credential
+  subsystem.** It is stored in your OS's native credential store via
+  `@napi-rs/keyring`, is not passed to a child process as a command-line
+  argument, and shell tools receive an environment with credential-like
+  variables removed. If the same value is deliberately included in file or
+  conversation content, the exact recovery-artifact exception above still
+  applies.
 - **The optional management key** is used only for the account-wide
   `GET /credits` call behind `/balance`; it is never sent to a model or to
   a child process. Without it, orcode still validates your inference
@@ -259,10 +267,14 @@ full-screen support or for debugging), `--json`, `-h`/`--help`,
 ├── config.json               # non-secret settings: model, approval mode, budgets, ...
 ├── chats/
 │   └── <workspace-id>/
-│       └── <chat-id>.json    # one file per persistent chat
+│       ├── <chat-id>.json          # one redacted persistent chat
+│       └── <chat-id>.json.state.json # opaque SDK recovery state
 ├── runs/
 │   └── <chat-id>/
-│       └── <run-id>.ndjson   # append-only per-run event log
+│       └── <run-id>.ndjson         # redacted versioned event envelopes
+├── checkpoints/
+│   └── <chat-id>/
+│       └── <run-id>.json           # exact ChangeJournal restore data
 └── sessions/                  # legacy pre-multi-chat session files, left untouched
 ```
 

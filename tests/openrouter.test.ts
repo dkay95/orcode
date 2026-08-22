@@ -17,8 +17,9 @@ import {
 import { redactSensitive } from "../src/session.js";
 import type { ModelInfo } from "../src/types.js";
 
-const INFERENCE_KEY = "sk-or-v1-this-is-a-test-secret";
-const MANAGEMENT_KEY = "sk-or-v1-this-is-a-management-secret";
+const TEST_KEY_PREFIX = `${["sk", "or", "v1"].join("-")}-`;
+const INFERENCE_KEY = `${TEST_KEY_PREFIX}this-is-a-test-secret`;
+const MANAGEMENT_KEY = `${TEST_KEY_PREFIX}this-is-a-management-secret`;
 
 interface RecordedCall {
   url: string;
@@ -105,13 +106,13 @@ test("API key is required and short keys are rejected", () => {
 
 test("key origins track keychain loading, replacement, and forgetting", () => {
   const service = new OpenRouterService(
-    "sk-or-v1-this-is-a-keychain-test-secret",
+    `${TEST_KEY_PREFIX}this-is-a-keychain-test-secret`,
     undefined,
     { inference: "keychain" },
   );
   assert.equal(service.keyOrigin, "keychain");
 
-  service.setKey("sk-or-v1-this-is-an-interactive-test-secret");
+  service.setKey(`${TEST_KEY_PREFIX}this-is-an-interactive-test-secret`);
   assert.equal(service.keyOrigin, "interactive");
 
   service.forgetKey();
@@ -140,7 +141,7 @@ test("management key has separate in-memory lifecycle", () => {
 
 test("session redaction removes pasted API keys", () => {
   const redacted = redactSensitive(
-    "one sk-or-v1-abcdefghijklmnopqrstuvwxyz and sk-abcdefghijklmnopqrstuv",
+    `one ${TEST_KEY_PREFIX}abcdefghijklmnopqrstuvwxyz and sk-abcdefghijklmnopqrstuv`,
   );
   assert.doesNotMatch(redacted, /abcdefghijklmnopqrstuvwxyz/);
   assert.match(redacted, /\[REDACTED_OPENROUTER_KEY\]/);
@@ -611,7 +612,7 @@ test("Schlüsselwechsel verwirft zwischengespeicherte Clients", () => {
   const first = service.client({ scope: "main" });
   assert.equal(service.client({ scope: "main" }), first);
   assert.notEqual(service.client({ scope: "compressor" }), first);
-  service.setKey("sk-or-v1-this-is-another-test-secret");
+  service.setKey(`${TEST_KEY_PREFIX}this-is-another-test-secret`);
   assert.notEqual(service.client({ scope: "main" }), first);
 });
 

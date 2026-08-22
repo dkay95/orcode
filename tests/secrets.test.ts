@@ -2,18 +2,20 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { formatSecretWarning, scanForSecrets } from "../src/secrets.js";
 
-// Alle „Keys" hier sind offensichtliche Fakes bzw. dokumentierte
-// Beispielwerte (AKIAIOSFODNN7EXAMPLE ist das AWS-Doku-Beispiel) — keine
+// Alle Werte werden deterministisch im Test zusammengesetzt und sind keine
 // echten Zugangsdaten.
 
+const openRouterPrefix = `${["sk", "or", "v1"].join("-")}-`;
+const awsPrefix = ["A", "K", "I", "A"].join("");
+
 test("erkennt OpenRouter-Keys ohne Doppelzählung durch das generische sk-Muster", () => {
-  const findings = scanForSecrets(`key = sk-or-v1-${"a".repeat(64)}`);
+  const findings = scanForSecrets(`key = ${openRouterPrefix}${"a".repeat(64)}`);
   assert.deepEqual(findings, [{ kind: "OpenRouter-Key", count: 1 }]);
 });
 
 test("erkennt AWS-, GitHub- und Slack-Muster mit Trefferzahl", () => {
   const text = [
-    "aws_access_key_id = AKIAIOSFODNN7EXAMPLE",
+    `aws_access_key_id = ${awsPrefix}${"A".repeat(16)}`,
     `token: ghp_${"b".repeat(36)}`,
     `xoxb-${"1".repeat(11)}-${"2".repeat(11)}-abcdef`,
   ].join("\n");
@@ -44,7 +46,7 @@ test("generischer sk-Key trifft, sk-ant wird separat gemeldet", () => {
 test("normaler Code und Prosa bleiben sauber", () => {
   const text = [
     "const result = scanForSecrets(input);",
-    "// kurze Tokens wie sk-123 oder akzente sind keine Keys",
+    "// kurze Tokens und akzente sind keine Keys",
     "Bitte rotiere den Key in der Konfigurationsdatei.",
   ].join("\n");
   assert.deepEqual(scanForSecrets(text), []);

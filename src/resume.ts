@@ -38,7 +38,7 @@ export interface InterruptedRun {
   runId: string;
   /** Absolute path to the run's NDJSON log. */
   path: string;
-  /** Every event the log contains, in order. Corrupt/half-written lines are already skipped (see `RunLog.read`). */
+  /** Every supported event in order. Legacy bare events and current envelopes are decoded; corrupt and future-version lines are isolated by `RunLog.read`. */
   events: AgentRunEvent[];
   /**
    * Whether the files this run wrote still match what it wrote, checked
@@ -56,7 +56,8 @@ export interface InterruptedRun {
  * completed run has since superseded is not worth resurfacing.
  *
  * Never throws on a missing runs directory, a vanished log file, or
- * corrupted content — all of that just means "nothing to report".
+ * corrupted or unsupported future-version content — all of that just means
+ * "nothing to report" for that content, without affecting other run files.
  */
 export async function findInterruptedRun(
   appHome: string,

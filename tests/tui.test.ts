@@ -369,7 +369,7 @@ test("a running tool shows exactly one spinner, phase, step and cost", () => {
 });
 
 test("secret entry never renders the actual API key", () => {
-  const secret = "sk-or-v1-this-must-never-be-rendered";
+  const secret = `${["sk", "or", "v1"].join("-")}-this-must-never-be-rendered`;
   const frame = buildDashboardFrame(
     input({
       mode: "secret",

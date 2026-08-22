@@ -24,6 +24,7 @@ import {
   type ReasoningSetting,
   type SessionData,
 } from "./types.js";
+import { redactText, redactValue } from "./redaction.js";
 import { formatUsd, hasCode, isRecord } from "./utils.js";
 
 const MAX_TURNS = 80;
@@ -226,7 +227,7 @@ export class SessionStore {
   addTurn(role: ChatTurn["role"], content: string): void {
     this.#data.turns.push({
       role,
-      content: redactSensitive(content),
+      content,
       createdAt: new Date().toISOString(),
     });
     if (role === "user" && this.#data.title === DEFAULT_TITLE) {
@@ -269,7 +270,7 @@ export class SessionStore {
   }
 
   setSummary(summary: string): void {
-    this.#data.summary = redactSensitive(summary);
+    this.#data.summary = summary;
     this.#data.updatedAt = new Date().toISOString();
   }
 
@@ -327,7 +328,7 @@ export class SessionStore {
   recordToolCall(name: string, summary = ""): SessionToolCall {
     const call: SessionToolCall = {
       name: name.trim().slice(0, 80) || "unbekannt",
-      summary: redactSensitive(summary).replace(/\s+/g, " ").trim().slice(0, 300),
+      summary: summary.replace(/\s+/g, " ").trim().slice(0, 300),
       turnIndex: this.#data.turns.length,
       at: new Date().toISOString(),
     };
@@ -441,11 +442,12 @@ export class SessionStore {
       }
 
       this.#data.revision = Math.max(this.#data.revision, foreign.revision) + 1;
+      const persisted = redactValue(this.#data);
       await writeFileAtomicSecure(
         this.path,
-        `${JSON.stringify(this.#data, null, 2)}\n`,
+        `${JSON.stringify(persisted, null, 2)}\n`,
       );
-      this.#base = structuredClone(this.#data);
+      this.#base = structuredClone(persisted);
       return { merged, conflictBackupPath, revision: this.#data.revision };
     } finally {
       await release();
@@ -594,7 +596,7 @@ export function exportSessionMarkdown(data: SessionExportInput): string {
     true,
   );
 
-  return `${lines.join("\n").trimEnd()}\n`;
+  return redactText(`${lines.join("\n").trimEnd()}\n`);
 }
 
 function appendToolCalls(
@@ -668,8 +670,7 @@ export async function migrateLegacySession(
   const createdAt = turns[0]?.createdAt ?? updatedAt;
   const data: PersistedSessionData = {
     ...emptySession(workspace, id, titleFromTurns(turns)),
-    summary:
-      typeof raw.summary === "string" ? redactSensitive(raw.summary) : "",
+    summary: typeof raw.summary === "string" ? raw.summary : "",
     turns,
     costs: normalizeCosts(raw.costs),
     createdAt,
@@ -821,8 +822,7 @@ function normalizeSession(
     id,
     title: normalizeTitle(value.title),
     workspace,
-    summary:
-      typeof value.summary === "string" ? redactSensitive(value.summary) : "",
+    summary: typeof value.summary === "string" ? value.summary : "",
     turns,
     costs: normalizeCosts(value.costs),
     revision: nonNegativeInteger(value.revision),
@@ -854,7 +854,7 @@ function normalizeTurns(value: unknown): ChatTurn[] {
     .slice(-MAX_TURNS)
     .map((turn) => ({
       role: turn.role as ChatTurn["role"],
-      content: redactSensitive(String(turn.content)),
+      content: String(turn.content),
       createdAt: validDate(turn.createdAt) ?? new Date().toISOString(),
     }));
 }
@@ -901,9 +901,7 @@ function normalizeToolCalls(value: unknown): SessionToolCall[] {
     }
     result.push({
       name: candidate.name.slice(0, 80),
-      summary: redactSensitive(
-        typeof candidate.summary === "string" ? candidate.summary : "",
-      ).slice(0, 300),
+      summary: (typeof candidate.summary === "string" ? candidate.summary : "").slice(0, 300),
       turnIndex: nonNegativeInteger(candidate.turnIndex),
       at,
     });
@@ -989,17 +987,17 @@ function normalizeTitle(value: unknown): string {
   if (typeof value !== "string") {
     return DEFAULT_TITLE;
   }
-  const clean = redactSensitive(value).replace(/\s+/g, " ").trim();
+  const clean = value.replace(/\s+/g, " ").trim();
   return clean ? clean.slice(0, 80) : DEFAULT_TITLE;
 }
 
 function normalizeCheckpointLabel(value: string, turnIndex: number): string {
-  const clean = redactSensitive(value).replace(/\s+/g, " ").trim();
+  const clean = value.replace(/\s+/g, " ").trim();
   return clean ? clean.slice(0, 60) : `Checkpoint bei Nachricht ${turnIndex}`;
 }
 
 function titleFromPrompt(prompt: string): string {
-  const clean = redactSensitive(prompt)
+  const clean = prompt
     .replace(/[`*_#>[\]]/g, "")
     .replace(/\s+/g, " ")
     .trim();
@@ -1431,80 +1429,6 @@ async function exists(path: string): Promise<boolean> {
   }
 }
 
-/* ------------------------------------------------------------------ *
- * Redaction (N4)
- * ------------------------------------------------------------------ */
-
-interface RedactionRule {
-  pattern: RegExp;
-  replacement: string;
-}
-
-/**
- * Ordered from most specific to most generic. Every rule requires enough
- * entropy/length that ordinary prose ("Bearer token", "sk-test", "AKIA")
- * survives untouched.
- */
-const REDACTION_RULES: RedactionRule[] = [
-  {
-    pattern:
-      /-----BEGIN (?:[A-Z0-9 ]+ )?PRIVATE KEY-----[\s\S]*?-----END (?:[A-Z0-9 ]+ )?PRIVATE KEY-----/g,
-    replacement: "[REDACTED_PRIVATE_KEY]",
-  },
-  {
-    pattern: /\bsk-or-v1-[A-Za-z0-9_-]{12,}(?![A-Za-z0-9_-])/g,
-    replacement: "[REDACTED_OPENROUTER_KEY]",
-  },
-  {
-    pattern: /\bsk-ant-[A-Za-z0-9_-]{16,}(?![A-Za-z0-9_-])/g,
-    replacement: "[REDACTED_ANTHROPIC_KEY]",
-  },
-  {
-    pattern: /\bsk-[A-Za-z0-9_-]{20,}(?![A-Za-z0-9_-])/g,
-    replacement: "[REDACTED_API_KEY]",
-  },
-  {
-    pattern: /\bgh[pousr]_[A-Za-z0-9]{20,}(?![A-Za-z0-9_])/g,
-    replacement: "[REDACTED_GITHUB_TOKEN]",
-  },
-  {
-    pattern: /\bgithub_pat_[A-Za-z0-9_]{20,}(?![A-Za-z0-9_])/g,
-    replacement: "[REDACTED_GITHUB_TOKEN]",
-  },
-  {
-    pattern: /\b(?:AKIA|ASIA|ABIA|ACCA)[A-Z0-9]{16}(?![A-Za-z0-9])/g,
-    replacement: "[REDACTED_AWS_KEY_ID]",
-  },
-  {
-    pattern:
-      /\b(aws[_-]?secret[_-]?access[_-]?key["']?\s*[:=]\s*["']?)[A-Za-z0-9/+=]{40}/gi,
-    replacement: "$1[REDACTED_AWS_SECRET]",
-  },
-  {
-    pattern: /\bAIza[A-Za-z0-9_-]{35}(?![A-Za-z0-9_-])/g,
-    replacement: "[REDACTED_GOOGLE_KEY]",
-  },
-  {
-    pattern: /\bxox[baprs]-[A-Za-z0-9-]{10,}(?![A-Za-z0-9-])/g,
-    replacement: "[REDACTED_SLACK_TOKEN]",
-  },
-  {
-    // Only tokens that actually look like tokens: 20+ chars including a digit.
-    pattern:
-      /\bBearer[ \t]+(?=[A-Za-z0-9._~+/=-]*\d)[A-Za-z0-9._~+/=-]{20,}(?![A-Za-z0-9._~+/=-])/g,
-    replacement: "Bearer [REDACTED_TOKEN]",
-  },
-  {
-    pattern:
-      /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}(?![A-Za-z0-9._-])/g,
-    replacement: "[REDACTED_JWT]",
-  },
-];
-
 export function redactSensitive(value: string): string {
-  let result = value;
-  for (const rule of REDACTION_RULES) {
-    result = result.replace(rule.pattern, rule.replacement);
-  }
-  return result;
+  return redactText(value);
 }
