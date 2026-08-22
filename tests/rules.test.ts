@@ -112,16 +112,16 @@ test("structured process subjects sort/deduplicate environment names and never p
       EMPTY_SETTING: undefined,
     },
   });
-  assert.deepEqual(subject.environment, ["EMPTY_SETTING", "LANG", "PATH"]);
+  assert.deepEqual(subject.environment, ["LANG", "PATH"]);
   const display = approvalSubjectDisplay(subject);
   assert.doesNotMatch(display, /de_DE|\/usr\/bin\"/);
-  assert.match(display, /EMPTY_SETTING/);
+  assert.doesNotMatch(display, /EMPTY_SETTING/);
 
   const sameNamesDifferentValues = processApprovalSubject({
     executable: "/usr/bin/git",
     argv: ["status", "--short"],
     cwd: ".",
-    forwardedEnvironment: { PATH: "/opt/bin", LANG: "C", EMPTY_SETTING: "set" },
+    forwardedEnvironment: { PATH: "/opt/bin", LANG: "C" },
   });
   assert.equal(
     approvalSubjectFingerprint(subject),
@@ -133,7 +133,7 @@ test("structured process subjects sort/deduplicate environment names and never p
       executable: "/usr/bin/git",
       argv: ["--short", "status"],
       cwd: ".",
-      forwardedEnvironment: { PATH: "/usr/bin", LANG: "C", EMPTY_SETTING: "set" },
+      forwardedEnvironment: { PATH: "/usr/bin", LANG: "C" },
     })),
   );
 
@@ -143,7 +143,7 @@ test("structured process subjects sort/deduplicate environment names and never p
     await store.remember({ workspace: "/ws", tool: "git_diff", subject, decision: "allow" });
     const persisted = await readFile(rulesPath(appHome), "utf8");
     assert.doesNotMatch(persisted, /de_DE\.UTF-8|\/opt\/bin/);
-    assert.match(persisted, /EMPTY_SETTING/);
+    assert.doesNotMatch(persisted, /EMPTY_SETTING/);
   } finally {
     await rm(appHome, { recursive: true, force: true });
   }

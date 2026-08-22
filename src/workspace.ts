@@ -738,30 +738,31 @@ export function createCodingTools(
       truncated: z.boolean(),
     }),
     execute: async ({ command, timeoutSeconds }) => {
-      const verdict = assessCommand(command);
+      const executionCommand = command.replaceAll("\r\n", "\n");
+      const verdict = assessCommand(executionCommand);
       if (verdict.blocked) {
         throw new Error(
           `Der Befehl wurde durch die Katastrophenschutz-Regel blockiert (${verdict.rule}): ${verdict.reason}`,
         );
       }
-      const shell = resolveCommandShell();
+      const shell = await resolveCommandShell();
       const cwd = await canonicalWorkspaceRelativeCwd(guard.root, guard.root);
       await approvals.authorize({
         name: "run_command",
         risk: "shell",
         summary: `Shell-Befehl in ${guard.root}`,
-        details: command,
+        details: executionCommand,
         subject: shellApprovalSubject({
           platform: process.platform,
           executable: shell.executable,
           mode: shell.args,
           cwd,
-          command,
+          command: executionCommand,
         }),
       });
       const handle: object = {};
-      options.onProcessStart?.(handle, "run_command", { command, timeoutSeconds });
-      const result = await runProcess(shell.executable, [...shell.args, command], {
+      options.onProcessStart?.(handle, "run_command", { command: executionCommand, timeoutSeconds });
+      const result = await runProcess(shell.executable, [...shell.args, executionCommand], {
         cwd: guard.root,
         timeoutMs: timeoutSeconds * 1_000,
         ...(signal ? { signal } : {}),
@@ -770,7 +771,7 @@ export function createCodingTools(
       const stdout = truncate(result.stdout, MAX_TOOL_OUTPUT);
       const stderr = truncate(result.stderr, MAX_TOOL_OUTPUT);
       return {
-        command,
+        command: executionCommand,
         exitCode: result.code,
         stdout,
         stderr,
@@ -798,13 +799,14 @@ export function createCodingTools(
         guard.root,
         { operation: "diff", staged },
         runProcess,
-        async ({ executable, args, cwd, env }) => {
+        async ({ executable, args, cwd, env }, policy) => {
           await approvals.authorize({
             name: "git_diff",
             risk: "shell",
             summary: `git diff${staged ? " --cached" : ""} in ${guard.root}`,
             details:
               "git wird ohne externe Diff-Treiber, ohne textconv, ohne fsmonitor und ohne Pager aufgerufen.",
+            rememberable: policy.rememberable,
             subject: processApprovalSubject({
               executable,
               argv: args,
@@ -1469,16 +1471,23 @@ export type HardenedGitReadRequest =
   | { operation: "diff"; staged: boolean }
   | { operation: "status" };
 
+export type HardenedGitRuntime = Pick<RunProcessOptions, "signal" | "onChunk"> & {
+  /** Injectable source for filtering; production uses the current process environment. */
+  environment?: NodeJS.ProcessEnv;
+};
+
 export async function resolveExecutablePath(
   executable: string,
   environment: NodeJS.ProcessEnv = process.env,
   platform: NodeJS.Platform = process.platform,
 ): Promise<string> {
   if (isAbsolute(executable) || executable.includes("/") || executable.includes("\\")) {
-    return realpath(resolve(executable));
+    const candidate = resolve(executable);
+    await access(candidate, fsConstants.X_OK);
+    return realpath(candidate);
   }
   const directories = (environment.PATH ?? "").split(delimiter).filter(Boolean);
-  const extensions = platform === "win32"
+  const extensions = platform === "win32" && !/\.[^\\/.]+$/.test(executable)
     ? (environment.PATHEXT ?? ".EXE;.CMD;.BAT;.COM").split(";")
     : [""];
   for (const directory of directories) {
@@ -1499,23 +1508,34 @@ export async function runHardenedGitRead(
   root: string,
   request: HardenedGitReadRequest,
   runner: RunProcess = runProcess,
-  beforeRun?: (invocation: HardenedGitInvocation) => Promise<void>,
-  runtime: Pick<RunProcessOptions, "signal" | "onChunk"> = {},
+  beforeRun?: (invocation: HardenedGitInvocation, policy: GitReadCapabilityPolicy) => Promise<void>,
+  runtime: HardenedGitRuntime = {},
 ): Promise<HardenedGitReadResult> {
   const operation: GitReadOperation = request.operation;
   const policy = evaluateGitReadCapability(operation);
+  const sourceEnvironment = runtime.environment ?? process.env;
+  const filteredEnvironment = Object.fromEntries(
+    Object.entries(sanitizedEnvironment(sourceEnvironment)).filter(
+      (entry): entry is [string, string] => entry[1] !== undefined,
+    ),
+  );
+  const effectiveEnvironment: NodeJS.ProcessEnv = {
+    ...filteredEnvironment,
+    ...GIT_SAFE_ENVIRONMENT,
+  };
+  const { environment: _environment, ...processRuntime } = runtime;
   const invocation: HardenedGitInvocation = {
-    executable: await resolveExecutablePath("git"),
+    executable: await resolveExecutablePath("git", effectiveEnvironment),
     args: request.operation === "diff" ? gitDiffArgs(request.staged) : gitStatusArgs(),
     cwd: root,
-    env: { ...GIT_SAFE_ENVIRONMENT },
+    env: effectiveEnvironment,
   };
-  await beforeRun?.(invocation);
+  await beforeRun?.(invocation, policy);
   const result = await runner(invocation.executable, invocation.args, {
     cwd: invocation.cwd,
     timeoutMs: request.operation === "diff" ? 20_000 : 3_000,
     env: invocation.env,
-    ...runtime,
+    ...processRuntime,
   });
   return { policy, invocation, result };
 }
@@ -1887,20 +1907,25 @@ export function changePreview(before: string | null, after: string): string {
  * can `cd` away from the workspace. `ORCODE_SHELL` overrides the default
  * (`ROUTERCODE_SHELL` still works too, for anyone with it already set).
  */
-export function resolveCommandShell(
+export async function resolveCommandShell(
   environment: NodeJS.ProcessEnv = process.env,
   platform: NodeJS.Platform = process.platform,
-): { executable: string; args: string[] } {
+  resolveExecutable: typeof resolveExecutablePath = resolveExecutablePath,
+): Promise<{ executable: string; args: string[] }> {
   const configured = (environment.ORCODE_SHELL ?? environment.ROUTERCODE_SHELL)?.trim();
   // Windows hat kein /bin/sh: dort ist PowerShell (immer vorinstalliert) der
   // Default. Ein konfigurierter Shell-Pfad gewinnt auf jeder Plattform.
-  const executable =
+  const requestedExecutable =
     configured && configured.length > 0
       ? configured
       : platform === "win32"
         ? "powershell.exe"
         : "/bin/sh";
-  const name = basename(executable).toLowerCase();
+  const executable = await resolveExecutable(requestedExecutable, environment, platform);
+  const name = executable.split(/[\\/]/).at(-1)?.toLowerCase() ?? "";
+  if (name === "cmd" || name === "cmd.exe") {
+    return { executable, args: ["/d", "/s", "/c"] };
+  }
   if (name.includes("pwsh") || name.includes("powershell")) {
     // Kein Profil (könnte das Arbeitsverzeichnis oder die Umgebung ändern)
     // und nicht-interaktiv — PowerShell versteht -c nicht zuverlässig.
@@ -2199,7 +2224,7 @@ export interface RunProcessOptions {
   cwd: string;
   timeoutMs: number;
   signal?: AbortSignal;
-  /** Extra variables merged on top of the sanitized environment. */
+  /** Complete effective child environment; defaults to the sanitized process environment. */
   env?: NodeJS.ProcessEnv;
   /**
    * Fired for every chunk actually kept in `stdout`/`stderr` (K3 live shell).
@@ -2243,7 +2268,7 @@ export function runProcess(
 
     const child = spawn(executable, args, {
       cwd: options.cwd,
-      env: { ...sanitizedEnvironment(), ...options.env },
+      env: options.env ?? sanitizedEnvironment(),
       stdio: ["ignore", "pipe", "pipe"],
       // Own process group, so a timeout can take the whole tree down instead
       // of only the shell that spawned it.

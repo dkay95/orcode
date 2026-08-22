@@ -33,6 +33,8 @@ export interface ApprovalRequest {
   policyRule?: string;
   /** Exact serializable authority identity. Omit when it cannot be derived safely. */
   subject?: ApprovalSubject;
+  /** False keeps the exact subject visible but forbids stored authority for this capability. */
+  rememberable?: boolean;
 }
 
 /** After this many rejections of the same tool the tool is locked for the run. */
@@ -117,11 +119,12 @@ export class ApprovalManager {
   async authorize(request: ApprovalRequest): Promise<void> {
     const subject = request.subject ? normalizeApprovalSubject(request.subject) : null;
     const subjectDisplay = subject ? approvalSubjectDisplay(subject) : undefined;
+    const rememberable = request.rememberable !== false;
 
     // (1) Remembered rules — a `deny` rule beats everything, including
     // `allow-all`.
     const ruleDecision =
-      this.#ruleStore && subject
+      rememberable && this.#ruleStore && subject
         ? this.#ruleStore.decide(this.#workspace, request.name, subject)
         : null;
     if (ruleDecision === "deny") {
@@ -164,7 +167,7 @@ export class ApprovalManager {
       result = { accepted };
     }
 
-    if (result.remember && this.#ruleStore && subject && exactSubjectMatch(subject)) {
+    if (rememberable && result.remember && this.#ruleStore && subject && exactSubjectMatch(subject)) {
       await this.#ruleStore.remember({
         workspace: this.#workspace,
         tool: request.name,
@@ -258,7 +261,7 @@ function toPreview(request: ApprovalRequest, subject?: ApprovalSubject): ToolCal
     summary: request.summary,
     ...(details ? { details } : {}),
     ...(subject ? { subject: approvalSubjectDisplay(subject) } : {}),
-    rememberAvailable: subject !== undefined,
+    rememberAvailable: subject !== undefined && request.rememberable !== false,
   };
 }
 

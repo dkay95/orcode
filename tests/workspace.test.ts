@@ -2,15 +2,22 @@ import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
-import { chmod, mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, realpath, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { isAbsolute, join } from "node:path";
 import test from "node:test";
 import { promisify } from "node:util";
 import { ApprovalManager, PermissionDeniedError } from "../src/approval.js";
 import { evaluateGitReadCapability } from "../src/policy.js";
-import { RuleStore } from "../src/rules.js";
-import type { ApprovalMode, ToolCallPreview } from "../src/types.js";
+import {
+  RuleStore,
+  approvalSubjectDisplay,
+  approvalSubjectFingerprint,
+  processApprovalSubject,
+  rulesPath,
+  shellApprovalSubject,
+} from "../src/rules.js";
+import type { ApprovalMode, ApprovalSubject, ToolCallPreview } from "../src/types.js";
 import {
   CATASTROPHIC_GUARD_NOTICE,
   ChangeJournal,
@@ -384,35 +391,63 @@ test("ambiguous replacements are refused without replaceAll", async () => {
 // run_command (M1, M2, M4)
 // ---------------------------------------------------------------------------
 
-test("Windows nutzt PowerShell als Default-Shell, Overrides gewinnen überall", () => {
-  const winStandard = resolveCommandShell({}, "win32");
+test("Windows nutzt PowerShell als Default-Shell, cmd uses exact safe mode, Overrides gewinnen überall", async () => {
+  const identityResolver = async (executable: string) => executable;
+  const winStandard = await resolveCommandShell({}, "win32", identityResolver);
   assert.equal(winStandard.executable, "powershell.exe");
   assert.deepEqual(winStandard.args, ["-NoProfile", "-NonInteractive", "-Command"]);
   assert.ok(winStandard.args.includes("-NoProfile"), "kein Profil sourcing");
 
-  const winPwsh = resolveCommandShell(
+  const winPwsh = await resolveCommandShell(
     { ORCODE_SHELL: "C:\\Program Files\\PowerShell\\7\\pwsh.exe" },
     "win32",
+    identityResolver,
   );
   assert.deepEqual(winPwsh.args, ["-NoProfile", "-NonInteractive", "-Command"]);
 
-  const winBashOverride = resolveCommandShell({ ORCODE_SHELL: "C:\\tools\\bash.exe" }, "win32");
+  const winBashOverride = await resolveCommandShell(
+    { ORCODE_SHELL: "C:\\tools\\bash.exe" },
+    "win32",
+    identityResolver,
+  );
   assert.ok(winBashOverride.args.includes("--norc"));
 
-  const posixPwsh = resolveCommandShell({ ORCODE_SHELL: "/usr/bin/pwsh" }, "darwin");
+  const winCmd = await resolveCommandShell({ ORCODE_SHELL: "cmd" }, "win32", identityResolver);
+  const winCmdExe = await resolveCommandShell(
+    { ORCODE_SHELL: "C:\\Windows\\System32\\cmd.exe" },
+    "win32",
+    identityResolver,
+  );
+  assert.deepEqual(winCmd.args, ["/d", "/s", "/c"]);
+  assert.deepEqual(winCmdExe.args, ["/d", "/s", "/c"]);
+
+  const posixPwsh = await resolveCommandShell(
+    { ORCODE_SHELL: "/usr/bin/pwsh" },
+    "darwin",
+    identityResolver,
+  );
   assert.deepEqual(posixPwsh.args, ["-NoProfile", "-NonInteractive", "-Command"]);
 });
 
-test("the command shell is never a login shell and stays configurable", () => {
-  const standard = resolveCommandShell({}, "linux");
+test("the command shell is never a login shell and stays configurable", async () => {
+  const identityResolver = async (executable: string) => executable;
+  const standard = await resolveCommandShell({}, "linux", identityResolver);
   assert.equal(standard.executable, "/bin/sh");
   assert.deepEqual(standard.args, ["-c"]);
 
-  const zsh = resolveCommandShell({ ROUTERCODE_SHELL: "/bin/zsh" });
+  const zsh = await resolveCommandShell(
+    { ROUTERCODE_SHELL: "/bin/zsh" },
+    process.platform,
+    identityResolver,
+  );
   assert.equal(zsh.executable, "/bin/zsh");
   assert.ok(zsh.args.includes("--no-rcs"));
 
-  const bash = resolveCommandShell({ ROUTERCODE_SHELL: "/usr/local/bin/bash" });
+  const bash = await resolveCommandShell(
+    { ROUTERCODE_SHELL: "/usr/local/bin/bash" },
+    process.platform,
+    identityResolver,
+  );
   assert.ok(bash.args.includes("--norc"));
 
   for (const shell of [standard, zsh, bash]) {
@@ -422,6 +457,98 @@ test("the command shell is never a login shell and stays configurable", () => {
       `Login-Shell-Flag in ${shell.executable}`,
     );
   }
+});
+
+test("a bare shell name resolves to an absolute real path and PATH changes its subject fingerprint", { skip: process.platform === "win32" ? "POSIX fixture" : false }, async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "routercode-shell-path-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const firstBin = join(root, "first-bin");
+  const secondBin = join(root, "second-bin");
+  await mkdir(firstBin);
+  await mkdir(secondBin);
+  await symlink("/bin/sh", join(firstBin, "fixture-shell"));
+  await symlink(process.execPath, join(secondBin, "fixture-shell"));
+
+  const first = await resolveCommandShell({ ORCODE_SHELL: "fixture-shell", PATH: firstBin });
+  const second = await resolveCommandShell({ ORCODE_SHELL: "fixture-shell", PATH: secondBin });
+  assert.equal(isAbsolute(first.executable), true);
+  assert.equal(first.executable, await realpath("/bin/sh"));
+  assert.equal(second.executable, await realpath(process.execPath));
+
+  const firstSubject = shellApprovalSubject({
+    platform: process.platform,
+    executable: first.executable,
+    mode: first.args,
+    cwd: ".",
+    command: "printf fixture",
+  });
+  const secondSubject = shellApprovalSubject({
+    platform: process.platform,
+    executable: second.executable,
+    mode: second.args,
+    cwd: ".",
+    command: "printf fixture",
+  });
+  assert.notEqual(approvalSubjectFingerprint(firstSubject), approvalSubjectFingerprint(secondSubject));
+});
+
+test("a configured shell symlink is realpathed before approval and that exact command tuple executes", { skip: process.platform === "win32" ? "POSIX fixture" : false }, async (t) => {
+  const box = await sandbox("ask", { answer: true, prefix: "shell-realpath" });
+  const shellLink = join(box.root, "fixture-shell");
+  await symlink("/bin/sh", shellLink);
+  const canonicalShell = await realpath(shellLink);
+  const previousOrcodeShell = process.env.ORCODE_SHELL;
+  const previousRoutercodeShell = process.env.ROUTERCODE_SHELL;
+  process.env.ORCODE_SHELL = shellLink;
+  delete process.env.ROUTERCODE_SHELL;
+  t.after(async () => {
+    if (previousOrcodeShell === undefined) delete process.env.ORCODE_SHELL;
+    else process.env.ORCODE_SHELL = previousOrcodeShell;
+    if (previousRoutercodeShell === undefined) delete process.env.ROUTERCODE_SHELL;
+    else process.env.ROUTERCODE_SHELL = previousRoutercodeShell;
+    await rm(box.root, { recursive: true, force: true });
+  });
+
+  const command = "printf '%s\\n' \"$0\"\r\nprintf 'done'";
+  const result = await invoke(box.tools, "run_command", { command, timeoutSeconds: 5 });
+  const subject = JSON.parse(box.asked[0]?.subject ?? "null") as ApprovalSubject | null;
+  assert.equal(subject?.kind, "shell-string");
+  assert.equal(subject?.kind === "shell-string" ? subject.executable : "", canonicalShell);
+  assert.equal(subject?.kind === "shell-string" ? subject.command : "", command.replaceAll("\r\n", "\n"));
+  assert.equal(result.command, command.replaceAll("\r\n", "\n"));
+  assert.equal(result.stdout, `${canonicalShell}\ndone`);
+});
+
+test("an unresolvable shell cannot ask for remembered authority or execute a guessed target", { skip: process.platform === "win32" ? "POSIX fixture" : false }, async (t) => {
+  const box = await sandbox("ask", { prefix: "shell-missing" });
+  const appHome = await mkdtemp(join(tmpdir(), "routercode-shell-missing-rules-"));
+  const ruleStore = await RuleStore.load(appHome);
+  box.approvals.setRuleStore(ruleStore, box.root);
+  let prompts = 0;
+  box.approvals.setPromptHandler(async () => {
+    prompts += 1;
+    return { accepted: true, remember: "allow" };
+  });
+  const marker = join(box.root, "must-not-exist");
+  const missingShell = join(box.root, "missing-shell");
+  const previousOrcodeShell = process.env.ORCODE_SHELL;
+  process.env.ORCODE_SHELL = missingShell;
+  t.after(async () => {
+    if (previousOrcodeShell === undefined) delete process.env.ORCODE_SHELL;
+    else process.env.ORCODE_SHELL = previousOrcodeShell;
+    await Promise.all([
+      rm(box.root, { recursive: true, force: true }),
+      rm(appHome, { recursive: true, force: true }),
+    ]);
+  });
+
+  await assert.rejects(
+    invoke(box.tools, "run_command", { command: `touch '${marker}'`, timeoutSeconds: 5 }),
+    /ENOENT|no such file|nicht gefunden/i,
+  );
+  assert.equal(prompts, 0);
+  assert.equal(existsSync(marker), false);
+  assert.deepEqual(ruleStore.list(box.root), []);
 });
 
 test("shell environment removes credential-like variables", () => {
@@ -617,6 +744,107 @@ test("/diff is a central hardened read-only Git capability, never a remembered m
   assert.ok(direct.invocation.args.includes("--cached"));
 });
 
+test("Git subject names come from the one filtered environment passed unchanged to the runner", async () => {
+  const sourceEnvironment: NodeJS.ProcessEnv = {
+    PATH: process.env.PATH,
+    HOME: "/fixture/home",
+    LANG: "fixture-locale",
+    NORMAL_SETTING: "synthetic-value",
+    FIXTURE_TOKEN: "filtered-value",
+    UNDEFINED_SETTING: undefined,
+  };
+  const expectedNames = [
+    "GIT_EXTERNAL_DIFF",
+    "GIT_OPTIONAL_LOCKS",
+    "GIT_PAGER",
+    "GIT_TERMINAL_PROMPT",
+    "HOME",
+    "LANG",
+    "NORMAL_SETTING",
+    "PATH",
+  ].sort();
+  let invocationEnvironment: NodeJS.ProcessEnv | undefined;
+  let subject: Extract<ApprovalSubject, { kind: "structured-process" }> | undefined;
+  const fakeRun = async (_executable: string, _args: string[], options: { env?: NodeJS.ProcessEnv }) => {
+    assert.strictEqual(options.env, invocationEnvironment);
+    assert.deepEqual(Object.keys(options.env ?? {}).sort(), expectedNames);
+    return { code: 0, stdout: "synthetic diff", stderr: "", truncated: false, timedOut: false, aborted: false };
+  };
+  const runtime = { environment: sourceEnvironment } as Parameters<typeof runHardenedGitRead>[4] & {
+    environment: NodeJS.ProcessEnv;
+  };
+
+  await runHardenedGitRead(
+    "/workspace",
+    { operation: "diff", staged: false },
+    fakeRun,
+    async (invocation) => {
+      invocationEnvironment = invocation.env;
+      subject = processApprovalSubject({
+        executable: invocation.executable,
+        argv: invocation.args,
+        cwd: ".",
+        forwardedEnvironment: invocation.env,
+      });
+    },
+    runtime,
+  );
+
+  assert.deepEqual(subject?.environment, expectedNames);
+  const display = approvalSubjectDisplay(subject!);
+  assert.doesNotMatch(display, /fixture\/home|fixture-locale|synthetic-value|filtered-value/);
+  assert.doesNotMatch(display, /FIXTURE_TOKEN|UNDEFINED_SETTING/);
+
+  const appHome = await mkdtemp(join(tmpdir(), "routercode-git-env-rules-"));
+  try {
+    const store = await RuleStore.load(appHome);
+    await store.remember({ workspace: "/workspace", tool: "git_diff", subject: subject!, decision: "allow" });
+    const persisted = await readFile(rulesPath(appHome), "utf8");
+    assert.doesNotMatch(persisted, /fixture\/home|fixture-locale|synthetic-value|filtered-value/);
+    assert.doesNotMatch(persisted, /FIXTURE_TOKEN|UNDEFINED_SETTING/);
+  } finally {
+    await rm(appHome, { recursive: true, force: true });
+  }
+});
+
+test("model git_diff shows its exact subject but cannot apply or persist remembered rules", async (t) => {
+  const box = await sandbox("ask", { answer: false, prefix: "git-no-remember" });
+  const appHome = await mkdtemp(join(tmpdir(), "routercode-git-no-remember-rules-"));
+  t.after(async () => {
+    await Promise.all([
+      rm(box.root, { recursive: true, force: true }),
+      rm(appHome, { recursive: true, force: true }),
+    ]);
+  });
+
+  await assert.rejects(invoke(box.tools, "git_diff", { staged: false }), /abgelehnt/);
+  const firstPreview = box.asked[0];
+  assert.ok(firstPreview?.subject, "git_diff must keep its exact subject visible");
+  assert.equal(firstPreview?.rememberAvailable, false);
+  const subject = JSON.parse(firstPreview!.subject!) as ApprovalSubject;
+
+  const store = await RuleStore.load(appHome);
+  await store.remember({ workspace: box.root, tool: "git_diff", subject, decision: "allow" });
+  box.approvals.setRuleStore(store, box.root);
+  const before = await readFile(rulesPath(appHome), "utf8");
+  const secondPreviews: ToolCallPreview[] = [];
+  box.approvals.setPromptHandler(async (preview) => {
+    secondPreviews.push(preview);
+    return { accepted: false, remember: "deny" };
+  });
+
+  await assert.rejects(
+    invoke(box.tools, "git_diff", { staged: false }),
+    /vom Benutzer abgelehnt/,
+  );
+  assert.equal(secondPreviews.length, 1, "stored allow must not bypass git_diff approval");
+  assert.equal(secondPreviews[0]?.subject, firstPreview?.subject);
+  assert.equal(secondPreviews[0]?.rememberAvailable, false);
+  assert.equal(await readFile(rulesPath(appHome), "utf8"), before);
+  assert.equal(store.list(box.root).length, 1);
+  assert.equal(store.decide(box.root, "git_diff", subject), "allow");
+});
+
 test("a repository cannot execute code through git_diff", async (t) => {
   if (!(await gitAvailable())) {
     t.skip("git ist nicht installiert");
@@ -660,6 +888,7 @@ test("shell, Git process, browser, and selected path/glob call sites pass exact 
 
   const gitBox = await sandbox("ask", { answer: false, prefix: "subjects-git" });
   await assert.rejects(invoke(gitBox.tools, "git_diff", { staged: false }), /abgelehnt/);
+  assert.equal(gitBox.asked[0]?.rememberAvailable, false);
   assert.match(gitBox.asked[0]?.subject ?? "", /"kind":"structured-process"/);
   assert.doesNotMatch(gitBox.asked[0]?.subject ?? "", /GIT_PAGER":"cat/);
 

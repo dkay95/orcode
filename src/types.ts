@@ -206,7 +206,7 @@ export interface ToolCallPreview {
   details?: string;
   /** Canonical, terminal-safe serialization of the policy subject. */
   subject?: string;
-  /** True only when `subject` was safely derived from this exact request. */
+  /** True only when the exact subject is safe and the capability permits stored rules. */
   rememberAvailable?: boolean;
 }
 

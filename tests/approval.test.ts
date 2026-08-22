@@ -474,6 +474,43 @@ test("remembering is unavailable without a safe derived subject and a forged rem
   }
 });
 
+test("rememberable false keeps the exact subject visible but ignores and cannot change stored rules", async () => {
+  const appHome = await tempAppHome();
+  try {
+    const subject = localShellSubject("git diff --");
+    const ruleStore = await RuleStore.load(appHome);
+    await ruleStore.remember({
+      workspace: "/ws",
+      tool: "git_diff",
+      subject,
+      decision: "allow",
+    });
+    const before = await readFile(rulesPath(appHome), "utf8");
+    const approvals = new ApprovalManager("ask", { ruleStore, workspace: "/ws" });
+    const previews: ToolCallPreview[] = [];
+    approvals.setPromptHandler(async (preview) => {
+      previews.push(preview);
+      return { accepted: true, remember: "deny" };
+    });
+
+    await approvals.authorize({
+      name: "git_diff",
+      risk: "shell",
+      summary: "Hardened Git diff",
+      subject,
+      rememberable: false,
+    });
+
+    assert.equal(previews.length, 1, "stored allow must not bypass a non-rememberable prompt");
+    assert.equal(previews[0]?.subject, approvalSubjectDisplay(subject));
+    assert.equal(previews[0]?.rememberAvailable, false);
+    assert.equal(await readFile(rulesPath(appHome), "utf8"), before);
+    assert.equal(ruleStore.decide("/ws", "git_diff", subject), "allow");
+  } finally {
+    await rm(appHome, { recursive: true, force: true });
+  }
+});
+
 test("the preview shows the exact canonical subject used by policy before remember is offered", async () => {
   const subject = localShellSubject("printf '  α  ' | sed 's/α/β/'");
   const { approvals, asked } = harness("ask", true);

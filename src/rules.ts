@@ -84,7 +84,9 @@ export interface ProcessSubjectInput {
 export function processApprovalSubject(input: ProcessSubjectInput): Extract<ApprovalSubject, { kind: "structured-process" }> {
   const names = Array.isArray(input.forwardedEnvironment)
     ? input.forwardedEnvironment
-    : Object.keys(input.forwardedEnvironment);
+    : Object.entries(input.forwardedEnvironment)
+        .filter(([, value]) => value !== undefined)
+        .map(([name]) => name);
   return {
     kind: "structured-process",
     executable: input.executable,

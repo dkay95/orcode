@@ -161,7 +161,7 @@ export async function runVerify(
     if (signal?.aborted) {
       return { status: "cancelled" };
     }
-    const shell = resolveCommandShell();
+    const shell = await resolveCommandShell();
     const start = Date.now();
     const result = await runProcess(shell.executable, [...shell.args, command], {
       cwd: guard.root,
