@@ -7,6 +7,7 @@ import {
   parseArgs,
   runOutcomeExitCode,
 } from "../src/cli.js";
+import { DEFAULT_CONFIG } from "../src/config.js";
 
 test("homeWorkspaceWarning warnt nur bei Workspace === Home-Verzeichnis", () => {
   const home = "/tmp/orcode-home-test";
@@ -119,4 +120,68 @@ test("the chat chooser does not show a transcript behind itself", () => {
   const start = cli.indexOf("ui.start()");
   assert.ok(guard > 0, "the startup load must be guarded by the chooser flag");
   assert.ok(load > guard && load < start, "the guarded load belongs before ui.start()");
+});
+
+test("startup awaits migration before config, rules, chats, exact artifacts, keys, or network can open", async () => {
+  const { initializeStartupStorage } = await import("../src/cli.js") as typeof import("../src/cli.js") & {
+    initializeStartupStorage: (...args: never[]) => Promise<never>;
+  };
+  const order: string[] = [];
+  let releaseMigration!: () => void;
+  const migrationGate = new Promise<void>((resolve) => {
+    releaseMigration = resolve;
+  });
+  const startup = initializeStartupStorage(
+    { workspace: "/synthetic/workspace", newChat: false },
+    {
+      migrateAppHome: async () => {
+        order.push("migration-start");
+        await migrationGate;
+        order.push("migration-complete");
+        return { appHome: "/synthetic/.orcode", warning: null };
+      },
+      pruneCheckpoints: async (appHome) => {
+        assert.equal(appHome, "/synthetic/.orcode");
+        order.push("checkpoints");
+      },
+      loadConfig: async (path) => {
+        assert.equal(path, "/synthetic/.orcode/config.json");
+        order.push("config");
+        return structuredClone(DEFAULT_CONFIG);
+      },
+      loadRules: async (appHome) => {
+        assert.equal(appHome, "/synthetic/.orcode");
+        order.push("rules");
+        return {} as never;
+      },
+      openSession: async (_workspace, appHome) => {
+        assert.equal(appHome, "/synthetic/.orcode");
+        order.push("chats");
+        return { appHome, data: { id: "chat-a" } } as never;
+      },
+    },
+  );
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(order, ["migration-start"]);
+  order.push("key-and-network-probe-blocked");
+  releaseMigration();
+  const result = await startup;
+  order.push("sdk-state", "run-logs", "journals", "task-sidecars", "key", "network");
+
+  assert.equal(result.appHome, "/synthetic/.orcode");
+  assert.deepEqual(order, [
+    "migration-start",
+    "key-and-network-probe-blocked",
+    "migration-complete",
+    "checkpoints",
+    "config",
+    "rules",
+    "chats",
+    "sdk-state",
+    "run-logs",
+    "journals",
+    "task-sidecars",
+    "key",
+    "network",
+  ]);
 });

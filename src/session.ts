@@ -1,4 +1,4 @@
-import { createHash, randomUUID } from "node:crypto";
+import { randomUUID } from "node:crypto";
 import {
   open,
   readdir,
@@ -25,6 +25,7 @@ import {
   type SessionData,
 } from "./types.js";
 import { redactText, redactValue } from "./redaction.js";
+import { CHAT_ARTIFACT_REGISTRY, workspaceStorageHash } from "./storage.js";
 import { formatUsd, hasCode, isRecord } from "./utils.js";
 
 const MAX_TURNS = 80;
@@ -973,11 +974,15 @@ function chatDirectory(appHome: string, workspace: string): string {
 }
 
 function chatPath(appHome: string, workspace: string, id: string): string {
-  return join(chatDirectory(appHome, workspace), `${id}.json`);
+  return CHAT_ARTIFACT_REGISTRY.resolve("chat", {
+    appHome,
+    workspace,
+    chatId: id,
+  });
 }
 
 function workspaceHash(workspace: string): string {
-  return createHash("sha256").update(workspace).digest("hex").slice(0, 16);
+  return workspaceStorageHash(workspace);
 }
 
 function assertChatId(id: string): void {

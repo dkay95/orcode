@@ -93,6 +93,22 @@ test("SessionStore.remove löscht einen Chat endgültig und meldet unbekannte ID
   );
 });
 
+test("SessionStore resolves its redacted transcript path through the central artifact registry", async () => {
+  const { workspace, appHome } = await workspaceRoot("registry-path");
+  const { CHAT_ARTIFACT_REGISTRY } = await import("../src/storage.js");
+  const store = SessionStore.create(workspace, appHome, "Registry");
+
+  assert.equal(
+    store.path,
+    CHAT_ARTIFACT_REGISTRY.resolve("chat", {
+      appHome,
+      workspace,
+      chatId: store.data.id,
+    }),
+  );
+  assert.equal(CHAT_ARTIFACT_REGISTRY.get("chat").privacy, "redacted");
+});
+
 test("workspace can contain multiple independently persisted chats", async () => {
   const { workspace, appHome } = await workspaceRoot("chats");
 

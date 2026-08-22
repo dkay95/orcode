@@ -351,3 +351,22 @@ test("saveConfig/loadConfig runden die neuen Felder verlustfrei", async () => {
   });
   assert.equal(written.config.contextBudgetRatio, 0.6);
 });
+
+test("config schema v0 reads as current while unknown future versions are visibly refused", async () => {
+  const { CONFIG_SCHEMA_VERSION } = await import("../src/config.js");
+  const legacyPath = await configPath("schema-v0");
+  await writeFile(legacyPath, JSON.stringify({ mainModel: "legacy/model" }));
+  const legacy = await loadConfigDetailed(legacyPath);
+  assert.equal(legacy.source, "file");
+  assert.equal(legacy.config.schemaVersion, CONFIG_SCHEMA_VERSION);
+  assert.equal(legacy.config.mainModel, "legacy/model");
+
+  const futurePath = await configPath("schema-future");
+  const futureRaw = JSON.stringify({ schemaVersion: CONFIG_SCHEMA_VERSION + 1, mainModel: "future/model" });
+  await writeFile(futurePath, futureRaw);
+  const future = await loadConfigDetailed(futurePath);
+  assert.equal(future.source, "defaults");
+  assert.match(future.warning ?? "", /zukünftige|Version/i);
+  await assert.rejects(saveConfig(DEFAULT_CONFIG, futurePath), /zukünftige|Version/i);
+  assert.equal(await readFile(futurePath, "utf8"), futureRaw);
+});

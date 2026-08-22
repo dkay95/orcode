@@ -4,7 +4,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { readFile, realpath } from "node:fs/promises";
 import { homedir } from "node:os";
 import { isAbsolute, join, relative, sep } from "node:path";
-import { ensureSecureDirectory, writeFileAtomicSecure } from "./config.js";
+import { PrivateStore } from "./private-store.js";
 import type { ApprovalEffect, ApprovalSubject } from "./types.js";
 import { hasCode } from "./utils.js";
 
@@ -39,7 +39,7 @@ export interface PermissionRule {
   createdAt: string;
 }
 
-interface RuleFileV2 {
+export interface RuleFileV2 {
   version: typeof RULE_FILE_VERSION;
   rules: PermissionRule[];
 }
@@ -259,29 +259,37 @@ function parseLegacyRule(value: unknown): LegacyRule | null {
   };
 }
 
+/** Parse current rules or safely upgrade the legacy v1 shape without persisting it. */
+export function normalizePermissionRuleFile(value: unknown): RuleFileV2 {
+  const parsed = record(value);
+  const version = parsed?.version;
+  if (!parsed || (version !== 1 && version !== RULE_FILE_VERSION)) {
+    throw new Error(`Unbekannte Berechtigungsregel-Version ${String(version)}.`);
+  }
+  const values = Array.isArray(parsed.rules) ? parsed.rules : [];
+  const rules = version === RULE_FILE_VERSION
+    ? values.map(parseV2Rule).filter((rule): rule is PermissionRule => rule !== null)
+    : values.map(parseLegacyRule).filter((rule): rule is LegacyRule => rule !== null).map(migrateLegacyRule);
+  return { version: RULE_FILE_VERSION, rules };
+}
+
 export class RuleStore {
   #appHome: string;
   #rules: PermissionRule[];
+  readonly #privateStore: PrivateStore;
 
   private constructor(appHome: string, rules: PermissionRule[]) {
     this.#appHome = appHome;
     this.#rules = rules;
+    this.#privateStore = new PrivateStore();
   }
 
   static async load(appHome: string = RULES_APP_HOME): Promise<RuleStore> {
     try {
-      const parsed = record(JSON.parse(await readFile(rulesPath(appHome), "utf8")));
-      const version = parsed?.version;
-      if (version !== 1 && version !== RULE_FILE_VERSION) {
-        throw new Error(`Unbekannte Berechtigungsregel-Version ${String(version)}.`);
-      }
-      const values = Array.isArray(parsed?.rules) ? parsed.rules : [];
-      if (version === RULE_FILE_VERSION) {
-        return new RuleStore(appHome, values.map(parseV2Rule).filter((rule): rule is PermissionRule => rule !== null));
-      }
-      const migrated = values.map(parseLegacyRule).filter((rule): rule is LegacyRule => rule !== null).map(migrateLegacyRule);
-      const store = new RuleStore(appHome, migrated);
-      await store.#persist();
+      const raw = JSON.parse(await readFile(rulesPath(appHome), "utf8"));
+      const parsed = normalizePermissionRuleFile(raw);
+      const store = new RuleStore(appHome, parsed.rules);
+      if (record(raw)?.version === 1) await store.#persist();
       return store;
     } catch (error) {
       if (hasCode(error, "ENOENT")) return new RuleStore(appHome, []);
@@ -332,8 +340,10 @@ export class RuleStore {
   }
 
   async #persist(): Promise<void> {
-    await ensureSecureDirectory(this.#appHome);
     const file: RuleFileV2 = { version: RULE_FILE_VERSION, rules: this.#rules };
-    await writeFileAtomicSecure(rulesPath(this.#appHome), `${JSON.stringify(file, null, 2)}\n`);
+    await this.#privateStore.writeTextAtomic(
+      rulesPath(this.#appHome),
+      `${JSON.stringify(file, null, 2)}\n`,
+    );
   }
 }

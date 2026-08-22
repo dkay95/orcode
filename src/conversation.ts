@@ -5,7 +5,9 @@ import {
   type ConversationState,
   type StateAccessor,
 } from "@openrouter/agent";
-import { SECURE_FILE_MODE, writeFileAtomicSecure } from "./config.js";
+import { SECURE_FILE_MODE } from "./config.js";
+import { PrivateStore } from "./private-store.js";
+import { CHAT_ARTIFACT_REGISTRY } from "./storage.js";
 import { chatLockPath } from "./session.js";
 import { hasCode, isRecord } from "./utils.js";
 
@@ -41,30 +43,42 @@ const LOCK_POLL_MS = 25;
  */
 export class ConversationStore {
   readonly #chatId: string;
+  readonly #appHome: string;
+  readonly #chatFilePath: string;
   readonly #statePath: string;
   #baseRevision: number;
   #committedState: ConversationState | null;
   #usable: boolean;
   #buffer: ConversationState | null = null;
+  readonly #privateStore: PrivateStore;
 
   private constructor(options: {
     chatId: string;
+    appHome: string;
+    chatFilePath: string;
     statePath: string;
     baseRevision: number;
     committedState: ConversationState | null;
     usable: boolean;
+    privateStore: PrivateStore;
   }) {
     this.#chatId = options.chatId;
+    this.#appHome = options.appHome;
+    this.#chatFilePath = options.chatFilePath;
     this.#statePath = options.statePath;
     this.#baseRevision = options.baseRevision;
     this.#committedState = options.committedState;
     this.#usable = options.usable;
+    this.#privateStore = options.privateStore;
   }
 
   /** `appHome` is accepted for signature symmetry with the rest of the app's path helpers; the state file always lives next to the chat file it belongs to. */
   static path(appHome: string, chatFilePath: string): string {
-    void appHome;
-    return `${chatFilePath}.state.json`;
+    return CHAT_ARTIFACT_REGISTRY.resolve("conversation-state", {
+      appHome,
+      chatId: "path-derived",
+      chatFilePath,
+    });
   }
 
   /**
@@ -82,8 +96,9 @@ export class ConversationStore {
     chatId: string,
   ): Promise<ConversationStore> {
     const statePath = ConversationStore.path(appHome, chatFilePath);
+    const privateStore = new PrivateStore();
     const [stateFile, currentTurnCount] = await Promise.all([
-      readStateFile(statePath),
+      readStateFile(statePath, privateStore),
       readChatTurnCount(chatFilePath),
     ]);
     const matchesChat = stateFile !== null && stateFile.chatId === chatId;
@@ -101,10 +116,13 @@ export class ConversationStore {
     }
     return new ConversationStore({
       chatId,
+      appHome,
+      chatFilePath,
       statePath,
       baseRevision,
       committedState,
       usable,
+      privateStore,
     });
   }
 
@@ -156,11 +174,19 @@ export class ConversationStore {
     const lockPath = chatLockPath(this.#statePath);
     const release = await acquireLock(lockPath);
     try {
-      const onDisk = await readStateFile(this.#statePath);
+      const onDisk = await readStateFile(this.#statePath, this.#privateStore);
       const diskRevision = onDisk?.revision ?? 0;
       if (onDisk !== null && diskRevision > this.#baseRevision) {
         const stamp = `${Date.now()}-${Math.random().toString(16).slice(2, 8)}`;
-        const conflictPath = `${this.#statePath}.konflikt-${stamp}.json`;
+        const conflictPath = CHAT_ARTIFACT_REGISTRY.resolve(
+          "conversation-conflict",
+          {
+            appHome: this.#appHome,
+            chatId: this.#chatId,
+            chatFilePath: this.#chatFilePath,
+            conflictId: stamp,
+          },
+        );
         const conflict: StateFile = {
           version: 1,
           revision: this.#baseRevision + 1,
@@ -169,7 +195,7 @@ export class ConversationStore {
           updatedAt: new Date().toISOString(),
           state: serializeConversationState(state),
         };
-        await writeFileAtomicSecure(
+        await this.#privateStore.writeTextAtomic(
           conflictPath,
           `${JSON.stringify(conflict, null, 2)}\n`,
         );
@@ -187,7 +213,7 @@ export class ConversationStore {
         updatedAt: new Date().toISOString(),
         state: serializeConversationState(state),
       };
-      await writeFileAtomicSecure(
+      await this.#privateStore.writeTextAtomic(
         this.#statePath,
         `${JSON.stringify(stateFile, null, 2)}\n`,
       );
@@ -200,10 +226,10 @@ export class ConversationStore {
   }
 }
 
-async function readStateFile(path: string): Promise<StateFile | null> {
+async function readStateFile(path: string, store: PrivateStore): Promise<StateFile | null> {
   let raw: string;
   try {
-    raw = await readFile(path, "utf8");
+    raw = await store.readText(path);
   } catch {
     return null;
   }

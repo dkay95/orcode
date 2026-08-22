@@ -217,6 +217,16 @@ test("/checkpoint marks a point and rewinds to it", async () => {
   );
 });
 
+test("/chat operations keep using the app home selected by startup migration", async () => {
+  const { context } = await harness();
+  const migratedAppHome = context.session.appHome;
+
+  await handleSlashCommand("/chat new Nach Migration", context);
+
+  assert.equal(context.session.appHome, migratedAppHome);
+  assert.equal(context.session.data.title, "Nach Migration");
+});
+
 test("/allow list shows nothing, then a remembered rule, then nothing after forget", async () => {
   const { context } = await harness();
   const { out, lines } = collectOutput();

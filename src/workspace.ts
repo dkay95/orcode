@@ -21,7 +21,9 @@ import fg from "fast-glob";
 import { tool } from "@openrouter/agent";
 import { z } from "zod";
 import type { ApprovalManager, ApprovalRequest } from "./approval.js";
-import { APP_HOME, writeFileAtomicSecure } from "./config.js";
+import { APP_HOME } from "./config.js";
+import { PrivateStore } from "./private-store.js";
+import { CHAT_ARTIFACT_REGISTRY } from "./storage.js";
 import { loadIgnore } from "./ignore.js";
 import {
   browserApprovalSubject,
@@ -81,7 +83,11 @@ export interface ChangeJournalOptions {
 
 /** Where one run's checkpoint entries live. Shared so a fresh process can find the same file `ChangeJournal` itself would write to. */
 export function checkpointRunPath(appHome: string, chatId: string, runId: string): string {
-  return join(appHome, "checkpoints", chatId, `${runId}.json`);
+  return CHAT_ARTIFACT_REGISTRY.resolve("checkpoint", {
+    appHome,
+    chatId,
+    artifactId: runId,
+  });
 }
 
 function isChangeEntry(value: unknown): value is ChangeEntry {
@@ -112,10 +118,12 @@ export class ChangeJournal {
   #entries: ChangeEntry[] = [];
   readonly #appHome: string;
   readonly #chatId: string;
+  readonly #privateStore: PrivateStore;
 
   constructor(options: ChangeJournalOptions = {}) {
     this.#appHome = options.appHome ?? APP_HOME;
     this.#chatId = options.chatId ?? "default";
+    this.#privateStore = new PrivateStore();
   }
 
   async record(entry: ChangeEntry): Promise<void> {
@@ -133,7 +141,7 @@ export class ChangeJournal {
 
   async #persistRun(runId: string): Promise<void> {
     const entries = this.#entries.filter((entry) => entry.runId === runId);
-    await writeFileAtomicSecure(this.#runFile(runId), JSON.stringify(entries));
+    await this.#privateStore.writeTextAtomic(this.#runFile(runId), JSON.stringify(entries));
   }
 
   /**
@@ -152,7 +160,7 @@ export class ChangeJournal {
   async hydrateRun(runId: string): Promise<ChangeEntry[]> {
     let raw: string;
     try {
-      raw = await readFile(this.#runFile(runId), "utf8");
+      raw = await this.#privateStore.readText(this.#runFile(runId));
     } catch {
       return [];
     }

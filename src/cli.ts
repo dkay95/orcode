@@ -41,6 +41,7 @@ import {
 } from "./commands.js";
 import {
   consumeConfigWarning,
+  configPath,
   isApprovalMode,
   isCompressionMode,
   loadConfig,
@@ -148,6 +149,62 @@ export interface CliOptions {
   noResume: boolean;
 }
 
+export interface StartupStorageDependencies {
+  migrateAppHome: typeof migrateAppHome;
+  pruneCheckpoints: typeof pruneCheckpoints;
+  loadConfig: typeof loadConfig;
+  loadRules: typeof RuleStore.load;
+  openSession: (
+    workspace: string,
+    appHome: string,
+    options: { newChat: boolean; chatId?: string },
+  ) => Promise<SessionStore>;
+}
+
+export interface StartupStorageResult {
+  appHome: string;
+  migrationWarning: string | null;
+  config: OrcodeConfigWithBudget;
+  ruleStore: RuleStore;
+  session: SessionStore;
+}
+
+/** The only CLI path that opens local state; migration is awaited first. */
+export async function initializeStartupStorage(
+  options: { workspace: string; newChat: boolean; chatId?: string },
+  dependencies: Partial<StartupStorageDependencies> = {},
+): Promise<StartupStorageResult> {
+  const deps: StartupStorageDependencies = {
+    migrateAppHome,
+    pruneCheckpoints,
+    loadConfig,
+    loadRules: (appHome) => RuleStore.load(appHome),
+    openSession: async (workspace, appHome, startup) => {
+      if (startup.newChat || startup.chatId) {
+        await migrateLegacySession(workspace, appHome);
+        return startup.chatId
+          ? SessionStore.openById(workspace, startup.chatId, appHome)
+          : SessionStore.create(workspace, appHome);
+      }
+      return SessionStore.open(workspace, appHome);
+    },
+    ...dependencies,
+  };
+  const migration = await deps.migrateAppHome();
+  const appHome = migration.appHome;
+  await deps.pruneCheckpoints(appHome).catch(() => undefined);
+  const config = await deps.loadConfig(configPath(appHome));
+  const ruleStore = await deps.loadRules(appHome);
+  const session = await deps.openSession(options.workspace, appHome, options);
+  return {
+    appHome,
+    migrationWarning: migration.warning,
+    config,
+    ruleStore,
+    session,
+  };
+}
+
 /**
  * Reads the version from package.json so it is stated in exactly one place.
  * Works from both src/ (tsx) and dist/ because both sit one level below the root.
@@ -181,10 +238,16 @@ async function main(): Promise<void> {
     return;
   }
 
-  // A5: startup cleanup, best-effort — a failed prune must never block a run.
-  void pruneCheckpoints().catch(() => undefined);
-
-  const config = await loadConfig();
+  const workspace = resolve(options.workspace);
+  const startup = await initializeStartupStorage({
+    workspace,
+    newChat: options.newChat,
+    ...(options.chatId ? { chatId: options.chatId } : {}),
+  });
+  if (startup.migrationWarning) {
+    console.error(chalk.yellow(startup.migrationWarning));
+  }
+  const { config, ruleStore, session } = startup;
   // loadConfig never throws any more; a broken file is reported instead of
   // silently replaced by defaults.
   const configWarning = consumeConfigWarning();
@@ -207,7 +270,6 @@ async function main(): Promise<void> {
     config.compressionMode = options.compression;
   }
 
-  const workspace = resolve(options.workspace);
   const homeWarning = homeWorkspaceWarning(workspace);
   if (homeWarning) {
     // stderr, damit --json/NDJSON auf stdout ungestört bleibt; gilt für TUI,
@@ -235,20 +297,8 @@ async function main(): Promise<void> {
     },
   );
   const approvals = new ApprovalManager(config.approvalMode);
-  const ruleStore = await RuleStore.load();
   approvals.setRuleStore(ruleStore, workspace);
   const sshSession = createSshSession();
-  let session: SessionStore;
-  if (options.newChat || options.chatId) {
-    // `SessionStore.open()` migrates on its own; the explicit start modes have
-    // to ask for it, otherwise an old v1 chat stays invisible after `--new`.
-    await migrateLegacySession(workspace);
-    session = options.chatId
-      ? await SessionStore.openById(workspace, options.chatId)
-      : SessionStore.create(workspace);
-  } else {
-    session = await SessionStore.open(workspace);
-  }
   if (!options.model && session.data.model) {
     config.mainModel = session.data.model;
   }
@@ -1013,7 +1063,7 @@ async function runDashboard(
                 selected.setting,
               );
               await Promise.all([
-                saveConfig(context.config),
+                saveConfig(context.config, configPath(context.session.appHome)),
                 context.session.save(),
               ]);
               ui.addMessage(
@@ -1060,7 +1110,7 @@ async function runDashboard(
                 const previous = context.approvals.mode;
                 context.approvals.mode = mode;
                 context.config.approvalMode = mode;
-                await saveConfig(context.config);
+                await saveConfig(context.config, configPath(context.session.appHome));
                 ui.addMessage(
                   "system",
                   `✓ Approval geändert: ${previous} → ${mode}\n${approvalDescription(mode)}`,
@@ -1156,7 +1206,7 @@ async function runDashboard(
             if (accepted) {
               context.approvals.mode = "allow-all";
               context.config.approvalMode = "allow-all";
-              await saveConfig(context.config);
+              await saveConfig(context.config, configPath(context.session.appHome));
               ui.addMessage(
                 "system",
                 "Approval-Modus: allow-all. Änderungen und Shell-Befehle laufen ohne Rückfrage.",
@@ -1391,7 +1441,7 @@ async function pickDashboardChat(
   preferNew: boolean,
 ): Promise<boolean> {
   await saveDashboardSessionPreferences(context, ui);
-  const chats = await SessionStore.list(context.workspace);
+  const chats = await SessionStore.list(context.workspace, context.session.appHome);
   const items = [
     {
       value: "__new__",
@@ -1412,7 +1462,7 @@ async function pickDashboardChat(
 
   let next: SessionStore;
   if (picked.value === "__new__") {
-    next = SessionStore.create(context.workspace);
+    next = SessionStore.create(context.workspace, context.session.appHome);
     next.setPreferences(
       context.config.mainModel,
       getReasoningSetting(context.config),
@@ -1421,7 +1471,11 @@ async function pickDashboardChat(
     if (picked.value === context.session.data.id) {
       return false;
     }
-    next = await SessionStore.openById(context.workspace, picked.value);
+    next = await SessionStore.openById(
+      context.workspace,
+      picked.value,
+      context.session.appHome,
+    );
     if (next.data.model) {
       context.config.mainModel = next.data.model;
     }
@@ -1435,7 +1489,7 @@ async function pickDashboardChat(
   // compressor price cache and the undo journal on every chat switch.
   context.agent.setSession(next);
   await saveDashboardSessionPreferences(context, ui);
-  await saveConfig(context.config);
+  await saveConfig(context.config, configPath(context.session.appHome));
   ui.loadTurns(next.recentTurns(VISIBLE_TURNS));
   ui.setStatus(`Chat geöffnet: ${next.data.title}`, false);
   return true;
@@ -1801,7 +1855,7 @@ async function runVoiceCapture(ui: TerminalUi, context: RuntimeContext): Promise
       );
       return decision.accepted;
     },
-    () => saveConfig(context.config),
+    () => saveConfig(context.config, configPath(context.session.appHome)),
   );
   if (!consented) {
     ui.addMessage("system", "Spracheingabe abgebrochen: keine Einwilligung erteilt.", "/whisper");
@@ -2051,7 +2105,7 @@ async function pickDashboardModel(
     return null;
   }
   context.config.mainModel = selected.id;
-  await saveConfig(context.config);
+  await saveConfig(context.config, configPath(context.session.appHome));
   return selected;
 }
 
@@ -2083,7 +2137,7 @@ async function pickDashboardCompressorModel(
     return null;
   }
   context.config.compressorModel = selected.id;
-  await saveConfig(context.config);
+  await saveConfig(context.config, configPath(context.session.appHome));
   return selected;
 }
 

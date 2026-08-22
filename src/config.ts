@@ -1,6 +1,5 @@
 import { randomUUID } from "node:crypto";
 import {
-  access,
   chmod,
   mkdir,
   readFile,
@@ -22,11 +21,22 @@ import {
 } from "./types.js";
 import { PANEL_MAX_MODELS, PANEL_MIN_MODELS } from "./panel.js";
 import { errorMessage, formatUsd, hasCode, isRecord } from "./utils.js";
+import {
+  migrateStorageHome,
+  STORAGE_SCHEMA_VERSION,
+  type AppHomeMigrationOptions,
+  type AppHomeMigrationResult,
+} from "./storage.js";
 
 export const APP_HOME = join(homedir(), ".orcode");
 /** Pre-rename state directory (the tool was called RouterCode before). `migrateAppHome` moves it once, on first startup. */
 export const LEGACY_APP_HOME = join(homedir(), ".routercode");
 export const CONFIG_PATH = join(APP_HOME, "config.json");
+export const CONFIG_SCHEMA_VERSION = STORAGE_SCHEMA_VERSION;
+
+export function configPath(appHome: string = APP_HOME): string {
+  return join(appHome, "config.json");
+}
 
 export const SECURE_DIRECTORY_MODE = 0o700;
 export const SECURE_FILE_MODE = 0o600;
@@ -79,6 +89,7 @@ export interface VerifyConfig {
  * `types.ts`.
  */
 export interface OrcodeConfigWithBudget extends OrcodeConfig {
+  schemaVersion: typeof CONFIG_SCHEMA_VERSION;
   budget: BudgetConfig;
   fallbackModels: string[];
   provider: ProviderConfig;
@@ -102,6 +113,7 @@ export interface OrcodeConfigWithBudget extends OrcodeConfig {
 
 /** Anything that may be handed to `validateConfig`/`saveConfig`. */
 export type ConfigInput = OrcodeConfig & {
+  schemaVersion?: unknown;
   budget?: unknown;
   fallbackModels?: unknown;
   provider?: unknown;
@@ -132,6 +144,7 @@ export const DEFAULT_VERIFY: VerifyConfig = {
 };
 
 export const DEFAULT_CONFIG: OrcodeConfigWithBudget = {
+  schemaVersion: CONFIG_SCHEMA_VERSION,
   mainModel: "openrouter/auto",
   compressorModel: "qwen/qwen3.5-flash-02-23",
   compressionMode: "auto",
@@ -208,6 +221,17 @@ export async function loadConfigDetailed(
     };
   }
 
+  if (
+    typeof parsed.schemaVersion === "number" &&
+    parsed.schemaVersion > CONFIG_SCHEMA_VERSION
+  ) {
+    return {
+      config: defaults(),
+      warning: `Konfiguration ${path} hat die zukünftige schemaVersion ${parsed.schemaVersion} und wurde nicht überschrieben.`,
+      source: "defaults",
+    };
+  }
+
   try {
     return {
       config: validateConfig({
@@ -247,6 +271,7 @@ export async function saveConfig(
   config: ConfigInput,
   path = CONFIG_PATH,
 ): Promise<void> {
+  await refuseFutureConfig(path);
   const validated = validateConfig(config);
   await preserveBrokenConfig(path);
   await writeFileAtomicSecure(path, `${JSON.stringify(validated, null, 2)}\n`);
@@ -304,60 +329,18 @@ export async function writeFileAtomicSecure(
   }
 }
 
-export interface AppHomeMigrationResult {
-  /** The app home the caller should use for the rest of this process. */
-  appHome: string;
-  /** German, user facing. `null` when nothing needed reporting. */
-  warning: string | null;
-}
-
-/**
- * Moves `~/.routercode` to `~/.orcode` once, the first time this build of the
- * renamed tool runs. Idempotent and safe to call on every startup:
- *
- * - `newHome` already exists (migration already ran, or the user started
- *   fresh under the new name) → does nothing, returns `newHome`.
- * - Neither directory exists (genuinely first run) → does nothing, returns
- *   `newHome`; it is created lazily by `ensureSecureDirectory` on first write.
- * - Only `legacyHome` exists → `rename()`s it in one atomic step (a real move,
- *   not a copy-and-leave-behind) so chats, config and rules all move together
- *   and nothing can end up duplicated between the two directories.
- * - The move fails (permissions, cross-device, …) → `legacyHome` is left
- *   completely untouched, the caller keeps working against it, and a German
- *   warning explains what happened. The next startup simply tries again,
- *   since `newHome` still won't exist.
- *
- * Callers must always pass explicit paths in tests — the defaults resolve to
- * the real home directory.
- */
 export async function migrateAppHome(
   newHome: string = APP_HOME,
   legacyHome: string = LEGACY_APP_HOME,
+  options: AppHomeMigrationOptions = {},
 ): Promise<AppHomeMigrationResult> {
-  if (await pathExists(newHome)) {
-    return { appHome: newHome, warning: null };
-  }
-  if (!(await pathExists(legacyHome))) {
-    return { appHome: newHome, warning: null };
-  }
-  try {
-    await rename(legacyHome, newHome);
-    return { appHome: newHome, warning: null };
-  } catch (error) {
-    return {
-      appHome: legacyHome,
-      warning: `${legacyHome} konnte nicht nach ${newHome} verschoben werden (${errorMessage(error)}). orcode arbeitet für diese Sitzung weiter mit ${legacyHome}.`,
-    };
-  }
-}
-
-async function pathExists(path: string): Promise<boolean> {
-  try {
-    await access(path);
-    return true;
-  } catch {
-    return false;
-  }
+  return migrateStorageHome(newHome, legacyHome, {
+    ...options,
+    normalizeConfig: (value) => validateConfig({
+      ...DEFAULT_CONFIG,
+      ...value,
+    } as ConfigInput) as unknown as Record<string, unknown>,
+  });
 }
 
 export function validateConfig(value: ConfigInput): OrcodeConfigWithBudget {
@@ -369,6 +352,7 @@ export function validateConfig(value: ConfigInput): OrcodeConfigWithBudget {
     : DEFAULT_CONFIG.compressionMode;
 
   return {
+    schemaVersion: CONFIG_SCHEMA_VERSION,
     mainModel: nonEmpty(value.mainModel, DEFAULT_CONFIG.mainModel),
     compressorModel: nonEmpty(value.compressorModel, DEFAULT_CONFIG.compressorModel),
     compressionMode,
@@ -635,6 +619,24 @@ function defaults(): OrcodeConfigWithBudget {
     verify: { ...DEFAULT_VERIFY },
     panelModels: [],
   };
+}
+
+async function refuseFutureConfig(path: string): Promise<void> {
+  try {
+    const parsed: unknown = JSON.parse(await readFile(path, "utf8"));
+    if (
+      isRecord(parsed) &&
+      typeof parsed.schemaVersion === "number" &&
+      parsed.schemaVersion > CONFIG_SCHEMA_VERSION
+    ) {
+      throw new Error(
+        `Konfiguration ${path} hat die zukünftige schemaVersion ${parsed.schemaVersion} und wird nicht überschrieben.`,
+      );
+    }
+  } catch (error) {
+    if (error instanceof SyntaxError || hasCode(error, "ENOENT")) return;
+    throw error;
+  }
 }
 
 /**

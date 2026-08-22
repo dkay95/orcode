@@ -6,11 +6,15 @@ import { createReadStream } from "node:fs";
 import { join } from "node:path";
 import { APP_HOME, ensureSecureDirectory, SECURE_FILE_MODE } from "./config.js";
 import { redactRunEvent } from "./redaction.js";
+import {
+  CHAT_ARTIFACT_REGISTRY,
+  RUN_LOG_ENVELOPE_VERSION,
+} from "./storage.js";
 import type { AgentRunEvent } from "./types.js";
 import { hasCode, isRecord } from "./utils.js";
 
 export const DEFAULT_KEEP_RUNS = 50;
-export const RUN_LOG_ENVELOPE_VERSION = 1 as const;
+export { RUN_LOG_ENVELOPE_VERSION } from "./storage.js";
 
 export interface RunLogEnvelope {
   version: typeof RUN_LOG_ENVELOPE_VERSION;
@@ -22,7 +26,11 @@ export function runsDir(appHome: string, chatId: string): string {
 }
 
 export function runLogPath(appHome: string, chatId: string, runId: string): string {
-  return join(runsDir(appHome, chatId), `${runId}.ndjson`);
+  return CHAT_ARTIFACT_REGISTRY.resolve("run-log", {
+    appHome,
+    chatId,
+    artifactId: runId,
+  });
 }
 
 /**

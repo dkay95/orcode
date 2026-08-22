@@ -1196,7 +1196,7 @@ async function chatCommand(
 ): Promise<void> {
   const action = (args[0] ?? "").toLowerCase();
   if (!action) {
-    const chats = await SessionStore.list(context.workspace);
+    const chats = await SessionStore.list(context.workspace, context.session.appHome);
     const choices = [
       {
         name: "＋ Neuer Chat",
@@ -1221,12 +1221,12 @@ async function chatCommand(
     if (selected === "__new__") {
       await replaceSession(
         context,
-        SessionStore.create(context.workspace),
+        SessionStore.create(context.workspace, context.session.appHome),
       );
     } else if (selected !== context.session.data.id) {
       await replaceSession(
         context,
-        await SessionStore.openById(context.workspace, selected),
+        await SessionStore.openById(context.workspace, selected, context.session.appHome),
       );
     }
     printCurrentChat(context.session, context.out);
@@ -1234,7 +1234,7 @@ async function chatCommand(
   }
 
   if (action === "list") {
-    const chats = await SessionStore.list(context.workspace);
+    const chats = await SessionStore.list(context.workspace, context.session.appHome);
     if (!chats.length) {
       context.out.text("Noch keine gespeicherten Chats in diesem Workspace.");
       return;
@@ -1257,7 +1257,7 @@ async function chatCommand(
     const title = args.slice(1).join(" ").trim() || "Neuer Chat";
     await replaceSession(
       context,
-      SessionStore.create(context.workspace, undefined, title),
+      SessionStore.create(context.workspace, context.session.appHome, title),
     );
     printCurrentChat(context.session, context.out);
     return;
@@ -1288,7 +1288,7 @@ async function chatCommand(
     if (!query) {
       throw new Error("Verwendung: /chat open <ID oder Titel>");
     }
-    const chats = await SessionStore.list(context.workspace);
+    const chats = await SessionStore.list(context.workspace, context.session.appHome);
     const matches = rankChatMatches(chats, query);
     if (!matches.length) {
       throw new Error(`Kein Chat gefunden: ${query}`);
@@ -1298,7 +1298,7 @@ async function chatCommand(
     if (!contested) {
       await replaceSession(
         context,
-        await SessionStore.openById(context.workspace, best.chat.id),
+        await SessionStore.openById(context.workspace, best.chat.id, context.session.appHome),
       );
       printCurrentChat(context.session, context.out);
       return;
@@ -1320,7 +1320,7 @@ async function chatCommand(
     if (selected !== context.session.data.id) {
       await replaceSession(
         context,
-        await SessionStore.openById(context.workspace, selected),
+        await SessionStore.openById(context.workspace, selected, context.session.appHome),
       );
     }
     printCurrentChat(context.session, context.out);
@@ -1332,7 +1332,7 @@ async function chatCommand(
     if (!query) {
       throw new Error("Verwendung: /chat search <Suchbegriff>");
     }
-    const hits = await SessionStore.search(context.workspace, query);
+    const hits = await SessionStore.search(context.workspace, query, context.session.appHome);
     if (!hits.length) {
       context.out.text(`Keine Chats gefunden für: ${query}`);
       return;
@@ -1359,7 +1359,7 @@ async function chatCommand(
     if (!query) {
       throw new Error("Verwendung: /chat delete <ID oder Titel>");
     }
-    const chats = await SessionStore.list(context.workspace);
+    const chats = await SessionStore.list(context.workspace, context.session.appHome);
     const matches = rankChatMatches(chats, query);
     if (!matches.length) {
       throw new Error(`Kein Chat gefunden: ${query}`);
@@ -1374,10 +1374,10 @@ async function chatCommand(
     }
     const target = best.chat;
     const wasActive = target.id === context.session.data.id;
-    await SessionStore.remove(context.workspace, target.id);
+    await SessionStore.remove(context.workspace, target.id, context.session.appHome);
     if (wasActive) {
       // Sonst legt der nächste Auto-Save die gelöschte Datei neu an.
-      await replaceSession(context, SessionStore.create(context.workspace));
+      await replaceSession(context, SessionStore.create(context.workspace, context.session.appHome));
     }
     context.out.text(
       `Chat endgültig gelöscht: ${target.title} (${target.id})${wasActive ? " — neuer leerer Chat gestartet." : ""}`,

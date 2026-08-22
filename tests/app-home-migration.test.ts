@@ -1,90 +1,355 @@
 import assert from "node:assert/strict";
-import { mkdtemp, mkdir, readFile, writeFile, rm } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import {
+  access,
+  mkdir,
+  mkdtemp,
+  readFile,
+  readdir,
+  stat,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { migrateAppHome } from "../src/config.js";
+import { approvalSubjectFingerprint } from "../src/rules.js";
 
-/**
- * The rename from `~/.routercode` to `~/.orcode` moves real user data: chats,
- * config, permission rules. These tests pin the four cases that decide whether
- * that data survives. Every path is injected — the real home is never touched.
- */
+const WORKSPACE = "/synthetic/workspace";
+const WORKSPACE_HASH = createHash("sha256").update(WORKSPACE).digest("hex").slice(0, 16);
 
-async function seedLegacy(root: string): Promise<string> {
-  const legacy = join(root, ".routercode");
-  await mkdir(join(legacy, "chats"), { recursive: true });
-  await writeFile(join(legacy, "config.json"), '{"mainModel":"kimi"}');
-  await writeFile(join(legacy, "chats", "a.json"), '{"turns":[1,2,3]}');
-  return legacy;
+function syntheticCredential(): string {
+  return `${["sk", "or", "v1"].join("-")}-${"m".repeat(40)}`;
 }
 
-test("the legacy directory is moved and its contents survive", async () => {
-  const root = await mkdtemp(join(tmpdir(), "orcode-migration-"));
-  const legacy = await seedLegacy(root);
-  const target = join(root, ".orcode");
+function chat(id: string, title: string, secret = ""): Record<string, unknown> {
+  return {
+    version: 2,
+    id,
+    title,
+    workspace: WORKSPACE,
+    summary: secret ? `summary ${secret}` : "summary",
+    turns: [{ role: "user", content: secret ? `prompt ${secret}` : "prompt", createdAt: "2026-08-20T10:00:00.000Z" }],
+    costs: { mainUsd: 0.2, compressorUsd: 0, voiceUsd: 0, totalUsd: 0.2 },
+    revision: 1,
+    checkpoints: [],
+    toolCalls: [],
+    dailySpendUsd: {},
+    createdAt: "2026-08-20T10:00:00.000Z",
+    updatedAt: "2026-08-20T10:01:00.000Z",
+  };
+}
 
-  const result = await migrateAppHome(target, legacy);
+async function seedHome(home: string, options: { id?: string; model?: string; secret?: string } = {}): Promise<string> {
+  const id = options.id ?? "legacy-chat-a";
+  await mkdir(join(home, "chats", WORKSPACE_HASH), { recursive: true });
+  await writeFile(join(home, "config.json"), JSON.stringify({ mainModel: options.model ?? "legacy/model" }));
+  await writeFile(join(home, "chats", WORKSPACE_HASH, `${id}.json`), JSON.stringify(chat(id, "Legacy", options.secret)));
+  return id;
+}
 
-  assert.equal(result.appHome, target);
-  assert.equal(result.warning, null);
-  assert.equal(
-    await readFile(join(target, "chats", "a.json"), "utf8"),
-    '{"turns":[1,2,3]}',
+async function exists(path: string): Promise<boolean> {
+  try {
+    await access(path);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+test("ChatArtifactRegistry centrally classifies every 0.4 chat artifact and only reserves task sidecars", async () => {
+  const { CHAT_ARTIFACT_REGISTRY } = await import("../src/storage.js");
+  assert.deepEqual(
+    CHAT_ARTIFACT_REGISTRY.entries().map((entry) => ({
+      kind: entry.kind,
+      privacy: entry.privacy,
+      retention: entry.retention,
+      migration: entry.migration,
+      deletion: entry.deletion,
+    })),
+    [
+      { kind: "chat", privacy: "redacted", retention: "chat", migration: "required", deletion: "file" },
+      { kind: "conversation-state", privacy: "exact", retention: "exact-recovery", migration: "required", deletion: "file" },
+      { kind: "conversation-conflict", privacy: "exact", retention: "exact-recovery", migration: "required", deletion: "file" },
+      { kind: "run-log", privacy: "redacted", retention: "redacted-run-log", migration: "required", deletion: "chat-tree" },
+      { kind: "checkpoint", privacy: "exact", retention: "exact-recovery", migration: "required", deletion: "chat-tree" },
+      { kind: "task-sidecar", privacy: "exact", retention: "exact-recovery", migration: "reserved", deletion: "chat-tree" },
+    ],
   );
   assert.equal(
-    await readFile(join(target, "config.json"), "utf8"),
-    '{"mainModel":"kimi"}',
+    CHAT_ARTIFACT_REGISTRY.resolve("run-log", { appHome: "/app", chatId: "chat-a", artifactId: "run-a" }),
+    join("/app", "runs", "chat-a", "run-a.ndjson"),
   );
-  await rm(root, { recursive: true, force: true });
+  assert.deepEqual(CHAT_ARTIFACT_REGISTRY.existing("task-sidecar", { appHome: "/app", chatId: "chat-a" }), []);
 });
 
-test("a second run changes nothing and never clobbers the new directory", async () => {
-  const root = await mkdtemp(join(tmpdir(), "orcode-migration-"));
-  const legacy = await seedLegacy(root);
+test("legacy-only migration stages, validates, maps every sidecar, redacts readable data, and keeps one protected exact backup", async () => {
+  const root = await mkdtemp(join(tmpdir(), "orcode-migration-full-"));
+  const legacy = join(root, ".routercode");
   const target = join(root, ".orcode");
+  const secret = syntheticCredential();
+  const oldId = await seedHome(legacy, { secret });
+  const oldChatPath = join(legacy, "chats", WORKSPACE_HASH, `${oldId}.json`);
+  await writeFile(`${oldChatPath}.state.json`, JSON.stringify({ version: 1, revision: 1, chatId: oldId, turnCount: 1, updatedAt: "2026-08-20T10:01:00.000Z", state: "opaque exact state" }));
+  await mkdir(join(legacy, "runs", oldId), { recursive: true });
+  const legacyEvents = [
+    { type: "run-start", model: "synthetic/model", maxSteps: 5, prompt: `run ${secret}`, timestamp: 11 },
+    { type: "model-end", model: "synthetic/model", step: 1, durationMs: 9, inputTokens: 4, outputTokens: 2, reasoningTokens: 0, cachedTokens: 0, costUsd: 0.125, timestamp: 12 },
+    { type: "run-end", outcome: "complete", durationMs: 10, toolCount: 0, timestamp: 13 },
+  ];
+  await writeFile(join(legacy, "runs", oldId, "run-a.ndjson"), `${legacyEvents.map((event) => JSON.stringify(event)).join("\n")}\n`);
+  await mkdir(join(legacy, "checkpoints", oldId), { recursive: true });
+  await writeFile(join(legacy, "checkpoints", oldId, "run-a.json"), JSON.stringify([{ path: "/synthetic/file", before: secret, after: "after", createdAt: "2026-08-20T10:00:00.000Z", runId: "run-a" }]));
+  await mkdir(join(legacy, "tasks", oldId), { recursive: true });
+  await writeFile(join(legacy, "tasks", oldId, "future.json"), JSON.stringify({ future: true }));
+  await writeFile(join(legacy, "chats", WORKSPACE_HASH, `${oldId}.json.lock`), "do not migrate");
+
+  const result = await migrateAppHome(target, legacy);
+  const { migrationManifestPath } = await import("../src/storage.js");
+  const manifest = JSON.parse(await readFile(migrationManifestPath(target), "utf8")) as {
+    phase: string;
+    complete: boolean;
+    sourceChecksum: string;
+    chatIdMap: Record<string, string>;
+    destinationPaths: string[];
+    backupPath: string;
+  };
+  const newId = manifest.chatIdMap[oldId]!;
+
+  assert.equal(result.appHome, target);
+  assert.equal(manifest.phase, "complete");
+  assert.equal(manifest.complete, true);
+  assert.match(manifest.sourceChecksum, /^[a-f0-9]{64}$/);
+  assert.notEqual(newId, oldId);
+  assert.ok(manifest.destinationPaths.every((path) => path.startsWith(target)));
+  assert.equal(await exists(legacy), false, "the legacy home must not remain unmanaged");
+  const migratedChat = await readFile(join(target, "chats", WORKSPACE_HASH, `${newId}.json`), "utf8");
+  assert.doesNotMatch(migratedChat, new RegExp(secret));
+  assert.equal((JSON.parse(migratedChat) as { id: string }).id, newId);
+  const migratedState = JSON.parse(await readFile(join(target, "chats", WORKSPACE_HASH, `${newId}.json.state.json`), "utf8")) as { chatId: string; state: string };
+  assert.deepEqual(migratedState, { version: 1, revision: 1, chatId: newId, turnCount: 1, updatedAt: "2026-08-20T10:01:00.000Z", state: "opaque exact state" });
+  const migratedLogLines = (await readFile(join(target, "runs", newId, "run-a.ndjson"), "utf8")).trim().split("\n").map((line) => JSON.parse(line));
+  assert.deepEqual(migratedLogLines.map((line) => line.version), [1, 1, 1]);
+  assert.deepEqual(migratedLogLines.map((line) => line.event.timestamp), [11, 12, 13]);
+  assert.equal(migratedLogLines[1].event.costUsd, 0.125);
+  assert.equal(migratedLogLines[2].event.outcome, "complete");
+  assert.doesNotMatch(JSON.stringify(migratedLogLines), new RegExp(secret));
+  assert.match(await readFile(join(target, "checkpoints", newId, "run-a.json"), "utf8"), new RegExp(secret), "exact journal stays exact");
+  assert.equal(await exists(join(target, "tasks", newId, "future.json")), false, "reserved task sidecars have no 0.4 migrator");
+  assert.equal(await exists(join(target, "chats", WORKSPACE_HASH, `${newId}.json.lock`)), false);
+  assert.equal((await stat(manifest.backupPath)).mode & 0o777, 0o700);
+  assert.match(await readFile(join(manifest.backupPath, "chats", WORKSPACE_HASH, `${oldId}.json`), "utf8"), new RegExp(secret));
+  assert.equal((await readdir(join(target, "migration-backups"))).length, 1);
+});
+
+test("dual-home migration keeps new config authoritative and merges exact rules by fingerprint without duplicate chats", async () => {
+  const root = await mkdtemp(join(tmpdir(), "orcode-migration-dual-"));
+  const legacy = join(root, ".routercode");
+  const target = join(root, ".orcode");
+  const oldId = await seedHome(legacy, { id: "shared-chat", model: "legacy/model" });
+  await seedHome(target, { id: "shared-chat", model: "new/model" });
+  await writeFile(join(target, "config.json"), JSON.stringify({ mainModel: "new/model" }));
+  const sharedRule = { id: "new-rule", workspace: WORKSPACE, tool: "read_file", match: { kind: "exact-subject", fingerprint: "f".repeat(64), display: "shared" }, decision: "allow", createdAt: "2026-08-20T00:00:00.000Z" };
+  const legacyRule = { ...sharedRule, id: "legacy-duplicate" };
+  const uniqueRule = { ...sharedRule, id: "legacy-unique", match: { ...sharedRule.match, fingerprint: "e".repeat(64), display: "unique" } };
+  await writeFile(join(target, "permissions.json"), JSON.stringify({ version: 2, rules: [sharedRule] }));
+  await writeFile(join(legacy, "permissions.json"), JSON.stringify({ version: 2, rules: [legacyRule, uniqueRule] }));
+
+  const result = await migrateAppHome(target, legacy);
+  const { migrationManifestPath } = await import("../src/storage.js");
+  const manifest = JSON.parse(await readFile(migrationManifestPath(target), "utf8")) as { chatIdMap: Record<string, string> };
+  const newId = manifest.chatIdMap[oldId]!;
+  const config = JSON.parse(await readFile(join(target, "config.json"), "utf8")) as { schemaVersion: number; mainModel: string };
+  const rules = JSON.parse(await readFile(join(target, "permissions.json"), "utf8")) as { rules: Array<{ match: { fingerprint: string } }> };
+
+  assert.equal(result.appHome, target);
+  assert.equal(config.schemaVersion, 1);
+  assert.equal(config.mainModel, "new/model");
+  assert.notEqual(newId, oldId);
+  assert.equal(await exists(join(target, "chats", WORKSPACE_HASH, "shared-chat.json")), true);
+  assert.equal(await exists(join(target, "chats", WORKSPACE_HASH, `${newId}.json`)), true);
+  assert.deepEqual(rules.rules.map((rule) => rule.match.fingerprint).sort(), ["e".repeat(64), "f".repeat(64)]);
+});
+
+test("app-home migration upgrades legacy v1 rules before the startup rule store opens", async () => {
+  const root = await mkdtemp(join(tmpdir(), "orcode-migration-v1-rules-"));
+  const legacy = join(root, ".routercode");
+  const target = join(root, ".orcode");
+  await seedHome(legacy);
+  const base = {
+    workspace: WORKSPACE,
+    tool: "read_file",
+    decision: "allow",
+    createdAt: "2026-08-20T00:00:00.000Z",
+  };
+  await writeFile(join(legacy, "permissions.json"), JSON.stringify({
+    version: 1,
+    rules: [
+      { ...base, id: "safe-path", match: { kind: "path-glob", value: "src/index.ts" } },
+      { ...base, id: "broad-command", tool: "run_command", match: { kind: "command-prefix", value: "git" } },
+    ],
+  }));
 
   await migrateAppHome(target, legacy);
-  // A stale legacy directory reappearing must not overwrite newer state.
-  await mkdir(legacy, { recursive: true });
-  await writeFile(join(legacy, "config.json"), '{"mainModel":"stale"}');
+  const stored = JSON.parse(await readFile(join(target, "permissions.json"), "utf8")) as {
+    version: number;
+    rules: Array<{ id: string; match: { kind: string; fingerprint?: string; reason?: string } }>;
+  };
 
-  const second = await migrateAppHome(target, legacy);
-
-  assert.equal(second.appHome, target);
-  assert.equal(second.warning, null);
+  assert.equal(stored.version, 2);
   assert.equal(
-    await readFile(join(target, "config.json"), "utf8"),
-    '{"mainModel":"kimi"}',
+    stored.rules.find((rule) => rule.id === "safe-path")?.match.fingerprint,
+    approvalSubjectFingerprint({ kind: "selected-path", path: "src/index.ts" }),
   );
-  await rm(root, { recursive: true, force: true });
+  assert.equal(stored.rules.find((rule) => rule.id === "broad-command")?.match.kind, "disabled");
+  assert.match(stored.rules.find((rule) => rule.id === "broad-command")?.match.reason ?? "", /nicht exakt/);
 });
 
-test("a fresh install without a legacy directory is a no-op", async () => {
-  const root = await mkdtemp(join(tmpdir(), "orcode-migration-"));
+test("an interrupted staged migration resumes idempotently with the same persisted chat ID map", async () => {
+  const root = await mkdtemp(join(tmpdir(), "orcode-migration-resume-"));
+  const legacy = join(root, ".routercode");
   const target = join(root, ".orcode");
+  const oldId = await seedHome(legacy);
+  let interrupted = false;
+  await assert.rejects(
+    migrateAppHome(target, legacy, {
+      onPhase: async (phase: string) => {
+        if (phase === "staged" && !interrupted) {
+          interrupted = true;
+          throw new Error("synthetic crash after staging");
+        }
+      },
+    } as never),
+    /synthetic crash/,
+  );
+  const { migrationManifestPath } = await import("../src/storage.js");
+  const before = JSON.parse(await readFile(migrationManifestPath(target), "utf8")) as { phase: string; chatIdMap: Record<string, string> };
+  assert.equal(before.phase, "staged");
+  assert.equal(await exists(legacy), true);
 
-  const result = await migrateAppHome(target, join(root, ".routercode"));
-
-  assert.equal(result.appHome, target);
-  assert.equal(result.warning, null);
-  await rm(root, { recursive: true, force: true });
+  const resumed = await migrateAppHome(target, legacy);
+  const after = JSON.parse(await readFile(migrationManifestPath(target), "utf8")) as { phase: string; chatIdMap: Record<string, string> };
+  assert.equal(resumed.appHome, target);
+  assert.equal(after.phase, "complete");
+  assert.equal(after.chatIdMap[oldId], before.chatIdMap[oldId]);
+  assert.equal((await readdir(join(target, "chats", WORKSPACE_HASH))).filter((name) => name.endsWith(".json")).length, 1);
 });
 
-test("a failed move leaves the old data untouched and keeps working with it", async () => {
-  const root = await mkdtemp(join(tmpdir(), "orcode-migration-"));
-  const legacy = await seedLegacy(root);
-  // An unwritable parent makes rename fail the way a cross-device move would.
-  const target = join(root, "missing-parent", "does-not-exist", ".orcode");
+test("one corrupt chat and one corrupt run are isolated without blocking valid chats or runs", async () => {
+  const root = await mkdtemp(join(tmpdir(), "orcode-migration-corrupt-"));
+  const legacy = join(root, ".routercode");
+  const target = join(root, ".orcode");
+  const goodId = await seedHome(legacy, { id: "good-chat" });
+  await writeFile(join(legacy, "chats", WORKSPACE_HASH, "bad-chat.json"), "{broken");
+  await mkdir(join(legacy, "runs", goodId), { recursive: true });
+  await writeFile(join(legacy, "runs", goodId, "good-run.ndjson"), `${JSON.stringify({ type: "run-end", outcome: "complete", durationMs: 1, toolCount: 0, timestamp: 1 })}\n`);
+  await writeFile(join(legacy, "runs", goodId, "bad-run.ndjson"), "not-json\n");
+
+  const result = await migrateAppHome(target, legacy);
+  const { migrationManifestPath } = await import("../src/storage.js");
+  const manifest = JSON.parse(await readFile(migrationManifestPath(target), "utf8")) as { chatIdMap: Record<string, string>; isolated: Array<{ path: string; reason: string }> };
+  const newId = manifest.chatIdMap[goodId]!;
+
+  assert.match(result.warning ?? "", /isoliert/i);
+  assert.ok(manifest.isolated.some((item) => item.path.endsWith("bad-chat.json")));
+  assert.ok(manifest.isolated.some((item) => item.path.endsWith("bad-run.ndjson")));
+  assert.equal(await exists(join(target, "chats", WORKSPACE_HASH, `${newId}.json`)), true);
+  assert.equal(await exists(join(target, "runs", newId, "good-run.ndjson")), true);
+  assert.equal(await exists(join(target, "runs", newId, "bad-run.ndjson")), false);
+});
+
+test("unknown future schema refuses migration without overwriting either home", async () => {
+  const root = await mkdtemp(join(tmpdir(), "orcode-migration-future-"));
+  const legacy = join(root, ".routercode");
+  const target = join(root, ".orcode");
+  await seedHome(legacy);
+  await writeFile(join(legacy, "config.json"), JSON.stringify({ schemaVersion: 99, mainModel: "future/model" }));
+
+  const before = await readFile(join(legacy, "config.json"), "utf8");
+  const result = await migrateAppHome(target, legacy);
+
+  assert.equal(result.appHome, legacy);
+  assert.match(result.warning ?? "", /zukünftige|future|Version 99/i);
+  assert.equal(await exists(target), false);
+  assert.equal(await readFile(join(legacy, "config.json"), "utf8"), before);
+});
+
+test("an unknown future migration manifest is never replaced by an older writer", async () => {
+  const root = await mkdtemp(join(tmpdir(), "orcode-migration-future-manifest-"));
+  const legacy = join(root, ".routercode");
+  const target = join(root, ".orcode");
+  await seedHome(legacy);
+  const manifestPath = join(target, "migrations", "app-home-v1.json");
+  await mkdir(join(target, "migrations"), { recursive: true });
+  const future = JSON.stringify({ version: 99, phase: "future", complete: false });
+  await writeFile(manifestPath, future);
 
   const result = await migrateAppHome(target, legacy);
 
-  assert.equal(result.appHome, legacy, "must keep using the old directory");
-  assert.match(String(result.warning), /konnte nicht/);
-  assert.equal(
-    await readFile(join(legacy, "chats", "a.json"), "utf8"),
-    '{"turns":[1,2,3]}',
-    "user data must survive a failed migration",
+  assert.equal(result.appHome, target);
+  assert.match(result.warning ?? "", /Manifest.*Version 99|zukünftige/i);
+  assert.equal(await readFile(manifestPath, "utf8"), future);
+  assert.equal(await exists(legacy), true);
+});
+
+test("backup-over-limit aborts before any destination write", async () => {
+  const root = await mkdtemp(join(tmpdir(), "orcode-migration-large-"));
+  const legacy = join(root, ".routercode");
+  const target = join(root, ".orcode");
+  await seedHome(legacy);
+
+  const result = await migrateAppHome(target, legacy, { maxBackupBytes: 1 } as never);
+
+  assert.equal(result.appHome, legacy);
+  assert.match(result.warning ?? "", /archivieren|Backup.*groß/i);
+  assert.equal(await exists(target), false);
+});
+
+test("an unavailable exact-private boundary aborts before migration writes and keeps legacy readable", async () => {
+  const { PrivateStore } = await import("../src/private-store.js");
+  const root = await mkdtemp(join(tmpdir(), "orcode-migration-private-fail-"));
+  const legacy = join(root, ".routercode");
+  const target = join(root, ".orcode");
+  await seedHome(legacy);
+  const privateStore = new PrivateStore({
+    adapter: {
+      name: "unavailable-test-boundary",
+      available: async () => false,
+      protectDirectory: async () => undefined,
+      protectFile: async () => undefined,
+    },
+  });
+
+  const result = await migrateAppHome(target, legacy, { privateStore } as never);
+
+  assert.equal(result.appHome, legacy);
+  assert.match(result.warning ?? "", /privat|private|Berechtigung/i);
+  assert.equal(await exists(target), false);
+  assert.equal(await exists(join(legacy, "config.json")), true);
+});
+
+test("new-only unversioned config is validated and atomically upgraded with one private backup", async () => {
+  const root = await mkdtemp(join(tmpdir(), "orcode-migration-config-"));
+  const legacy = join(root, ".routercode");
+  const target = join(root, ".orcode");
+  await seedHome(target, { model: "new-only/model" });
+  await writeFile(
+    join(target, "config.json"),
+    JSON.stringify({ mainModel: "new-only/model", approvalMode: "unsafe", maxSteps: 0 }),
   );
-  await rm(root, { recursive: true, force: true });
+  const original = await readFile(join(target, "config.json"), "utf8");
+
+  const first = await migrateAppHome(target, legacy);
+  const second = await migrateAppHome(target, legacy);
+  const upgraded = JSON.parse(await readFile(join(target, "config.json"), "utf8")) as { schemaVersion: number; mainModel: string };
+  const backups = await readdir(join(target, "migration-backups"));
+
+  assert.equal(first.appHome, target);
+  assert.equal(second.appHome, target);
+  assert.equal(upgraded.schemaVersion, 1);
+  assert.equal(upgraded.mainModel, "new-only/model");
+  assert.equal((upgraded as { approvalMode?: string }).approvalMode, "ask");
+  assert.equal((upgraded as { maxSteps?: number }).maxSteps, 12);
+  assert.equal(backups.length, 1);
+  assert.equal(await readFile(join(target, "migration-backups", backups[0]!), "utf8"), original);
 });
