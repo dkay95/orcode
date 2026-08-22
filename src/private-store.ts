@@ -550,11 +550,21 @@ export class PrivateStore {
     await this.#protectTree(target, ancestors);
   }
 
-  async #protectTree(path: string, ancestors: readonly PathIdentity[]): Promise<void> {
-    await assertDirectoryIdentities(ancestors);
+  async #protectTree(
+    path: string,
+    ancestors: readonly PathIdentity[],
+    expectedIdentity?: PathIdentity,
+  ): Promise<void> {
+    if (!expectedIdentity) await assertDirectoryIdentities(ancestors);
     const info = await lstat(path, { bigint: true });
     if (info.isSymbolicLink()) {
       throw new Error(`PrivateStore schützt keine symbolischen Links in exakten Daten: ${path}`);
+    }
+    if (expectedIdentity) {
+      const actualKind = info.isDirectory() ? "directory" : info.isFile() ? "file" : null;
+      if (!actualKind) throw new Error(`PrivateStore schützt nur reguläre Dateien: ${path}`);
+      assertSameIdentity(expectedIdentity, pathIdentity(path, info, actualKind), path);
+      await assertDirectoryIdentities(ancestors);
     }
     if (!info.isDirectory()) {
       if (!info.isFile()) throw new Error(`PrivateStore schützt nur reguläre Dateien: ${path}`);
@@ -563,7 +573,7 @@ export class PrivateStore {
         "file",
         this.adapter,
         ancestors,
-        pathIdentity(path, info, "file"),
+        expectedIdentity ?? pathIdentity(path, info, "file"),
       );
       return;
     }
@@ -572,7 +582,7 @@ export class PrivateStore {
       "directory",
       this.adapter,
       ancestors,
-      pathIdentity(path, info, "directory"),
+      expectedIdentity ?? pathIdentity(path, info, "directory"),
     );
     const tree = [...ancestors, identity];
     await assertDirectoryIdentities(tree);
@@ -587,7 +597,11 @@ export class PrivateStore {
         throw new Error(`PrivateStore schützt keine symbolischen Links in exakten Daten: ${child}`);
       }
       if (childInfo.isDirectory()) {
-        await this.#protectTree(child, tree);
+        await this.#protectTree(
+          child,
+          tree,
+          pathIdentity(child, childInfo, "directory"),
+        );
       } else if (childInfo.isFile()) {
         await protectBoundPath(
           child,

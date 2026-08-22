@@ -531,3 +531,75 @@ DONE
 ### Commit
 
 - Requested message: `fix: revalidate private paths at final await boundaries`
+
+## Fix Round 5
+
+### Receiving-review verification and RED
+
+- Read the complete round-5 finding and updated implementation ledger, then
+  independently verified the recursive nested-directory race against base
+  `13968d25d57c322ef3bb78c8f392f6d4c2d077a5` before changing production code.
+  The finding was confirmed; there was no technical pushback, blocker, or scope
+  expansion.
+- The regression captures the real child-directory snapshot, then schedules a
+  same-name replacement during the immediately following parent
+  `assertDirectoryIdentities(tree)` await. It therefore exercises the exact
+  interval between the parent's `childInfo` snapshot and recursive
+  `protectTree`, rather than a later helper phase.
+- Exact RED command:
+  `node --import tsx --test --test-name-pattern='nested directory snapshot through the parent ancestor await' tests/private-store-identity-races.test.ts`.
+  It reached 1 test: 0 passed and 1 failed. The replacement directory was
+  changed from mode 0755 to 0700, proving that recursion had adopted the
+  replacement as a new baseline.
+
+### Implementation
+
+1. Recursive `protectTree` calls now receive the `PathIdentity` derived from
+   the parent's already-observed `childInfo` rather than taking an unrelated
+   new baseline.
+2. The recursive entry compares that expected identity with its first `lstat`
+   result before any further await. A same-name replacement is rejected before
+   ancestor validation or any permission adapter effect.
+3. The identical expected object is propagated through `protectBoundPath`, so
+   the helper snapshot and opened handle remain bound to the original parent
+   observation. Top-level call ordering is unchanged.
+
+### Focused GREEN and final gates
+
+- Exact round-5 nested-race command: 1/1 passed, 0 failed; replacement
+  directory mode 0755, file mode 0644, and sentinel content all remained
+  unchanged while the operation rejected.
+- Complete identity-race suite: 8/8 passed.
+- Combined PrivateStore suites: 22 reached, 21 passed, 0 failed, 1 Windows-only
+  skip.
+- Task 5 focus plus the identity-race suite (`app-home-migration`,
+  `private-store`, `private-store-identity-races`, `config`, `session`, `cli`):
+  110 reached, 109 passed, 0 failed, 1 Windows-only skip.
+- Related `runlog`, `conversation`, `workspace`, `rules`, `commands`, `agent`,
+  and `integration` suites: 146/146 passed.
+- `npx tsc -p tsconfig.json --noEmit`: passed.
+- `npx tsc -p tsconfig.tests.json --noEmit`: passed.
+- Full `npm test`: 692 reached, 691 passed, 0 failed, 1 Windows-only skip.
+- Central credential-fixture audit
+  (`rg -n --hidden --glob '!node_modules/**' --glob '!dist/**'
+  'sk-or-|AKIA|glpat-|npm_' tests README.md`): no matches (`rg` exit 1).
+- `git diff --check`: passed.
+
+### Round-5 self-review and concerns
+
+- Rechecked the recursive chain line by line: parent `childInfo`, first
+  recursive `lstat`, helper `lstat`, and opened handle must all retain one
+  directory identity before any chmod/DACL effect. The new test performs a
+  real name swap at the specified await and verifies real metadata and content,
+  not a mocked call count.
+- This round does not change the Windows DACL child. Its real Windows-only test
+  remains registered and skipped on this macOS host; no actual Windows run is
+  claimed.
+- The previously accepted native single-syscall race boundary remains
+  unchanged. Node exposes no public bound `unlinkat`/`renameat` primitive here;
+  removing that boundary would require the native helper already documented as
+  outside Task 5.
+
+### Commit
+
+- Requested message: `fix: preserve recursive private path identities`

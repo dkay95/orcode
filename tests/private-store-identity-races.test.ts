@@ -328,3 +328,36 @@ test("PrivateStore ensureDirectory keeps its caller snapshot through the helper 
   assert.equal(rejected, true);
   assert.equal(deferredLstatSwap, null);
 });
+
+test("PrivateStore protectTree keeps a nested directory snapshot through the parent ancestor await", async () => {
+  const root = await fs.promises.mkdtemp(join(tmpdir(), "orcode-private-nested-tree-await-"));
+  const tree = join(root, "backup");
+  const nested = join(tree, "nested");
+  const original = join(tree, "nested-before-swap");
+  const replacement = join(root, "outside-replacement");
+  const sentinel = join(replacement, "must-survive.txt");
+  await fs.promises.mkdir(nested, { recursive: true, mode: 0o755 });
+  await fs.promises.mkdir(replacement, { mode: 0o755 });
+  await fs.promises.writeFile(sentinel, "outside sentinel", { mode: 0o644 });
+  await fs.promises.chmod(nested, 0o755);
+  await fs.promises.chmod(replacement, 0o755);
+  await fs.promises.chmod(sentinel, 0o644);
+  swapAfterLstat(nested, tree, 1, async () => {
+    await fs.promises.rename(nested, original);
+    await fs.promises.rename(replacement, nested);
+  });
+  const store = new PrivateStore({ adapter: new PosixPrivateStoreAdapter(), root } as never);
+  let rejected = false;
+
+  try {
+    await store.protectTree(tree);
+  } catch {
+    rejected = true;
+  }
+
+  assert.equal((await fs.promises.stat(nested)).mode & 0o777, 0o755);
+  assert.equal((await fs.promises.stat(join(nested, "must-survive.txt"))).mode & 0o777, 0o644);
+  assert.equal(await fs.promises.readFile(join(nested, "must-survive.txt"), "utf8"), "outside sentinel");
+  assert.equal(rejected, true);
+  assert.equal(deferredLstatSwap, null);
+});
