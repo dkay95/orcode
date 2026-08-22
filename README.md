@@ -22,10 +22,6 @@ the work.
 
 Optional, not required:
 
-- **[ripgrep](https://github.com/BurntSushi/ripgrep) (`rg`) on your `PATH`.**
-  The `search_files` tool uses it when present for faster search. Without
-  it, orcode falls back to a built-in searcher with the same output
-  format — search still works, just slower on very large workspaces.
 - **A POSIX-compatible shell for `run_command` on Windows.** Shell commands
   run through `/bin/sh -c` by default on every platform. macOS and Linux
   ship `/bin/sh`; a native Windows install does not. Until this is fixed

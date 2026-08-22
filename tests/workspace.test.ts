@@ -632,14 +632,79 @@ async function searchFixture(prefix: string): Promise<Sandbox> {
   await mkdir(join(box.root, "src"), { recursive: true });
   await mkdir(join(box.root, "node_modules", "pkg"), { recursive: true });
   await mkdir(join(box.root, ".git"), { recursive: true });
+  await mkdir(join(box.root, ".ssh"), { recursive: true });
   await writeFile(join(box.root, "src", "a.ts"), "const Foo = 1;\nconst bar = 2;\n", "utf8");
   await writeFile(join(box.root, "src", "b.txt"), "erste\nfoo bar\ndritte\n", "utf8");
   await writeFile(join(box.root, "node_modules", "pkg", "index.js"), "foo\n", "utf8");
   await writeFile(join(box.root, ".git", "COMMIT_EDITMSG"), "foo\n", "utf8");
-  await writeFile(join(box.root, ".env"), "TOKEN=foo\n", "utf8");
+  await writeFile(join(box.root, ".env"), "SYNTHETIC_VALUE=foo\n", "utf8");
+  await writeFile(join(box.root, ".env.local"), "SYNTHETIC_LOCAL=foo\n", "utf8");
+  await writeFile(join(box.root, ".ssh", "known_hosts"), "synthetic-host foo\n", "utf8");
+  await writeFile(join(box.root, "ignored.txt"), "foo\n", "utf8");
+  await writeFile(join(box.root, ".gitignore"), "ignored.txt\n", "utf8");
   await writeFile(join(box.root, "bin.dat"), Buffer.from([0x66, 0x6f, 0x6f, 0x00, 0x01]));
   return box;
 }
+
+test("search_files uses one canonical safe path", async () => {
+  const box = await searchFixture("search-canonical");
+  const fakeBin = join(box.root, "fake-bin");
+  const marker = join(box.root, "fake-rg-invoked");
+  await mkdir(fakeBin);
+  await writeFile(
+    join(fakeBin, "rg"),
+    `#!/bin/sh\n: > "${marker}"\nexit 2\n`,
+    { encoding: "utf8", mode: 0o755 },
+  );
+  const originalPath = process.env.PATH;
+  try {
+    process.env.PATH = fakeBin;
+    let fakeResult: Record<string, unknown>;
+    try {
+      fakeResult = await invoke(box.tools, "search_files", { query: "foo" });
+    } catch (error) {
+      fakeResult = { error: error instanceof Error ? error.message : String(error) };
+    }
+
+    const noRgBin = join(box.root, "no-rg-bin");
+    await mkdir(noRgBin);
+    process.env.PATH = noRgBin;
+    const noRgResult = await invoke(box.tools, "search_files", { query: "foo" });
+
+    assert.equal(existsSync(marker), false, "Ein installiertes/fake rg darf nie gestartet werden");
+    assert.equal(JSON.stringify(fakeResult), JSON.stringify(noRgResult));
+  } finally {
+    if (originalPath === undefined) {
+      delete process.env.PATH;
+    } else {
+      process.env.PATH = originalPath;
+    }
+  }
+});
+
+test("search_files never searches reserved trees when scoped inside them", async () => {
+  const box = await searchFixture("search-reserved");
+  await mkdir(join(box.root, ".GIT"), { recursive: true });
+  await mkdir(join(box.root, "NODE_MODULES", "pkg"), { recursive: true });
+  await mkdir(join(box.root, "src", ".git"), { recursive: true });
+  await mkdir(join(box.root, "src", "Node_Modules", "pkg"), { recursive: true });
+  await writeFile(join(box.root, ".GIT", "HEAD"), "foo\n", "utf8");
+  await writeFile(join(box.root, "NODE_MODULES", "pkg", "index.js"), "foo\n", "utf8");
+  await writeFile(join(box.root, "src", ".git", "config"), "foo\n", "utf8");
+  await writeFile(join(box.root, "src", "Node_Modules", "pkg", "index.js"), "foo\n", "utf8");
+
+  for (const path of [".git", "node_modules", ".GIT", "src/Node_Modules"]) {
+    const scoped = await invoke(box.tools, "search_files", { query: "foo", path });
+    assert.equal(scoped.matchCount, 0, `Reservierter Suchpfad wurde durchsucht: ${path}`);
+    assert.equal(scoped.matches, "");
+  }
+  const wholeWorkspace = await invoke(box.tools, "search_files", { query: "foo" });
+  assert.equal(wholeWorkspace.matchCount, 2);
+  assert.equal(String(wholeWorkspace.matches).includes(".GIT"), false);
+  assert.equal(String(wholeWorkspace.matches).includes("NODE_MODULES"), false);
+  assert.equal(String(wholeWorkspace.matches).includes("src/.git"), false);
+  assert.equal(String(wholeWorkspace.matches).includes("src/Node_Modules"), false);
+});
 
 test("search_files works without ripgrep", async () => {
   const { tools } = await searchFixture("search");

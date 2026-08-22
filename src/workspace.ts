@@ -559,8 +559,7 @@ export function createCodingTools(
 
   const searchFilesTool = tool({
     name: "search_files",
-    description:
-      "Search text inside the workspace. Uses ripgrep when available and a built-in searcher otherwise.",
+    description: "Search text inside the workspace with the built-in safe workspace searcher.",
     inputSchema: z.object({
       query: z.string().min(1),
       path: z.string().default("."),
@@ -590,7 +589,7 @@ export function createCodingTools(
         contextLines,
         limit,
       };
-      const result = (await ripgrepSearch(request, signal)) ?? (await searchWorkspaceText(request));
+      const result = await searchWorkspaceText(request);
       const matches = truncate(result.matches, MAX_TOOL_OUTPUT);
       return {
         matches,
@@ -2261,63 +2260,9 @@ export interface WorkspaceSearchResult {
   truncated: boolean;
 }
 
-let ripgrepMissing = false;
-
-/** Returns null when ripgrep is unavailable, so the caller can fall back. */
-async function ripgrepSearch(
-  options: WorkspaceSearchOptions,
-  signal?: AbortSignal,
-): Promise<WorkspaceSearchResult | null> {
-  if (ripgrepMissing) {
-    return null;
-  }
-  const limit = options.limit ?? 300;
-  const args = ["-n", "--hidden", "--glob", "!.git/**", "--glob", "!node_modules/**"];
-  if (!options.regex) {
-    args.push("--fixed-strings");
-  }
-  if (!options.caseSensitive) {
-    args.push("--ignore-case");
-  }
-  if (options.contextLines) {
-    args.push("--context", String(options.contextLines));
-  }
-  if (options.glob) {
-    args.push("--glob", options.glob);
-  }
-  args.push("--max-count", String(limit), "--", options.query, options.directory);
-  let result: ProcessResult;
-  try {
-    result = await runProcess("rg", args, {
-      cwd: options.root,
-      timeoutMs: 30_000,
-      ...(signal ? { signal } : {}),
-    });
-  } catch (error) {
-    if (hasCode(error, "ENOENT") || hasCode(error, "EACCES") || hasCode(error, "EPERM")) {
-      ripgrepMissing = true;
-      return null;
-    }
-    throw error;
-  }
-  if (result.code !== 0 && result.code !== 1) {
-    throw new Error(result.stderr || `rg endete mit Code ${result.code}`);
-  }
-  const lines = result.stdout.split("\n").filter((line) => line.length > 0);
-  const relativeLines = lines.map((line) =>
-    line.startsWith(options.root) ? line.slice(options.root.length + 1) : line,
-  );
-  return {
-    matches: relativeLines.join("\n"),
-    matchCount: relativeLines.filter((line) => /:\d+:/.test(line)).length,
-    filesWithMatches: new Set(relativeLines.map((line) => line.split(":")[0])).size,
-    truncated: result.truncated,
-  };
-}
-
 /**
- * Built-in searcher. This is the normal path: ripgrep is optional and often
- * missing, and a search tool that dies with `spawn rg ENOENT` is no tool.
+ * Built-in searcher. Keeping one implementation here makes policy, matching,
+ * output, and limits identical on every machine.
  */
 export async function searchWorkspaceText(
   options: WorkspaceSearchOptions,
@@ -2342,6 +2287,7 @@ export async function searchWorkspaceText(
   const ignoreMatcher = await loadIgnore(options.root);
   const files = candidates
     .filter((file) => isWithinWorkspace(options.root, resolve(file)))
+    .filter((file) => !hasReservedSearchSegment(options.root, file))
     // Secrets are not searched: the hit line would be the leak.
     .filter((file) => classifyPath(relative(options.root, file), "read").verdict === "allow")
     .filter((file) => !ignoreMatcher.matches(relative(options.root, file), false))
@@ -2405,6 +2351,15 @@ export async function searchWorkspaceText(
     filesWithMatches,
     truncated,
   };
+}
+
+/** Search never descends into reserved trees, even when the search is scoped there. */
+function hasReservedSearchSegment(root: string, file: string): boolean {
+  const segments = relative(root, resolve(file)).split(/[\\/]+/);
+  return segments.some((segment) => {
+    const lowered = segment.toLowerCase();
+    return lowered === ".git" || lowered === "node_modules";
+  });
 }
 
 function buildMatcher(
