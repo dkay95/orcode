@@ -342,7 +342,7 @@ test("a reasoning error without any answer text fails the run", async () => {
   assert.equal(setup.session.data.turns.length, 0);
 });
 
-test("a cancelled run keeps the history and stores the fragment as a marked turn", async () => {
+test("a cancelled run keeps the prior history but does not commit the fragment", async () => {
   const setup = await createAgent({ compressionMode: "always" });
   setup.session.addTurn("user", "Alte Frage");
   setup.session.addTurn("assistant", "Alte Antwort");
@@ -386,11 +386,8 @@ test("a cancelled run keeps the history and stores the fragment as a marked turn
   assert.equal(error.result.partial, true);
   assert.equal(error.result.text, "Ich fange an");
   assert.equal(setup.session.data.summary, "", "Kompression darf nicht angewandt werden");
-  assert.equal(setup.session.data.turns.length, 8, "kein Turn darf verloren gehen");
-  assert.match(
-    setup.session.data.turns.at(-1)?.content ?? "",
-    /Ich fange an[\s\S]*abgebrochen/,
-  );
+  assert.equal(setup.session.data.turns.length, 6, "kein alter Turn darf verloren gehen");
+  assert.doesNotMatch(setup.session.transcript(), /Ich fange an|Neue Aufgabe/);
   assert.equal(setup.session.data.costs.compressorUsd, 0.001);
   assert.equal(setup.session.data.costs.mainUsd, 0.003);
   assert.equal(error.result.costUsd, 0.004);
@@ -448,7 +445,7 @@ test("a failing compressor falls back to the raw context and the run continues",
   assert.match(result.notices.join("\n"), /Kompressor fehlgeschlagen/);
   assert.match(
     inputText(mainRequest(client)),
-    /CURRENT USER REQUEST:\nMach weiter/,
+    /AUTHORITATIVE CURRENT USER REQUEST:\nMach weiter/,
     "der Rohkontext muss übergeben werden",
   );
   assert.equal(result.outcome, "completed");
@@ -951,7 +948,473 @@ test("K7.6: a cancelled run leaves the conversation state file with an unchanged
   );
 });
 
+test("volatile run data is sent once per call and never loaded from committed SDK state", async () => {
+  const setup = await createAgent({ compressionMode: "off" });
+  await writeFile(
+    join(setup.workspace, "ORCODE.md"),
+    "VOLATILE_PROJECT_NOTE_SENTINEL",
+    "utf8",
+  );
+  const loadedStates: unknown[] = [];
+  const client = fakeClient((request) => ({
+    text: ["Fertig."],
+    before: async (emit) => {
+      const loaded = await request.state?.load();
+      loadedStates.push(loaded);
+      const previousMessages =
+        loaded && typeof loaded === "object" && "messages" in loaded &&
+        Array.isArray((loaded as { messages?: unknown }).messages)
+          ? (loaded as { messages: unknown[] }).messages
+          : [];
+      const inputItems = Array.isArray(request.input) ? request.input : [];
+      await request.state?.save({
+        ...sampleConversationState("sdk-like-save"),
+        messages: [...previousMessages, ...inputItems],
+      } as never);
+      await emit.modelCall(0, 0.001);
+    },
+  }));
+  const agent = await setup.agent(client.client);
+
+  await agent.run("FIRST_VOLATILE_REQUEST", { onText: () => {} });
+  await agent.run("SECOND_VOLATILE_REQUEST", { onText: () => {} });
+
+  const secondRequest = client.requests[1]!;
+  const secondLoaded = JSON.stringify(loadedStates[1]);
+  assert.equal(occurrences(secondLoaded, "FIRST_VOLATILE_REQUEST"), 1);
+  assert.equal(occurrences(secondLoaded, "RUN LIMITS:"), 0);
+  assert.equal(occurrences(secondLoaded, "VOLATILE_PROJECT_NOTE_SENTINEL"), 0);
+  assert.equal(occurrences(inputText(secondRequest), "RUN LIMITS:"), 1);
+  assert.equal(
+    occurrences(inputText(secondRequest), "VOLATILE_PROJECT_NOTE_SENTINEL"),
+    1,
+  );
+});
+
+test("an open conversation store rechecks the exact summary epoch before reusing SDK history", async () => {
+  const setup = await createAgent({ compressionMode: "off" });
+  const loadedStates: unknown[] = [];
+  const client = fakeClient((request) => ({
+    text: ["Fertig."],
+    before: async (emit) => {
+      loadedStates.push(await request.state?.load());
+      await request.state?.save(sampleConversationState("first-covered-state") as never);
+      await emit.modelCall(0, 0.001);
+    },
+  }));
+  const agent = await setup.agent(client.client);
+
+  await agent.run("Erster Prompt", { onText: () => {} });
+  setup.session.setSummary("Extern geänderter Summary-Epoch");
+  await setup.session.save();
+  await agent.run("Zweiter Prompt", { onText: () => {} });
+
+  assert.doesNotMatch(JSON.stringify(loadedStates[1]), /first-covered-state/);
+  assert.match(JSON.stringify(loadedStates[1]), /Extern geänderter Summary-Epoch/);
+});
+
+test("Task 7 captured-request matrix: every main call uses one history source and commits only on success", async (t) => {
+  const prompt = "CURRENT_REQUEST_SENTINEL";
+
+  await t.test("first run without SDK state seeds transcript history and sends the current request once", async () => {
+    const setup = await createAgent({ compressionMode: "off" });
+    await addHistory(setup.session, "FIRST_TRANSCRIPT_SENTINEL");
+    let loadedState: unknown = undefined;
+    const client = fakeClient((request) => ({
+      text: ["Fertig."],
+      before: async (emit) => {
+        loadedState = await request.state?.load();
+        await request.state?.save(sampleConversationState("first-result"));
+        await emit.modelCall(0, 0.001);
+      },
+    }));
+    const agent = await setup.agent(client.client);
+
+    await agent.run(prompt, { onText: () => {} });
+
+    const request = mainRequest(client);
+    assert.equal(occurrences(mainPayload(request, loadedState), prompt), 1);
+    assert.equal(occurrences(inputText(request), "FIRST_TRANSCRIPT_SENTINEL"), 0);
+    assert.equal(occurrences(JSON.stringify(loadedState), "FIRST_TRANSCRIPT_SENTINEL"), 1);
+  });
+
+  await t.test("a valid SDK state excludes transcript history and carries only the new request plus volatile input", async () => {
+    const setup = await createAgent({ compressionMode: "off" });
+    await addHistory(setup.session, "STALE_TRANSCRIPT_SENTINEL");
+    await persistConversationState(setup, "VALID_SDK_HISTORY_SENTINEL");
+    let loadedState: unknown = undefined;
+    const client = fakeClient((request) => ({
+      text: ["Fertig."],
+      before: async (emit) => {
+        loadedState = await request.state?.load();
+        await request.state?.save(sampleConversationState("valid-result"));
+        await emit.modelCall(0, 0.001);
+      },
+    }));
+    const agent = await setup.agent(client.client);
+
+    await agent.run(prompt, { onText: () => {} });
+
+    const request = mainRequest(client);
+    const payload = mainPayload(request, loadedState);
+    assert.equal(occurrences(payload, prompt), 1);
+    assert.equal(occurrences(payload, "VALID_SDK_HISTORY_SENTINEL"), 1);
+    assert.equal(occurrences(payload, "STALE_TRANSCRIPT_SENTINEL"), 0);
+    assert.doesNotMatch(inputText(request), /WORK CONTEXT/);
+  });
+
+  await t.test("forced compression seeds the fresh handoff into the state used by that same main call", async () => {
+    const setup = await createAgent({ compressionMode: "always" });
+    await addHistory(setup.session, "OLD_TRANSCRIPT_SENTINEL");
+    await persistConversationState(setup, "OLD_SDK_STATE_SENTINEL");
+    const imagePath = join(setup.workspace, "ATTACHMENT_SENTINEL.png");
+    const imageBytes = Buffer.from([
+      0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a,
+      0x00, 0x00, 0x00, 0x00,
+    ]);
+    await writeFile(imagePath, imageBytes);
+    const attachment = {
+      path: imagePath,
+      name: "ATTACHMENT_SENTINEL.png",
+      mimeType: "image/png" as const,
+      sizeBytes: imageBytes.length,
+    };
+    let stateAtCall: Promise<unknown> | undefined;
+    let compressorInput = "";
+    const client = fakeClient((request) => {
+      if (request.model === DEFAULT_CONFIG.compressorModel) {
+        compressorInput = inputText(request);
+        return { compressed: "FRESH_COMPRESSED_HANDOFF_SENTINEL", response: { usage: { cost: 0.002 } } };
+      }
+      stateAtCall = request.state?.load();
+      return {
+            text: ["Fertig."],
+            before: async (emit) => {
+              await request.state?.save(sampleConversationState("compressed-result"));
+              await emit.modelCall(0, 0.003);
+            },
+          };
+    });
+    const agent = await setup.agent(client.client);
+
+    const result = await agent.run(prompt, { onText: () => {} }, [attachment]);
+    const loadedState = await stateAtCall;
+
+    assert.equal(result.compression.used, true);
+    const request = mainRequest(client);
+    const payload = mainPayload(request, loadedState);
+    assert.equal(occurrences(payload, prompt), 1);
+    assert.equal(occurrences(payload, "FRESH_COMPRESSED_HANDOFF_SENTINEL"), 1);
+    assert.equal(occurrences(JSON.stringify(loadedState), "FRESH_COMPRESSED_HANDOFF_SENTINEL"), 1);
+    assert.equal(occurrences(inputText(request), "FRESH_COMPRESSED_HANDOFF_SENTINEL"), 0);
+    assert.equal(occurrences(payload, "OLD_TRANSCRIPT_SENTINEL"), 0);
+    assert.equal(occurrences(payload, "OLD_SDK_STATE_SENTINEL"), 0);
+    assert.equal(occurrences(compressorInput, prompt), 0);
+    assert.equal(occurrences(compressorInput, "ATTACHMENT_SENTINEL"), 0);
+  });
+
+  await t.test("below-threshold compression still seeds raw history once without owning the current request", async () => {
+    const setup = await createAgent({
+      compressionMode: "auto",
+      compressionThresholdChars: 100_000,
+    });
+    await addHistory(setup.session, "BELOW_THRESHOLD_HISTORY_SENTINEL");
+    let loadedState: unknown = undefined;
+    const client = fakeClient((request) => ({
+      text: ["Fertig."],
+      before: async (emit) => {
+        loadedState = await request.state?.load();
+        await request.state?.save(sampleConversationState("below-result"));
+        await emit.modelCall(0, 0.001);
+      },
+    }));
+    const agent = await setup.agent(client.client);
+
+    const result = await agent.run(prompt, { onText: () => {} });
+
+    assert.equal(result.compression.skipReason, "below-threshold");
+    const request = mainRequest(client);
+    assert.equal(occurrences(mainPayload(request, loadedState), prompt), 1);
+    assert.equal(occurrences(inputText(request), "BELOW_THRESHOLD_HISTORY_SENTINEL"), 0);
+    assert.equal(occurrences(JSON.stringify(loadedState), "BELOW_THRESHOLD_HISTORY_SENTINEL"), 1);
+  });
+
+  await t.test("compressor failure falls back to one fresh raw-history source", async () => {
+    const setup = await createAgent({ compressionMode: "always" });
+    await addHistory(setup.session, "COMPRESSOR_FAILURE_HISTORY_SENTINEL");
+    let loadedState: unknown = undefined;
+    const client = fakeClient((request) => {
+      if (request.model === DEFAULT_CONFIG.compressorModel) {
+        throw new Error("compressor unavailable");
+      }
+      return {
+        text: ["Fertig."],
+        before: async (emit) => {
+          loadedState = await request.state?.load();
+          await request.state?.save(sampleConversationState("fallback-result"));
+          await emit.modelCall(0, 0.001);
+        },
+      };
+    });
+    const agent = await setup.agent(client.client);
+
+    const result = await agent.run(prompt, { onText: () => {} });
+
+    assert.equal(result.compression.skipReason, "failed");
+    const request = mainRequest(client);
+    assert.equal(occurrences(mainPayload(request, loadedState), prompt), 1);
+    assert.equal(occurrences(inputText(request), "COMPRESSOR_FAILURE_HISTORY_SENTINEL"), 0);
+    assert.equal(occurrences(JSON.stringify(loadedState), "COMPRESSOR_FAILURE_HISTORY_SENTINEL"), 1);
+  });
+
+  await t.test("main failure discards buffered SDK state and preserves session data except incurred cost", async () => {
+    const setup = await createAgent({ compressionMode: "off" });
+    await addHistory(setup.session, "MAIN_FAILURE_TRANSCRIPT_SENTINEL");
+    await persistConversationState(setup, "MAIN_FAILURE_COMMITTED_STATE");
+    setup.session.setSummary("MAIN_FAILURE_SUMMARY");
+    await setup.session.save();
+    const beforeTurns = structuredClone(setup.session.data.turns);
+    const beforeToolCalls = structuredClone(setup.session.data.toolCalls);
+    const statePath = ConversationStore.path(setup.appHome, setup.session.path);
+    const beforeState = await readFile(statePath, "utf8");
+    let loadedState: unknown = undefined;
+    const client = fakeClient((request) => ({
+      textError: () => new Error("main failed"),
+      before: async (emit) => {
+        loadedState = await request.state?.load();
+        await request.state?.save(sampleConversationState("must-not-commit"));
+        await emit.modelCall(0, 0.004);
+        await emit.tool("read_file", { path: "a.ts" });
+      },
+    }));
+    const agent = await setup.agent(client.client);
+
+    await assert.rejects(agent.run(prompt, { onText: () => {} }), /main failed/);
+
+    assert.equal(occurrences(mainPayload(mainRequest(client), loadedState), prompt), 1);
+    assert.deepEqual(setup.session.data.turns, beforeTurns);
+    assert.deepEqual(setup.session.data.toolCalls, beforeToolCalls);
+    assert.equal(setup.session.data.summary, "MAIN_FAILURE_SUMMARY");
+    assert.equal(setup.session.data.costs.mainUsd, 0.004);
+    assert.equal(await readFile(statePath, "utf8"), beforeState);
+  });
+
+  await t.test("a synchronous main-call failure leaves the session artifact byte-identical when no cost was incurred", async () => {
+    const setup = await createAgent({ compressionMode: "off" });
+    await addHistory(setup.session, "SYNC_MAIN_FAILURE_HISTORY");
+    const beforeSession = await readFile(setup.session.path, "utf8");
+    const beforeData = structuredClone(setup.session.data);
+    const client = fakeClient(() => {
+      throw new Error("synchronous main call failure");
+    });
+    const agent = await setup.agent(client.client);
+
+    await assert.rejects(
+      agent.run(prompt, { onText: () => {} }),
+      /synchronous main call failure/,
+    );
+
+    assert.deepEqual(setup.session.data, beforeData);
+    assert.equal(await readFile(setup.session.path, "utf8"), beforeSession);
+  });
+
+  await t.test("a synchronous post-usage main failure persists the incurred cost exactly once", async () => {
+    const setup = await createAgent({ compressionMode: "off" });
+    await addHistory(setup.session, "SYNC_POST_USAGE_FAILURE_HISTORY");
+    const beforeTurns = structuredClone(setup.session.data.turns);
+    const client = {
+      callModel(request: FakeRequest) {
+        for (const entry of request.hooks?.PostModelCall ?? []) {
+          entry.handler({
+            model: "vendor/echt",
+            durationMs: 5,
+            turnNumber: 0,
+            usage: {
+              inputTokens: 10,
+              outputTokens: 5,
+              totalTokens: 15,
+              cachedTokens: 0,
+              reasoningTokens: 0,
+              cost: 0.006,
+            },
+          } as never);
+        }
+        throw new Error("synchronous post-usage failure");
+      },
+    };
+    const agent = await setup.agent(client);
+
+    await assert.rejects(
+      agent.run(prompt, { onText: () => {} }),
+      /synchronous post-usage failure/,
+    );
+
+    assert.deepEqual(setup.session.data.turns, beforeTurns);
+    assert.equal(setup.session.data.costs.mainUsd, 0.006);
+    const persisted = JSON.parse(await readFile(setup.session.path, "utf8")) as {
+      costs: { mainUsd: number; totalUsd: number };
+    };
+    assert.equal(persisted.costs.mainUsd, 0.006);
+    assert.equal(persisted.costs.totalUsd, 0.006);
+  });
+
+  await t.test("session commit failure restores staged turns and discards buffered conversation coverage", async () => {
+    const setup = await createAgent({ compressionMode: "off" });
+    await addHistory(setup.session, "SESSION_COMMIT_HISTORY");
+    await persistConversationState(setup, "SESSION_COMMIT_OLD_STATE");
+    const beforeTurns = structuredClone(setup.session.data.turns);
+    const statePath = ConversationStore.path(setup.appHome, setup.session.path);
+    const beforeState = await readFile(statePath, "utf8");
+    const client = fakeClient((request) => ({
+      text: ["Antwort, die nicht committed werden darf."],
+      before: async (emit) => {
+        await request.state?.save(sampleConversationState("session-save-failed"));
+        await emit.modelCall(0, 0.004);
+      },
+    }));
+    const agent = await setup.agent(client.client);
+    const originalSave = SessionStore.prototype.save;
+    let failNextSave = true;
+    SessionStore.prototype.save = async function() {
+      if (this === setup.session && failNextSave) {
+        failNextSave = false;
+        throw new Error("synthetic session commit failure");
+      }
+      return originalSave.call(this);
+    };
+    try {
+      await assert.rejects(
+        agent.run(prompt, { onText: () => {} }),
+        /synthetic session commit failure/,
+      );
+    } finally {
+      SessionStore.prototype.save = originalSave;
+    }
+
+    assert.deepEqual(setup.session.data.turns, beforeTurns);
+    assert.equal(setup.session.data.costs.mainUsd, 0.004);
+    assert.equal(await readFile(statePath, "utf8"), beforeState);
+  });
+
+  await t.test("a cost-free session commit failure leaves both persisted artifacts byte-identical", async () => {
+    const setup = await createAgent({ compressionMode: "off" });
+    await addHistory(setup.session, "COST_FREE_COMMIT_FAILURE_HISTORY");
+    await persistConversationState(setup, "COST_FREE_COMMIT_OLD_STATE");
+    const statePath = ConversationStore.path(setup.appHome, setup.session.path);
+    const beforeSession = await readFile(setup.session.path, "utf8");
+    const beforeState = await readFile(statePath, "utf8");
+    const beforeData = structuredClone(setup.session.data);
+    const client = fakeClient((request) => ({
+      text: ["Nicht persistierte Antwort"],
+      before: async () => {
+        await request.state?.save(sampleConversationState("must-not-cover") as never);
+      },
+    }));
+    const agent = await setup.agent(client.client);
+    const originalSave = SessionStore.prototype.save;
+    let failNextSave = true;
+    SessionStore.prototype.save = async function() {
+      if (this === setup.session && failNextSave) {
+        failNextSave = false;
+        throw new Error("cost-free session commit failure");
+      }
+      return originalSave.call(this);
+    };
+    try {
+      await assert.rejects(
+        agent.run(prompt, { onText: () => {} }),
+        /cost-free session commit failure/,
+      );
+    } finally {
+      SessionStore.prototype.save = originalSave;
+    }
+
+    assert.deepEqual(setup.session.data, beforeData);
+    assert.equal(await readFile(setup.session.path, "utf8"), beforeSession);
+    assert.equal(await readFile(statePath, "utf8"), beforeState);
+  });
+
+  await t.test("cancellation discards fresh compression state and preserves turns and summary while charging providers", async () => {
+    const setup = await createAgent({ compressionMode: "always" });
+    await addHistory(setup.session, "CANCEL_TRANSCRIPT_SENTINEL");
+    await persistConversationState(setup, "CANCEL_COMMITTED_STATE");
+    setup.session.setSummary("CANCEL_SUMMARY");
+    await setup.session.save();
+    const beforeTurns = structuredClone(setup.session.data.turns);
+    const beforeToolCalls = structuredClone(setup.session.data.toolCalls);
+    const statePath = ConversationStore.path(setup.appHome, setup.session.path);
+    const beforeState = await readFile(statePath, "utf8");
+    const controller = new AbortController();
+    let loadedState: unknown = undefined;
+    const client = fakeClient((request) =>
+      request.model === DEFAULT_CONFIG.compressorModel
+        ? { compressed: "CANCEL_FRESH_HANDOFF", response: { usage: { cost: 0.002 } } }
+        : {
+            text: ["Teilantwort"],
+            textError: () => {
+              controller.abort(new Error("cancelled"));
+              return new Error("cancelled");
+            },
+            before: async (emit) => {
+              loadedState = await request.state?.load();
+              await request.state?.save(sampleConversationState("cancelled-buffer"));
+              await emit.modelCall(0, 0.003);
+              await emit.tool("read_file", { path: "b.ts" });
+            },
+          },
+    );
+    const agent = await setup.agent(client.client);
+
+    await assert.rejects(
+      agent.run(prompt, { onText: () => {}, signal: controller.signal }),
+      /cancelled/,
+    );
+
+    assert.equal(occurrences(mainPayload(mainRequest(client), loadedState), prompt), 1);
+    assert.equal(occurrences(JSON.stringify(loadedState), "CANCEL_FRESH_HANDOFF"), 1);
+    assert.deepEqual(setup.session.data.turns, beforeTurns);
+    assert.deepEqual(setup.session.data.toolCalls, beforeToolCalls);
+    assert.equal(setup.session.data.summary, "CANCEL_SUMMARY");
+    assert.equal(setup.session.data.costs.compressorUsd, 0.002);
+    assert.equal(setup.session.data.costs.mainUsd, 0.003);
+    assert.equal(await readFile(statePath, "utf8"), beforeState);
+  });
+});
+
 // --- helpers -------------------------------------------------------------
+
+async function addHistory(session: SessionStore, sentinel: string): Promise<void> {
+  session.addTurn("user", sentinel);
+  session.addTurn("assistant", "Historische Antwort ohne Wiederholung des Markers");
+  await session.save();
+}
+
+async function persistConversationState(
+  setup: Pick<AgentSetup, "appHome" | "session">,
+  sentinel: string,
+): Promise<void> {
+  const store = await ConversationStore.open(
+    setup.appHome,
+    setup.session.path,
+    setup.session.data.id,
+  );
+  await store.accessor().save(sampleConversationState(sentinel) as never);
+  await store.commit(setup.session.data.turns.length);
+}
+
+function occurrences(value: string, needle: string): number {
+  let count = 0;
+  let offset = 0;
+  while ((offset = value.indexOf(needle, offset)) >= 0) {
+    count += 1;
+    offset += needle.length;
+  }
+  return count;
+}
+
+function mainPayload(request: FakeRequest, loadedState: unknown): string {
+  return `${inputText(request)}\n${JSON.stringify(loadedState)}`;
+}
 
 function sampleConversationState(tag: string): {
   id: string;
@@ -961,7 +1424,7 @@ function sampleConversationState(tag: string): {
   updatedAt: number;
 } {
   return {
-    id: `conv-${tag}`,
+    id: "conv-synthetic-state",
     messages: [{ role: "user", content: tag }],
     status: "complete",
     createdAt: Date.now(),

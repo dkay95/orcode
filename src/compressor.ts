@@ -2,7 +2,7 @@ import type { OpenRouter } from "@openrouter/agent";
 import type { OrcodeConfig } from "./types.js";
 import { SessionStore } from "./session.js";
 import { SDK_RETRY_CODES } from "./reconnect.js";
-import { formatUsd } from "./utils.js";
+import { errorMessage, formatUsd } from "./utils.js";
 
 /** Output cap of a single compressor call; also the basis of the cost estimate. */
 export const COMPRESSOR_MAX_OUTPUT_TOKENS = 2_000;
@@ -52,7 +52,6 @@ export interface CompressContextOptions {
   client: OpenRouter;
   config: OrcodeConfig;
   session: SessionStore;
-  currentPrompt: string;
   signal?: AbortSignal;
   /** Optional price source; without it the cost limit can only be checked afterwards. */
   lookupPrice?: CompressorPriceLookup;
@@ -76,8 +75,8 @@ export interface CompressContextOptions {
 export async function compressContext(
   options: CompressContextOptions,
 ): Promise<CompressionResult> {
-  const { client, config, session, currentPrompt, signal, lookupPrice, force } = options;
-  const rawContext = uncompressedContext(session, currentPrompt);
+  const { client, config, session, signal, lookupPrice, force } = options;
+  const rawContext = uncompressedContext(session);
   const warnings: string[] = [];
 
   const shouldCompress =
@@ -119,8 +118,10 @@ export async function compressContext(
   }
 
   let observedCost = 0;
-  const result = client.callModel(
-    {
+  let handoff: string;
+  let response: Awaited<ReturnType<ReturnType<typeof client.callModel>["getResponse"]>>;
+  try {
+    const result = client.callModel({
       model: config.compressorModel,
       instructions: [
         "You are orcode's context compressor.",
@@ -141,14 +142,25 @@ export async function compressContext(
           },
         ],
       },
-    },
-    {
+    }, {
       ...(signal ? { signal } : {}),
       retryCodes: [...SDK_RETRY_CODES],
-    },
-  );
-  const handoff = (await result.getText()).trim();
-  const response = await result.getResponse();
+    });
+    handoff = (await result.getText()).trim();
+    response = await result.getResponse();
+  } catch (error) {
+    warnings.push(
+      `Kompressor fehlgeschlagen; unkomprimierter Kontext wird verwendet: ${errorMessage(error)}`,
+    );
+    return unusedResult({
+      rawContext,
+      reason: "failed",
+      costUsd: observedCost,
+      estimatedCostUsd,
+      limitEnforcedUpfront: estimatedCostUsd !== null,
+      warnings,
+    });
+  }
   const costUsd = observedCost || response.usage?.cost || 0;
   if (costUsd > config.compressorMaxCostUsd) {
     warnings.push(
@@ -199,7 +211,6 @@ export async function compressContext(
 
 export function uncompressedContext(
   session: SessionStore,
-  currentPrompt: string,
 ): string {
   const sections: string[] = [];
   if (session.data.summary) {
@@ -209,7 +220,6 @@ export function uncompressedContext(
   if (transcript) {
     sections.push(`CONVERSATION TRANSCRIPT:\n${transcript}`);
   }
-  sections.push(`CURRENT USER REQUEST:\n${currentPrompt}`);
   return sections.join("\n\n");
 }
 

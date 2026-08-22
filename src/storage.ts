@@ -27,6 +27,7 @@ export interface StoredConversationStateFile {
   revision: number;
   chatId: string;
   turnCount: number;
+  historyDigest: string;
   updatedAt: string;
   state: string;
 }
@@ -46,6 +47,8 @@ export function parseConversationStateFile(
   const value = parseRecord(raw);
   if (value.version !== 1 || typeof value.revision !== "number"
     || typeof value.chatId !== "string" || typeof value.turnCount !== "number"
+    || typeof value.historyDigest !== "string"
+    || !/^[a-f0-9]{64}$/.test(value.historyDigest)
     || typeof value.updatedAt !== "string" || typeof value.state !== "string"
     || (expectedChatId !== undefined && value.chatId !== expectedChatId)) {
     throw new Error("ungültiger ConversationStore-Zustand");

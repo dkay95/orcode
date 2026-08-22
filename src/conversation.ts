@@ -1,5 +1,6 @@
 import { open as openFile, readFile, unlink } from "node:fs/promises";
 import {
+  createInitialState,
   deserializeConversationState,
   serializeConversationState,
   type ConversationState,
@@ -12,7 +13,7 @@ import {
   parseConversationStateFile,
   type StoredConversationStateFile,
 } from "./storage.js";
-import { chatLockPath } from "./session.js";
+import { chatLockPath, conversationHistoryDigest } from "./session.js";
 import { hasCode, isRecord } from "./utils.js";
 
 /**
@@ -44,7 +45,10 @@ export class ConversationStore {
   #baseRevision: number;
   #committedState: ConversationState | null;
   #usable: boolean;
+  #coveredTurnCount: number;
+  #historyDigest: string | null;
   #buffer: ConversationState | null = null;
+  #stagedState: ConversationState | undefined;
   readonly #privateStore: PrivateStore;
 
   private constructor(options: {
@@ -55,6 +59,8 @@ export class ConversationStore {
     baseRevision: number;
     committedState: ConversationState | null;
     usable: boolean;
+    coveredTurnCount: number;
+    historyDigest: string | null;
     privateStore: PrivateStore;
   }) {
     this.#chatId = options.chatId;
@@ -64,6 +70,8 @@ export class ConversationStore {
     this.#baseRevision = options.baseRevision;
     this.#committedState = options.committedState;
     this.#usable = options.usable;
+    this.#coveredTurnCount = options.coveredTurnCount;
+    this.#historyDigest = options.historyDigest;
     this.#privateStore = options.privateStore;
   }
 
@@ -92,15 +100,19 @@ export class ConversationStore {
   ): Promise<ConversationStore> {
     const statePath = ConversationStore.path(appHome, chatFilePath);
     const privateStore = new PrivateStore({ root: appHome });
-    const [stateFile, currentTurnCount] = await Promise.all([
+    const [stateFile, history] = await Promise.all([
       readStateFile(statePath, privateStore),
-      readChatTurnCount(chatFilePath),
+      readChatHistory(chatFilePath),
     ]);
     const matchesChat = stateFile !== null && stateFile.chatId === chatId;
     const baseRevision = matchesChat ? stateFile!.revision : 0;
     let committedState: ConversationState | null = null;
     let usable = false;
-    if (matchesChat && stateFile!.turnCount <= currentTurnCount) {
+    if (
+      matchesChat &&
+      stateFile!.turnCount === history.turnCount &&
+      stateFile!.historyDigest === history.digest
+    ) {
       try {
         committedState = deserializeConversationState(stateFile!.state);
         usable = true;
@@ -117,24 +129,40 @@ export class ConversationStore {
       baseRevision,
       committedState,
       usable,
+      coveredTurnCount: usable ? stateFile!.turnCount : 0,
+      historyDigest: usable ? stateFile!.historyDigest : null,
       privateStore,
     });
   }
 
   /** True when a usable, non-stale committed state exists. */
   hasState(): boolean {
-    return this.#usable && this.#committedState !== null;
+    return this.#stagedState !== undefined
+      ? true
+      : this.#usable && this.#committedState !== null;
+  }
+
+  /** Exact current-history check for a store that may stay open across session mutations. */
+  covers(turnCount: number, historyDigest: string): boolean {
+    return (
+      this.#usable &&
+      this.#committedState !== null &&
+      this.#coveredTurnCount === turnCount &&
+      this.#historyDigest === historyDigest
+    );
   }
 
   /**
    * Handed to `client.callModel({ state: ... })`. `save` only ever touches
    * the in-memory buffer (K7b) — see the class doc comment.
    */
-  accessor(): StateAccessor {
+  accessor(transientDeveloperMessages: readonly string[] = []): StateAccessor {
+    const transient = new Set(transientDeveloperMessages.filter(Boolean));
     return {
-      load: async () => (this.#usable ? this.#committedState : null),
+      load: async () =>
+        this.#stagedState ?? (this.#usable ? this.#committedState : null),
       save: async (state) => {
-        this.#buffer = state;
+        this.#buffer = stripTransientDeveloperMessages(state, transient);
       },
     };
   }
@@ -142,14 +170,35 @@ export class ConversationStore {
   /** Drops the in-memory buffer. The committed file on disk is untouched. */
   discard(): void {
     this.#buffer = null;
+    this.#stagedState = undefined;
   }
 
-  /** A fresh, empty state — used after a destructive context cut (K7f) or when the transcript itself was reset/rolled back out from under this store (K7c). */
+  /** A seed stages a fresh state for the next call; no seed permanently invalidates old memory after clear/rollback. */
   reset(seed?: string): void {
-    void seed;
     this.#buffer = null;
+    if (seed !== undefined) {
+      const fresh = createInitialState();
+      fresh.messages = seed
+        ? [{ role: "user", content: seed }]
+        : [];
+      this.#stagedState = fresh;
+      return;
+    }
+    this.#stagedState = undefined;
     this.#committedState = null;
     this.#usable = false;
+    this.#coveredTurnCount = 0;
+    this.#historyDigest = null;
+  }
+
+  /** Forces the next request to rebuild from complete history. */
+  invalidate(): void {
+    this.#buffer = null;
+    this.#stagedState = undefined;
+    this.#committedState = null;
+    this.#usable = false;
+    this.#coveredTurnCount = 0;
+    this.#historyDigest = null;
   }
 
   /**
@@ -162,13 +211,19 @@ export class ConversationStore {
    */
   async commit(turnCount: number): Promise<void> {
     if (this.#buffer === null) {
+      this.#stagedState = undefined;
       return;
     }
     const state = this.#buffer;
-    this.#buffer = null;
     const lockPath = chatLockPath(this.#statePath);
     const release = await acquireLock(lockPath);
     try {
+      const history = await readChatHistory(this.#chatFilePath);
+      if (history.turnCount !== turnCount) {
+        throw new Error(
+          `Conversation state covers ${turnCount} turns, chat contains ${history.turnCount}.`,
+        );
+      }
       const onDisk = await readStateFile(this.#statePath, this.#privateStore);
       const diskRevision = onDisk?.revision ?? 0;
       if (onDisk !== null && diskRevision > this.#baseRevision) {
@@ -187,6 +242,7 @@ export class ConversationStore {
           revision: this.#baseRevision + 1,
           chatId: this.#chatId,
           turnCount,
+          historyDigest: history.digest,
           updatedAt: new Date().toISOString(),
           state: serializeConversationState(state),
         };
@@ -194,9 +250,21 @@ export class ConversationStore {
           conflictPath,
           `${JSON.stringify(conflict, null, 2)}\n`,
         );
-        this.#committedState = deserializeConversationState(onDisk.state);
-        this.#usable = true;
+        if (
+          onDisk.turnCount === history.turnCount &&
+          onDisk.historyDigest === history.digest
+        ) {
+          this.#committedState = deserializeConversationState(onDisk.state);
+          this.#usable = true;
+          this.#coveredTurnCount = onDisk.turnCount;
+          this.#historyDigest = onDisk.historyDigest;
+        } else {
+          this.#committedState = null;
+          this.#usable = false;
+        }
         this.#baseRevision = diskRevision;
+        this.#buffer = null;
+        this.#stagedState = undefined;
         return;
       }
       const newRevision = diskRevision + 1;
@@ -205,6 +273,7 @@ export class ConversationStore {
         revision: newRevision,
         chatId: this.#chatId,
         turnCount,
+        historyDigest: history.digest,
         updatedAt: new Date().toISOString(),
         state: serializeConversationState(state),
       };
@@ -214,11 +283,39 @@ export class ConversationStore {
       );
       this.#committedState = state;
       this.#usable = true;
+      this.#coveredTurnCount = history.turnCount;
+      this.#historyDigest = history.digest;
       this.#baseRevision = newRevision;
+      this.#buffer = null;
+      this.#stagedState = undefined;
+    } catch (error) {
+      this.invalidate();
+      throw error;
     } finally {
       await release();
     }
   }
+}
+
+function stripTransientDeveloperMessages(
+  state: ConversationState,
+  transient: ReadonlySet<string>,
+): ConversationState {
+  if (!transient.size || !Array.isArray(state.messages)) {
+    return state;
+  }
+  const messages = state.messages.filter((message) => {
+    const candidate: unknown = message;
+    if (!isRecord(candidate)) {
+      return true;
+    }
+    return !(
+      candidate.role === "developer" &&
+      typeof candidate.content === "string" &&
+      transient.has(candidate.content)
+    );
+  });
+  return messages.length === state.messages.length ? state : { ...state, messages };
 }
 
 async function readStateFile(path: string, store: PrivateStore): Promise<StateFile | null> {
@@ -235,20 +332,39 @@ async function readStateFile(path: string, store: PrivateStore): Promise<StateFi
   }
 }
 
-/** Reads only `turns.length` from the actual chat JSON; never the state file. */
-async function readChatTurnCount(chatFilePath: string): Promise<number> {
+/** Reads the exact redacted summary/transcript epoch from the actual chat JSON. */
+async function readChatHistory(
+  chatFilePath: string,
+): Promise<{ turnCount: number; digest: string }> {
   try {
     const raw = await readFile(chatFilePath, "utf8");
     const parsed: unknown = JSON.parse(raw);
-    if (isRecord(parsed) && Array.isArray(parsed.turns)) {
-      return parsed.turns.length;
+    if (
+      isRecord(parsed) &&
+      typeof parsed.summary === "string" &&
+      Array.isArray(parsed.turns)
+    ) {
+      const turns = parsed.turns.filter(
+        (turn): turn is { role: "user" | "assistant"; content: string; createdAt: string } =>
+          isRecord(turn) &&
+          (turn.role === "user" || turn.role === "assistant") &&
+          typeof turn.content === "string" &&
+          typeof turn.createdAt === "string",
+      );
+      return {
+        turnCount: turns.length,
+        digest: conversationHistoryDigest({ summary: parsed.summary, turns }),
+      };
     }
   } catch {
     // A missing or unreadable chat file is treated as "zero turns", the
     // conservative direction: it makes any existing state look stale rather
     // than risk resurrecting memory the chat no longer shows.
   }
-  return 0;
+  return {
+    turnCount: 0,
+    digest: conversationHistoryDigest({ summary: "", turns: [] }),
+  };
 }
 
 async function acquireLock(lockPath: string): Promise<() => Promise<void>> {

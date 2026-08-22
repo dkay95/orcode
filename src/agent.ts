@@ -28,7 +28,11 @@ import {
 } from "./openrouter.js";
 import { formatSecretWarning, scanForSecrets } from "./secrets.js";
 import { createRunId, RunLog } from "./runlog.js";
-import { SessionStore, workspaceSpend } from "./session.js";
+import {
+  SessionStore,
+  conversationHistoryDigest,
+  workspaceSpend,
+} from "./session.js";
 import {
   ChatArtifactStore,
   collectRetentionErrors,
@@ -110,11 +114,6 @@ export interface AgentRunObserver {
   onEvent?: (event: AgentRunEvent) => void;
   signal?: AbortSignal;
 }
-
-const PARTIAL_TURN_MARKER = {
-  cancelled: "[Lauf abgebrochen — unvollständige Antwort]",
-  error: "[Lauf fehlgeschlagen — unvollständige Antwort]",
-} as const;
 
 export class OrcodeAgent {
   readonly guard: WorkspaceGuard;
@@ -379,7 +378,7 @@ export class OrcodeAgent {
     // K7f: a context-budget overrun measured on the *previous* run forces a
     // compression pass now, even below the char threshold.
     const forceCompress = this.#shouldCutContext();
-    const compression = await this.#compress(promptForContext, observer, forceCompress);
+    const compression = await this.#compress(observer, forceCompress);
     // The compressor call is already paid for even if the run is cancelled
     // later, so book and persist it right away. This write only touches the
     // cost ledger — the destructive part of compression happens after a
@@ -388,6 +387,7 @@ export class OrcodeAgent {
       this.#session.addCost("compressor", compression.costUsd);
       await this.#session.save();
     }
+    throwIfAborted(observer.signal);
     for (const warning of compression.warnings) {
       notices.push(warning);
       emitStatus(observer, warning, chalk.yellow);
@@ -399,6 +399,22 @@ export class OrcodeAgent {
         chalk.dim,
       );
     }
+
+    type HistorySource =
+      | { kind: "sdk-state" }
+      | { kind: "fresh-seed"; handoff: string }
+      | { kind: "none" };
+    const historySource: HistorySource = compression.used
+      ? { kind: "fresh-seed", handoff: compression.handoff }
+      : conversation.covers(
+          this.#session.data.turns.length,
+          conversationHistoryDigest(this.#session.data),
+        )
+        ? { kind: "sdk-state" }
+        : compression.handoff
+          ? { kind: "fresh-seed", handoff: compression.handoff }
+          : { kind: "none" };
+    const sessionSnapshot = this.#session.snapshotRunState();
 
     observer.onStatus?.(`${this.config.mainModel} arbeitet`);
     // K7d: `instructions` carries only what practically never changes within
@@ -464,6 +480,7 @@ export class OrcodeAgent {
       }>
     >();
     const activeToolIds = new Set<string>();
+    const pendingSessionToolCalls: Array<{ name: string; summary: string }> = [];
     const announceModelStep = (step: number) => {
       if (step <= announcedStep) {
         return;
@@ -491,11 +508,9 @@ export class OrcodeAgent {
       step: modelStep,
       timestamp: Date.now(),
     });
-    const modelInputText = [
-      projectNotes,
-      `WORK CONTEXT (compressed or raw):\n${compression.handoff}`,
-      `AUTHORITATIVE CURRENT USER REQUEST:\n${promptForContext}`,
-    ]
+    const currentRequestMessage =
+      `AUTHORITATIVE CURRENT USER REQUEST:\n${promptForContext}`;
+    const modelInputText = [projectNotes, currentRequestMessage, runLimitsMessage]
       .filter(Boolean)
       .join("\n\n");
     if (attachments.length) {
@@ -504,9 +519,9 @@ export class OrcodeAgent {
       );
     }
     const modelInput = await buildModelInput(
-      modelInputText,
+      currentRequestMessage,
       attachments,
-      runLimitsMessage,
+      { before: [projectNotes], after: [runLimitsMessage] },
     );
     // Warn-only: mögliche Zugangsdaten im ausgehenden Kontext sichtbar
     // melden, bevor sie zu OpenRouter gehen. Nichts wird redigiert.
@@ -524,8 +539,12 @@ export class OrcodeAgent {
     const plugins = shouldEnableWebSearch(this.config.web, promptForContext)
       ? [webSearchPlugin()]
       : undefined;
-    const result = client.callModel(
-      {
+    if (historySource.kind === "fresh-seed") {
+      conversation.reset(historySource.handoff);
+    }
+    let result: ReturnType<typeof client.callModel>;
+    try {
+      result = client.callModel({
         models,
         instructions,
         input: modelInput,
@@ -537,7 +556,7 @@ export class OrcodeAgent {
         // are the chat id — stable for the lifetime of the chat, so every
         // request in it routes to the same upstream provider and hits the
         // same prompt cache.
-        state: conversation.accessor(),
+        state: conversation.accessor([projectNotes, runLimitsMessage]),
         cacheControl: { type: "ephemeral" },
         promptCacheKey: this.#session.data.id,
         sessionId: this.#session.data.id,
@@ -609,10 +628,10 @@ export class OrcodeAgent {
                 const number = pending?.number ?? toolSequence;
                 updateToolCount(toolSequence);
                 activeToolIds.delete(id);
-                this.#session.recordToolCall(
-                  toolName,
-                  toolMetadata(toolName).summarizeInput(toolInput),
-                );
+                pendingSessionToolCalls.push({
+                  name: toolName,
+                  summary: toolMetadata(toolName).summarizeInput(toolInput),
+                });
                 observer.onEvent?.({
                   type: "tool-end",
                   id,
@@ -700,12 +719,20 @@ export class OrcodeAgent {
             },
           ],
         },
-      },
-      {
+      }, {
         ...(observer.signal ? { signal: observer.signal } : {}),
         retryCodes: [...SDK_RETRY_CODES],
-      },
-    );
+      });
+    } catch (error) {
+      conversation.discard();
+      if (
+        this.#session.data.costs.totalUsd >
+        sessionSnapshot.data.costs.totalUsd
+      ) {
+        await this.#session.save();
+      }
+      throw error;
+    }
 
     const answer = new SuggestedReplyStreamFilter();
     let reasoningStreamError: unknown;
@@ -817,31 +844,56 @@ export class OrcodeAgent {
       if (compression.used) {
         this.#session.setSummary(compression.handoff);
         this.#session.compactTurns(4);
-        // K7f: the handoff becomes the first message of a fresh SDK state —
-        // cheap, cache-friendly (stable prefix before and after the cut), and
-        // never violates the SDK's opacity contract on `messages`.
-        conversation.reset(compression.handoff);
       }
       this.#session.addTurn("user", promptForContext);
       this.#session.addTurn("assistant", text);
-    } else if (text.trim()) {
-      // Keep the fragment: tools may already have changed files, and the next
-      // run needs to know what was said. The history is not compacted.
-      this.#session.addTurn("user", promptForContext);
-      this.#session.addTurn(
-        "assistant",
-        `${text}\n\n${cancelled ? PARTIAL_TURN_MARKER.cancelled : PARTIAL_TURN_MARKER.error}`,
-      );
+      for (const call of pendingSessionToolCalls) {
+        this.#session.recordToolCall(call.name, call.summary);
+      }
     }
-    await this.#session.save();
     // K7b: exactly one commit after a successful run, one discard otherwise —
     // never both, never neither. This is what makes Ctrl+C harmless: a
     // `tool_call` without its `tool_result` can only ever live in the
     // in-memory buffer, which `discard()` throws away.
     if (failure === undefined) {
-      await conversation.commit(this.#session.data.turns.length);
+      let saveOutcome: Awaited<ReturnType<SessionStore["save"]>>;
+      try {
+        saveOutcome = await this.#session.save();
+      } catch (error) {
+        this.#session.restoreRunState(sessionSnapshot);
+        conversation.discard();
+        if (
+          this.#session.data.costs.totalUsd >
+          sessionSnapshot.data.costs.totalUsd
+        ) {
+          await this.#session.save().catch(() => {});
+        }
+        throw error;
+      }
+      if (saveOutcome.merged) {
+        conversation.invalidate();
+        const notice =
+          "SDK-Kontext wurde wegen gleichzeitig geänderter Chat-Historie verworfen; der nächste Lauf baut den vollständigen Verlauf neu auf.";
+        notices.push(notice);
+        emitStatus(observer, notice, chalk.yellow);
+      } else {
+        try {
+          await conversation.commit(this.#session.data.turns.length);
+        } catch (error) {
+          conversation.invalidate();
+          const notice = `SDK-Kontext konnte nicht gespeichert werden; der nächste Lauf baut den vollständigen Verlauf neu auf: ${this.openRouter.safeMessage(error)}`;
+          notices.push(notice);
+          emitStatus(observer, notice, chalk.yellow);
+        }
+      }
     } else {
       conversation.discard();
+      if (
+        this.#session.data.costs.totalUsd >
+        sessionSnapshot.data.costs.totalUsd
+      ) {
+        await this.#session.save();
+      }
     }
 
     if (failure === undefined && !observer.onText && !text.endsWith("\n")) {
@@ -935,7 +987,6 @@ export class OrcodeAgent {
   }
 
   async #compress(
-    promptForContext: string,
     observer: AgentRunObserver,
     force = false,
   ): Promise<CompressionResult> {
@@ -946,7 +997,6 @@ export class OrcodeAgent {
         client: this.openRouter.client({ scope: "compressor" }),
         config: this.config,
         session: this.#session,
-        currentPrompt: promptForContext,
         ...(observer.signal ? { signal: observer.signal } : {}),
         lookupPrice: (model, signal) => this.#compressorPriceFor(model, signal),
         force,
@@ -954,7 +1004,7 @@ export class OrcodeAgent {
     } catch (error) {
       throwIfAborted(observer.signal);
       return rawCompressionResult(
-        uncompressedContext(this.#session, promptForContext),
+        uncompressedContext(this.#session),
         "failed",
         [
           `Kompressor fehlgeschlagen; unkomprimierter Kontext wird verwendet: ${this.openRouter.safeMessage(error)}`,
@@ -1017,7 +1067,10 @@ function createChatBinding(session: SessionStore): {
 export async function buildModelInput(
   text: string,
   attachments: readonly ImageAttachment[],
-  developerMessage: string,
+  developerMessage:
+    | string
+    | readonly string[]
+    | { before?: readonly string[]; after?: readonly string[] },
 ): Promise<Item[]> {
   let userItem: NewUserMessageItem;
   if (attachments.length) {
@@ -1036,9 +1089,31 @@ export async function buildModelInput(
   } else {
     userItem = { role: "user", content: text };
   }
-  const items: Item[] = [userItem];
-  if (developerMessage) {
-    items.push({ role: "developer", content: developerMessage });
+  let before: readonly string[] = [];
+  let after: readonly string[] = [];
+  if (typeof developerMessage === "string") {
+    after = [developerMessage];
+  } else if (Array.isArray(developerMessage)) {
+    after = developerMessage;
+  } else {
+    const placement = developerMessage as {
+      before?: readonly string[];
+      after?: readonly string[];
+    };
+    before = placement.before ?? [];
+    after = placement.after ?? [];
+  }
+  const items: Item[] = [];
+  for (const content of before) {
+    if (content) {
+      items.push({ role: "developer", content });
+    }
+  }
+  items.push(userItem);
+  for (const content of after) {
+    if (content) {
+      items.push({ role: "developer", content });
+    }
   }
   return items;
 }

@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import {
   open,
   readdir,
@@ -85,6 +85,10 @@ export interface SaveOutcome {
   /** Set when an unreadable foreign file was moved aside instead of destroyed. */
   conflictBackupPath: string | null;
   revision: number;
+}
+
+export interface SessionRunSnapshot {
+  data: PersistedSessionData;
 }
 
 export class SessionStore {
@@ -312,9 +316,47 @@ export class SessionStore {
   }
 
   transcript(): string {
-    return this.#data.turns
+    return redactText(this.#data.turns
       .map((turn) => `${turn.role === "user" ? "USER" : "ASSISTANT"}:\n${turn.content}`)
-      .join("\n\n");
+      .join("\n\n"));
+  }
+
+  snapshotRunState(): SessionRunSnapshot {
+    return { data: structuredClone(this.#data) };
+  }
+
+  /** Restores staged chat data while retaining provider charges incurred after the snapshot. */
+  restoreRunState(snapshot: SessionRunSnapshot): void {
+    const current = this.#data;
+    const restored = structuredClone(snapshot.data);
+    const mainDelta = Math.max(0, current.costs.mainUsd - restored.costs.mainUsd);
+    const compressorDelta = Math.max(
+      0,
+      current.costs.compressorUsd - restored.costs.compressorUsd,
+    );
+    const voiceDelta = Math.max(0, current.costs.voiceUsd - restored.costs.voiceUsd);
+    restored.costs.mainUsd += mainDelta;
+    restored.costs.compressorUsd += compressorDelta;
+    restored.costs.voiceUsd += voiceDelta;
+    restored.costs.totalUsd =
+      restored.costs.mainUsd + restored.costs.compressorUsd + restored.costs.voiceUsd;
+    const days = new Set([
+      ...Object.keys(restored.dailySpendUsd),
+      ...Object.keys(current.dailySpendUsd),
+    ]);
+    for (const day of days) {
+      const delta = Math.max(
+        0,
+        (current.dailySpendUsd[day] ?? 0) -
+          (snapshot.data.dailySpendUsd[day] ?? 0),
+      );
+      if (delta > 0) {
+        restored.dailySpendUsd[day] =
+          (restored.dailySpendUsd[day] ?? 0) + delta;
+      }
+    }
+    restored.dailySpendUsd = pruneSpend(restored.dailySpendUsd);
+    this.#data = restored;
   }
 
   recordToolCall(name: string, summary = ""): SessionToolCall {
@@ -1453,4 +1495,19 @@ async function exists(path: string): Promise<boolean> {
 
 export function redactSensitive(value: string): string {
   return redactText(value);
+}
+
+/** Stable identity of the exact redacted summary and transcript covered by SDK state. */
+export function conversationHistoryDigest(
+  data: Pick<SessionData, "summary" | "turns">,
+): string {
+  const canonical = {
+    summary: redactText(data.summary),
+    turns: data.turns.map((turn) => ({
+      role: turn.role,
+      content: redactText(turn.content),
+      createdAt: turn.createdAt,
+    })),
+  };
+  return createHash("sha256").update(JSON.stringify(canonical)).digest("hex");
 }

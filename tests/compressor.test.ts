@@ -21,13 +21,12 @@ test("compressor off performs no model call", async () => {
     client: client.client as never,
     config: config({ compressionMode: "off" }),
     session,
-    currentPrompt: "current task",
   });
 
   assert.equal(client.calls, 0);
   assert.equal(result.used, false);
   assert.equal(result.skipReason, "disabled");
-  assert.match(result.handoff, /current task/);
+  assert.doesNotMatch(result.handoff, /current task/);
 });
 
 test("compressor auto stays silent below the threshold", async () => {
@@ -41,20 +40,19 @@ test("compressor auto stays silent below the threshold", async () => {
       compressionThresholdChars: 100_000,
     }),
     session,
-    currentPrompt: "kurze Aufgabe",
   });
 
   assert.equal(client.calls, 0);
   assert.equal(result.used, false);
   assert.equal(result.skipReason, "below-threshold");
   assert.equal(result.savedPercent, 0);
-  assert.equal(result.handoff, uncompressedContext(session, "kurze Aufgabe"));
+  assert.equal(result.handoff, uncompressedContext(session));
 });
 
 test("compressor auto compresses once the context reaches the threshold", async () => {
   const session = await freshSession("auto-above");
   fill(session, 12);
-  const raw = uncompressedContext(session, "Weiter");
+  const raw = uncompressedContext(session);
   const client = countingClient(() => raw.slice(0, Math.floor(raw.length / 3)));
 
   const result = await compressContext({
@@ -64,7 +62,6 @@ test("compressor auto compresses once the context reaches the threshold", async 
       compressionThresholdChars: raw.length,
     }),
     session,
-    currentPrompt: "Weiter",
   });
 
   assert.equal(client.calls, 1);
@@ -83,7 +80,6 @@ test("compression never touches the session", async () => {
     client: client.client as never,
     config: config({ compressionMode: "always" }),
     session,
-    currentPrompt: "Weiter",
   });
 
   assert.equal(result.used, true);
@@ -98,14 +94,13 @@ test("compression never touches the session", async () => {
 test("a handoff that barely shrinks the context is discarded", async () => {
   const session = await freshSession("weak");
   fill(session, 8);
-  const raw = uncompressedContext(session, "Weiter");
+  const raw = uncompressedContext(session);
   const client = countingClient(() => raw.slice(0, Math.floor(raw.length * 0.9)));
 
   const result = await compressContext({
     client: client.client as never,
     config: config({ compressionMode: "always" }),
     session,
-    currentPrompt: "Weiter",
   });
 
   assert.equal(client.calls, 1);
@@ -120,14 +115,13 @@ test("a handoff that barely shrinks the context is discarded", async () => {
 test("a handoff larger than the context never reports a negative saving", async () => {
   const session = await freshSession("bigger");
   fill(session, 4);
-  const raw = uncompressedContext(session, "Weiter");
+  const raw = uncompressedContext(session);
   const client = countingClient(() => `${raw}${raw}`);
 
   const result = await compressContext({
     client: client.client as never,
     config: config({ compressionMode: "always" }),
     session,
-    currentPrompt: "Weiter",
   });
 
   assert.equal(result.used, false);
@@ -145,7 +139,6 @@ test("an estimate above the cost limit rejects the compressor call upfront", asy
     client: client.client as never,
     config: config({ compressionMode: "always", compressorMaxCostUsd: 0.05 }),
     session,
-    currentPrompt: "Weiter",
     lookupPrice: async () => price(0.001, 0.002),
   });
 
@@ -167,7 +160,6 @@ test("an estimate below the cost limit lets the compressor run", async () => {
     client: client.client as never,
     config: config({ compressionMode: "always", compressorMaxCostUsd: 0.05 }),
     session,
-    currentPrompt: "Weiter",
     lookupPrice: async () => price(1e-8, 2e-8),
   });
 
@@ -186,7 +178,6 @@ test("without a price the limit is named honestly instead of pretended", async (
     client: client.client as never,
     config: config({ compressionMode: "always" }),
     session,
-    currentPrompt: "Weiter",
     lookupPrice: async () => null,
   });
 
@@ -205,7 +196,6 @@ test("an actual cost above the limit is reported clearly", async () => {
     client: client.client as never,
     config: config({ compressionMode: "always", compressorMaxCostUsd: 0.05 }),
     session,
-    currentPrompt: "Weiter",
     lookupPrice: async () => price(1e-9, 1e-9),
   });
 
@@ -222,12 +212,65 @@ test("an empty handoff falls back to the raw context", async () => {
     client: client.client as never,
     config: config({ compressionMode: "always" }),
     session,
-    currentPrompt: "Weiter",
   });
 
   assert.equal(result.used, false);
   assert.equal(result.skipReason, "empty-handoff");
-  assert.equal(result.handoff, uncompressedContext(session, "Weiter"));
+  assert.equal(result.handoff, uncompressedContext(session));
+});
+
+test("the compressor handoff never owns the current request", async () => {
+  const session = await freshSession("prompt-owner");
+  fill(session, 4);
+  let capturedInput = "";
+  const client = {
+    callModel(request: { input: string }) {
+      capturedInput = request.input;
+      return {
+        getText: async () => "Kurzer Handoff.",
+        getResponse: async () => ({ usage: { cost: 0.002 } }),
+      };
+    },
+  };
+
+  await compressContext({
+    client: client as never,
+    config: config({ compressionMode: "always" }),
+    session,
+  });
+
+  assert.doesNotMatch(capturedInput, /CURRENT REQUEST SENTINEL/);
+  assert.equal(capturedInput, uncompressedContext(session));
+});
+
+test("a compressor failure after provider usage returns a fallback and preserves the incurred cost once", async () => {
+  const session = await freshSession("post-usage-failure");
+  fill(session, 4);
+  const client = {
+    callModel(request: {
+      hooks: { PostModelCall: Array<{ handler: (payload: unknown) => void }> };
+    }) {
+      request.hooks.PostModelCall[0]?.handler({ usage: { cost: 0.007 } });
+      return {
+        getText: async () => {
+          throw new Error("compressor stream failed after usage");
+        },
+        getResponse: async () => ({ usage: { cost: 0.007 } }),
+      };
+    },
+  };
+
+  const result = await compressContext({
+    client: client as never,
+    config: config({ compressionMode: "always" }),
+    session,
+  });
+
+  assert.equal(result.used, false);
+  assert.equal(result.skipReason, "failed");
+  assert.equal(result.handoff, uncompressedContext(session));
+  assert.equal(result.costUsd, 0.007);
+  assert.match(result.warnings.join("\n"), /stream failed after usage/);
 });
 
 // --- helpers -------------------------------------------------------------

@@ -151,7 +151,8 @@ test("legacy-only migration stages, validates, maps every sidecar, redacts reada
   const oldId = await seedHome(legacy, { secret });
   const oldChatPath = join(legacy, "chats", WORKSPACE_HASH, `${oldId}.json`);
   const exactState = serializedState("opaque exact state");
-  await writeFile(`${oldChatPath}.state.json`, JSON.stringify({ version: 1, revision: 1, chatId: oldId, turnCount: 1, updatedAt: "2026-08-20T10:01:00.000Z", state: exactState }));
+  const historyDigest = "0".repeat(64);
+  await writeFile(`${oldChatPath}.state.json`, JSON.stringify({ version: 1, revision: 1, chatId: oldId, turnCount: 1, historyDigest, updatedAt: "2026-08-20T10:01:00.000Z", state: exactState }));
   await writeFile(`${oldChatPath}.konflikt-old.json`, `unreadable exact conflict ${secret}`);
   await mkdir(join(legacy, "runs", oldId), { recursive: true });
   const legacyEvents = [
@@ -189,7 +190,7 @@ test("legacy-only migration stages, validates, maps every sidecar, redacts reada
   assert.doesNotMatch(migratedChat, new RegExp(secret));
   assert.equal((JSON.parse(migratedChat) as { id: string }).id, newId);
   const migratedState = JSON.parse(await readFile(join(target, "chats", WORKSPACE_HASH, `${newId}.json.state.json`), "utf8")) as { chatId: string; state: string };
-  assert.deepEqual(migratedState, { version: 1, revision: 1, chatId: newId, turnCount: 1, updatedAt: "2026-08-20T10:01:00.000Z", state: exactState });
+  assert.deepEqual(migratedState, { version: 1, revision: 1, chatId: newId, turnCount: 1, historyDigest, updatedAt: "2026-08-20T10:01:00.000Z", state: exactState });
   const migratedChatConflict = join(target, "chats", WORKSPACE_HASH, `${newId}.json.konflikt-old.json`);
   assert.match(await readFile(migratedChatConflict, "utf8"), new RegExp(secret));
   assert.equal((await stat(migratedChatConflict)).mode & 0o777, 0o600);
