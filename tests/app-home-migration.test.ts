@@ -2,11 +2,13 @@ import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import {
   access,
+  lstat,
   mkdir,
   mkdtemp,
   readFile,
   readdir,
   stat,
+  symlink,
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -395,6 +397,27 @@ test("migration revalidates the source checksum after validation and before comm
   assert.equal((result as typeof result & { status?: string }).status, "recovery-required");
 });
 
+test("migration refuses a symlinked legacy source before rename and leaves its target untouched", async () => {
+  const root = await mkdtemp(join(tmpdir(), "orcode-migration-source-symlink-"));
+  const legacy = join(root, ".routercode");
+  const target = join(root, ".orcode");
+  const outsideSource = join(root, "outside-source");
+  await seedHome(outsideSource);
+  const originalConfig = await readFile(join(outsideSource, "config.json"), "utf8");
+  await symlink(outsideSource, legacy, "dir");
+
+  const result = await migrateAppHome(target, legacy);
+  const manifest = JSON.parse(
+    await readFile(join(target, "migrations", "app-home-v1.json"), "utf8"),
+  ) as { backupPath: string };
+
+  assert.equal((result as typeof result & { status?: string }).status, "recovery-required");
+  assert.equal(await exists(legacy), true);
+  assert.equal((await lstat(legacy)).isSymbolicLink(), true);
+  assert.equal(await exists(manifest.backupPath), false);
+  assert.equal(await readFile(join(outsideSource, "config.json"), "utf8"), originalConfig);
+});
+
 test("a complete manifest resumes exact staging cleanup before startup reports ready", async () => {
   const root = await mkdtemp(join(tmpdir(), "orcode-migration-cleanup-resume-"));
   const legacy = join(root, ".routercode");
@@ -425,6 +448,43 @@ test("a complete manifest resumes exact staging cleanup before startup reports r
 
   assert.equal(await exists(stagingPath), false);
   assert.equal((result as typeof result & { status?: string }).status, "ready");
+});
+
+test("complete migration refuses symlinked staging cleanup without touching outside", async () => {
+  const root = await mkdtemp(join(tmpdir(), "orcode-migration-cleanup-symlink-"));
+  const legacy = join(root, ".routercode");
+  const target = join(root, ".orcode");
+  const outside = join(root, "outside");
+  const checksum = "a".repeat(64);
+  const outsideStaging = join(outside, checksum);
+  const victim = join(outsideStaging, "must-survive.txt");
+  const stagingPath = join(target, ".migration-staging", checksum);
+  const backupPath = join(target, "migration-backups", `routercode-${checksum.slice(0, 16)}`);
+  await mkdir(outsideStaging, { recursive: true });
+  await writeFile(victim, "outside exact bytes");
+  await mkdir(target, { recursive: true });
+  await symlink(outside, join(target, ".migration-staging"), "dir");
+  await mkdir(backupPath, { recursive: true });
+  await mkdir(join(target, "migrations"), { recursive: true });
+  await writeFile(join(target, "migrations", "app-home-v1.json"), JSON.stringify({
+    version: 1,
+    phase: "complete",
+    sourcePath: legacy,
+    sourceChecksum: checksum,
+    stagingPath,
+    backupPath,
+    chatIdMap: {},
+    destinationPaths: [],
+    isolated: [],
+    complete: true,
+    startedAt: "2026-08-20T00:00:00.000Z",
+    completedAt: "2026-08-20T00:01:00.000Z",
+  }));
+
+  const result = await migrateAppHome(target, legacy);
+
+  assert.equal(await exists(victim), true);
+  assert.equal((result as typeof result & { status?: string }).status, "recovery-required");
 });
 
 test("one corrupt chat and one corrupt run are isolated without blocking valid chats or runs", async () => {

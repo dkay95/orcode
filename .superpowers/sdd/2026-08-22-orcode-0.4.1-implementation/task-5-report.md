@@ -245,3 +245,95 @@ DONE
   this macOS host. No actual Windows execution is claimed; cross-platform tests
   validate parser binding, exact argv/environment separation, DACL program
   contents, and fail-closed behavior.
+
+## Fix Round 2
+
+### Receiving-review verification and RED
+
+- Read the complete round-2 findings and updated implementation ledger, then
+  independently reproduced all three findings against base
+  `990f6bfd1ddc88361ed52b907e201ad8d52aca53` before changing production code.
+  All three were confirmed; there was no technical pushback or scope expansion.
+- Initial combined behavioral RED command:
+  `node --import tsx --test --test-name-pattern='Windows availability proves|rolls back a newly-created|ensureDirectory binds|protectTree binds|complete migration refuses' tests/private-store.test.ts tests/app-home-migration.test.ts`.
+  It reached 5 tests: 0 passed and 5 failed.
+- `Windows availability proves disposable directory and file DACL
+  enforceability` failed because `available()` reported true after only the SID
+  lookup even when a real file-DACL protection call returned exit 17.
+- `PrivateStore rolls back a newly-created destination root when protection
+  fails` failed because the root remained after the exact write was rejected.
+- `PrivateStore ensureDirectory binds protection to the verified directory
+  identity` and `PrivateStore protectTree binds protection and traversal to the
+  verified tree identity` failed because a deterministic adapter-time swap
+  changed the outside directory from 0755 to 0700.
+- `complete migration refuses symlinked staging cleanup without touching
+  outside` failed because recursive path-based cleanup deleted the outside
+  victim through `.migration-staging -> outside`.
+- Self-review added a distinct rename regression before restoring the safe
+  primitive. `migration refuses a symlinked legacy source before rename and
+  leaves its target untouched` reached 1 test: 0 passed and 1 failed because
+  the raw rename moved the legacy symlink. This closed the test-observability
+  gap between cleanup and rename.
+
+### Implementation
+
+1. Windows availability now creates a disposable directory and file and proves
+   both DACL operations, including their post-write ACL verification, before a
+   destination path can be created. Any probe failure returns unavailable and
+   removes the disposable paths. `PrivateStore` separately tracks every
+   directory it created and rolls those identities back in reverse order when
+   directory or file protection fails.
+2. POSIX protection uses the already-open file/directory handle for chmod.
+   `ensureDirectory`, `protectTree`, and atomic writes snapshot file IDs, reject
+   symlinks/non-regular nodes, and revalidate ancestor, named-path, and open-
+   handle identity before and after every awaited protection/traversal boundary.
+   A deterministic swap therefore protects only the originally opened inode,
+   leaves outside content and metadata unchanged, and returns failure.
+3. Recursive `rm` and raw migration-tree rename were removed from storage
+   migration. `PrivateStore.removeTree()` performs a sorted, manual no-symlink
+   walk with root/ancestor and open-handle identity checks around reads and
+   deletes. `PrivateStore.renameTree()` verifies source and destination parents,
+   requires a real source directory, binds its identity to an open handle where
+   supported, and brackets the rename with source/destination identity checks.
+   Cleanup/protection/rename mismatches are converted to typed
+   `recovery-required` migration results.
+
+### Focused GREEN and final gates
+
+- Round-2 behavioral command, including the additional rename regression: 6/6
+  passed, 0 failed. The outside directory/file modes and content stayed
+  unchanged in both deterministic protection-swap tests, and the cleanup and
+  rename targets survived their symlink traps.
+- Required Task 5 focus (`app-home-migration`, `private-store`, `config`,
+  `session`, `cli`): 100 reached, 99 passed, 0 failed, 1 Windows-only skip.
+- Related `runlog`, `conversation`, `workspace`, `rules`, `commands`, `agent`,
+  and `integration` suites: 146/146 passed.
+- `npx tsc -p tsconfig.json --noEmit`: passed.
+- `npx tsc -p tsconfig.tests.json --noEmit`: passed.
+- Full `npm test`: 682 reached, 681 passed, 0 failed, 1 Windows-only skip.
+- Central credential-fixture audit
+  (`rg -n --hidden --glob '!node_modules/**' --glob '!dist/**'
+  'sk-or-|AKIA|glpat-|npm_' tests README.md`): no matches.
+- `git diff --check`: passed.
+
+### Round-2 self-review and concerns
+
+- Rechecked that the disposable Windows preflight happens before any migration
+  destination mutation and that a later protection failure cannot leave a
+  newly created root or exact temp file behind.
+- Rechecked every new await boundary in directory creation, tree protection,
+  recursive cleanup, atomic file publication, and legacy-tree rename. POSIX
+  metadata protection is handle-bound; cleanup never follows a symlink; all
+  path operations fail closed when their recorded file ID changes.
+- The Windows-only real-DACL integration remains registered but skipped on this
+  macOS host; this report does not claim an actual Windows run.
+- Node exposes no public `openat`/`unlinkat`/`renameat` API here. The
+  implementation is handle-bound where Node supports it and revalidates file
+  IDs across every awaited boundary, but it does not claim kernel-atomic
+  protection against an external native process racing inside one filesystem
+  syscall. A native helper would be required to remove that final single-
+  syscall boundary and is intentionally outside Task 5.
+
+### Commit
+
+- Requested message: `fix: bind private storage operations to verified roots`

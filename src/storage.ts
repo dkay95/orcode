@@ -5,8 +5,6 @@ import {
   mkdir,
   readFile,
   readdir,
-  rename,
-  rm,
   stat,
 } from "node:fs/promises";
 import { basename, dirname, join, relative, resolve as resolvePath, sep } from "node:path";
@@ -280,7 +278,7 @@ export async function migrateStorageHome(
   const existingManifest = manifestState.kind === "valid" ? manifestState.manifest : null;
   if (existingManifest?.complete) {
     try {
-      await rm(existingManifest.stagingPath, { recursive: true, force: true });
+      await privateStore.removeTree(existingManifest.stagingPath);
     } catch (error) {
       return {
         status: "recovery-required",
@@ -373,12 +371,20 @@ export async function migrateStorageHome(
   await persistManifest(newHome, manifest, privateStore);
   await options.onPhase?.("planned", manifest);
 
-  manifest = await buildStaging(
-    manifest,
-    newHome,
-    privateStore,
-    options.normalizeConfig,
-  );
+  try {
+    manifest = await buildStaging(
+      manifest,
+      newHome,
+      privateStore,
+      options.normalizeConfig,
+    );
+  } catch (error) {
+    return {
+      status: "recovery-required",
+      appHome: newHome,
+      warning: `Migrations-Staging konnte nicht sicher aufgebaut werden: ${errorText(error)}`,
+    };
+  }
   manifest.phase = "staged";
   await persistManifest(newHome, manifest, privateStore);
   await options.onPhase?.("staged", manifest);
@@ -412,19 +418,39 @@ export async function migrateStorageHome(
     };
   }
 
-  if (await pathExists(manifest.sourcePath)) {
-    await privateStore.ensureDirectory(dirname(manifest.backupPath));
-    if (await pathExists(manifest.backupPath)) {
-      throw new Error(`Migration-Backup existiert bereits: ${manifest.backupPath}`);
+  try {
+    if (await pathExists(manifest.sourcePath)) {
+      await privateStore.ensureDirectory(dirname(manifest.backupPath));
+      if (await pathExists(manifest.backupPath)) {
+        throw new Error(`Migration-Backup existiert bereits: ${manifest.backupPath}`);
+      }
+      await privateStore.renameTree(
+        manifest.sourcePath,
+        manifest.backupPath,
+        dirname(manifest.sourcePath),
+      );
     }
-    await rename(manifest.sourcePath, manifest.backupPath);
+    await privateStore.protectTree(manifest.backupPath);
+  } catch (error) {
+    return {
+      status: "recovery-required",
+      appHome: newHome,
+      warning: `Migrations-Backup konnte nicht sicher veröffentlicht werden: ${errorText(error)}`,
+    };
   }
-  await privateStore.protectTree(manifest.backupPath);
   manifest.phase = "backed-up";
   await persistManifest(newHome, manifest, privateStore);
   await options.onPhase?.("backed-up", manifest);
 
-  await rm(manifest.stagingPath, { recursive: true, force: true });
+  try {
+    await privateStore.removeTree(manifest.stagingPath);
+  } catch (error) {
+    return {
+      status: "recovery-required",
+      appHome: newHome,
+      warning: `Migrations-Staging konnte nicht sicher bereinigt werden: ${errorText(error)}`,
+    };
+  }
   manifest.phase = "complete";
   manifest.complete = true;
   manifest.completedAt = new Date().toISOString();
@@ -439,7 +465,7 @@ async function buildStaging(
   store: PrivateStore,
   normalizeConfig: AppHomeMigrationOptions["normalizeConfig"],
 ): Promise<StorageMigrationManifest> {
-  await rm(manifest.stagingPath, { recursive: true, force: true });
+  await store.removeTree(manifest.stagingPath);
   await store.ensureDirectory(manifest.stagingPath);
   manifest.destinationPaths = [];
   manifest.isolated = [];
@@ -782,8 +808,16 @@ async function resumeAfterLegacyRename(
     return { status: "recovery-required", appHome: dirname(dirname(manifest.backupPath)), warning: "Migration ist unvollständig; Quelle und Backup fehlen." };
   }
   const appHome = dirname(dirname(manifest.backupPath));
-  await store.protectTree(manifest.backupPath);
-  await rm(manifest.stagingPath, { recursive: true, force: true });
+  try {
+    await store.protectTree(manifest.backupPath);
+    await store.removeTree(manifest.stagingPath);
+  } catch (error) {
+    return {
+      status: "recovery-required",
+      appHome,
+      warning: `Migration konnte Backup/Staging nicht sicher abschließen: ${errorText(error)}`,
+    };
+  }
   manifest.phase = "complete";
   manifest.complete = true;
   manifest.completedAt = new Date().toISOString();

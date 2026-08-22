@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import {
   chmod,
+  type FileHandle,
   mkdir,
   mkdtemp,
   readFile,
@@ -8,6 +9,7 @@ import {
   rename,
   stat,
   symlink,
+  writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -42,9 +44,8 @@ test("Windows PrivateStore applies and verifies the deterministic current-user p
 
   await store.writeTextAtomic(path, "opaque\n");
 
-  assert.equal(calls.length, 4, "one fail-closed probe plus root, directory, and file DACLs");
-  assert.match(calls[0]!.args[3] ?? "", /WindowsIdentity.*GetCurrent/);
-  for (const call of calls.slice(1)) {
+  assert.equal(calls.length, 5, "disposable directory/file probes plus root, directory, and file DACLs");
+  for (const call of calls) {
     assert.equal(call.executable, "powershell.exe");
     assert.deepEqual(call.args.slice(0, 3), ["-NoProfile", "-NonInteractive", "-EncodedCommand"]);
     const script = Buffer.from(call.args[3] ?? "", "base64").toString("utf16le");
@@ -54,9 +55,10 @@ test("Windows PrivateStore applies and verifies the deterministic current-user p
     assert.match(script, /Get-Acl/);
     assert.match(script, /exit 17/);
   }
-  assert.equal(calls[1]!.environment?.ORCODE_PRIVATE_KIND, "directory");
-  assert.equal(calls[2]!.environment?.ORCODE_PRIVATE_KIND, "directory");
-  assert.equal(calls[3]!.environment?.ORCODE_PRIVATE_KIND, "file");
+  assert.deepEqual(
+    calls.map((call) => call.environment?.ORCODE_PRIVATE_KIND),
+    ["directory", "file", "directory", "directory", "file"],
+  );
 });
 
 test("Windows ACL invocation binds an untrusted path as data through an encoded parser boundary", async () => {
@@ -84,6 +86,39 @@ test("Windows ACL invocation binds an untrusted path as data through an encoded 
   assert.equal(captured.environment?.ORCODE_PRIVATE_PATH, maliciousPath);
   assert.equal(captured.environment?.ORCODE_PRIVATE_KIND, "file");
   assert.equal(captured.args.includes(maliciousPath), false);
+});
+
+test("Windows availability proves disposable directory and file DACL enforceability", async () => {
+  const { WindowsPrivateStoreAdapter } = await import("../src/private-store.js");
+  const adapter = new WindowsPrivateStoreAdapter(async (_executable, _args, options) => ({
+    code: options?.environment?.ORCODE_PRIVATE_KIND === "file" ? 17 : 0,
+    stdout: "",
+    stderr: "synthetic file DACL refusal",
+  }));
+
+  assert.equal(await adapter.available(), false);
+});
+
+test("PrivateStore rolls back a newly-created destination root when protection fails", async () => {
+  const { PrivateStore } = await import("../src/private-store.js");
+  const parent = await mkdtemp(join(tmpdir(), "orcode-private-rollback-"));
+  const root = join(parent, "new-home");
+  const target = join(root, "exact", "state.json");
+  const store = new PrivateStore({
+    root,
+    adapter: {
+      name: "later-protection-failure",
+      available: async () => true,
+      protectDirectory: async () => {
+        throw new Error("synthetic protection failure");
+      },
+      protectFile: async () => undefined,
+    },
+  });
+
+  await assert.rejects(store.writeTextAtomic(target, "must remain absent"), /protection failure/);
+  await assert.rejects(stat(root), /ENOENT/);
+  await assert.rejects(readFile(target), /ENOENT/);
 });
 
 test("Windows PrivateStore real DACL integration", { skip: process.platform !== "win32" }, async () => {
@@ -167,6 +202,90 @@ test("PrivateStore protectTree rejects a symlink root without changing its targe
   await assert.rejects(store.protectTree(link), /symbol|symlink|link/i);
 
   assert.equal((await stat(outside)).mode & 0o777, 0o755);
+});
+
+test("PrivateStore ensureDirectory binds protection to the verified directory identity", async () => {
+  const { PosixPrivateStoreAdapter, PrivateStore } = await import("../src/private-store.js");
+  const root = await mkdtemp(join(tmpdir(), "orcode-private-directory-handle-"));
+  const exact = join(root, "exact");
+  const moved = join(root, "exact-before-swap");
+  const outside = join(root, "outside");
+  const victim = join(outside, "victim.txt");
+  await mkdir(exact);
+  await mkdir(outside, { mode: 0o755 });
+  await chmod(outside, 0o755);
+  await writeFile(victim, "outside content", { mode: 0o644 });
+  await chmod(victim, 0o644);
+  let swapped = false;
+  class SwappingDirectoryAdapter extends PosixPrivateStoreAdapter {
+    override async protectDirectory(path: string, handle?: FileHandle): Promise<void> {
+      if (!swapped && path === exact) {
+        swapped = true;
+        await rename(exact, moved);
+        await symlink(outside, exact, "dir");
+      }
+      const protect = super.protectDirectory as unknown as (
+        path: string,
+        handle?: FileHandle,
+      ) => Promise<void>;
+      await protect(path, handle);
+    }
+  }
+  const store = new PrivateStore({ adapter: new SwappingDirectoryAdapter(), root } as never);
+  let rejected = false;
+
+  try {
+    await store.ensureDirectory(exact);
+  } catch {
+    rejected = true;
+  }
+
+  assert.equal((await stat(outside)).mode & 0o777, 0o755);
+  assert.equal((await stat(victim)).mode & 0o777, 0o644);
+  assert.equal(await readFile(victim, "utf8"), "outside content");
+  assert.equal(rejected, true);
+});
+
+test("PrivateStore protectTree binds protection and traversal to the verified tree identity", async () => {
+  const { PosixPrivateStoreAdapter, PrivateStore } = await import("../src/private-store.js");
+  const root = await mkdtemp(join(tmpdir(), "orcode-private-tree-handle-"));
+  const tree = join(root, "backup");
+  const moved = join(root, "backup-before-swap");
+  const outside = join(root, "outside");
+  const victim = join(outside, "victim.txt");
+  await mkdir(tree);
+  await mkdir(outside, { mode: 0o755 });
+  await chmod(outside, 0o755);
+  await writeFile(victim, "outside content", { mode: 0o644 });
+  await chmod(victim, 0o644);
+  let swapped = false;
+  class SwappingTreeAdapter extends PosixPrivateStoreAdapter {
+    override async protectDirectory(path: string, handle?: FileHandle): Promise<void> {
+      if (!swapped && path === tree) {
+        swapped = true;
+        await rename(tree, moved);
+        await symlink(outside, tree, "dir");
+      }
+      const protect = super.protectDirectory as unknown as (
+        path: string,
+        handle?: FileHandle,
+      ) => Promise<void>;
+      await protect(path, handle);
+    }
+  }
+  const store = new PrivateStore({ adapter: new SwappingTreeAdapter(), root } as never);
+  let rejected = false;
+
+  try {
+    await store.protectTree(tree);
+  } catch {
+    rejected = true;
+  }
+
+  assert.equal((await stat(outside)).mode & 0o777, 0o755);
+  assert.equal((await stat(victim)).mode & 0o777, 0o644);
+  assert.equal(await readFile(victim, "utf8"), "outside content");
+  assert.equal(rejected, true);
 });
 
 test("PrivateStore fails closed and never publishes an exact file when its adapter cannot enforce privacy", async () => {
