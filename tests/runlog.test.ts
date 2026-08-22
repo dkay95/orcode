@@ -22,6 +22,32 @@ function syntheticCredential(): string {
   return `${["sk", "or", "v1"].join("-")}-${"z".repeat(40)}`;
 }
 
+function streamingCredentialFixtures(): Array<{ name: string; secret: string; sensitive: string }> {
+  const awsSecret = "A".repeat(40);
+  const bearer = `token9${"b".repeat(24)}`;
+  const privateBody = "QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVo=";
+  const privateLabel = ["PRIVATE", "KEY"].join(" ");
+  return [
+    { name: "openrouter", secret: `${["sk", "or", "v1"].join("-")}-${"o".repeat(24)}`, sensitive: "o".repeat(24) },
+    { name: "anthropic", secret: `${["sk", "ant"].join("-")}-${"a".repeat(24)}`, sensitive: "a".repeat(24) },
+    { name: "generic-sk", secret: `${["sk", "generic"].join("-")}-${"g".repeat(24)}`, sensitive: "g".repeat(24) },
+    { name: "aws-access", secret: `${["AK", "IA"].join("")}${"C".repeat(16)}`, sensitive: "C".repeat(16) },
+    { name: "aws-secret", secret: `aws_secret_access_key=${awsSecret}`, sensitive: awsSecret },
+    { name: "github", secret: `${["gh", "p_"].join("")}${"H".repeat(24)}`, sensitive: "H".repeat(24) },
+    { name: "gitlab", secret: `${["glpat", ""].join("-")}${"L".repeat(24)}`, sensitive: "L".repeat(24) },
+    { name: "slack", secret: `${["xox", "b-"].join("")}${"1".repeat(16)}`, sensitive: "1".repeat(16) },
+    { name: "google", secret: `${["AI", "za"].join("")}${"Q".repeat(35)}`, sensitive: "Q".repeat(35) },
+    { name: "npm", secret: `${["npm", "_"].join("")}${"N".repeat(36)}`, sensitive: "N".repeat(36) },
+    { name: "bearer", secret: `Bearer ${bearer}`, sensitive: bearer },
+    { name: "jwt", secret: `eyJ${"j".repeat(10)}.${"k".repeat(10)}.${"m".repeat(10)}`, sensitive: `${"j".repeat(10)}.${"k".repeat(10)}.${"m".repeat(10)}` },
+    {
+      name: "private-key",
+      secret: `-----BEGIN ${privateLabel}-----\n${privateBody}\n-----END ${privateLabel}-----`,
+      sensitive: privateBody,
+    },
+  ];
+}
+
 const SAMPLE_EVENTS: AgentRunEvent[] = [
   {
     type: "run-start",
@@ -247,6 +273,68 @@ test("process output is redacted at RunLog persistence without mutating the vola
 
   assert.deepEqual(event, before);
   assert.doesNotMatch(await readFile(runLogPath(home, "chat-process", "run-process"), "utf8"), new RegExp(secret));
+});
+
+test("RunLog hides every registered credential family at every process chunk split and flushes benign suffixes", async () => {
+  const home = await appHome("all-process-splits");
+  const chatId = "chat-all-process-splits";
+  const runId = createRunId();
+  const log = await RunLog.open(home, chatId, runId);
+  const fixtures = streamingCredentialFixtures();
+  let timestamp = 1;
+
+  for (const fixture of fixtures) {
+    for (let split = 1; split < fixture.secret.length; split += 1) {
+      const id = `${fixture.name}-${split}`;
+      log.write({ type: "process-start", id, name: "verify", input: {}, timestamp: timestamp++ });
+      log.write({ type: "process-output", id, name: "verify", stream: "stdout", text: fixture.secret.slice(0, split), timestamp: timestamp++ });
+      log.write({ type: "process-output", id, name: "verify", stream: "stdout", text: `${fixture.secret.slice(split)}\n`, timestamp: timestamp++ });
+      log.write({
+        type: "process-end",
+        id,
+        name: "verify",
+        input: {},
+        exitCode: 0,
+        durationMs: 1,
+        truncated: false,
+        timedOut: false,
+        aborted: false,
+        timestamp: timestamp++,
+      });
+    }
+  }
+  log.write({ type: "process-start", id: "benign-suffix", name: "verify", input: {}, timestamp: timestamp++ });
+  log.write({ type: "process-output", id: "benign-suffix", name: "verify", stream: "stdout", text: "ordinary trailing s", timestamp: timestamp++ });
+  log.write({
+    type: "process-end",
+    id: "benign-suffix",
+    name: "verify",
+    input: {},
+    exitCode: 0,
+    durationMs: 1,
+    truncated: false,
+    timedOut: false,
+    aborted: false,
+    timestamp: timestamp++,
+  });
+  await log.close();
+
+  const outputById = new Map<string, string>();
+  for await (const event of RunLog.read(home, chatId, runId)) {
+    if (event.type === "process-output") {
+      outputById.set(event.id, `${outputById.get(event.id) ?? ""}${event.text}`);
+    }
+  }
+  for (const fixture of fixtures) {
+    for (let split = 1; split < fixture.secret.length; split += 1) {
+      assert.equal(
+        outputById.get(`${fixture.name}-${split}`)?.includes(fixture.sensitive),
+        false,
+        `${fixture.name} leaked at split ${split}`,
+      );
+    }
+  }
+  assert.equal(outputById.get("benign-suffix"), "ordinary trailing s");
 });
 
 test("read accepts versioned and legacy events while isolating future versions", async () => {

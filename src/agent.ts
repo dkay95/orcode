@@ -1,3 +1,5 @@
+import { AsyncLocalStorage } from "node:async_hooks";
+import { randomUUID } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import chalk from "chalk";
@@ -27,7 +29,7 @@ import {
   webSearchPlugin,
 } from "./openrouter.js";
 import { formatSecretWarning, scanForSecrets } from "./secrets.js";
-import { redactRunEvent } from "./redaction.js";
+import { ProcessEventRedactor } from "./redaction.js";
 import { createRunId, RunLog } from "./runlog.js";
 import {
   SessionStore,
@@ -116,6 +118,15 @@ export interface AgentRunObserver {
   onText?: (delta: string, fullText: string) => void;
   onEvent?: (event: AgentRunEvent) => void;
   signal?: AbortSignal;
+}
+
+interface LocalToolInvocation {
+  readonly invocationId: string;
+  readonly toolId: string;
+  readonly number: number;
+  readonly name: string;
+  readonly input: Record<string, unknown>;
+  readonly startedAt: number;
 }
 
 export class OrcodeAgent {
@@ -253,15 +264,22 @@ export class OrcodeAgent {
     const runHome = this.#session.appHome;
     let successful = false;
     let terminal = false;
+    const eventRedactor = new ProcessEventRedactor();
     // Every event this run produces goes through here: to the caller's
     // observer exactly as before, and — best effort, never fatal to the run
     // itself — appended to the run log so an interrupted run leaves a
     // reconstructable trail even if the process never reaches `finally`.
     const emit = (event: AgentRunEvent): void => {
       if (terminal) return;
-      if (event.type === "run-end") terminal = true;
-      runLog?.write(event);
-      observer.onEvent?.(event);
+      for (const safe of eventRedactor.push(event)) {
+        if (safe.type === "run-end") terminal = true;
+        runLog?.write(safe);
+        try {
+          observer.onEvent?.(safe);
+        } catch {
+          // Volatile UI/log consumers are observational and cannot fail a run.
+        }
+      }
     };
     emit({
       type: "run-start",
@@ -483,17 +501,8 @@ export class OrcodeAgent {
     // A closure assignment would not be visible to control-flow analysis, so
     // the stop reason is collected in an array instead of a narrowed variable.
     const stopReasons: Array<"step-limit" | "cost-limit"> = [];
-    const pendingTools = new Map<
-      string,
-      Array<{
-        id: string;
-        number: number;
-        input: Record<string, unknown>;
-        startedAt: number;
-      }>
-    >();
     const activeToolIds = new Set<string>();
-    const processTools = new Map<string, { id: string; number: number }>();
+    const invocationContext = new AsyncLocalStorage<LocalToolInvocation>();
     const pendingSessionToolCalls: Array<{ name: string; summary: string }> = [];
     const announceModelStep = (step: number) => {
       if (step <= announcedStep) {
@@ -516,35 +525,19 @@ export class OrcodeAgent {
       pendingModelStep = null;
       announceModelStep(step);
     };
-    const processBinding = (operation: ProcessOperation) => {
-      const existing = processTools.get(operation.id);
-      if (existing) return existing;
-      const claimedToolIds = new Set([...processTools.values()].map((binding) => binding.id));
-      const pending = findPendingTool(
-        pendingTools,
-        operation.name,
-        operation.input,
-        claimedToolIds,
-      );
-      if (pending) {
-        const binding = { id: pending.id, number: pending.number };
-        processTools.set(operation.id, binding);
-        return binding;
-      }
-      return undefined;
-    };
     const liveProcessEvent = (event: AgentRunEvent): void => {
       // External process output is redacted before any volatile sink sees it;
       // the canonical ProcessResult returned to the model remains untouched.
-      observer.onEvent?.(redactRunEvent(event));
+      observer.onEvent?.(event);
     };
     const processCallbacks = {
       onProcessStart: (operation: ProcessOperation) => {
-        const binding = processBinding(operation);
+        const binding = invocationContext.getStore();
         liveProcessEvent({
           type: "process-start",
           ...operation,
-          ...(binding ? { toolId: binding.id, toolNumber: binding.number } : {}),
+          invocationId: binding?.invocationId ?? operation.invocationId ?? operation.id,
+          ...(binding ? { toolId: binding.toolId, toolNumber: binding.number } : {}),
           timestamp: Date.now(),
         });
       },
@@ -553,26 +546,28 @@ export class OrcodeAgent {
         stream: "stdout" | "stderr",
         text: string,
       ) => {
-        const binding = processBinding(operation);
+        const binding = invocationContext.getStore();
         liveProcessEvent({
           type: "process-output",
           id: operation.id,
+          invocationId: binding?.invocationId ?? operation.invocationId ?? operation.id,
           name: operation.name,
           stream,
           text,
-          ...(binding ? { toolId: binding.id, toolNumber: binding.number } : {}),
+          ...(binding ? { toolId: binding.toolId, toolNumber: binding.number } : {}),
           timestamp: Date.now(),
         });
       },
       onProcessEnd: (operation: ProcessOperation, completion: ProcessCompletion) => {
-        const binding = processBinding(operation);
+        const binding = invocationContext.getStore();
         liveProcessEvent({
           type: "process-end",
           id: operation.id,
+          invocationId: binding?.invocationId ?? operation.invocationId ?? operation.id,
           name: operation.name,
           input: operation.input,
           ...completion,
-          ...(binding ? { toolId: binding.id, toolNumber: binding.number } : {}),
+          ...(binding ? { toolId: binding.toolId, toolNumber: binding.number } : {}),
           timestamp: Date.now(),
         });
       },
@@ -585,6 +580,100 @@ export class OrcodeAgent {
       runId,
       ...processCallbacks,
     });
+    // The SDK hooks do not expose a trustworthy per-call identity. Instrument
+    // the actual execute boundary instead: one immutable local identity owns
+    // the tool start, every descendant process event, and exactly one terminal.
+    type ExecutableTool = {
+      function: {
+        name: string;
+        execute: (
+          input: Record<string, unknown>,
+          context?: unknown,
+        ) => unknown | Promise<unknown>;
+      };
+    };
+    for (const definition of tools as unknown as ExecutableTool[]) {
+      const originalExecute = definition.function.execute.bind(definition.function);
+      definition.function.execute = async (input, context) => {
+        toolSequence += 1;
+        updateToolCount(toolSequence);
+        const invocation = Object.freeze<LocalToolInvocation>({
+          invocationId: randomUUID(),
+          toolId: `tool-${toolSequence}`,
+          number: toolSequence,
+          name: definition.function.name,
+          input,
+          startedAt: Date.now(),
+        });
+        activeToolIds.add(invocation.toolId);
+        observer.onEvent?.({
+          type: "tool-start",
+          id: invocation.toolId,
+          invocationId: invocation.invocationId,
+          number: invocation.number,
+          name: invocation.name,
+          input: invocation.input,
+          timestamp: invocation.startedAt,
+        });
+        let terminal = false;
+        try {
+          const output = await invocationContext.run(
+            invocation,
+            () => originalExecute(input, context),
+          );
+          try {
+            const outputText =
+              typeof output === "string" ? output : JSON.stringify(output) ?? "";
+            const findings = scanForSecrets(outputText);
+            if (findings.length) {
+              emitStatus(
+                observer,
+                formatSecretWarning(`Das Ergebnis von ${invocation.name}`, findings),
+                chalk.yellow,
+              );
+            }
+          } catch {
+            // Warning-only inspection and status sinks cannot alter the result.
+          }
+          pendingSessionToolCalls.push({
+            name: invocation.name,
+            summary: toolMetadata(invocation.name).summarizeInput(invocation.input),
+          });
+          terminal = true;
+          observer.onEvent?.({
+            type: "tool-end",
+            id: invocation.toolId,
+            invocationId: invocation.invocationId,
+            number: invocation.number,
+            name: invocation.name,
+            input: invocation.input,
+            output,
+            durationMs: Date.now() - invocation.startedAt,
+            timestamp: Date.now(),
+          });
+          return output;
+        } catch (error) {
+          if (!terminal) {
+            terminal = true;
+            observer.onEvent?.({
+              type: "tool-error",
+              id: invocation.toolId,
+              invocationId: invocation.invocationId,
+              number: invocation.number,
+              name: invocation.name,
+              input: invocation.input,
+              error: errorMessage(error),
+              durationMs: Date.now() - invocation.startedAt,
+              timestamp: Date.now(),
+            });
+          }
+          throw error;
+        } finally {
+          activeToolIds.delete(invocation.toolId);
+          startPendingModelStep();
+        }
+      };
+    }
     observer.onEvent?.({
       type: "model-start",
       model: this.config.mainModel,
@@ -659,102 +748,6 @@ export class OrcodeAgent {
           );
         },
         hooks: {
-          PreToolUse: [
-            {
-              handler: ({ toolName, toolInput }) => {
-                toolSequence += 1;
-                updateToolCount(toolSequence);
-                const pending = {
-                  id: `tool-${toolSequence}`,
-                  number: toolSequence,
-                  input: toolInput,
-                  startedAt: Date.now(),
-                };
-                const queue = pendingTools.get(toolName) ?? [];
-                queue.push(pending);
-                pendingTools.set(toolName, queue);
-                activeToolIds.add(pending.id);
-                observer.onEvent?.({
-                  type: "tool-start",
-                  id: pending.id,
-                  number: pending.number,
-                  name: toolName,
-                  input: toolInput,
-                  timestamp: pending.startedAt,
-                });
-              },
-            },
-          ],
-          PostToolUse: [
-            {
-              handler: ({ toolName, toolInput, toolOutput, durationMs }) => {
-                // Tool-Ergebnisse wandern in die Historie und damit zu
-                // OpenRouter — hier auf Zugangsdaten prüfen (warn-only).
-                const toolOutputText =
-                  typeof toolOutput === "string"
-                    ? toolOutput
-                    : JSON.stringify(toolOutput) ?? "";
-                const toolFindings = scanForSecrets(toolOutputText);
-                if (toolFindings.length) {
-                  emitStatus(
-                    observer,
-                    formatSecretWarning(`Das Ergebnis von ${toolName}`, toolFindings),
-                    chalk.yellow,
-                  );
-                }
-                const pending = shiftPendingTool(
-                  pendingTools,
-                  toolName,
-                  toolInput,
-                );
-                const id = pending?.id ?? `tool-${++toolSequence}`;
-                const number = pending?.number ?? toolSequence;
-                updateToolCount(toolSequence);
-                activeToolIds.delete(id);
-                pendingSessionToolCalls.push({
-                  name: toolName,
-                  summary: toolMetadata(toolName).summarizeInput(toolInput),
-                });
-                observer.onEvent?.({
-                  type: "tool-end",
-                  id,
-                  number,
-                  name: toolName,
-                  input: toolInput,
-                  output: toolOutput,
-                  durationMs,
-                  timestamp: Date.now(),
-                });
-                startPendingModelStep();
-              },
-            },
-          ],
-          PostToolUseFailure: [
-            {
-              handler: ({ toolName, toolInput, error }) => {
-                const pending = shiftPendingTool(
-                  pendingTools,
-                  toolName,
-                  toolInput,
-                );
-                const id = pending?.id ?? `tool-${++toolSequence}`;
-                const number = pending?.number ?? toolSequence;
-                updateToolCount(toolSequence);
-                activeToolIds.delete(id);
-                observer.onEvent?.({
-                  type: "tool-error",
-                  id,
-                  number,
-                  name: toolName,
-                  input: toolInput,
-                  error: errorMessage(error),
-                  durationMs: pending ? Date.now() - pending.startedAt : 0,
-                  timestamp: Date.now(),
-                });
-                startPendingModelStep();
-              },
-            },
-          ],
           Stop: [
             {
               handler: () => {
@@ -1199,63 +1192,6 @@ export async function buildModelInput(
     }
   }
   return items;
-}
-
-function shiftPendingTool(
-  pendingTools: Map<
-    string,
-    Array<{
-      id: string;
-      number: number;
-      input: Record<string, unknown>;
-      startedAt: number;
-    }>
-  >,
-  toolName: string,
-  toolInput: Record<string, unknown>,
-):
-  | {
-      id: string;
-      number: number;
-      input: Record<string, unknown>;
-      startedAt: number;
-    }
-  | undefined {
-  const queue = pendingTools.get(toolName);
-  if (!queue?.length) {
-    return undefined;
-  }
-  const exactIndex = queue.findIndex(
-    (pending) => JSON.stringify(pending.input) === JSON.stringify(toolInput),
-  );
-  const [pending] = queue.splice(exactIndex >= 0 ? exactIndex : 0, 1);
-  if (!queue.length) {
-    pendingTools.delete(toolName);
-  }
-  return pending;
-}
-
-function findPendingTool(
-  pendingTools: Map<
-    string,
-    Array<{
-      id: string;
-      number: number;
-      input: Record<string, unknown>;
-      startedAt: number;
-    }>
-  >,
-  toolName: string,
-  toolInput: Record<string, unknown>,
-  claimedToolIds: ReadonlySet<string>,
-): { id: string; number: number } | undefined {
-  const queue = pendingTools.get(toolName);
-  if (!queue?.length) return undefined;
-  return queue.find(
-    (pending) =>
-      !claimedToolIds.has(pending.id) &&
-      JSON.stringify(pending.input) === JSON.stringify(toolInput),
-  ) ?? queue.find((pending) => !claimedToolIds.has(pending.id));
 }
 
 /**

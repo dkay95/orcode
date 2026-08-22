@@ -215,6 +215,8 @@ export interface ProcessOperation {
   id: string;
   name: string;
   input: Record<string, unknown>;
+  /** Local immutable identity of the actual tool execution, when one owns this process. */
+  invocationId?: string;
 }
 
 /** Terminal process data emitted exactly once, independently of a tool's final result. */
@@ -224,6 +226,10 @@ export interface ProcessCompletion {
   truncated: boolean;
   timedOut: boolean;
   aborted: boolean;
+  /** Bounded terminal aggregate; the canonical ProcessResult stays unchanged. */
+  stdout?: string;
+  /** Bounded terminal aggregate; the canonical ProcessResult stays unchanged. */
+  stderr?: string;
   error?: string;
 }
 
@@ -296,6 +302,8 @@ export type AgentRunEvent =
   | {
       type: "tool-start";
       id: string;
+      /** Collision-free local identity created at the actual tool execute boundary. */
+      invocationId?: string;
       number: number;
       name: string;
       input: Record<string, unknown>;
@@ -304,6 +312,7 @@ export type AgentRunEvent =
   | {
       type: "tool-end";
       id: string;
+      invocationId?: string;
       number: number;
       name: string;
       input: Record<string, unknown>;
@@ -314,6 +323,7 @@ export type AgentRunEvent =
   | {
       type: "tool-error";
       id: string;
+      invocationId?: string;
       number: number;
       name: string;
       input: Record<string, unknown>;
@@ -324,6 +334,7 @@ export type AgentRunEvent =
   | {
       type: "tool-output";
       id: string;
+      invocationId?: string;
       number: number;
       stream: "stdout" | "stderr";
       text: string;
@@ -332,6 +343,7 @@ export type AgentRunEvent =
   | {
       type: "process-start";
       id: string;
+      invocationId?: string;
       name: string;
       input: Record<string, unknown>;
       toolId?: string;
@@ -341,6 +353,7 @@ export type AgentRunEvent =
   | {
       type: "process-output";
       id: string;
+      invocationId?: string;
       name: string;
       stream: "stdout" | "stderr";
       text: string;
@@ -351,6 +364,7 @@ export type AgentRunEvent =
   | ({
       type: "process-end";
       id: string;
+      invocationId?: string;
       name: string;
       input: Record<string, unknown>;
       toolId?: string;

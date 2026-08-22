@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { existsSync } from "node:fs";
-import { mkdtemp, readdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -455,6 +455,11 @@ test("a failing compressor falls back to the raw context and the run continues",
 
 test("the step counter follows model turns and never jumps back", async () => {
   const setup = await createAgent();
+  await Promise.all(
+    ["a.ts", "b.ts", "c.ts", "d.ts"].map((path) =>
+      writeFile(join(setup.workspace, path), `export const ${path[0]} = true;\n`),
+    ),
+  );
   const client = fakeClient(() => ({
     text: ["Fertig."],
     before: async (emit) => {
@@ -784,7 +789,7 @@ test("agent binds live process events to the stable tool ID, redacts split crede
   assert.equal(canonicalStdout, `${prefix}${body}\n`, "live redaction must not alter the canonical tool result");
   assert.equal(firstOutputWasLive, true);
   const processEvents = events.filter((event) => event.type.startsWith("process-")) as Array<AgentRunEvent & { id: string; toolId?: string; toolNumber?: number }>;
-  assert.deepEqual(processEvents.map((event) => event.type), ["process-start", "process-output", "process-output", "process-end"]);
+  assert.deepEqual(processEvents.map((event) => event.type), ["process-start", "process-output", "process-end"]);
   assert.equal(new Set(processEvents.map((event) => event.id)).size, 1);
   assert.ok(processEvents.every((event) => event.toolId === "tool-1" && event.toolNumber === 1));
   const visible = processEvents.map((event) => event.type === "process-output" ? (event as AgentRunEvent & { text: string }).text : "").join("");
@@ -792,6 +797,38 @@ test("agent binds live process events to the stable tool ID, redacts split crede
   assert.equal(events.filter((event) => event.type === "run-end").length, 1);
   const runName = (await readdir(join(setup.appHome, "runs", setup.session.data.id)))[0]!;
   assert.doesNotMatch(await readFile(join(setup.appHome, "runs", setup.session.data.id, runName), "utf8"), new RegExp(`${prefix}${body}`));
+});
+
+test("agent releases ordinary non-line output while the child is still alive", { skip: process.platform === "win32" ? "needs a POSIX shell (ORCODE_SHELL/ROUTERCODE_SHELL)" : false }, async () => {
+  const setup = await createAgent({}, new ApprovalManager("allow-all"));
+  const marker = join(tmpdir(), `routercode-agent-overlap-${Date.now()}-${Math.random()}`);
+  const client = fakeClient(() => ({
+    text: ["Fertig."],
+    before: async (emit) => {
+      const script = [
+        "const fs=require('node:fs')",
+        `fs.writeFileSync(${JSON.stringify(marker)}, 'alive')`,
+        "process.stdout.write('ordinary-live-output')",
+        `setTimeout(() => fs.unlinkSync(${JSON.stringify(marker)}), 120)`,
+      ].join(";");
+      await emit.executeTool("run_command", {
+        command: `${JSON.stringify(process.execPath)} -e ${JSON.stringify(script)}`,
+        timeoutSeconds: 5,
+      });
+      await emit.modelCall(0, 0.001);
+    },
+  }));
+  const agent = await setup.agent(client.client);
+  let outputWasLive = false;
+
+  await agent.run("stream ordinary", {
+    onText: () => {},
+    onEvent: (event) => {
+      if (event.type === "process-output") outputWasLive ||= existsSync(marker);
+    },
+  });
+
+  assert.equal(outputWasLive, true, "ordinary output was retained until process termination");
 });
 
 test("parallel identical process-backed tool calls retain distinct stable tool bindings", { skip: process.platform === "win32" ? "needs a POSIX shell (ORCODE_SHELL/ROUTERCODE_SHELL)" : false }, async () => {
@@ -820,6 +857,66 @@ test("parallel identical process-backed tool calls retain distinct stable tool b
     const lifecycle = events.filter((event) => event.type.startsWith("process-") && "id" in event && event.id === start.id);
     assert.ok(lifecycle.every((event) => "toolId" in event && event.toolId === start.toolId));
     assert.equal(lifecycle.at(-1)?.type, "process-end");
+  }
+});
+
+test("same-input tool invocations keep process and tool identities when completion reverses", { skip: process.platform === "win32" ? "needs a POSIX shell (ORCODE_SHELL/ROUTERCODE_SHELL)" : false }, async () => {
+  const setup = await createAgent({}, new ApprovalManager("allow-all"));
+  const marker = join(setup.workspace, "reverse-completion.marker");
+  const script = [
+    "const fs = require('node:fs')",
+    "const marker = process.argv[1]",
+    "try {",
+    "  fs.writeFileSync(marker, '', { flag: 'wx' })",
+    "  setTimeout(() => process.stdout.write('slow-first'), 200)",
+    "} catch {",
+    "  process.stdout.write('fast-second')",
+    "}",
+  ].join(";");
+  const input = {
+    command: `${JSON.stringify(process.execPath)} -e ${JSON.stringify(script)} ${JSON.stringify(marker)}`,
+    timeoutSeconds: 5,
+  };
+  const events: AgentRunEvent[] = [];
+  const client = fakeClient(() => ({
+    text: ["Fertig."],
+    before: async (emit) => {
+      const first = emit.executeTool("run_command", input);
+      for (let attempt = 0; attempt < 100 && !existsSync(marker); attempt += 1) {
+        await new Promise((resolve) => setTimeout(resolve, 5));
+      }
+      assert.equal(existsSync(marker), true, "the first identical invocation must be running before the second starts");
+      const second = emit.executeTool("run_command", input);
+      await second;
+      await first;
+      await emit.modelCall(0, 0.001);
+    },
+  }));
+  const agent = await setup.agent(client.client);
+
+  await agent.run("reverse", { onText: () => {}, onEvent: (event) => events.push(event) });
+
+  const processStarts = events.filter((event) => event.type === "process-start");
+  assert.deepEqual(processStarts.map((event) => event.toolId), ["tool-1", "tool-2"]);
+  assert.equal(new Set(processStarts.map((event) => event.invocationId)).size, 2);
+  for (const start of processStarts) {
+    const processEvents = events.filter((event) => event.type.startsWith("process-") && "id" in event && event.id === start.id);
+    assert.ok(processEvents.every((event) => "toolId" in event && event.toolId === start.toolId));
+    assert.ok(
+      processEvents.every((event) => "invocationId" in event && event.invocationId === start.invocationId),
+      JSON.stringify(processEvents),
+    );
+  }
+  const terminals = events.filter((event) => event.type === "tool-end" || event.type === "tool-error");
+  assert.deepEqual(terminals.map((event) => event.id), ["tool-2", "tool-1"],
+    "the second actual tool execution completed first and must keep its own identity",
+  );
+  assert.equal(new Set(terminals.map((event) => event.invocationId)).size, 2);
+  for (const terminal of terminals) {
+    const start = events.find((event) => event.type === "tool-start" && event.id === terminal.id);
+    assert.ok(start && start.type === "tool-start");
+    assert.equal(terminal.invocationId, start.invocationId);
+    assert.equal(terminals.filter((event) => event.id === terminal.id).length, 1);
   }
 });
 
@@ -898,6 +995,8 @@ test("a warning workspace budget only reports and lets the run continue", async 
 
 test("tool calls of a run show up in the Markdown export", async () => {
   const setup = await createAgent();
+  await mkdir(join(setup.workspace, "src"));
+  await writeFile(join(setup.workspace, "src/index.ts"), "export {};\n");
   const client = fakeClient(() => ({
     text: ["Gelesen."],
     before: async (emit) => {
@@ -1389,6 +1488,7 @@ test("Task 7 captured-request matrix: every main call uses one history source an
 
   await t.test("main failure discards buffered SDK state and preserves session data except incurred cost", async () => {
     const setup = await createAgent({ compressionMode: "off" });
+    await writeFile(join(setup.workspace, "a.ts"), "export {};\n");
     await addHistory(setup.session, "MAIN_FAILURE_TRANSCRIPT_SENTINEL");
     await persistConversationState(setup, "MAIN_FAILURE_COMMITTED_STATE");
     setup.session.setSummary("MAIN_FAILURE_SUMMARY");
@@ -1556,6 +1656,7 @@ test("Task 7 captured-request matrix: every main call uses one history source an
 
   await t.test("cancellation discards fresh compression state and preserves turns and summary while charging providers", async () => {
     const setup = await createAgent({ compressionMode: "always" });
+    await writeFile(join(setup.workspace, "b.ts"), "export {};\n");
     await addHistory(setup.session, "CANCEL_TRANSCRIPT_SENTINEL");
     await persistConversationState(setup, "CANCEL_COMMITTED_STATE");
     setup.session.setSummary("CANCEL_SUMMARY");
@@ -1722,7 +1823,10 @@ interface HookEmitter {
   modelCall(turnNumber: number, cost: number): Promise<void>;
   turnStart(numberOfTurns: number): Promise<void>;
   tool(name: string, input: Record<string, unknown>): Promise<void>;
-  executeTool(name: string, input: Record<string, unknown>): Promise<unknown>;
+  executeTool(
+    name: string,
+    input: Record<string, unknown>,
+  ): Promise<unknown>;
   stop(): Promise<void>;
 }
 
@@ -1794,6 +1898,27 @@ function hookEmitter(request: FakeRequest): HookEmitter {
       await entry.handler(payload as never);
     }
   };
+  const executeTool = async (name: string, input: Record<string, unknown>) => {
+    const raw = (request.tools ?? []) as RawTool[];
+    const selected = raw.find((candidate) => candidate.function.name === name);
+    assert.ok(selected, `Tool ${name} fehlt im Request`);
+    const parsed = selected.function.inputSchema.parse(input);
+    const executeContext = { numberOfTurns: 1 };
+    await call("PreToolUse", { toolName: name, toolInput: parsed });
+    try {
+      const output = await selected.function.execute(parsed as never, executeContext as never);
+      await call("PostToolUse", {
+        toolName: name,
+        toolInput: parsed,
+        toolOutput: output,
+        durationMs: 2,
+      });
+      return output;
+    } catch (error) {
+      await call("PostToolUseFailure", { toolName: name, toolInput: parsed, error });
+      throw error;
+    }
+  };
   return {
     async modelCall(turnNumber, cost) {
       await call("PostModelCall", {
@@ -1815,33 +1940,10 @@ function hookEmitter(request: FakeRequest): HookEmitter {
       await request.onTurnStart?.({ numberOfTurns });
     },
     async tool(name, input) {
-      await call("PreToolUse", { toolName: name, toolInput: input });
-      await call("PostToolUse", {
-        toolName: name,
-        toolInput: input,
-        toolOutput: { ok: true },
-        durationMs: 2,
-      });
+      await executeTool(name, input);
     },
     async executeTool(name, input) {
-      const raw = (request.tools ?? []) as RawTool[];
-      const selected = raw.find((candidate) => candidate.function.name === name);
-      assert.ok(selected, `Tool ${name} fehlt im Request`);
-      const parsed = selected.function.inputSchema.parse(input);
-      await call("PreToolUse", { toolName: name, toolInput: parsed });
-      try {
-        const output = await selected.function.execute(parsed as never, {} as never);
-        await call("PostToolUse", {
-          toolName: name,
-          toolInput: parsed,
-          toolOutput: output,
-          durationMs: 2,
-        });
-        return output;
-      } catch (error) {
-        await call("PostToolUseFailure", { toolName: name, toolInput: parsed, error });
-        throw error;
-      }
+      return executeTool(name, input);
     },
     async stop() {
       await call("Stop", { reason: "max_turns" });

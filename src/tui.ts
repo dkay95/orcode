@@ -21,7 +21,7 @@ import {
   type SlashCommandDefinition,
 } from "./command-catalog.js";
 import type { AgentRunEvent, ChatTurn, ModelInfo, ToolCallPreview } from "./types.js";
-import { redactRunEvent } from "./redaction.js";
+import { ProcessEventRedactor, redactRunEvent } from "./redaction.js";
 import type { ImageAttachment } from "./attachments.js";
 import type { PanelJudgment, PanelResult } from "./panel.js";
 import { approvalRiskLabel } from "./approval.js";
@@ -252,6 +252,7 @@ export class TerminalUi {
   >();
   readonly #processPending = new Map<string, { stream: "stdout" | "stderr"; text: string }>();
   readonly #terminalProcesses = new Set<string>();
+  readonly #processRedactor = new ProcessEventRedactor();
   #tick = 0;
   #spinnerTimer: NodeJS.Timeout | null = null;
   readonly #signalHandlers = new Map<NodeJS.Signals, () => void>();
@@ -408,6 +409,12 @@ export class TerminalUi {
 
   /** Bridge: the blocks belong to the view model, the run header stays here. */
   handleRunEvent(event: AgentRunEvent): void {
+    for (const safe of this.#processRedactor.push(event)) {
+      this.#handleRedactedRunEvent(safe);
+    }
+  }
+
+  #handleRedactedRunEvent(event: AgentRunEvent): void {
     if (
       event.type === "process-start" ||
       event.type === "process-output" ||
@@ -491,19 +498,32 @@ export class TerminalUi {
     }
     this.#flushProcessOutput(binding, safe.timestamp);
     if (!binding.bound) {
+      const stdout = safe.stdout ?? "";
+      const stderr = safe.stderr || safe.error || "";
+      const output = safe.name === "git_diff"
+        ? {
+            diff: stdout,
+            stderr,
+            exitCode: safe.exitCode,
+            truncated: safe.truncated,
+            timedOut: safe.timedOut,
+            aborted: safe.aborted,
+          }
+        : {
+            stdout,
+            stderr,
+            exitCode: safe.exitCode,
+            truncated: safe.truncated,
+            timedOut: safe.timedOut,
+            aborted: safe.aborted,
+          };
       this.#vm.apply({
         type: "tool-end",
         id: binding.eventId,
         number: binding.number,
         name: binding.name,
         input: binding.input,
-        output: {
-          exitCode: safe.exitCode,
-          truncated: safe.truncated,
-          timedOut: safe.timedOut,
-          aborted: safe.aborted,
-          ...(safe.error ? { stderr: safe.error } : {}),
-        },
+        output,
         durationMs: safe.durationMs,
         timestamp: safe.timestamp,
       });

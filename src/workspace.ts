@@ -1269,12 +1269,22 @@ export const TOOL_METADATA: Readonly<Record<string, ToolMetadata>> = Object.free
     "Git-Diff",
     "shell",
     (input) => (input.staged ? "gestagte Änderungen" : "Arbeitsbaum"),
-    (output) =>
-      `${nonEmptyLines(text(output.diff))} Diff-Zeilen${
+    (output) => {
+      const exitCode = count(output.exitCode);
+      if (exitCode !== null && exitCode !== 0) {
+        return `Git fehlgeschlagen (Exit ${exitCode})`;
+      }
+      return `${nonEmptyLines(text(output.diff))} Diff-Zeilen${
         output.truncated ? " · Ausgabe gekürzt" : ""
-      }`,
-    (output, opts) => bodyFromText(text(output.diff), null, opts),
-    (output) => text(output.diff),
+      }`;
+    },
+    (output, opts) =>
+      bodyFromText(
+        [text(output.diff), text(output.stderr)].filter(Boolean).join("\n"),
+        count(output.exitCode),
+        opts,
+      ),
+    (output) => [text(output.diff), text(output.stderr)].filter(Boolean).join("\n"),
   ),
   ssh_command: metadataEntry(
     "ssh_command",
@@ -2305,12 +2315,19 @@ export async function runObservedProcess(
   };
   try {
     const result = await execute(onChunk);
+    const stdout = boundedProcessCompletionText(result.stdout);
+    const stderr = boundedProcessCompletionText(result.stderr);
     finish({
       exitCode: result.code,
       durationMs: Date.now() - startedAt,
-      truncated: result.truncated,
+      truncated:
+        result.truncated ||
+        stdout.length !== result.stdout.length ||
+        stderr.length !== result.stderr.length,
       timedOut: result.timedOut,
       aborted: result.aborted,
+      stdout,
+      stderr,
     });
     return result;
   } catch (error) {
@@ -2324,6 +2341,12 @@ export async function runObservedProcess(
     });
     throw error;
   }
+}
+
+function boundedProcessCompletionText(value: string): string {
+  if (value.length <= MAX_TOOL_OUTPUT) return value;
+  const suffix = "\n… gekürzt …";
+  return `${value.slice(0, MAX_TOOL_OUTPUT - suffix.length)}${suffix}`;
 }
 
 export function runProcess(

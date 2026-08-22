@@ -87,7 +87,7 @@ import {
 } from "./reasoning.js";
 import { suggestVerifyCommands } from "./verify.js";
 import { errorMessage, hasCode, truncate } from "./utils.js";
-import { redactRunEvent } from "./redaction.js";
+import { ProcessEventRedactor } from "./redaction.js";
 
 /** Sink for command output — replaces the direct `console.log`/`console.error` calls. */
 export interface CommandOutput {
@@ -202,28 +202,32 @@ export function createPlainCommandOutput(): CommandOutput {
 }
 
 function processCallbacksForEvents(onEvent: (event: AgentRunEvent) => void): ProcessCallbacks {
+  const redactor = new ProcessEventRedactor();
+  const emit = (event: AgentRunEvent): void => {
+    for (const safe of redactor.push(event)) onEvent(safe);
+  };
   return {
-    onProcessStart: (operation) => onEvent(redactRunEvent({
+    onProcessStart: (operation) => emit({
       type: "process-start",
       ...operation,
       timestamp: Date.now(),
-    })),
-    onProcessChunk: (operation, stream, text) => onEvent(redactRunEvent({
+    }),
+    onProcessChunk: (operation, stream, text) => emit({
       type: "process-output",
       id: operation.id,
       name: operation.name,
       stream,
       text,
       timestamp: Date.now(),
-    })),
-    onProcessEnd: (operation, completion) => onEvent(redactRunEvent({
+    }),
+    onProcessEnd: (operation, completion) => emit({
       type: "process-end",
       id: operation.id,
       name: operation.name,
       input: operation.input,
       ...completion,
       timestamp: Date.now(),
-    })),
+    }),
   };
 }
 

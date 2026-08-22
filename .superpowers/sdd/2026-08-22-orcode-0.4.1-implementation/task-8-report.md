@@ -135,3 +135,99 @@ DONE
 - This task intentionally renders process lines through the existing tool-card
   model. Broader view-model/UI redesign and global Task 10 hardening remain out
   of scope.
+
+---
+
+## Fix round 1
+
+### Review RED
+
+- Read `task-8-findings-round-1.md` and the complete implementation ledger,
+  then reproduced every finding before its production fix.
+- Stateful credential probe: actual RunLog readback and actual TUI rendering
+  each failed at `openrouter leaked at split 1`; the matrices cover every split
+  of OpenRouter, Anthropic, generic `sk`, AWS ID/secret, GitHub, GitLab, Slack,
+  Google, npm, Bearer, JWT and private-key fixtures.
+- Invocation probe: two identical parallel `run_command` executions whose
+  completion order was deliberately reversed produced terminal IDs
+  `tool-1, tool-2` instead of `tool-2, tool-1` under hook/FIFO correlation.
+- Direct `/diff` probe: an actual dirty repository terminated as
+  `Arbeitsbaum — 0 Diff-Zeilen`; clean and failure distinctions therefore had
+  no trustworthy terminal aggregate.
+- Final self-review added one further RED barrier: ordinary non-newline output
+  was held until process termination instead of reaching the sink while the
+  child was alive.
+
+### SDK feasibility and approved identity design
+
+- The pinned `@openrouter/agent` 0.8.0 declarations describe a tool-call item
+  on execute context, but the installed runtime passes only turn state into the
+  tool and exposes no immutable call identity in Pre/Post hooks. No dependency
+  upgrade or patch was made.
+- Each actual local tool `execute` now creates exactly one frozen,
+  collision-free local invocation UUID plus its stable `tool-N` display ID.
+  `AsyncLocalStorage` carries that identity to every descendant process event.
+  The same execute wrapper owns start and exactly one success/error terminal;
+  Pre/Post hooks no longer create or correlate tool lifecycle events, and the
+  old name/input/FIFO maps were removed.
+- The local invocation UUID is explicitly not represented as a provider call
+  ID. Reverse completion, parallel identical input, process lifecycle binding
+  and exactly-one terminal are asserted against the real execute boundary.
+
+### Stateful streaming privacy
+
+- Added one operation-and-stream scoped overlap redactor used by the agent
+  observer boundary, direct command event bridge, TUI and RunLog. It retains
+  only a possible credential introducer/suffix or incomplete private-key block,
+  releases unrelated output live, and flushes retained benign text before the
+  terminal event.
+- Stateless redaction remains available for non-stream values. Redaction is
+  applied only to event clones; canonical `ProcessResult` stdout/stderr remains
+  byte-identical for the model and existing outbound warning policy.
+- RunLog owns its state across successive writes and flushes it on close. The
+  reconstructed flush event preserves invocation/tool identity, stream and
+  ordering before the one process terminal.
+
+### Accurate direct `/diff` terminal
+
+- `runObservedProcess` adds independently bounded stdout/stderr aggregates to
+  the volatile terminal completion without changing the returned canonical
+  process result. Direct `/diff` maps that aggregate to the existing
+  `git_diff` metadata, so dirty, clean and non-repository outcomes are accurate.
+- Failure summaries report `Git fehlgeschlagen (Exit N)`. The existing view
+  model continues to prefer its streamed buffer over the terminal aggregate,
+  so the visible tail is not duplicated.
+- `/diff` still uses the single hardened Git adapter, filtered environment,
+  disabled helper/textconv/pager policy and exact non-rememberable approval
+  subject; no second launch or helper path was introduced.
+
+### Fix-round GREEN evidence
+
+- Exact Task 8 focus:
+  `node --import tsx --test tests/workspace.test.ts tests/verify.test.ts tests/agent.test.ts tests/tui.test.ts tests/runlog.test.ts`
+  passed 220/220, with no skip or failure.
+- Every-family/every-split actual RunLog and TUI probes each passed 1/1; the
+  ordinary non-line child-liveness barrier, reverse-completion identity probe
+  and dirty/clean/failure `/diff` probe each passed 1/1.
+- Production and test TypeScript checks both passed.
+- Commands/approval/policy passed 38/38 and exact rule regressions 11/11; SSH
+  adapter/config/slash regressions passed 47/47 and SSH header regressions 4/4;
+  routing/config/OpenRouter/models/reasoning passed 62/62.
+- Full `npm test` reached 759 tests: 758 passed, 0 failed and 1 existing
+  platform-only skip.
+- The central scanner, literal credential-fixture audit and `git diff --check`
+  returned no findings.
+
+### Fix-round scope and concerns
+
+- The ledger-approved narrow additions are `src/redaction.ts` for central
+  stateful overlap handling and `src/runlog.ts` for persistence stream state.
+  `src/ui/view-model.ts`, approvals, remembered rules, private-store retention,
+  SDK dependency versions and provider routing remain unchanged.
+- Real process timing/reverse-completion tests are POSIX-only. SSH remains
+  covered with its injected runner and exact policy tests; no remote host was
+  contacted. Global Task 10 hardening and broader UI work remain out of scope.
+
+### Fix-round commit
+
+- Requested message: `fix: preserve streamed secrets and invocation identity`

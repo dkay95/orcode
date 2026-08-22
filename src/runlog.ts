@@ -5,7 +5,7 @@ import { createInterface } from "node:readline";
 import { createReadStream } from "node:fs";
 import { join } from "node:path";
 import { APP_HOME, ensureSecureDirectory, SECURE_FILE_MODE } from "./config.js";
-import { redactRunEvent } from "./redaction.js";
+import { ProcessEventRedactor, redactRunEvent } from "./redaction.js";
 import {
   CHAT_ARTIFACT_REGISTRY,
   RUN_LOG_ENVELOPE_VERSION,
@@ -72,6 +72,7 @@ export class RunLog {
   #handle: FileHandle;
   #chain: Promise<void> = Promise.resolve();
   #closed = false;
+  readonly #redactor = new ProcessEventRedactor();
 
   private constructor(handle: FileHandle, path: string) {
     this.#handle = handle;
@@ -98,13 +99,19 @@ export class RunLog {
     if (this.#closed) {
       return;
     }
-    const line = serializeRunEvent(event);
-    this.#chain = this.#chain.then(() => this.#handle.appendFile(line));
+    for (const safe of this.#redactor.push(event)) {
+      const line = serializeRunEvent(safe);
+      this.#chain = this.#chain.then(() => this.#handle.appendFile(line));
+    }
   }
 
   async close(): Promise<void> {
     if (this.#closed) {
       return;
+    }
+    for (const safe of this.#redactor.flushAll()) {
+      const line = serializeRunEvent(safe);
+      this.#chain = this.#chain.then(() => this.#handle.appendFile(line));
     }
     this.#closed = true;
     await this.#chain;

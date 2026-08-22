@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import { EventEmitter } from "node:events";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -17,6 +18,7 @@ import { lineWidth, plainText, type Line } from "../src/ui/spans.js";
 import { createTheme } from "../src/ui/theme.js";
 import { RunViewModel } from "../src/ui/view-model.js";
 import type { AgentRunEvent, ModelInfo } from "../src/types.js";
+import { handleSlashCommand, type CommandContext } from "../src/commands.js";
 
 const theme = createTheme({ level: 0 });
 const NOW = 1_700_000_000_000;
@@ -705,6 +707,57 @@ test("volatile process events render live and one terminal event does not duplic
   }
 });
 
+test("fullscreen /diff terminal frames distinguish dirty, clean, and failed repositories without duplicate tails", async (t) => {
+  try {
+    execFileSync("git", ["--version"], { stdio: "ignore" });
+  } catch {
+    t.skip("git ist nicht installiert");
+    return;
+  }
+  const renderDiff = async (workspace: string): Promise<string> => {
+    const stdin = new FakeInput();
+    const stdout = new FakeOutput();
+    stdout.rows = 40;
+    const terminal = ui(stdin, stdout);
+    terminal.start();
+    try {
+      const context = {
+        workspace,
+        onRunEvent: (event: AgentRunEvent) => terminal.handleRunEvent(event),
+        out: { text: () => undefined, error: () => undefined },
+      } as unknown as CommandContext;
+      await handleSlashCommand("/diff", context);
+      return text(terminal.frame().lines);
+    } finally {
+      terminal.stop();
+    }
+  };
+  const repository = mkdtempSync(join(tmpdir(), "routercode-tui-diff-"));
+  execFileSync("git", ["init", "-q"], { cwd: repository });
+  execFileSync("git", ["config", "user.email", "test@example.invalid"], { cwd: repository });
+  execFileSync("git", ["config", "user.name", "RouterCode Test"], { cwd: repository });
+  writeFileSync(join(repository, "tracked.txt"), "before\n");
+  execFileSync("git", ["add", "tracked.txt"], { cwd: repository });
+  execFileSync("git", ["commit", "-qm", "fixture"], { cwd: repository });
+  const failed = mkdtempSync(join(tmpdir(), "routercode-tui-diff-failed-"));
+  try {
+    const clean = await renderDiff(repository);
+    assert.match(clean, /0 Diff-Zeilen/);
+
+    writeFileSync(join(repository, "tracked.txt"), "after\n");
+    const dirty = await renderDiff(repository);
+    assert.match(dirty, /[1-9]\d* Diff-Zeilen/);
+    assert.ok((dirty.match(/after/g)?.length ?? 0) <= 1, "the streamed tail was duplicated at terminal completion");
+
+    const failure = await renderDiff(failed);
+    assert.match(failure, /(?:Git fehlgeschlagen|exit 1(?:28|29))/i);
+    assert.doesNotMatch(failure, /0 Diff-Zeilen/);
+  } finally {
+    rmSync(repository, { recursive: true, force: true });
+    rmSync(failed, { recursive: true, force: true });
+  }
+});
+
 test("process chunks are redacted and partial lines are reassembled before TUI rendering", () => {
   const stdin = new FakeInput();
   const stdout = new FakeOutput();
@@ -721,6 +774,78 @@ test("process chunks are redacted and partial lines are reassembled before TUI r
     assert.match(screen, /partial-line/);
     assert.doesNotMatch(screen, /^partial$/m);
     assert.doesNotMatch(screen, new RegExp(`${["sk", "or", "v1"].join("-")}-${"q".repeat(40)}`));
+  } finally {
+    terminal.stop();
+  }
+});
+
+test("TUI hides every registered credential family at every process chunk split and flushes benign suffixes", () => {
+  const awsSecret = "A".repeat(40);
+  const bearer = `token9${"b".repeat(24)}`;
+  const privateBody = "QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVo=";
+  const privateLabel = ["PRIVATE", "KEY"].join(" ");
+  const fixtures = [
+    { name: "openrouter", secret: `${["sk", "or", "v1"].join("-")}-${"o".repeat(24)}`, sensitive: "o".repeat(24) },
+    { name: "anthropic", secret: `${["sk", "ant"].join("-")}-${"a".repeat(24)}`, sensitive: "a".repeat(24) },
+    { name: "generic-sk", secret: `${["sk", "generic"].join("-")}-${"g".repeat(24)}`, sensitive: "g".repeat(24) },
+    { name: "aws-access", secret: `${["AK", "IA"].join("")}${"C".repeat(16)}`, sensitive: "C".repeat(16) },
+    { name: "aws-secret", secret: `aws_secret_access_key=${awsSecret}`, sensitive: awsSecret },
+    { name: "github", secret: `${["gh", "p_"].join("")}${"H".repeat(24)}`, sensitive: "H".repeat(24) },
+    { name: "gitlab", secret: `${["glpat", ""].join("-")}${"L".repeat(24)}`, sensitive: "L".repeat(24) },
+    { name: "slack", secret: `${["xox", "b-"].join("")}${"1".repeat(16)}`, sensitive: "1".repeat(16) },
+    { name: "google", secret: `${["AI", "za"].join("")}${"Q".repeat(35)}`, sensitive: "Q".repeat(35) },
+    { name: "npm", secret: `${["npm", "_"].join("")}${"N".repeat(36)}`, sensitive: "N".repeat(36) },
+    { name: "bearer", secret: `Bearer ${bearer}`, sensitive: bearer },
+    { name: "jwt", secret: `eyJ${"j".repeat(10)}.${"k".repeat(10)}.${"m".repeat(10)}`, sensitive: `${"j".repeat(10)}.${"k".repeat(10)}.${"m".repeat(10)}` },
+    { name: "private-key", secret: `-----BEGIN ${privateLabel}-----\n${privateBody}\n-----END ${privateLabel}-----`, sensitive: privateBody },
+  ];
+  const stdin = new FakeInput();
+  const stdout = new FakeOutput();
+  stdout.rows = 40;
+  const terminal = ui(stdin, stdout);
+  terminal.start();
+  try {
+    let timestamp = NOW;
+    for (const fixture of fixtures) {
+      for (let split = 1; split < fixture.secret.length; split += 1) {
+        const id = `${fixture.name}-${split}`;
+        terminal.handleRunEvent({ type: "process-start", id, name: "verify", input: {}, timestamp: timestamp++ } as AgentRunEvent);
+        terminal.handleRunEvent({ type: "process-output", id, name: "verify", stream: "stdout", text: fixture.secret.slice(0, split), timestamp: timestamp++ } as AgentRunEvent);
+        terminal.handleRunEvent({ type: "process-output", id, name: "verify", stream: "stdout", text: `${fixture.secret.slice(split)}\n`, timestamp: timestamp++ } as AgentRunEvent);
+        assert.equal(
+          text(terminal.frame().lines).includes(fixture.sensitive),
+          false,
+          `${fixture.name} leaked at split ${split}`,
+        );
+        terminal.handleRunEvent({
+          type: "process-end",
+          id,
+          name: "verify",
+          input: {},
+          exitCode: 0,
+          durationMs: 1,
+          truncated: false,
+          timedOut: false,
+          aborted: false,
+          timestamp: timestamp++,
+        } as AgentRunEvent);
+      }
+    }
+    terminal.handleRunEvent({ type: "process-start", id: "benign-suffix", name: "verify", input: {}, timestamp: timestamp++ } as AgentRunEvent);
+    terminal.handleRunEvent({ type: "process-output", id: "benign-suffix", name: "verify", stream: "stdout", text: "ordinary trailing s", timestamp: timestamp++ } as AgentRunEvent);
+    terminal.handleRunEvent({
+      type: "process-end",
+      id: "benign-suffix",
+      name: "verify",
+      input: {},
+      exitCode: 1,
+      durationMs: 1,
+      truncated: false,
+      timedOut: false,
+      aborted: false,
+      timestamp: timestamp++,
+    } as AgentRunEvent);
+    assert.match(text(terminal.frame().lines), /ordinary trailing s/);
   } finally {
     terminal.stop();
   }
