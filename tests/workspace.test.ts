@@ -18,6 +18,7 @@ import {
   shellApprovalSubject,
 } from "../src/rules.js";
 import type { ApprovalMode, ApprovalSubject, ToolCallPreview } from "../src/types.js";
+import type { SshHost } from "../src/ssh-config.js";
 import {
   CHAT_ARTIFACT_REGISTRY,
   migrationManifestPath,
@@ -95,8 +96,17 @@ async function sandbox(
     answer?: boolean;
     signal?: AbortSignal;
     prefix?: string;
-    onProcessStart?: (handle: object, tool: string, input: Record<string, unknown>) => void;
-    onProcessChunk?: (handle: object, stream: "stdout" | "stderr", text: string) => void;
+    onProcessStart?: (operation: { id: string; name: string; input: Record<string, unknown> }) => void;
+    onProcessChunk?: (
+      operation: { id: string; name: string; input: Record<string, unknown> },
+      stream: "stdout" | "stderr",
+      text: string,
+    ) => void;
+    onProcessEnd?: (
+      operation: { id: string; name: string; input: Record<string, unknown> },
+      result: { exitCode: number | null; durationMs: number; timedOut: boolean; aborted: boolean },
+    ) => void;
+    ssh?: CodingToolOptions["ssh"];
     inspectUrlFn?: CodingToolOptions["inspectUrlFn"];
   } = {},
 ): Promise<Sandbox> {
@@ -117,6 +127,8 @@ async function sandbox(
     ...(options.signal ? { signal: options.signal } : {}),
     ...(options.onProcessStart ? { onProcessStart: options.onProcessStart } : {}),
     ...(options.onProcessChunk ? { onProcessChunk: options.onProcessChunk } : {}),
+    ...(options.onProcessEnd ? { onProcessEnd: options.onProcessEnd } : {}),
+    ...(options.ssh ? { ssh: options.ssh } : {}),
     ...(options.inspectUrlFn ? { inspectUrlFn: options.inspectUrlFn } : {}),
   });
   return { root, tools, approvals, journal, asked };
@@ -853,13 +865,18 @@ test("run_command stops when the run is aborted", { skip: process.platform === "
 });
 
 test("run_command truncates oversized output", { skip: process.platform === "win32" ? "needs a POSIX shell (ORCODE_SHELL/ROUTERCODE_SHELL)" : false }, async () => {
-  const { tools } = await sandbox("allow-all", { prefix: "trunc" });
+  const chunks: string[] = [];
+  const { tools } = await sandbox("allow-all", {
+    prefix: "trunc",
+    onProcessChunk: (_operation, _stream, text) => chunks.push(text),
+  });
   const result = await invoke(tools, "run_command", {
-    command: `awk 'BEGIN{for(i=0;i<5000;i++) print "${"0123456789".repeat(4)}"}'`,
+    command: `awk 'BEGIN{for(i=0;i<10000;i++) print "${"0123456789".repeat(4)}"}'`,
     timeoutSeconds: 30,
   });
   assert.equal(result.truncated, true);
   assert.ok(String(result.stdout).length < 90_000);
+  assert.ok(chunks.join("").length <= 240_000, "volatile output exceeded the process buffer cap");
 });
 
 test("run_command keeps a hard timeout ceiling in its schema", async () => {
@@ -1465,11 +1482,15 @@ test("run_command streams stdout chunks that concatenate to the final result", {
 test("an aborted run_command stops delivering chunks", { skip: process.platform === "win32" ? "needs a POSIX shell (ORCODE_SHELL/ROUTERCODE_SHELL)" : false }, async () => {
   const controller = new AbortController();
   const chunks: string[] = [];
+  const completions: Array<{ aborted: boolean; exitCode: number | null }> = [];
   const { tools } = await sandbox("allow-all", {
     prefix: "abort-chunks",
     signal: controller.signal,
     onProcessChunk: (_handle, _stream, text) => {
       chunks.push(text);
+    },
+    onProcessEnd: (_operation, completion) => {
+      completions.push({ aborted: completion.aborted, exitCode: completion.exitCode });
     },
   });
   const pending = invoke(tools, "run_command", {
@@ -1482,35 +1503,156 @@ test("an aborted run_command stops delivering chunks", { skip: process.platform 
   const countAfterAbort = chunks.length;
   await delay(300);
   assert.equal(chunks.length, countAfterAbort, "onChunk feuerte nach dem Abbruch noch");
+  assert.deepEqual(completions, [{ aborted: true, exitCode: 130 }]);
 });
 
-test("run_command and git_diff report process start and chunks through one identity handle", { skip: process.platform === "win32" ? "needs a POSIX shell (ORCODE_SHELL/ROUTERCODE_SHELL)" : false }, async () => {
-  const starts: Array<{ tool: string }> = [];
-  const chunkHandles = new Set<object>();
+test("run_command and hardened git stream ordered stdout/stderr before exit through stable bounded operation IDs", { skip: process.platform === "win32" ? "needs a POSIX shell (ORCODE_SHELL/ROUTERCODE_SHELL)" : false }, async () => {
+  const marker = join(tmpdir(), `routercode-live-${Date.now()}-${Math.random()}`);
+  const lifecycle: Array<{ kind: "start" | "chunk" | "end"; id: string; name: string; stream?: string; text?: string }> = [];
+  let firstChunkWasLive = false;
   const { root, tools } = await sandbox("allow-all", {
     prefix: "handles",
-    onProcessStart: (handle, tool) => {
-      starts.push({ tool });
-      chunkHandles.add(handle);
+    onProcessStart: (operation) => {
+      lifecycle.push({ kind: "start", id: operation.id, name: operation.name });
     },
-    onProcessChunk: (handle) => {
-      assert.ok(chunkHandles.has(handle), "onProcessChunk bekam ein fremdes Handle");
+    onProcessChunk: (operation, stream, text) => {
+      if (lifecycle.every((event) => event.kind !== "chunk")) {
+        firstChunkWasLive = existsSync(marker);
+      }
+      lifecycle.push({ kind: "chunk", id: operation.id, name: operation.name, stream, text });
+    },
+    onProcessEnd: (operation) => {
+      lifecycle.push({ kind: "end", id: operation.id, name: operation.name });
     },
   });
-  await invoke(tools, "run_command", { command: "echo hi", timeoutSeconds: 5 });
+  const script = [
+    "const fs=require('node:fs')",
+    `fs.writeFileSync(${JSON.stringify(marker)}, 'alive')`,
+    "process.stdout.write('out-one\\n')",
+    "setTimeout(() => process.stderr.write('err-two\\n'), 40)",
+    `setTimeout(() => { fs.unlinkSync(${JSON.stringify(marker)}); process.stdout.write('out-three\\n') }, 90)`,
+  ].join(";");
+  const commandResult = await invoke(tools, "run_command", {
+    command: `${JSON.stringify(process.execPath)} -e ${JSON.stringify(script)}`,
+    timeoutSeconds: 5,
+  });
+  assert.equal(firstChunkWasLive, true, "the first visible chunk arrived only after child exit");
+  assert.deepEqual(
+    lifecycle
+      .filter((event) => event.name === "run_command" && event.kind === "chunk")
+      .map((event) => [event.stream, event.text]),
+    [
+      ["stdout", "out-one\n"],
+      ["stderr", "err-two\n"],
+      ["stdout", "out-three\n"],
+    ],
+  );
+  assert.equal(commandResult.stdout, "out-one\nout-three\n");
+  assert.equal(commandResult.stderr, "err-two\n");
 
-  if (await gitAvailable()) {
+  const hasGit = await gitAvailable();
+  if (hasGit) {
     await run("git", ["init", "-q"], { cwd: root });
     await run("git", ["config", "user.email", "test@example.invalid"], { cwd: root });
     await run("git", ["config", "user.name", "RouterCode Test"], { cwd: root });
     await invoke(tools, "git_diff", { staged: false });
-    assert.deepEqual(
-      starts.map((entry) => entry.tool),
-      ["run_command", "git_diff"],
-    );
-  } else {
-    assert.deepEqual(starts, [{ tool: "run_command" }]);
   }
+  const names = hasGit ? ["run_command", "git_diff"] : ["run_command"];
+  assert.deepEqual(lifecycle.filter((event) => event.kind === "start").map((event) => event.name), names);
+  for (const name of names) {
+    const events = lifecycle.filter((event) => event.name === name);
+    assert.equal(new Set(events.map((event) => event.id)).size, 1, `${name} changed operation id`);
+    assert.equal(events.filter((event) => event.kind === "start").length, 1);
+    assert.equal(events.filter((event) => event.kind === "end").length, 1);
+    assert.equal(events.at(-1)?.kind, "end");
+  }
+  assert.ok(lifecycle.filter((event) => event.kind === "chunk").reduce((sum, event) => sum + (event.text?.length ?? 0), 0) < 250_000);
+  await rm(marker, { force: true });
+});
+
+test("ssh_command uses the same stable start/chunk/end contract", async () => {
+  const host: SshHost = { alias: "fixture", hostName: "203.0.113.20", user: "tester" };
+  const lifecycle: Array<{ kind: string; id: string; stream?: string; text?: string }> = [];
+  let sshRuns = 0;
+  const { tools } = await sandbox("allow-all", {
+    prefix: "ssh-live",
+    ssh: {
+      hosts: [host],
+      appHome: await mkdtemp(join(tmpdir(), "routercode-ssh-live-")),
+      runSsh: async (_args, options) => {
+        sshRuns += 1;
+        options.onChunk?.("stdout", "remote-out\n");
+        await delay(10);
+        options.onChunk?.("stderr", "remote-err\n");
+        return { code: 0, stdout: "remote-out\n", stderr: "remote-err\n", truncated: false, timedOut: false, aborted: false };
+      },
+    },
+    onProcessStart: (operation) => lifecycle.push({ kind: "start", id: operation.id }),
+    onProcessChunk: (operation, stream, text) => lifecycle.push({ kind: "chunk", id: operation.id, stream, text }),
+    onProcessEnd: (operation) => lifecycle.push({ kind: "end", id: operation.id }),
+  });
+
+  const result = await invoke(tools, "ssh_command", { host: "fixture", command: "status", timeoutSeconds: 5 });
+  assert.equal(result.stdout, "remote-out\n");
+  assert.equal(result.stderr, "remote-err\n");
+  assert.deepEqual(lifecycle.map((event) => event.kind), ["start", "chunk", "chunk", "end"]);
+  assert.equal(new Set(lifecycle.map((event) => event.id)).size, 1);
+  assert.equal(sshRuns, 1, "stream observation must not execute SSH a second time");
+});
+
+test("parallel identical commands retain collision-free operation IDs", { skip: process.platform === "win32" ? "needs a POSIX shell (ORCODE_SHELL/ROUTERCODE_SHELL)" : false }, async () => {
+  const starts: string[] = [];
+  const byId = new Map<string, string[]>();
+  const { tools } = await sandbox("allow-all", {
+    prefix: "parallel-ids",
+    onProcessStart: (operation) => starts.push(operation.id),
+    onProcessChunk: (operation, _stream, text) => byId.set(operation.id, [...(byId.get(operation.id) ?? []), text]),
+  });
+  await Promise.all([
+    invoke(tools, "run_command", { command: "printf same; sleep 0.05", timeoutSeconds: 5 }),
+    invoke(tools, "run_command", { command: "printf same; sleep 0.05", timeoutSeconds: 5 }),
+  ]);
+  assert.equal(starts.length, 2);
+  assert.equal(new Set(starts).size, 2);
+  assert.deepEqual(starts.map((id) => byId.get(id)?.join("")), ["same", "same"]);
+});
+
+test("consumer callback failures never change the canonical process result", { skip: process.platform === "win32" ? "needs a POSIX shell (ORCODE_SHELL/ROUTERCODE_SHELL)" : false }, async () => {
+  const { tools } = await sandbox("allow-all", {
+    prefix: "callback-isolation",
+    onProcessStart: () => { throw new Error("start sink failed"); },
+    onProcessChunk: () => { throw new Error("chunk sink failed"); },
+    onProcessEnd: () => { throw new Error("end sink failed"); },
+  });
+  const result = await invoke(tools, "run_command", { command: "printf canonical", timeoutSeconds: 5 });
+  assert.equal(result.exitCode, 0);
+  assert.equal(result.stdout, "canonical");
+});
+
+test("timeout emits one terminal process event and rejects every late chunk", { skip: process.platform === "win32" ? "needs a POSIX shell (ORCODE_SHELL/ROUTERCODE_SHELL)" : false }, async () => {
+  const chunks: string[] = [];
+  const ends: Array<{ timedOut: boolean }> = [];
+  let ended = false;
+  const { tools } = await sandbox("allow-all", {
+    prefix: "timeout-terminal",
+    onProcessChunk: (_operation, _stream, text) => {
+      assert.equal(ended, false, "chunk arrived after terminal event");
+      chunks.push(text);
+    },
+    onProcessEnd: (_operation, result) => {
+      ended = true;
+      ends.push({ timedOut: result.timedOut });
+    },
+  });
+  const result = await invoke(tools, "run_command", {
+    command: "printf before; (sleep 0.3; printf late) & sleep 5",
+    timeoutSeconds: 1,
+  });
+  assert.equal(result.exitCode, 124);
+  assert.deepEqual(ends, [{ timedOut: true }]);
+  const after = chunks.length;
+  await delay(500);
+  assert.equal(chunks.length, after);
 });
 
 test("run_command's timeout ceiling sits at exactly 1800 seconds", async () => {
@@ -1583,8 +1725,15 @@ test("undoLastRun --dry-run reports what it would do without writing anything", 
 
 test("browser_check inspects localhost without asking", async () => {
   const calls: string[] = [];
+  const lifecycle: Array<{ kind: "start" | "end"; id: string; exitCode?: number | null }> = [];
   const box = await sandbox("ask", {
     answer: false, // a question here would reject and fail the call
+    onProcessStart: (operation) => lifecycle.push({ kind: "start", id: operation.id }),
+    onProcessEnd: (operation, completion) => lifecycle.push({
+      kind: "end",
+      id: operation.id,
+      exitCode: completion.exitCode,
+    }),
     inspectUrlFn: async (options: { url: string }) => {
       calls.push(options.url);
       return {
@@ -1604,6 +1753,11 @@ test("browser_check inspects localhost without asking", async () => {
   assert.equal(calls.length, 1);
   assert.equal(box.asked.length, 0, "localhost must not require approval");
   assert.equal(result.title, "Lokale Seite");
+  assert.equal(lifecycle.length, 2);
+  assert.equal(lifecycle[0]?.kind, "start");
+  assert.equal(lifecycle[1]?.kind, "end");
+  assert.equal(lifecycle[0]?.id, lifecycle[1]?.id);
+  assert.equal(lifecycle[1]?.exitCode, 0);
 });
 
 test("browser_check asks before loading a third-party page", async () => {

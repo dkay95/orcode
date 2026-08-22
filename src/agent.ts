@@ -27,6 +27,7 @@ import {
   webSearchPlugin,
 } from "./openrouter.js";
 import { formatSecretWarning, scanForSecrets } from "./secrets.js";
+import { redactRunEvent } from "./redaction.js";
 import { createRunId, RunLog } from "./runlog.js";
 import {
   SessionStore,
@@ -42,6 +43,8 @@ import type {
   AgentRunEvent,
   BalanceInfo,
   ModelInfo,
+  ProcessCompletion,
+  ProcessOperation,
 } from "./types.js";
 import {
   getReasoningSetting,
@@ -249,11 +252,14 @@ export class OrcodeAgent {
     const runLog = await this.#openRunLog(runId);
     const runHome = this.#session.appHome;
     let successful = false;
+    let terminal = false;
     // Every event this run produces goes through here: to the caller's
     // observer exactly as before, and — best effort, never fatal to the run
     // itself — appended to the run log so an interrupted run leaves a
     // reconstructable trail even if the process never reaches `finally`.
     const emit = (event: AgentRunEvent): void => {
+      if (terminal) return;
+      if (event.type === "run-end") terminal = true;
       runLog?.write(event);
       observer.onEvent?.(event);
     };
@@ -452,16 +458,6 @@ export class OrcodeAgent {
     const projectNotes = projectNotesBlock(
       await loadProjectNotes(this.guard.root),
     );
-    // The signal has to reach the tools, otherwise Esc/Ctrl+C leaves a running
-    // shell command behind.
-    // K3/A5: one runId per agent run (now handed in by `run()`, shared with
-    // the run log), so every tool call within this run shares the same undo
-    // unit instead of createCodingTools minting a new one per call.
-    const tools = createCodingTools(this.guard, this.approvals, this.journal, {
-      ...(observer.signal ? { signal: observer.signal } : {}),
-      registry: this.#readRegistry,
-      runId,
-    });
     const modelInfo = await this.#mainModelInfoFor(
       this.config.mainModel,
       observer.signal,
@@ -497,6 +493,7 @@ export class OrcodeAgent {
       }>
     >();
     const activeToolIds = new Set<string>();
+    const processTools = new Map<string, { id: string; number: number }>();
     const pendingSessionToolCalls: Array<{ name: string; summary: string }> = [];
     const announceModelStep = (step: number) => {
       if (step <= announcedStep) {
@@ -519,6 +516,75 @@ export class OrcodeAgent {
       pendingModelStep = null;
       announceModelStep(step);
     };
+    const processBinding = (operation: ProcessOperation) => {
+      const existing = processTools.get(operation.id);
+      if (existing) return existing;
+      const claimedToolIds = new Set([...processTools.values()].map((binding) => binding.id));
+      const pending = findPendingTool(
+        pendingTools,
+        operation.name,
+        operation.input,
+        claimedToolIds,
+      );
+      if (pending) {
+        const binding = { id: pending.id, number: pending.number };
+        processTools.set(operation.id, binding);
+        return binding;
+      }
+      return undefined;
+    };
+    const liveProcessEvent = (event: AgentRunEvent): void => {
+      // External process output is redacted before any volatile sink sees it;
+      // the canonical ProcessResult returned to the model remains untouched.
+      observer.onEvent?.(redactRunEvent(event));
+    };
+    const processCallbacks = {
+      onProcessStart: (operation: ProcessOperation) => {
+        const binding = processBinding(operation);
+        liveProcessEvent({
+          type: "process-start",
+          ...operation,
+          ...(binding ? { toolId: binding.id, toolNumber: binding.number } : {}),
+          timestamp: Date.now(),
+        });
+      },
+      onProcessChunk: (
+        operation: ProcessOperation,
+        stream: "stdout" | "stderr",
+        text: string,
+      ) => {
+        const binding = processBinding(operation);
+        liveProcessEvent({
+          type: "process-output",
+          id: operation.id,
+          name: operation.name,
+          stream,
+          text,
+          ...(binding ? { toolId: binding.id, toolNumber: binding.number } : {}),
+          timestamp: Date.now(),
+        });
+      },
+      onProcessEnd: (operation: ProcessOperation, completion: ProcessCompletion) => {
+        const binding = processBinding(operation);
+        liveProcessEvent({
+          type: "process-end",
+          id: operation.id,
+          name: operation.name,
+          input: operation.input,
+          ...completion,
+          ...(binding ? { toolId: binding.id, toolNumber: binding.number } : {}),
+          timestamp: Date.now(),
+        });
+      },
+    };
+    // The signal has to reach the tools, otherwise Esc/Ctrl+C leaves a running
+    // shell command behind. One runId keeps every edit in one undo unit.
+    const tools = createCodingTools(this.guard, this.approvals, this.journal, {
+      ...(observer.signal ? { signal: observer.signal } : {}),
+      registry: this.#readRegistry,
+      runId,
+      ...processCallbacks,
+    });
     observer.onEvent?.({
       type: "model-start",
       model: this.config.mainModel,
@@ -1167,6 +1233,29 @@ function shiftPendingTool(
     pendingTools.delete(toolName);
   }
   return pending;
+}
+
+function findPendingTool(
+  pendingTools: Map<
+    string,
+    Array<{
+      id: string;
+      number: number;
+      input: Record<string, unknown>;
+      startedAt: number;
+    }>
+  >,
+  toolName: string,
+  toolInput: Record<string, unknown>,
+  claimedToolIds: ReadonlySet<string>,
+): { id: string; number: number } | undefined {
+  const queue = pendingTools.get(toolName);
+  if (!queue?.length) return undefined;
+  return queue.find(
+    (pending) =>
+      !claimedToolIds.has(pending.id) &&
+      JSON.stringify(pending.input) === JSON.stringify(toolInput),
+  ) ?? queue.find((pending) => !claimedToolIds.has(pending.id));
 }
 
 /**

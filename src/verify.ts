@@ -30,7 +30,13 @@ import {
   type VerifyConfig,
   type VerifyMode,
 } from "./config.js";
-import { resolveCommandShell, runProcess, type WorkspaceGuard } from "./workspace.js";
+import {
+  resolveCommandShell,
+  runObservedProcess,
+  runProcess,
+  type WorkspaceGuard,
+} from "./workspace.js";
+import type { ProcessCallbacks } from "./types.js";
 import { isRecord, truncate } from "./utils.js";
 
 // ---------------------------------------------------------------------------
@@ -156,6 +162,7 @@ export async function runVerify(
   guard: WorkspaceGuard,
   signal: AbortSignal | undefined,
   onEvent: OnVerifyEvent,
+  processCallbacks: ProcessCallbacks = {},
 ): Promise<VerifyOutcome> {
   for (const command of commands) {
     if (signal?.aborted) {
@@ -163,11 +170,17 @@ export async function runVerify(
     }
     const shell = await resolveCommandShell();
     const start = Date.now();
-    const result = await runProcess(shell.executable, [...shell.args, command], {
-      cwd: guard.root,
-      timeoutMs: VERIFY_TIMEOUT_MS,
-      signal,
-    });
+    const result = await runObservedProcess(
+      "verify",
+      { command },
+      processCallbacks,
+      (onChunk) => runProcess(shell.executable, [...shell.args, command], {
+        cwd: guard.root,
+        timeoutMs: VERIFY_TIMEOUT_MS,
+        signal,
+        onChunk,
+      }),
+    );
     if (result.aborted) {
       return { status: "cancelled" };
     }

@@ -13,7 +13,9 @@ import {
   REASONING_EFFORTS,
   type BalanceInfo,
   type CreditInfo,
+  type AgentRunEvent,
   type ModelInfo,
+  type ProcessCallbacks,
   type ReasoningEffort,
   type ReasoningSetting,
   type OrcodeConfig,
@@ -85,6 +87,7 @@ import {
 } from "./reasoning.js";
 import { suggestVerifyCommands } from "./verify.js";
 import { errorMessage, hasCode, truncate } from "./utils.js";
+import { redactRunEvent } from "./redaction.js";
 
 /** Sink for command output — replaces the direct `console.log`/`console.error` calls. */
 export interface CommandOutput {
@@ -174,6 +177,8 @@ export interface CommandContext {
   ) => void;
   /** One destructive chat-deletion confirmation. Fullscreen UI injects its modal; plain mode uses Inquirer. */
   confirmChatDeletion?: (title: string, details: string) => Promise<boolean>;
+  /** Active surface event sink; the dashboard uses it for direct `/diff` live output. */
+  onRunEvent?: (event: AgentRunEvent) => void;
 }
 
 /** Every command that persists `context.config` goes through this, never a bare `saveConfig(context.config)` — see `CommandContext.configPath`. */
@@ -193,6 +198,32 @@ export function createPlainCommandOutput(): CommandOutput {
         console.error(chalk.dim(hint));
       }
     },
+  };
+}
+
+function processCallbacksForEvents(onEvent: (event: AgentRunEvent) => void): ProcessCallbacks {
+  return {
+    onProcessStart: (operation) => onEvent(redactRunEvent({
+      type: "process-start",
+      ...operation,
+      timestamp: Date.now(),
+    })),
+    onProcessChunk: (operation, stream, text) => onEvent(redactRunEvent({
+      type: "process-output",
+      id: operation.id,
+      name: operation.name,
+      stream,
+      text,
+      timestamp: Date.now(),
+    })),
+    onProcessEnd: (operation, completion) => onEvent(redactRunEvent({
+      type: "process-end",
+      id: operation.id,
+      name: operation.name,
+      input: operation.input,
+      ...completion,
+      timestamp: Date.now(),
+    })),
   };
 }
 
@@ -295,7 +326,13 @@ export async function handleSlashCommand(
       await clearSession(context.session, context.agent, context.out);
       return "continue";
     case "diff":
-      context.out.text(await getGitDiff(context.workspace));
+      {
+        const callbacks = context.onRunEvent
+          ? processCallbacksForEvents(context.onRunEvent)
+          : undefined;
+        const diff = await getGitDiff(context.workspace, runProcess, callbacks);
+        if (!callbacks) context.out.text(diff);
+      }
       return "continue";
     case "undo":
       context.out.text(
@@ -1756,11 +1793,15 @@ async function verifyCommand(args: string[], context: CommandContext): Promise<v
       return;
     }
     const { runVerify } = await import("./verify.js");
+    const callbacks = context.onRunEvent
+      ? processCallbacksForEvents(context.onRunEvent)
+      : undefined;
     const outcome = await runVerify(
       context.config.verify.commands,
       context.agent.guard,
       undefined,
       () => {},
+      callbacks,
     );
     if (outcome.status === "passed") {
       context.out.text(chalk.green("Verify: alle Kommandos grün."));

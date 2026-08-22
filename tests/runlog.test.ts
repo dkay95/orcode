@@ -82,6 +82,39 @@ const SAMPLE_EVENTS: AgentRunEvent[] = [
     timestamp: 8,
   },
   {
+    type: "process-start",
+    id: "process-1",
+    name: "run_command",
+    input: { command: "npm test" },
+    toolId: "t1",
+    toolNumber: 1,
+    timestamp: 8.1,
+  },
+  {
+    type: "process-output",
+    id: "process-1",
+    name: "run_command",
+    stream: "stderr",
+    text: "live error\n",
+    toolId: "t1",
+    toolNumber: 1,
+    timestamp: 8.2,
+  },
+  {
+    type: "process-end",
+    id: "process-1",
+    name: "run_command",
+    input: { command: "npm test" },
+    exitCode: 0,
+    durationMs: 200,
+    truncated: false,
+    timedOut: false,
+    aborted: false,
+    toolId: "t1",
+    toolNumber: 1,
+    timestamp: 8.3,
+  },
+  {
     type: "verify",
     command: "npm test",
     round: 1,
@@ -194,6 +227,26 @@ test("appendRunEvent redacts a clone and writes the same versioned envelope", as
   const envelope = JSON.parse(raw) as RunLogEnvelope;
   assert.equal(envelope.version, 1);
   assert.equal(envelope.event.type, "notice");
+});
+
+test("process output is redacted at RunLog persistence without mutating the volatile event", async () => {
+  const home = await appHome("process-output-redaction");
+  const secret = syntheticCredential();
+  const event = {
+    type: "process-output",
+    id: "process-secret",
+    name: "verify",
+    stream: "stdout",
+    text: `live ${secret}`,
+    timestamp: 44,
+  } as AgentRunEvent;
+  const before = structuredClone(event);
+  const log = await RunLog.open(home, "chat-process", "run-process");
+  log.write(event);
+  await log.close();
+
+  assert.deepEqual(event, before);
+  assert.doesNotMatch(await readFile(runLogPath(home, "chat-process", "run-process"), "utf8"), new RegExp(secret));
 });
 
 test("read accepts versioned and legacy events while isolating future versions", async () => {

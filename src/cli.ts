@@ -482,6 +482,8 @@ interface RuntimeContext {
   ) => void;
   /** Fullscreen destructive-chat confirmation; plain mode leaves this unset for Inquirer. */
   confirmChatDeletion?: (title: string, details: string) => Promise<boolean>;
+  /** Direct slash-command process events (currently `/diff`) for the active dashboard. */
+  onRunEvent?: (event: AgentRunEvent) => void;
 }
 
 async function runPlainLoop(
@@ -843,6 +845,7 @@ async function runDashboard(
   context.seedNextMessage = (text) => ui.insertInputText(text);
   context.onPanelResult = (result, judgment, expandedIndex) =>
     ui.addPanelResult(result, judgment, expandedIndex);
+  context.onRunEvent = (event) => ui.handleRunEvent(event);
   context.confirmChatDeletion = async (title, details) =>
     (await ui.confirmAction(title, details)).accepted;
   // Showing a transcript behind the chat chooser contradicts the question it

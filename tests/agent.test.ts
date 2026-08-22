@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { existsSync } from "node:fs";
 import { mkdtemp, readdir, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -740,6 +741,86 @@ test("the tools of a run receive the abort signal", async () => {
     {} as never,
   )) as { exitCode: number };
   assert.equal(output.exitCode, 130);
+});
+
+test("agent binds live process events to the stable tool ID, redacts split credentials, and terminates once", { skip: process.platform === "win32" ? "needs a POSIX shell (ORCODE_SHELL/ROUTERCODE_SHELL)" : false }, async () => {
+  const setup = await createAgent({}, new ApprovalManager("allow-all"));
+  const marker = join(tmpdir(), `routercode-agent-live-${Date.now()}-${Math.random()}`);
+  const prefix = `${["sk", "or", "v1"].join("-")}-`;
+  const body = "q".repeat(40);
+  let canonicalStdout = "";
+  const client = fakeClient(() => ({
+    text: ["Fertig."],
+    before: async (emit) => {
+      const script = [
+        "const fs=require('node:fs')",
+        `fs.writeFileSync(${JSON.stringify(marker)}, 'alive')`,
+        `process.stdout.write(${JSON.stringify(prefix)})`,
+        `setTimeout(() => process.stdout.write(${JSON.stringify(`${body}\n`)}), 30)`,
+        `setTimeout(() => fs.unlinkSync(${JSON.stringify(marker)}), 90)`,
+      ].join(";");
+      const output = await emit.executeTool("run_command", {
+        command: `${JSON.stringify(process.execPath)} -e ${JSON.stringify(script)}`,
+        timeoutSeconds: 5,
+      }) as { stdout: string };
+      canonicalStdout = output.stdout;
+      await emit.modelCall(0, 0.001);
+    },
+  }));
+  const agent = await setup.agent(client.client);
+  const events: AgentRunEvent[] = [];
+  let firstOutputWasLive = false;
+
+  await agent.run("stream", {
+    onText: () => {},
+    onEvent: (event) => {
+      if (event.type === "process-output" && !events.some((candidate) => candidate.type === "process-output")) {
+        firstOutputWasLive = existsSync(marker);
+      }
+      events.push(event);
+    },
+  });
+
+  assert.equal(canonicalStdout, `${prefix}${body}\n`, "live redaction must not alter the canonical tool result");
+  assert.equal(firstOutputWasLive, true);
+  const processEvents = events.filter((event) => event.type.startsWith("process-")) as Array<AgentRunEvent & { id: string; toolId?: string; toolNumber?: number }>;
+  assert.deepEqual(processEvents.map((event) => event.type), ["process-start", "process-output", "process-output", "process-end"]);
+  assert.equal(new Set(processEvents.map((event) => event.id)).size, 1);
+  assert.ok(processEvents.every((event) => event.toolId === "tool-1" && event.toolNumber === 1));
+  const visible = processEvents.map((event) => event.type === "process-output" ? (event as AgentRunEvent & { text: string }).text : "").join("");
+  assert.equal(visible.includes(`${prefix}${body}`), false);
+  assert.equal(events.filter((event) => event.type === "run-end").length, 1);
+  const runName = (await readdir(join(setup.appHome, "runs", setup.session.data.id)))[0]!;
+  assert.doesNotMatch(await readFile(join(setup.appHome, "runs", setup.session.data.id, runName), "utf8"), new RegExp(`${prefix}${body}`));
+});
+
+test("parallel identical process-backed tool calls retain distinct stable tool bindings", { skip: process.platform === "win32" ? "needs a POSIX shell (ORCODE_SHELL/ROUTERCODE_SHELL)" : false }, async () => {
+  const setup = await createAgent({}, new ApprovalManager("allow-all"));
+  const input = { command: "sleep 0.05; printf parallel", timeoutSeconds: 5 };
+  const client = fakeClient(() => ({
+    text: ["Fertig."],
+    before: async (emit) => {
+      await Promise.all([
+        emit.executeTool("run_command", input),
+        emit.executeTool("run_command", input),
+      ]);
+      await emit.modelCall(0, 0.001);
+    },
+  }));
+  const agent = await setup.agent(client.client);
+  const events: AgentRunEvent[] = [];
+
+  await agent.run("parallel", { onText: () => {}, onEvent: (event) => events.push(event) });
+
+  const starts = events.filter((event) => event.type === "process-start");
+  assert.equal(starts.length, 2);
+  assert.equal(new Set(starts.map((event) => event.id)).size, 2);
+  assert.deepEqual(new Set(starts.map((event) => event.toolId)), new Set(["tool-1", "tool-2"]));
+  for (const start of starts) {
+    const lifecycle = events.filter((event) => event.type.startsWith("process-") && "id" in event && event.id === start.id);
+    assert.ok(lifecycle.every((event) => "toolId" in event && event.toolId === start.toolId));
+    assert.equal(lifecycle.at(-1)?.type, "process-end");
+  }
 });
 
 test("each run starts with a fresh rejection budget", async () => {
@@ -1641,6 +1722,7 @@ interface HookEmitter {
   modelCall(turnNumber: number, cost: number): Promise<void>;
   turnStart(numberOfTurns: number): Promise<void>;
   tool(name: string, input: Record<string, unknown>): Promise<void>;
+  executeTool(name: string, input: Record<string, unknown>): Promise<unknown>;
   stop(): Promise<void>;
 }
 
@@ -1740,6 +1822,26 @@ function hookEmitter(request: FakeRequest): HookEmitter {
         toolOutput: { ok: true },
         durationMs: 2,
       });
+    },
+    async executeTool(name, input) {
+      const raw = (request.tools ?? []) as RawTool[];
+      const selected = raw.find((candidate) => candidate.function.name === name);
+      assert.ok(selected, `Tool ${name} fehlt im Request`);
+      const parsed = selected.function.inputSchema.parse(input);
+      await call("PreToolUse", { toolName: name, toolInput: parsed });
+      try {
+        const output = await selected.function.execute(parsed as never, {} as never);
+        await call("PostToolUse", {
+          toolName: name,
+          toolInput: parsed,
+          toolOutput: output,
+          durationMs: 2,
+        });
+        return output;
+      } catch (error) {
+        await call("PostToolUseFailure", { toolName: name, toolInput: parsed, error });
+        throw error;
+      }
     },
     async stop() {
       await call("Stop", { reason: "max_turns" });

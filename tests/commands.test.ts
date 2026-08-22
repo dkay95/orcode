@@ -1,8 +1,10 @@
 import assert from "node:assert/strict";
+import { execFile } from "node:child_process";
 import { mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { promisify } from "node:util";
 import { SpendUnavailableError, assertSpendAvailable } from "../src/agent.js";
 import {
   handleSlashCommand,
@@ -13,6 +15,9 @@ import { OpenRouterHttpError } from "../src/openrouter.js";
 import { SessionStore } from "../src/session.js";
 import { DEFAULT_CONFIG } from "../src/config.js";
 import { migrationManifestPath } from "../src/storage.js";
+import type { AgentRunEvent } from "../src/types.js";
+
+const run = promisify(execFile);
 
 test("only unusable credentials trigger replacement", () => {
   assert.equal(
@@ -87,6 +92,56 @@ test("an expired key is still replaced", () => {
   });
   assert.equal(expired.reason, "key-expired");
   assert.equal(shouldReplaceCredential(expired), true);
+});
+
+test("direct /diff streams through the hardened Git event path without duplicating the final diff", async (t) => {
+  const workspace = await mkdtemp(join(tmpdir(), "routercode-command-diff-"));
+  try {
+    await run("git", ["init", "-q"], { cwd: workspace });
+  } catch {
+    t.skip("git ist nicht installiert");
+    return;
+  }
+  await writeFile(join(workspace, "tracked.txt"), "before\n", "utf8");
+  await run("git", ["add", "tracked.txt"], { cwd: workspace });
+  await run("git", ["-c", "user.email=test@example.invalid", "-c", "user.name=RouterCode Test", "commit", "-qm", "fixture"], { cwd: workspace });
+  await writeFile(join(workspace, "tracked.txt"), "after\n", "utf8");
+  const events: AgentRunEvent[] = [];
+  const output: string[] = [];
+  const context = {
+    workspace,
+    onRunEvent: (event: AgentRunEvent) => events.push(event),
+    out: { text: (value: string) => output.push(value), error: (value: string) => output.push(value) },
+  } as unknown as CommandContext;
+
+  await handleSlashCommand("/diff", context);
+
+  assert.deepEqual(events.map((event) => event.type), ["process-start", "process-output", "process-end"]);
+  const processEvents = events as Array<AgentRunEvent & { id: string; name: string }>;
+  assert.equal(new Set(processEvents.map((event) => event.id)).size, 1);
+  assert.ok(processEvents.every((event) => event.name === "git_diff"));
+  assert.deepEqual(output, [], "the streamed diff must not be printed a second time as a final tail");
+});
+
+test("direct /verify now forwards the live process lifecycle to the active surface", { skip: process.platform === "win32" ? "needs a POSIX shell" : false }, async () => {
+  const workspace = await mkdtemp(join(tmpdir(), "routercode-command-verify-"));
+  const events: AgentRunEvent[] = [];
+  const config = structuredClone(DEFAULT_CONFIG);
+  config.verify.commands = ["printf verify-live"];
+  const context = {
+    workspace,
+    config,
+    agent: { guard: { root: workspace } },
+    onRunEvent: (event: AgentRunEvent) => events.push(event),
+    out: { text: () => undefined, error: () => undefined },
+  } as unknown as CommandContext;
+
+  await handleSlashCommand("/verify now", context);
+
+  assert.deepEqual(events.map((event) => event.type), ["process-start", "process-output", "process-end"]);
+  const processEvents = events as Array<AgentRunEvent & { id: string; name: string }>;
+  assert.equal(new Set(processEvents.map((event) => event.id)).size, 1);
+  assert.ok(processEvents.every((event) => event.name === "verify"));
 });
 
 test("chat deletion asks exactly once; decline changes nothing and accept deletes the selected chat", async () => {

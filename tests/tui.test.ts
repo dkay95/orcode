@@ -16,7 +16,7 @@ import type { ChatBlock } from "../src/ui/blocks.js";
 import { lineWidth, plainText, type Line } from "../src/ui/spans.js";
 import { createTheme } from "../src/ui/theme.js";
 import { RunViewModel } from "../src/ui/view-model.js";
-import type { ModelInfo } from "../src/types.js";
+import type { AgentRunEvent, ModelInfo } from "../src/types.js";
 
 const theme = createTheme({ level: 0 });
 const NOW = 1_700_000_000_000;
@@ -654,6 +654,123 @@ test("assistant text after a tool is rendered after the completed tool card", ()
     assert.ok(after > tool);
     // exit 0 earns the verified glyph, everything else would only get `~`.
     assert.match(screen, /✓ python -m pytest/);
+  } finally {
+    terminal.stop();
+  }
+});
+
+test("volatile process events render live and one terminal event does not duplicate the tail", () => {
+  const stdin = new FakeInput();
+  const stdout = new FakeOutput();
+  stdout.rows = 36;
+  const terminal = ui(stdin, stdout);
+  terminal.start();
+  try {
+    terminal.handleRunEvent({
+      type: "process-start",
+      id: "direct-diff-1",
+      name: "git_diff",
+      input: { staged: false },
+      timestamp: NOW,
+    } as AgentRunEvent);
+    terminal.handleRunEvent({
+      type: "process-output",
+      id: "direct-diff-1",
+      name: "git_diff",
+      stream: "stdout",
+      text: "+live-line\n",
+      timestamp: NOW + 1,
+    } as AgentRunEvent);
+    assert.match(text(terminal.frame().lines), /live-line/);
+
+    const terminalEvent = {
+      type: "process-end",
+      id: "direct-diff-1",
+      name: "git_diff",
+      input: { staged: false },
+      exitCode: 0,
+      durationMs: 20,
+      truncated: false,
+      timedOut: false,
+      aborted: false,
+      timestamp: NOW + 20,
+    } as AgentRunEvent;
+    terminal.handleRunEvent(terminalEvent);
+    terminal.handleRunEvent(terminalEvent);
+    const screen = text(terminal.frame().lines);
+    assert.ok((screen.match(/live-line/g)?.length ?? 0) <= 1);
+    assert.equal(screen.match(/Arbeitsbaum/g)?.length, 1);
+  } finally {
+    terminal.stop();
+  }
+});
+
+test("process chunks are redacted and partial lines are reassembled before TUI rendering", () => {
+  const stdin = new FakeInput();
+  const stdout = new FakeOutput();
+  stdout.rows = 36;
+  const terminal = ui(stdin, stdout);
+  terminal.start();
+  try {
+    terminal.handleRunEvent({ type: "process-start", id: "p-secret", name: "verify", input: { command: "check" }, timestamp: NOW } as AgentRunEvent);
+    terminal.handleRunEvent({ type: "process-output", id: "p-secret", name: "verify", stream: "stdout", text: "partial", timestamp: NOW + 1 } as AgentRunEvent);
+    terminal.handleRunEvent({ type: "process-output", id: "p-secret", name: "verify", stream: "stdout", text: "-line\n", timestamp: NOW + 2 } as AgentRunEvent);
+    terminal.handleRunEvent({ type: "process-output", id: "p-secret", name: "verify", stream: "stderr", text: `${["sk", "or", "v1"].join("-")}-`, timestamp: NOW + 3 } as AgentRunEvent);
+    terminal.handleRunEvent({ type: "process-output", id: "p-secret", name: "verify", stream: "stderr", text: `${"q".repeat(40)}\n`, timestamp: NOW + 4 } as AgentRunEvent);
+    const screen = text(terminal.frame().lines);
+    assert.match(screen, /partial-line/);
+    assert.doesNotMatch(screen, /^partial$/m);
+    assert.doesNotMatch(screen, new RegExp(`${["sk", "or", "v1"].join("-")}-${"q".repeat(40)}`));
+  } finally {
+    terminal.stop();
+  }
+});
+
+test("terminal process deduplication is bounded and eventually releases old operation IDs", () => {
+  const stdin = new FakeInput();
+  const stdout = new FakeOutput();
+  stdout.rows = 36;
+  const terminal = ui(stdin, stdout);
+  terminal.start();
+  try {
+    for (let index = 0; index < 513; index += 1) {
+      const id = `bounded-${index}`;
+      terminal.handleRunEvent({
+        type: "process-start",
+        id,
+        name: "verify",
+        input: { command: String(index) },
+        timestamp: NOW + index,
+      } as AgentRunEvent);
+      terminal.handleRunEvent({
+        type: "process-end",
+        id,
+        name: "verify",
+        input: { command: String(index) },
+        exitCode: 0,
+        durationMs: 1,
+        truncated: false,
+        timedOut: false,
+        aborted: false,
+        timestamp: NOW + index,
+      } as AgentRunEvent);
+    }
+    terminal.handleRunEvent({
+      type: "process-start",
+      id: "bounded-0",
+      name: "verify",
+      input: { command: "reused" },
+      timestamp: NOW + 600,
+    } as AgentRunEvent);
+    terminal.handleRunEvent({
+      type: "process-output",
+      id: "bounded-0",
+      name: "verify",
+      stream: "stdout",
+      text: "reused-live\n",
+      timestamp: NOW + 601,
+    } as AgentRunEvent);
+    assert.match(text(terminal.frame().lines), /reused-live/);
   } finally {
     terminal.stop();
   }

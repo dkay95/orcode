@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readdir } from "node:fs/promises";
+import { existsSync } from "node:fs";
+import { mkdtemp, readdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test, { mock } from "node:test";
@@ -154,6 +155,62 @@ test("runVerify passes when every command exits 0", needsPosixShell, async () =>
   assert.equal(events[1]?.exitCode, 0);
   assert.ok(events.every((event) => typeof event.durationMs === "number" && event.durationMs >= 0));
   assert.ok(events.every((event) => typeof event.timestamp === "number"));
+});
+
+test("runVerify streams separated output while the child is alive with one stable operation terminal", needsPosixShell, async () => {
+  const guard = await tempWorkspace();
+  const marker = join(tmpdir(), `routercode-verify-live-${Date.now()}-${Math.random()}`);
+  const { onEvent } = collect();
+  const lifecycle: Array<{ kind: string; id: string; stream?: string; text?: string }> = [];
+  let firstChunkWasLive = false;
+  const script = [
+    "const fs=require('node:fs')",
+    `fs.writeFileSync(${JSON.stringify(marker)}, 'alive')`,
+    "process.stdout.write('verify-out\\n')",
+    "setTimeout(() => process.stderr.write('verify-err\\n'), 30)",
+    `setTimeout(() => fs.unlinkSync(${JSON.stringify(marker)}), 80)`,
+  ].join(";");
+
+  const outcome = await runVerify(
+    [`${JSON.stringify(process.execPath)} -e ${JSON.stringify(script)}`],
+    guard,
+    undefined,
+    onEvent,
+    {
+      onProcessStart: (operation: { id: string }) => lifecycle.push({ kind: "start", id: operation.id }),
+      onProcessChunk: (operation: { id: string }, stream: string, text: string) => {
+        if (!lifecycle.some((event) => event.kind === "chunk")) firstChunkWasLive = existsSync(marker);
+        lifecycle.push({ kind: "chunk", id: operation.id, stream, text });
+      },
+      onProcessEnd: (operation: { id: string }) => lifecycle.push({ kind: "end", id: operation.id }),
+    } as never,
+  );
+
+  assert.deepEqual(outcome, { status: "passed" });
+  assert.equal(firstChunkWasLive, true);
+  assert.deepEqual(lifecycle.map((event) => event.kind), ["start", "chunk", "chunk", "end"]);
+  assert.equal(new Set(lifecycle.map((event) => event.id)).size, 1);
+  assert.deepEqual(lifecycle.filter((event) => event.kind === "chunk").map((event) => [event.stream, event.text]), [
+    ["stdout", "verify-out\n"],
+    ["stderr", "verify-err\n"],
+  ]);
+  await rm(marker, { force: true });
+});
+
+test("repeated verification commands receive distinct operation IDs", needsPosixShell, async () => {
+  const guard = await tempWorkspace();
+  const ids: string[] = [];
+  const { onEvent } = collect();
+  const outcome = await runVerify(
+    ["printf repeated", "printf repeated"],
+    guard,
+    undefined,
+    onEvent,
+    { onProcessStart: (operation: { id: string }) => ids.push(operation.id) } as never,
+  );
+  assert.deepEqual(outcome, { status: "passed" });
+  assert.equal(ids.length, 2);
+  assert.equal(new Set(ids).size, 2);
 });
 
 test("runVerify stops at the first failing command and does not run the rest", needsPosixShell, async () => {

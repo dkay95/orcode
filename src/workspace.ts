@@ -55,7 +55,12 @@ import {
 } from "./rules.js";
 import { findSshHost, loadSshHosts, type SshHost } from "./ssh-config.js";
 import { execSshCommand, sshApprovalSubject, type RunSsh } from "./ssh.js";
-import type { ToolRisk } from "./types.js";
+import type {
+  ProcessCallbacks,
+  ProcessCompletion,
+  ProcessOperation,
+  ToolRisk,
+} from "./types.js";
 import { hasCode, isRecord, sanitizedEnvironment, truncate } from "./utils.js";
 
 const MAX_FILE_BYTES = 1_500_000;
@@ -347,17 +352,13 @@ function text_(value: string): string {
   return truncate(value.replace(/\s+/g, " ").trim(), 500);
 }
 
-export interface CodingToolOptions {
+export interface CodingToolOptions extends ProcessCallbacks {
   /** Cancels running child processes (Esc / Ctrl+C in the UI). */
   signal?: AbortSignal;
   /** Tracks reads so writes can detect external changes (K4). One per agent. */
   registry?: ReadRegistry;
   /** Groups every change this call bundle makes into one undoable run (A5). */
   runId?: string;
-  /** Fired once, right before a child process starts (K3, live shell). */
-  onProcessStart?: (handle: object, tool: string, input: Record<string, unknown>) => void;
-  /** Fired for every chunk of stdout/stderr a running process produces (K3). */
-  onProcessChunk?: (handle: object, stream: "stdout" | "stderr", text: string) => void;
   /** `browser_check`: explicit browser binary; unset means auto-detection. */
   browserPath?: string;
   /** `browser_check`: hard limit for one inspection, browser startup included. */
@@ -716,14 +717,17 @@ export function createCodingTools(
           command: executionCommand,
         }),
       });
-      const handle: object = {};
-      options.onProcessStart?.(handle, "run_command", { command: executionCommand, timeoutSeconds });
-      const result = await runProcess(shell.executable, [...shell.args, executionCommand], {
-        cwd: guard.root,
-        timeoutMs: timeoutSeconds * 1_000,
-        ...(signal ? { signal } : {}),
-        onChunk: (stream, text) => options.onProcessChunk?.(handle, stream, text),
-      });
+      const result = await runObservedProcess(
+        "run_command",
+        { command: executionCommand, timeoutSeconds },
+        options,
+        (onChunk) => runProcess(shell.executable, [...shell.args, executionCommand], {
+          cwd: guard.root,
+          timeoutMs: timeoutSeconds * 1_000,
+          ...(signal ? { signal } : {}),
+          onChunk,
+        }),
+      );
       const stdout = truncate(result.stdout, MAX_TOOL_OUTPUT);
       const stderr = truncate(result.stderr, MAX_TOOL_OUTPUT);
       return {
@@ -750,7 +754,6 @@ export function createCodingTools(
       truncated: z.boolean(),
     }),
     execute: async ({ staged }) => {
-      const handle: object = {};
       const execution = await runHardenedGitRead(
         guard.root,
         { operation: "diff", staged },
@@ -770,11 +773,12 @@ export function createCodingTools(
               forwardedEnvironment: env,
             }),
           });
-          options.onProcessStart?.(handle, "git_diff", { staged });
         },
         {
           ...(signal ? { signal } : {}),
-          onChunk: (stream, text) => options.onProcessChunk?.(handle, stream, text),
+          processCallbacks: options,
+          processName: "git_diff",
+          processInput: { staged },
         },
       );
       const result = execution.result;
@@ -852,17 +856,42 @@ export function createCodingTools(
           subject: browserApprovalSubject(target, "inspect"),
         });
       }
-      const handle: object = {};
-      options.onProcessStart?.(handle, "browser_check", { url: target.href });
+      const operation: ProcessOperation = {
+        id: randomUUID(),
+        name: "browser_check",
+        input: { url: target.href },
+      };
+      const startedAt = Date.now();
+      safeNotify(options.onProcessStart, operation);
       const inspect = options.inspectUrlFn ?? inspectUrl;
-      const report = await inspect({
-        url: target.href,
-        timeoutMs: (options.browserTimeoutSeconds ?? 30) * 1000,
-        waitMs,
-        fullPage,
-        ...(viewport ? { viewport } : {}),
-        ...(options.browserPath ? { browserPath: options.browserPath } : {}),
-      });
+      let report: Awaited<ReturnType<typeof inspect>>;
+      try {
+        report = await inspect({
+          url: target.href,
+          timeoutMs: (options.browserTimeoutSeconds ?? 30) * 1000,
+          waitMs,
+          fullPage,
+          ...(viewport ? { viewport } : {}),
+          ...(options.browserPath ? { browserPath: options.browserPath } : {}),
+        });
+        safeNotify(options.onProcessEnd, operation, {
+          exitCode: 0,
+          durationMs: Date.now() - startedAt,
+          truncated: report.truncated,
+          timedOut: false,
+          aborted: false,
+        });
+      } catch (error) {
+        safeNotify(options.onProcessEnd, operation, {
+          exitCode: null,
+          durationMs: Date.now() - startedAt,
+          truncated: false,
+          timedOut: false,
+          aborted: signal?.aborted ?? false,
+          error: error instanceof Error ? error.message : String(error),
+        });
+        throw error;
+      }
       return {
         url: report.url,
         title: report.title,
@@ -931,12 +960,13 @@ export function createCodingTools(
         }.\n$ ${command}`,
       });
 
-      const handle: object = {};
-      options.onProcessStart?.(handle, "ssh_command", { host, command, timeoutSeconds });
-      const result = await execSshCommand(host, hosts, command, runSsh, {
+      const input = { host, command, timeoutSeconds };
+      const observedRunSsh: RunSsh = (args, runOptions) =>
+        runObservedProcess("ssh_command", input, options, (onChunk) =>
+          runSsh(args, { ...runOptions, onChunk }));
+      const result = await execSshCommand(host, hosts, command, observedRunSsh, {
         timeoutSeconds,
         ...(signal ? { signal } : {}),
-        onChunk: (stream, text) => options.onProcessChunk?.(handle, stream, text),
         runtime: {
           ...(sshOptions.appHome ? { appHome: sshOptions.appHome } : {}),
           ...(sshOptions.controlPersist ? { controlPersist: sshOptions.controlPersist } : {}),
@@ -1430,6 +1460,9 @@ export type HardenedGitReadRequest =
 export type HardenedGitRuntime = Pick<RunProcessOptions, "signal" | "onChunk"> & {
   /** Injectable source for filtering; production uses the current process environment. */
   environment?: NodeJS.ProcessEnv;
+  processCallbacks?: ProcessCallbacks;
+  processName?: string;
+  processInput?: Record<string, unknown>;
 };
 
 export async function resolveExecutablePath(
@@ -1488,7 +1521,13 @@ export async function runHardenedGitRead(
     ...filteredEnvironment,
     ...GIT_SAFE_ENVIRONMENT,
   };
-  const { environment: _environment, ...processRuntime } = runtime;
+  const {
+    environment: _environment,
+    processCallbacks,
+    processName,
+    processInput,
+    ...processRuntime
+  } = runtime;
   const invocation: HardenedGitInvocation = {
     executable: await resolveExecutablePath("git", effectiveEnvironment),
     args: request.operation === "diff" ? gitDiffArgs(request.staged) : gitStatusArgs(),
@@ -1496,17 +1535,42 @@ export async function runHardenedGitRead(
     env: effectiveEnvironment,
   };
   await beforeRun?.(invocation, policy);
-  const result = await runner(invocation.executable, invocation.args, {
-    cwd: invocation.cwd,
-    timeoutMs: request.operation === "diff" ? 20_000 : 3_000,
-    env: invocation.env,
-    ...processRuntime,
-  });
+  const execute = (onChunk: RunProcessOptions["onChunk"]) =>
+    runner(invocation.executable, invocation.args, {
+      cwd: invocation.cwd,
+      timeoutMs: request.operation === "diff" ? 20_000 : 3_000,
+      env: invocation.env,
+      ...processRuntime,
+      ...(onChunk ? { onChunk } : {}),
+    });
+  const result = processCallbacks
+    ? await runObservedProcess(
+        processName ?? policy.id,
+        processInput ?? { operation: request.operation },
+        processCallbacks,
+        (observedChunk) => execute((stream, text) => {
+          safeNotify(processRuntime.onChunk, stream, text);
+          observedChunk(stream, text);
+        }),
+      )
+    : await execute(processRuntime.onChunk);
   return { policy, invocation, result };
 }
 
-export async function getGitDiff(root: string, runner: RunProcess = runProcess): Promise<string> {
-  const { result } = await runHardenedGitRead(root, { operation: "diff", staged: false }, runner);
+export async function getGitDiff(
+  root: string,
+  runner: RunProcess = runProcess,
+  processCallbacks?: ProcessCallbacks,
+): Promise<string> {
+  const { result } = await runHardenedGitRead(
+    root,
+    { operation: "diff", staged: false },
+    runner,
+    undefined,
+    processCallbacks
+      ? { processCallbacks, processName: "git_diff", processInput: { staged: false } }
+      : {},
+  );
   if (result.code !== 0) {
     return result.stderr || "Kein Git-Repository oder git diff ist fehlgeschlagen.";
   }
@@ -2208,6 +2272,60 @@ export interface ProcessResult {
   aborted: boolean;
 }
 
+function safeNotify<TArgs extends unknown[]>(
+  callback: ((...args: TArgs) => void) | undefined,
+  ...args: TArgs
+): void {
+  try {
+    callback?.(...args);
+  } catch {
+    // A display/log sink is observational and must never change execution.
+  }
+}
+
+/** Runs one already-authorized child exactly once and emits one bounded lifecycle. */
+export async function runObservedProcess(
+  name: string,
+  input: Record<string, unknown>,
+  callbacks: ProcessCallbacks,
+  execute: (onChunk: NonNullable<RunProcessOptions["onChunk"]>) => Promise<ProcessResult>,
+): Promise<ProcessResult> {
+  const operation: ProcessOperation = { id: randomUUID(), name, input };
+  const startedAt = Date.now();
+  let terminal = false;
+  safeNotify(callbacks.onProcessStart, operation);
+  const onChunk: NonNullable<RunProcessOptions["onChunk"]> = (stream, text) => {
+    if (terminal || text.length === 0) return;
+    safeNotify(callbacks.onProcessChunk, operation, stream, text);
+  };
+  const finish = (completion: ProcessCompletion): void => {
+    if (terminal) return;
+    terminal = true;
+    safeNotify(callbacks.onProcessEnd, operation, completion);
+  };
+  try {
+    const result = await execute(onChunk);
+    finish({
+      exitCode: result.code,
+      durationMs: Date.now() - startedAt,
+      truncated: result.truncated,
+      timedOut: result.timedOut,
+      aborted: result.aborted,
+    });
+    return result;
+  } catch (error) {
+    finish({
+      exitCode: null,
+      durationMs: Date.now() - startedAt,
+      truncated: false,
+      timedOut: false,
+      aborted: false,
+      error: error instanceof Error ? error.message : String(error),
+    });
+    throw error;
+  }
+}
+
 export function runProcess(
   executable: string,
   args: string[],
@@ -2298,19 +2416,21 @@ export function runProcess(
     child.stdout?.setEncoding("utf8");
     child.stderr?.setEncoding("utf8");
     child.stdout?.on("data", (chunk: string) => {
+      if (settled) return;
       const next = appendBounded(stdout, chunk, MAX_TOOL_OUTPUT * 3);
       stdout = next.value;
       truncated ||= next.truncated;
       if (next.adopted.length > 0) {
-        options.onChunk?.("stdout", next.adopted);
+        safeNotify(options.onChunk, "stdout", next.adopted);
       }
     });
     child.stderr?.on("data", (chunk: string) => {
+      if (settled) return;
       const next = appendBounded(stderr, chunk, MAX_TOOL_OUTPUT * 3);
       stderr = next.value;
       truncated ||= next.truncated;
       if (next.adopted.length > 0) {
-        options.onChunk?.("stderr", next.adopted);
+        safeNotify(options.onChunk, "stderr", next.adopted);
       }
     });
     child.on("error", (error) => {

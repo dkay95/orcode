@@ -21,6 +21,7 @@ import {
   type SlashCommandDefinition,
 } from "./command-catalog.js";
 import type { AgentRunEvent, ChatTurn, ModelInfo, ToolCallPreview } from "./types.js";
+import { redactRunEvent } from "./redaction.js";
 import type { ImageAttachment } from "./attachments.js";
 import type { PanelJudgment, PanelResult } from "./panel.js";
 import { approvalRiskLabel } from "./approval.js";
@@ -68,6 +69,7 @@ const ESCAPE_SEQUENCE = /\u001b[@-_]/g;
 const UNSAFE_CONTROL = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f]/g;
 const SPINNER_INTERVAL_MS = 80;
 const STATUS_FRESH_MS = 6_000;
+const TERMINAL_PROCESS_CAPACITY = 512;
 const SIGNALS: readonly NodeJS.Signals[] = ["SIGINT", "SIGTERM", "SIGHUP"];
 
 export interface ChoicePickerItem {
@@ -244,6 +246,12 @@ export class TerminalUi {
   #lastWidth = 0;
   #lastHeight = 0;
   #run: RunSnapshot | null = null;
+  readonly #processes = new Map<
+    string,
+    { eventId: string; number: number; name: string; input: Record<string, unknown>; bound: boolean }
+  >();
+  readonly #processPending = new Map<string, { stream: "stdout" | "stderr"; text: string }>();
+  readonly #terminalProcesses = new Set<string>();
   #tick = 0;
   #spinnerTimer: NodeJS.Timeout | null = null;
   readonly #signalHandlers = new Map<NodeJS.Signals, () => void>();
@@ -400,7 +408,15 @@ export class TerminalUi {
 
   /** Bridge: the blocks belong to the view model, the run header stays here. */
   handleRunEvent(event: AgentRunEvent): void {
-    this.#vm.apply(event);
+    if (
+      event.type === "process-start" ||
+      event.type === "process-output" ||
+      event.type === "process-end"
+    ) {
+      this.#applyProcessEvent(event);
+    } else {
+      this.#vm.apply(event);
+    }
     if (event.type === "run-start") {
       this.#run = {
         phase: "Lauf wird vorbereitet",
@@ -425,6 +441,9 @@ export class TerminalUi {
       if (event.type === "model-end") run.costUsd += event.costUsd;
       if (event.type === "run-end") {
         run.running = false;
+        for (const id of this.#processes.keys()) this.#rememberTerminalProcess(id);
+        this.#processes.clear();
+        this.#processPending.clear();
         this.#stopSpinner();
       }
       run.phase = this.#phaseOf(event, run.phase);
@@ -435,6 +454,124 @@ export class TerminalUi {
   finishRun(): void {
     this.#stopSpinner();
     this.#run = null;
+  }
+
+  #applyProcessEvent(
+    event: Extract<AgentRunEvent, { type: "process-start" | "process-output" | "process-end" }>,
+  ): void {
+    if (this.#terminalProcesses.has(event.id)) return;
+    const safe = redactRunEvent(event) as typeof event;
+    if (safe.type === "process-start") {
+      if (this.#processes.has(safe.id)) return;
+      const binding = {
+        eventId: safe.toolId ?? safe.id,
+        number: safe.toolNumber ?? 0,
+        name: safe.name,
+        input: safe.input,
+        bound: safe.toolId !== undefined,
+      };
+      this.#processes.set(safe.id, binding);
+      if (!binding.bound) {
+        this.#vm.apply({
+          type: "tool-start",
+          id: binding.eventId,
+          number: binding.number,
+          name: binding.name,
+          input: binding.input,
+          timestamp: safe.timestamp,
+        });
+      }
+      return;
+    }
+    const binding = this.#processes.get(safe.id);
+    if (!binding) return;
+    if (safe.type === "process-output") {
+      this.#bufferProcessOutput(binding, safe.stream, safe.text, safe.timestamp);
+      return;
+    }
+    this.#flushProcessOutput(binding, safe.timestamp);
+    if (!binding.bound) {
+      this.#vm.apply({
+        type: "tool-end",
+        id: binding.eventId,
+        number: binding.number,
+        name: binding.name,
+        input: binding.input,
+        output: {
+          exitCode: safe.exitCode,
+          truncated: safe.truncated,
+          timedOut: safe.timedOut,
+          aborted: safe.aborted,
+          ...(safe.error ? { stderr: safe.error } : {}),
+        },
+        durationMs: safe.durationMs,
+        timestamp: safe.timestamp,
+      });
+    }
+    this.#processes.delete(safe.id);
+    this.#processPending.delete(safe.id);
+    this.#rememberTerminalProcess(safe.id);
+  }
+
+  #rememberTerminalProcess(id: string): void {
+    this.#terminalProcesses.delete(id);
+    this.#terminalProcesses.add(id);
+    while (this.#terminalProcesses.size > TERMINAL_PROCESS_CAPACITY) {
+      const oldest = this.#terminalProcesses.values().next().value as string | undefined;
+      if (oldest === undefined) break;
+      this.#terminalProcesses.delete(oldest);
+    }
+  }
+
+  #bufferProcessOutput(
+    binding: { eventId: string; number: number },
+    stream: "stdout" | "stderr",
+    text: string,
+    timestamp: number,
+  ): void {
+    const operationId = [...this.#processes.entries()].find(([, value]) => value === binding)?.[0];
+    if (!operationId || !text) return;
+    const pending = this.#processPending.get(operationId);
+    if (pending && pending.stream !== stream) {
+      this.#emitProcessOutput(binding, pending.stream, pending.text, timestamp);
+      this.#processPending.delete(operationId);
+    }
+    const current = this.#processPending.get(operationId);
+    const combined = `${current?.text ?? ""}${text}`;
+    const lastNewline = Math.max(combined.lastIndexOf("\n"), combined.lastIndexOf("\r"));
+    if (lastNewline >= 0) {
+      this.#emitProcessOutput(binding, stream, combined.slice(0, lastNewline + 1), timestamp);
+      const rest = combined.slice(lastNewline + 1);
+      if (rest) this.#processPending.set(operationId, { stream, text: rest });
+      else this.#processPending.delete(operationId);
+    } else {
+      this.#processPending.set(operationId, { stream, text: combined });
+    }
+  }
+
+  #flushProcessOutput(binding: { eventId: string; number: number }, timestamp: number): void {
+    const operationId = [...this.#processes.entries()].find(([, value]) => value === binding)?.[0];
+    if (!operationId) return;
+    const pending = this.#processPending.get(operationId);
+    if (pending?.text) this.#emitProcessOutput(binding, pending.stream, pending.text, timestamp);
+    this.#processPending.delete(operationId);
+  }
+
+  #emitProcessOutput(
+    binding: { eventId: string; number: number },
+    stream: "stdout" | "stderr",
+    text: string,
+    timestamp: number,
+  ): void {
+    if (!text) return;
+    this.#vm.apply({
+      type: "tool-output",
+      id: binding.eventId,
+      number: binding.number,
+      stream,
+      text,
+      timestamp,
+    });
   }
 
   pickModel(
@@ -775,6 +912,12 @@ export class TerminalUi {
         return "Tool läuft";
       case "tool-output":
         return "Tool schreibt Ausgabe";
+      case "process-start":
+        return "Prozess läuft";
+      case "process-output":
+        return "Prozess schreibt Ausgabe";
+      case "process-end":
+        return event.exitCode === 0 ? "Prozess beendet" : "Prozess fehlgeschlagen";
       case "tool-end":
         return "Modell verarbeitet Tool-Ergebnis";
       case "tool-error":

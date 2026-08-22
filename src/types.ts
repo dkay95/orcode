@@ -210,6 +210,34 @@ export interface ToolCallPreview {
   rememberAvailable?: boolean;
 }
 
+/** One concrete child-process execution. The UUID is stable for its complete lifecycle. */
+export interface ProcessOperation {
+  id: string;
+  name: string;
+  input: Record<string, unknown>;
+}
+
+/** Terminal process data emitted exactly once, independently of a tool's final result. */
+export interface ProcessCompletion {
+  exitCode: number | null;
+  durationMs: number;
+  truncated: boolean;
+  timedOut: boolean;
+  aborted: boolean;
+  error?: string;
+}
+
+/** Volatile observer boundary shared by tools, hardened Git, SSH, and verification. */
+export interface ProcessCallbacks {
+  onProcessStart?: (operation: ProcessOperation) => void;
+  onProcessChunk?: (
+    operation: ProcessOperation,
+    stream: "stdout" | "stderr",
+    text: string,
+  ) => void;
+  onProcessEnd?: (operation: ProcessOperation, completion: ProcessCompletion) => void;
+}
+
 export type AgentRunEvent =
   | {
       type: "run-start";
@@ -301,6 +329,34 @@ export type AgentRunEvent =
       text: string;
       timestamp: number;
     }
+  | {
+      type: "process-start";
+      id: string;
+      name: string;
+      input: Record<string, unknown>;
+      toolId?: string;
+      toolNumber?: number;
+      timestamp: number;
+    }
+  | {
+      type: "process-output";
+      id: string;
+      name: string;
+      stream: "stdout" | "stderr";
+      text: string;
+      toolId?: string;
+      toolNumber?: number;
+      timestamp: number;
+    }
+  | ({
+      type: "process-end";
+      id: string;
+      name: string;
+      input: Record<string, unknown>;
+      toolId?: string;
+      toolNumber?: number;
+      timestamp: number;
+    } & ProcessCompletion)
   | {
       type: "verify";
       command: string;
