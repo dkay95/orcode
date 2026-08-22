@@ -9,6 +9,12 @@ const nativeOpen = fs.promises.open.bind(fs.promises);
 const nativeLstat = fs.promises.lstat.bind(fs.promises);
 let pendingOpenSwap: { path: string; run: () => Promise<void> } | null = null;
 let pendingLstatSwap: { path: string; run: () => Promise<void> } | null = null;
+let deferredLstatSwap: {
+  triggerPath: string | null;
+  path: string;
+  remaining: number;
+  run: () => Promise<void>;
+} | null = null;
 let swappedOpenHandle: Awaited<ReturnType<typeof nativeOpen>> | null = null;
 const wrappedOpen = (async (...args: unknown[]) => {
   const path = resolve(String(args[0]));
@@ -37,9 +43,20 @@ const wrappedLstat = (async (...args: unknown[]) => {
     pendingLstatSwap = null;
     await swap();
   }
-  return (nativeLstat as unknown as (
+  const result = await (nativeLstat as unknown as (
     ...callArgs: unknown[]
   ) => ReturnType<typeof nativeLstat>)(...args);
+  const deferred = deferredLstatSwap;
+  if (deferred?.triggerPath === path) {
+    deferred.triggerPath = null;
+  } else if (deferred?.triggerPath === null && deferred.path === path) {
+    deferred.remaining -= 1;
+    if (deferred.remaining === 0) {
+      deferredLstatSwap = null;
+      await deferred.run();
+    }
+  }
+  return result;
 }) as typeof nativeLstat;
 Object.defineProperty(fs.promises, "lstat", {
   configurable: true,
@@ -73,6 +90,33 @@ function swapAtNextOpen(path: string, run: () => Promise<void>): void {
 function swapAtNextLstat(path: string, run: () => Promise<void>): void {
   assert.equal(pendingLstatSwap, null);
   pendingLstatSwap = { path: resolve(path), run };
+}
+
+function swapAtNthLstat(path: string, occurrence: number, run: () => Promise<void>): void {
+  assert.equal(deferredLstatSwap, null);
+  assert.ok(occurrence > 0);
+  deferredLstatSwap = {
+    triggerPath: null,
+    path: resolve(path),
+    remaining: occurrence,
+    run,
+  };
+}
+
+function swapAfterLstat(
+  triggerPath: string,
+  path: string,
+  occurrence: number,
+  run: () => Promise<void>,
+): void {
+  assert.equal(deferredLstatSwap, null);
+  assert.ok(occurrence > 0);
+  deferredLstatSwap = {
+    triggerPath: resolve(triggerPath),
+    path: resolve(path),
+    remaining: occurrence,
+    run,
+  };
 }
 
 test("PrivateStore protect compares the pre-open snapshot before changing a replacement", async () => {
@@ -184,4 +228,103 @@ test("PrivateStore rename rechecks the opened source after awaited destination i
   assert.equal(await fs.promises.readFile(join(source, "must-survive.txt"), "utf8"), "outside sentinel");
   await assert.rejects(fs.promises.stat(destination), /ENOENT/);
   assert.equal(rejected, true);
+});
+
+test("PrivateStore temp cleanup checks the bound name after its final ancestor await", async () => {
+  const root = await fs.promises.mkdtemp(join(tmpdir(), "orcode-private-final-temp-await-"));
+  const target = join(root, "state.json");
+  let temporary: string | null = null;
+  let originalTemporary: string | null = null;
+  class RejectingAdapter extends PosixPrivateStoreAdapter {
+    override async protectFile(
+      path: string,
+      handle?: Awaited<ReturnType<typeof nativeOpen>>,
+    ): Promise<void> {
+      await super.protectFile(path, handle);
+      temporary = path;
+      originalTemporary = `${path}.before-cleanup`;
+      swapAtNthLstat(root, 2, async () => {
+        await fs.promises.rename(path, originalTemporary!);
+        await fs.promises.writeFile(path, "replacement sentinel", { mode: 0o644 });
+      });
+      throw new Error("synthetic cleanup boundary failure");
+    }
+  }
+  const store = new PrivateStore({ adapter: new RejectingAdapter(), root } as never);
+
+  await assert.rejects(
+    store.writeTextAtomic(target, "exact bytes"),
+    /cleanup boundary failure/,
+  );
+
+  assert.notEqual(temporary, null);
+  assert.notEqual(originalTemporary, null);
+  assert.equal(await fs.promises.readFile(temporary!, "utf8"), "replacement sentinel");
+  assert.equal(await fs.promises.readFile(originalTemporary!, "utf8"), "");
+  await assert.rejects(fs.promises.stat(target), /ENOENT/);
+  assert.equal(deferredLstatSwap, null);
+});
+
+test("PrivateStore protectTree keeps its caller snapshot through the helper ancestor await", async () => {
+  const root = await fs.promises.mkdtemp(join(tmpdir(), "orcode-private-helper-tree-await-"));
+  const tree = join(root, "backup");
+  const original = join(root, "backup-before-swap");
+  const replacement = join(root, "outside-replacement");
+  const sentinel = join(replacement, "must-survive.txt");
+  await fs.promises.mkdir(tree, { mode: 0o755 });
+  await fs.promises.mkdir(replacement, { mode: 0o755 });
+  await fs.promises.writeFile(sentinel, "outside sentinel", { mode: 0o644 });
+  await fs.promises.chmod(tree, 0o755);
+  await fs.promises.chmod(replacement, 0o755);
+  await fs.promises.chmod(sentinel, 0o644);
+  swapAfterLstat(tree, root, 1, async () => {
+    await fs.promises.rename(tree, original);
+    await fs.promises.rename(replacement, tree);
+  });
+  const store = new PrivateStore({ adapter: new PosixPrivateStoreAdapter(), root } as never);
+  let rejected = false;
+
+  try {
+    await store.protectTree(tree);
+  } catch {
+    rejected = true;
+  }
+
+  assert.equal((await fs.promises.stat(tree)).mode & 0o777, 0o755);
+  assert.equal((await fs.promises.stat(join(tree, "must-survive.txt"))).mode & 0o777, 0o644);
+  assert.equal(await fs.promises.readFile(join(tree, "must-survive.txt"), "utf8"), "outside sentinel");
+  assert.equal(rejected, true);
+  assert.equal(deferredLstatSwap, null);
+});
+
+test("PrivateStore ensureDirectory keeps its caller snapshot through the helper ancestor await", async () => {
+  const root = await fs.promises.mkdtemp(join(tmpdir(), "orcode-private-helper-ensure-await-"));
+  const directory = join(root, "exact");
+  const original = join(root, "exact-before-swap");
+  const replacement = join(root, "outside-replacement");
+  const sentinel = join(replacement, "must-survive.txt");
+  await fs.promises.mkdir(directory, { mode: 0o755 });
+  await fs.promises.mkdir(replacement, { mode: 0o755 });
+  await fs.promises.writeFile(sentinel, "outside sentinel", { mode: 0o644 });
+  await fs.promises.chmod(directory, 0o755);
+  await fs.promises.chmod(replacement, 0o755);
+  await fs.promises.chmod(sentinel, 0o644);
+  swapAfterLstat(directory, root, 2, async () => {
+    await fs.promises.rename(directory, original);
+    await fs.promises.rename(replacement, directory);
+  });
+  const store = new PrivateStore({ adapter: new PosixPrivateStoreAdapter(), root } as never);
+  let rejected = false;
+
+  try {
+    await store.ensureDirectory(directory);
+  } catch {
+    rejected = true;
+  }
+
+  assert.equal((await fs.promises.stat(directory)).mode & 0o777, 0o755);
+  assert.equal((await fs.promises.stat(join(directory, "must-survive.txt"))).mode & 0o777, 0o644);
+  assert.equal(await fs.promises.readFile(join(directory, "must-survive.txt"), "utf8"), "outside sentinel");
+  assert.equal(rejected, true);
+  assert.equal(deferredLstatSwap, null);
 });

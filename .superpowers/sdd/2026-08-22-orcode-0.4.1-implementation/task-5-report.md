@@ -449,3 +449,85 @@ DONE
 ### Commit
 
 - Requested message: `fix: close private store identity races`
+
+## Fix Round 4
+
+### Receiving-review verification and RED
+
+- Read the complete round-4 findings and updated implementation ledger, then
+  independently verified both multi-await findings against base
+  `c7b0f8b4a29f4491d0108b477d629b27a8f31c27` before changing production code.
+  Both findings were confirmed; there was no technical pushback, blocker, or
+  scope expansion.
+- The temp-cleanup regression schedules the replacement during the second and
+  final ancestor `lstat` await, after the old handle/name validation. The
+  protection regressions arm only after the caller snapshot and swap during
+  the exact helper ancestor await; `ensureDirectory` accounts for its one
+  preceding caller-level ancestor await so it does not test another phase.
+- Exact RED command:
+  `node --import tsx --test --test-name-pattern='final ancestor await|caller snapshot through the helper ancestor await' tests/private-store-identity-races.test.ts`.
+  It reached 3 tests: 0 passed and 3 failed.
+- `PrivateStore temp cleanup checks the bound name after its final ancestor
+  await` failed with `ENOENT` when reading the same-basename replacement: the
+  old cleanup unlinked it after the swap.
+- `PrivateStore protectTree keeps its caller snapshot through the helper
+  ancestor await` and `PrivateStore ensureDirectory keeps its caller snapshot
+  through the helper ancestor await` both observed the replacement directory
+  changed from mode 0755 to 0700 before the later mismatch was accepted or
+  rejected.
+
+### Implementation
+
+1. `unlinkBoundTemporary()` retains its early trusted-ancestor validation, but
+   orders the final awaited boundary as ancestor identity, handle-to-name (or
+   recorded path) identity, then immediate `unlink()`. A name installed during
+   the final ancestor await is therefore compared with the still-open original
+   handle and left untouched on mismatch.
+2. `protectBoundPath()` now requires the caller's `PathIdentity`. It compares
+   that expected identity with its post-ancestor-validation `lstat` snapshot,
+   then the existing open-handle check compares the helper snapshot with the
+   opened object before the adapter can chmod or apply a DACL.
+3. `protectTree()` passes its original directory/file snapshot for roots and
+   file children. `ensureOneDirectory()` passes the identity captured before
+   its intervening ancestor awaits. A replacement can no longer become the
+   helper's new baseline.
+
+### Focused GREEN and final gates
+
+- Round-4 race command: 3/3 passed, 0 failed; every replacement retained mode
+  0755/file mode 0644 and sentinel content while the operation rejected.
+- Combined PrivateStore suites: 21 reached, 20 passed, 0 failed, 1 Windows-only
+  skip.
+- Task 5 focus plus the identity-race suite (`app-home-migration`,
+  `private-store`, `private-store-identity-races`, `config`, `session`, `cli`):
+  109 reached, 108 passed, 0 failed, 1 Windows-only skip.
+- Related `runlog`, `conversation`, `workspace`, `rules`, `commands`, `agent`,
+  and `integration` suites: 146/146 passed.
+- `npx tsc -p tsconfig.json --noEmit`: passed.
+- `npx tsc -p tsconfig.tests.json --noEmit`: passed.
+- Full `npm test`: 691 reached, 690 passed, 0 failed, 1 Windows-only skip.
+- Central credential-fixture audit
+  (`rg -n --hidden --glob '!node_modules/**' --glob '!dist/**'
+  'sk-or-|AKIA|glpat-|npm_' tests README.md`): no matches (`rg` exit 1).
+- `git diff --check`: passed.
+
+### Round-4 self-review and concerns
+
+- Rechecked that each new test mutates a real filesystem name during the
+  specified await and asserts real replacement metadata/content rather than a
+  mock call count. All deferred swap hooks were consumed in their intended
+  phase.
+- Rechecked the complete protection chain: caller snapshot, helper snapshot,
+  and opened handle must all represent the same kind and file ID before POSIX
+  chmod or the Windows adapter is invoked.
+- This round did not change the Windows DACL child. Its real Windows-only test
+  remains registered and skipped on this macOS host; no actual Windows run is
+  claimed.
+- The accepted native single-syscall race after the final identity check and
+  inside `unlink` remains unchanged. Node still exposes no public bound
+  `unlinkat` primitive here; removing that boundary requires the native helper
+  already documented as outside Task 5.
+
+### Commit
+
+- Requested message: `fix: revalidate private paths at final await boundaries`

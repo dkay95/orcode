@@ -558,10 +558,22 @@ export class PrivateStore {
     }
     if (!info.isDirectory()) {
       if (!info.isFile()) throw new Error(`PrivateStore schützt nur reguläre Dateien: ${path}`);
-      await protectBoundPath(path, "file", this.adapter, ancestors);
+      await protectBoundPath(
+        path,
+        "file",
+        this.adapter,
+        ancestors,
+        pathIdentity(path, info, "file"),
+      );
       return;
     }
-    const identity = await protectBoundPath(path, "directory", this.adapter, ancestors);
+    const identity = await protectBoundPath(
+      path,
+      "directory",
+      this.adapter,
+      ancestors,
+      pathIdentity(path, info, "directory"),
+    );
     const tree = [...ancestors, identity];
     await assertDirectoryIdentities(tree);
     const entries = await readdir(path, { withFileTypes: true });
@@ -577,7 +589,13 @@ export class PrivateStore {
       if (childInfo.isDirectory()) {
         await this.#protectTree(child, tree);
       } else if (childInfo.isFile()) {
-        await protectBoundPath(child, "file", this.adapter, tree);
+        await protectBoundPath(
+          child,
+          "file",
+          this.adapter,
+          tree,
+          pathIdentity(child, childInfo, "file"),
+        );
       }
     }
     await assertDirectoryIdentities(tree);
@@ -636,7 +654,13 @@ async function ensureOneDirectory(
     created.push(identity);
   }
   await assertDirectoryIdentities(ancestors);
-  const protectedIdentity = await protectBoundPath(path, "directory", adapter, ancestors);
+  const protectedIdentity = await protectBoundPath(
+    path,
+    "directory",
+    adapter,
+    ancestors,
+    identity,
+  );
   if (!sameIdentity(identity, protectedIdentity)) {
     throw new Error(`PrivateStore-Verzeichnis wurde während der Absicherung ausgetauscht: ${path}`);
   }
@@ -724,6 +748,7 @@ async function protectBoundPath(
   kind: "directory" | "file",
   adapter: PrivateStoreAdapter,
   ancestors: readonly PathIdentity[],
+  expectedIdentity: PathIdentity,
 ): Promise<PathIdentity> {
   await assertDirectoryIdentities(ancestors);
   const before = await lstat(path, { bigint: true });
@@ -732,6 +757,7 @@ async function protectBoundPath(
     throw new Error(`PrivateStore-${kind === "directory" ? "Verzeichnis" : "Datei"} ist ungültig: ${path}`);
   }
   const preOpenIdentity = pathIdentity(path, before, kind);
+  assertSameIdentity(expectedIdentity, preOpenIdentity, path);
   const handle = await openIdentityHandle(path, kind);
   if (!handle) {
     await assertDirectoryIdentities(ancestors);
@@ -867,13 +893,13 @@ async function unlinkBoundTemporary(
   if (!identity) return;
   try {
     await assertDirectoryIdentities(ancestors);
+    await assertDirectoryIdentities(ancestors);
     if (handle) {
       const current = await assertHandlePathIdentity(handle, identity.path, "file");
       assertSameIdentity(identity, current, identity.path);
     } else {
       await assertPathIdentity(identity);
     }
-    await assertDirectoryIdentities(ancestors);
     await unlink(identity.path);
   } catch {
     // The current name is unknown after an identity mismatch; never unlink it.
