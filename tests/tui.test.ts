@@ -851,6 +851,45 @@ test("TUI hides every registered credential family at every process chunk split 
   }
 });
 
+test("TUI keeps later stderr behind an earlier ambiguous stdout prefix", () => {
+  const stdin = new FakeInput();
+  const stdout = new FakeOutput();
+  stdout.rows = 36;
+  const terminal = ui(stdin, stdout);
+  terminal.start();
+  try {
+    const id = "cross-stream-order";
+    terminal.handleRunEvent({ type: "process-start", id, name: "run_command", input: { command: "order" }, timestamp: NOW } as AgentRunEvent);
+    terminal.handleRunEvent({ type: "process-output", id, name: "run_command", stream: "stdout", text: "eyJ", timestamp: NOW + 1 } as AgentRunEvent);
+    terminal.handleRunEvent({ type: "process-output", id, name: "run_command", stream: "stderr", text: "ERR-LATER\n", timestamp: NOW + 2 } as AgentRunEvent);
+    assert.doesNotMatch(
+      text(terminal.frame().lines),
+      /ERR-LATER/,
+      "later stderr escaped while the earlier stdout overlap was unresolved",
+    );
+    terminal.handleRunEvent({
+      type: "process-end",
+      id,
+      name: "run_command",
+      input: { command: "order" },
+      exitCode: 1,
+      durationMs: 3,
+      truncated: false,
+      timedOut: false,
+      aborted: false,
+      timestamp: NOW + 3,
+    } as AgentRunEvent);
+
+    const screen = text(terminal.frame().lines);
+    const earlier = screen.indexOf("eyJ");
+    const later = screen.indexOf("ERR-LATER");
+    assert.ok(earlier >= 0 && later >= 0, screen);
+    assert.ok(earlier < later, screen);
+  } finally {
+    terminal.stop();
+  }
+});
+
 test("terminal process deduplication is bounded and eventually releases old operation IDs", () => {
   const stdin = new FakeInput();
   const stdout = new FakeOutput();

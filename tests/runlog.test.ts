@@ -337,6 +337,41 @@ test("RunLog hides every registered credential family at every process chunk spl
   assert.equal(outputById.get("benign-suffix"), "ordinary trailing s");
 });
 
+test("RunLog keeps later stderr behind an earlier ambiguous stdout prefix", async () => {
+  const home = await appHome("cross-stream-order");
+  const chatId = "chat-cross-stream-order";
+  const runId = createRunId();
+  const log = await RunLog.open(home, chatId, runId);
+  const id = "cross-stream-order";
+  log.write({ type: "process-start", id, name: "run_command", input: { command: "order" }, timestamp: 10 });
+  log.write({ type: "process-output", id, name: "run_command", stream: "stdout", text: "eyJ", timestamp: 11 });
+  log.write({ type: "process-output", id, name: "run_command", stream: "stderr", text: "ERR-LATER\n", timestamp: 12 });
+  log.write({
+    type: "process-end",
+    id,
+    name: "run_command",
+    input: { command: "order" },
+    exitCode: 1,
+    durationMs: 3,
+    truncated: false,
+    timedOut: false,
+    aborted: false,
+    timestamp: 13,
+  });
+  await log.close();
+
+  const output: Array<{ stream: "stdout" | "stderr"; text: string; timestamp: number }> = [];
+  for await (const event of RunLog.read(home, chatId, runId)) {
+    if (event.type === "process-output") {
+      output.push({ stream: event.stream, text: event.text, timestamp: event.timestamp });
+    }
+  }
+  assert.deepEqual(output, [
+    { stream: "stdout", text: "eyJ", timestamp: 11 },
+    { stream: "stderr", text: "ERR-LATER\n", timestamp: 12 },
+  ]);
+});
+
 test("read accepts versioned and legacy events while isolating future versions", async () => {
   const home = await appHome("mixed-versions");
   const chatId = "chat-mixed";

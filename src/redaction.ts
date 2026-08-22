@@ -228,6 +228,14 @@ export function redactRunEvent(event: AgentRunEvent): AgentRunEvent {
 class StreamingTextRedactor {
   #pending = "";
 
+  get hasPending(): boolean {
+    return this.#pending.length > 0;
+  }
+
+  get pendingLength(): number {
+    return this.#pending.length;
+  }
+
   push(text: string): string {
     if (!text) return "";
     this.#pending += text;
@@ -277,6 +285,17 @@ class StreamingTextRedactor {
     const output = redactTextInternal(this.#pending, true);
     this.#pending = "";
     return output;
+  }
+
+  /**
+   * Break an overlong streaming ambiguity without exposing the retained
+   * fragment. Future chunks therefore cannot reconstruct it across the
+   * bounded-buffer boundary.
+   */
+  discardPending(): string {
+    if (!this.#pending) return "";
+    this.#pending = "";
+    return "[REDACTED_STREAM_FRAGMENT]";
   }
 }
 
@@ -331,15 +350,34 @@ type ProcessOutputEvent = Extract<AgentRunEvent, { type: "process-output" }>;
 
 interface ProcessStreamState {
   redactor: StreamingTextRedactor;
-  template: ProcessOutputEvent;
+  barrier?: BufferedProcessOutput;
 }
 
-/** Stateful process-event redaction keyed by immutable operation and stream. */
+interface BufferedProcessOutput {
+  readonly sequence: number;
+  readonly template: ProcessOutputEvent;
+  text: string;
+  unresolved: boolean;
+}
+
+interface ProcessOperationState {
+  readonly streams: Map<"stdout" | "stderr", ProcessStreamState>;
+  readonly queue: BufferedProcessOutput[];
+  nextSequence: number;
+}
+
+// Process producers retain at most 240k per stream. Keep the consumer barrier
+// independently bounded as well, including adversarial/direct event callers.
+const MAX_BLOCKED_PROCESS_TEXT = 480_000;
+const MAX_BLOCKED_PROCESS_EVENTS = 2_048;
+
+/**
+ * Stateful process-event redaction keyed by immutable operation and stream.
+ * A single per-operation queue prevents either stream from passing an earlier
+ * unresolved credential overlap on the other stream.
+ */
 export class ProcessEventRedactor {
-  readonly #operations = new Map<
-    string,
-    Map<"stdout" | "stderr", ProcessStreamState>
-  >();
+  readonly #operations = new Map<string, ProcessOperationState>();
 
   push(event: AgentRunEvent): AgentRunEvent[] {
     if (event.type === "process-start") {
@@ -347,71 +385,137 @@ export class ProcessEventRedactor {
       return [redactRunEvent(event)];
     }
     if (event.type === "process-output") {
-      const streams = this.#operations.get(event.id) ?? new Map();
-      const state = streams.get(event.stream) ?? {
+      let operation = this.#operations.get(event.id);
+      if (!operation) {
+        operation = {
+          streams: new Map(),
+          queue: [],
+          nextSequence: 0,
+        };
+      }
+      const state = operation.streams.get(event.stream) ?? {
         redactor: new StreamingTextRedactor(),
-        template: event,
       };
-      state.template = event;
-      streams.set(event.stream, state);
-      this.#operations.set(event.id, streams);
+      operation.streams.set(event.stream, state);
+      this.#operations.set(event.id, operation);
+
+      const previousBarrier = state.barrier;
       const text = state.redactor.push(event.text);
-      return text ? [redactRunEvent({ ...event, text })] : [];
+      const buffered: BufferedProcessOutput = {
+        sequence: operation.nextSequence++,
+        template: event,
+        text,
+        unresolved: false,
+      };
+      operation.queue.push(buffered);
+
+      if (!state.redactor.hasPending) {
+        if (previousBarrier) previousBarrier.unresolved = false;
+        state.barrier = undefined;
+      } else if (!previousBarrier || text) {
+        // Any released text proves an older ambiguity was consumed. A suffix
+        // still retained after that release begins in this arrival instead.
+        if (previousBarrier) previousBarrier.unresolved = false;
+        buffered.unresolved = true;
+        state.barrier = buffered;
+      }
+
+      this.#enforceBounds(operation);
+      return this.#drain(operation);
     }
     if (event.type === "process-end") {
-      const flushed = this.#flushOperation(event.id, event.timestamp, event);
+      const flushed = this.#flushOperation(event.id, event);
       return [...flushed, redactRunEvent(event)];
     }
     if (event.type === "run-end") {
-      return [...this.flushAll(event.timestamp), redactRunEvent(event)];
+      return [...this.flushAll(), redactRunEvent(event)];
     }
     return [redactRunEvent(event)];
   }
 
-  flushAll(timestamp = Date.now()): AgentRunEvent[] {
+  flushAll(): AgentRunEvent[] {
     const events: AgentRunEvent[] = [];
     for (const id of [...this.#operations.keys()]) {
-      events.push(...this.#flushOperation(id, timestamp));
+      events.push(...this.#flushOperation(id));
     }
     return events;
   }
 
   #flushOperation(
     id: string,
-    timestamp: number,
     terminal?: Extract<AgentRunEvent, { type: "process-end" }>,
   ): AgentRunEvent[] {
-    const streams = this.#operations.get(id);
+    const operation = this.#operations.get(id);
     this.#operations.delete(id);
-    if (!streams) return [];
-    const events: AgentRunEvent[] = [];
-    for (const [stream, state] of streams) {
+    if (!operation) return [];
+    for (const state of operation.streams.values()) {
       const text = state.redactor.flush();
-      if (!text) continue;
-      events.push(redactRunEvent({
-        type: "process-output",
-        id,
-        name: terminal?.name ?? state.template.name,
-        stream,
-        text,
-        ...(terminal?.invocationId !== undefined
-          ? { invocationId: terminal.invocationId }
-          : state.template.invocationId !== undefined
-            ? { invocationId: state.template.invocationId }
-            : {}),
-        ...(terminal?.toolId !== undefined
-          ? { toolId: terminal.toolId }
-          : state.template.toolId !== undefined
-            ? { toolId: state.template.toolId }
-            : {}),
-        ...(terminal?.toolNumber !== undefined
-          ? { toolNumber: terminal.toolNumber }
-          : state.template.toolNumber !== undefined
-            ? { toolNumber: state.template.toolNumber }
-            : {}),
-        timestamp,
-      }));
+      if (state.barrier) {
+        state.barrier.text += text;
+        state.barrier.unresolved = false;
+        state.barrier = undefined;
+      }
+    }
+    return this.#drain(operation, terminal);
+  }
+
+  #drain(
+    operation: ProcessOperationState,
+    terminal?: Extract<AgentRunEvent, { type: "process-end" }>,
+  ): AgentRunEvent[] {
+    const events: AgentRunEvent[] = [];
+    while (operation.queue.length > 0) {
+      const buffered = operation.queue[0]!;
+      if (buffered.text) {
+        events.push(this.#outputEvent(buffered, terminal));
+        buffered.text = "";
+      }
+      if (buffered.unresolved) break;
+      operation.queue.shift();
     }
     return events;
+  }
+
+  #outputEvent(
+    buffered: BufferedProcessOutput,
+    terminal?: Extract<AgentRunEvent, { type: "process-end" }>,
+  ): AgentRunEvent {
+    const template = buffered.template;
+    return redactRunEvent({
+      ...template,
+      text: buffered.text,
+      ...(template.invocationId === undefined && terminal?.invocationId !== undefined
+        ? { invocationId: terminal.invocationId }
+        : {}),
+      ...(template.toolId === undefined && terminal?.toolId !== undefined
+        ? { toolId: terminal.toolId }
+        : {}),
+      ...(template.toolNumber === undefined && terminal?.toolNumber !== undefined
+        ? { toolNumber: terminal.toolNumber }
+        : {}),
+    });
+  }
+
+  #enforceBounds(operation: ProcessOperationState): void {
+    const retainedText = () =>
+      operation.queue.reduce((total, item) => total + item.text.length, 0) +
+      [...operation.streams.values()].reduce(
+        (total, state) => total + state.redactor.pendingLength,
+        0,
+      );
+    while (
+      operation.queue.length > MAX_BLOCKED_PROCESS_EVENTS ||
+      retainedText() > MAX_BLOCKED_PROCESS_TEXT
+    ) {
+      const barrier = operation.queue.find((item) => item.unresolved);
+      if (!barrier) return;
+      const state = [...operation.streams.values()].find(
+        (candidate) => candidate.barrier === barrier,
+      );
+      if (!state) return;
+      barrier.text += state.redactor.discardPending();
+      barrier.unresolved = false;
+      state.barrier = undefined;
+    }
   }
 }

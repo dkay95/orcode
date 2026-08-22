@@ -231,3 +231,86 @@ DONE
 ### Fix-round commit
 
 - Requested message: `fix: preserve streamed secrets and invocation identity`
+
+---
+
+## Fix round 2
+
+### Review RED
+
+- Read `task-8-findings-round-2.md` and the complete implementation ledger,
+  then reproduced the cross-stream ordering defect before any production edit.
+- Actual RunLog readback failed
+  `RunLog keeps later stderr behind an earlier ambiguous stdout prefix`: an
+  earlier stdout `eyJ` event at timestamp 11 was retained, later stderr at
+  timestamp 12 was persisted first, and the stdout fragment was appended only
+  at the process terminal with timestamp 13.
+- Actual TUI rendering failed
+  `TUI keeps later stderr behind an earlier ambiguous stdout prefix`: the
+  visible failure card rendered `ERR-LATER` before the earlier `eyJ` fragment.
+- Root cause was the operation's two independent stream redactors. Each stream
+  could safely emit by itself, but there was no operation-wide barrier keeping
+  a later stream behind an earlier unresolved overlap.
+
+### Global arrival barrier
+
+- Replaced the independent emission path with one insertion-sequenced queue per
+  immutable process operation while retaining independent stdout/stderr
+  redaction state. A queue head may emit its known-safe prefix immediately, but
+  it remains a barrier until its possible credential overlap is resolved.
+- Later stdout or stderr entries cannot pass that head. Terminal flushes attach
+  retained text to the original output frame, preserving its stream,
+  operation/tool/invocation identity and original timestamp, then drain both
+  streams in global arrival order before the single terminal event.
+- A same-stream arrival that releases the previous ambiguity resolves its old
+  barrier; if it ends with a new ambiguity, the new arrival becomes the next
+  barrier. Empty output stays suppressed and emitted text is cleared from the
+  queue, so no streamed tail can be duplicated at terminal completion.
+- Retained barrier state is capped per operation at 480,000 characters and
+  2,048 events, matching the two producer stream caps. A direct/adversarial
+  caller crossing the bound has the unresolved fragment replaced rather than
+  released, so future chunks cannot reconstruct it across the forced boundary.
+- The fix is confined to the ledger-approved central streaming privacy layer,
+  `src/redaction.ts`; RunLog, TUI, process producers, canonical `ProcessResult`,
+  approvals, persistence/retention and view-model semantics are unchanged.
+
+### Fix-round GREEN evidence
+
+- The two exact review probes each passed 1/1. The TUI probe additionally
+  asserts that later stderr is not visible before the earlier stdout overlap is
+  resolved; RunLog readback asserts stdout/stderr attribution and timestamps
+  11 then 12.
+- Every-family/every-split credential probes passed 1/1 through actual TUI and
+  1/1 through actual RunLog. The real-child ordinary non-line liveness barrier
+  passed 1/1, proving safe output still reaches the observer before child exit.
+- Exact Task 8 focus
+  `node --import tsx --test tests/workspace.test.ts tests/verify.test.ts tests/agent.test.ts tests/tui.test.ts tests/runlog.test.ts`
+  passed 222/222 with no failure or skip.
+- Production and test TypeScript checks both passed.
+- Commands/approval/policy passed 38/38 and exact rules passed 11/11. SSH
+  adapter/config/slash passed 47/47 and SSH UI passed 4/4. Routing/config,
+  OpenRouter, models and reasoning passed 62/62.
+- Full `npm test` reached 761 tests: 760 passed, 0 failed and 1 existing
+  platform-only skip.
+- The central scanner returned no credential findings; the literal audit for
+  `sk-or-`, `AKIA`, `glpat-` and `npm_` returned no matches; and
+  `git diff --check` passed.
+
+### Fix-round self-review and concerns
+
+- Confirmed the operation queue is drained only from its head; a later stream
+  therefore cannot become visible or persisted while an earlier overlap is
+  unresolved. Safe text at the head remains live.
+- Confirmed terminal flushing reuses the original output frame and timestamp,
+  emits held output before the one terminal, and clears each emitted segment so
+  terminal completion cannot duplicate a streamed tail.
+- Confirmed state is isolated by operation and stream, and bound enforcement
+  destroys rather than exposes an unresolved credential fragment.
+- The existing real process timing probes remain POSIX-only, with the same one
+  platform skip in the full suite. No remote SSH host was contacted. Broader UI
+  partial-line/view-model changes and global Task 10 hardening remain out of
+  scope.
+
+### Fix-round commit
+
+- Requested message: `fix: preserve cross-stream process event order`
