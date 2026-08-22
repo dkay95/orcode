@@ -1040,11 +1040,8 @@ export class OpenRouterService {
 // --------------------------------------------------------------------------
 // A3 — Ausfallsicherheit: request fragments and provider-switch notices.
 //
-// BENÖTIGT IN src/agent.ts: the `callModel`/request-building call site must
-// spread `modelsField(this.config.mainModel, this.config.fallbackModels)`
-// into the `models` request field (instead of a bare `model: mainModel`),
-// and `providerField(this.config.provider)` into the request's `provider`
-// field. Neither is wired in from here — agent.ts owns the actual SDK call.
+// `agent.ts` applies these fragments at its one main `callModel` boundary;
+// compressor and panel calls deliberately keep their own routing policies.
 // --------------------------------------------------------------------------
 
 /**
@@ -1069,17 +1066,19 @@ export function modelsField(
 
 /** OpenRouter `provider` preferences field, straight passthrough. */
 export interface ProviderRequestField {
-  sort?: string;
-  dataCollection?: string;
+  sort?: "price" | "throughput" | "latency";
+  dataCollection?: "allow" | "deny";
   only?: string[];
   ignore?: string[];
+  allowFallbacks?: boolean;
 }
 
 export function providerField(config: {
-  sort?: string;
-  dataCollection?: string;
+  sort?: "price" | "throughput" | "latency";
+  dataCollection?: "allow" | "deny";
   only?: string[];
   ignore?: string[];
+  allowFallbacks?: boolean;
 }): ProviderRequestField {
   const field: ProviderRequestField = {};
   if (config.sort) {
@@ -1093,6 +1092,9 @@ export function providerField(config: {
   }
   if (config.ignore && config.ignore.length > 0) {
     field.ignore = [...config.ignore];
+  }
+  if (typeof config.allowFallbacks === "boolean") {
+    field.allowFallbacks = config.allowFallbacks;
   }
   return field;
 }
@@ -1134,11 +1136,8 @@ export function providerSwitchNotice(
 // --------------------------------------------------------------------------
 // A2 — Websuche: prompt-signal detection and the request fragment.
 //
-// BENÖTIGT IN src/agent.ts: the request-building call site must compute
-// `shouldEnableWebSearch(this.config.web, prompt)` and, when true, add
-// `webSearchPlugin(this.config.webMaxResults ?? 5)` to the request's
-// `plugins` array (exact shape verified against
-// `node_modules/@openrouter/agent/node_modules/@openrouter/sdk/esm/models/websearchplugin.d.ts`).
+// `agent.ts` applies this only to a classifier-positive main request (or a
+// forced `web: "on"` request), using the pinned SDK's `plugins` field.
 // --------------------------------------------------------------------------
 
 const URL_PATTERN = /\bhttps?:\/\/[^\s)]+/i;

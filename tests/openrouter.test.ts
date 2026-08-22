@@ -639,8 +639,8 @@ test("providerField reicht nur gesetzte Felder durch", () => {
     dataCollection: "deny",
   });
   assert.deepEqual(
-    providerField({ sort: "price", only: ["anthropic"], ignore: [] }),
-    { sort: "price", only: ["anthropic"] },
+    providerField({ sort: "price", only: ["anthropic"], ignore: [], allowFallbacks: false }),
+    { sort: "price", only: ["anthropic"], allowFallbacks: false },
   );
   assert.deepEqual(providerField({}), {});
 });

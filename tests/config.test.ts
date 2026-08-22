@@ -266,6 +266,13 @@ test("validateProvider erzwingt dataCollection=deny als Default und filtert Unsi
   assert.deepEqual(validateProvider({ sort: "fastest", dataCollection: "vielleicht" }), {
     dataCollection: "deny",
   });
+  assert.deepEqual(
+    validateProvider({ allowFallbacks: false }),
+    { dataCollection: "deny", allowFallbacks: false },
+  );
+  assert.deepEqual(validateProvider({ allowFallbacks: "nein" }), {
+    dataCollection: "deny",
+  });
 });
 
 test("validateVerify begrenzt maxRounds auf 2 und normalisiert den Modus", () => {
@@ -290,13 +297,17 @@ test("validateConfig übernimmt fallbackModels/provider/web/verify/contextBudget
   const config = validateConfig({
     ...DEFAULT_CONFIG,
     fallbackModels: ["anthropic/x"],
-    provider: { sort: "throughput" },
+    provider: { sort: "throughput", allowFallbacks: false },
     web: "on",
     verify: { commands: ["npm run check"], mode: "on-edit", maxRounds: 2 },
     contextBudgetRatio: 0.5,
   });
   assert.deepEqual(config.fallbackModels, ["anthropic/x"]);
-  assert.deepEqual(config.provider, { sort: "throughput", dataCollection: "deny" });
+  assert.deepEqual(config.provider, {
+    sort: "throughput",
+    dataCollection: "deny",
+    allowFallbacks: false,
+  });
   assert.equal(config.web, "on");
   assert.deepEqual(config.verify, { commands: ["npm run check"], mode: "on-edit", maxRounds: 2 });
   assert.equal(config.contextBudgetRatio, 0.5);
@@ -316,7 +327,7 @@ test("saveConfig/loadConfig runden die neuen Felder verlustfrei", async () => {
     {
       ...DEFAULT_CONFIG,
       fallbackModels: ["anthropic/x", "openai/y"],
-      provider: { sort: "price", only: ["anthropic"] },
+      provider: { sort: "price", only: ["anthropic"], allowFallbacks: false },
       web: "off",
       verify: { commands: ["npm test"], mode: "on-edit", maxRounds: 2 },
       contextBudgetRatio: 0.6,
@@ -330,6 +341,7 @@ test("saveConfig/loadConfig runden die neuen Felder verlustfrei", async () => {
     sort: "price",
     dataCollection: "deny",
     only: ["anthropic"],
+    allowFallbacks: false,
   });
   assert.equal(written.config.web, "off");
   assert.deepEqual(written.config.verify, {

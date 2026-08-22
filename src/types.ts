@@ -20,6 +20,9 @@ export type ReasoningSetting =
   | { mode: "effort"; effort: ReasoningEffort }
   | { mode: "budget"; maxTokens: number };
 
+/** Whether OpenRouter may select a backup provider for the chosen model. */
+export type ProviderFallbackPolicy = boolean;
+
 export interface OrcodeConfig {
   mainModel: string;
   compressorModel: string;

@@ -19,7 +19,13 @@ import {
   type CompressorPrice,
 } from "./compressor.js";
 import { ConversationStore } from "./conversation.js";
-import { OpenRouterService } from "./openrouter.js";
+import {
+  OpenRouterService,
+  modelsField,
+  providerField,
+  shouldEnableWebSearch,
+  webSearchPlugin,
+} from "./openrouter.js";
 import { formatSecretWarning, scanForSecrets } from "./secrets.js";
 import { createRunId, RunLog } from "./runlog.js";
 import { SessionStore, workspaceSpend } from "./session.js";
@@ -466,12 +472,22 @@ export class OrcodeAgent {
       notices.push(warning);
       emitStatus(observer, warning, chalk.yellow);
     }
+    const models = modelsField(
+      this.config.mainModel,
+      this.config.fallbackModels,
+    );
+    const provider = providerField(this.config.provider);
+    const plugins = shouldEnableWebSearch(this.config.web, promptForContext)
+      ? [webSearchPlugin()]
+      : undefined;
     const result = client.callModel(
       {
-        model: this.config.mainModel,
+        models,
         instructions,
         input: modelInput,
         ...(reasoning ? { reasoning } : {}),
+        ...(Object.keys(provider).length > 0 ? { provider } : {}),
+        ...(plugins ? { plugins } : {}),
         tools,
         // K7e: cache-friendly request fields. `sessionId`/`promptCacheKey`
         // are the chat id — stable for the lifetime of the chat, so every

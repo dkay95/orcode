@@ -294,7 +294,7 @@ test("/web sets the config mode and rejects unknown values", async () => {
   assert.equal(context.config.web, "off", "eine ungültige Eingabe darf den Modus nicht ändern");
 });
 
-test("/provider sort, deny/allow, only and clear round-trip through config", async () => {
+test("/provider sort, deny/allow, only, fallback policy, and clear round-trip through config", async () => {
   const { context } = await harness();
   const { out, lines } = collectOutput();
   context.out = out;
@@ -308,9 +308,16 @@ test("/provider sort, deny/allow, only and clear round-trip through config", asy
   await handleSlashCommand("/provider only anthropic openai", context);
   assert.deepEqual(context.config.provider.only, ["anthropic", "openai"]);
 
+  await handleSlashCommand("/provider fallback off", context);
+  assert.equal(context.config.provider.allowFallbacks, false);
+
+  await handleSlashCommand("/provider fallback on", context);
+  assert.equal(context.config.provider.allowFallbacks, true);
+
   await handleSlashCommand("/provider clear", context);
   assert.equal(context.config.provider.sort, undefined);
   assert.equal(context.config.provider.only, undefined);
+  assert.equal(context.config.provider.allowFallbacks, undefined);
   assert.equal(
     context.config.provider.dataCollection,
     "deny",

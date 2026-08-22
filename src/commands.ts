@@ -1812,9 +1812,7 @@ function printVerifyStatus(context: CommandContext): void {
 }
 
 // ---------------------------------------------------------------------------
-// A2 — /web. Config-only: `shouldEnableWebSearch`/`webSearchPlugin` from
-// openrouter.ts are not yet spread into the `callModel` request (agent.ts),
-// see the needsElsewhere note in the task report.
+// A2 — /web. The main call computes the SDK plugin from this persisted mode.
 // ---------------------------------------------------------------------------
 
 async function webCommand(args: string[], context: CommandContext): Promise<void> {
@@ -1833,9 +1831,8 @@ async function webCommand(args: string[], context: CommandContext): Promise<void
 }
 
 // ---------------------------------------------------------------------------
-// A3 — /provider and /fallback. Config-only: `providerField`/`modelsField`
-// from openrouter.ts are not yet spread into the `callModel` request, see the
-// needsElsewhere note in the task report.
+// A3 — /provider and /fallback. The main call applies this persisted routing
+// policy; compressor and panel calls intentionally do not inherit it.
 // ---------------------------------------------------------------------------
 
 async function providerCommand(args: string[], context: CommandContext): Promise<void> {
@@ -1869,11 +1866,20 @@ async function providerCommand(args: string[], context: CommandContext): Promise
       ...context.config.provider,
       [action]: providers.length ? providers : undefined,
     });
+  } else if (action === "fallback" || action === "fallbacks") {
+    const value = (args[1] ?? "").toLowerCase();
+    if (value !== "on" && value !== "off") {
+      throw new Error("/provider fallback erlaubt: on oder off");
+    }
+    context.config.provider = validateProvider({
+      ...context.config.provider,
+      allowFallbacks: value === "on",
+    });
   } else if (action === "clear" || action === "reset") {
     context.config.provider = validateProvider({});
   } else {
     throw new Error(
-      "Verwendung: /provider [sort <off|price|throughput|latency>|allow|deny|only <a> <b>…|ignore <a> <b>…|clear]",
+      "Verwendung: /provider [sort <off|price|throughput|latency>|allow|deny|only <a> <b>…|ignore <a> <b>…|fallback <on|off>|clear]",
     );
   }
   await saveContextConfig(context);
@@ -1886,6 +1892,7 @@ function printProviderStatus(context: CommandContext): void {
     [
       `Sortierung: ${provider.sort ?? "Standard (Preis/Verfügbarkeit)"}`,
       `Datenweitergabe: ${provider.dataCollection ?? DATA_COLLECTIONS[1]}`,
+      `Provider-Fallbacks: ${provider.allowFallbacks === false ? "aus" : "an"}`,
       provider.only?.length ? `Nur: ${provider.only.join(", ")}` : "",
       provider.ignore?.length ? `Ausgeschlossen: ${provider.ignore.join(", ")}` : "",
     ]

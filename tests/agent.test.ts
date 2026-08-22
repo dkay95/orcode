@@ -232,6 +232,77 @@ test("a successful run persists the turn, books the cost once, and reports the o
   assert.equal(persisted.data.costs.totalUsd, result.costUsd);
 });
 
+test("the main model call binds routing, reasoning, web search, identifiers, and cost once", async () => {
+  const primary = "vendor/primary";
+  const setup = await createAgent({
+    mainModel: primary,
+    fallbackModels: ["vendor/fallback-one", primary, " vendor/fallback-two ", "vendor/fallback-one"],
+    provider: {
+      sort: "latency",
+      dataCollection: "allow",
+      only: ["provider-a"],
+      ignore: ["provider-b"],
+      allowFallbacks: false,
+    },
+    web: "on",
+    reasoningByModel: { [primary]: { mode: "effort", effort: "high" } },
+  });
+  const client = fakeClient(() => ({
+    text: ["Fertig."],
+    before: async (emit) => {
+      await emit.modelCall(0, 0.007);
+    },
+    response: { model: primary, usage: { cost: 0.007 } },
+  }));
+  const agent = await setup.agent(client.client);
+
+  const result = await agent.run("Bitte recherchiere das", { onText: () => {} });
+
+  assert.equal(client.requests.length, 1, "nur der Hauptlauf darf hier erfasst werden");
+  const request = mainRequest(client);
+  assert.equal("model" in request, false, "die Hauptroute nutzt die geordnete models-Kette");
+  assert.deepEqual(request.models, ["vendor/primary", "vendor/fallback-one", "vendor/fallback-two"]);
+  assert.deepEqual(request.provider, {
+    sort: "latency",
+    dataCollection: "allow",
+    only: ["provider-a"],
+    ignore: ["provider-b"],
+    allowFallbacks: false,
+  });
+  assert.deepEqual(request.reasoning, { enabled: true, effort: "high" });
+  assert.deepEqual(request.plugins, [{ id: "web", maxResults: 5 }]);
+  assert.deepEqual(request.cacheControl, { type: "ephemeral" });
+  assert.equal(request.promptCacheKey, setup.session.data.id);
+  assert.equal(request.sessionId, setup.session.data.id);
+  assert.equal(result.mainCostUsd, 0.007);
+  assert.equal(setup.session.data.costs.mainUsd, 0.007);
+  assert.equal(setup.session.data.costs.totalUsd, 0.007);
+});
+
+test("the main model call enables web search only for the selected web mode", async () => {
+  const cases = [
+    { mode: "off" as const, prompt: "https://example.invalid", plugins: undefined },
+    { mode: "on" as const, prompt: "Bitte zusammenfassen", plugins: [{ id: "web", maxResults: 5 }] },
+    { mode: "auto" as const, prompt: "Bitte zusammenfassen", plugins: undefined },
+    { mode: "auto" as const, prompt: "Prüfe https://example.invalid", plugins: [{ id: "web", maxResults: 5 }] },
+  ];
+
+  for (const entry of cases) {
+    const setup = await createAgent({ web: entry.mode });
+    const client = fakeClient(() => ({ text: ["Fertig."] }));
+    const agent = await setup.agent(client.client);
+
+    await agent.run(entry.prompt, { onText: () => {} });
+
+    const request = mainRequest(client);
+    if (entry.plugins) {
+      assert.deepEqual(request.plugins, entry.plugins, `${entry.mode}: ${entry.prompt}`);
+    } else {
+      assert.equal("plugins" in request, false, `${entry.mode}: ${entry.prompt}`);
+    }
+  }
+});
+
 test("a broken reasoning stream does not destroy a finished answer", async () => {
   const setup = await createAgent();
   const client = fakeClient(() => ({
@@ -772,9 +843,19 @@ interface FakeInputItem {
 }
 
 interface FakeRequest {
-  model: string;
+  model?: string;
+  models?: string[];
   instructions: string;
   input: string | FakeInputItem[];
+  provider?: {
+    sort?: string;
+    dataCollection?: string;
+    only?: string[];
+    ignore?: string[];
+    allowFallbacks?: boolean;
+  };
+  reasoning?: unknown;
+  plugins?: Array<{ id: string; maxResults?: number }>;
   tools?: readonly unknown[];
   state?: FakeStateAccessor;
   cacheControl?: unknown;
@@ -941,7 +1022,7 @@ async function createAgent(
   const config: OrcodeConfigWithBudget = {
     ...DEFAULT_CONFIG,
     ...overrides,
-    reasoningByModel: {},
+    reasoningByModel: { ...overrides.reasoningByModel },
     budget: { ...DEFAULT_CONFIG.budget, ...overrides.budget },
   };
   return {

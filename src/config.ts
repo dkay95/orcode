@@ -16,6 +16,7 @@ import {
   REASONING_EFFORTS,
   type ApprovalMode,
   type CompressionMode,
+  type ProviderFallbackPolicy,
   type ReasoningSetting,
   type OrcodeConfig,
 } from "./types.js";
@@ -55,6 +56,8 @@ export interface ProviderConfig {
   dataCollection?: DataCollectionPreference;
   only?: string[];
   ignore?: string[];
+  /** OpenRouter's provider-level backup-provider policy. */
+  allowFallbacks?: ProviderFallbackPolicy;
 }
 
 export const VERIFY_MODES = ["off", "on-edit"] as const;
@@ -525,6 +528,9 @@ export function validateProvider(value: unknown): ProviderConfig {
   const ignore = stringListOf(value.ignore);
   if (ignore) {
     result.ignore = ignore;
+  }
+  if (typeof value.allowFallbacks === "boolean") {
+    result.allowFallbacks = value.allowFallbacks;
   }
   return result;
 }
