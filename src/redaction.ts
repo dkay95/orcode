@@ -622,9 +622,9 @@ export class ProcessEventRedactor {
     terminal?: Extract<AgentRunEvent, { type: "process-end" }>,
   ): AgentRunEvent {
     const template = buffered.template;
-    return redactRunEvent({
+    const safeTemplate = redactRunEvent({
       ...template,
-      text: buffered.text,
+      text: "",
       ...(template.invocationId === undefined && terminal?.invocationId !== undefined
         ? { invocationId: terminal.invocationId }
         : {}),
@@ -634,7 +634,8 @@ export class ProcessEventRedactor {
       ...(template.toolNumber === undefined && terminal?.toolNumber !== undefined
         ? { toolNumber: terminal.toolNumber }
         : {}),
-    });
+    }) as ProcessOutputEvent;
+    return { ...safeTemplate, text: buffered.text };
   }
 
   #enforceBounds(operation: ProcessOperationState): void {

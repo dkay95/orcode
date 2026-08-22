@@ -94,6 +94,15 @@ function modelInfo(id: string, name = id): ModelInfo {
   };
 }
 
+function awsCaptureLabels(): Array<{ name: string; label: string }> {
+  return [
+    { name: "bare-equals", label: "aws_secret_access_key=" },
+    { name: "spaced-double-value", label: 'aws_secret_access_key =  "' },
+    { name: "double-quoted-json", label: 'aws_secret_access_key" : "' },
+    { name: "single-quoted-tabbed", label: "AWS-SECRET-ACCESS-KEY'\t=\t'" },
+  ];
+}
+
 class FakeInput extends EventEmitter {
   isTTY = true;
   isRaw = false;
@@ -926,6 +935,96 @@ test("TUI preserves retained stdout provenance when a same-stream chunk resolves
     } as AgentRunEvent);
   } finally {
     terminal.stop();
+  }
+});
+
+test("TUI emits exactly one AWS marker in original output order across every capture split", () => {
+  const sensitive = "S".repeat(40);
+  const marker = "[REDACTED_AWS_SECRET]";
+  for (const variant of awsCaptureLabels()) {
+    for (let split = 1; split <= variant.label.length; split += 1) {
+      const stdin = new FakeInput();
+      const stdout = new FakeOutput();
+      stdout.columns = 180;
+      stdout.rows = 50;
+      const terminal = ui(stdin, stdout);
+      terminal.start();
+      try {
+        const id = `aws-${variant.name}-${split}`;
+        const oldTag = `OLD-${variant.name}-${split}|`;
+        const errorTag = `ERR-${variant.name}-${split}`;
+        const currentTag = `|CURRENT-${variant.name}-${split}`;
+        terminal.handleRunEvent({
+          type: "process-start",
+          id,
+          name: "verify",
+          input: {},
+          timestamp: NOW,
+        } as AgentRunEvent);
+        terminal.handleRunEvent({
+          type: "process-output",
+          id,
+          name: "verify",
+          stream: "stdout",
+          text: `${oldTag}${variant.label.slice(0, split)}`,
+          timestamp: NOW + 1,
+        } as AgentRunEvent);
+        terminal.handleRunEvent({
+          type: "process-output",
+          id,
+          name: "verify",
+          stream: "stderr",
+          text: `${errorTag}\n`,
+          timestamp: NOW + 2,
+        } as AgentRunEvent);
+        assert.doesNotMatch(
+          text(terminal.frame().lines),
+          new RegExp(errorTag),
+          `${id} let stderr pass an unresolved stdout capture`,
+        );
+        terminal.handleRunEvent({
+          type: "process-output",
+          id,
+          name: "verify",
+          stream: "stdout",
+          text: `${variant.label.slice(split)}${sensitive}${currentTag}\n`,
+          timestamp: NOW + 3,
+        } as AgentRunEvent);
+        terminal.handleRunEvent({
+          type: "process-end",
+          id,
+          name: "verify",
+          input: {},
+          exitCode: 1,
+          durationMs: 4,
+          truncated: false,
+          timedOut: false,
+          aborted: false,
+          timestamp: NOW + 4,
+        } as AgentRunEvent);
+
+        const screen = text(terminal.frame().lines);
+        const markerIsOld = split === variant.label.length;
+        const oldText = `${oldTag}${variant.label.slice(0, split)}${markerIsOld ? marker : ""}`.trim();
+        const currentText = `${variant.label.slice(split)}${markerIsOld ? "" : marker}${currentTag}`.trim();
+        assert.equal(
+          screen.split(marker).length - 1,
+          1,
+          `${id} emitted more than one marker:\n${screen}`,
+        );
+        assert.doesNotMatch(screen, new RegExp(sensitive), `${id} leaked secret bytes`);
+        const oldIndex = screen.indexOf(oldText);
+        const errorIndex = screen.indexOf(errorTag);
+        const currentIndex = screen.indexOf(currentText);
+        assert.ok(oldIndex >= 0, `${id} lost old-frame text:\n${screen}`);
+        assert.ok(errorIndex >= 0, `${id} lost stderr text:\n${screen}`);
+        assert.ok(currentIndex >= 0, `${id} lost current-frame text:\n${screen}`);
+        assert.ok(oldIndex < errorIndex, `${id} reordered old stdout behind stderr:\n${screen}`);
+        assert.ok(errorIndex < currentIndex, `${id} reordered current stdout before stderr:\n${screen}`);
+      } finally {
+        terminal.stop();
+      }
+    }
   }
 });
 

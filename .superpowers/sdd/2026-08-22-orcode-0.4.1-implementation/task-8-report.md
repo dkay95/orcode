@@ -411,3 +411,91 @@ DONE
 ### Fix-round commit
 
 - Requested message: `fix: preserve streamed fragment provenance`
+
+---
+
+## Fix round 4
+
+### Review RED
+
+- Read `task-8-findings-round-4.md` and the latest implementation-ledger
+  entry, verified the exact clean base
+  `ee695bea1dc6a6299240569965d7c81f1d5fccda`, and changed no production code
+  before reproducing the finding through both actual consumers.
+- `RunLog emits exactly one AWS marker with original frame provenance across every capture split`
+  failed at `aws-spaced-double-value-23`: one credential persisted two markers,
+  one on old stdout timestamp 321 and one on current stdout timestamp 323,
+  with intervening stderr correctly retained at timestamp 322.
+- `TUI emits exactly one AWS marker in original output order across every capture split`
+  failed on the same optional-whitespace/value-quote boundary and visibly
+  rendered both markers around the intervening stderr line.
+- The fail-first matrix covers bare and spaced labels, optional double/single
+  key and value quotes, colon/equal separators, spaces/tabs, case and separator
+  variants, and every split from the first captured byte through the complete
+  capture. It independently asserts one marker, no secret bytes and original
+  frame/stream/timestamp/arrival provenance.
+
+### Root cause and minimal fix
+
+- Stateful attributed redaction had already removed the AWS secret and placed
+  one marker on the frame owning the capture's final byte. The safe text was
+  then passed through whole-event stateless redaction at three boundaries:
+  `ProcessEventRedactor.#outputEvent`, TUI process application and RunLog
+  serialization. A frame ending at `aws_secret_access_key =` lacked the later
+  frame's marker context, so the partial rule created a second marker.
+- `ProcessEventRedactor` now stateless-redacts a clone of the output template
+  whose text is empty, then restores only the attributed, statefully safe
+  `buffered.text`. IDs, names, tool/invocation fields and timestamps still pass
+  through central event-field redaction, while safe text is not reclassified
+  out of its cross-frame context.
+- The private TUI process path now consumes the event returned by its own
+  `ProcessEventRedactor` directly instead of redacting that event a second
+  time. No view-model or partial-line behavior changed.
+- Live RunLog writes and close-time flushes mark only events returned by their
+  owned `ProcessEventRedactor` as already redacted when serializing. The raw
+  `RunLog.appendRunEvent` path retains the default full stateless redaction, so
+  an arbitrary standalone event cannot bypass persistence privacy.
+- The RunLog matrix places a separate synthetic credential in output-event
+  metadata and verifies it remains redacted in readback and raw NDJSON while
+  the attributed AWS output retains exactly one marker. Canonical
+  `ProcessResult`, producers, approvals and terminal semantics are unchanged.
+
+### Fix-round GREEN evidence
+
+- The two exact fail-first RunLog/TUI review probes passed 2/2 after the
+  production fix.
+- The named privacy/provenance/live/terminal selection passed 14/14, including
+  every-family/every-split TUI and RunLog privacy, cross-stream barrier and
+  mid-stream provenance, ordinary child-live output, verification liveness,
+  bounded stable operation IDs, timeout late-chunk rejection and one terminal.
+- The direct 2,048-event bound probe emitted one old-frame
+  `[REDACTED_STREAM_FRAGMENT]`, all 2,050 stderr frames in order, no retained
+  `eyJ` bytes and exactly one final terminal (`2,051` output events total).
+- Exact Task 8 focus
+  `node --import tsx --test tests/workspace.test.ts tests/verify.test.ts tests/agent.test.ts tests/tui.test.ts tests/runlog.test.ts`
+  passed 227/227 with no failure or skip.
+- Production and test TypeScript checks both passed.
+- Commands/approval/policy passed 38/38 and exact rules passed 11/11. SSH
+  adapter/config/slash passed 47/47 and SSH UI passed 4/4. Routing/config,
+  OpenRouter, models and reasoning passed 62/62.
+- Full `npm test` reached 766 tests: 765 passed, 0 failed and 1 existing
+  platform-only skip.
+- The central scanner returned no credential findings; the literal audit for
+  `sk-or-`, `AKIA`, `glpat-` and `npm_` returned no matches; and
+  `git diff --check` passed.
+
+### Fix-round scope and concerns
+
+- Production changes are limited to the existing central redactor and its two
+  actual consumers: `src/redaction.ts`, `src/runlog.ts` and `src/tui.ts`.
+  Tests changed only RunLog and TUI capture-boundary coverage. RunLog envelope
+  schema, private-store retention, TUI view model, process producers, canonical
+  results, approvals, remembered rules and routing remain unchanged.
+- The existing real process timing probes remain POSIX-only, with the same one
+  platform skip in the full suite. SSH remains covered through injected runner
+  and exact policy tests; no remote host was contacted. Task 9 repair, broader
+  UI work and global Task 10 hardening remain out of scope.
+
+### Fix-round commit
+
+- Requested message: `fix: avoid double-redacting streamed output`

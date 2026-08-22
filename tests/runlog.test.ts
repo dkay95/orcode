@@ -48,6 +48,15 @@ function streamingCredentialFixtures(): Array<{ name: string; secret: string; se
   ];
 }
 
+function awsCaptureLabels(): Array<{ name: string; label: string }> {
+  return [
+    { name: "bare-equals", label: "aws_secret_access_key=" },
+    { name: "spaced-double-value", label: 'aws_secret_access_key =  "' },
+    { name: "double-quoted-json", label: 'aws_secret_access_key" : "' },
+    { name: "single-quoted-tabbed", label: "AWS-SECRET-ACCESS-KEY'\t=\t'" },
+  ];
+}
+
 const SAMPLE_EVENTS: AgentRunEvent[] = [
   {
     type: "run-start",
@@ -447,6 +456,148 @@ test("RunLog emits one redaction marker while preserving AWS label provenance", 
     { stream: "stdout", text: "\n", timestamp: 23 },
   ]);
   assert.doesNotMatch(JSON.stringify(output), new RegExp(sensitive));
+});
+
+test("RunLog emits exactly one AWS marker with original frame provenance across every capture split", async () => {
+  const home = await appHome("aws-capture-boundaries");
+  const chatId = "chat-aws-capture-boundaries";
+  const runId = createRunId();
+  const log = await RunLog.open(home, chatId, runId);
+  const sensitive = "S".repeat(40);
+  const metadataSecret = `${["sk", "or", "v1"].join("-")}-${"M".repeat(24)}`;
+  const marker = "[REDACTED_AWS_SECRET]";
+  const expected = new Map<string, {
+    label: string;
+    split: number;
+    oldTag: string;
+    errorTag: string;
+    currentTag: string;
+    oldTimestamp: number;
+    errorTimestamp: number;
+    currentTimestamp: number;
+  }>();
+  let timestamp = 100;
+
+  for (const variant of awsCaptureLabels()) {
+    for (let split = 1; split <= variant.label.length; split += 1) {
+      const id = `aws-${variant.name}-${split}`;
+      const oldTag = `OLD-${variant.name}-${split}|`;
+      const errorTag = `ERR-${variant.name}-${split}`;
+      const currentTag = `|CURRENT-${variant.name}-${split}`;
+      const oldTimestamp = timestamp + 1;
+      const errorTimestamp = timestamp + 2;
+      const currentTimestamp = timestamp + 3;
+      expected.set(id, {
+        label: variant.label,
+        split,
+        oldTag,
+        errorTag,
+        currentTag,
+        oldTimestamp,
+        errorTimestamp,
+        currentTimestamp,
+      });
+      log.write({ type: "process-start", id, name: "verify", input: {}, timestamp });
+      log.write({
+        type: "process-output",
+        id,
+        name: `verify-${metadataSecret}`,
+        stream: "stdout",
+        text: `${oldTag}${variant.label.slice(0, split)}`,
+        timestamp: oldTimestamp,
+      });
+      log.write({
+        type: "process-output",
+        id,
+        name: "verify",
+        stream: "stderr",
+        text: `${errorTag}\n`,
+        timestamp: errorTimestamp,
+      });
+      log.write({
+        type: "process-output",
+        id,
+        name: `verify-${metadataSecret}`,
+        stream: "stdout",
+        text: `${variant.label.slice(split)}${sensitive}${currentTag}\n`,
+        timestamp: currentTimestamp,
+      });
+      log.write({
+        type: "process-end",
+        id,
+        name: "verify",
+        input: {},
+        exitCode: 1,
+        durationMs: 4,
+        truncated: false,
+        timedOut: false,
+        aborted: false,
+        timestamp: timestamp + 4,
+      });
+      timestamp += 5;
+    }
+  }
+  await log.close();
+
+  const outputById = new Map<string, Array<Extract<AgentRunEvent, { type: "process-output" }>>>();
+  for await (const event of RunLog.read(home, chatId, runId)) {
+    if (event.type !== "process-output") continue;
+    const events = outputById.get(event.id) ?? [];
+    events.push(event);
+    outputById.set(event.id, events);
+  }
+
+  for (const [id, fixture] of expected) {
+    const events = outputById.get(id) ?? [];
+    const visible = events.map((event) => event.text).join("");
+    assert.equal(
+      visible.split(marker).length - 1,
+      1,
+      `${id} emitted more than one marker: ${JSON.stringify(events)}`,
+    );
+    assert.doesNotMatch(visible, new RegExp(sensitive), `${id} leaked secret bytes`);
+    const oldText = events
+      .filter((event) => event.stream === "stdout" && event.timestamp === fixture.oldTimestamp)
+      .map((event) => event.text)
+      .join("");
+    const errorText = events
+      .filter((event) => event.stream === "stderr" && event.timestamp === fixture.errorTimestamp)
+      .map((event) => event.text)
+      .join("");
+    const currentText = events
+      .filter((event) => event.stream === "stdout" && event.timestamp === fixture.currentTimestamp)
+      .map((event) => event.text)
+      .join("");
+    const markerIsOld = fixture.split === fixture.label.length;
+    assert.equal(
+      oldText,
+      `${fixture.oldTag}${fixture.label.slice(0, fixture.split)}${markerIsOld ? marker : ""}`,
+      `${id} changed old-frame provenance`,
+    );
+    assert.equal(errorText, `${fixture.errorTag}\n`, `${id} changed stderr provenance`);
+    assert.equal(
+      currentText,
+      `${fixture.label.slice(fixture.split)}${markerIsOld ? "" : marker}${fixture.currentTag}\n`,
+      `${id} changed current-frame provenance`,
+    );
+    assert.ok(
+      events.findIndex((event) => event.timestamp === fixture.oldTimestamp) <
+        events.findIndex((event) => event.timestamp === fixture.errorTimestamp),
+      `${id} reordered old stdout behind stderr`,
+    );
+    assert.ok(
+      events.findIndex((event) => event.timestamp === fixture.errorTimestamp) <
+        events.findIndex((event) => event.timestamp === fixture.currentTimestamp),
+      `${id} reordered current stdout before stderr`,
+    );
+    for (const event of events.filter((candidate) => candidate.stream === "stdout")) {
+      assert.equal(event.name, "verify-[REDACTED_OPENROUTER_KEY]");
+    }
+  }
+
+  const raw = await readFile(runLogPath(home, chatId, runId), "utf8");
+  assert.doesNotMatch(raw, new RegExp(sensitive));
+  assert.doesNotMatch(raw, new RegExp(metadataSecret));
 });
 
 test("read accepts versioned and legacy events while isolating future versions", async () => {

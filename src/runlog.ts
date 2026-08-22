@@ -100,7 +100,7 @@ export class RunLog {
       return;
     }
     for (const safe of this.#redactor.push(event)) {
-      const line = serializeRunEvent(safe);
+      const line = serializeRunEvent(safe, true);
       this.#chain = this.#chain.then(() => this.#handle.appendFile(line));
     }
   }
@@ -110,7 +110,7 @@ export class RunLog {
       return;
     }
     for (const safe of this.#redactor.flushAll()) {
-      const line = serializeRunEvent(safe);
+      const line = serializeRunEvent(safe, true);
       this.#chain = this.#chain.then(() => this.#handle.appendFile(line));
     }
     this.#closed = true;
@@ -303,10 +303,10 @@ function addRetentionError(
   onError?.(entry);
 }
 
-function serializeRunEvent(event: AgentRunEvent): string {
+function serializeRunEvent(event: AgentRunEvent, alreadyRedacted = false): string {
   const envelope: RunLogEnvelope = {
     version: RUN_LOG_ENVELOPE_VERSION,
-    event: redactRunEvent(event),
+    event: alreadyRedacted ? event : redactRunEvent(event),
   };
   return `${JSON.stringify(envelope)}\n`;
 }

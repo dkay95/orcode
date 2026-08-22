@@ -21,7 +21,7 @@ import {
   type SlashCommandDefinition,
 } from "./command-catalog.js";
 import type { AgentRunEvent, ChatTurn, ModelInfo, ToolCallPreview } from "./types.js";
-import { ProcessEventRedactor, redactRunEvent } from "./redaction.js";
+import { ProcessEventRedactor } from "./redaction.js";
 import type { ImageAttachment } from "./attachments.js";
 import type { PanelJudgment, PanelResult } from "./panel.js";
 import { approvalRiskLabel } from "./approval.js";
@@ -467,7 +467,7 @@ export class TerminalUi {
     event: Extract<AgentRunEvent, { type: "process-start" | "process-output" | "process-end" }>,
   ): void {
     if (this.#terminalProcesses.has(event.id)) return;
-    const safe = redactRunEvent(event) as typeof event;
+    const safe = event;
     if (safe.type === "process-start") {
       if (this.#processes.has(safe.id)) return;
       const binding = {
