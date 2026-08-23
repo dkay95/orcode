@@ -43,6 +43,8 @@ export interface OrcodeConfig {
 
 export interface KeyInfo {
   label?: string;
+  /** Documented stable OpenRouter account identity; never persist or log raw. */
+  creatorUserId?: string | null;
   isFreeTier?: boolean;
   isManagementKey?: boolean;
   limit?: number | null;

@@ -981,6 +981,22 @@ export class OpenRouterService {
     }
   }
 
+  /**
+   * Reads documented key metadata with candidate scope. This operation never
+   * changes the active key, credential validity, connectivity, or spend state.
+   */
+  async inspectKey(
+    apiKey: string,
+    signal?: AbortSignal,
+  ): Promise<KeyInfo> {
+    const normalized = normalizeKey(apiKey);
+    if (!normalized || normalized.length < 20 || /\s/.test(normalized)) {
+      throw new Error("Der OpenRouter API-Key sieht ungültig aus.");
+    }
+    const payload = await this.request("/key", normalized, signal, "candidate");
+    return keyInfoFromPayload(payload);
+  }
+
   async getCredits(
     bearerKey: string,
     signal: AbortSignal | undefined,
@@ -1028,11 +1044,22 @@ export class OpenRouterService {
     ) {
       return [...cached.models];
     }
+    const models = await this.#fetchModels(options.signal);
+    this.#modelCache = { models, fetchedAt: this.#now() };
+    return [...models];
+  }
+
+  /** Candidate/setup catalogue read that cannot populate the active cache. */
+  async inspectModels(signal?: AbortSignal): Promise<ModelInfo[]> {
+    return this.#fetchModels(signal);
+  }
+
+  async #fetchModels(signal?: AbortSignal): Promise<ModelInfo[]> {
     const response = await this.#send(
       `${API_BASE}/models`,
       { headers: { "X-OpenRouter-Title": APP_TITLE } },
       "models",
-      options.signal,
+      signal,
     );
     const text = await response.text();
     if (!response.ok) {
@@ -1047,7 +1074,6 @@ export class OpenRouterService {
     const models = data
       .map(parseModel)
       .filter((model): model is ModelInfo => Boolean(model));
-    this.#modelCache = { models, fetchedAt: this.#now() };
     return [...models];
   }
 
@@ -1205,12 +1231,14 @@ export class OpenRouterService {
     if (!this.#reconnectInProgress || connectivity === "disconnected") {
       this.#state.connectivity = connectivity;
     }
-    if (status >= 200 && status < 300) {
-      if (scope === "inference") this.#state.inferenceValidity = "valid";
-      else this.#state.managementValidity = "valid";
-    } else if (status === 401) {
-      if (scope === "inference") this.#state.inferenceValidity = "rejected";
-      else this.#state.managementValidity = "rejected";
+    if (path !== "/credits") {
+      if (status >= 200 && status < 300) {
+        if (scope === "inference") this.#state.inferenceValidity = "valid";
+        else this.#state.managementValidity = "valid";
+      } else if (status === 401) {
+        if (scope === "inference") this.#state.inferenceValidity = "rejected";
+        else this.#state.managementValidity = "rejected";
+      }
     }
     if (status === 402) {
       this.#state.credit = "insufficient";
@@ -1615,14 +1643,15 @@ function keyInfoFromPayload(payload: Record<string, unknown>): KeyInfo {
   const data = requireRecord(payload.data, "Ungültige Key-Antwort");
   return {
     label: stringOf(data.label),
+    creatorUserId: nullableStringOf(data.creator_user_id),
     isFreeTier: booleanOf(data.is_free_tier),
     isManagementKey: booleanOf(data.is_management_key),
     limit: nullableNumberOf(data.limit),
     limitRemaining: nullableNumberOf(data.limit_remaining),
-    usage: numberOf(data.usage),
-    usageDaily: numberOf(data.usage_daily),
-    usageWeekly: numberOf(data.usage_weekly),
-    usageMonthly: numberOf(data.usage_monthly),
+    usage: optionalNumberOf(data.usage),
+    usageDaily: optionalNumberOf(data.usage_daily),
+    usageWeekly: optionalNumberOf(data.usage_weekly),
+    usageMonthly: optionalNumberOf(data.usage_monthly),
     expiresAt: nullableStringOf(data.expires_at),
   };
 }
@@ -1649,19 +1678,23 @@ function nullableStringOf(value: unknown): string | null | undefined {
 }
 
 function numberOf(value: unknown): number {
-  const parsed = typeof value === "number" ? value : Number(value ?? 0);
-  return Number.isFinite(parsed) ? parsed : 0;
+  return finiteNumberOf(value) ?? 0;
 }
 
 function nullableNumberOf(value: unknown): number | null {
-  return value === null || value === undefined ? null : numberOf(value);
+  return finiteNumberOf(value) ?? null;
 }
 
 function optionalNumberOf(value: unknown): number | undefined {
-  if (value === null || value === undefined) {
-    return undefined;
-  }
-  const parsed = numberOf(value);
+  return finiteNumberOf(value);
+}
+
+function finiteNumberOf(value: unknown): number | undefined {
+  const parsed = typeof value === "number"
+    ? value
+    : typeof value === "string" && value.trim().length > 0
+      ? Number(value)
+      : Number.NaN;
   return Number.isFinite(parsed) ? parsed : undefined;
 }
 

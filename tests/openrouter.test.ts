@@ -162,7 +162,7 @@ test("credential validity, connectivity, and credit remain independent runtime s
   await service.checkBalance();
   assert.deepEqual(service.runtimeState, {
     inferenceValidity: "valid",
-    managementValidity: "valid",
+    managementValidity: "unknown",
     connectivity: "connected",
     credit: "available",
   });
@@ -326,14 +326,106 @@ test("candidate validation stays isolated even when candidate bytes equal an act
       },
     );
     await service.checkBalance();
-    assert.equal(service.runtimeState.managementValidity, "valid");
+    assert.equal(service.runtimeState.managementValidity, "unknown");
     reject = true;
 
     await assert.rejects(service.validateManagementKey(MANAGEMENT_KEY));
 
-    assert.equal(service.runtimeState.managementValidity, "valid");
+    assert.equal(service.runtimeState.managementValidity, "unknown");
     assert.equal(service.runtimeState.connectivity, "connected");
   });
+});
+
+test("candidate-safe key inspection preserves missing identity and usage as unknown", async () => {
+  const candidate = `${TEST_KEY_PREFIX}${["inspection", "candidate", "secret"].join("-")}`;
+  const service = new OpenRouterService(INFERENCE_KEY, MANAGEMENT_KEY, {
+    inference: "keychain",
+    management: "keychain",
+  }, {
+    fetchImpl: async (_url, init) => {
+      assert.equal(bearerOf(init), `Bearer ${candidate}`);
+      return jsonResponse({
+        data: {
+          label: "Sparse documented response",
+          is_management_key: false,
+          expires_at: null,
+        },
+      });
+    },
+  });
+  service.activateValidatedKey(INFERENCE_KEY, "keychain", {
+    key: { limitRemaining: 5 },
+    credits: { totalCredits: 10, totalUsage: 4, remaining: 6 },
+  });
+  service.activateValidatedManagementKey(MANAGEMENT_KEY, "keychain", {
+    totalCredits: 10,
+    totalUsage: 4,
+    remaining: 6,
+  });
+  const before = service.runtimeState;
+
+  const inspected = await service.inspectKey(candidate);
+
+  assert.equal(inspected.creatorUserId, undefined);
+  assert.equal(inspected.usage, undefined);
+  assert.equal(inspected.usageDaily, undefined);
+  assert.equal(inspected.usageWeekly, undefined);
+  assert.equal(inspected.usageMonthly, undefined);
+  assert.equal(inspected.limit, null);
+  assert.equal(inspected.limitRemaining, null);
+  assert.equal(inspected.expiresAt, null);
+  assert.deepEqual(service.runtimeState, before);
+  assert.equal(service.requireKey(), INFERENCE_KEY);
+});
+
+test("candidate-safe key inspection parses documented creator identity without exposing it to active state", async () => {
+  const candidate = `${TEST_KEY_PREFIX}${["identity", "candidate", "secret"].join("-")}`;
+  const creator = ["documented", "creator", "fixture"].join("_");
+  const service = new OpenRouterService(INFERENCE_KEY, undefined, { inference: "keychain" }, {
+    fetchImpl: async () => keyResponse({ creator_user_id: creator }),
+  });
+  const before = service.runtimeState;
+
+  const inspected = await service.inspectKey(candidate);
+
+  assert.equal(inspected.creatorUserId, creator);
+  assert.deepEqual(service.runtimeState, before);
+  assert.equal(service.requireKey(), INFERENCE_KEY);
+});
+
+test("candidate-safe key inspection never coerces malformed numeric metadata to zero", async () => {
+  const candidate = `${TEST_KEY_PREFIX}${["numeric", "candidate", "secret"].join("-")}`;
+  const service = new OpenRouterService(INFERENCE_KEY, undefined, {}, {
+    fetchImpl: async () => keyResponse({
+      limit: "not-a-number",
+      limit_remaining: "not-a-number",
+      usage: "not-a-number",
+      usage_daily: "not-a-number",
+      usage_weekly: "not-a-number",
+      usage_monthly: "not-a-number",
+    }),
+  });
+
+  const inspected = await service.inspectKey(candidate);
+
+  assert.equal(inspected.limit, null);
+  assert.equal(inspected.limitRemaining, null);
+  assert.equal(inspected.usage, undefined);
+  assert.equal(inspected.usageDaily, undefined);
+  assert.equal(inspected.usageWeekly, undefined);
+  assert.equal(inspected.usageMonthly, undefined);
+});
+
+test("inspection model loading does not populate or replace the active model cache", async () => {
+  const service = new OpenRouterService(INFERENCE_KEY, undefined, {}, {
+    fetchImpl: async () => jsonResponse(MODEL_PAYLOAD),
+  });
+  assert.equal(service.modelCacheAgeMs(), null);
+
+  const models = await service.inspectModels();
+
+  assert.equal(models.length, 3);
+  assert.equal(service.modelCacheAgeMs(), null);
 });
 
 test("active inference and management scopes never collide when their key bytes are equal", async () => {
@@ -355,13 +447,13 @@ test("active inference and management scopes never collide when their key bytes 
 
   await service.checkBalance();
   assert.equal(service.runtimeState.inferenceValidity, "valid");
-  assert.equal(service.runtimeState.managementValidity, "valid");
+  assert.equal(service.runtimeState.managementValidity, "unknown");
   assert.equal(service.runtimeState.credit, "available");
 
   rejectInference = true;
   await assert.rejects(service.getCurrentKey());
   assert.equal(service.runtimeState.inferenceValidity, "rejected");
-  assert.equal(service.runtimeState.managementValidity, "valid");
+  assert.equal(service.runtimeState.managementValidity, "unknown");
 });
 
 test("reconnect exposes reconnecting during the attempt and preserves validity on transport failure", async () => {
@@ -417,7 +509,7 @@ test("a management 401 rejects only the management credential and keeps the infe
 
   assert.equal(fallback.credits, undefined);
   assert.equal(service.runtimeState.inferenceValidity, "valid");
-  assert.equal(service.runtimeState.managementValidity, "rejected");
+  assert.equal(service.runtimeState.managementValidity, "unknown");
   assert.equal(service.runtimeState.connectivity, "connected");
   assert.equal(service.runtimeState.credit, "unavailable");
   assert.equal(service.hasKey, true);
