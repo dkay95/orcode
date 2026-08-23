@@ -271,51 +271,58 @@ export class ProviderStateStore {
 
     const buildCandidate = (current: ProviderSetupStateV1): ProviderSetupStateV1 => {
       assertCapabilityOpen();
-      if (adoptedCandidate) {
-        throw new Error("Provider state CAS build capability is closed after adoption.");
-      }
-      buildCalls += 1;
-      if (buildCalls !== 1) {
-        protocolInvalid = true;
-        throw new Error("Provider state CAS may build exactly one candidate.");
-      }
-      assertCurrent();
-      const authoritative = requirePersistableProviderState(
-        validateProviderSetupState(current),
-      );
-      if (authoritative.revision !== expectedRevision) {
-        throw new Error(
-          `Stale provider state revision ${expectedRevision}; authoritative revision is ${authoritative.revision}.`,
+      try {
+        if (adoptedCandidate) {
+          throw new Error("Provider state CAS build capability is closed after adoption.");
+        }
+        buildCalls += 1;
+        if (buildCalls !== 1) {
+          throw new Error("Provider state CAS may build exactly one candidate.");
+        }
+        assertCurrent();
+        const authoritative = requirePersistableProviderState(
+          validateProviderSetupState(current),
         );
+        if (authoritative.revision !== expectedRevision) {
+          throw new Error(
+            `Stale provider state revision ${expectedRevision}; authoritative revision is ${authoritative.revision}.`,
+          );
+        }
+        builtCandidate = this.#prepareNext(
+          build(structuredClone(authoritative)),
+          expectedRevision,
+        );
+        return structuredClone(builtCandidate);
+      } catch (error) {
+        protocolInvalid = true;
+        throw error;
       }
-      builtCandidate = this.#prepareNext(
-        build(structuredClone(authoritative)),
-        expectedRevision,
-      );
-      return structuredClone(builtCandidate);
     };
 
     const adopt = (committed: ProviderSetupStateV1): void => {
       assertCapabilityOpen();
-      if (adoptedCandidate) throw new Error("Provider state CAS may adopt exactly once.");
-      if (protocolInvalid || buildCalls !== 1 || !builtCandidate) {
+      try {
+        if (adoptedCandidate) throw new Error("Provider state CAS may adopt exactly once.");
+        if (protocolInvalid || buildCalls !== 1 || !builtCandidate) {
+          throw new Error("Provider state CAS must build exactly once before adoption.");
+        }
+        this.#assertExpectedRevision(expectedRevision);
+        assertCurrent();
+        const validated = requirePersistableProviderState(
+          validateProviderSetupState(committed),
+        );
+        if (validated.revision !== expectedRevision + 1) {
+          throw new Error("Provider state CAS returned an invalid committed revision.");
+        }
+        if (JSON.stringify(validated) !== JSON.stringify(builtCandidate)) {
+          throw new Error("Provider state CAS may adopt only its exact built candidate.");
+        }
+        this.#state = structuredClone(validated);
+        adoptedCandidate = structuredClone(validated);
+      } catch (error) {
         protocolInvalid = true;
-        throw new Error("Provider state CAS must build exactly once before adoption.");
+        throw error;
       }
-      this.#assertExpectedRevision(expectedRevision);
-      assertCurrent();
-      const validated = requirePersistableProviderState(
-        validateProviderSetupState(committed),
-      );
-      if (validated.revision !== expectedRevision + 1) {
-        throw new Error("Provider state CAS returned an invalid committed revision.");
-      }
-      if (JSON.stringify(validated) !== JSON.stringify(builtCandidate)) {
-        protocolInvalid = true;
-        throw new Error("Provider state CAS may adopt only its exact built candidate.");
-      }
-      this.#state = structuredClone(validated);
-      adoptedCandidate = structuredClone(validated);
     };
 
     if (!this.#persist) {

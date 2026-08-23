@@ -317,6 +317,82 @@ test("durable provider state commit rejects a suppressed duplicate build before 
   assert.deepEqual(store.read(), initial);
 });
 
+test("durable provider state commit rejects a suppressed build after adoption", async () => {
+  const initial = createNeverConfiguredProviderState();
+  let builderCalls = 0;
+  const store = new ProviderStateStore(initial, {
+    persist: async (request) => {
+      const built = request.build(initial);
+      request.adopt(built);
+      try {
+        request.build(initial);
+      } catch {
+        // A post-adoption build attempt must poison settlement even when suppressed.
+      }
+      return structuredClone(built);
+    },
+  });
+
+  const outcome = await store.commit(
+    initial.revision,
+    (current) => {
+      builderCalls += 1;
+      return { ...current, lifecycle: "cancelled" };
+    },
+  ).then(() => "resolved", () => "rejected");
+
+  assert.equal(outcome, "rejected");
+  assert.equal(builderCalls, 1);
+});
+
+test("durable provider state commit rejects a suppressed duplicate adoption", async () => {
+  const initial = createNeverConfiguredProviderState();
+  const store = new ProviderStateStore(initial, {
+    persist: async (request) => {
+      const built = request.build(initial);
+      request.adopt(built);
+      try {
+        request.adopt(built);
+      } catch {
+        // A duplicate adoption attempt must poison settlement even when suppressed.
+      }
+      return structuredClone(built);
+    },
+  });
+
+  const outcome = await store.commit(
+    initial.revision,
+    (current) => ({ ...current, lifecycle: "cancelled" }),
+  ).then(() => "resolved", () => "rejected");
+
+  assert.equal(outcome, "rejected");
+});
+
+test("durable provider state commit rejects a suppressed wrong-revision adoption", async () => {
+  const initial = createNeverConfiguredProviderState();
+  const store = new ProviderStateStore(initial, {
+    persist: async (request) => {
+      const built = request.build(initial);
+      const wrongRevision = { ...built, revision: built.revision + 1 };
+      try {
+        request.adopt(wrongRevision);
+      } catch {
+        // A wrong-revision adoption must poison a later otherwise-valid adoption.
+      }
+      request.adopt(built);
+      return structuredClone(built);
+    },
+  });
+
+  const outcome = await store.commit(
+    initial.revision,
+    (current) => ({ ...current, lifecycle: "cancelled" }),
+  ).then(() => "resolved", () => "rejected");
+
+  assert.equal(outcome, "rejected");
+  assert.deepEqual(store.read(), initial);
+});
+
 test("durable provider state capabilities are closed after successful settlement", async () => {
   const initial = createNeverConfiguredProviderState();
   let retained!: ProviderStateCommitRequest;

@@ -406,8 +406,9 @@ export class SetupOrchestrator {
     }
     const canonicalModelId = exact[0]!.canonicalModelId;
 
+    let committed: ProviderSetupStateV1;
     try {
-      const committed = await this.#stateStore.commit(
+      committed = await this.#stateStore.commit(
         captured.revision,
         (authoritative) => {
           if (JSON.stringify(authoritative) !== JSON.stringify(captured)) {
@@ -428,24 +429,6 @@ export class SetupOrchestrator {
           }
         },
       );
-      if (options.signal?.aborted) {
-        await this.#handleLegacyCallerCancellation(
-          this.#stateStore.read(),
-          generation,
-          options.signal,
-        );
-      }
-      if (generation !== this.#generation) return this.#staleResult();
-      const currentProof = this.#proofs.get(connection.id);
-      if (currentProof && currentProof.generation === generation) {
-        this.#proofs.set(connection.id, {
-          ...currentProof,
-          stateRevision: committed.revision,
-        });
-      }
-      const result = this.#reduce(committed, generation, []);
-      this.#latestResult = result;
-      return result;
     } catch {
       if (generation !== this.#generation) {
         return this.#latestResult
@@ -453,6 +436,24 @@ export class SetupOrchestrator {
       }
       return this.#publishRouteChoice(this.#stateStore.read(), generation, legacyRoute);
     }
+    if (options.signal?.aborted) {
+      await this.#handleLegacyCallerCancellation(
+        this.#stateStore.read(),
+        generation,
+        options.signal,
+      );
+    }
+    if (generation !== this.#generation) return this.#staleResult();
+    const currentProof = this.#proofs.get(connection.id);
+    if (currentProof && currentProof.generation === generation) {
+      this.#proofs.set(connection.id, {
+        ...currentProof,
+        stateRevision: committed.revision,
+      });
+    }
+    const result = this.#reduce(committed, generation, []);
+    this.#latestResult = result;
+    return result;
   }
 
   #reserveGeneration(): GenerationToken {
@@ -1110,7 +1111,6 @@ export class SetupOrchestrator {
           const result = this.#setupRequiredResult(state, generation);
           this.#latestResult = result;
           this.#proofs.clear();
-          this.#emit({ version: 1, type: "setup-required", generation });
         }
       } catch {
         this.#proofs.clear();

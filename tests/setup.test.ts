@@ -1386,6 +1386,60 @@ test("pre-aborted legacy resolution performs no catalog work and stores exact ca
   assert.equal(fixture.clock.activeTimers(), 0);
 });
 
+test("caller cancellation during durable legacy-route commit rejects exactly without route actions", async () => {
+  const initial = migrateLegacyOpenRouterState(
+    { mainModel: "vendor/legacy-requested" },
+    { connectionId: "legacy-durable-cancellation" },
+  );
+  let durable = structuredClone(initial);
+  let persistCalls = 0;
+  const legacyAdopted = deferred<void>();
+  const releaseLegacy = deferred<void>();
+  const stateStore = new ProviderStateStore(initial, {
+    persist: async (request) => {
+      persistCalls += 1;
+      const next = request.build(durable);
+      request.adopt(next);
+      durable = structuredClone(next);
+      if (persistCalls === 2) {
+        legacyAdopted.resolve();
+        await releaseLegacy.promise;
+      }
+      return structuredClone(next);
+    },
+  });
+  const adapter = new FakeAdapter();
+  adapter.inspectionScripts = [(request) => inspected(initial.connections[0]!, request, {
+    accountFingerprint: "acct_verified_durable_cancel",
+  })];
+  adapter.models = [model("vendor/legacy-requested", "vendor/canonical")];
+  const fixture = await setupFixture({ state: initial, stateStore, adapter });
+  await fixture.orchestrator.inspectStartup();
+  fixture.events.splice(0);
+  const controller = new AbortController();
+  const reason = new DOMException("exact-legacy-durable-cancellation", "AbortError");
+
+  const resolving = fixture.orchestrator.resolveLegacyDefaultRoute({
+    signal: controller.signal,
+  });
+  await legacyAdopted.promise;
+  controller.abort(reason);
+  releaseLegacy.resolve();
+
+  await assert.rejects(resolving, (error: unknown) => error === reason);
+  assert.equal(stateStore.read().lifecycle, "cancelled");
+  assert.equal(durable.lifecycle, "cancelled");
+  assert.equal(stateStore.read().cross.enabled, false);
+  assert.deepEqual(
+    fixture.events.filter((event) =>
+      event.type === "route-choice-required" || event.type === "setup-required"
+    ),
+    [],
+  );
+  assert.equal(adapter.calls.filter((call) => call === "openrouter.listModels").length, 1);
+  assert.equal(fixture.clock.activeTimers(), 0);
+});
+
 test("caller cancellation during durable inspection commit wins before events and result", async () => {
   const primary = connection();
   const initial = configuredState({ connections: [primary] });
