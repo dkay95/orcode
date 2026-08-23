@@ -58,6 +58,7 @@ import {
 } from "./config.js";
 import {
   CredentialStore,
+  normalizeProviderSecret,
   type CredentialKind,
 } from "./credentials.js";
 import { OpenRouterService } from "./openrouter.js";
@@ -269,14 +270,24 @@ export function createOpenRouterServiceForStartup(keys: {
   storedManagementKey?: string | null;
   environmentManagementKey?: string | null;
 }): OpenRouterService {
+  const storedInferenceKey = normalizeOptionalProviderSecret(keys.storedInferenceKey);
+  const environmentInferenceKey = normalizeOptionalProviderSecret(keys.environmentInferenceKey);
+  const storedManagementKey = normalizeOptionalProviderSecret(keys.storedManagementKey ?? null);
+  const environmentManagementKey = normalizeOptionalProviderSecret(
+    keys.environmentManagementKey ?? null,
+  );
   return new OpenRouterService(
-    keys.storedInferenceKey ?? keys.environmentInferenceKey ?? undefined,
-    keys.storedManagementKey ?? keys.environmentManagementKey ?? undefined,
+    storedInferenceKey ?? environmentInferenceKey ?? undefined,
+    storedManagementKey ?? environmentManagementKey ?? undefined,
     {
-      inference: keys.storedInferenceKey ? "keychain" : "environment",
-      management: keys.storedManagementKey ? "keychain" : "environment",
+      inference: storedInferenceKey !== null ? "keychain" : "environment",
+      management: storedManagementKey !== null ? "keychain" : "environment",
     },
   );
+}
+
+function normalizeOptionalProviderSecret(value: string | null): string | null {
+  return value === null ? null : normalizeProviderSecret(value);
 }
 
 async function main(): Promise<void> {
@@ -328,7 +339,12 @@ async function main(): Promise<void> {
     // Plain- und Prompt-Modus gleichermaßen.
     console.error(chalk.yellow(homeWarning));
   }
-  const credentials = new CredentialStore();
+  const credentials = new CredentialStore(
+    undefined,
+    undefined,
+    undefined,
+    startup.appHome,
+  );
   const storedInferenceKey = await loadStoredCredential(
     credentials,
     "inference",
@@ -337,9 +353,9 @@ async function main(): Promise<void> {
     credentials,
     "management",
   );
-  const environmentInferenceKey = process.env.OPENROUTER_API_KEY?.trim() || null;
+  const environmentInferenceKey = process.env.OPENROUTER_API_KEY ?? null;
   const environmentManagementKey =
-    process.env.OPENROUTER_MANAGEMENT_KEY?.trim() || null;
+    process.env.OPENROUTER_MANAGEMENT_KEY ?? null;
   const openRouter = createOpenRouterServiceForStartup({
     storedInferenceKey,
     environmentInferenceKey,

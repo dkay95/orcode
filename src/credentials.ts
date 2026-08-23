@@ -1,7 +1,8 @@
 import { AsyncEntry } from "@napi-rs/keyring";
 import { randomBytes, randomUUID } from "node:crypto";
-import { redactText } from "./redaction.js";
-import { errorMessage } from "./utils.js";
+import { join } from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
+import { PrivateStore } from "./private-store.js";
 
 export type CredentialKind = "inference" | "management";
 
@@ -67,12 +68,30 @@ const ACCOUNT_HMAC_KEY = "provider-account-hmac-v1";
 const SLOT_ACCOUNT_PREFIX = "provider-slot:";
 const CANONICAL_UUID =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+const HMAC_INIT_LEASE = "provider-account-hmac-init.lock";
+const HMAC_WAIT_ATTEMPTS = 80;
+const HMAC_WAIT_DELAY_MS = 25;
+
+interface ParsedSlot {
+  kind: CredentialKind;
+  id: string;
+  account: string;
+}
+
+interface OwnedReservation extends ParsedSlot {
+  state: "reserved" | "written" | "unsafe";
+}
 
 export class CredentialStore implements VersionedCredentialStoreLike {
   readonly location =
     process.platform === "darwin"
       ? "macOS-Schlüsselbund"
       : "System-Schlüsselbund";
+  readonly #reservationIds = new Set<string>();
+  readonly #reservations = new WeakMap<object, OwnedReservation>();
+  readonly #hmacPrivateStore: PrivateStore | null;
+  readonly #hmacLeasePath: string | null;
+  #hmacInitialization: Promise<Uint8Array> | null = null;
 
   constructor(
     private readonly createEntry: EntryFactory = (service, account) =>
@@ -80,7 +99,11 @@ export class CredentialStore implements VersionedCredentialStoreLike {
     private readonly createUuid: () => string = randomUUID,
     private readonly createAccountHmacKey: () => Uint8Array = () =>
       randomBytes(32),
-  ) {}
+    appHome?: string,
+  ) {
+    this.#hmacPrivateStore = appHome ? new PrivateStore({ root: appHome }) : null;
+    this.#hmacLeasePath = appHome ? join(appHome, HMAC_INIT_LEASE) : null;
+  }
 
   reserveSlot(kind: CredentialSlotRef["kind"]): CredentialSlotRef {
     if (kind !== "inference" && kind !== "management") {
@@ -90,16 +113,46 @@ export class CredentialStore implements VersionedCredentialStoreLike {
     if (!CANONICAL_UUID.test(uuid)) {
       throw new Error("Der erzeugte Credential-Slot ist ungültig.");
     }
-    return Object.freeze({
+    const id = `v1:${kind}:${uuid}`;
+    if (this.#reservationIds.has(id)) {
+      throw new Error("Der erzeugte Credential-Slot kollidiert mit einer bestehenden Reservierung.");
+    }
+    this.#reservationIds.add(id);
+    const slot = Object.freeze({
       version: 1 as const,
       kind,
-      id: `v1:${kind}:${uuid}`,
+      id,
     });
+    this.#reservations.set(slot, {
+      kind,
+      id,
+      account: `${SLOT_ACCOUNT_PREFIX}${id}`,
+      state: "reserved",
+    });
+    return slot;
   }
 
   async writeSlot(slot: CredentialSlotRef, secret: string): Promise<void> {
     const normalized = normalizeProviderSecret(secret);
-    const entry = this.slotEntry(slot);
+    const reservation = typeof slot === "object" && slot !== null
+      ? this.#reservations.get(slot)
+      : undefined;
+    if (!reservation || reservation.state !== "reserved") {
+      throw new Error("Der Credential-Slot wurde nicht frisch von diesem Store reserviert.");
+    }
+    const entry = this.createEntry(SERVICE, reservation.account);
+    let previous: string | null;
+    try {
+      previous = rawStored(await entry.getPassword());
+    } catch (error) {
+      throw credentialError("lesen", error);
+    }
+    if (previous !== null) {
+      throw new CredentialStoreError(
+        "Der reservierte Credential-Slot ist bereits belegt und wurde nicht verändert.",
+      );
+    }
+
     let primaryError: unknown;
     try {
       await entry.setPassword(normalized);
@@ -108,18 +161,51 @@ export class CredentialStore implements VersionedCredentialStoreLike {
     }
 
     let stored: string | null = null;
+    let storedReadSucceeded = false;
     try {
       stored = rawStored(await entry.getPassword());
+      storedReadSucceeded = true;
     } catch (error) {
       primaryError ??= error;
     }
     if (!primaryError && stored === normalized) {
+      reservation.state = "written";
       return;
     }
 
     primaryError ??= new Error(
       "Der Schlüsselbund hat den neuen Provider-Key nicht unverändert gespeichert.",
     );
+    if (!storedReadSucceeded || (stored !== null && stored !== normalized)) {
+      reservation.state = "unsafe";
+      throw new CredentialStoreError(
+        "Der reservierte Credential-Slot konnte nach dem Schreibversuch nicht sicher zugeordnet werden.",
+        "unknown",
+      );
+    }
+    if (stored !== normalized) {
+      throw credentialError("speichern", primaryError, normalized);
+    }
+
+    // A throwing backend may still have written the candidate. Recheck exact
+    // bytes immediately before deleting; never clean an absent or foreign slot.
+    let candidateStillPresent = false;
+    try {
+      candidateStillPresent = rawStored(await entry.getPassword()) === normalized;
+    } catch {
+      reservation.state = "unsafe";
+      throw new CredentialStoreError(
+        "Der Kandidaten-Slot konnte nach dem Schreibfehler nicht sicher geprüft werden.",
+        "unknown",
+      );
+    }
+    if (!candidateStillPresent) {
+      reservation.state = "unsafe";
+      throw new CredentialStoreError(
+        "Der Kandidaten-Slot änderte sich während der Bereinigung.",
+        "unknown",
+      );
+    }
     let cleanupError: unknown;
     try {
       await entry.deleteCredential();
@@ -135,6 +221,7 @@ export class CredentialStore implements VersionedCredentialStoreLike {
       cleanupError ??= error;
     }
     if (!cleanupReadSucceeded || remaining !== null) {
+      reservation.state = "unsafe";
       const primary = credentialError(
         "speichern",
         primaryError,
@@ -162,32 +249,66 @@ export class CredentialStore implements VersionedCredentialStoreLike {
   }
 
   async readSlot(slot: CredentialSlotRef): Promise<string | null> {
+    const parsed = parseSlotRef(slot);
     try {
-      return rawStored(await this.slotEntry(slot).getPassword());
+      return rawStored(await this.createEntry(SERVICE, parsed.account).getPassword());
     } catch (error) {
       throw credentialError("lesen", error);
     }
   }
 
   async deleteSlot(slot: CredentialSlotRef): Promise<boolean> {
-    const entry = this.slotEntry(slot);
+    const parsed = parseSlotRef(slot);
+    const entry = this.createEntry(SERVICE, parsed.account);
     let existing: string | null = null;
     try {
       existing = rawStored(await entry.getPassword());
-      if (existing === null) return false;
-      await entry.deleteCredential();
-      if (rawStored(await entry.getPassword()) !== null) {
-        throw new CredentialStoreError(
-          "Der System-Schlüsselbund hat den Provider-Key nicht gelöscht. Versuche es erneut.",
-        );
-      }
-      return true;
     } catch (error) {
-      throw credentialError("löschen", error, existing ?? undefined);
+      throw credentialError("lesen", error);
     }
+    if (existing === null) return false;
+
+    let deleteError: unknown;
+    try {
+      await entry.deleteCredential();
+    } catch (error) {
+      deleteError = error;
+    }
+    let remaining: string | null;
+    try {
+      remaining = rawStored(await entry.getPassword());
+    } catch {
+      throw new CredentialStoreError(
+        "Der Credential-Slot konnte nach dem Löschversuch nicht sicher gelesen werden.",
+        "unknown",
+      );
+    }
+    if (remaining === null) return true;
+    if (remaining === existing) {
+      throw credentialError("löschen", deleteError ?? new Error("unverändert"), existing);
+    }
+    throw new CredentialStoreError(
+      "Der Credential-Slot änderte sich während des Löschversuchs.",
+      "unknown",
+    );
   }
 
   async getOrCreateAccountHmacKey(): Promise<Uint8Array> {
+    if (this.#hmacInitialization) {
+      return new Uint8Array(await this.#hmacInitialization);
+    }
+    const initialization = this.#initializeAccountHmacKey();
+    this.#hmacInitialization = initialization;
+    try {
+      return new Uint8Array(await initialization);
+    } finally {
+      if (this.#hmacInitialization === initialization) {
+        this.#hmacInitialization = null;
+      }
+    }
+  }
+
+  async #initializeAccountHmacKey(): Promise<Uint8Array> {
     const entry = this.createEntry(SERVICE, ACCOUNT_HMAC_KEY);
     let existing: string | null;
     try {
@@ -199,6 +320,53 @@ export class CredentialStore implements VersionedCredentialStoreLike {
       return decodeAccountHmacKey(existing);
     }
 
+    if (this.#hmacPrivateStore && this.#hmacLeasePath) {
+      let acquired: boolean;
+      try {
+        acquired = await this.#hmacPrivateStore.createDirectoryExclusive(
+          this.#hmacLeasePath,
+        );
+      } catch (error) {
+        throw credentialError("lesen", error);
+      }
+      if (!acquired) {
+        for (let attempt = 0; attempt < HMAC_WAIT_ATTEMPTS; attempt += 1) {
+          await delay(HMAC_WAIT_DELAY_MS);
+          let persisted: string | null;
+          try {
+            persisted = rawStored(await entry.getPassword());
+          } catch (error) {
+            throw credentialError("lesen", error);
+          }
+          if (persisted !== null) return decodeAccountHmacKey(persisted);
+        }
+        throw new CredentialStoreError(
+          "Die lokale Account-HMAC-Initialisierung ist noch exklusiv belegt.",
+          "unknown",
+        );
+      }
+
+      try {
+        const raced = rawStored(await entry.getPassword());
+        if (raced !== null) return decodeAccountHmacKey(raced);
+        return await this.#writeNewAccountHmacKey(entry);
+      } catch (error) {
+        if (error instanceof CredentialStoreError) throw error;
+        throw credentialError("speichern", error);
+      } finally {
+        try {
+          await this.#hmacPrivateStore.removeTree(this.#hmacLeasePath);
+        } catch {
+          // The persisted key is exact and future readers do not need the
+          // initialization lease. Never use an unresolved removal fallback.
+        }
+      }
+    }
+
+    return this.#writeNewAccountHmacKey(entry);
+  }
+
+  async #writeNewAccountHmacKey(entry: KeyringEntry): Promise<Uint8Array> {
     const generated = this.createAccountHmacKey();
     if (generated.byteLength !== 32) {
       throw new CredentialStoreError(
@@ -221,20 +389,19 @@ export class CredentialStore implements VersionedCredentialStoreLike {
   }
 
   async get(kind: CredentialKind): Promise<string | null> {
+    let value: string | undefined | null;
     try {
-      const value = await this.entry(kind).getPassword();
-      const normalized = value?.trim();
-      return normalized || null;
+      value = await this.entry(kind).getPassword();
     } catch (error) {
       throw credentialError("lesen", error);
     }
+    return value === undefined || value === null
+      ? null
+      : normalizeProviderSecret(value);
   }
 
   async set(kind: CredentialKind, secret: string): Promise<void> {
-    const normalized = secret.trim();
-    if (normalized.length < 20 || /\s/.test(normalized)) {
-      throw new Error("Der API-Key sieht ungültig aus und wurde nicht gespeichert.");
-    }
+    const normalized = normalizeProviderSecret(secret);
     const entry = this.entry(kind);
     let previous: string | null;
     try {
@@ -335,15 +502,12 @@ export class CredentialStore implements VersionedCredentialStoreLike {
     return this.createEntry(SERVICE, ACCOUNTS[kind]);
   }
 
-  private slotEntry(slot: CredentialSlotRef): KeyringEntry {
-    validateSlotRef(slot);
-    return this.createEntry(SERVICE, `${SLOT_ACCOUNT_PREFIX}${slot.id}`);
-  }
 }
 
 function normalizeStored(value: string | undefined | null): string | null {
-  const normalized = value?.trim();
-  return normalized || null;
+  return value === undefined || value === null
+    ? null
+    : normalizeProviderSecret(value);
 }
 
 function rawStored(value: string | undefined | null): string | null {
@@ -352,18 +516,23 @@ function rawStored(value: string | undefined | null): string | null {
     : value;
 }
 
-function validateSlotRef(slot: CredentialSlotRef): void {
+function parseSlotRef(slot: CredentialSlotRef): ParsedSlot {
+  const version = slot?.version;
+  const kind = slot?.kind;
+  const id = slot?.id;
   if (
     !slot ||
-    slot.version !== 1 ||
-    (slot.kind !== "inference" && slot.kind !== "management")
+    version !== 1 ||
+    (kind !== "inference" && kind !== "management")
   ) {
     throw new Error("Der Credential-Slot ist ungültig.");
   }
-  const prefix = `v1:${slot.kind}:`;
-  if (!slot.id.startsWith(prefix) || !CANONICAL_UUID.test(slot.id.slice(prefix.length))) {
+  const prefix = `v1:${kind}:`;
+  if (typeof id !== "string" || !id.startsWith(prefix)
+    || !CANONICAL_UUID.test(id.slice(prefix.length))) {
     throw new Error("Der Credential-Slot ist ungültig oder nicht kanonisch.");
   }
+  return { kind, id, account: `${SLOT_ACCOUNT_PREFIX}${id}` };
 }
 
 function decodeAccountHmacKey(value: string): Uint8Array {
@@ -394,17 +563,13 @@ export class CredentialStoreError extends Error {
 function credentialError(
   operation: "lesen" | "speichern" | "löschen",
   error: unknown,
-  ...secrets: Array<string | undefined>
+  ..._secrets: Array<string | undefined>
 ): CredentialStoreError {
-  const rawDetail = errorMessage(error);
-  const explicitlyRedacted = secrets.reduce<string>(
-    (current, secret) => secret
-      ? current.split(secret).join("[REDACTED]")
-      : current,
-    rawDetail,
-  );
-  const detail = redactText(explicitlyRedacted);
+  const persistenceState = error instanceof CredentialStoreError
+    ? error.persistenceState
+    : "unchanged";
   return new CredentialStoreError(
-    `Der System-Schlüsselbund konnte nicht ${operation} werden: ${detail}`,
+    `Der System-Schlüsselbund konnte nicht ${operation} werden: [REDACTED]`,
+    persistenceState,
   );
 }

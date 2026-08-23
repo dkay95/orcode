@@ -413,6 +413,60 @@ export class PrivateStore {
     await ensurePrivateDirectoryTree(root, target, this.adapter);
   }
 
+  /**
+   * Atomically reserves one real, private directory beneath the verified root.
+   * Existing real directories are reported as a lost race; links and identity
+   * changes fail closed. The caller releases a winning reservation with
+   * removeTree(), which repeats the same root-bound identity checks.
+   */
+  async createDirectoryExclusive(path: string): Promise<boolean> {
+    await this.assertAvailable();
+    const target = resolve(path);
+    const root = this.#root ?? dirname(target);
+    assertContained(root, target);
+    if (target === root) {
+      throw new Error(`PrivateStore reserviert seine eigene Root-Grenze nicht: ${target}`);
+    }
+    const ancestors = await directoryIdentities(root, dirname(target));
+    await assertDirectoryIdentities(ancestors);
+    try {
+      await mkdir(target, { mode: PRIVATE_DIRECTORY_MODE });
+    } catch (error) {
+      if (!hasCode(error, "EEXIST")) throw error;
+      await assertDirectoryIdentities(ancestors);
+      const existing = await lstat(target, { bigint: true });
+      await assertDirectoryIdentities(ancestors);
+      if (existing.isSymbolicLink() || !existing.isDirectory()) {
+        throw new Error(`PrivateStore-Lease ist kein echtes Verzeichnis: ${target}`);
+      }
+      return false;
+    }
+
+    let created: PathIdentity | null = null;
+    try {
+      await assertDirectoryIdentities(ancestors);
+      const info = await lstat(target, { bigint: true });
+      if (info.isSymbolicLink() || !info.isDirectory()) {
+        throw new Error(`PrivateStore-Lease wurde bei der Erstellung ausgetauscht: ${target}`);
+      }
+      created = pathIdentity(target, info, "directory");
+      const protectedIdentity = await protectBoundPath(
+        target,
+        "directory",
+        this.adapter,
+        ancestors,
+        created,
+      );
+      assertSameIdentity(created, protectedIdentity, target);
+      await assertDirectoryIdentities(ancestors);
+      await assertPathIdentity(protectedIdentity);
+      return true;
+    } catch (error) {
+      if (created) await rollbackCreatedDirectories([created]);
+      throw error;
+    }
+  }
+
   async writeTextAtomic(path: string, content: string): Promise<void> {
     await this.assertAvailable();
     const target = resolve(path);

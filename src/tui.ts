@@ -1141,16 +1141,21 @@ export class TerminalUi {
       return;
     }
     if (this.#pasting) {
+      const rawSecretBytes = this.#mode === "secret"
+        ? key.sequence || character || ""
+        : "";
       if (key.name === "enter" || key.name === "return") {
-        this.#pasteBuffer += this.#mode === "secret" && character
-          ? character
+        this.#pasteBuffer += this.#mode === "secret" && rawSecretBytes
+          ? rawSecretBytes
           : "\n";
       } else if (key.name === "tab") {
-        this.#pasteBuffer += this.#mode === "secret" && character
-          ? character
+        this.#pasteBuffer += this.#mode === "secret" && rawSecretBytes
+          ? rawSecretBytes
           : "\t";
       }
-      else if (character) this.#pasteBuffer += character;
+      else if (this.#mode === "secret" && rawSecretBytes) {
+        this.#pasteBuffer += rawSecretBytes;
+      } else if (character) this.#pasteBuffer += character;
       return;
     }
     if (this.#mode === "model-picker" || this.#mode === "choice-picker") {

@@ -119,6 +119,42 @@ function swapAfterLstat(
   };
 }
 
+test("PrivateStore exclusive creation refuses a swapped replacement before protection or rollback", async () => {
+  const root = await fs.promises.mkdtemp(join(tmpdir(), "orcode-private-exclusive-swap-"));
+  const lease = join(root, "hmac-init.lock");
+  const original = join(root, "hmac-init-before-swap");
+  const outsideReplacement = join(root, "outside-replacement");
+  const sentinel = join(outsideReplacement, "must-survive.txt");
+  await fs.promises.mkdir(outsideReplacement, { mode: 0o755 });
+  await fs.promises.writeFile(sentinel, "outside sentinel");
+  await fs.promises.chmod(outsideReplacement, 0o755);
+  swapAtNextOpen(lease, async () => {
+    await fs.promises.rename(lease, original);
+    await fs.promises.rename(outsideReplacement, lease);
+  });
+  const store = new PrivateStore({
+    adapter: new PosixPrivateStoreAdapter(),
+    root,
+  }) as unknown as {
+    createDirectoryExclusive(path: string): Promise<boolean>;
+  };
+  let rejected = false;
+
+  try {
+    await store.createDirectoryExclusive(lease);
+  } catch {
+    rejected = true;
+  }
+
+  const hookWasNotReached = pendingOpenSwap?.path === resolve(lease);
+  if (hookWasNotReached) pendingOpenSwap = null;
+  assert.equal(hookWasNotReached, false, "exclusive creation must bind the new directory through an identity handle");
+
+  assert.equal(await fs.promises.readFile(join(lease, "must-survive.txt"), "utf8"), "outside sentinel");
+  assert.equal((await fs.promises.stat(lease)).mode & 0o777, 0o755);
+  assert.equal(rejected, true);
+});
+
 test("PrivateStore protect compares the pre-open snapshot before changing a replacement", async () => {
   const root = await fs.promises.mkdtemp(join(tmpdir(), "orcode-private-preopen-protect-"));
   const tree = join(root, "backup");

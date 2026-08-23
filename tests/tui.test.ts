@@ -619,6 +619,49 @@ test("secret bracketed paste preserves raw CRLF until common normalization, mask
   }
 });
 
+test("secret paste preserves non-framing readline key.sequence bytes for rejection and clears the next input", async () => {
+  const stdin = new FakeInput();
+  const stdout = new FakeOutput();
+  const terminal = ui(stdin, stdout);
+  const body = `candidate-${"q".repeat(32)}`;
+  const raw = `${body}\u001b[31m\0\r\n`;
+  const normalize = (credentialsModule as typeof credentialsModule & {
+    normalizeProviderSecret(value: string): string;
+  }).normalizeProviderSecret;
+
+  terminal.start();
+  try {
+    const value = terminal.readSecret("OpenRouter API-Key");
+    let settled = false;
+    void value.then(() => {
+      settled = true;
+    });
+    press(stdin, "paste-start", "", { sequence: "\u001b[200~" });
+    type(stdin, body);
+    press(stdin, "unknown", "", { sequence: "\u001b[31m" });
+    press(stdin, "unknown", "", { sequence: "\0" });
+    press(stdin, "enter", "", { sequence: "\r\n" });
+    press(stdin, "paste-end", "", { sequence: "\u001b[201~" });
+    await Promise.resolve();
+
+    assert.equal(settled, false, "paste-end must not submit a secret");
+    assert.doesNotMatch(stdout.output, new RegExp(body));
+    assert.match(stdout.output, /•{8,}/);
+
+    press(stdin, "return");
+    const received = await value;
+    assert.equal(received, raw);
+    assert.throws(() => normalize(received ?? ""), /ungültig|Steuer|Leerzeichen/i);
+
+    const next = terminal.readInput();
+    type(stdin, "clean-next-input");
+    press(stdin, "return");
+    assert.equal(await next, "clean-next-input");
+  } finally {
+    terminal.stop();
+  }
+});
+
 test("secret success, validation error, and cancellation leave the next input buffer clean", async () => {
   const stdin = new FakeInput();
   const stdout = new FakeOutput();

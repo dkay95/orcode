@@ -135,6 +135,69 @@ test("startup reuses a saved key and otherwise marks environment keys process-on
   assert.equal(processOnly.runtimeState.inferenceValidity, "unknown");
 });
 
+test("startup rejects every saved and environment credential before constructing provider state", () => {
+  const valid = `${STARTUP_KEY_PREFIX}${"v".repeat(48)}`;
+  const invalid = `opaque\u001b[31m${"x".repeat(30)}`;
+  const cases = [
+    { storedInferenceKey: invalid, environmentInferenceKey: null },
+    { storedInferenceKey: null, environmentInferenceKey: invalid },
+    { storedInferenceKey: valid, environmentInferenceKey: invalid },
+    {
+      storedInferenceKey: valid,
+      environmentInferenceKey: null,
+      storedManagementKey: invalid,
+      environmentManagementKey: null,
+    },
+    {
+      storedInferenceKey: valid,
+      environmentInferenceKey: null,
+      storedManagementKey: null,
+      environmentManagementKey: invalid,
+    },
+    {
+      storedInferenceKey: valid,
+      environmentInferenceKey: null,
+      storedManagementKey: valid,
+      environmentManagementKey: invalid,
+    },
+  ];
+
+  for (const keys of cases) {
+    assert.throws(
+      () => createOpenRouterServiceForStartup(keys),
+      /ungültig|Steuer|Leerzeichen/i,
+    );
+  }
+});
+
+test("startup accepts outer Unicode whitespace for all saved and environment credentials", () => {
+  const inference = `${STARTUP_KEY_PREFIX}${"i".repeat(48)}`;
+  const management = `${STARTUP_KEY_PREFIX}${"m".repeat(48)}`;
+  const wrap = (value: string): string => `\u00a0\r\n${value}\r\n\u2003`;
+
+  const saved = createOpenRouterServiceForStartup({
+    storedInferenceKey: wrap(inference),
+    environmentInferenceKey: null,
+    storedManagementKey: wrap(management),
+    environmentManagementKey: null,
+  });
+  assert.equal(saved.requireKey(), inference);
+  assert.equal(saved.requireManagementKey(), management);
+  assert.equal(saved.keyOrigin, "keychain");
+  assert.equal(saved.managementKeyOrigin, "keychain");
+
+  const environment = createOpenRouterServiceForStartup({
+    storedInferenceKey: null,
+    environmentInferenceKey: wrap(inference),
+    storedManagementKey: null,
+    environmentManagementKey: wrap(management),
+  });
+  assert.equal(environment.requireKey(), inference);
+  assert.equal(environment.requireManagementKey(), management);
+  assert.equal(environment.keyOrigin, "environment");
+  assert.equal(environment.managementKeyOrigin, "environment");
+});
+
 test("dashboard startup validation never persists an environment key implicitly", async () => {
   const key = `${STARTUP_KEY_PREFIX}dashboard-environment-key-123`;
   const openRouter = new OpenRouterService(

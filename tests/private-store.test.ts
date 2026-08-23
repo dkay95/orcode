@@ -16,6 +16,49 @@ import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import test from "node:test";
 
+type ExclusiveDirectoryStore = {
+  createDirectoryExclusive(path: string): Promise<boolean>;
+  removeTree(path: string): Promise<void>;
+};
+
+test("PrivateStore exclusive directory creation has exactly one parallel winner", async () => {
+  const { PosixPrivateStoreAdapter, PrivateStore } = await import("../src/private-store.js");
+  const root = await mkdtemp(join(tmpdir(), "orcode-private-exclusive-"));
+  const lease = join(root, "hmac-init.lock");
+  const store = new PrivateStore({
+    adapter: new PosixPrivateStoreAdapter(),
+    root,
+  }) as unknown as ExclusiveDirectoryStore;
+
+  const outcomes = await Promise.all(
+    Array.from({ length: 32 }, () => store.createDirectoryExclusive(lease)),
+  );
+  assert.equal(outcomes.filter(Boolean).length, 1);
+  assert.equal((await stat(lease)).mode & 0o777, 0o700);
+  await store.removeTree(lease);
+  await assert.rejects(stat(lease), /ENOENT/);
+});
+
+test("PrivateStore exclusive directory creation rejects symlinked ancestors without touching outside", async () => {
+  const { PosixPrivateStoreAdapter, PrivateStore } = await import("../src/private-store.js");
+  const fixture = await mkdtemp(join(tmpdir(), "orcode-private-exclusive-symlink-"));
+  const root = join(fixture, "home");
+  const outside = join(fixture, "outside");
+  await mkdir(root);
+  await mkdir(outside);
+  await symlink(outside, join(root, "locks"), "dir");
+  const store = new PrivateStore({
+    adapter: new PosixPrivateStoreAdapter(),
+    root,
+  }) as unknown as ExclusiveDirectoryStore;
+
+  await assert.rejects(
+    store.createDirectoryExclusive(join(root, "locks", "hmac-init.lock")),
+    /symbol|symlink|link/i,
+  );
+  assert.deepEqual(await readdir(outside), []);
+});
+
 test("PrivateStore enforces 0700 directories and 0600 atomic files on POSIX", async () => {
   const { PosixPrivateStoreAdapter, PrivateStore } = await import("../src/private-store.js");
   const root = await mkdtemp(join(tmpdir(), "orcode-private-posix-"));
