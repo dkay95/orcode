@@ -29,6 +29,16 @@ const APP_TITLE = "orcode";
 const MODEL_CACHE_TTL_MS = 5 * 60_000;
 
 export type KeyOrigin = "none" | "environment" | "keychain" | "interactive";
+export type CredentialValidity = "unknown" | "valid" | "rejected";
+export type ConnectivityState = "unknown" | "connected" | "reconnecting" | "disconnected";
+export type CreditState = "unknown" | "available" | "insufficient" | "unavailable";
+
+export interface OpenRouterRuntimeState {
+  inferenceValidity: CredentialValidity;
+  managementValidity: CredentialValidity;
+  connectivity: ConnectivityState;
+  credit: CreditState;
+}
 
 /** Injection points for tests and for future runtime tuning. */
 export interface OpenRouterRuntime {
@@ -636,6 +646,13 @@ export class OpenRouterService {
   readonly #runtime: OpenRouterRuntime;
   readonly #restMonitor: SdkReconnectMonitor;
   readonly #clients = new Map<string, OpenRouter>();
+  readonly #state: OpenRouterRuntimeState = {
+    inferenceValidity: "unknown",
+    managementValidity: "unknown",
+    connectivity: "unknown",
+    credit: "unknown",
+  };
+  #reconnectInProgress = false;
   #modelCache: { models: ModelInfo[]; fetchedAt: number } | null = null;
 
   constructor(
@@ -678,6 +695,10 @@ export class OpenRouterService {
     return this.#managementKeyOrigin;
   }
 
+  get runtimeState(): OpenRouterRuntimeState {
+    return { ...this.#state };
+  }
+
   setKey(apiKey: string, origin: KeyOrigin = "interactive"): void {
     const normalized = normalizeKey(apiKey);
     if (!normalized || normalized.length < 20 || /\s/.test(normalized)) {
@@ -685,12 +706,18 @@ export class OpenRouterService {
     }
     this.#apiKey = normalized;
     this.#keyOrigin = origin;
+    this.#state.inferenceValidity = "unknown";
+    this.#state.connectivity = "unknown";
+    this.#state.credit = "unknown";
     this.dropClients();
   }
 
   forgetKey(): void {
     this.#apiKey = null;
     this.#keyOrigin = "none";
+    this.#state.inferenceValidity = "unknown";
+    this.#state.connectivity = "unknown";
+    this.#state.credit = "unknown";
     this.dropClients();
   }
 
@@ -701,11 +728,15 @@ export class OpenRouterService {
     }
     this.#managementKey = normalized;
     this.#managementKeyOrigin = origin;
+    this.#state.managementValidity = "unknown";
+    this.#state.credit = "unknown";
   }
 
   forgetManagementKey(): void {
     this.#managementKey = null;
     this.#managementKeyOrigin = "none";
+    this.#state.managementValidity = "unknown";
+    this.#state.credit = "unknown";
   }
 
   /**
@@ -740,12 +771,21 @@ export class OpenRouterService {
         {
           afterError: (context, response, error) => {
             monitor.afterError(context, response);
+            if (response) {
+              this.#recordResponse(response.status, "inference", "sdk");
+            } else {
+              this.#state.connectivity = "disconnected";
+            }
             return { response, error };
           },
         },
         {
           afterSuccess: (context, response) => {
             monitor.afterSuccess(context);
+            if (!this.#reconnectInProgress) {
+              this.#state.connectivity = "connected";
+            }
+            this.#state.inferenceValidity = "valid";
             return response;
           },
         },
@@ -774,36 +814,55 @@ export class OpenRouterService {
   async reconnect(signal?: AbortSignal): Promise<ReconnectReport> {
     const hadClients = this.#clients.size > 0;
     const cachedModels = this.#modelCache?.models.length ?? 0;
+    const previousConnectivity = this.#state.connectivity;
     this.dropClients();
     this.invalidateModelCache();
+    this.#reconnectInProgress = true;
+    this.#state.connectivity = "reconnecting";
+    try {
+      const balance = await this.checkBalance(signal);
+      this.client();
+      this.#state.connectivity = "connected";
 
-    const balance = await this.checkBalance(signal);
-    this.client();
-
-    const steps = [
-      hadClients
-        ? "Bestehende OpenRouter-Verbindung verworfen und neu aufgebaut."
-        : "OpenRouter-Verbindung neu aufgebaut.",
-      `Key erneut geprüft: ${balance.key.label ?? "ohne Label"} · ${
-        balance.capabilities?.summary ?? "Fähigkeiten unbekannt."
-      }`,
-      cachedModels
-        ? `Modell-Cache geleert (${cachedModels} Einträge).`
-        : "Modell-Cache war leer und bleibt leer.",
-    ];
-    return {
-      ...balance,
-      steps,
-      message: steps.join(" "),
-      clientRebuilt: true,
-      modelCacheCleared: true,
-    };
+      const steps = [
+        hadClients
+          ? "Bestehende OpenRouter-Verbindung verworfen und neu aufgebaut."
+          : "OpenRouter-Verbindung neu aufgebaut.",
+        `Key erneut geprüft: ${balance.key.label ?? "ohne Label"} · ${
+          balance.capabilities?.summary ?? "Fähigkeiten unbekannt."
+        }`,
+        cachedModels
+          ? `Modell-Cache geleert (${cachedModels} Einträge).`
+          : "Modell-Cache war leer und bleibt leer.",
+      ];
+      return {
+        ...balance,
+        steps,
+        message: steps.join(" "),
+        clientRebuilt: true,
+        modelCacheCleared: true,
+      };
+    } catch (error) {
+      if (signal?.aborted) {
+        this.#state.connectivity = previousConnectivity;
+      } else if (this.#state.connectivity === "reconnecting") {
+        // An HTTP response proves transport connectivity even when credentials
+        // or permissions made the reconnect itself fail.
+        this.#state.connectivity = "connected";
+      }
+      throw error;
+    } finally {
+      this.#reconnectInProgress = false;
+    }
   }
 
   async checkBalance(signal?: AbortSignal): Promise<BalanceReport> {
     const key = await this.getCurrentKey(signal);
     const capabilities = describeKeyCapabilities(key, this.hasManagementKey);
     if (!capabilities.accountCredits) {
+      this.#state.credit = key.limitRemaining !== undefined && key.limitRemaining !== null
+        ? (key.limitRemaining > 0 ? "available" : "insufficient")
+        : "unavailable";
       return {
         key,
         capabilities,
@@ -859,11 +918,15 @@ export class OpenRouterService {
     const data = requireRecord(payload.data, "Ungültige Guthaben-Antwort");
     const totalCredits = numberOf(data.total_credits);
     const totalUsage = numberOf(data.total_usage);
-    return {
+    const credits = {
       totalCredits,
       totalUsage,
       remaining: Math.max(0, totalCredits - totalUsage),
     };
+    if (this.#credentialScope(bearerKey) !== "candidate") {
+      this.#state.credit = credits.remaining > 0 ? "available" : "insufficient";
+    }
+    return credits;
   }
 
   async getCurrentKey(signal?: AbortSignal): Promise<KeyInfo> {
@@ -982,18 +1045,40 @@ export class OpenRouterService {
     bearerKey = this.requireKey(),
     signal?: AbortSignal,
   ): Promise<Record<string, unknown>> {
-    const response = await this.#send(
-      `${API_BASE}${path}`,
-      {
-        headers: {
-          Authorization: `Bearer ${bearerKey}`,
-          "Content-Type": "application/json",
-          "X-OpenRouter-Title": APP_TITLE,
+    const scope = this.#credentialScope(bearerKey);
+    let response: Response;
+    try {
+      response = await this.#send(
+        `${API_BASE}${path}`,
+        {
+          headers: {
+            Authorization: `Bearer ${bearerKey}`,
+            "Content-Type": "application/json",
+            "X-OpenRouter-Title": APP_TITLE,
+          },
         },
-      },
-      operationFromPath(path),
-      signal,
-    );
+        operationFromPath(path),
+        signal,
+      );
+    } catch (error) {
+      if (signal?.aborted) {
+        throw abortError(signal);
+      }
+      const failure = describeOpenRouterFailure(error, [
+        this.#apiKey,
+        this.#managementKey,
+        bearerKey,
+      ]);
+      if (scope !== "candidate" && failure.kind !== "cancelled") {
+        this.#state.connectivity = "disconnected";
+      }
+      if (failure.kind === "cancelled") {
+        throw error;
+      }
+      throw new OpenRouterRequestError(failure);
+    }
+
+    this.#recordResponse(response.status, scope, path);
 
     const text = await response.text();
     const payload = parseJson(text);
@@ -1018,24 +1103,45 @@ export class OpenRouterService {
     operation: string,
     signal?: AbortSignal,
   ): Promise<Response> {
-    try {
-      return await fetchWithReconnect(url, init, {
-        operation,
-        monitor: this.#restMonitor,
-        signal,
-        timeoutMs: RETRY_POLICY.requestTimeoutMs,
-        clock: this.#runtime.clock,
-        fetchImpl: this.#runtime.fetchImpl,
-      });
-    } catch (error) {
-      if (signal?.aborted) {
-        throw abortError(signal);
-      }
-      const failure = this.explain(error);
-      if (failure.kind === "cancelled") {
-        throw error;
-      }
-      throw new OpenRouterRequestError(failure);
+    return fetchWithReconnect(url, init, {
+      operation,
+      monitor: this.#restMonitor,
+      signal,
+      timeoutMs: RETRY_POLICY.requestTimeoutMs,
+      clock: this.#runtime.clock,
+      fetchImpl: this.#runtime.fetchImpl,
+    });
+  }
+
+  #credentialScope(bearerKey: string): "inference" | "management" | "candidate" {
+    if (this.#managementKey && bearerKey === this.#managementKey) return "management";
+    if (this.#apiKey && bearerKey === this.#apiKey) return "inference";
+    return "candidate";
+  }
+
+  #recordResponse(
+    status: number,
+    scope: "inference" | "management" | "candidate",
+    path: string,
+  ): void {
+    if (scope === "candidate") return;
+    const connectivity = status === 408 || status === 504 || status >= 500
+      ? "disconnected"
+      : "connected";
+    if (!this.#reconnectInProgress || connectivity === "disconnected") {
+      this.#state.connectivity = connectivity;
+    }
+    if (status >= 200 && status < 300) {
+      if (scope === "inference") this.#state.inferenceValidity = "valid";
+      else this.#state.managementValidity = "valid";
+    } else if (status === 401) {
+      if (scope === "inference") this.#state.inferenceValidity = "rejected";
+      else this.#state.managementValidity = "rejected";
+    }
+    if (status === 402) {
+      this.#state.credit = "insufficient";
+    } else if (path === "/credits" && (status === 401 || status === 403)) {
+      this.#state.credit = "unavailable";
     }
   }
 

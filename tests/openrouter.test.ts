@@ -139,6 +139,216 @@ test("management key has separate in-memory lifecycle", () => {
   assert.equal(service.hasManagementKey, false);
 });
 
+test("credential validity, connectivity, and credit remain independent runtime states", async () => {
+  const service = new OpenRouterService(
+    INFERENCE_KEY,
+    MANAGEMENT_KEY,
+    { inference: "keychain", management: "keychain" },
+    {
+      fetchImpl: async (url) =>
+        url.endsWith("/credits")
+          ? creditsResponse()
+          : keyResponse({ is_management_key: false }),
+    },
+  );
+
+  assert.deepEqual(service.runtimeState, {
+    inferenceValidity: "unknown",
+    managementValidity: "unknown",
+    connectivity: "unknown",
+    credit: "unknown",
+  });
+
+  await service.checkBalance();
+  assert.deepEqual(service.runtimeState, {
+    inferenceValidity: "valid",
+    managementValidity: "valid",
+    connectivity: "connected",
+    credit: "available",
+  });
+
+  const leaked = service.runtimeState as { connectivity: string };
+  leaked.connectivity = "disconnected";
+  assert.equal(service.runtimeState.connectivity, "connected");
+});
+
+test("only a genuine active-scope 401 rejects a credential while permission and credit stay orthogonal", async (t) => {
+  const fixtures = [
+    {
+      name: "inference 401",
+      response: jsonResponse({ error: { message: "unauthorized" } }, { status: 401 }),
+      expectedValidity: "rejected",
+      expectedConnectivity: "connected",
+      expectedCredit: "unknown",
+    },
+    {
+      name: "permission 403",
+      response: jsonResponse({ error: { message: "forbidden" } }, { status: 403 }),
+      expectedValidity: "unknown",
+      expectedConnectivity: "connected",
+      expectedCredit: "unknown",
+    },
+    {
+      name: "insufficient credit 402",
+      response: jsonResponse({ error: { message: "payment required" } }, { status: 402 }),
+      expectedValidity: "unknown",
+      expectedConnectivity: "connected",
+      expectedCredit: "insufficient",
+    },
+    {
+      name: "final provider 503",
+      response: jsonResponse({ error: { message: "provider unavailable" } }, { status: 503 }),
+      expectedValidity: "unknown",
+      expectedConnectivity: "disconnected",
+      expectedCredit: "unknown",
+    },
+  ] as const;
+
+  for (const fixture of fixtures) {
+    await t.test(fixture.name, async () => {
+      const service = new OpenRouterService(INFERENCE_KEY, undefined, {}, {
+        clock: { sleep: async () => undefined },
+        fetchImpl: async () => fixture.response.clone(),
+      });
+      await assert.rejects(service.getCurrentKey());
+      assert.equal(service.hasKey, true);
+      assert.equal(service.runtimeState.inferenceValidity, fixture.expectedValidity);
+      assert.equal(service.runtimeState.connectivity, fixture.expectedConnectivity);
+      assert.equal(service.runtimeState.credit, fixture.expectedCredit);
+    });
+  }
+});
+
+test("management candidate failures redact the candidate and never mutate active runtime state", async () => {
+  const candidate = `${TEST_KEY_PREFIX}${["candidate", "transport", "secret"].join("-")}`;
+  let candidateCall = false;
+  const service = new OpenRouterService(
+    INFERENCE_KEY,
+    MANAGEMENT_KEY,
+    { inference: "keychain", management: "keychain" },
+    {
+      clock: { sleep: async () => undefined },
+      fetchImpl: async (url, init) => {
+        if (bearerOf(init) === `Bearer ${candidate}`) {
+          candidateCall = true;
+          throw Object.assign(new TypeError(`transport failed for ${candidate}`), {
+            cause: { code: "ENOTFOUND" },
+          });
+        }
+        return url.endsWith("/credits")
+          ? creditsResponse()
+          : keyResponse({ is_management_key: false });
+      },
+    },
+  );
+  await service.checkBalance();
+  const before = service.runtimeState;
+
+  await assert.rejects(service.validateManagementKey(candidate), (error: unknown) => {
+    assert.doesNotMatch(String(error), new RegExp(candidate));
+    assert.doesNotMatch(service.safeMessage(error), new RegExp(candidate));
+    assert.match(service.safeMessage(error), /Internetverbindung|DNS/);
+    return true;
+  });
+
+  assert.equal(candidateCall, true);
+  assert.deepEqual(service.runtimeState, before);
+  assert.equal(service.requireKey(), INFERENCE_KEY);
+  assert.equal(service.hasManagementKey, true);
+});
+
+test("reconnect exposes reconnecting during the attempt and preserves validity on transport failure", async () => {
+  let shouldFail = false;
+  let service: OpenRouterService;
+  service = new OpenRouterService(INFERENCE_KEY, undefined, {}, {
+    clock: { sleep: async () => undefined },
+    fetchImpl: async (url) => {
+      assert.equal(service.runtimeState.connectivity, "reconnecting");
+      if (shouldFail) {
+        throw Object.assign(new TypeError("fetch failed"), {
+          cause: { code: "ENETUNREACH" },
+        });
+      }
+      return url.endsWith("/credits")
+        ? creditsResponse()
+        : keyResponse({ is_management_key: true });
+    },
+  });
+
+  await service.reconnect();
+  assert.equal(service.runtimeState.connectivity, "connected");
+  assert.equal(service.runtimeState.inferenceValidity, "valid");
+
+  shouldFail = true;
+  await assert.rejects(service.reconnect());
+  assert.equal(service.runtimeState.connectivity, "disconnected");
+  assert.equal(service.runtimeState.inferenceValidity, "valid");
+  assert.equal(service.hasKey, true);
+});
+
+test("a management 401 rejects only the management credential and keeps the inference key active", async () => {
+  let rejectManagement = false;
+  const service = new OpenRouterService(
+    INFERENCE_KEY,
+    MANAGEMENT_KEY,
+    { inference: "keychain", management: "keychain" },
+    {
+      fetchImpl: async (url) => {
+        if (url.endsWith("/credits")) {
+          return rejectManagement
+            ? jsonResponse({ error: { message: "management unauthorized" } }, { status: 401 })
+            : creditsResponse();
+        }
+        return keyResponse({ is_management_key: false });
+      },
+    },
+  );
+
+  await service.checkBalance();
+  rejectManagement = true;
+  const fallback = await service.checkBalance();
+
+  assert.equal(fallback.credits, undefined);
+  assert.equal(service.runtimeState.inferenceValidity, "valid");
+  assert.equal(service.runtimeState.managementValidity, "rejected");
+  assert.equal(service.runtimeState.connectivity, "connected");
+  assert.equal(service.runtimeState.credit, "unavailable");
+  assert.equal(service.hasKey, true);
+  assert.equal(service.hasManagementKey, true);
+});
+
+test("permission, limits, expiry metadata, and offline failures never erase last-known credential validity", async () => {
+  let mode: "valid" | "forbidden" | "limited" | "offline" = "valid";
+  const service = new OpenRouterService(INFERENCE_KEY, undefined, {}, {
+    clock: { sleep: async () => undefined },
+    fetchImpl: async () => {
+      if (mode === "forbidden") {
+        return jsonResponse({ error: { message: "forbidden" } }, { status: 403 });
+      }
+      if (mode === "limited") {
+        return jsonResponse({ error: { message: "slow down" } }, { status: 429 });
+      }
+      if (mode === "offline") {
+        throw Object.assign(new TypeError("fetch failed after HTTP 401 text"), {
+          cause: { code: "ENETUNREACH" },
+        });
+      }
+      return keyResponse({ expires_at: "2000-01-01T00:00:00.000Z" });
+    },
+  });
+
+  await service.getCurrentKey();
+  assert.equal(service.runtimeState.inferenceValidity, "valid");
+
+  for (const failureMode of ["forbidden", "limited", "offline"] as const) {
+    mode = failureMode;
+    await assert.rejects(service.getCurrentKey());
+    assert.equal(service.runtimeState.inferenceValidity, "valid", failureMode);
+    assert.equal(service.hasKey, true, failureMode);
+  }
+  assert.equal(service.runtimeState.connectivity, "disconnected");
+});
+
 test("session redaction removes pasted API keys", () => {
   const genericKey = `${["sk", ""].join("-")}${"abcdefghijklmnopqrstuv"}`;
   const redacted = redactSensitive(
