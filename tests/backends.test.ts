@@ -155,3 +155,37 @@ test("registry distinguishes an unknown backend from a registered coming-soon ba
   const registry = new BackendRegistry([{ descriptor: openRouterDescriptor, adapter: adapter() }]);
   assert.throws(() => registry.adapter("anthropic"), /unknown backend/i);
 });
+
+test("Slice 1 rejects a runnable Codex registration", () => {
+  const codex: BackendDescriptor = {
+    ...openRouterDescriptor,
+    id: "codex",
+    displayName: "Codex",
+    maturity: "preview",
+    kind: "managed-agent",
+    credentialOwner: "provider-runtime",
+    billingRealmKind: "provider-managed",
+  };
+
+  assert.throws(
+    () => new BackendRegistry([{ descriptor: codex, adapter: adapter("codex") }]),
+    /reserved/i,
+  );
+});
+
+test("Slice 1 rejects a runnable non-coming-soon Anthropic registration", () => {
+  const anthropic: BackendDescriptor = {
+    ...openRouterDescriptor,
+    id: "anthropic",
+    displayName: "Anthropic / Claude-Abo",
+    maturity: "preview",
+    kind: "managed-agent",
+    credentialOwner: "provider-runtime",
+    billingRealmKind: "provider-managed",
+  };
+
+  assert.throws(
+    () => new BackendRegistry([{ descriptor: anthropic, adapter: adapter("anthropic") }]),
+    /coming-soon/i,
+  );
+});

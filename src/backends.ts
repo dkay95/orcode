@@ -157,6 +157,15 @@ export class BackendRegistry {
     const descriptors: BackendDescriptor[] = [];
     for (const entry of entries) {
       const { descriptor, adapter } = entry;
+      if (descriptor.id === "codex") {
+        throw new Error("Backend codex is reserved in Slice 1 and cannot be registered.");
+      }
+      if (
+        descriptor.id === "anthropic"
+        && (descriptor.maturity !== "coming-soon" || descriptor.connectable || adapter)
+      ) {
+        throw new Error("Backend anthropic is coming-soon and non-connectable in Slice 1; it must not have an adapter.");
+      }
       if (this.#descriptors.has(descriptor.id)) {
         throw new Error(`Duplicate backend descriptor ID: ${descriptor.id}.`);
       }
