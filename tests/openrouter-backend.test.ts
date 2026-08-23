@@ -125,6 +125,7 @@ interface InspectFixtureOptions {
   creditsStatus?: number;
   creditsFailure?: unknown;
   credits?: { total: number; usage: number };
+  creditsPayload?: Record<string, unknown>;
   credentials?: FakeCredentials;
   environment?: Readonly<Record<string, string | undefined>>;
   signal?: AbortSignal;
@@ -152,6 +153,9 @@ async function inspectFixture(options: InspectFixtureOptions = {}) {
               { error: { message: `opaque-credit-body-${options.creditsStatus}` } },
               { status: options.creditsStatus },
             );
+          }
+          if (options.creditsPayload) {
+            return jsonResponse({ data: options.creditsPayload });
           }
           return creditsResponse(options.credits?.total, options.credits?.usage);
         }
@@ -326,6 +330,50 @@ test("known zero account credits block a run", async () => {
   assert.equal(observed.result.headline, "limit-reached");
   assert.equal(observed.result.routeEligible, false);
 });
+
+for (const fixture of [
+  { name: "HTTP failure", options: { creditsStatus: 503 } },
+  {
+    name: "transport failure",
+    options: {
+      creditsFailure: Object.assign(new TypeError("credits offline"), {
+        cause: { code: "ENOTFOUND" },
+      }),
+    },
+  },
+] as const) {
+  test(`authoritative zero key limit survives credits ${fixture.name}`, async () => {
+    const observed = await inspectFixture({
+      keyExtra: { limit_remaining: 0 },
+      ...fixture.options,
+    });
+    assert.equal(observed.result.health.credential, "valid");
+    assert.equal(observed.result.health.connectivity, "connected");
+    assert.equal(observed.result.health.spend, "limit-reached");
+    assert.equal(observed.result.headline, "limit-reached");
+    assert.equal(observed.result.routeEligible, false);
+  });
+}
+
+for (const fixture of [
+  { name: "missing totals", payload: {} },
+  { name: "missing total credits", payload: { total_usage: 4 } },
+  { name: "missing total usage", payload: { total_credits: 10 } },
+  { name: "malformed total credits", payload: { total_credits: "wrong", total_usage: 4 } },
+  { name: "malformed total usage", payload: { total_credits: 10, total_usage: "wrong" } },
+  { name: "nonfinite total credits", payload: { total_credits: "Infinity", total_usage: 4 } },
+  { name: "nonfinite total usage", payload: { total_credits: 10, total_usage: "-Infinity" } },
+] as const) {
+  test(`strict credits metadata keeps spend unknown for ${fixture.name}`, async () => {
+    const observed = await inspectFixture({ creditsPayload: fixture.payload });
+    assert.equal(observed.result.health.credential, "valid");
+    assert.equal(observed.result.health.connectivity, "connected");
+    assert.equal(observed.result.health.spend, "unknown");
+    assert.equal(observed.result.headline, "ready");
+    assert.equal(observed.result.routeEligible, true);
+    assert.ok(observed.result.qualifiers.includes("Guthaben unbekannt"));
+  });
+}
 
 test("a valid inference key without authoritative credits remains runnable with a qualifier", async () => {
   const credentials = new FakeCredentials({ inference: INFERENCE_KEY, management: null });
@@ -522,6 +570,68 @@ test("/credits DNS failure preserves valid connected inference health", async ()
   assert.doesNotMatch(JSON.stringify(observed.result), /opaque credits transport/);
 });
 
+test("caller abort during credits rejects inspection and clears prior model eligibility", async () => {
+  const controller = new AbortController();
+  let modelRequests = 0;
+  let abortCredits = false;
+  const service = new OpenRouterService(ACTIVE_KEY, undefined, {}, {
+    fetchImpl: async (url) => {
+      if (url.endsWith("/models")) {
+        modelRequests += 1;
+        return jsonResponse({ data: [] });
+      }
+      if (url.endsWith("/credits")) {
+        if (abortCredits) {
+          const reason = new DOMException("caller cancelled credits", "AbortError");
+          controller.abort(reason);
+          throw reason;
+        }
+        return creditsResponse();
+      }
+      return keyResponse({ is_management_key: true });
+    },
+  });
+  const adapter = new OpenRouterBackendAdapter({
+    service,
+    credentials: new FakeCredentials(),
+    connectionId: "connection-local",
+    now: () => NOW,
+  });
+  const ready = await adapter.inspect({
+    generation: 1,
+    deadlineAt: NOW + 5_000,
+    signal: new AbortController().signal,
+  });
+  assert.equal(ready.routeEligible, true);
+
+  abortCredits = true;
+  await assert.rejects(
+    adapter.inspect({
+      generation: 2,
+      deadlineAt: NOW + 5_000,
+      signal: controller.signal,
+    }),
+    (error: unknown) => error instanceof DOMException && error.name === "AbortError",
+  );
+  await assert.rejects(
+    adapter.listModels({ signal: new AbortController().signal }),
+    /inspection|prüf/i,
+  );
+  assert.equal(modelRequests, 0);
+});
+
+test("internal credits timeout degrades spend without becoming caller cancellation", async () => {
+  const observed = await inspectFixture({
+    creditsFailure: Object.assign(new Error("internal credits deadline"), {
+      name: "TimeoutError",
+    }),
+  });
+  assert.equal(observed.result.health.credential, "valid");
+  assert.equal(observed.result.health.connectivity, "connected");
+  assert.equal(observed.result.health.spend, "unknown");
+  assert.equal(observed.result.routeEligible, true);
+});
+
 test("account fingerprints use the fixed provider namespace and never expose identity", async () => {
   const left = openRouterAccountFingerprint(HMAC_KEY, CREATOR_A);
   const again = openRouterAccountFingerprint(HMAC_KEY, CREATOR_A);
@@ -689,4 +799,116 @@ test("candidate connection is inspection-only until explicit activation", async 
   assert.deepEqual(service.runtimeState, before);
   assert.equal(service.requireKey(), ACTIVE_KEY);
   assert.deepEqual(credentials.effects, ["accountHmac"]);
+});
+
+interface Deferred<T> {
+  promise: Promise<T>;
+  resolve(value: T): void;
+}
+
+function deferred<T>(): Deferred<T> {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((accept) => {
+    resolve = accept;
+  });
+  return { promise, resolve };
+}
+
+async function waitForCount(values: readonly unknown[], expected: number): Promise<void> {
+  for (let attempt = 0; attempt < 20 && values.length < expected; attempt += 1) {
+    await new Promise<void>((resolve) => setImmediate(resolve));
+  }
+  assert.equal(values.length, expected);
+}
+
+function inspectionRaceFixture() {
+  const keyRequests: Deferred<Response>[] = [];
+  let modelRequests = 0;
+  const service = new OpenRouterService(ACTIVE_KEY, undefined, {}, {
+    fetchImpl: async (url) => {
+      if (url.endsWith("/models")) {
+        modelRequests += 1;
+        return jsonResponse({ data: [] });
+      }
+      const pending = deferred<Response>();
+      keyRequests.push(pending);
+      return pending.promise;
+    },
+  });
+  const adapter = new OpenRouterBackendAdapter({
+    service,
+    credentials: new FakeCredentials({ inference: INFERENCE_KEY, management: null }),
+    connectionId: "connection-local",
+    now: () => NOW,
+  });
+  const inspect = (generation: number) => adapter.inspect({
+    generation,
+    deadlineAt: NOW + 5_000,
+    signal: new AbortController().signal,
+  });
+  return {
+    adapter,
+    inspect,
+    keyRequests,
+    modelRequests: () => modelRequests,
+  };
+}
+
+test("stale generation success cannot re-enable models after newest rejection", async () => {
+  const fixture = inspectionRaceFixture();
+  const stale = fixture.inspect(1);
+  const newest = fixture.inspect(2);
+  await waitForCount(fixture.keyRequests, 2);
+
+  fixture.keyRequests[1]!.resolve(jsonResponse(
+    { error: { message: "newest rejected" } },
+    { status: 401 },
+  ));
+  assert.equal((await newest).health.credential, "rejected");
+  fixture.keyRequests[0]!.resolve(keyResponse({ is_management_key: false }));
+  assert.equal((await stale).health.credential, "valid");
+
+  await assert.rejects(
+    fixture.adapter.listModels({ signal: new AbortController().signal }),
+    /inspection|prüf/i,
+  );
+  assert.equal(fixture.modelRequests(), 0);
+});
+
+test("stale generation error cannot clear newest successful model eligibility", async () => {
+  const fixture = inspectionRaceFixture();
+  const stale = fixture.inspect(1);
+  const newest = fixture.inspect(2);
+  await waitForCount(fixture.keyRequests, 2);
+
+  fixture.keyRequests[1]!.resolve(keyResponse({ is_management_key: false }));
+  assert.equal((await newest).routeEligible, true);
+  fixture.keyRequests[0]!.resolve(jsonResponse(
+    { error: { message: "stale rejected" } },
+    { status: 401 },
+  ));
+  assert.equal((await stale).health.credential, "rejected");
+
+  await fixture.adapter.listModels({ signal: new AbortController().signal });
+  assert.equal(fixture.modelRequests(), 1);
+});
+
+test("older completion cannot publish while a newer inspection is still pending", async () => {
+  const fixture = inspectionRaceFixture();
+  const stale = fixture.inspect(1);
+  const newest = fixture.inspect(2);
+  await waitForCount(fixture.keyRequests, 2);
+
+  fixture.keyRequests[0]!.resolve(keyResponse({ is_management_key: false }));
+  assert.equal((await stale).routeEligible, true);
+  await assert.rejects(
+    fixture.adapter.listModels({ signal: new AbortController().signal }),
+    /inspection|prüf/i,
+  );
+  assert.equal(fixture.modelRequests(), 0);
+
+  fixture.keyRequests[1]!.resolve(keyResponse({ is_management_key: false }));
+  assert.equal((await newest).routeEligible, true);
+  await fixture.adapter.listModels({ signal: new AbortController().signal });
+  assert.equal(fixture.modelRequests(), 1);
 });

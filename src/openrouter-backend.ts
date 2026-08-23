@@ -115,6 +115,7 @@ export class OpenRouterBackendAdapter implements BackendAdapter {
   readonly #createCandidateId: () => string;
   readonly #candidates = new Map<string, CandidateEntry>();
   #activeInspection: InspectedSecret | null = null;
+  #inspectionSequence = 0;
 
   constructor(options: OpenRouterBackendAdapterOptions) {
     this.#service = options.service;
@@ -133,13 +134,14 @@ export class OpenRouterBackendAdapter implements BackendAdapter {
     signal: AbortSignal;
   }): Promise<OpenRouterInspection> {
     void request.deadlineAt;
+    const inspectionSequence = ++this.#inspectionSequence;
+    this.#activeInspection = null;
     const selected = await this.#selectCredential(
       "inference",
       this.#inferenceCredential,
       "OPENROUTER_API_KEY",
     );
     if (selected.kind !== "available") {
-      this.#activeInspection = null;
       return this.#emptyInspection(
         request.generation,
         selected.kind === "invalid"
@@ -152,7 +154,9 @@ export class OpenRouterBackendAdapter implements BackendAdapter {
       request.generation,
       request.signal,
     );
-    this.#activeInspection = inspected.inspection.routeEligible ? inspected : null;
+    if (inspectionSequence === this.#inspectionSequence) {
+      this.#activeInspection = inspected.inspection.routeEligible ? inspected : null;
+    }
     return inspected.inspection;
   }
 
@@ -296,6 +300,7 @@ export class OpenRouterBackendAdapter implements BackendAdapter {
       try {
         credits = await this.#service.getCredits(secret, signal, "candidate");
       } catch {
+        throwIfAborted(signal);
         creditsFailed = true;
       }
     } else if (key.isManagementKey === false) {
@@ -313,6 +318,7 @@ export class OpenRouterBackendAdapter implements BackendAdapter {
             "candidate",
           );
         } catch {
+          throwIfAborted(signal);
           creditsFailed = true;
         }
       } else if (management.kind === "invalid") {
@@ -324,7 +330,7 @@ export class OpenRouterBackendAdapter implements BackendAdapter {
     const health: ProviderHealth = {
       credential: expiry,
       connectivity: "connected",
-      spend: creditsFailed ? "unknown" : spend,
+      spend: creditsFailed && spend !== "limit-reached" ? "unknown" : spend,
       runtime: "not-applicable",
       observedAt: this.#now(),
       generation,

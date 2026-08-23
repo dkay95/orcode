@@ -1009,8 +1009,14 @@ export class OpenRouterService {
       requestScope,
     );
     const data = requireRecord(payload.data, "Ungültige Guthaben-Antwort");
-    const totalCredits = numberOf(data.total_credits);
-    const totalUsage = numberOf(data.total_usage);
+    const totalCredits = finiteNumberOf(data.total_credits);
+    const totalUsage = finiteNumberOf(data.total_usage);
+    if (totalCredits === undefined || totalUsage === undefined) {
+      if (requestScope !== "candidate") {
+        this.#state.credit = "unknown";
+      }
+      throw new Error("Ungültige Guthaben-Antwort");
+    }
     const credits = {
       totalCredits,
       totalUsage,
@@ -1176,7 +1182,11 @@ export class OpenRouterService {
         bearerKey,
       ]);
       if (scope !== "candidate" && failure.kind !== "cancelled") {
-        this.#state.connectivity = "disconnected";
+        if (path === "/credits") {
+          this.#state.credit = "unknown";
+        } else {
+          this.#state.connectivity = "disconnected";
+        }
       }
       if (failure.kind === "cancelled") {
         throw error;
@@ -1225,25 +1235,31 @@ export class OpenRouterService {
     path: string,
   ): void {
     if (scope === "candidate") return;
+    if (path === "/credits") {
+      if (status === 402) {
+        this.#state.credit = "insufficient";
+      } else if (status === 401 || status === 403) {
+        this.#state.credit = "unavailable";
+      } else if (status < 200 || status >= 300) {
+        this.#state.credit = "unknown";
+      }
+      return;
+    }
     const connectivity = status === 408 || status === 504 || status >= 500
       ? "disconnected"
       : "connected";
     if (!this.#reconnectInProgress || connectivity === "disconnected") {
       this.#state.connectivity = connectivity;
     }
-    if (path !== "/credits") {
-      if (status >= 200 && status < 300) {
-        if (scope === "inference") this.#state.inferenceValidity = "valid";
-        else this.#state.managementValidity = "valid";
-      } else if (status === 401) {
-        if (scope === "inference") this.#state.inferenceValidity = "rejected";
-        else this.#state.managementValidity = "rejected";
-      }
+    if (status >= 200 && status < 300) {
+      if (scope === "inference") this.#state.inferenceValidity = "valid";
+      else this.#state.managementValidity = "valid";
+    } else if (status === 401) {
+      if (scope === "inference") this.#state.inferenceValidity = "rejected";
+      else this.#state.managementValidity = "rejected";
     }
     if (status === 402) {
       this.#state.credit = "insufficient";
-    } else if (path === "/credits" && (status === 401 || status === 403)) {
-      this.#state.credit = "unavailable";
     }
   }
 

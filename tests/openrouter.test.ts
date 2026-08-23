@@ -172,6 +172,60 @@ test("credential validity, connectivity, and credit remain independent runtime s
   assert.equal(service.runtimeState.connectivity, "connected");
 });
 
+for (const fixture of [
+  {
+    name: "HTTP 503",
+    response: jsonResponse({ error: { message: "credits unavailable" } }, { status: 503 }),
+  },
+  {
+    name: "DNS failure",
+    failure: Object.assign(new TypeError("credits fetch failed"), {
+      cause: { code: "ENOTFOUND" },
+    }),
+  },
+] as const) {
+  test(`active-scope credits ${fixture.name} preserves successful key connectivity and validity`, async () => {
+    const service = new OpenRouterService(INFERENCE_KEY, undefined, {}, {
+      clock: { sleep: async () => undefined },
+      fetchImpl: async () => {
+        if ("failure" in fixture) throw fixture.failure;
+        return fixture.response.clone();
+      },
+    });
+    service.activateValidatedKey(INFERENCE_KEY, "keychain", {
+      key: { limitRemaining: 5 },
+      credits: { totalCredits: 10, totalUsage: 4, remaining: 6 },
+    });
+
+    await assert.rejects(service.getCredits(INFERENCE_KEY, undefined, "inference"));
+
+    assert.equal(service.runtimeState.inferenceValidity, "valid");
+    assert.equal(service.runtimeState.connectivity, "connected");
+    assert.equal(service.runtimeState.credit, "unknown");
+    assert.equal(service.hasKey, true);
+  });
+}
+
+test("active-scope credits caller abort preserves successful key connectivity and validity", async () => {
+  const controller = new AbortController();
+  controller.abort(new DOMException("caller cancelled credits", "AbortError"));
+  const service = new OpenRouterService(INFERENCE_KEY);
+  service.activateValidatedKey(INFERENCE_KEY, "keychain", {
+    key: { limitRemaining: 5 },
+    credits: { totalCredits: 10, totalUsage: 4, remaining: 6 },
+  });
+
+  await assert.rejects(
+    service.getCredits(INFERENCE_KEY, controller.signal, "inference"),
+    (error: unknown) => error instanceof DOMException && error.name === "AbortError",
+  );
+
+  assert.equal(service.runtimeState.inferenceValidity, "valid");
+  assert.equal(service.runtimeState.connectivity, "connected");
+  assert.equal(service.runtimeState.credit, "available");
+  assert.equal(service.hasKey, true);
+});
+
 test("only a genuine active-scope 401 rejects a credential while permission and credit stay orthogonal", async (t) => {
   const fixtures = [
     {
