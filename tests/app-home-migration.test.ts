@@ -226,8 +226,24 @@ async function publishConfigBehindMigrationLockAttempt(options: {
     `
       const privateApi = await import(process.env.ORCODE_FIX3_PRIVATE_STORE_MODULE_URL);
       const originalCreate = privateApi.PrivateStore.prototype.createDirectoryExclusive;
+      let firstLockAttempt = true;
       privateApi.PrivateStore.prototype.createDirectoryExclusive = async function (path) {
-        process.send({ type: "lock-attempt" });
+        if (firstLockAttempt) {
+          firstLockAttempt = false;
+          await new Promise((resolve, reject) => {
+            const onMessage = (message) => {
+              if (message?.type !== "lock-attempt-ack") return;
+              process.off("message", onMessage);
+              resolve();
+            };
+            process.on("message", onMessage);
+            process.send({ type: "lock-attempt" }, (error) => {
+              if (!error) return;
+              process.off("message", onMessage);
+              reject(error);
+            });
+          });
+        }
         return originalCreate.call(this, path);
       };
       try {
@@ -308,6 +324,12 @@ async function publishConfigBehindMigrationLockAttempt(options: {
     releaseHolder();
     holderReleased = true;
     await holder;
+    await new Promise<void>((resolve, reject) => {
+      child.send({ type: "lock-attempt-ack" }, (error) => {
+        if (error) reject(error);
+        else resolve();
+      });
+    });
     const result = await resultPromise;
     const exitCode = await childExit;
     assert.equal(exitCode, 0, stderr);
