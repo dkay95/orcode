@@ -111,16 +111,19 @@ export async function withConfigWriteLocks<T>(
       options.signal,
     );
     for (const entry of entries) {
-      held.push(await acquireCrossProcessLock(
+      const acquired = await acquireCrossProcessLock(
         entry.target.canonicalPath,
         entry.target.identityKey,
         options.signal,
-      ));
+      );
+      held.push(acquired);
+      throwIfAborted(options.signal);
     }
     const ownerships = Object.freeze(held.map((entry, index) => Object.freeze({
       canonicalPath: targets[index]!.canonicalPath,
       assertHeld: () => assertCrossProcessLock(entry),
     })));
+    throwIfAborted(options.signal);
     result = await activeConfigWrite.run(
       targets.map((target) => target.identityKey).join("\0"),
       () => task(ownerships),
@@ -165,6 +168,10 @@ async function acquireCrossProcessLock(
       throw new Error("Config writer ownership identity could not be verified.");
     }
     if (claim) {
+      if (signal?.aborted) {
+        await store.releaseDirectoryClaim(claim, null).catch(() => undefined);
+        throw abortFrom(signal);
+      }
       const acquiredAt = Date.now();
       const expiresAt = acquiredAt + DEFAULT_LEASE_DURATION_MS;
       if (!Number.isSafeInteger(acquiredAt) || acquiredAt < 0

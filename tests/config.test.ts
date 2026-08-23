@@ -628,6 +628,52 @@ test("a writer retries when the live claim disappears before adoption", async ()
   assert.equal(entered, true);
 });
 
+test("abort after awaited config claim acquisition keeps the exact reason and never starts the task", async () => {
+  const { PrivateStore } = await import("../src/private-store.js");
+  const path = await configPath("abort-after-claim-acquisition");
+  const originalCreate = PrivateStore.prototype.createDirectoryExclusive;
+  let claimCreated!: () => void;
+  let resumeCreate!: () => void;
+  const created = new Promise<void>((resolve) => { claimCreated = resolve; });
+  const paused = new Promise<void>((resolve) => { resumeCreate = resolve; });
+  let intercepted = false;
+  PrivateStore.prototype.createDirectoryExclusive = async function (claimPath) {
+    const claim = await originalCreate.call(this, claimPath);
+    if (claim !== null && !intercepted) {
+      intercepted = true;
+      claimCreated();
+      await paused;
+    }
+    return claim;
+  };
+
+  const controller = new AbortController();
+  const reason = new DOMException("claim acquisition cancelled", "AbortError");
+  let taskEntered = false;
+  let operation: Promise<void> | null = null;
+  try {
+    operation = withConfigWriteLock(path, async () => {
+      taskEntered = true;
+    }, { signal: controller.signal });
+    await created;
+    controller.abort(reason);
+    resumeCreate();
+    await assert.rejects(operation, (error: unknown) => error === reason);
+  } finally {
+    resumeCreate();
+    await operation?.catch(() => undefined);
+    PrivateStore.prototype.createDirectoryExclusive = originalCreate;
+  }
+
+  let successorEntered = false;
+  await withConfigWriteLock(path, async () => {
+    successorEntered = true;
+  });
+  assert.equal(intercepted, true);
+  assert.equal(taskEntered, false);
+  assert.equal(successorEntered, true, "the acquired claim was released after cancellation");
+});
+
 test("an aborted queued writer cannot let a third writer bypass the live holder", async () => {
   const path = await configPath("aborted-writer-queue");
   let holderReached!: () => void;

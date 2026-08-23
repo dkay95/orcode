@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
   access,
@@ -117,6 +118,142 @@ async function snapshotFileTree(root: string): Promise<Record<string, string>> {
   }
   await walk(root, "");
   return snapshot;
+}
+
+interface MigrationRaceResult {
+  status: "ready" | "declined" | "future" | "recovery-required";
+  appHome: string;
+  warning: string | null;
+}
+
+async function publishConfigBehindMigrationLockAttempt(options: {
+  target: string;
+  legacy: string;
+  blockedConfigPath: string;
+  writerConfigPath: string;
+  writerBytes: string;
+}): Promise<MigrationRaceResult> {
+  let holderReached!: () => void;
+  let releaseHolder!: () => void;
+  const reached = new Promise<void>((resolve) => { holderReached = resolve; });
+  const release = new Promise<void>((resolve) => { releaseHolder = resolve; });
+  const holder = withConfigWriteLock(options.blockedConfigPath, async (ownership) => {
+    holderReached();
+    await release;
+    if (options.writerConfigPath === options.blockedConfigPath) {
+      const store = new PrivateStore({ root: dirname(ownership.canonicalPath) });
+      await ownership.assertHeld();
+      await store.writeTextAtomic(
+        ownership.canonicalPath,
+        options.writerBytes,
+        ownership.assertHeld,
+      );
+      await ownership.assertHeld();
+    }
+  });
+  await reached;
+
+  const configModuleUrl = new URL("../src/config.ts", import.meta.url).href;
+  const privateStoreModuleUrl = new URL("../src/private-store.ts", import.meta.url).href;
+  const child = spawn(process.execPath, [
+    "--import",
+    "tsx",
+    "--input-type=module",
+    "--eval",
+    `
+      const privateApi = await import(process.env.ORCODE_FIX3_PRIVATE_STORE_MODULE_URL);
+      const originalCreate = privateApi.PrivateStore.prototype.createDirectoryExclusive;
+      privateApi.PrivateStore.prototype.createDirectoryExclusive = async function (path) {
+        process.send({ type: "lock-attempt" });
+        return originalCreate.call(this, path);
+      };
+      try {
+        const api = await import(process.env.ORCODE_FIX3_CONFIG_MODULE_URL);
+        const result = await api.migrateAppHome(
+          process.env.ORCODE_FIX3_TARGET,
+          process.env.ORCODE_FIX3_LEGACY,
+        );
+        process.send({ type: "result", result });
+      } catch (error) {
+        process.send({ type: "error", message: String(error) });
+        process.exitCode = 1;
+      }
+    `,
+  ], {
+    env: {
+      ...process.env,
+      ORCODE_FIX3_CONFIG_MODULE_URL: configModuleUrl,
+      ORCODE_FIX3_PRIVATE_STORE_MODULE_URL: privateStoreModuleUrl,
+      ORCODE_FIX3_TARGET: options.target,
+      ORCODE_FIX3_LEGACY: options.legacy,
+    },
+    stdio: ["ignore", "ignore", "pipe", "ipc"],
+  });
+  let stderr = "";
+  child.stderr?.setEncoding("utf8");
+  child.stderr?.on("data", (chunk: string) => { stderr += chunk; });
+  let lockAttemptReached!: () => void;
+  const lockAttempt = new Promise<void>((resolve) => { lockAttemptReached = resolve; });
+  let resolveResult!: (result: MigrationRaceResult) => void;
+  let rejectResult!: (error: Error) => void;
+  const resultPromise = new Promise<MigrationRaceResult>((resolve, reject) => {
+    resolveResult = resolve;
+    rejectResult = reject;
+  });
+  let receivedResult = false;
+  child.on("message", (message: unknown) => {
+    if (typeof message !== "object" || message === null || !("type" in message)) return;
+    if (message.type === "lock-attempt") lockAttemptReached();
+    if (message.type === "result" && "result" in message) {
+      receivedResult = true;
+      resolveResult(message.result as MigrationRaceResult);
+    }
+    if (message.type === "error") {
+      rejectResult(new Error(String("message" in message ? message.message : "migration child failed")));
+    }
+  });
+  child.once("error", rejectResult);
+  const childExit = new Promise<number | null>((resolve) => {
+    child.once("exit", (code) => {
+      if (!receivedResult && code !== 0) {
+        rejectResult(new Error(`migration child exited ${code}: ${stderr}`));
+      }
+      resolve(code);
+    });
+  });
+
+  let holderReleased = false;
+  try {
+    await Promise.race([
+      lockAttempt,
+      resultPromise.then(() => {
+        throw new Error("migration completed before requesting serialized config ownership");
+      }),
+    ]);
+    if (options.writerConfigPath !== options.blockedConfigPath) {
+      await withConfigWriteLock(options.writerConfigPath, async (ownership) => {
+        const store = new PrivateStore({ root: dirname(ownership.canonicalPath) });
+        await ownership.assertHeld();
+        await store.writeTextAtomic(
+          ownership.canonicalPath,
+          options.writerBytes,
+          ownership.assertHeld,
+        );
+        await ownership.assertHeld();
+      });
+    }
+    releaseHolder();
+    holderReleased = true;
+    await holder;
+    const result = await resultPromise;
+    const exitCode = await childExit;
+    assert.equal(exitCode, 0, stderr);
+    return result;
+  } finally {
+    if (!holderReleased) releaseHolder();
+    await holder.catch(() => undefined);
+    if (child.exitCode === null) child.kill();
+  }
 }
 
 test("ChatArtifactRegistry centrally classifies every 0.4 chat artifact and only reserves task sidecars", async () => {
@@ -440,6 +577,99 @@ test("migration revalidates the source checksum after validation and before comm
   assert.equal((result as typeof result & { status?: string }).status, "recovery-required");
 });
 
+test("legacy migration rebuilds from a source config writer that completes while ownership waits", async () => {
+  const root = await mkdtemp(join(tmpdir(), "orcode-migration-source-writer-wins-"));
+  const legacy = join(root, ".routercode");
+  const target = join(root, ".orcode");
+  await seedHome(legacy, { model: "staged/old-source" });
+  const writerBytes = `${JSON.stringify({
+    schemaVersion: 0,
+    mainModel: "writer/new-source",
+    approvalMode: "allow-all",
+    exactSourceMarker: "source-writer-complete",
+  }, null, 2)}\n`;
+
+  const result = await publishConfigBehindMigrationLockAttempt({
+    target,
+    legacy,
+    blockedConfigPath: join(target, "config.json"),
+    writerConfigPath: join(legacy, "config.json"),
+    writerBytes,
+  });
+  const stored = JSON.parse(await readFile(join(target, "config.json"), "utf8")) as {
+    mainModel: string;
+    approvalMode: string;
+  };
+  const manifest = JSON.parse(await readFile(migrationManifestPath(target), "utf8")) as {
+    backupPath: string;
+  };
+
+  assert.equal(result.status, "ready");
+  assert.equal(stored.mainModel, "writer/new-source");
+  assert.equal(stored.approvalMode, "allow-all");
+  assert.equal(await readFile(join(manifest.backupPath, "config.json"), "utf8"), writerBytes);
+});
+
+test("legacy migration preserves exact destination v1 bytes when a complete writer update wins ownership", async () => {
+  const root = await mkdtemp(join(tmpdir(), "orcode-migration-destination-writer-wins-"));
+  const legacy = join(root, ".routercode");
+  const target = join(root, ".orcode");
+  await seedHome(legacy, { model: "legacy/staged-model" });
+  await seedHome(target, { model: "destination/staged-old" });
+  const writerBytes = `${JSON.stringify({
+    schemaVersion: 1,
+    mainModel: "destination/writer-new",
+    compressorModel: "destination/writer-compressor",
+    fallbackModels: Array.from({ length: 21 }, (_value, index) => `destination/fallback-${index + 1}`),
+    unrelatedWriterState: { exact: true, generation: 7 },
+    providerSetup: {
+      schemaVersion: 1,
+      revision: 9,
+      lifecycle: "configured",
+      connections: [],
+      defaultRoute: null,
+      cross: { enabled: false, preferredLead: null, preferredChallenger: null },
+    },
+  }, null, 4)}\n`;
+
+  const result = await publishConfigBehindMigrationLockAttempt({
+    target,
+    legacy,
+    blockedConfigPath: join(target, "config.json"),
+    writerConfigPath: join(target, "config.json"),
+    writerBytes,
+  });
+
+  assert.equal(result.status, "ready");
+  assert.equal(await readFile(join(target, "config.json"), "utf8"), writerBytes);
+});
+
+test("legacy migration refuses a destination future schema published while ownership waits", async () => {
+  const root = await mkdtemp(join(tmpdir(), "orcode-migration-destination-future-wins-"));
+  const legacy = join(root, ".routercode");
+  const target = join(root, ".orcode");
+  await seedHome(legacy, { model: "legacy/staged-model" });
+  await seedHome(target, { model: "destination/staged-old" });
+  const writerBytes = `${JSON.stringify({
+    schemaVersion: 2,
+    mainModel: "future/writer-model",
+    opaqueFutureState: { exact: "future-destination-writer" },
+  }, null, 2)}\n`;
+
+  const result = await publishConfigBehindMigrationLockAttempt({
+    target,
+    legacy,
+    blockedConfigPath: join(target, "config.json"),
+    writerConfigPath: join(target, "config.json"),
+    writerBytes,
+  });
+
+  assert.equal(result.status, "future");
+  assert.equal(await readFile(join(target, "config.json"), "utf8"), writerBytes);
+  assert.equal(await exists(migrationManifestPath(target)), false);
+  assert.equal(await exists(legacy), true);
+});
+
 test("migration refuses a symlinked legacy source before rename and leaves its target untouched", async () => {
   const root = await mkdtemp(join(tmpdir(), "orcode-migration-source-symlink-"));
   const legacy = join(root, ".routercode");
@@ -450,14 +680,11 @@ test("migration refuses a symlinked legacy source before rename and leaves its t
   await symlink(outsideSource, legacy, "dir");
 
   const result = await migrateAppHome(target, legacy);
-  const manifest = JSON.parse(
-    await readFile(join(target, "migrations", "app-home-v1.json"), "utf8"),
-  ) as { backupPath: string };
 
   assert.equal((result as typeof result & { status?: string }).status, "recovery-required");
   assert.equal(await exists(legacy), true);
   assert.equal((await lstat(legacy)).isSymbolicLink(), true);
-  assert.equal(await exists(manifest.backupPath), false);
+  assert.equal(await exists(target), false, "ownership refusal happens before migration artifacts");
   assert.equal(await readFile(join(outsideSource, "config.json"), "utf8"), originalConfig);
 });
 

@@ -11,8 +11,8 @@ import { basename, dirname, join, relative, resolve as resolvePath, sep } from "
 import { deserializeConversationState } from "@openrouter/agent";
 import { PrivateStore } from "./private-store.js";
 import {
-  withConfigWriteLock,
   withConfigWriteLocks,
+  type ConfigWriteOwnership,
 } from "./config-write-lock.js";
 import {
   assertConfigFileSnapshot,
@@ -592,6 +592,50 @@ export async function migrateStorageHome(
   legacyHome: string,
   options: AppHomeMigrationOptions = {},
 ): Promise<AppHomeMigrationResult> {
+  const sourceConfigPath = resolvePath(join(legacyHome, "config.json"));
+  const destinationConfigPath = resolvePath(join(newHome, "config.json"));
+  let taskEntered = false;
+  let taskCompleted = false;
+  try {
+    return await withConfigWriteLocks([
+      sourceConfigPath,
+      destinationConfigPath,
+    ], async (ownerships) => {
+      taskEntered = true;
+      const ownershipByPath = new Map(
+        ownerships.map((ownership) => [ownership.canonicalPath, ownership]),
+      );
+      const sourceOwnership = ownershipByPath.get(sourceConfigPath)!;
+      const destinationOwnership = ownershipByPath.get(destinationConfigPath)!;
+      await sourceOwnership.assertHeld();
+      await destinationOwnership.assertHeld();
+      const result = await migrateStorageHomeUnderConfigOwnership(
+        newHome,
+        legacyHome,
+        options,
+        sourceOwnership,
+        destinationOwnership,
+      );
+      taskCompleted = true;
+      return result;
+    });
+  } catch (error) {
+    if (taskEntered && !taskCompleted) throw error;
+    return {
+      status: "recovery-required",
+      appHome: newHome,
+      warning: `Config-Writer-Serialisierung konnte nicht verifiziert werden: ${errorText(error)}`,
+    };
+  }
+}
+
+async function migrateStorageHomeUnderConfigOwnership(
+  newHome: string,
+  legacyHome: string,
+  options: AppHomeMigrationOptions,
+  sourceOwnership: ConfigWriteOwnership,
+  destinationOwnership: ConfigWriteOwnership,
+): Promise<AppHomeMigrationResult> {
   const newExists = await pathExists(newHome);
   const legacyExists = await pathExists(legacyHome);
   const privateStore = options.privateStore ?? new PrivateStore({ root: newHome });
@@ -634,12 +678,22 @@ export async function migrateStorageHome(
 
   if (!legacyExists && !existingManifest) {
     if (!newExists) return { status: "ready", appHome: newHome, warning: null };
-    return migrateCurrentConfig(
-      newHome,
-      privateStore,
-      maxBackupBytes,
-      options.normalizeConfig,
-    );
+    try {
+      return await migrateCurrentConfigUnderLock(
+        newHome,
+        destinationOwnership.canonicalPath,
+        destinationOwnership.assertHeld,
+        privateStore,
+        maxBackupBytes,
+        options.normalizeConfig,
+      );
+    } catch {
+      return {
+        status: "recovery-required",
+        appHome: newHome,
+        warning: "Config-Migration konnte die exakte Zielidentität nicht verifizieren.",
+      };
+    }
   }
 
   if (!legacyExists && existingManifest) {
@@ -647,21 +701,43 @@ export async function migrateStorageHome(
   }
 
   const activeSource = existingManifest?.sourcePath ?? legacyHome;
-  const future = await futureConfigVersion(activeSource);
-  if (future !== null) {
+  await sourceOwnership.assertHeld();
+  await destinationOwnership.assertHeld();
+  const sourceConfigFact = await inspectMigrationConfig(
+    sourceOwnership.canonicalPath,
+  );
+  await sourceOwnership.assertHeld();
+  if (sourceConfigFact.kind === "future") {
     return {
       status: "future",
       appHome: newExists ? newHome : legacyHome,
-      warning: `Speichermigration abgelehnt: ${activeSource}/config.json hat die zukünftige schemaVersion ${future}.`,
+      warning: `Speichermigration abgelehnt: Eine Konfiguration hat die zukünftige schemaVersion ${sourceConfigFact.version}.`,
+    };
+  }
+  if (sourceConfigFact.kind === "ambiguous") {
+    return {
+      status: "recovery-required",
+      appHome: newExists ? newHome : legacyHome,
+      warning: "Speichermigration abgelehnt: Eine Konfiguration ist beschädigt oder nicht eindeutig lesbar.",
     };
   }
   if (newExists) {
-    const targetFuture = await futureConfigVersion(newHome);
-    if (targetFuture !== null) {
+    const destinationConfigFact = await inspectMigrationConfig(
+      destinationOwnership.canonicalPath,
+    );
+    await destinationOwnership.assertHeld();
+    if (destinationConfigFact.kind === "future") {
       return {
         status: "future",
         appHome: newHome,
-        warning: `Speichermigration abgelehnt: ${newHome}/config.json hat die zukünftige schemaVersion ${targetFuture}.`,
+        warning: `Speichermigration abgelehnt: Eine Konfiguration hat die zukünftige schemaVersion ${destinationConfigFact.version}.`,
+      };
+    }
+    if (destinationConfigFact.kind === "ambiguous") {
+      return {
+        status: "recovery-required",
+        appHome: newHome,
+        warning: "Speichermigration abgelehnt: Eine Konfiguration ist beschädigt oder nicht eindeutig lesbar.",
       };
     }
   }
@@ -710,6 +786,8 @@ export async function migrateStorageHome(
     startedAt: new Date().toISOString(),
   };
 
+  await sourceOwnership.assertHeld();
+  await destinationOwnership.assertHeld();
   await privateStore.ensureDirectory(newHome);
   await persistManifest(newHome, manifest, privateStore);
   await options.onPhase?.("planned", manifest);
@@ -745,95 +823,71 @@ export async function migrateStorageHome(
     };
   }
 
-  let publicationFailure: AppHomeMigrationResult | null;
-  try {
-    const sourceConfigPath = resolvePath(join(manifest.sourcePath, "config.json"));
-    const destinationConfigPath = resolvePath(join(newHome, "config.json"));
-    publicationFailure = await withConfigWriteLocks([
-      sourceConfigPath,
-      destinationConfigPath,
-    ], async (ownerships) => {
-      const ownershipByPath = new Map(
-        ownerships.map((ownership) => [ownership.canonicalPath, ownership]),
+  await sourceOwnership.assertHeld();
+  await destinationOwnership.assertHeld();
+  for (const destination of manifest.destinationPaths) {
+    const staged = join(manifest.stagingPath, relative(newHome, destination));
+    const content = await readFile(staged, "utf8");
+    if (basename(destination) === "config.json") {
+      await destinationOwnership.assertHeld();
+      const merged = await preserveCurrentProviderSetup(
+        destinationOwnership.canonicalPath,
+        content,
       );
-      const sourceOwnership = ownershipByPath.get(
-        sourceConfigPath,
-      )!;
-      await sourceOwnership.assertHeld();
-      for (const destination of manifest.destinationPaths) {
-        const staged = join(manifest.stagingPath, relative(newHome, destination));
-        const content = await readFile(staged, "utf8");
-        if (basename(destination) === "config.json") {
-          const ownership = ownershipByPath.get(destinationConfigPath)!;
-          await ownership.assertHeld();
-          const merged = await preserveCurrentProviderSetup(
-            ownership.canonicalPath,
-            content,
+      await destinationOwnership.assertHeld();
+      await privateStore.writeTextAtomic(
+        destinationOwnership.canonicalPath,
+        merged.content,
+        async () => {
+          await destinationOwnership.assertHeld();
+          await assertConfigFileSnapshot(
+            destinationOwnership.canonicalPath,
+            merged.target,
           );
-          await ownership.assertHeld();
-          await privateStore.writeTextAtomic(
-            ownership.canonicalPath,
-            merged.content,
-            async () => {
-              await ownership.assertHeld();
-              await assertConfigFileSnapshot(
-                ownership.canonicalPath,
-                merged.target,
-              );
-              await ownership.assertHeld();
-            },
-          );
-          await ownership.assertHeld();
-        } else {
-          await privateStore.writeTextAtomic(destination, content);
-        }
-      }
-      manifest.phase = "committed";
-      await persistManifest(newHome, manifest, privateStore);
-      await options.onPhase?.("committed", manifest);
-      await sourceOwnership.assertHeld();
+          await destinationOwnership.assertHeld();
+        },
+      );
+      await destinationOwnership.assertHeld();
+    } else {
+      await privateStore.writeTextAtomic(destination, content);
+    }
+  }
+  manifest.phase = "committed";
+  await persistManifest(newHome, manifest, privateStore);
+  await options.onPhase?.("committed", manifest);
+  await sourceOwnership.assertHeld();
 
-      if (await checksumTree(manifest.sourcePath) !== manifest.sourceChecksum) {
-        return {
-          status: "recovery-required",
-          appHome: newHome,
-          warning: "Migrationsquelle wurde vor dem Backup-Rename verändert; Quelle bleibt erhalten.",
-        };
+  if (await checksumTree(manifest.sourcePath) !== manifest.sourceChecksum) {
+    return {
+      status: "recovery-required",
+      appHome: newHome,
+      warning: "Migrationsquelle wurde vor dem Backup-Rename verändert; Quelle bleibt erhalten.",
+    };
+  }
+  await sourceOwnership.assertHeld();
+
+  try {
+    if (await pathExists(manifest.sourcePath)) {
+      await privateStore.ensureDirectory(dirname(manifest.backupPath));
+      if (await pathExists(manifest.backupPath)) {
+        throw new Error(`Migration-Backup existiert bereits: ${manifest.backupPath}`);
       }
       await sourceOwnership.assertHeld();
-
-      try {
-        if (await pathExists(manifest.sourcePath)) {
-          await privateStore.ensureDirectory(dirname(manifest.backupPath));
-          if (await pathExists(manifest.backupPath)) {
-            throw new Error(`Migration-Backup existiert bereits: ${manifest.backupPath}`);
-          }
-          await sourceOwnership.assertHeld();
-          await privateStore.renameTree(
-            manifest.sourcePath,
-            manifest.backupPath,
-            dirname(manifest.sourcePath),
-          );
-          await sourceOwnership.assertHeld();
-        }
-        await privateStore.protectTree(manifest.backupPath);
-      } catch (error) {
-        return {
-          status: "recovery-required",
-          appHome: newHome,
-          warning: `Migrations-Backup konnte nicht sicher veröffentlicht werden: ${errorText(error)}`,
-        };
-      }
-      return null;
-    });
+      await privateStore.renameTree(
+        manifest.sourcePath,
+        manifest.backupPath,
+        dirname(manifest.sourcePath),
+      );
+      await sourceOwnership.assertHeld();
+    }
+    await privateStore.protectTree(manifest.backupPath);
   } catch (error) {
     return {
       status: "recovery-required",
       appHome: newHome,
-      warning: `Config-Writer-Serialisierung konnte nicht verifiziert werden: ${errorText(error)}`,
+      warning: `Migrations-Backup konnte nicht sicher veröffentlicht werden: ${errorText(error)}`,
     };
   }
-  if (publicationFailure) return publicationFailure;
   manifest.phase = "backed-up";
   await persistManifest(newHome, manifest, privateStore);
   await options.onPhase?.("backed-up", manifest);
@@ -1164,31 +1218,6 @@ function isUnreadableChatConflictPath(path: string): boolean {
   return path.includes(".json.konflikt-") && !path.includes(".state.json.konflikt-");
 }
 
-async function migrateCurrentConfig(
-  appHome: string,
-  store: PrivateStore,
-  maxBackupBytes: number,
-  normalizeConfig: AppHomeMigrationOptions["normalizeConfig"],
-): Promise<AppHomeMigrationResult> {
-  const path = join(appHome, "config.json");
-  try {
-    return await withConfigWriteLock(path, async (ownership) => migrateCurrentConfigUnderLock(
-      appHome,
-      ownership.canonicalPath,
-      ownership.assertHeld,
-      store,
-      maxBackupBytes,
-      normalizeConfig,
-    ));
-  } catch {
-    return {
-      status: "recovery-required",
-      appHome,
-      warning: "Config-Migration konnte die exakte Zielidentität nicht verifizieren.",
-    };
-  }
-}
-
 async function migrateCurrentConfigUnderLock(
   appHome: string,
   path: string,
@@ -1406,17 +1435,35 @@ function hasErrorCode(error: unknown, code: string): boolean {
   return isRecord(error) && error.code === code;
 }
 
-async function futureConfigVersion(home: string): Promise<number | null> {
+type MigrationConfigFact =
+  | { kind: "clear" }
+  | { kind: "future"; version: number }
+  | { kind: "ambiguous" };
+
+async function inspectMigrationConfig(path: string): Promise<MigrationConfigFact> {
+  let snapshot: ConfigFileSnapshot;
   try {
-    const snapshot = await readConfigFileSnapshot(join(home, "config.json"));
-    if (snapshot.kind === "absent") return null;
-    const value = parseRecord(snapshot.raw);
-    return typeof value.schemaVersion === "number" && value.schemaVersion > STORAGE_SCHEMA_VERSION
-      ? value.schemaVersion
-      : null;
+    snapshot = await readConfigFileSnapshot(path);
   } catch {
-    return null;
+    return { kind: "ambiguous" };
   }
+  if (snapshot.kind === "absent") return { kind: "clear" };
+  let value: Record<string, unknown>;
+  try {
+    value = parseRecord(snapshot.raw);
+  } catch {
+    return { kind: "ambiguous" };
+  }
+  if (typeof value.schemaVersion === "number"
+    && value.schemaVersion > STORAGE_SCHEMA_VERSION) {
+    return { kind: "future", version: value.schemaVersion };
+  }
+  if (!("providerSetup" in value)) return { kind: "clear" };
+  const providerSetup = validateProviderSetupState(value.providerSetup);
+  if (!isProviderStateIssue(providerSetup)) return { kind: "clear" };
+  return providerSetup.kind === "future-version"
+    ? { kind: "future", version: providerSetup.version }
+    : { kind: "ambiguous" };
 }
 
 async function futureObjectVersion(
