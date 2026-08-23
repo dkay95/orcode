@@ -244,6 +244,48 @@ test("/ssh off tears the control connection down and clears the remembered targe
   }
 });
 
+test("/ssh off disables the shared target before awaiting close and never erases a newer selection", async () => {
+  let markCloseStarted!: () => void;
+  const closeStarted = new Promise<void>((resolve) => { markCloseStarted = resolve; });
+  let releaseClose!: () => void;
+  const closeGate = new Promise<void>((resolve) => { releaseClose = resolve; });
+  const runSsh: RunSsh = async () => {
+    markCloseStarted();
+    await closeGate;
+    return okResult();
+  };
+  const { context, appHome } = await harness({ runSsh });
+  context.sshSession = { active: "vps" };
+  const pending = handleSlashCommand("/ssh off", context);
+  try {
+    await closeStarted;
+    assert.equal(context.sshSession.active, null, "active stayed stale while close was pending");
+    context.sshSession.active = "produktion";
+    releaseClose();
+    await pending;
+    assert.equal(context.sshSession.active, "produktion");
+  } finally {
+    releaseClose();
+    await pending.catch(() => undefined);
+    await rm(appHome, { recursive: true, force: true });
+  }
+});
+
+test("/ssh off reports a real close failure after disabling the shared target", async () => {
+  const runSsh: RunSsh = async () => {
+    throw new Error("spawn ssh ENOENT: no such file or directory");
+  };
+  const { context, lines, appHome } = await harness({ runSsh });
+  try {
+    context.sshSession = { active: "vps" };
+    await handleSlashCommand("/ssh off", context);
+    assert.equal(context.sshSession.active, null);
+    assert.match(lines.join("\n"), /deaktiviert.*spawn ssh ENOENT/is);
+  } finally {
+    await rm(appHome, { recursive: true, force: true });
+  }
+});
+
 test("/ssh off with nothing active says so and does not touch ssh", async () => {
   const runner = recordingRunner(okResult());
   const { context, lines, appHome } = await harness({ runSsh: runner.runSsh });

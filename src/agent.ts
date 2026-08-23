@@ -58,6 +58,7 @@ import {
   createCodingTools,
   toolMetadata,
 } from "./workspace.js";
+import { createSshSession, type SshSession } from "./ssh.js";
 import { ReadRegistry } from "./read-registry.js";
 import {
   SDK_RETRY_CODES,
@@ -170,6 +171,9 @@ export class OrcodeAgent {
       pruneExactArtifacts: (appHome: string) => Promise<unknown>;
     },
     private readonly verifyRunner: typeof runVerify,
+    private readonly sshSession: SshSession,
+    /** Test seam for inspecting the Agent → Workspace tool boundary without real external effects. */
+    private readonly codingToolsFactory: typeof createCodingTools,
   ) {
     this.guard = guard;
     this.#binding = createChatBinding(session);
@@ -186,6 +190,10 @@ export class OrcodeAgent {
       pruneExactArtifacts: (appHome: string) => Promise<unknown>;
     };
     verifyRunner?: typeof runVerify;
+    /** One live in-memory selection shared with `/ssh` and the dashboard. */
+    sshSession?: SshSession;
+    /** Test-only seam; production always uses `createCodingTools`. */
+    codingToolsFactory?: typeof createCodingTools;
   }): Promise<OrcodeAgent> {
     return new OrcodeAgent(
       options.openRouter,
@@ -198,6 +206,8 @@ export class OrcodeAgent {
         pruneExactArtifacts,
       },
       options.verifyRunner ?? runVerify,
+      options.sshSession ?? createSshSession(),
+      options.codingToolsFactory ?? createCodingTools,
     );
   }
 
@@ -582,8 +592,11 @@ export class OrcodeAgent {
     };
     // The signal has to reach the tools, otherwise Esc/Ctrl+C leaves a running
     // shell command behind. One runId keeps every edit in one undo unit.
-    const tools = createCodingTools(this.guard, this.approvals, this.journal, {
+    const tools = this.codingToolsFactory(this.guard, this.approvals, this.journal, {
       ...(observer.signal ? { signal: observer.signal } : {}),
+      ...(this.config.browserPath ? { browserPath: this.config.browserPath } : {}),
+      browserTimeoutSeconds: this.config.browserTimeoutSeconds,
+      ssh: { session: this.sshSession },
       registry: this.#readRegistry,
       runId,
       ...processCallbacks,

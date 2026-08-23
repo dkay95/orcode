@@ -2336,13 +2336,25 @@ async function sshCommand(args: string[], context: CommandContext): Promise<void
   const first = (args[0] ?? "").toLowerCase();
 
   if (first === "off") {
-    const active = context.sshSession?.active ?? null;
-    if (!active) {
+    const session = context.sshSession;
+    const active = session?.active ?? null;
+    if (!session || !active) {
       context.out.text("Keine aktive SSH-Sitzung.");
       return;
     }
-    await closeSshControl(active, runSsh, runtime);
-    context.sshSession!.active = null;
+    // Disable first: the dashboard and any later tool execution must observe
+    // `/ssh off` immediately, even while the best-effort ControlMaster close
+    // is still pending. Never write this field again after the await — a
+    // concurrently selected newer target owns the shared session by then.
+    session.active = null;
+    const close = await closeSshControl(active, runSsh, runtime);
+    if (close.error) {
+      context.out.error(
+        `SSH-Ziel „${active}“ ist deaktiviert, aber die Control-Verbindung konnte nicht bestätigt geschlossen werden.`,
+        close.error,
+      );
+      return;
+    }
     context.out.text(chalk.green(`SSH-Sitzung zu „${active}“ getrennt.`));
     return;
   }

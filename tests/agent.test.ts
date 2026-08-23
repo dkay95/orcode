@@ -23,8 +23,13 @@ import { ConversationStore } from "../src/conversation.js";
 import { OpenRouterService } from "../src/openrouter.js";
 import { RunLog, runLogPath } from "../src/runlog.js";
 import { SessionStore } from "../src/session.js";
+import { createSshSession } from "../src/ssh.js";
 import { CHAT_ARTIFACT_REGISTRY } from "../src/storage.js";
-import { checkpointRunPath } from "../src/workspace.js";
+import {
+  checkpointRunPath,
+  createCodingTools,
+  type CodingToolOptions,
+} from "../src/workspace.js";
 import type { AgentRunEvent } from "../src/types.js";
 import { runVerify, type VerifyOutcome } from "../src/verify.js";
 
@@ -747,6 +752,47 @@ test("the tools of a run receive the abort signal", async () => {
     {} as never,
   )) as { exitCode: number };
   assert.equal(output.exitCode, 130);
+});
+
+test("agent binds browser config, the exact run signal, and one shared SSH session into its tool bundle", async () => {
+  const setup = await createAgent({
+    browserPath: "/fixture/Chromium",
+    browserTimeoutSeconds: 47,
+  });
+  const controller = new AbortController();
+  const sshSession = createSshSession();
+  sshSession.active = "vps";
+  let captured: CodingToolOptions | undefined;
+  const codingToolsFactory: typeof createCodingTools = (
+    _guard,
+    _approvals,
+    _journal,
+    options,
+  ) => {
+    captured = options;
+    return createCodingTools(_guard, _approvals, _journal, options);
+  };
+  const client = fakeClient(() => ({ text: ["Fertig."] }));
+  const agent = await OrcodeAgent.create({
+    openRouter: fakeService(client.client),
+    approvals: new ApprovalManager("allow-all"),
+    session: setup.session,
+    config: setup.config,
+    workspace: setup.workspace,
+    sshSession,
+    codingToolsFactory,
+  });
+
+  await agent.run("Verdrahtung prüfen", {
+    onText: () => {},
+    signal: controller.signal,
+  });
+
+  assert.ok(captured, "createCodingTools wurde nicht über die Agent-Grenze aufgerufen");
+  assert.equal(captured.browserPath, "/fixture/Chromium");
+  assert.equal(captured.browserTimeoutSeconds, 47);
+  assert.strictEqual(captured.signal, controller.signal);
+  assert.strictEqual(captured.ssh?.session, sshSession);
 });
 
 test("agent binds live process events to the stable tool ID, redacts split credentials, and terminates once", { skip: process.platform === "win32" ? "needs a POSIX shell (ORCODE_SHELL/ROUTERCODE_SHELL)" : false }, async () => {

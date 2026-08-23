@@ -36,6 +36,7 @@ import {
 } from "./storage.js";
 import { loadIgnore } from "./ignore.js";
 import {
+  BrowserTimeoutError,
   browserApprovalSubject,
   inspectUrl,
   isLocalHttpHost,
@@ -55,7 +56,12 @@ import {
   shellApprovalSubject,
 } from "./rules.js";
 import { findSshHost, loadSshHosts, type SshHost } from "./ssh-config.js";
-import { execSshCommand, sshApprovalSubject, type RunSsh } from "./ssh.js";
+import {
+  execSshCommand,
+  sshApprovalSubject,
+  type RunSsh,
+  type SshSession,
+} from "./ssh.js";
 import { redactText } from "./redaction.js";
 import type {
   ProcessCallbacks,
@@ -384,6 +390,8 @@ export interface CodingToolOptions extends ProcessCallbacks {
 }
 
 export interface SshToolOptions {
+  /** Shared live selection owned by the CLI; read only when a tool execution begins. */
+  session?: SshSession;
   /** Pre-resolved hosts; bypasses `loadSshHosts` entirely when set. */
   hosts?: readonly SshHost[];
   /** Passed to `loadSshHosts` when `hosts` is unset. */
@@ -885,6 +893,7 @@ export function createCodingTools(
           fullPage,
           ...(viewport ? { viewport } : {}),
           ...(options.browserPath ? { browserPath: options.browserPath } : {}),
+          ...(signal ? { signal } : {}),
         });
         safeNotify(options.onProcessEnd, operation, {
           exitCode: 0,
@@ -898,7 +907,7 @@ export function createCodingTools(
           exitCode: null,
           durationMs: Date.now() - startedAt,
           truncated: false,
-          timedOut: false,
+          timedOut: error instanceof BrowserTimeoutError,
           aborted: signal?.aborted ?? false,
           error: error instanceof Error ? error.message : String(error),
         });
@@ -927,11 +936,12 @@ export function createCodingTools(
     name: "ssh_command",
     description:
       "Run a shell command on a remote host over SSH, using a host alias from the user's ~/.ssh/config " +
-      "(see /ssh in the chat UI to list and check hosts). Key/agent authentication only, never a password. " +
+      "(see /ssh in the chat UI to list and check hosts). Omit host to use the currently active /ssh target. " +
+      "Key/agent authentication only, never a password. " +
       "This tool always asks for explicit approval before it runs anything, even in auto-edit mode: unlike the " +
       "local tools, there is no workspace sandbox, no undo and no change journal on a remote machine.",
     inputSchema: z.object({
-      host: z.string().min(1),
+      host: z.string().trim().min(1).optional(),
       command: z.string().min(1).max(20_000),
       timeoutSeconds: z.number().int().min(1).max(1_800).default(30),
     }),
@@ -945,11 +955,17 @@ export function createCodingTools(
     }),
     execute: async ({ host, command, timeoutSeconds }) => {
       const sshOptions = options.ssh ?? {};
+      const targetAlias = host ?? sshOptions.session?.active;
+      if (!targetAlias) {
+        throw new Error(
+          "Kein aktives SSH-Ziel. Gib host explizit an oder wähle zuerst /ssh <alias>.",
+        );
+      }
       const hosts = sshOptions.hosts ?? (await loadSshHosts({ configPath: sshOptions.configPath }));
-      const resolved = findSshHost(host, hosts);
+      const resolved = findSshHost(targetAlias, hosts);
       if (!resolved) {
         throw new Error(
-          `„${host}“ ist kein bekannter Host aus der SSH-Konfiguration (~/.ssh/config). /ssh zeigt die verfügbaren Hosts.`,
+          `„${targetAlias}“ ist kein bekannter Host aus der SSH-Konfiguration (~/.ssh/config). /ssh zeigt die verfügbaren Hosts.`,
         );
       }
       const runSsh: RunSsh = sshOptions.runSsh ?? ((args, runOptions) => runProcess("ssh", args, runOptions));
@@ -966,17 +982,17 @@ export function createCodingTools(
         name: "ssh_command",
         risk: "remote-shell",
         subject: sshApprovalSubject(resolved.alias, command),
-        summary: `SSH-ZIEL: ${host.toUpperCase()} (${resolved.hostName}) — ${oneLine(command, 200)}`,
+        summary: `SSH-ZIEL: ${resolved.alias.toUpperCase()} (${resolved.hostName}) — ${oneLine(command, 200)}`,
         details: `Läuft NICHT lokal, sondern auf ${resolved.hostName}${
           resolved.user ? ` als ${resolved.user}` : ""
         }.\n$ ${command}`,
       });
 
-      const input = { host, command, timeoutSeconds };
+      const input = { host: resolved.alias, command, timeoutSeconds };
       const observedRunSsh: RunSsh = (args, runOptions) =>
         runObservedProcess("ssh_command", input, options, (onChunk) =>
           runSsh(args, { ...runOptions, onChunk }));
-      const result = await execSshCommand(host, hosts, command, observedRunSsh, {
+      const result = await execSshCommand(resolved.alias, hosts, command, observedRunSsh, {
         timeoutSeconds,
         ...(signal ? { signal } : {}),
         runtime: {
@@ -990,7 +1006,7 @@ export function createCodingTools(
       const stdout = truncate(result.stdout, MAX_TOOL_OUTPUT);
       const stderr = truncate(result.stderr, MAX_TOOL_OUTPUT);
       return {
-        host,
+        host: resolved.alias,
         command,
         exitCode: result.code,
         stdout,

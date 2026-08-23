@@ -8,6 +8,7 @@ import { delimiter, dirname, isAbsolute, join, sep } from "node:path";
 import test from "node:test";
 import { promisify } from "node:util";
 import { ApprovalManager, PermissionDeniedError } from "../src/approval.js";
+import { BrowserTimeoutError, type InspectUrlOptions } from "../src/browser.js";
 import { evaluateGitReadCapability } from "../src/policy.js";
 import {
   RuleStore,
@@ -117,6 +118,8 @@ async function sandbox(
     ) => void;
     ssh?: CodingToolOptions["ssh"];
     inspectUrlFn?: CodingToolOptions["inspectUrlFn"];
+    browserPath?: string;
+    browserTimeoutSeconds?: number;
   } = {},
 ): Promise<Sandbox> {
   const root = await mkdtemp(join(tmpdir(), `routercode-${options.prefix ?? "ws"}-`));
@@ -139,6 +142,10 @@ async function sandbox(
     ...(options.onProcessEnd ? { onProcessEnd: options.onProcessEnd } : {}),
     ...(options.ssh ? { ssh: options.ssh } : {}),
     ...(options.inspectUrlFn ? { inspectUrlFn: options.inspectUrlFn } : {}),
+    ...(options.browserPath ? { browserPath: options.browserPath } : {}),
+    ...(options.browserTimeoutSeconds
+      ? { browserTimeoutSeconds: options.browserTimeoutSeconds }
+      : {}),
   });
   return { root, tools, approvals, journal, asked };
 }
@@ -2519,6 +2526,60 @@ test("browser_check inspects localhost without asking", async () => {
   assert.equal(lifecycle[1]?.kind, "end");
   assert.equal(lifecycle[0]?.id, lifecycle[1]?.id);
   assert.equal(lifecycle[1]?.exitCode, 0);
+});
+
+test("browser_check forwards configured path, timeout, and the exact root signal to inspection", async () => {
+  const controller = new AbortController();
+  let captured: InspectUrlOptions | undefined;
+  const box = await sandbox("allow-all", {
+    signal: controller.signal,
+    browserPath: "/fixture/Chromium",
+    browserTimeoutSeconds: 47,
+    inspectUrlFn: async (options) => {
+      captured = options;
+      return {
+        url: options.url,
+        title: "Verdrahtet",
+        screenshotPath: null,
+        consoleMessages: [],
+        pageErrors: [],
+        failedRequests: [],
+        loadTimeMs: 1,
+        truncated: false,
+      };
+    },
+  });
+
+  await invoke(box.tools, "browser_check", { url: "http://localhost:5173/" });
+
+  assert.ok(captured);
+  assert.equal(captured.browserPath, "/fixture/Chromium");
+  assert.equal(captured.timeoutMs, 47_000);
+  assert.strictEqual(captured.signal, controller.signal);
+});
+
+test("browser_check emits one typed timeout terminal event", async () => {
+  const starts: string[] = [];
+  const ends: Array<{ id: string; timedOut: boolean; aborted: boolean }> = [];
+  const box = await sandbox("allow-all", {
+    onProcessStart: (operation) => starts.push(operation.id),
+    onProcessEnd: (operation, completion) => ends.push({
+      id: operation.id,
+      timedOut: completion.timedOut,
+      aborted: completion.aborted,
+    }),
+    inspectUrlFn: async () => {
+      throw new BrowserTimeoutError(8_000);
+    },
+  });
+
+  await assert.rejects(
+    invoke(box.tools, "browser_check", { url: "http://localhost:5173/" }),
+    BrowserTimeoutError,
+  );
+
+  assert.equal(starts.length, 1);
+  assert.deepEqual(ends, [{ id: starts[0]!, timedOut: true, aborted: false }]);
 });
 
 test("browser_check asks before loading a third-party page", async () => {

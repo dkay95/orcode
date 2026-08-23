@@ -21,6 +21,7 @@ import { join } from "node:path";
 import { ensureSecureDirectory } from "./config.js";
 import { findSshHost, type SshHost } from "./ssh-config.js";
 import type { ApprovalSubject } from "./types.js";
+import { errorMessage } from "./utils.js";
 import type { ProcessResult, RunProcessOptions } from "./workspace.js";
 
 export function sshApprovalSubject(
@@ -236,21 +237,41 @@ export async function execSshCommand(
   };
 }
 
-/** `/ssh off`: tears the `ControlMaster` down (`ssh -O exit`) instead of leaving it to `ControlPersist`'s timeout. Best-effort — a socket that is already gone is not an error. */
+export interface SshControlCloseReport {
+  closed: boolean;
+  error?: string;
+}
+
+const MISSING_CONTROL_SOCKET = /control socket.*(?:no such file|not found|does not exist)|no master/i;
+
+/** `/ssh off`: tears the `ControlMaster` down (`ssh -O exit`) instead of leaving it to `ControlPersist`'s timeout. A missing socket stays benign; real failures are returned for visible reporting. */
 export async function closeSshControl(
   alias: string,
   runSsh: RunSsh,
   options: SshRuntimeOptions = {},
-): Promise<void> {
+): Promise<SshControlCloseReport> {
   const appHome = options.appHome ?? SSH_APP_HOME;
   const socket = sshSocketPath(alias, appHome);
   try {
-    await runSsh(["-o", `ControlPath=${socket}`, "-O", "exit", alias], {
+    const result = await runSsh(["-o", `ControlPath=${socket}`, "-O", "exit", alias], {
       cwd: appHome,
       timeoutMs: 5_000,
     });
-  } catch {
-    // No live control socket to close — nothing to do.
+    if (result.code === 0) {
+      return { closed: true };
+    }
+    const detail = result.launchError || result.stderr.trim() ||
+      (result.timedOut
+        ? "Zeitlimit beim Schließen der SSH-Control-Verbindung."
+        : `ssh -O exit endete mit Code ${result.code ?? "unbekannt"}.`);
+    return MISSING_CONTROL_SOCKET.test(detail)
+      ? { closed: false }
+      : { closed: false, error: detail };
+  } catch (error) {
+    const detail = errorMessage(error);
+    return MISSING_CONTROL_SOCKET.test(detail)
+      ? { closed: false }
+      : { closed: false, error: detail };
   }
 }
 

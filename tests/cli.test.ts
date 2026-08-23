@@ -299,7 +299,7 @@ test("the chat chooser does not show a transcript behind itself", () => {
   assert.ok(load > guard && load < start, "the guarded load belongs before ui.start()");
 });
 
-test("startup awaits migration before config, rules, chats, exact artifacts, keys, or network can open", async () => {
+test("startup awaits migration before config, rules, chats, browser artifacts, keys, or network can open", async () => {
   const { initializeStartupStorage } = await import("../src/cli.js") as typeof import("../src/cli.js") & {
     initializeStartupStorage: (...args: never[]) => Promise<never>;
   };
@@ -324,6 +324,9 @@ test("startup awaits migration before config, rules, chats, exact artifacts, key
       pruneCheckpoints: async (appHome) => {
         assert.equal(appHome, "/synthetic/.orcode");
         order.push("exact-retention");
+      },
+      pruneBrowserTempArtifacts: async () => {
+        order.push("browser-retention");
       },
       loadConfig: async (path) => {
         assert.equal(path, "/synthetic/.orcode/config.json");
@@ -356,6 +359,7 @@ test("startup awaits migration before config, rules, chats, exact artifacts, key
     "migration-complete",
     "redacted-retention",
     "exact-retention",
+    "browser-retention",
     "config",
     "rules",
     "chats",
@@ -390,6 +394,9 @@ test("declined future or recovery-required migration stops startup before any mu
           pruneCheckpoints: async () => {
             calls.push("prune");
           },
+          pruneBrowserTempArtifacts: async () => {
+            calls.push("browser-prune");
+          },
           loadConfig: async () => {
             calls.push("config");
             return structuredClone(DEFAULT_CONFIG);
@@ -419,6 +426,7 @@ test("startup exposes the selected app-home config path to every runtime command
       migrateAppHome: async () => ({ status: "ready", appHome, warning: null } as never),
       pruneRunLogs: async () => undefined,
       pruneCheckpoints: async () => undefined,
+      pruneBrowserTempArtifacts: async () => undefined,
       loadConfig: async () => structuredClone(DEFAULT_CONFIG),
       loadRules: async () => ({} as never),
       openSession: async () => ({ appHome, data: { id: "chat-a" } } as never),
@@ -428,7 +436,7 @@ test("startup exposes the selected app-home config path to every runtime command
   assert.equal((result as typeof result & { configPath?: string }).configPath, join(appHome, "config.json"));
 });
 
-test("startup invokes both retention classes best effort and reports each failure before opening stores", async () => {
+test("startup invokes all retention classes best effort and reports each failure before opening stores", async () => {
   const { initializeStartupStorage } = await import("../src/cli.js");
   const calls: string[] = [];
   const result = await initializeStartupStorage(
@@ -442,6 +450,10 @@ test("startup invokes both retention classes best effort and reports each failur
       pruneCheckpoints: async () => {
         calls.push("exact");
         throw new Error("exact retention unavailable");
+      },
+      pruneBrowserTempArtifacts: async () => {
+        calls.push("browser");
+        throw new Error("browser retention unavailable");
       },
       loadConfig: async () => {
         calls.push("config");
@@ -458,10 +470,11 @@ test("startup invokes both retention classes best effort and reports each failur
     },
   );
 
-  assert.deepEqual(calls, ["redacted", "exact", "config", "rules", "session"]);
-  assert.equal(result.retentionWarnings.length, 2);
+  assert.deepEqual(calls, ["redacted", "exact", "browser", "config", "rules", "session"]);
+  assert.equal(result.retentionWarnings.length, 3);
   assert.match(result.retentionWarnings[0]!, /run retention unavailable/);
   assert.match(result.retentionWarnings[1]!, /exact retention unavailable/);
+  assert.match(result.retentionWarnings[2]!, /browser retention unavailable/);
 });
 
 test("startup surfaces returned per-class retention errors, including nested exact backup reports", async () => {
@@ -478,16 +491,21 @@ test("startup surfaces returned per-class retention errors, including nested exa
         exact: { removed: [], errors: [{ path: "tasks/chat-a/state.json", message: "exact state remained busy" }] },
         backups: { removed: [], errors: [{ path: "migration-backup", message: "backup remained busy" }] },
       }),
+      pruneBrowserTempArtifacts: async () => ({
+        removed: [],
+        errors: [{ path: "orcode-browser-operation-Ab12Z9", message: "browser profile remained busy" }],
+      }),
       loadConfig: async () => structuredClone(DEFAULT_CONFIG),
       loadRules: async () => ({} as never),
       openSession: async (_workspace, appHome) => ({ appHome, data: { id: "chat-a" } } as never),
     },
   );
 
-  assert.equal(result.retentionWarnings.length, 3);
+  assert.equal(result.retentionWarnings.length, 4);
   assert.ok(result.retentionWarnings.some((warning) => /redacted log remained busy/.test(warning)));
   assert.ok(result.retentionWarnings.some((warning) => /exact state remained busy/.test(warning)));
   assert.ok(result.retentionWarnings.some((warning) => /backup remained busy/.test(warning)));
+  assert.ok(result.retentionWarnings.some((warning) => /browser profile remained busy/.test(warning)));
 });
 
 function cliRoleModel(

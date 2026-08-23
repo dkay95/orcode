@@ -24,6 +24,7 @@ import {
   type ImageAttachment,
 } from "./attachments.js";
 import { ApprovalManager } from "./approval.js";
+import { pruneBrowserTempArtifacts } from "./browser.js";
 import { RuleStore } from "./rules.js";
 import { createSshSession, type SshSession } from "./ssh.js";
 import {
@@ -160,6 +161,7 @@ export interface StartupStorageDependencies {
   migrateAppHome: typeof migrateAppHome;
   pruneRunLogs: (appHome: string) => Promise<unknown>;
   pruneCheckpoints: (appHome: string) => Promise<unknown>;
+  pruneBrowserTempArtifacts: () => Promise<unknown>;
   loadConfig: typeof loadConfig;
   loadRules: typeof RuleStore.load;
   openSession: (
@@ -188,6 +190,7 @@ export async function initializeStartupStorage(
     migrateAppHome,
     pruneRunLogs: (appHome) => RunLog.prune(appHome),
     pruneCheckpoints,
+    pruneBrowserTempArtifacts: () => pruneBrowserTempArtifacts(),
     loadConfig,
     loadRules: (appHome) => RuleStore.load(appHome),
     openSession: async (workspace, appHome, startup) => {
@@ -208,11 +211,12 @@ export async function initializeStartupStorage(
   const appHome = migration.appHome;
   const retentionWarnings: string[] = [];
   for (const [label, prune] of [
-    ["redacted", deps.pruneRunLogs],
-    ["exact", deps.pruneCheckpoints],
+    ["redacted", () => deps.pruneRunLogs(appHome)],
+    ["exact", () => deps.pruneCheckpoints(appHome)],
+    ["browser", deps.pruneBrowserTempArtifacts],
   ] as const) {
     try {
-      const result = await prune(appHome);
+      const result = await prune();
       for (const error of collectRetentionErrors(result)) {
         retentionWarnings.push(
           `Aufbewahrung (${label}) konnte nicht vollständig bereinigt werden: ${error.message} (${error.path})`,
@@ -363,6 +367,7 @@ async function main(): Promise<void> {
     session,
     config,
     workspace,
+    sshSession,
   });
 
   const useTui = Boolean(
