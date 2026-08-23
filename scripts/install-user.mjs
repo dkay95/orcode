@@ -1,9 +1,9 @@
-import { chmod, lstat, mkdir, readlink, symlink, unlink } from "node:fs/promises";
+import { chmod, lstat, mkdir, readlink, symlink } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
-const defaultFileSystem = { chmod, lstat, mkdir, readlink, symlink, unlink };
+const defaultFileSystem = { chmod, lstat, mkdir, readlink, symlink };
 const defaultProjectRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 
 export function isInstallerEntrypoint(
@@ -67,8 +67,7 @@ export async function installUserAliases(options = {}) {
     for (const alias of preflight) {
       if (alias.exists) continue;
       await fileSystem.symlink(target, alias.link);
-      const createdAlias = { ...alias, identity: null };
-      created.push(createdAlias);
+      created.push(alias);
       const info = await fileSystem.lstat(alias.link);
       if (!info.isSymbolicLink()) {
         throw new Error(`${alias.link} wurde nicht als Symlink angelegt.`);
@@ -77,23 +76,14 @@ export async function installUserAliases(options = {}) {
       if (current !== target) {
         throw new Error(`${alias.link} wurde mit einem unerwarteten Ziel angelegt.`);
       }
-      createdAlias.identity = fileIdentity(info);
     }
   } catch (installError) {
-    const rollbackErrors = [];
-    for (const alias of [...created].reverse()) {
-      try {
-        await rollbackCreatedAlias(fileSystem, alias, target);
-      } catch (rollbackError) {
-        rollbackErrors.push(rollbackError);
-      }
-    }
-    if (rollbackErrors.length > 0) {
-      throw new AggregateError(
-        [installError, ...rollbackErrors],
-        `Alias-Installation fehlgeschlagen und konnte nicht sicher vollständig ` +
-          `zurückgerollt werden. Ausgangsfehler: ${errorMessage(installError)}. ` +
-          `Rückrollen: ${rollbackErrors.map(errorMessage).join("; ")}`,
+    if (created.length > 0) {
+      throw new Error(
+        `Alias-Installation wurde teilweise abgeschlossen. Es wurde kein Pfad gelöscht ` +
+          `oder ersetzt. Du kannst den Installer sicher erneut ausführen; vorhandene ` +
+          `eigene Links werden erkannt und fremde Pfade abgelehnt. Ursache: ` +
+          `${errorMessage(installError)}`,
         { cause: installError },
       );
     }
@@ -107,44 +97,6 @@ export async function installUserAliases(options = {}) {
         : `${alias.name} installiert: ${alias.link}`,
     );
   }
-}
-
-async function rollbackCreatedAlias(fileSystem, alias, target) {
-  let info;
-  try {
-    info = await fileSystem.lstat(alias.link);
-  } catch (error) {
-    if (hasCode(error, "ENOENT")) return;
-    throw error;
-  }
-  if (!info.isSymbolicLink()) {
-    throw new Error(
-      `Unsicheres Rückrollen abgelehnt: ${alias.link} ist nicht mehr der angelegte Symlink.`,
-    );
-  }
-  const current = resolve(dirname(alias.link), await fileSystem.readlink(alias.link));
-  if (current !== target) {
-    throw new Error(
-      `Unsicheres Rückrollen abgelehnt: ${alias.link} zeigt nicht mehr auf das angelegte Ziel.`,
-    );
-  }
-  const currentIdentity = fileIdentity(info);
-  if (
-    alias.identity !== null &&
-    (currentIdentity === null || currentIdentity !== alias.identity)
-  ) {
-    throw new Error(
-      `Unsicheres Rückrollen abgelehnt: ${alias.link} wurde nach dem Anlegen ausgetauscht.`,
-    );
-  }
-  await fileSystem.unlink(alias.link);
-}
-
-function fileIdentity(info) {
-  const validPart = (value) => typeof value === "number" || typeof value === "bigint";
-  return validPart(info.dev) && validPart(info.ino)
-    ? `${String(info.dev)}:${String(info.ino)}`
-    : null;
 }
 
 function hasCode(error, code) {

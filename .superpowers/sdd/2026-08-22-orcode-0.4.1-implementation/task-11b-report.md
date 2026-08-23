@@ -59,46 +59,51 @@
   owned by the adjacent Task 11a/Task 12 slices and are intentionally outside
   this commit.
 
-## Review Fix R1 — recover partial alias creation
+## Review fixes — retryable partial alias installation
 
-The package review found one transactional gap after the original commit: if
-`orcode` was created successfully and creating `routercode` then failed, the
-first new link remained even though installation reported failure.
+The first package review correctly identified that a second-link failure left
+the first new alias behind without explaining recovery. Fix R1 attempted to
+restore all-or-none behavior with `lstat`/`readlink` identity checks followed by
+`unlink`. A follow-up timing probe swapped a foreign path after the final check
+but inside the injected unlink boundary; path-based Node APIs could then delete
+that unrelated path. R1's destructive rollback claim was therefore rejected
+and is fully superseded here.
 
-### RED
+### Final RED contract
 
-- An injected second-`symlink` failure left the newly created `orcode` alias in
-  the fake filesystem instead of restoring the pre-call state.
-- A timing fixture replaced that just-created link with an unrelated regular
-  file before failure. The old implementation surfaced only the original
-  error, with no indication that safe rollback was impossible.
+- Against R1, an injected second-`symlink` failure did not retain the first
+  exact own link and did not report a safely retryable partial installation.
+- A foreign replacement during that failure had to remain present with no
+  `unlink` attempt. Path identity checks cannot make a later path deletion
+  atomic, so any destructive rollback was disallowed by contract.
+- A second invocation had to recognize the retained exact own first link and
+  create only the still-missing second link.
 
-### Fix
+### Final implementation
 
-- Alias creation is now a transaction over only the missing aliases from the
-  completed all-target preflight. Newly created links are recorded with their
-  post-create file identity and removed in reverse order on failure.
-- Rollback rechecks link type, exact resolved target, and captured file identity
-  before `unlink`. A missing link is already restored; a replaced/foreign path
-  is never removed. Any rollback error is combined with the original install
-  error so the unsafe partial state cannot be hidden.
-- Pre-existing correct aliases are never added to the rollback set. Success
-  messages are emitted only after every required alias has been created.
-- `mkdir` and executable `chmod` are intentionally not rolled back. The bin
-  directory may have gained concurrent user content, making directory removal
-  unsafe, while `dist/cli.js` is the installer-owned executable and mode `0755`
-  is its required steady state. The binding invariant is exact restoration of
-  the two alias paths.
+- The installer never deletes or replaces an alias. It retains its completed
+  all-target preflight and creates only missing paths with `symlink`, whose
+  no-overwrite behavior closes a concurrent-creation conflict safely.
+- If a later alias fails after an earlier alias was created, the error states
+  that installation is partial, that no path was deleted/replaced, and that it
+  is safe to run the installer again. The original error remains the cause.
+- On retry, an exact existing own link is accepted and only the missing alias is
+  created. A file, wrong link, or concurrently replaced path is left untouched
+  and rejected by the next preflight before mutation.
+- Success messages remain deferred until every required alias exists. The
+  package-owned executable's required `0755` mode and a possibly newly created
+  bin directory remain benign setup state, as explicitly accepted in review;
+  neither requires destructive cleanup.
 
-### GREEN
+### Final GREEN
 
-- Focused rollback matrix: 2/2 passed, covering exact restoration,
-  pre-existing-link preservation, unrelated-path preservation, and explicit
-  unsafe-rollback reporting.
+- Focused partial-install/retry matrix: 2/2 passed, covering retained own-link
+  retry, no second creation of the first link, foreign-path preservation, zero
+  unlink attempts, and explicit partial-install guidance.
 - Complete CLI-entrypoint/installer suite: 12/12 passed; production and test
   TypeScript checks and installer syntax check exited 0.
-- A real-filesystem injected second-alias failure removed the first new link,
-  left both alias paths absent as before the call, and removed its temporary
-  home afterward.
-- The fresh 148-file tarball check and both installed npm bin shims remained
-  green; `git diff --check` remained clean.
+- A real-filesystem second-alias failure retained the first link and its inode;
+  the next invocation created only the missing alias and temporary state was
+  removed afterward.
+- The fresh exact 148-file tarball check and both installed npm bin shims
+  remained green; `git diff --check` remained clean.
