@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { readFileSync } from "node:fs";
+import { mkdtemp } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
@@ -11,6 +13,7 @@ import {
   runOutcomeExitCode,
 } from "../src/cli.js";
 import { DEFAULT_CONFIG } from "../src/config.js";
+import type { ModelInfo } from "../src/types.js";
 
 test("homeWorkspaceWarning warnt nur bei Workspace === Home-Verzeichnis", () => {
   const home = "/tmp/orcode-home-test";
@@ -346,3 +349,265 @@ test("startup surfaces returned per-class retention errors, including nested exa
   assert.ok(result.retentionWarnings.some((warning) => /exact state remained busy/.test(warning)));
   assert.ok(result.retentionWarnings.some((warning) => /backup remained busy/.test(warning)));
 });
+
+function cliRoleModel(
+  overrides: Partial<ModelInfo> & Pick<ModelInfo, "id">,
+): ModelInfo {
+  const { id, ...rest } = overrides;
+  return {
+    id,
+    name: id,
+    description: "synthetic CLI role fixture",
+    contextLength: 64_000,
+    promptPrice: 0,
+    completionPrice: 0,
+    supportedParameters: ["tools"],
+    inputModalities: ["text"],
+    outputModalities: ["text"],
+    ...rest,
+  };
+}
+
+test("configured run gate rejects incompatible roles and preserves catalogue failures", async () => {
+  const cli = await import("../src/cli.js") as typeof import("../src/cli.js") & {
+    ensureRunnableModelConfiguration: (
+      openRouter: { listModels: (...args: unknown[]) => Promise<ModelInfo[]> },
+      config: typeof DEFAULT_CONFIG,
+    ) => Promise<unknown>;
+  };
+  assert.equal(
+    typeof cli.ensureRunnableModelConfiguration,
+    "function",
+    "the final --model/session/config value needs one run-boundary gate",
+  );
+
+  const incompatibleMain = roleModelForCli({
+    id: "provider/no-tools",
+    supportedParameters: [],
+  });
+  const config = structuredClone(DEFAULT_CONFIG);
+  config.mainModel = incompatibleMain.id;
+  config.compressionMode = "off";
+  await assert.rejects(
+    cli.ensureRunnableModelConfiguration(
+      { listModels: async () => [incompatibleMain] },
+      config,
+    ),
+    (error: unknown) =>
+      error instanceof Error && error.name === "ModelCapabilityError",
+  );
+
+  const unavailable = new Error("synthetic catalogue offline");
+  config.mainModel = "provider/complete";
+  await assert.rejects(
+    cli.ensureRunnableModelConfiguration(
+      { listModels: async () => { throw unavailable; } },
+      config,
+    ),
+    (error: unknown) => error === unavailable,
+  );
+});
+
+test("configured run gate accepts main auto and an input-agnostic text compressor", async () => {
+  const cli = await import("../src/cli.js") as typeof import("../src/cli.js") & {
+    ensureRunnableModelConfiguration: (
+      openRouter: { listModels: (...args: unknown[]) => Promise<ModelInfo[]> },
+      config: typeof DEFAULT_CONFIG,
+    ) => Promise<{ main: ModelInfo | null; compressor: ModelInfo | null }>;
+  };
+  const compressor = roleModelForCli({
+    id: "provider/audio-to-text",
+    supportedParameters: [],
+    inputModalities: ["audio"],
+    outputModalities: ["text"],
+  });
+  const config = structuredClone(DEFAULT_CONFIG);
+  config.mainModel = "openrouter/auto";
+  config.compressorModel = compressor.id;
+  config.compressionMode = "auto";
+  const calls: unknown[][] = [];
+
+  const result = await cli.ensureRunnableModelConfiguration(
+    {
+      listModels: async (...args: unknown[]) => {
+        calls.push(args);
+        return [compressor];
+      },
+    },
+    config,
+  );
+
+  assert.equal(result.main, null, "auto is the explicit catalogue-independent main route");
+  assert.equal(result.compressor?.id, compressor.id);
+  assert.deepEqual(calls.map((args) => args[0]), [compressor.id]);
+});
+
+test("dashboard snapshot distinguishes incompatible, missing, and unavailable models", async () => {
+  const cli = await import("../src/cli.js") as typeof import("../src/cli.js") & {
+    loadModelSnapshot: (
+      openRouter: { listModels: (...args: unknown[]) => Promise<ModelInfo[]> },
+      modelId: string,
+    ) => Promise<{
+      model: ModelInfo | null;
+      details: string;
+      status: "available" | "incompatible" | "missing" | "unavailable";
+      error?: unknown;
+    }>;
+  };
+  assert.equal(typeof cli.loadModelSnapshot, "function");
+
+  const incompatible = cliRoleModel({
+    id: "provider/image-only",
+    outputModalities: ["image"],
+  });
+  const incompatibleSnapshot = await cli.loadModelSnapshot(
+    { listModels: async () => [incompatible] },
+    incompatible.id,
+  );
+  assert.equal(incompatibleSnapshot.status, "incompatible");
+  assert.equal(incompatibleSnapshot.model, null);
+  assert.match(incompatibleSnapshot.details, /inkompatibel/i);
+
+  const missingSnapshot = await cli.loadModelSnapshot(
+    { listModels: async () => [] },
+    "provider/missing",
+  );
+  assert.equal(missingSnapshot.status, "missing");
+  assert.doesNotMatch(missingSnapshot.details, /dynamische OpenRouter-Route/i);
+
+  const unavailable = new Error("synthetic catalogue timeout");
+  const unavailableSnapshot = await cli.loadModelSnapshot(
+    { listModels: async () => { throw unavailable; } },
+    "provider/complete",
+  );
+  assert.equal(unavailableSnapshot.status, "unavailable");
+  assert.equal(unavailableSnapshot.error, unavailable);
+  assert.doesNotMatch(unavailableSnapshot.details, /inkompatibel/i);
+
+  const autoSnapshot = await cli.loadModelSnapshot(
+    { listModels: async () => { throw new Error("auto must not query the catalogue"); } },
+    "openrouter/auto",
+  );
+  assert.equal(autoSnapshot.status, "available");
+  assert.equal(autoSnapshot.model, null);
+  assert.match(autoSnapshot.details, /dynamische OpenRouter-Route/i);
+});
+
+test("dashboard pickers expose only their role-compatible candidates before mutation", async () => {
+  type CandidateSource = (query: string) => ModelInfo[];
+  type DashboardPicker = (
+    ui: {
+      setStatus: (value: string) => void;
+      setCancelHandler: (handler?: () => void) => void;
+      pickModel: (
+        source: CandidateSource,
+        current: string,
+        title?: string,
+      ) => Promise<ModelInfo | null>;
+    },
+    context: {
+      openRouter: { listModels: (...args: unknown[]) => Promise<ModelInfo[]> };
+      config: typeof DEFAULT_CONFIG;
+      configPath: string;
+    },
+  ) => Promise<ModelInfo | null>;
+  const cli = await import("../src/cli.js") as typeof import("../src/cli.js") & {
+    pickDashboardModel: DashboardPicker;
+    pickDashboardCompressorModel: DashboardPicker;
+  };
+  assert.equal(typeof cli.pickDashboardModel, "function");
+  assert.equal(typeof cli.pickDashboardCompressorModel, "function");
+
+  const root = await mkdtemp(join(tmpdir(), "orcode-dashboard-roles-"));
+  const complete = cliRoleModel({ id: "provider/complete" });
+  const noTools = cliRoleModel({ id: "provider/no-tools", supportedParameters: [] });
+  const imageOnly = cliRoleModel({ id: "provider/image-only", outputModalities: ["image"] });
+  const audioToText = cliRoleModel({
+    id: "provider/audio-to-text",
+    supportedParameters: [],
+    inputModalities: ["audio"],
+  });
+  const seen: string[][] = [];
+  const ui = {
+    setStatus: () => undefined,
+    setCancelHandler: () => undefined,
+    pickModel: async (source: CandidateSource, _current: string, title?: string) => {
+      const candidates = source("");
+      seen.push(candidates.map((candidate) => candidate.id));
+      return title
+        ? candidates.find((candidate) => candidate.id === audioToText.id) ?? null
+        : candidates.find((candidate) => candidate.id === complete.id) ?? null;
+    },
+  };
+  const config = structuredClone(DEFAULT_CONFIG);
+  config.mainModel = noTools.id;
+  config.compressorModel = imageOnly.id;
+  const calls: unknown[][] = [];
+  const context = {
+    config,
+    configPath: join(root, "config.json"),
+    openRouter: {
+      listModels: async (...args: unknown[]) => {
+        calls.push(args);
+        return [complete, noTools, imageOnly, audioToText];
+      },
+    },
+  };
+
+  await cli.pickDashboardModel(ui, context);
+  await cli.pickDashboardCompressorModel(ui, context);
+
+  assert.deepEqual(seen[0], [complete.id]);
+  assert.deepEqual(seen[1], [complete.id, noTools.id, audioToText.id]);
+  assert.equal(config.mainModel, complete.id);
+  assert.equal(config.compressorModel, audioToText.id);
+  assert.deepEqual(calls.map((args) => args[1]), [false, false]);
+});
+
+test("dashboard picker preserves catalogue failure identity and current selection", async () => {
+  const cli = await import("../src/cli.js") as typeof import("../src/cli.js") & {
+    pickDashboardModel: (
+      ui: {
+        setStatus: (value: string) => void;
+        setCancelHandler: (handler?: () => void) => void;
+        pickModel: (...args: unknown[]) => Promise<ModelInfo | null>;
+      },
+      context: {
+        openRouter: { listModels: (...args: unknown[]) => Promise<ModelInfo[]> };
+        config: typeof DEFAULT_CONFIG;
+        configPath: string;
+      },
+    ) => Promise<ModelInfo | null>;
+  };
+  const unavailable = new Error("synthetic dashboard catalogue offline");
+  const config = structuredClone(DEFAULT_CONFIG);
+  config.mainModel = "provider/current";
+  let pickerCalls = 0;
+
+  await assert.rejects(
+    cli.pickDashboardModel(
+      {
+        setStatus: () => undefined,
+        setCancelHandler: () => undefined,
+        pickModel: async () => {
+          pickerCalls += 1;
+          return null;
+        },
+      },
+      {
+        config,
+        configPath: "/synthetic/not-written.json",
+        openRouter: { listModels: async () => { throw unavailable; } },
+      },
+    ),
+    (error: unknown) => error === unavailable,
+  );
+  assert.equal(config.mainModel, "provider/current");
+  assert.equal(pickerCalls, 0);
+});
+
+function roleModelForCli(
+  overrides: Partial<ModelInfo> & Pick<ModelInfo, "id">,
+): ModelInfo {
+  return cliRoleModel(overrides);
+}

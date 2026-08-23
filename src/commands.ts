@@ -51,6 +51,8 @@ import {
   OpenRouterService,
   createPanelCall,
   estimatePanelModelCostUsd,
+  isCompressorModelCandidate,
+  isMainModelCandidate,
   modelCapabilities,
   proposePanelModels,
   type BalanceReport,
@@ -707,14 +709,18 @@ export async function validateAndStoreManagementKey(
 async function modelCommand(args: string[], context: CommandContext): Promise<void> {
   const id = args.join(" ").trim();
   if (!id) {
-    const models = await context.openRouter.listModels("", true);
+    const models = mainModelCandidates(
+      await context.openRouter.listModels("", false),
+    );
     const selected = await pickModel(models, context.config.mainModel);
     await selectModel(selected, context);
     return;
   }
   if (id.toLowerCase() === "current") {
-    const models = await context.openRouter.listModels(context.config.mainModel, true);
-    const current = models.find((model) => model.id === context.config.mainModel);
+    const current = await resolveMainModelCandidate(
+      context.openRouter,
+      context.config.mainModel,
+    );
     if (current) {
       printModelDetails(current, false, context.out);
     } else {
@@ -722,33 +728,25 @@ async function modelCommand(args: string[], context: CommandContext): Promise<vo
     }
     return;
   }
-  if (id !== "openrouter/auto") {
-    const matches = await context.openRouter.listModels(id, true);
-    const exact = matches.find((model) => model.id === id);
-    if (!exact) {
-      throw new Error(`Kein tool-fähiges Modell mit exakter ID gefunden: ${id}`);
-    }
+  const exact = await resolveMainModelCandidate(context.openRouter, id);
+  if (exact) {
     await selectModel(exact, context);
     return;
   }
-  const matches = await context.openRouter.listModels(id, true);
-  const exact = matches.find((model) => model.id === id);
-  if (exact) {
-    await selectModel(exact, context);
-  } else {
-    context.config.mainModel = id;
-    context.session.setPreferences(
-      context.config.mainModel,
-      getReasoningSetting(context.config),
-    );
-    await Promise.all([saveContextConfig(context), context.session.save()]);
-    context.out.text(chalk.green(`Main-Modell: ${id}`));
-  }
+  context.config.mainModel = id;
+  context.session.setPreferences(
+    context.config.mainModel,
+    getReasoningSetting(context.config),
+  );
+  await Promise.all([saveContextConfig(context), context.session.save()]);
+  context.out.text(chalk.green(`Main-Modell: ${id}`));
 }
 
 async function modelsCommand(args: string[], context: CommandContext): Promise<void> {
   const query = args.join(" ");
-  const models = await context.openRouter.listModels(query, true);
+  const models = mainModelCandidates(
+    await context.openRouter.listModels(query, false),
+  );
   if (!models.length) {
     context.out.text("Keine passenden tool-fähigen Modelle gefunden.");
     return;
@@ -1526,26 +1524,19 @@ async function compressorCommand(args: string[], context: CommandContext): Promi
   } else if (action === "model") {
     const requestedId = args.slice(1).join(" ").trim();
     if (!requestedId) {
-      const models = (
-        await context.openRouter.listModels("", false)
-      ).filter(isTextGenerationModel);
+      const models = compressorModelCandidates(
+        await context.openRouter.listModels("", false),
+      );
       const selected = await pickModel(
         models,
         context.config.compressorModel,
       );
       context.config.compressorModel = selected.id;
     } else {
-      const matches = await context.openRouter.listModels(requestedId, false);
-      const exact = matches.find(
-        (candidate) =>
-          candidate.id === requestedId &&
-          isTextGenerationModel(candidate),
+      const exact = await resolveCompressorModelCandidate(
+        context.openRouter,
+        requestedId,
       );
-      if (!exact) {
-        throw new Error(
-          `Kein Textmodell mit exakter ID gefunden: ${requestedId}`,
-        );
-      }
       context.config.compressorModel = exact.id;
     }
   } else if (action === "threshold") {
@@ -2233,10 +2224,82 @@ export function rankModels(
 }
 
 export function isTextGenerationModel(model: ModelInfo): boolean {
-  return (
-    model.inputModalities.includes("text") &&
-    model.outputModalities.includes("text")
-  );
+  return isCompressorModelCandidate(model);
+}
+
+export type ModelRole = "main" | "compressor";
+
+export class ModelCapabilityError extends Error {
+  constructor(
+    readonly role: ModelRole,
+    readonly modelId: string,
+  ) {
+    super(
+      role === "main"
+        ? `Das Modell ${modelId} ist für die Main-Rolle inkompatibel: benötigt werden Text-Input, Text-Output und Tools.`
+        : `Das Modell ${modelId} ist für die Kompressor-Rolle inkompatibel: benötigt wird Text-Output.`,
+    );
+    this.name = "ModelCapabilityError";
+  }
+}
+
+export class ModelNotFoundError extends Error {
+  constructor(
+    readonly role: ModelRole,
+    readonly modelId: string,
+  ) {
+    super(`Modell mit exakter ID nicht im OpenRouter-Katalog gefunden: ${modelId}`);
+    this.name = "ModelNotFoundError";
+  }
+}
+
+type ModelCatalog = Pick<OpenRouterService, "listModels">;
+
+export function mainModelCandidates(
+  models: readonly ModelInfo[],
+): ModelInfo[] {
+  return models.filter(isMainModelCandidate);
+}
+
+export function compressorModelCandidates(
+  models: readonly ModelInfo[],
+): ModelInfo[] {
+  return models.filter(isCompressorModelCandidate);
+}
+
+export async function resolveMainModelCandidate(
+  openRouter: ModelCatalog,
+  modelId: string,
+  signal?: AbortSignal,
+): Promise<ModelInfo | null> {
+  if (modelId === "openrouter/auto") {
+    return null;
+  }
+  const matches = await openRouter.listModels(modelId, false, signal);
+  const exact = matches.find((candidate) => candidate.id === modelId);
+  if (!exact) {
+    throw new ModelNotFoundError("main", modelId);
+  }
+  if (!isMainModelCandidate(exact)) {
+    throw new ModelCapabilityError("main", modelId);
+  }
+  return exact;
+}
+
+export async function resolveCompressorModelCandidate(
+  openRouter: ModelCatalog,
+  modelId: string,
+  signal?: AbortSignal,
+): Promise<ModelInfo> {
+  const matches = await openRouter.listModels(modelId, false, signal);
+  const exact = matches.find((candidate) => candidate.id === modelId);
+  if (!exact) {
+    throw new ModelNotFoundError("compressor", modelId);
+  }
+  if (!isCompressorModelCandidate(exact)) {
+    throw new ModelCapabilityError("compressor", modelId);
+  }
+  return exact;
 }
 
 export async function pickModel(
@@ -2321,8 +2384,7 @@ async function findCurrentModel(
   modelId: string,
 ): Promise<ModelInfo | null> {
   try {
-    const models = await openRouter.listModels(modelId, false);
-    return models.find((model) => model.id === modelId) ?? null;
+    return await resolveMainModelCandidate(openRouter, modelId);
   } catch {
     return null;
   }

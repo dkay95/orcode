@@ -15,7 +15,7 @@ import { OpenRouterHttpError } from "../src/openrouter.js";
 import { SessionStore } from "../src/session.js";
 import { DEFAULT_CONFIG } from "../src/config.js";
 import { migrationManifestPath } from "../src/storage.js";
-import type { AgentRunEvent } from "../src/types.js";
+import type { AgentRunEvent, ModelInfo } from "../src/types.js";
 
 const run = promisify(execFile);
 
@@ -378,4 +378,182 @@ test("a managed-backup inspection failure retains the active transcript and retr
   assert.deepEqual(rebound, [context.session.data.id]);
   assert.equal((await SessionStore.list(workspace, appHome)).some((chat) => chat.id === oldId), false);
   await assert.rejects(stat(backupPath), /ENOENT/);
+});
+
+function roleModel(
+  overrides: Partial<ModelInfo> & Pick<ModelInfo, "id">,
+): ModelInfo {
+  const { id, ...rest } = overrides;
+  return {
+    id,
+    name: id,
+    description: "synthetic role fixture",
+    contextLength: 32_000,
+    promptPrice: 0,
+    completionPrice: 0,
+    supportedParameters: ["tools"],
+    inputModalities: ["text"],
+    outputModalities: ["text"],
+    ...rest,
+  };
+}
+
+function roleCommandContext(
+  root: string,
+  listModels: (...args: unknown[]) => Promise<ModelInfo[]>,
+): {
+  context: CommandContext;
+  output: string[];
+  preferences: string[];
+  sessionSaves: { count: number };
+} {
+  const output: string[] = [];
+  const preferences: string[] = [];
+  const sessionSaves = { count: 0 };
+  const config = structuredClone(DEFAULT_CONFIG);
+  config.mainModel = "provider/initial-main";
+  config.compressorModel = "provider/initial-compressor";
+  return {
+    context: {
+      config,
+      configPath: join(root, "config.json"),
+      openRouter: { listModels },
+      session: {
+        setPreferences: (modelId: string) => preferences.push(modelId),
+        save: async () => {
+          sessionSaves.count += 1;
+        },
+      },
+      out: {
+        text: (value: string) => output.push(value),
+        error: (value: string) => output.push(value),
+      },
+    } as unknown as CommandContext,
+    output,
+    preferences,
+    sessionSaves,
+  };
+}
+
+test("slash main catalogue lists only complete main-role candidates", async () => {
+  const root = await mkdtemp(join(tmpdir(), "orcode-main-list-"));
+  const calls: unknown[][] = [];
+  const catalog = [
+    roleModel({ id: "provider/complete" }),
+    roleModel({ id: "provider/no-tools", supportedParameters: [] }),
+    roleModel({ id: "provider/no-text-input", inputModalities: ["image"] }),
+    roleModel({ id: "provider/no-text-output", outputModalities: ["image"] }),
+    roleModel({
+      id: "openrouter/auto",
+      supportedParameters: [],
+      inputModalities: [],
+      outputModalities: [],
+    }),
+  ];
+  const { context, output } = roleCommandContext(root, async (...args) => {
+    calls.push(args);
+    return catalog;
+  });
+
+  await handleSlashCommand("/models", context);
+
+  const rendered = output.join("\n");
+  assert.match(rendered, /provider\/complete/);
+  assert.match(rendered, /openrouter\/auto/);
+  assert.doesNotMatch(rendered, /provider\/no-tools/);
+  assert.doesNotMatch(rendered, /provider\/no-text-input/);
+  assert.doesNotMatch(rendered, /provider\/no-text-output/);
+  assert.equal(calls[0]?.[1], false, "role filtering must see the unfiltered catalogue");
+});
+
+test("slash exact and current main selection reject a found incompatible model before mutation", async () => {
+  const root = await mkdtemp(join(tmpdir(), "orcode-main-reject-"));
+  const incompatible = roleModel({
+    id: "provider/no-tools",
+    supportedParameters: [],
+  });
+  const fixture = roleCommandContext(root, async () => [incompatible]);
+
+  await assert.rejects(
+    handleSlashCommand("/model provider/no-tools", fixture.context),
+    (error: unknown) =>
+      error instanceof Error &&
+      error.name === "ModelCapabilityError" &&
+      /provider\/no-tools/.test(error.message),
+  );
+  assert.equal(fixture.context.config.mainModel, "provider/initial-main");
+  assert.deepEqual(fixture.preferences, []);
+  assert.equal(fixture.sessionSaves.count, 0);
+
+  fixture.context.config.mainModel = "provider/no-tools";
+  await assert.rejects(
+    handleSlashCommand("/model current", fixture.context),
+    (error: unknown) =>
+      error instanceof Error && error.name === "ModelCapabilityError",
+  );
+  assert.equal(fixture.context.config.mainModel, "provider/no-tools");
+  assert.deepEqual(fixture.preferences, []);
+  assert.equal(fixture.sessionSaves.count, 0);
+});
+
+test("slash model catalogue failures keep their original retryable error identity", async () => {
+  const root = await mkdtemp(join(tmpdir(), "orcode-main-network-"));
+  const unavailable = new Error("synthetic catalogue unavailable");
+  const fixture = roleCommandContext(root, async () => {
+    throw unavailable;
+  });
+
+  await assert.rejects(
+    handleSlashCommand("/model provider/complete", fixture.context),
+    (error: unknown) => error === unavailable,
+  );
+  assert.equal(fixture.context.config.mainModel, "provider/initial-main");
+  assert.deepEqual(fixture.preferences, []);
+  assert.equal(fixture.sessionSaves.count, 0);
+});
+
+test("openrouter auto is a catalogue-independent main-only selection", async () => {
+  const root = await mkdtemp(join(tmpdir(), "orcode-main-auto-"));
+  const fixture = roleCommandContext(root, async () => {
+    throw new Error("the auto exception must not query the catalogue");
+  });
+
+  await handleSlashCommand("/model openrouter/auto", fixture.context);
+
+  assert.equal(fixture.context.config.mainModel, "openrouter/auto");
+  assert.deepEqual(fixture.preferences, ["openrouter/auto"]);
+  assert.equal(fixture.sessionSaves.count, 1);
+});
+
+test("slash compressor selection requires text output but no text input or tools", async () => {
+  const root = await mkdtemp(join(tmpdir(), "orcode-compressor-role-"));
+  const imageToText = roleModel({
+    id: "provider/image-to-text",
+    supportedParameters: [],
+    inputModalities: ["image"],
+    outputModalities: ["text"],
+  });
+  const imageOnly = roleModel({
+    id: "provider/image-only",
+    outputModalities: ["image"],
+  });
+  const fixture = roleCommandContext(root, async (search) =>
+    search === imageToText.id ? [imageToText] : [imageOnly],
+  );
+
+  await handleSlashCommand(`/compress model ${imageToText.id}`, fixture.context);
+  assert.equal(fixture.context.config.compressorModel, imageToText.id);
+
+  await assert.rejects(
+    handleSlashCommand(`/compress model ${imageOnly.id}`, fixture.context),
+    (error: unknown) =>
+      error instanceof Error &&
+      error.name === "ModelCapabilityError" &&
+      /provider\/image-only/.test(error.message),
+  );
+  assert.equal(
+    fixture.context.config.compressorModel,
+    imageToText.id,
+    "the rejected value must not replace the last compatible compressor",
+  );
 });

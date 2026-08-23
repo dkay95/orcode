@@ -31,8 +31,13 @@ import {
   handleSlashCommand,
   printBalance,
   promptForValidKey,
-  isTextGenerationModel,
+  compressorModelCandidates,
+  mainModelCandidates,
+  ModelCapabilityError,
+  ModelNotFoundError,
   rankModels,
+  resolveCompressorModelCandidate,
+  resolveMainModelCandidate,
   shouldReplaceCredential,
   validateAndStoreInferenceKey,
   validateAndStoreManagementKey,
@@ -416,6 +421,7 @@ async function main(): Promise<void> {
         "Kein Prompt: --json braucht -p/--prompt oder eine nicht-interaktive stdin.",
       );
     }
+    await ensureRunnableModelConfiguration(openRouter, config);
     // Human-readable, so it goes to stderr — stdout is reserved for the
     // NDJSON event stream in --json mode (see createStderrCommandOutput).
     const effectivePrompt = await applyInterruptedRunNonInteractive(
@@ -430,6 +436,7 @@ async function main(): Promise<void> {
 
   if (options.prompt) {
     await printBalance(startupBalance, out);
+    await ensureRunnableModelConfiguration(openRouter, config);
     const effectivePrompt = await applyInterruptedRunNonInteractive(
       session,
       options,
@@ -526,6 +533,7 @@ async function runPlainLoop(
         }
         continue;
       }
+      await ensureRunnableModelConfiguration(context.openRouter, context.config);
       const effective = pendingSeed ? `${pendingSeed}\n\n${trimmed}` : trimmed;
       pendingSeed = undefined;
       const result = await context.agent.run(effective);
@@ -1321,6 +1329,14 @@ async function runDashboard(
           continue;
         }
 
+        const runnableModels = await ensureRunnableModelConfiguration(
+          context.openRouter,
+          context.config,
+        );
+        if (runnableModels.main) {
+          currentModelInfo = runnableModels.main;
+          modelDetails = summarizeModel(runnableModels.main);
+        }
         if (pendingImages.length) {
           if (!currentModelInfo) {
             const snapshot = await loadModelSnapshot(
@@ -2121,7 +2137,7 @@ async function initializeDashboardKey(
   return promptDashboardInferenceKey(ui, context);
 }
 
-async function pickDashboardModel(
+export async function pickDashboardModel(
   ui: TerminalUi,
   context: RuntimeContext,
 ): Promise<ModelInfo | null> {
@@ -2132,7 +2148,9 @@ async function pickDashboardModel(
   });
   let models: ModelInfo[];
   try {
-    models = await context.openRouter.listModels("", true, controller.signal);
+    models = mainModelCandidates(
+      await context.openRouter.listModels("", false, controller.signal),
+    );
   } finally {
     ui.setCancelHandler();
   }
@@ -2148,7 +2166,7 @@ async function pickDashboardModel(
   return selected;
 }
 
-async function pickDashboardCompressorModel(
+export async function pickDashboardCompressorModel(
   ui: TerminalUi,
   context: RuntimeContext,
 ): Promise<ModelInfo | null> {
@@ -2161,9 +2179,9 @@ async function pickDashboardCompressorModel(
   });
   let models: ModelInfo[];
   try {
-    models = (
-      await context.openRouter.listModels("", false, controller.signal)
-    ).filter(isTextGenerationModel);
+    models = compressorModelCandidates(
+      await context.openRouter.listModels("", false, controller.signal),
+    );
   } finally {
     ui.setCancelHandler();
   }
@@ -2327,23 +2345,63 @@ async function inspectWorkspace(workspace: string): Promise<string> {
   }
 }
 
-async function loadModelSnapshot(
-  openRouter: OpenRouterService,
+export interface ModelSnapshot {
+  model: ModelInfo | null;
+  details: string;
+  status: "available" | "incompatible" | "missing" | "unavailable";
+  error?: unknown;
+}
+
+export async function ensureRunnableModelConfiguration(
+  openRouter: Pick<OpenRouterService, "listModels">,
+  config: Pick<
+    OrcodeConfigWithBudget,
+    "mainModel" | "compressorModel" | "compressionMode"
+  >,
+): Promise<{ main: ModelInfo | null; compressor: ModelInfo | null }> {
+  const main = await resolveMainModelCandidate(openRouter, config.mainModel);
+  const compressor = config.compressionMode === "off"
+    ? null
+    : await resolveCompressorModelCandidate(
+        openRouter,
+        config.compressorModel,
+      );
+  return { main, compressor };
+}
+
+export async function loadModelSnapshot(
+  openRouter: Pick<OpenRouterService, "listModels">,
   modelId: string,
-): Promise<{ model: ModelInfo | null; details: string }> {
+): Promise<ModelSnapshot> {
   try {
-    const models = await openRouter.listModels(modelId, true);
-    const model = models.find((candidate) => candidate.id === modelId);
+    const model = await resolveMainModelCandidate(openRouter, modelId);
     return {
-      model: model ?? null,
+      model,
       details: model
         ? summarizeModel(model)
         : "dynamische OpenRouter-Route",
+      status: "available",
     };
-  } catch {
+  } catch (error) {
+    if (error instanceof ModelCapabilityError) {
+      return {
+        model: null,
+        details: `Aktives Modell ist für die Main-Rolle inkompatibel: ${modelId}`,
+        status: "incompatible",
+      };
+    }
+    if (error instanceof ModelNotFoundError) {
+      return {
+        model: null,
+        details: `Aktives Modell fehlt im OpenRouter-Katalog: ${modelId}`,
+        status: "missing",
+      };
+    }
     return {
       model: null,
       details: "Modellmetadaten momentan nicht verfügbar",
+      status: "unavailable",
+      error,
     };
   }
 }
