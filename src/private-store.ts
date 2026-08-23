@@ -436,7 +436,17 @@ export class PrivateStore {
     if (target === root) {
       throw new Error(`PrivateStore reserviert seine eigene Root-Grenze nicht: ${target}`);
     }
+    const ensuredRoot = this.#root === null
+      ? null
+      : await ensureExclusiveClaimRoot(root, this.adapter);
     const ancestors = await directoryIdentities(root, dirname(target));
+    if (ensuredRoot !== null) {
+      const capturedRoot = ancestors[0];
+      if (!capturedRoot) {
+        throw new Error(`PrivateStore-Claim-Root wurde nicht gebunden: ${root}`);
+      }
+      assertSameIdentity(ensuredRoot, capturedRoot, root);
+    }
     await assertDirectoryIdentities(ancestors);
     try {
       await mkdir(target, { mode: PRIVATE_DIRECTORY_MODE });
@@ -673,6 +683,45 @@ export class PrivateStore {
     }
     await assertDirectoryIdentities(tree);
   }
+}
+
+/**
+ * Establishes the configured boundary required by an exclusive claim. Unlike
+ * the generic exact-store directory helper, this permanent root is never
+ * path-rolled back: a failed protection or identity check leaves the empty
+ * object untouched for fail-closed inspection.
+ */
+async function ensureExclusiveClaimRoot(
+  rootPath: string,
+  adapter: PrivateStoreAdapter,
+): Promise<PathIdentity> {
+  const root = resolve(rootPath);
+  let info;
+  try {
+    info = await lstat(root, { bigint: true });
+  } catch (error) {
+    if (!hasCode(error, "ENOENT")) throw error;
+    try {
+      await mkdir(root, { mode: PRIVATE_DIRECTORY_MODE });
+    } catch (mkdirError) {
+      if (!hasCode(mkdirError, "EEXIST")) throw mkdirError;
+    }
+    info = await lstat(root, { bigint: true });
+  }
+  if (info.isSymbolicLink() || !info.isDirectory()) {
+    throw new Error(`PrivateStore-Claim-Root ist kein echtes Verzeichnis: ${root}`);
+  }
+  const identity = pathIdentity(root, info, "directory");
+  const protectedIdentity = await protectBoundPath(
+    root,
+    "directory",
+    adapter,
+    [],
+    identity,
+  );
+  assertSameIdentity(identity, protectedIdentity, root);
+  await assertPathIdentity(protectedIdentity);
+  return protectedIdentity;
 }
 
 async function ensurePrivateDirectoryTree(

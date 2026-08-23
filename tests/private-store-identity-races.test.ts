@@ -217,6 +217,78 @@ test("PrivateStore claim protection failure never rmdirs a replacement during ro
   assert.equal((await fs.promises.stat(claim)).isDirectory(), true);
 });
 
+test("PrivateStore exclusive root protection detects a replacement without deleting it", async () => {
+  const fixture = await fs.promises.mkdtemp(join(tmpdir(), "orcode-private-root-open-swap-"));
+  const root = join(fixture, "canonical-root");
+  const claim = join(root, "hmac-init.lock");
+  const movedRoot = join(fixture, "created-root-before-swap");
+  const replacement = join(fixture, "foreign-root-replacement");
+  const sentinel = "foreign root sentinel must survive";
+  await fs.promises.mkdir(replacement, { mode: 0o755 });
+  await fs.promises.writeFile(join(replacement, "must-survive.txt"), sentinel);
+  swapAtNextOpen(root, async () => {
+    await fs.promises.rename(root, movedRoot);
+    await fs.promises.rename(replacement, root);
+  });
+  const store = new PrivateStore({
+    adapter: new PosixPrivateStoreAdapter(),
+    root,
+  }) as unknown as {
+    createDirectoryExclusive(path: string): Promise<object | null>;
+  };
+  let failure: unknown;
+  try {
+    await store.createDirectoryExclusive(claim);
+  } catch (error) {
+    failure = error;
+  }
+  const swapTriggered = pendingOpenSwap === null;
+  pendingOpenSwap = null;
+
+  assert.ok(failure instanceof Error);
+  assert.equal(swapTriggered, true, "root must reach bound protection after exclusive creation");
+  assert.equal(
+    await fs.promises.readFile(join(root, "must-survive.txt"), "utf8"),
+    sentinel,
+  );
+  assert.equal((await fs.promises.stat(movedRoot)).isDirectory(), true);
+});
+
+test("PrivateStore exclusive claim rejects a root replaced after root protection", async () => {
+  const fixture = await fs.promises.mkdtemp(join(tmpdir(), "orcode-private-root-post-protect-swap-"));
+  const root = join(fixture, "canonical-root");
+  const claim = join(root, "hmac-init.lock");
+  const movedRoot = join(fixture, "protected-root-before-swap");
+  const replacement = join(fixture, "foreign-root-after-protection");
+  const sentinel = "post-protection replacement must stay exact";
+  await fs.promises.mkdir(root, { mode: 0o700 });
+  await fs.promises.mkdir(replacement, { mode: 0o755 });
+  await fs.promises.writeFile(join(replacement, "must-survive.txt"), sentinel);
+  swapAtNthLstat(root, 6, async () => {
+    await fs.promises.rename(root, movedRoot);
+    await fs.promises.rename(replacement, root);
+  });
+  const store = new PrivateStore({
+    adapter: new PosixPrivateStoreAdapter(),
+    root,
+  }) as unknown as {
+    createDirectoryExclusive(path: string): Promise<object | null>;
+  };
+
+  await assert.rejects(
+    store.createDirectoryExclusive(claim),
+    /ausgetauscht|identity|Identität/i,
+  );
+
+  assert.equal(deferredLstatSwap, null);
+  assert.equal(
+    await fs.promises.readFile(join(root, "must-survive.txt"), "utf8"),
+    sentinel,
+  );
+  assert.deepEqual(await fs.promises.readdir(root), ["must-survive.txt"]);
+  assert.equal((await fs.promises.stat(movedRoot)).isDirectory(), true);
+});
+
 test("PrivateStore protect compares the pre-open snapshot before changing a replacement", async () => {
   const root = await fs.promises.mkdtemp(join(tmpdir(), "orcode-private-preopen-protect-"));
   const tree = join(root, "backup");

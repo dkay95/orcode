@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, readFile, readdir, rename, stat, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, rename, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -442,6 +442,140 @@ test("independent CredentialStore instances serialize HMAC initialization to one
   ]);
   assert.deepEqual(first, second);
   assert.equal(setCalls, 1);
+});
+
+test("an absent canonical HMAC claim root is privately created before the first exact key is persisted", async () => {
+  const fixture = await mkdtemp(join(tmpdir(), "orcode-hmac-absent-root-"));
+  const globalRoot = join(fixture, "canonical-root");
+  const generated = Uint8Array.from({ length: 32 }, (_, index) => index);
+  let stored: string | undefined;
+  let writes = 0;
+  const store = versioned(new CredentialStore(
+    () => ({
+      async getPassword() { return stored; },
+      async setPassword(password: string) { writes += 1; stored = password; },
+      async deleteCredential() { stored = undefined; return true; },
+    }),
+    undefined,
+    () => generated,
+    globalRoot,
+  ));
+
+  const actual = await store.getOrCreateAccountHmacKey();
+
+  assert.deepEqual(actual, generated);
+  assert.equal(actual.byteLength, 32);
+  assert.deepEqual(Buffer.from(stored ?? "", "base64"), Buffer.from(generated));
+  assert.equal(writes, 1);
+  assert.equal((await stat(globalRoot)).isDirectory(), true);
+  if (process.platform !== "win32") {
+    assert.equal((await stat(globalRoot)).mode & 0o777, 0o700);
+  }
+});
+
+test("a second independent store reads the same key after canonical HMAC root creation", async () => {
+  const fixture = await mkdtemp(join(tmpdir(), "orcode-hmac-absent-root-reader-"));
+  const globalRoot = join(fixture, "canonical-root");
+  let stored: string | undefined;
+  let writes = 0;
+  let generations = 0;
+  const createEntry = () => ({
+    async getPassword() { return stored; },
+    async setPassword(password: string) { writes += 1; stored = password; },
+    async deleteCredential() { stored = undefined; return true; },
+  });
+  const firstStore = versioned(new CredentialStore(
+    createEntry,
+    undefined,
+    () => new Uint8Array(32).fill(++generations),
+    globalRoot,
+  ));
+  const secondStore = versioned(new CredentialStore(
+    createEntry,
+    undefined,
+    () => new Uint8Array(32).fill(++generations),
+    globalRoot,
+  ));
+
+  const first = await firstStore.getOrCreateAccountHmacKey();
+  const second = await secondStore.getOrCreateAccountHmacKey();
+
+  assert.deepEqual(second, first);
+  assert.equal(writes, 1);
+  assert.equal(generations, 1);
+});
+
+test("symlinked and file canonical HMAC roots fail closed before any keychain write", async (t) => {
+  for (const kind of ["symlink", "file"] as const) {
+    await t.test(kind, async () => {
+      const fixture = await mkdtemp(join(tmpdir(), `orcode-hmac-invalid-root-${kind}-`));
+      const globalRoot = join(fixture, "canonical-root");
+      const outside = join(fixture, "outside");
+      const sentinel = `outside-${kind}-must-stay-exact`;
+      await mkdir(outside);
+      await writeFile(join(outside, "sentinel.txt"), sentinel);
+      if (kind === "symlink") {
+        await symlink(outside, globalRoot, "dir");
+      } else {
+        await writeFile(globalRoot, sentinel);
+      }
+      let writes = 0;
+      let generations = 0;
+      const store = versioned(new CredentialStore(
+        () => ({
+          async getPassword() { return undefined; },
+          async setPassword() { writes += 1; },
+          async deleteCredential() { return false; },
+        }),
+        undefined,
+        () => { generations += 1; return new Uint8Array(32).fill(3); },
+        globalRoot,
+      ));
+
+      await assert.rejects(store.getOrCreateAccountHmacKey(), (error: unknown) => {
+        const serialized = serializedError(error);
+        assert.match(serialized, /CredentialStoreError|Schlüsselbund/);
+        assert.doesNotMatch(serialized, new RegExp(globalRoot.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+        assert.doesNotMatch(serialized, new RegExp(sentinel));
+        return true;
+      });
+      assert.equal(writes, 0);
+      assert.equal(generations, 0);
+      assert.equal(await readFile(join(outside, "sentinel.txt"), "utf8"), sentinel);
+      if (kind === "file") assert.equal(await readFile(globalRoot, "utf8"), sentinel);
+    });
+  }
+});
+
+test("canonical HMAC root creation failure exposes a fixed error and persists no secret", async () => {
+  const fixture = await mkdtemp(join(tmpdir(), "orcode-hmac-root-create-failure-"));
+  const blocker = join(fixture, "not-a-directory");
+  const sentinel = "root-create-failure-private-sentinel";
+  await writeFile(blocker, sentinel);
+  const globalRoot = join(blocker, "canonical-root");
+  let writes = 0;
+  let generations = 0;
+  const store = versioned(new CredentialStore(
+    () => ({
+      async getPassword() { return undefined; },
+      async setPassword() { writes += 1; },
+      async deleteCredential() { return false; },
+    }),
+    undefined,
+    () => { generations += 1; return new Uint8Array(32).fill(5); },
+    globalRoot,
+  ));
+
+  await assert.rejects(store.getOrCreateAccountHmacKey(), (error: unknown) => {
+    const serialized = serializedError(error);
+    assert.match(serialized, /CredentialStoreError|Schlüsselbund/);
+    assert.doesNotMatch(serialized, new RegExp(sentinel));
+    assert.doesNotMatch(serialized, new RegExp(globalRoot.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+    return true;
+  });
+  assert.equal(writes, 0);
+  assert.equal(generations, 0);
+  assert.equal(await readFile(blocker, "utf8"), sentinel);
 });
 
 test("a successful HMAC initialization leaves its permanent claim while future readers use the persisted key", async () => {

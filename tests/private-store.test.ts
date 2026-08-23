@@ -87,6 +87,31 @@ test("PrivateStore leaves an empty exclusive claim on protection failure instead
   assert.deepEqual(await readdir(claimPath), []);
 });
 
+test("PrivateStore exclusive root protection failure leaves the empty created root without rollback", async () => {
+  const { PrivateStore } = await import("../src/private-store.js");
+  const fixture = await mkdtemp(join(tmpdir(), "orcode-private-exclusive-root-protect-"));
+  const root = join(fixture, "canonical-root");
+  const claimPath = join(root, "hmac-init.lock");
+  const store = new PrivateStore({
+    root,
+    adapter: {
+      name: "root-protection-failure",
+      available: async () => true,
+      protectDirectory: async (path) => {
+        if (path === root) throw new Error("synthetic root protection failure");
+      },
+      protectFile: async () => undefined,
+    },
+  }) as unknown as ExclusiveDirectoryStore;
+
+  await assert.rejects(
+    store.createDirectoryExclusive(claimPath),
+    /root protection failure/,
+  );
+  assert.equal((await stat(root)).isDirectory(), true);
+  assert.deepEqual(await readdir(root), []);
+});
+
 test("PrivateStore enforces 0700 directories and 0600 atomic files on POSIX", async () => {
   const { PosixPrivateStoreAdapter, PrivateStore } = await import("../src/private-store.js");
   const root = await mkdtemp(join(tmpdir(), "orcode-private-posix-"));
