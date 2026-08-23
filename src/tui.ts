@@ -1142,7 +1142,9 @@ export class TerminalUi {
   };
 
   #onKeypress = (character: string, key: Key): void => {
-    if (this.#consumeMouseKeypress(character, key)) return;
+    const filteredKeypress = this.#filterMouseKeypress(character, key);
+    if (!filteredKeypress) return;
+    ({ character, key } = filteredKeypress);
     // Ctrl+C is evaluated before everything else, especially before the paste
     // buffer: a paste without an end marker must never freeze the exit (B12).
     if (key.ctrl && key.name === "c") {
@@ -1315,7 +1317,13 @@ export class TerminalUi {
     if (!this.#active) return;
     const text = typeof chunk === "string" ? chunk : chunk.toString("utf8");
     const sequence = `${this.#mouseProtocolBuffer}${text}`;
-    if (!"\u001b[<".startsWith(sequence) && !sequence.startsWith("\u001b[<")) return;
+    if (!"\u001b[<".startsWith(sequence) && !sequence.startsWith("\u001b[<")) {
+      if (this.#mouseProtocolBuffer) {
+        this.#rememberMouseKeypresses(text);
+        this.#mouseProtocolBuffer = "";
+      }
+      return;
+    }
 
     this.#rememberMouseKeypresses(text);
     if ("\u001b[<".startsWith(sequence)) {
@@ -1356,28 +1364,41 @@ export class TerminalUi {
     this.#ignoredMouseKeypresses.push(...Array.from(text));
   }
 
-  #consumeMouseKeypress(character: string, key: Key): boolean {
+  #filterMouseKeypress(character: string, key: Key): { character: string; key: Key } | null {
     const expected = this.#ignoredMouseKeypresses.join("");
-    if (!expected) return false;
+    if (!expected) return { character, key };
     const actual = key.sequence || character || "";
     if (!actual) {
       this.#ignoredMouseKeypresses = [];
-      return false;
+      return { character, key };
+    }
+    if (
+      key.name === "escape"
+      && actual === "\u001b"
+      && this.#mouseProtocolBuffer === "\u001b"
+      && expected === "\u001b"
+    ) {
+      this.#clearMouseProtocol();
+      return { character, key };
     }
     if (expected.startsWith(actual)) {
       this.#ignoredMouseKeypresses.splice(0, Array.from(actual).length);
-      return true;
+      return null;
     }
     if (actual.startsWith(expected)) {
       this.#ignoredMouseKeypresses = [];
-      return true;
-    }
-    if (expected.includes(actual)) {
-      this.#ignoredMouseKeypresses = [];
-      return true;
+      const remainder = actual.slice(expected.length);
+      const remainderChars = Array.from(remainder);
+      if (key.meta && !key.ctrl && remainderChars.length === 1 && remainderChars[0]! >= " ") {
+        return {
+          character: remainderChars[0]!,
+          key: { ...key, sequence: remainder, ctrl: false, meta: false },
+        };
+      }
+      return null;
     }
     this.#ignoredMouseKeypresses = [];
-    return false;
+    return { character, key };
   }
 
   #enableMouseReporting(): void {

@@ -148,6 +148,17 @@ function press(stdin: FakeInput, name: string, character = "", extra: Record<str
   stdin.emit("keypress", character, { name, ctrl: false, meta: false, ...extra });
 }
 
+function emitTerminalData(stdin: FakeInput, value: string): void {
+  const listener = stdin.listeners("data")[0];
+  assert.ok(listener, "TerminalUi raw-data listener must be installed first");
+  listener(Buffer.from(value));
+}
+
+function pressReadlineEscape(stdin: FakeInput): void {
+  emitTerminalData(stdin, "\u001b");
+  press(stdin, "escape", "", { sequence: "\u001b" });
+}
+
 function type(stdin: FakeInput, value: string): void {
   for (const character of value) {
     press(stdin, character.toLowerCase(), character);
@@ -209,6 +220,105 @@ test("choice picker parses real SGR mouse bytes into the same Anthropic selectio
   assert.equal(await select("mouse"), "anthropic");
 });
 
+test("Readline standalone Escape cancels a choice picker and disables mouse reporting", async () => {
+  const enable = "\u001b[?1000h\u001b[?1006h";
+  const disable = "\u001b[?1000l\u001b[?1006l";
+  const stdin = new FakeInput();
+  const stdout = new FakeOutput();
+  const terminal = ui(stdin, stdout);
+  terminal.start();
+  let settled = false;
+  let picker: Promise<{ value: string } | null> | null = null;
+  try {
+    picker = terminal.pickChoice("Provider", [
+      { value: "openrouter", label: "OpenRouter", description: "Ready" },
+    ], "openrouter");
+    void picker.then(() => {
+      settled = true;
+    });
+
+    pressReadlineEscape(stdin);
+    await Promise.resolve();
+
+    assert.equal(settled, true, "completed Escape keypress must settle the picker");
+    assert.equal(await picker, null);
+    assert.equal(stdout.output.split(enable).length - 1, 1, stdout.output);
+    assert.equal(stdout.output.split(disable).length - 1, 1, stdout.output);
+    assert.match(text(terminal.frame().lines), /Auswahl abgebrochen/);
+  } finally {
+    if (!settled) {
+      press(stdin, "c", "\u0003", { ctrl: true });
+      await picker;
+    }
+    terminal.stop();
+  }
+});
+
+test("Readline standalone Escape cancels a model picker and disables mouse reporting", async () => {
+  const enable = "\u001b[?1000h\u001b[?1006h";
+  const disable = "\u001b[?1000l\u001b[?1006l";
+  const stdin = new FakeInput();
+  const stdout = new FakeOutput();
+  const terminal = ui(stdin, stdout);
+  terminal.start();
+  let settled = false;
+  let picker: Promise<ModelInfo | null> | null = null;
+  try {
+    picker = terminal.pickModel(() => [modelInfo("vendor/a")], "vendor/a");
+    void picker.then(() => {
+      settled = true;
+    });
+
+    pressReadlineEscape(stdin);
+    await Promise.resolve();
+
+    assert.equal(settled, true, "completed Escape keypress must settle the picker");
+    assert.equal(await picker, null);
+    assert.equal(stdout.output.split(enable).length - 1, 1, stdout.output);
+    assert.equal(stdout.output.split(disable).length - 1, 1, stdout.output);
+    assert.match(text(terminal.frame().lines), /Auswahl abgebrochen/);
+  } finally {
+    if (!settled) {
+      press(stdin, "c", "\u0003", { ctrl: true });
+      await picker;
+    }
+    terminal.stop();
+  }
+});
+
+test("Readline standalone Escape cancels secret entry and clears its input", async () => {
+  const stdin = new FakeInput();
+  const stdout = new FakeOutput();
+  const terminal = ui(stdin, stdout);
+  terminal.start();
+  let settled = false;
+  let secret: Promise<string | null> | null = null;
+  try {
+    secret = terminal.readSecret("OpenRouter API-Key");
+    void secret.then(() => {
+      settled = true;
+    });
+    type(stdin, "stale-secret");
+
+    pressReadlineEscape(stdin);
+    await Promise.resolve();
+
+    assert.equal(settled, true, "completed Escape keypress must settle secret entry");
+    assert.equal(await secret, null);
+    assert.match(text(terminal.frame().lines), /Eingabe abgebrochen/);
+    const next = terminal.readInput();
+    type(stdin, "clean");
+    press(stdin, "return");
+    assert.equal(await next, "clean");
+  } finally {
+    if (!settled) {
+      press(stdin, "c", "\u0003", { ctrl: true });
+      await secret;
+    }
+    terminal.stop();
+  }
+});
+
 test("SGR mouse parsing accepts every split escape prefix without leaking into the picker", async () => {
   for (const prefixLength of [1, 2, 3]) {
     const stdin = new FakeInput();
@@ -236,6 +346,43 @@ test("SGR mouse parsing accepts every split escape prefix without leaking into t
       await picked;
       terminal.stop();
     }
+  }
+});
+
+test("ESC [ followed by a divergent non-mouse escape resets before the next chat key", async () => {
+  const stdin = new FakeInput();
+  const stdout = new FakeOutput();
+  const terminal = ui(stdin, stdout);
+  terminal.start();
+  try {
+    const input = terminal.readInput();
+    stdin.emit("data", Buffer.from("\u001b["));
+    stdin.emit("data", Buffer.from("\u001b"));
+    stdin.emit("data", Buffer.from("a"));
+    stdin.emit("data", Buffer.from("\u001b[<0;1;1M"));
+    press(stdin, "return");
+
+    assert.equal(await input, "a");
+  } finally {
+    terminal.stop();
+  }
+});
+
+test("ESC [ < followed by a divergent non-mouse escape resets before the next secret key", async () => {
+  const stdin = new FakeInput();
+  const stdout = new FakeOutput();
+  const terminal = ui(stdin, stdout);
+  terminal.start();
+  try {
+    const secret = terminal.readSecret("OpenRouter API-Key");
+    stdin.emit("data", Buffer.from("\u001b[<"));
+    stdin.emit("data", Buffer.from("\u001b"));
+    stdin.emit("data", Buffer.from("a"));
+    press(stdin, "return");
+
+    assert.equal(await secret, "a");
+  } finally {
+    terminal.stop();
   }
 });
 
