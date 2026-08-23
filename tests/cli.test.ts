@@ -26,7 +26,8 @@ import { COMMAND_CATALOG } from "../src/command-catalog.js";
 import { DEFAULT_CONFIG } from "../src/config.js";
 import { OpenRouterService } from "../src/openrouter.js";
 import { CredentialStore } from "../src/credentials.js";
-import type { CredentialStoreLike } from "../src/credentials.js";
+import type { CredentialSlotRef, CredentialStoreLike } from "../src/credentials.js";
+import { ProviderStateStore, type ProviderSetupStateV1 } from "../src/provider-state.js";
 import type { ModelInfo } from "../src/types.js";
 
 type BootstrapRuntimeDouble = {
@@ -226,6 +227,91 @@ test("runCli opens route choice for a healthy secondary and never silently repla
   assert.deepEqual(calls, ["provider:inspect", "provider:setup:plain", "plain"]);
 });
 
+test("a healthy saved route cannot dispatch a different --model without an explicit route transition", async () => {
+  const calls: string[] = [];
+  const runtime = bootstrapRuntime({ route: bootstrapRoute("vendor/a"), events: calls });
+  runtime.openRouter.listModels = async () => [roleModelForCli({ id: "vendor/b" })];
+  runtime.runSetup = async (transport) => {
+    calls.push(`provider:setup:${transport}`);
+    return { kind: "cancelled", mode: "setup-required" };
+  };
+  let plainAgent: unknown = undefined;
+
+  const exitCode = await invokeRunCli(["--plain", "--model", "vendor/b"], {
+    initializeStorage: async () => {
+      const storage = bootstrapStorage();
+      storage.config.mainModel = "vendor/a";
+      return storage;
+    },
+    createProviderRuntime: async () => runtime,
+    createAgent: async () => {
+      calls.push("agent:create");
+      return {} as never;
+    },
+    runPlain: async (input: { agent: unknown }) => {
+      plainAgent = input.agent;
+      calls.push("plain");
+    },
+    runDashboard: async () => undefined,
+    stdout: { write: () => true },
+    stderr: { write: () => true },
+  });
+
+  assert.equal(exitCode, 0);
+  assert.equal(plainAgent, null);
+  assert.deepEqual(calls, [
+    "provider:inspect",
+    "provider:ensure",
+    "provider:setup:plain",
+    "plain",
+  ]);
+});
+
+test("a setup-selected route becomes the authoritative main model before agent creation", async () => {
+  const calls: string[] = [];
+  let currentRoute: Record<string, unknown> | null = null;
+  const selectedRoute = bootstrapRoute("vendor/b");
+  const runtime = bootstrapRuntime({ mode: "setup-required", route: null, events: calls });
+  runtime.runSetup = async (transport) => {
+    calls.push(`provider:setup:${transport}`);
+    currentRoute = selectedRoute;
+    return { kind: "ready" };
+  };
+  runtime.ensureRunnableRoute = () => {
+    calls.push("provider:ensure");
+    if (!currentRoute) throw Object.assign(new Error("setup"), { code: "provider-setup-required" });
+    return currentRoute;
+  };
+  let createdModel: string | null = null;
+
+  await invokeRunCli(["--plain"], {
+    initializeStorage: async () => {
+      const storage = bootstrapStorage();
+      storage.config.mainModel = "vendor/a";
+      return storage;
+    },
+    createProviderRuntime: async () => runtime,
+    createAgent: async (input: { config: { mainModel: string } }) => {
+      createdModel = input.config.mainModel;
+      calls.push("agent:create");
+      return {} as never;
+    },
+    runPlain: async () => calls.push("plain"),
+    runDashboard: async () => undefined,
+    stdout: { write: () => true },
+    stderr: { write: () => true },
+  });
+
+  assert.equal(createdModel, "vendor/b");
+  assert.deepEqual(calls, [
+    "provider:inspect",
+    "provider:setup:plain",
+    "provider:ensure",
+    "agent:create",
+    "plain",
+  ]);
+});
+
 test("plain setup cancellation keeps commands alive and the next model input reopens setup before agent creation", async () => {
   const calls: string[] = [];
   let setupCalls = 0;
@@ -291,6 +377,116 @@ test("model-dependent slash commands recheck the route while local command varia
   assert.equal(commandRequiresRunnableRoute("panel", ["show", "1"]), false);
   assert.equal(commandRequiresRunnableRoute("panel", ["judge", "off"]), false);
   assert.equal(commandRequiresRunnableRoute("whisper", [], "plain"), false);
+});
+
+test("fullscreen model authentication failure invalidates proof and opens shared setup before later model work", async () => {
+  const execute = (cliModule as typeof cliModule & {
+    executeProviderModelAction?: <T>(input: {
+      ensureRunnableRoute(): Record<string, unknown>;
+      beginRun(): () => void;
+      run(route: Record<string, unknown>): Promise<T>;
+      isAuthenticationFailure(error: unknown): boolean;
+      invalidateAndInspect(): Promise<void>;
+      runSetup(surface: "fullscreen"): Promise<Record<string, unknown>>;
+      surface: "fullscreen";
+    }) => Promise<T>;
+  }).executeProviderModelAction;
+  assert.equal(typeof execute, "function");
+
+  const calls: string[] = [];
+  const rejected = Object.assign(new Error("synthetic secret provider body"), { status: 401 });
+  await assert.rejects(
+    execute!({
+      ensureRunnableRoute() {
+        calls.push("route:ensure");
+        return bootstrapRoute("vendor/a");
+      },
+      beginRun() {
+        calls.push("run:begin");
+        return () => calls.push("run:release");
+      },
+      async run() {
+        calls.push("model:first-byte-attempt");
+        throw rejected;
+      },
+      isAuthenticationFailure: (error) => error === rejected,
+      async invalidateAndInspect() {
+        calls.push("route:invalidate+inspect");
+      },
+      async runSetup(surface) {
+        calls.push(`setup:${surface}`);
+        return { kind: "cancelled", mode: "setup-required" };
+      },
+      surface: "fullscreen",
+    }),
+    (error: unknown) => error === rejected,
+  );
+
+  assert.deepEqual(calls, [
+    "route:ensure",
+    "run:begin",
+    "model:first-byte-attempt",
+    "run:release",
+    "route:invalidate+inspect",
+    "setup:fullscreen",
+  ]);
+});
+
+test("voice transcription executes inside the shared provider action and lets 401 recovery finish first", async () => {
+  const transcribeAndInsert = (cliModule as typeof cliModule & {
+    transcribeAndInsert?: (
+      ui: {
+        setStatus(value: string): void;
+        addMessage(level: string, text: string, label?: string): void;
+        insertInputText(text: string): void;
+      },
+      context: Record<string, unknown>,
+      audio: { path: string; format: "wav"; sizeBytes: number; durationMs: number; quiet: boolean },
+      dependencies: { transcribe(): Promise<{ text: string; costUsd: number; model: string }> },
+    ) => Promise<void>;
+  }).transcribeAndInsert;
+  assert.equal(typeof transcribeAndInsert, "function");
+
+  const directory = await mkdtemp(join(tmpdir(), "orcode-voice-provider-gate-"));
+  const audioPath = join(directory, "voice.wav");
+  await writeFile(audioPath, "synthetic audio");
+  const calls: string[] = [];
+  const rejected = Object.assign(new Error("synthetic provider body"), { status: 401 });
+  const providerRuntime = {
+    async runWithReadyRoute<T>(run: () => Promise<T>) {
+      calls.push("runtime:enter");
+      try {
+        return await run();
+      } catch (error) {
+        calls.push("runtime:recover-auth");
+        throw error;
+      }
+    },
+  };
+
+  await transcribeAndInsert!(
+    {
+      setStatus: () => calls.push("voice:status"),
+      addMessage: (_level, text) => calls.push(`voice:message:${text.includes("Transkription fehlgeschlagen")}`),
+      insertInputText: () => calls.push("voice:insert"),
+    },
+    {
+      providerRuntime,
+      openRouter: { safeMessage: () => "fixed-safe-auth-error" },
+      config: { transcriptionModel: "vendor/audio" },
+      session: { addCost: () => undefined, save: async () => undefined },
+    },
+    { path: audioPath, format: "wav", sizeBytes: 15, durationMs: 100, quiet: false },
+    { transcribe: async () => { calls.push("voice:model-call"); throw rejected; } },
+  );
+
+  assert.deepEqual(calls, [
+    "voice:status",
+    "runtime:enter",
+    "voice:model-call",
+    "runtime:recover-auth",
+    "voice:message:true",
+  ]);
 });
 
 test("fullscreen Escape from setup enters the dashboard in setup-required without agent or run artifacts", async () => {
@@ -708,6 +904,74 @@ test("provider runtime keeps an unreadable saved credential authoritative withou
   });
 });
 
+test("restart recovery derives inspection credentials only from the recovered versioned pointer", async () => {
+  const recoverBinding = (cliModule as typeof cliModule & {
+    recoverProviderCredentialBinding?: (input: {
+      stateStore: ProviderStateStore;
+      recover(): Promise<void>;
+      readCredential(reference: "legacy:inference" | CredentialSlotRef): Promise<
+        { kind: "absent" } | { kind: "present"; value: string } | { kind: "invalid" }
+      >;
+      environmentCredential: string | null;
+    }) => Promise<{
+      reference: "legacy:inference" | CredentialSlotRef;
+      stored: { kind: "absent" } | { kind: "present"; value: string };
+      environment: string | null;
+    }>;
+  }).recoverProviderCredentialBinding;
+  assert.equal(typeof recoverBinding, "function");
+
+  const oldSlot = "v1:inference:00000000-0000-4000-8000-000000000011";
+  const newSlot = "v1:inference:00000000-0000-4000-8000-000000000022";
+  const state = (revision: number, slot: string, account: string): ProviderSetupStateV1 => ({
+    schemaVersion: 1,
+    revision,
+    lifecycle: "configured",
+    connections: [{
+      id: "00000000-0000-4000-8000-000000000099",
+      backendId: "openrouter",
+      enabled: true,
+      maturity: "stable",
+      credentialSlot: slot,
+      accountFingerprint: account,
+      accountFingerprintState: "verified",
+      billingRealm: "openrouter-payg",
+      lastHealth: null,
+    }],
+    defaultRoute: {
+      version: 1,
+      backendId: "openrouter",
+      accountFingerprint: account,
+      billingRealm: "openrouter-payg",
+      requestedModelId: "vendor/main",
+      canonicalModelId: "vendor/main",
+      resolutionState: "resolved",
+    },
+    cross: { enabled: false, preferredLead: null, preferredChallenger: null },
+  });
+  const store = new ProviderStateStore(state(0, oldSlot, "acct_old"));
+  const reads: string[] = [];
+  const environment = `${STARTUP_KEY_PREFIX}${"e".repeat(48)}`;
+  const recovered = await recoverBinding!({
+    stateStore: store,
+    async recover() {
+      store.replace(state(1, newSlot, "acct_new"), 0);
+    },
+    async readCredential(reference) {
+      reads.push(typeof reference === "string" ? reference : reference.id);
+      return reference !== "legacy:inference" && reference.id === newSlot
+        ? { kind: "present", value: `${STARTUP_KEY_PREFIX}${"n".repeat(48)}` }
+        : { kind: "present", value: `${STARTUP_KEY_PREFIX}${"o".repeat(48)}` };
+    },
+    environmentCredential: environment,
+  });
+
+  assert.deepEqual(reads, [newSlot]);
+  assert.equal(recovered.reference === "legacy:inference" ? recovered.reference : recovered.reference.id, newSlot);
+  assert.equal(recovered.stored.kind, "present");
+  assert.equal(recovered.environment, null);
+});
+
 test("startup durable provider commits preserve every unrelated config byte under exact revision CAS", async () => {
   const persist = (cliModule as typeof cliModule & {
     persistProviderSetupState?: (
@@ -747,6 +1011,112 @@ test("startup durable provider commits preserve every unrelated config byte unde
   assert.equal(await readFile(path, "utf8"), expectedRaw);
   assert.deepEqual(committed, after);
   assert.deepEqual(adopted, after);
+});
+
+test("versioned inference replace and forget leave one restart-atomic provider tuple", async () => {
+  const createController = (cliModule as typeof cliModule & {
+    createProviderCredentialController?: (input: Record<string, unknown>) => {
+      apply(intent: Record<string, unknown>): Promise<Record<string, unknown>>;
+    };
+  }).createProviderCredentialController;
+  assert.equal(typeof createController, "function");
+
+  const oldKey = `${STARTUP_KEY_PREFIX}${"o".repeat(48)}`;
+  const newKey = `${STARTUP_KEY_PREFIX}${"n".repeat(48)}`;
+  const oldSlot = "v1:inference:00000000-0000-4000-8000-000000000031";
+  const newSlot = "v1:inference:00000000-0000-4000-8000-000000000032";
+  const connectionId = "00000000-0000-4000-8000-000000000039";
+  const route = bootstrapRoute("vendor/main") as unknown as ProviderSetupStateV1["defaultRoute"];
+  const initial: ProviderSetupStateV1 = {
+    schemaVersion: 1,
+    revision: 0,
+    lifecycle: "configured",
+    connections: [{
+      id: connectionId,
+      backendId: "openrouter",
+      enabled: true,
+      maturity: "stable",
+      credentialSlot: oldSlot,
+      accountFingerprint: route!.accountFingerprint,
+      accountFingerprintState: "verified",
+      billingRealm: "openrouter-payg",
+      lastHealth: null,
+    }],
+    defaultRoute: route,
+    cross: { enabled: false, preferredLead: null, preferredChallenger: null },
+  };
+  let durable = structuredClone(initial);
+  const stateStore = new ProviderStateStore(initial, {
+    persist: async (request) => {
+      request.assertCurrent();
+      const next = request.build(durable);
+      durable = structuredClone(next);
+      request.adopt(next);
+      return structuredClone(next);
+    },
+  });
+  const slots = new Map([[oldSlot, oldKey]]);
+  const openRouter = new OpenRouterService(oldKey, undefined, { inference: "keychain" });
+  const runtimeEvents: string[] = [];
+  const controller = createController!({
+    stateStore,
+    openRouter,
+    credentials: {
+      location: "test-keychain",
+      async deleteSlot(slot: CredentialSlotRef) {
+        runtimeEvents.push(`delete:${slot.id}`);
+        return slots.delete(slot.id);
+      },
+    },
+    runtimeGuard: {
+      async acquire() {
+        runtimeEvents.push("guard:acquire");
+        return {
+          assertHeld() { runtimeEvents.push("guard:assert"); },
+          release() { runtimeEvents.push("guard:release"); },
+        };
+      },
+    },
+    activationCoordinator: {
+      async activate(request: { expectedRevision: number; candidate: string }) {
+        assert.equal(request.expectedRevision, 0);
+        assert.equal(request.candidate, newKey);
+        const next: ProviderSetupStateV1 = {
+          ...structuredClone(initial),
+          revision: 1,
+          connections: [{ ...initial.connections[0]!, credentialSlot: newSlot }],
+        };
+        durable = structuredClone(next);
+        stateStore.replace(next, 0);
+        slots.set(newSlot, newKey);
+        openRouter.setKey(newKey, "keychain");
+        return { persisted: true, route, state: next, warnings: [] };
+      },
+    },
+  });
+
+  await controller.apply({
+    kind: "replace",
+    credentialKind: "inference",
+    candidate: newKey,
+    persistence: "persisted",
+  });
+  assert.equal(durable.connections[0]?.credentialSlot, newSlot);
+  assert.equal(openRouter.requireKey(), newKey);
+
+  await controller.apply({ kind: "forget", credentialKind: "inference" });
+  const restarted = new ProviderStateStore(durable).read();
+  assert.equal(restarted.defaultRoute, null);
+  assert.deepEqual(restarted.connections, []);
+  assert.equal(slots.has(newSlot), false);
+  assert.equal(openRouter.hasKey, false);
+  assert.deepEqual(runtimeEvents, [
+    "guard:acquire",
+    "guard:assert",
+    "delete:v1:inference:00000000-0000-4000-8000-000000000032",
+    "guard:assert",
+    "guard:release",
+  ]);
 });
 
 test("startup accepts outer Unicode whitespace for all saved and environment credentials", () => {

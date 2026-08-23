@@ -86,7 +86,13 @@ import {
   undoInterruptedRun,
 } from "./resume.js";
 import { rankChatMatches, SessionStore, workspaceSpend } from "./session.js";
-import { getGitDiff, runProcess, writeApprovalRequest } from "./workspace.js";
+import {
+  getGitDiff,
+  runProcess,
+  writeApprovalRequest,
+  type ChangeJournal,
+  type WorkspaceGuard,
+} from "./workspace.js";
 import {
   getReasoningSetting,
   reasoningLabel,
@@ -103,12 +109,42 @@ export interface CommandOutput {
   error(value: string, hint?: string): void;
 }
 
-export interface CommandContext {
+export type ProviderCredentialIntent =
+  | {
+      kind: "replace";
+      credentialKind: "inference" | "management";
+      candidate: string;
+      allowProcessOnly?: (kind: "inference" | "management", reason: string) => Promise<boolean>;
+    }
+  | { kind: "save"; credentialKind: "inference" | "management" }
+  | { kind: "forget"; credentialKind: "inference" | "management" };
+
+export interface ProviderCredentialIntentPort {
+  apply(intent: ProviderCredentialIntent): Promise<{
+    kind: "ready" | "forgotten" | "unchanged";
+    credentialKind: "inference" | "management";
+    persisted?: boolean;
+    removed?: boolean;
+    balance?: BalanceReport;
+    credits?: CreditInfo;
+  }>;
+}
+
+export interface CommandLocalRuntime {
+  guard: WorkspaceGuard;
+  journal: ChangeJournal;
+  setSession(session: SessionStore): void;
+  resetConversationMemory(): void;
+}
+
+export interface CommandContext<Agent extends OrcodeAgent | null = OrcodeAgent> {
   config: OrcodeConfigWithBudget;
   approvals: ApprovalManager;
   openRouter: OpenRouterService;
   session: SessionStore;
-  agent: OrcodeAgent;
+  agent: Agent;
+  localRuntime?: CommandLocalRuntime;
+  providerCredentials?: ProviderCredentialIntentPort;
   workspace: string;
   credentials: CredentialStoreLike;
   out: CommandOutput;
@@ -185,6 +221,7 @@ export interface CommandContext {
   ) => void;
   /** One destructive chat-deletion confirmation. Fullscreen UI injects its modal; plain mode uses Inquirer. */
   confirmChatDeletion?: (title: string, details: string) => Promise<boolean>;
+  confirmClearSession?: () => Promise<boolean>;
   /** One confirmation per explicit credential-forget attempt. */
   confirmCredentialForget?: (
     kind: "inference" | "management",
@@ -201,6 +238,26 @@ export interface CommandContext {
   ) => Promise<string | null>;
   /** Active surface event sink; the dashboard uses it for direct `/diff` live output. */
   onRunEvent?: (event: AgentRunEvent) => void;
+}
+
+export type NullableCommandContext = CommandContext<OrcodeAgent | null>;
+
+function commandLocalRuntime(
+  context: NullableCommandContext,
+): Pick<CommandLocalRuntime, "guard" | "journal"> {
+  if (context.agent) return context.agent;
+  if (context.localRuntime) return context.localRuntime;
+  throw new Error("Lokale Sitzungsfunktionen sind nicht verfügbar.");
+}
+
+function updateCommandSession(context: NullableCommandContext, next: SessionStore): void {
+  context.agent?.setSession(next);
+  context.localRuntime?.setSession(next);
+}
+
+function resetCommandConversation(context: NullableCommandContext): void {
+  context.agent?.resetConversationMemory();
+  context.localRuntime?.resetConversationMemory();
 }
 
 /** Every command that persists `context.config` goes through this, never a bare `saveConfig(context.config)` — see `CommandContext.configPath`. */
@@ -255,7 +312,7 @@ function processCallbacksForEvents(onEvent: (event: AgentRunEvent) => void): Pro
 
 export async function handleSlashCommand(
   raw: string,
-  context: CommandContext,
+  context: NullableCommandContext,
 ): Promise<"continue" | "exit"> {
   const [commandToken = "", ...args] = tokenize(raw.slice(1));
   const resolution = resolveSlashCommand(commandToken || "help");
@@ -267,6 +324,9 @@ export async function handleSlashCommand(
     return "continue";
   }
   const command = resolution.handlerId;
+  // Model-dependent handlers are dispatched only after the CLI route gate;
+  // local handlers below use nullable-aware helpers when no agent exists.
+  const dispatchContext = context as CommandContext;
 
   switch (command) {
     case "help":
@@ -275,10 +335,10 @@ export async function handleSlashCommand(
     case "quit":
       return "exit";
     case "status":
-      printStatus(context);
+      printStatus(dispatchContext);
       return "continue";
     case "key":
-      await keyCommand(args, context);
+      await keyCommand(args, dispatchContext);
       return "continue";
     case "balance":
       await printBalance(await context.openRouter.checkBalance(), context.out);
@@ -293,28 +353,28 @@ export async function handleSlashCommand(
       return "continue";
     }
     case "model":
-      await modelCommand(args, context);
+      await modelCommand(args, dispatchContext);
       return "continue";
     case "models":
-      await modelsCommand(args, context);
+      await modelsCommand(args, dispatchContext);
       return "continue";
     case "think":
-      await reasoningCommand(args, context);
+      await reasoningCommand(args, dispatchContext);
       return "continue";
     case "allow":
-      await approvalCommand(args, context);
+      await approvalCommand(args, dispatchContext);
       return "continue";
     case "chat":
-      await chatCommand(args, context);
+      await chatCommand(args, dispatchContext);
       return "continue";
     case "new":
-      await chatCommand(["new", ...args], context);
+      await chatCommand(["new", ...args], dispatchContext);
       return "continue";
     case "fork":
-      await chatCommand(["fork", ...args], context);
+      await chatCommand(["fork", ...args], dispatchContext);
       return "continue";
     case "compress":
-      await compressorCommand(args, context);
+      await compressorCommand(args, dispatchContext);
       return "continue";
     case "image":
       context.out.text(
@@ -327,22 +387,22 @@ export async function handleSlashCommand(
       );
       return "continue";
     case "panel":
-      await panelCommand(args, context);
+      await panelCommand(args, dispatchContext);
       return "continue";
     case "cost":
       printCosts(context.session, context.out);
       return "continue";
     case "max-cost":
-      await maxCostCommand(args, context);
+      await maxCostCommand(args, dispatchContext);
       return "continue";
     case "steps":
-      await stepsCommand(args, context);
+      await stepsCommand(args, dispatchContext);
       return "continue";
     case "history":
       printHistory(context.session, args, context.out);
       return "continue";
     case "clear":
-      await clearSession(context.session, context.agent, context.out);
+      await clearSession(dispatchContext);
       return "continue";
     case "diff":
       {
@@ -354,45 +414,48 @@ export async function handleSlashCommand(
       }
       return "continue";
     case "undo":
+      {
+        const local = commandLocalRuntime(context);
       context.out.text(
-        await context.agent.journal.undoLast(context.agent.guard, context.approvals, {
+        await local.journal.undoLast(local.guard, context.approvals, {
           dryRun: args.includes("--dry-run"),
         }),
       );
+      }
       return "continue";
     case "resume":
-      await resumeCommand(args, context);
+      await resumeCommand(args, dispatchContext);
       return "continue";
     case "config":
       context.out.text(chalk.bold(context.configPath ?? CONFIG_PATH));
       context.out.text(JSON.stringify(context.config, null, 2));
       return "continue";
     case "export":
-      await exportCommand(args, context);
+      await exportCommand(args, dispatchContext);
       return "continue";
     case "checkpoint":
-      await checkpointCommand(args, context);
+      await checkpointCommand(args, dispatchContext);
       return "continue";
     case "budget":
-      await budgetCommand(args, context);
+      await budgetCommand(args, dispatchContext);
       return "continue";
     case "verify":
-      await verifyCommand(args, context);
+      await verifyCommand(args, dispatchContext);
       return "continue";
     case "web":
-      await webCommand(args, context);
+      await webCommand(args, dispatchContext);
       return "continue";
     case "provider":
-      await providerCommand(args, context);
+      await providerCommand(args, dispatchContext);
       return "continue";
     case "fallback":
-      await fallbackCommand(args, context);
+      await fallbackCommand(args, dispatchContext);
       return "continue";
     case "init":
-      await initInstructions(context);
+      await initInstructions(dispatchContext);
       return "continue";
     case "ssh":
-      await sshCommand(args, context);
+      await sshCommand(args, dispatchContext);
       return "continue";
   }
 
@@ -627,8 +690,16 @@ async function keyCommand(args: string[], context: CommandContext): Promise<void
       context.out.text("API-Key unverändert; Entfernen abgebrochen.");
       return;
     }
-    const removed = await context.credentials.delete("inference");
-    context.openRouter.forgetKey();
+    const delegated = context.providerCredentials
+      ? await context.providerCredentials.apply({
+          kind: "forget",
+          credentialKind: "inference",
+        })
+      : null;
+    const removed = delegated
+      ? delegated.removed === true
+      : await context.credentials.delete("inference");
+    if (!delegated) context.openRouter.forgetKey();
     context.out.text(
       removed
         ? `API-Key aus Prozessspeicher und ${context.credentials.location} entfernt.`
@@ -640,16 +711,21 @@ async function keyCommand(args: string[], context: CommandContext): Promise<void
     if (!context.openRouter.hasKey) {
       throw new Error("Kein aktiver API-Key zum Speichern. Verwende /key replace.");
     }
-    const balance = await validateAndStoreInferenceKey(
-      context.openRouter.requireKey(),
-      context,
-    );
+    const delegated = context.providerCredentials
+      ? await context.providerCredentials.apply({
+          kind: "save",
+          credentialKind: "inference",
+        })
+      : null;
+    const balance = delegated
+      ? delegated.balance
+      : await validateAndStoreInferenceKey(context.openRouter.requireKey(), context);
     context.out.text(
       chalk.green(
         `API-Key geprüft und im ${context.credentials.location} gespeichert.`,
       ),
     );
-    await printBalance(balance, context.out);
+    if (balance) await printBalance(balance, context.out);
     return;
   }
   if (action === "set" || action === "replace") {
@@ -658,7 +734,14 @@ async function keyCommand(args: string[], context: CommandContext): Promise<void
       context.out.text("Key-Eingabe abgebrochen; aktiver Key unverändert.");
       return;
     }
-    const activated = await validateAndActivateInferenceKey(candidate, context, {
+    const activated = context.providerCredentials
+      ? await context.providerCredentials.apply({
+          kind: "replace",
+          credentialKind: "inference",
+          candidate,
+          allowProcessOnly: context.confirmProcessOnlyCredential,
+        })
+      : await validateAndActivateInferenceKey(candidate, context, {
       persist: true,
       confirmProcessOnly: context.confirmProcessOnlyCredential
         ? (error) => context.confirmProcessOnlyCredential!(
@@ -669,7 +752,7 @@ async function keyCommand(args: string[], context: CommandContext): Promise<void
           message: `Der Key ist gültig, aber ${context.credentials.location} ist nicht verfügbar (${errorMessage(error)}). Nur für diesen Prozess verwenden?`,
           default: false,
         }),
-    });
+      });
     if (!activated) {
       context.out.text("Aktiver und gespeicherter Key unverändert.");
       return;
@@ -681,7 +764,7 @@ async function keyCommand(args: string[], context: CommandContext): Promise<void
           : "Neuer Key ist gültig und nur für diesen Prozess aktiv.",
       ),
     );
-    await printBalance(activated.balance, context.out);
+    if (activated.balance) await printBalance(activated.balance, context.out);
     return;
   }
   if (action === "management") {
@@ -717,8 +800,15 @@ async function keyCommand(args: string[], context: CommandContext): Promise<void
         context.out.text("Management-Key unverändert; Entfernen abgebrochen.");
         return;
       }
-      await context.credentials.delete("management");
-      context.openRouter.forgetManagementKey();
+      if (context.providerCredentials) {
+        await context.providerCredentials.apply({
+          kind: "forget",
+          credentialKind: "management",
+        });
+      } else {
+        await context.credentials.delete("management");
+        context.openRouter.forgetManagementKey();
+      }
       context.out.text(
         `Management-Key aus Prozessspeicher und ${context.credentials.location} entfernt.`,
       );
@@ -730,9 +820,14 @@ async function keyCommand(args: string[], context: CommandContext): Promise<void
           "Kein aktiver Management-Key zum Speichern. Verwende /key management replace.",
         );
       }
-      const credits = await validateAndStoreManagementKey(
-        context.openRouter.requireManagementKey(),
-        context,
+      const delegated = context.providerCredentials
+        ? await context.providerCredentials.apply({
+            kind: "save",
+            credentialKind: "management",
+          })
+        : null;
+      const credits = delegated?.credits ?? await validateAndStoreManagementKey(
+        context.openRouter.requireManagementKey(), context,
       );
       context.out.text(
         chalk.green(
@@ -747,7 +842,14 @@ async function keyCommand(args: string[], context: CommandContext): Promise<void
         context.out.text("Management-Key-Eingabe abgebrochen; aktiver Key unverändert.");
         return;
       }
-      const activated = await validateAndActivateManagementKey(candidate, context, {
+      const activated = context.providerCredentials
+        ? await context.providerCredentials.apply({
+            kind: "replace",
+            credentialKind: "management",
+            candidate,
+            allowProcessOnly: context.confirmProcessOnlyCredential,
+          })
+        : await validateAndActivateManagementKey(candidate, context, {
         confirmProcessOnly: context.confirmProcessOnlyCredential
           ? (error) => context.confirmProcessOnlyCredential!(
             "management",
@@ -757,7 +859,7 @@ async function keyCommand(args: string[], context: CommandContext): Promise<void
             message: `Der Management-Key ist gültig, aber ${context.credentials.location} ist nicht verfügbar (${errorMessage(error)}). Nur für diesen Prozess verwenden?`,
             default: false,
           }),
-      });
+        });
       if (!activated) {
         context.out.text("Aktiver und gespeicherter Management-Key unverändert.");
         return;
@@ -765,8 +867,8 @@ async function keyCommand(args: string[], context: CommandContext): Promise<void
       context.out.text(
         chalk.green(
           activated.persisted
-            ? `Management-Key gültig und im ${context.credentials.location} gespeichert. Kontoguthaben: ${usd(activated.credits.remaining)} verbleibend.`
-            : `Management-Key gültig und nur für diesen Prozess aktiv. Kontoguthaben: ${usd(activated.credits.remaining)} verbleibend.`,
+            ? `Management-Key gültig und im ${context.credentials.location} gespeichert.${activated.credits ? ` Kontoguthaben: ${usd(activated.credits.remaining)} verbleibend.` : ""}`
+            : `Management-Key gültig und nur für diesen Prozess aktiv.${activated.credits ? ` Kontoguthaben: ${usd(activated.credits.remaining)} verbleibend.` : ""}`,
         ),
       );
       return;
@@ -1002,15 +1104,16 @@ async function resumeCommand(args: string[], context: CommandContext): Promise<v
     // make `undoLastRun`'s "last run" ambiguous (see resume.ts). At startup
     // that is guaranteed by construction; reachable mid-session as this
     // command is, it has to be checked explicitly instead.
-    if (context.agent.journal.size > 0) {
+    const local = commandLocalRuntime(context);
+    if (local.journal.size > 0) {
       throw new Error(
         "/resume undo ist nur sicher, solange diese Sitzung noch keine eigene Dateiänderung vorgenommen hat. " +
           "Nutze /undo für den letzten eigenen Lauf, oder starte orcode neu, um den abgebrochenen Lauf zurückzunehmen.",
       );
     }
     const outcome = await undoInterruptedRun(
-      context.agent.journal,
-      context.agent.guard,
+      local.journal,
+      local.guard,
       context.approvals,
       run,
     );
@@ -1659,7 +1762,7 @@ async function replaceDeletedSession(
   next: SessionStore,
 ): Promise<void> {
   context.session = next;
-  context.agent.setSession(next);
+  updateCommandSession(context, next);
   next.setPreferences(
     context.config.mainModel,
     getReasoningSetting(context.config),
@@ -1683,7 +1786,7 @@ async function replaceSession(
   }
   // Swapping the chat keeps the cached model resolution, the compressor price
   // cache and the change journal; rebuilding the agent threw all of that away.
-  context.agent.setSession(next);
+  updateCommandSession(context, next);
   next.setPreferences(
     context.config.mainModel,
     getReasoningSetting(context.config),
@@ -1817,22 +1920,20 @@ function printHistory(session: SessionStore, args: string[], out: CommandOutput)
   }
 }
 
-async function clearSession(
-  session: SessionStore,
-  agent: OrcodeAgent,
-  out: CommandOutput,
-): Promise<void> {
-  const accepted = await confirm({
+async function clearSession(context: CommandContext): Promise<void> {
+  const accepted = context.confirmClearSession
+    ? await context.confirmClearSession()
+    : await confirm({
     message: "Gesprächskontext und aufgezeichnete Sitzungskosten zurücksetzen?",
     default: false,
   });
   if (!accepted) {
     return;
   }
-  session.clear();
-  agent.resetConversationMemory();
-  await session.save();
-  out.text("Sitzung zurückgesetzt.");
+  context.session.clear();
+  resetCommandConversation(context);
+  await context.session.save();
+  context.out.text("Sitzung zurückgesetzt.");
 }
 
 async function exportCommand(
@@ -1845,8 +1946,9 @@ async function exportCommand(
     context.out.text(markdown);
     return;
   }
-  const target = await context.agent.guard.resolvePath(requested);
-  const display = context.agent.guard.display(target);
+  const local = commandLocalRuntime(context);
+  const target = await local.guard.resolvePath(requested);
+  const display = local.guard.display(target);
   // Same policy as the write tools: `/export .git/config` must not be a way
   // around the deny list.
   await context.approvals.authorize(
@@ -1895,7 +1997,7 @@ async function checkpointCommand(
       throw new Error("Verwendung: /checkpoint restore <ID oder Name>");
     }
     const checkpoint = context.session.restoreCheckpoint(reference);
-    context.agent.resetConversationMemory();
+    resetCommandConversation(context);
     await context.session.save();
     context.out.text(
       chalk.green(
@@ -1995,7 +2097,7 @@ async function verifyCommand(args: string[], context: CommandContext): Promise<v
       : undefined;
     const outcome = await runVerify(
       context.config.verify.commands,
-      context.agent.guard,
+      commandLocalRuntime(context).guard,
       undefined,
       () => {},
       callbacks,
@@ -2027,7 +2129,7 @@ async function verifyCommand(args: string[], context: CommandContext): Promise<v
     let packageJson: unknown;
     try {
       const raw = await readFile(
-        await context.agent.guard.resolvePath("package.json"),
+        await commandLocalRuntime(context).guard.resolvePath("package.json"),
         "utf8",
       );
       packageJson = JSON.parse(raw);
@@ -2232,11 +2334,12 @@ function includesValue<T extends readonly string[]>(list: T, value: string): val
 }
 
 async function initInstructions(context: CommandContext): Promise<void> {
-  const target = await context.agent.guard.resolvePath("ORCODE.md");
+  const local = commandLocalRuntime(context);
+  const target = await local.guard.resolvePath("ORCODE.md");
   // Also refuse to overwrite a pre-rename `ROUTERCODE.md`: creating a second,
   // redundant instructions file next to it would be more confusing than
   // helpful, and `loadProjectNotes` already reads both if both exist.
-  const legacyTarget = await context.agent.guard.resolvePath("ROUTERCODE.md");
+  const legacyTarget = await local.guard.resolvePath("ROUTERCODE.md");
   for (const [existing, label] of [
     [target, "ORCODE.md"],
     [legacyTarget, "ROUTERCODE.md"],
@@ -2252,7 +2355,7 @@ async function initInstructions(context: CommandContext): Promise<void> {
     }
   }
   await context.approvals.authorize(
-    writeApprovalRequest("init", context.agent.guard.display(target), {
+    writeApprovalRequest("init", local.guard.display(target), {
       summary: "ORCODE.md im Workspace anlegen",
       details:
         "Projektbefehle, Konventionen, Grenzen und Definition-of-Done können dort dauerhaft eingetragen werden.",

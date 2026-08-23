@@ -42,7 +42,9 @@ import {
   shouldReplaceCredential,
   validateAndActivateInferenceKey,
   type CommandContext,
+  type CommandLocalRuntime,
   type CommandOutput,
+  type ProviderCredentialIntentPort,
 } from "./commands.js";
 import {
   APP_HOME,
@@ -120,6 +122,8 @@ import {
   type RecordingStopReason,
 } from "./voice.js";
 import {
+  ChangeJournal,
+  WorkspaceGuard,
   catastrophicGuardNotice,
   getGitStatus,
   pruneCheckpoints,
@@ -419,7 +423,49 @@ export interface ProviderRuntime {
   resolveLegacyDefaultRoute(): Promise<StartupSetupResult>;
   runSetup(surface: SetupSurface | "plain" | "fullscreen"): Promise<SetupHubResult>;
   ensureRunnableRoute(): RouteIdentityV1;
-  runWithReadyRoute<T>(run: (route: RouteIdentityV1) => Promise<T>): Promise<T>;
+  readonly providerCredentials: ProviderCredentialIntentPort;
+  runWithReadyRoute<T>(
+    run: (route: RouteIdentityV1) => Promise<T>,
+    surface?: SetupSurface | "plain" | "fullscreen",
+  ): Promise<T>;
+}
+
+export async function executeProviderModelAction<T>(input: {
+  ensureRunnableRoute(): RouteIdentityV1;
+  beginRun(): () => void;
+  run(route: RouteIdentityV1): Promise<T>;
+  isAuthenticationFailure(error: unknown): boolean;
+  invalidateAndInspect(): Promise<void>;
+  runSetup(surface: SetupSurface | "plain" | "fullscreen"): Promise<unknown>;
+  surface?: SetupSurface | "plain" | "fullscreen";
+}): Promise<T> {
+  const route = input.ensureRunnableRoute();
+  const release = input.beginRun();
+  let failure: unknown;
+  try {
+    return await input.run(route);
+  } catch (error) {
+    failure = error;
+  } finally {
+    release();
+  }
+  if (input.isAuthenticationFailure(failure)) {
+    try {
+      await input.invalidateAndInspect();
+      if (input.surface) await input.runSetup(input.surface);
+    } catch {
+      // The original provider rejection is the only error safe and relevant
+      // to the attempted action; recovery remains best effort and the proof
+      // was invalidated before inspection began.
+    }
+  }
+  throw failure;
+}
+
+function assertModelBoundToRoute(modelId: string, route: RouteIdentityV1): void {
+  if (modelId !== route.requestedModelId && modelId !== route.canonicalModelId) {
+    throw new ProviderSetupRequiredError();
+  }
 }
 
 class SessionProviderRuntimeGuard implements ProviderActivationRuntimeGuard {
@@ -471,13 +517,34 @@ class DefaultProviderRuntime implements ProviderRuntime {
     private readonly stateStore: ProviderStateStore,
     private readonly orchestrator: SetupOrchestrator,
     private readonly runtimeGuard: SessionProviderRuntimeGuard,
-    private readonly savedSecret: string | null,
-    private readonly environmentSecret: string | null,
+    readonly providerCredentials: ProviderCredentialIntentPort,
+    private savedSecret: string | null,
+    private environmentSecret: string | null,
     private readonly requestedModel: string,
   ) {}
 
   get preparedRoles(): SetupPreparedRoles | null {
     return this.#preparedRoles ? structuredClone(this.#preparedRoles) : null;
+  }
+
+  adoptCredentialActivation(
+    route: RouteIdentityV1,
+    persisted: boolean,
+    secret: string,
+  ): void {
+    this.#sessionRoute = structuredClone(route);
+    this.#sessionRoutePersisted = persisted;
+    this.#preparedRoles = null;
+    this.savedSecret = persisted ? secret : null;
+    this.environmentSecret = persisted ? null : secret;
+  }
+
+  adoptCredentialForget(): void {
+    this.#sessionRoute = null;
+    this.#sessionRoutePersisted = false;
+    this.#preparedRoles = null;
+    this.savedSecret = null;
+    this.environmentSecret = null;
   }
 
   async inspectStartup(): Promise<StartupSetupResult> {
@@ -579,14 +646,24 @@ class DefaultProviderRuntime implements ProviderRuntime {
     return this.orchestrator.ensureRunnableRoute();
   }
 
-  async runWithReadyRoute<T>(run: (route: RouteIdentityV1) => Promise<T>): Promise<T> {
-    const route = this.ensureRunnableRoute();
-    const release = this.runtimeGuard.beginRun();
-    try {
-      return await run(route);
-    } finally {
-      release();
-    }
+  async runWithReadyRoute<T>(
+    run: (route: RouteIdentityV1) => Promise<T>,
+    surface?: SetupSurface | "plain" | "fullscreen",
+  ): Promise<T> {
+    return executeProviderModelAction({
+      ensureRunnableRoute: () => this.ensureRunnableRoute(),
+      beginRun: () => this.runtimeGuard.beginRun(),
+      run,
+      isAuthenticationFailure: (error) => shouldReplaceCredential(error, this.openRouter),
+      invalidateAndInspect: async () => {
+        this.#sessionRoute = null;
+        this.#sessionRoutePersisted = false;
+        this.#preparedRoles = null;
+        await this.orchestrator.reconnect("openrouter");
+      },
+      runSetup: (requestedSurface) => this.runSetup(requestedSurface),
+      surface,
+    });
   }
 }
 
@@ -619,6 +696,27 @@ async function loadCredentialReferenceForStartup(
   }
 }
 
+export async function recoverProviderCredentialBinding(input: {
+  stateStore: ProviderStateStore;
+  recover(): Promise<void>;
+  readCredential(
+    reference: "legacy:inference" | CredentialSlotRef,
+  ): Promise<StoredCredentialStartupState>;
+  environmentCredential: string | null;
+}): Promise<{
+  reference: "legacy:inference" | CredentialSlotRef;
+  stored: { kind: "absent" } | { kind: "present"; value: string };
+  environment: string | null;
+}> {
+  await input.recover();
+  const reference = credentialSlotFromState(input.stateStore.read());
+  const selected = providerServiceStartupCredential(
+    await input.readCredential(reference),
+    input.environmentCredential,
+  );
+  return { reference, ...selected };
+}
+
 export function providerServiceStartupCredential(
   stored: StoredCredentialStartupState,
   environment: string | null,
@@ -642,6 +740,125 @@ export function providerServiceStartupCredential(
     }
   }
   return { stored: { kind: "absent" }, environment: null };
+}
+
+export function createProviderCredentialController(input: {
+  stateStore: ProviderStateStore;
+  openRouter: OpenRouterService;
+  credentials: {
+    location?: string;
+    set?(kind: CredentialKind, secret: string): Promise<void>;
+    delete?(kind: CredentialKind): Promise<boolean>;
+    deleteSlot(slot: CredentialSlotRef): Promise<boolean>;
+  };
+  runtimeGuard: ProviderActivationRuntimeGuard;
+  activationCoordinator: Pick<ProviderActivationCoordinator, "activate">;
+  onInferenceReady?(route: RouteIdentityV1, persisted: boolean, candidate: string): void;
+  onInferenceForgotten?(): void;
+}): ProviderCredentialIntentPort {
+  const inferenceRoute = (): RouteIdentityV1 => {
+    const route = input.stateStore.read().defaultRoute;
+    if (!route?.canonicalModelId || route.resolutionState !== "resolved") {
+      throw new ProviderSetupRequiredError();
+    }
+    return route;
+  };
+  return {
+    async apply(intent) {
+      if (intent.credentialKind === "inference" && intent.kind !== "forget") {
+        const candidate = intent.kind === "save"
+          ? input.openRouter.requireKey()
+          : intent.candidate;
+        const state = input.stateStore.read();
+        const route = inferenceRoute();
+        const result = await input.activationCoordinator.activate({
+          expectedRevision: state.revision,
+          candidate,
+          selectedCanonicalModelId: route.canonicalModelId!,
+          generation: state.connections.find((connection) => connection.enabled)?.lastHealth?.generation ?? 0,
+          signal: new AbortController().signal,
+          persistence: "persisted",
+          onPersistenceFailure: intent.kind === "replace" && intent.allowProcessOnly
+            ? async () => (await intent.allowProcessOnly!("inference", "Der sichere Credential-Speicher ist nicht verfügbar."))
+              ? "process-only"
+              : "decline"
+            : undefined,
+        });
+        input.onInferenceReady?.(result.route, result.persisted, candidate);
+        return {
+          kind: "ready",
+          credentialKind: "inference",
+          persisted: result.persisted,
+        };
+      }
+
+      const lease = await input.runtimeGuard.acquire(new AbortController().signal);
+      try {
+        await lease.assertHeld();
+        if (intent.credentialKind === "inference") {
+          const state = input.stateStore.read();
+          const connection = state.connections.find((candidate) =>
+            candidate.backendId === "openrouter" && candidate.enabled
+          );
+          await input.stateStore.commit(state.revision, (current) => ({
+            ...current,
+            lifecycle: "configured",
+            connections: current.connections.filter((candidate) => candidate.id !== connection?.id),
+            defaultRoute: null,
+            cross: { enabled: false, preferredLead: null, preferredChallenger: null },
+          }));
+          let removed = false;
+          if (connection?.credentialSlot?.startsWith("v1:inference:")) {
+            removed = await input.credentials.deleteSlot({
+              version: 1,
+              kind: "inference",
+              id: connection.credentialSlot,
+            });
+          } else if (input.credentials.delete) {
+            removed = await input.credentials.delete("inference");
+          }
+          input.openRouter.forgetKey();
+          input.onInferenceForgotten?.();
+          await lease.assertHeld();
+          return { kind: "forgotten", credentialKind: "inference", removed };
+        }
+
+        if (intent.kind === "forget") {
+          const removed = await input.credentials.delete?.("management") ?? false;
+          input.openRouter.forgetManagementKey();
+          await lease.assertHeld();
+          return { kind: "forgotten", credentialKind: "management", removed };
+        }
+        const candidate = intent.kind === "save"
+          ? input.openRouter.requireManagementKey()
+          : normalizeProviderSecret(intent.candidate);
+        const credits = await input.openRouter.validateManagementKey(candidate);
+        let persisted = true;
+        try {
+          if (!input.credentials.set) throw new Error("Credential persistence unavailable.");
+          await input.credentials.set("management", candidate);
+        } catch (error) {
+          if (
+            intent.kind !== "replace"
+            || !intent.allowProcessOnly
+            || !(await intent.allowProcessOnly("management", "Der sichere Credential-Speicher ist nicht verfügbar."))
+          ) {
+            throw error;
+          }
+          persisted = false;
+        }
+        input.openRouter.activateValidatedManagementKey(
+          candidate,
+          persisted ? "keychain" : "interactive",
+          credits,
+        );
+        await lease.assertHeld();
+        return { kind: "ready", credentialKind: "management", persisted, credits };
+      } finally {
+        await lease.release();
+      }
+    },
+  };
 }
 
 export function createAutomaticEnvironmentSetupSurface(
@@ -844,26 +1061,56 @@ export async function createDefaultProviderRuntime(
   const stateStore = new ProviderStateStore(startup.config.providerSetup, {
     persist: (request) => persistProviderSetupState(startup.configPath, request),
   });
-  const inferenceReference = credentialSlotFromState(stateStore.read());
-  const storedInference = await loadCredentialReferenceForStartup(
+  const runtimeGuard = new SessionProviderRuntimeGuard();
+  const privateStore = new PrivateStore({ root: startup.appHome });
+
+  // Recovery must own the authoritative provider pointer before the active
+  // service derives its credential. This adapter is recovery-only: committed
+  // candidates carry their own secret and no environment key is consulted.
+  const recoveryService = createOpenRouterServiceForStartup({
+    storedInferenceKey: { kind: "absent" },
+    environmentInferenceKey: null,
+    storedManagementKey: { kind: "absent" },
+    environmentManagementKey: null,
+  });
+  const recoveryReference = credentialSlotFromState(stateStore.read());
+  const recoveryAdapter = new OpenRouterBackendAdapter({
+    service: recoveryService,
     credentials,
-    inferenceReference,
-  );
-  const storedManagement = await loadStoredCredentialForStartup(
+    connectionId: stateStore.read().connections.find((connection) =>
+      connection.backendId === "openrouter" && connection.enabled
+    )?.id ?? randomUUID(),
+    inferenceCredential: recoveryReference,
+    environment,
+  });
+  const recoveryCoordinator = new ProviderActivationCoordinator({
+    appHome: startup.appHome,
+    configPath: startup.configPath,
+    privateStore,
     credentials,
-    "management",
-  );
-  const inferenceServiceCredential = providerServiceStartupCredential(
-    storedInference,
-    environment.OPENROUTER_API_KEY ?? null,
-  );
+    adapter: recoveryAdapter,
+    stateStore,
+    runtimeGuard,
+  });
+  const recoveredInference = await recoverProviderCredentialBinding({
+    stateStore,
+    recover: async () => {
+      await recoveryCoordinator.recover({
+        signal: new AbortController().signal,
+        inspectCommitted: true,
+      });
+    },
+    readCredential: (reference) => loadCredentialReferenceForStartup(credentials, reference),
+    environmentCredential: environment.OPENROUTER_API_KEY ?? null,
+  });
+  const storedManagement = await loadStoredCredentialForStartup(credentials, "management");
   const managementServiceCredential = providerServiceStartupCredential(
     storedManagement,
     environment.OPENROUTER_MANAGEMENT_KEY ?? null,
   );
   const openRouter = createOpenRouterServiceForStartup({
-    storedInferenceKey: inferenceServiceCredential.stored,
-    environmentInferenceKey: inferenceServiceCredential.environment,
+    storedInferenceKey: recoveredInference.stored,
+    environmentInferenceKey: recoveredInference.environment,
     storedManagementKey: managementServiceCredential.stored,
     environmentManagementKey: managementServiceCredential.environment,
   });
@@ -874,48 +1121,55 @@ export async function createDefaultProviderRuntime(
     service: openRouter,
     credentials,
     connectionId,
-    inferenceCredential: inferenceReference,
+    inferenceCredential: recoveredInference.reference,
     environment,
   });
   const registry = new BackendRegistry([
     { descriptor: OPENROUTER_DESCRIPTOR, adapter },
     { descriptor: ANTHROPIC_COMING_SOON_DESCRIPTOR },
   ]);
-  const runtimeGuard = new SessionProviderRuntimeGuard();
   const activationCoordinator = new ProviderActivationCoordinator({
     appHome: startup.appHome,
     configPath: startup.configPath,
-    privateStore: new PrivateStore({ root: startup.appHome }),
+    privateStore,
     credentials,
     adapter,
     stateStore,
     runtimeGuard,
-  });
-  await activationCoordinator.recover({
-    signal: new AbortController().signal,
-    inspectCommitted: true,
   });
   const orchestrator = new SetupOrchestrator({
     registry,
     stateStore,
     activationCoordinator,
   });
-  const savedSecret = inferenceServiceCredential.stored.kind === "present"
-    ? inferenceServiceCredential.stored.value
+  let runtimeOwner: DefaultProviderRuntime | null = null;
+  const providerCredentials = createProviderCredentialController({
+    stateStore,
+    openRouter,
+    credentials,
+    runtimeGuard,
+    activationCoordinator,
+    onInferenceReady: (route, persisted, candidate) => {
+      runtimeOwner?.adoptCredentialActivation(route, persisted, candidate);
+    },
+    onInferenceForgotten: () => runtimeOwner?.adoptCredentialForget(),
+  });
+  const savedSecret = recoveredInference.stored.kind === "present"
+    ? recoveredInference.stored.value
     : null;
-  return new DefaultProviderRuntime(
+  runtimeOwner = new DefaultProviderRuntime(
     openRouter,
     credentials,
     registry,
     stateStore,
     orchestrator,
     runtimeGuard,
+    providerCredentials,
     savedSecret,
-    storedInference.kind === "absent"
-      ? environment.OPENROUTER_API_KEY ?? null
-      : null,
+    recoveredInference.environment,
     input.requestedModel ?? startup.config.mainModel,
   );
+  return runtimeOwner;
 }
 
 export interface PlainRunInput extends Omit<RuntimeContext, "agent"> {
@@ -1050,11 +1304,11 @@ export async function runCli(
   const nonInteractive = options.prompt !== undefined || options.json;
   const out = options.json ? createStderrCommandOutput() : createPlainCommandOutput();
   let agent: OrcodeAgent | null = null;
-  let modelPreferencesApplied = false;
 
   const ensureAgentForPrompt = async (surface?: SetupSurface): Promise<OrcodeAgent> => {
+    let route: RouteIdentityV1;
     try {
-      providerRuntime.ensureRunnableRoute();
+      route = providerRuntime.ensureRunnableRoute();
     } catch (error) {
       if (!(error instanceof ProviderSetupRequiredError) &&
         (typeof error !== "object" || error === null || !("code" in error) || error.code !== "provider-setup-required")) {
@@ -1062,21 +1316,29 @@ export async function runCli(
       }
       const setup = await providerRuntime.runSetup(surface ?? "plain");
       if (setup.kind !== "ready") throw new ProviderSetupRequiredError();
-      providerRuntime.ensureRunnableRoute();
+      route = providerRuntime.ensureRunnableRoute();
     }
-    if (!modelPreferencesApplied) {
-      if (!options.model && session.data.model) config.mainModel = session.data.model;
-      if (!options.model && session.data.reasoning) {
-        setReasoningSetting(config, session.data.reasoning);
+    if (
+      options.model
+      && options.model !== route.requestedModelId
+      && options.model !== route.canonicalModelId
+    ) {
+      if (nonInteractive) throw new ProviderSetupRequiredError();
+      const setup = await providerRuntime.runSetup(surface ?? "plain");
+      if (setup.kind !== "ready") throw new ProviderSetupRequiredError();
+      route = providerRuntime.ensureRunnableRoute();
+      if (
+        options.model !== route.requestedModelId
+        && options.model !== route.canonicalModelId
+      ) {
+        throw new ProviderSetupRequiredError();
       }
-      await applyStartupModelPreference(
-        providerRuntime.openRouter,
-        options.model,
-        config,
-        session,
-      );
-      modelPreferencesApplied = true;
     }
+    if (!options.model && session.data.reasoning) {
+      setReasoningSetting(config, session.data.reasoning);
+    }
+    config.mainModel = route.requestedModelId;
+    session.setPreferences(config.mainModel, getReasoningSetting(config));
     if (!agent) {
       agent = await dependencies.createAgent({
         openRouter: providerRuntime.openRouter,
@@ -1110,7 +1372,6 @@ export async function runCli(
         "Kein Prompt: --json braucht -p/--prompt oder eine nicht-interaktive stdin.",
       );
     }
-    await ensureRunnableModelConfiguration(providerRuntime.openRouter, config);
     const effectivePrompt = await applyInterruptedRunNonInteractive(
       session,
       options,
@@ -1119,7 +1380,10 @@ export async function runCli(
     );
     const execute = () => runNonInteractive(agent!, effectivePrompt, { json: options.json });
     if (typeof providerRuntime.runWithReadyRoute === "function") {
-      return providerRuntime.runWithReadyRoute(() => execute());
+      return providerRuntime.runWithReadyRoute((route) => {
+        assertModelBoundToRoute(config.mainModel, route);
+        return execute();
+      });
     }
     providerRuntime.ensureRunnableRoute();
     return execute();
@@ -1144,6 +1408,15 @@ export async function runCli(
     }
   }
 
+  const localRuntime: CommandLocalRuntime = {
+    guard: await WorkspaceGuard.create(workspace),
+    journal: new ChangeJournal({ appHome: session.appHome, chatId: session.data.id }),
+    setSession(next) {
+      this.journal = new ChangeJournal({ appHome: next.appHome, chatId: next.data.id });
+    },
+    resetConversationMemory() {},
+  };
+
   const common = {
     workspace,
     configPath: runtimeConfigPath,
@@ -1153,6 +1426,8 @@ export async function runCli(
     session,
     agent,
     credentials: providerRuntime.credentials,
+    providerCredentials: providerRuntime.providerCredentials,
+    localRuntime,
     out,
     ruleStore,
     sshSession,
@@ -1186,7 +1461,9 @@ interface RuntimeContext {
   approvals: ApprovalManager;
   openRouter: OpenRouterService;
   session: SessionStore;
-  agent: OrcodeAgent;
+  agent: OrcodeAgent | null;
+  localRuntime: CommandLocalRuntime;
+  providerCredentials: ProviderCredentialIntentPort;
   providerRuntime: ProviderRuntime;
   credentials: CredentialStore;
   out: CommandOutput;
@@ -1245,11 +1522,21 @@ async function runPlainLoop(
     try {
       if (trimmed.startsWith("/")) {
         const commandName = resolveCliCommandName(trimmed);
-        if (commandRequiresRunnableRoute(commandName, commandArguments(trimmed))) {
+        const requiresRoute = commandRequiresRunnableRoute(
+          commandName,
+          commandArguments(trimmed),
+        );
+        if (requiresRoute) {
           const agent = await context.ensureAgentForPrompt();
           context.agent = agent;
         }
-        const outcome = await handleSlashCommand(trimmed, context as RuntimeContext);
+        const executeCommand = () => handleSlashCommand(trimmed, context as RuntimeContext);
+        const outcome = requiresRoute
+          ? await context.providerRuntime.runWithReadyRoute((route) => {
+              assertModelBoundToRoute(context.config.mainModel, route);
+              return executeCommand();
+            }, "plain")
+          : await executeCommand();
         if (outcome === "exit") {
           break;
         }
@@ -1260,24 +1547,16 @@ async function runPlainLoop(
       await ensureRunnableModelConfiguration(context.openRouter, context.config);
       const effective = pendingSeed ? `${pendingSeed}\n\n${trimmed}` : trimmed;
       pendingSeed = undefined;
-      const result = await context.providerRuntime.runWithReadyRoute(() =>
-        agent.run(effective)
-      );
+      const result = await context.providerRuntime.runWithReadyRoute((route) => {
+        assertModelBoundToRoute(context.config.mainModel, route);
+        return agent.run(effective);
+      }, "plain");
       printRunFooter(result);
     } catch (error) {
       console.error(chalk.red(context.openRouter.safeMessage(error)));
       if (error instanceof AgentRunError) {
         // The fragment is already in the chat file; name what it cost.
         printRunFooter(error.result);
-      }
-      if (
-        !(error instanceof ProviderSetupRequiredError)
-        && shouldReplaceCredential(error, context.openRouter)
-      ) {
-        const setup = await context.providerRuntime.runSetup("plain");
-        if (setup.kind === "ready") {
-          context.agent = await context.ensureAgentForPrompt();
-        }
       }
     }
   }
@@ -1324,9 +1603,10 @@ async function applyResumeChoice(
     return undefined;
   }
   if (choice === "undo") {
+    const local = context.agent ?? context.localRuntime;
     const outcome = await undoInterruptedRun(
-      context.agent.journal,
-      context.agent.guard,
+      local.journal,
+      local.guard,
       context.approvals,
       run,
     );
@@ -1755,7 +2035,7 @@ async function runDashboard(
           }
 
           if (completedCommand === "whisper") {
-            await runVoiceCapture(ui, context as RuntimeContext);
+            await runVoiceCapture(ui, context as RuntimeContext, setupSurface);
             ui.setStatus("Bereit", false);
             continue;
           }
@@ -1975,7 +2255,17 @@ async function runDashboard(
             continue;
           }
 
-          const outcome = await handleSlashCommand(trimmed, context as RuntimeContext);
+          const executeCommand = () => handleSlashCommand(trimmed, context as RuntimeContext);
+          const outcome = commandRequiresRunnableRoute(
+            completedCommand,
+            commandArgs,
+            "dashboard",
+          )
+            ? await context.providerRuntime.runWithReadyRoute((route) => {
+                assertModelBoundToRoute(context.config.mainModel, route);
+                return executeCommand();
+              }, setupSurface)
+            : await executeCommand();
           const captured = dashboardOut.flush();
           if (context.session !== sessionBefore) {
             startingSessionCost = context.session.data.costs.totalUsd;
@@ -2081,8 +2371,9 @@ async function runDashboard(
         ui.setCancelHandler(() => {
           runController?.abort(new Error("Der aktuelle Lauf wurde vom Benutzer abgebrochen."));
         });
-        const result = await context.providerRuntime.runWithReadyRoute(() =>
-          agent.run(
+        const result = await context.providerRuntime.runWithReadyRoute((route) => {
+          assertModelBoundToRoute(context.config.mainModel, route);
+          return agent.run(
             trimmed,
             {
               onStatus: (status) => ui.setStatus(status),
@@ -2102,8 +2393,8 @@ async function runDashboard(
               signal: controller.signal,
             },
             submittedImages,
-          )
-        );
+          );
+        }, setupSurface);
         submittedImages = [];
         ui.setCancelHandler();
         resolvedModel = result.resolvedModel;
@@ -2228,7 +2519,8 @@ async function pickDashboardChat(
   context.session = next;
   // Reuse the agent: rebuilding it dropped the cached model resolution, the
   // compressor price cache and the undo journal on every chat switch.
-  context.agent.setSession(next);
+  context.agent?.setSession(next);
+  context.localRuntime.setSession(next);
   await saveDashboardSessionPreferences(context, ui);
   await saveConfig(context.config, context.configPath);
   ui.loadTurns(next.recentTurns(VISIBLE_TURNS));
@@ -2657,7 +2949,11 @@ function recordingLimitLabel(reason: RecordingStopReason): string {
  * `ui.addMessage("error", …)` instead of throwing, so a broken microphone or
  * a rejected model never crashes the dashboard loop.
  */
-async function runVoiceCapture(ui: TerminalUi, context: RuntimeContext): Promise<void> {
+async function runVoiceCapture(
+  ui: TerminalUi,
+  context: RuntimeContext,
+  setupSurface?: SetupSurface,
+): Promise<void> {
   const consented = await ensureVoiceConsent(
     context.config,
     async () => {
@@ -2722,7 +3018,7 @@ async function runVoiceCapture(ui: TerminalUi, context: RuntimeContext): Promise
       `Aufnahme automatisch beendet: ${recordingLimitLabel(outcome.reason)}.`,
       "/whisper",
     );
-    await transcribeAndInsert(ui, context, outcome.audio);
+    await transcribeAndInsert(ui, context, outcome.audio, { surface: setupSurface });
     return;
   }
 
@@ -2739,14 +3035,18 @@ async function runVoiceCapture(ui: TerminalUi, context: RuntimeContext): Promise
     ui.addMessage("error", errorMessage(error), "/whisper");
     return;
   }
-  await transcribeAndInsert(ui, context, audio);
+  await transcribeAndInsert(ui, context, audio, { surface: setupSurface });
 }
 
 /** Sends the recording to `config.transcriptionModel`, inserts the result into the input line, and always deletes the temp file. */
-async function transcribeAndInsert(
+export async function transcribeAndInsert(
   ui: TerminalUi,
   context: RuntimeContext,
   audio: RecordedAudio,
+  dependencies: {
+    transcribe?: typeof transcribeAudio;
+    surface?: SetupSurface;
+  } = {},
 ): Promise<void> {
   if (audio.quiet) {
     ui.addMessage(
@@ -2757,12 +3057,22 @@ async function transcribeAndInsert(
   }
   ui.setStatus("Aufnahme wird erkannt …");
   try {
-    const result = await transcribeAudio({
-      client: context.openRouter.client({ scope: "voice" }),
-      openRouter: context.openRouter,
-      modelId: context.config.transcriptionModel,
-      audio,
-    });
+    const result = await context.providerRuntime.runWithReadyRoute(
+      () => dependencies.transcribe
+        ? dependencies.transcribe({
+            client: undefined as never,
+            openRouter: context.openRouter,
+            modelId: context.config.transcriptionModel,
+            audio,
+          })
+        : transcribeAudio({
+            client: context.openRouter.client({ scope: "voice" }),
+            openRouter: context.openRouter,
+            modelId: context.config.transcriptionModel,
+            audio,
+          }),
+      dependencies.surface,
+    );
     if (!result.text) {
       ui.addMessage(
         "system",

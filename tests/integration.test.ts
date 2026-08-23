@@ -14,9 +14,11 @@ import {
 import { DEFAULT_CONFIG } from "../src/config.js";
 import type { CredentialStoreLike } from "../src/credentials.js";
 import { OpenRouterService } from "../src/openrouter.js";
+import { createRunId, RunLog } from "../src/runlog.js";
 import { RuleStore, rulesPath, shellApprovalSubject } from "../src/rules.js";
 import { SessionStore } from "../src/session.js";
 import type { ToolCallPreview } from "../src/types.js";
+import { ChangeJournal, WorkspaceGuard } from "../src/workspace.js";
 
 const TEST_KEY_PREFIX = `${["sk", "or", "v1"].join("-")}-`;
 
@@ -209,6 +211,112 @@ test("model-independent slash commands remain available with one setup-required 
   assert.equal(await handleSlashCommand("/help", setupRequiredContext), "continue");
   assert.equal(setupRequiredContext.providerRuntime, providerRuntime);
   assert.match(lines.join("\n"), /orcode Befehle|\/help/i);
+});
+
+test("setup-required local chat, clear, checkpoint, and interrupted undo work with zero agent model client", async () => {
+  const workspace = await mkdtemp(join(tmpdir(), "orcode-local-no-agent-"));
+  const appHome = join(workspace, ".state");
+  const session = await SessionStore.open(workspace, appHome);
+  session.rename("Original");
+  session.addTurn("user", "vorher");
+  await session.save();
+  const guard = await WorkspaceGuard.create(workspace);
+  const localRuntime = {
+    guard,
+    journal: new ChangeJournal({ appHome, chatId: session.data.id }),
+    setSession(next: SessionStore) {
+      this.journal = new ChangeJournal({ appHome, chatId: next.data.id });
+    },
+    resetConversationMemory() {},
+  };
+  const context = {
+    config: structuredClone(DEFAULT_CONFIG),
+    configPath: join(appHome, "config.json"),
+    approvals: new ApprovalManager("allow-all"),
+    openRouter: new OpenRouterService(undefined),
+    session,
+    agent: null,
+    localRuntime,
+    workspace,
+    credentials: {
+      location: "Test-Speicher",
+      async get() { return null; },
+      async set() {},
+      async delete() { return false; },
+      async has() { return false; },
+    },
+    out: collectOutput().out,
+    ruleStore: await RuleStore.load(appHome),
+    confirmClearSession: async () => true,
+  } as unknown as CommandContext;
+
+  await handleSlashCommand("/chat new Lokal", context);
+  assert.equal(context.session.data.title, "Lokal");
+  await handleSlashCommand("/chat open Original", context);
+  assert.equal(context.session.data.title, "Original");
+
+  await handleSlashCommand("/checkpoint new Basis", context);
+  context.session.addTurn("assistant", "nachher");
+  await handleSlashCommand("/checkpoint restore Basis", context);
+  assert.equal(context.session.data.turns.length, 1);
+
+  await handleSlashCommand("/clear", context);
+  assert.equal(context.session.data.turns.length, 0);
+
+  const runId = createRunId();
+  const log = await RunLog.open(appHome, context.session.data.id, runId);
+  log.write({
+    type: "run-start",
+    model: "vendor/main",
+    maxSteps: 1,
+    prompt: "unterbrochen",
+    timestamp: 1,
+  });
+  await log.close();
+  await handleSlashCommand("/resume undo", context);
+});
+
+test("inference key replace and forget delegate to the shared provider credential intent", async () => {
+  const { context } = await harness();
+  const candidate = `${TEST_KEY_PREFIX}${"r".repeat(48)}`;
+  const intents: Array<Record<string, unknown>> = [];
+  context.readCredentialSecret = async () => candidate;
+  context.confirmCredentialForget = async () => true;
+  context.credentials = {
+    location: "legacy-store-must-not-run",
+    async get() { throw new Error("legacy get bypass"); },
+    async set() { throw new Error("legacy set bypass"); },
+    async delete() { throw new Error("legacy delete bypass"); },
+    async has() { throw new Error("legacy has bypass"); },
+  };
+  (context as CommandContext & {
+    providerCredentials: { apply(intent: Record<string, unknown>): Promise<Record<string, unknown>> };
+  }).providerCredentials = {
+    async apply(intent) {
+      intents.push(intent);
+      return intent.kind === "forget"
+        ? { kind: "forgotten", credentialKind: "inference", removed: true }
+        : {
+            kind: "ready",
+            credentialKind: "inference",
+            persisted: true,
+            balance: { key: { isFreeTier: false } },
+          };
+    },
+  };
+
+  await handleSlashCommand("/key replace", context);
+  await handleSlashCommand("/key forget", context);
+
+  assert.deepEqual(intents, [
+    {
+      kind: "replace",
+      credentialKind: "inference",
+      candidate,
+      allowProcessOnly: context.confirmProcessOnlyCredential,
+    },
+    { kind: "forget", credentialKind: "inference" },
+  ]);
 });
 
 test("/checkpoint marks a point and rewinds to it", async () => {
