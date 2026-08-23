@@ -95,3 +95,84 @@ Slice start base: `587943673f0347c3713acf2ab45946d232cbabf7`
   coverage remains green; no native Windows process result is claimed.
 
 Requested commit: `fix: harden automatic git processes`
+
+## Independent Review Fix Round 1
+
+The post-commit review found two additional repository-delegation paths. The
+new exact matrix was RED with 9 reached, 0 passed: a PATH entry located in the
+workspace could be a symlink to an outside fake `git`, and symlinked
+`HEAD`/`index`/`objects`/`refs`/`packed-refs` plus object alternates reached the
+spawn boundary.
+
+The fix checks both the lexical and canonical workspace names before
+realpathing any executable candidate. Critical Git metadata is now recursively
+snapshotted as regular file/directory identities, rejects every symlink and
+`objects/info/{alternates,http-alternates}`, and is fully compared again after
+approval immediately before spawn. The exact review matrix is GREEN 9/9 and
+the complete workspace suite is GREEN 93/93; source TypeScript and diff-check
+are also green. Test TypeScript/full-suite output was intentionally deferred
+until the parallel B2 test-only RED fixtures receive their production wiring.
+
+## Independent Review Fix Round 2
+
+The first re-review found one remaining observer window: the final repository
+snapshot happened before `runObservedProcess` synchronously emitted its visible
+start event. A process-start consumer could therefore replace `.git/index` and
+`.git/objects` after validation but before the runner was invoked. The exact
+real-repository regression was RED 0/1 (`Missing expected rejection`) and the
+fake runner received the swapped repository.
+
+The root and executable identity checks plus the final complete repository
+snapshot now execute inside the observed-process closure: after the visible
+start event and immediately before invoking the runner, with no intervening
+consumer callback. The named regression is GREEN 1/1; the complete independent
+review matrix is GREEN 11/11 and `tests/workspace.test.ts` is GREEN 94/94.
+Source TypeScript and the scoped diff-check are also green. The documented
+same-user check-to-spawn kernel gap remains a native-launcher limitation; this
+round closes the avoidable application callback window.
+
+## Independent Review Fix Round 3
+
+The second re-review found one remaining executable-selection alias: an outside
+PATH name could point into the workspace and a later workspace symlink could
+point back out to an outside fake `git`. Checking only the lexical candidate
+and its final realpath missed that enter-then-leave traversal. The real launcher
+regression was RED 0/1 and proved the outside marker executable ran.
+
+Automatic Git selection now canonicalizes every existing prefix in each
+candidate path and rejects the candidate if any prefix enters the canonical
+workspace. Uninspectable prefix chains also fail closed so selection may try a
+later trusted PATH entry. The exact alias regression is GREEN 1/1 and the
+combined PATH/metadata/process-start security selection is GREEN 11/11.
+
+## Independent Review Fix Round 4
+
+The third review showed that prefix `realpath()` still collapsed a complete
+symlink chain and could hide a workspace-owned intermediate target. The new
+fixture links an outside PATH alias to `workspace/linked-bin`, which itself
+links back to an outside fake executable. It was RED 0/1 and executed the fake
+launcher.
+
+Candidate inspection now walks path components and each `readlink()` target
+itself, tracks at most 64 symlink hops, rejects every intermediate name or
+target inside the canonical workspace, and rechecks the symlink identity after
+reading it. Unresolvable or changing chains fail closed. The chained-alias test
+is GREEN 1/1; the full PATH/metadata/process-start selection is GREEN 12/12 and
+source TypeScript remains green.
+
+## Independent Review Fix Round 5
+
+The fourth review found that the component walker still normalized a raw link
+target before walking it. That differs from kernel path semantics when `..`
+appears after an intermediate symlink. The exact chained fixture was RED 0/1
+and again reached the outside marker executable.
+
+Raw `readlink()` targets now remain unnormalized. Their `.` and `..` components
+are consumed one at a time against the already-resolved prefix, so every
+intermediate symlink is inspected before later parent traversal is applied.
+The exact dotdot chain is GREEN 1/1; the accumulated executable/metadata/start
+matrix is GREEN 13/13 and source TypeScript remains green.
+
+The final independent re-review is APPROVED with no remaining P0/P1 in this
+boundary. The complete workspace suite is GREEN 97/97 and the scoped
+diff-check is clean on the final code.

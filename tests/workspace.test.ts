@@ -1,10 +1,10 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
-import { existsSync } from "node:fs";
+import { existsSync, renameSync, symlinkSync } from "node:fs";
 import { chmod, mkdir, mkdtemp, readFile, readdir, realpath, rename, rm, stat, symlink, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { delimiter, dirname, isAbsolute, join } from "node:path";
+import { delimiter, dirname, isAbsolute, join, sep } from "node:path";
 import test from "node:test";
 import { promisify } from "node:util";
 import { ApprovalManager, PermissionDeniedError } from "../src/approval.js";
@@ -1205,6 +1205,162 @@ test("automatic Git skips a repo-local PATH executable and approves the exact tr
   assert.equal(approvedExecutable, execution.invocation.executable);
 });
 
+test("automatic Git rejects a workspace-owned PATH symlink before realpath can make it look external", { skip: process.platform === "win32" ? "POSIX symlink fixture" : false }, async (t) => {
+  if (!(await gitAvailable())) {
+    t.skip("git ist nicht installiert");
+    return;
+  }
+  const holder = await mkdtemp(join(tmpdir(), "routercode-git-path-link-"));
+  t.after(() => rm(holder, { recursive: true, force: true }));
+  const root = join(holder, "workspace");
+  const outsideBin = join(holder, "outside-bin");
+  const repoPathEntry = join(root, "linked-bin");
+  const marker = join(holder, "fake-git-ran");
+  await mkdir(root);
+  await mkdir(outsideBin);
+  await initCommittedGitRepository(root);
+  await writeFile(
+    join(outsideBin, "git"),
+    `#!/bin/sh\nprintf fake > ${JSON.stringify(marker)}\nprintf 'fake status\\n'\n`,
+    { encoding: "utf8", mode: 0o755 },
+  );
+  await symlink(outsideBin, repoPathEntry, "dir");
+  const trustedGit = await realGitExecutable();
+
+  const execution = await runHardenedGitRead(
+    root,
+    { operation: "status" },
+    runProcess,
+    undefined,
+    { environment: { PATH: `${repoPathEntry}${delimiter}${dirname(trustedGit)}` } },
+  );
+
+  assert.equal(existsSync(marker), false, "workspace-owned PATH symlink executed fake git");
+  assert.equal(execution.invocation.executable, await realpath(trustedGit));
+  assert.doesNotMatch(execution.result.stdout, /fake status/);
+});
+
+test("automatic Git rejects a PATH candidate whose alias traversal enters and leaves the workspace", { skip: process.platform === "win32" ? "POSIX symlink fixture" : false }, async (t) => {
+  if (!(await gitAvailable())) {
+    t.skip("git ist nicht installiert");
+    return;
+  }
+  const holder = await mkdtemp(join(tmpdir(), "routercode-git-path-alias-"));
+  t.after(() => rm(holder, { recursive: true, force: true }));
+  const root = join(holder, "workspace");
+  const workspaceAlias = join(holder, "workspace-alias");
+  const outsideBin = join(holder, "outside-bin");
+  const linkedBin = join(root, "linked-bin");
+  const marker = join(holder, "fake-git-ran");
+  await mkdir(root);
+  await mkdir(outsideBin);
+  await initCommittedGitRepository(root);
+  await writeFile(
+    join(outsideBin, "git"),
+    `#!/bin/sh\nprintf fake > ${JSON.stringify(marker)}\nprintf 'fake status\\n'\n`,
+    { encoding: "utf8", mode: 0o755 },
+  );
+  await symlink(root, workspaceAlias, "dir");
+  await symlink(outsideBin, linkedBin, "dir");
+  const trustedGit = await realGitExecutable();
+
+  const execution = await runHardenedGitRead(
+    root,
+    { operation: "status" },
+    runProcess,
+    undefined,
+    {
+      environment: {
+        PATH: `${join(workspaceAlias, "linked-bin")}${delimiter}${dirname(trustedGit)}`,
+      },
+    },
+  );
+
+  assert.equal(existsSync(marker), false, "workspace alias traversal executed fake git");
+  assert.equal(execution.invocation.executable, await realpath(trustedGit));
+  assert.doesNotMatch(execution.result.stdout, /fake status/);
+});
+
+test("automatic Git inspects every intermediate target in a chained PATH alias", { skip: process.platform === "win32" ? "POSIX symlink fixture" : false }, async (t) => {
+  if (!(await gitAvailable())) {
+    t.skip("git ist nicht installiert");
+    return;
+  }
+  const holder = await mkdtemp(join(tmpdir(), "routercode-git-path-chain-"));
+  t.after(() => rm(holder, { recursive: true, force: true }));
+  const root = join(holder, "workspace");
+  const outside = join(holder, "outside");
+  const outsideBin = join(holder, "outside-bin");
+  const linkedBin = join(root, "linked-bin");
+  const pathAlias = join(outside, "path-alias");
+  const marker = join(holder, "fake-git-ran");
+  await mkdir(root);
+  await mkdir(outside);
+  await mkdir(outsideBin);
+  await initCommittedGitRepository(root);
+  await writeFile(
+    join(outsideBin, "git"),
+    `#!/bin/sh\nprintf fake > ${JSON.stringify(marker)}\nprintf 'fake status\\n'\n`,
+    { encoding: "utf8", mode: 0o755 },
+  );
+  await symlink(outsideBin, linkedBin, "dir");
+  await symlink(linkedBin, pathAlias, "dir");
+  const trustedGit = await realGitExecutable();
+
+  const execution = await runHardenedGitRead(
+    root,
+    { operation: "status" },
+    runProcess,
+    undefined,
+    { environment: { PATH: `${pathAlias}${delimiter}${dirname(trustedGit)}` } },
+  );
+
+  assert.equal(existsSync(marker), false, "chained workspace alias executed fake git");
+  assert.equal(execution.invocation.executable, await realpath(trustedGit));
+  assert.doesNotMatch(execution.result.stdout, /fake status/);
+});
+
+test("automatic Git preserves dotdot semantics while inspecting chained PATH aliases", { skip: process.platform === "win32" ? "POSIX symlink fixture" : false }, async (t) => {
+  if (!(await gitAvailable())) {
+    t.skip("git ist nicht installiert");
+    return;
+  }
+  const holder = await mkdtemp(join(tmpdir(), "routercode-git-path-dotdot-"));
+  t.after(() => rm(holder, { recursive: true, force: true }));
+  const root = join(holder, "workspace");
+  const outside = join(holder, "outside");
+  const outsideBin = join(holder, "outside-bin");
+  const pivotDeep = join(holder, "pivot", "deep");
+  const linkedBin = join(root, "linked-bin");
+  const pathAlias = join(outside, "path-alias");
+  const marker = join(holder, "fake-git-ran");
+  await mkdir(root);
+  await mkdir(outside);
+  await mkdir(outsideBin);
+  await mkdir(pivotDeep, { recursive: true });
+  await initCommittedGitRepository(root);
+  await writeFile(
+    join(outsideBin, "git"),
+    `#!/bin/sh\nprintf fake > ${JSON.stringify(marker)}\nprintf 'fake status\\n'\n`,
+    { encoding: "utf8", mode: 0o755 },
+  );
+  await symlink(pivotDeep, linkedBin, "dir");
+  await symlink(`${linkedBin}${sep}..${sep}..${sep}outside-bin`, pathAlias, "dir");
+  const trustedGit = await realGitExecutable();
+
+  const execution = await runHardenedGitRead(
+    root,
+    { operation: "status" },
+    runProcess,
+    undefined,
+    { environment: { PATH: `${pathAlias}${delimiter}${dirname(trustedGit)}` } },
+  );
+
+  assert.equal(existsSync(marker), false, "dotdot alias traversal executed fake git");
+  assert.equal(execution.invocation.executable, await realpath(trustedGit));
+  assert.doesNotMatch(execution.result.stdout, /fake status/);
+});
+
 test("automatic diff, status/dashboard, and direct diff cannot launch repository helpers", { skip: process.platform === "win32" ? "POSIX launcher fixture" : false }, async (t) => {
   if (!(await gitAvailable())) {
     t.skip("git ist nicht installiert");
@@ -1335,6 +1491,78 @@ test("automatic Git rejects a commondir that delegates repository metadata outsi
   assert.equal(spawned, false, "Git spawned with external common metadata");
 });
 
+test("automatic Git rejects symlinked critical metadata and object alternates before spawn", { skip: process.platform === "win32" ? "POSIX symlink fixture" : false }, async (t) => {
+  if (!(await gitAvailable())) {
+    t.skip("git ist nicht installiert");
+    return;
+  }
+  const fixtures = [
+    { name: "HEAD", kind: "file" as const },
+    { name: "index", kind: "file" as const },
+    { name: "objects", kind: "dir" as const },
+    { name: "refs", kind: "dir" as const },
+    { name: "packed-refs", kind: "file" as const },
+  ];
+  for (const fixture of fixtures) {
+    await t.test(fixture.name, async () => {
+      const holder = await mkdtemp(join(tmpdir(), "routercode-git-metadata-link-"));
+      t.after(() => rm(holder, { recursive: true, force: true }));
+      const root = join(holder, "workspace");
+      await mkdir(root);
+      await initCommittedGitRepository(root);
+      const target = join(root, ".git", fixture.name);
+      if (fixture.name === "packed-refs") {
+        await writeFile(target, "# pack-refs with: peeled fully-peeled sorted\n", "utf8");
+      }
+      const outside = join(holder, `outside-${fixture.name}`);
+      await rename(target, outside);
+      await symlink(outside, target, fixture.kind);
+      let spawned = false;
+
+      await assert.rejects(
+        runHardenedGitRead(
+          root,
+          { operation: "diff", staged: false },
+          async () => {
+            spawned = true;
+            return { code: 0, stdout: "external sentinel", stderr: "", truncated: false, timedOut: false, aborted: false };
+          },
+        ),
+        /Git-Metadaten|nicht sicher|ausgetauscht/i,
+      );
+      assert.equal(spawned, false, `${fixture.name} delegation reached Git spawn`);
+    });
+  }
+
+  for (const alternateName of ["alternates", "http-alternates"] as const) {
+    await t.test(`objects/info/${alternateName}`, async () => {
+      const holder = await mkdtemp(join(tmpdir(), "routercode-git-alternate-"));
+      t.after(() => rm(holder, { recursive: true, force: true }));
+      const root = join(holder, "workspace");
+      await mkdir(root);
+      await initCommittedGitRepository(root);
+      const alternate = alternateName === "alternates"
+        ? join(holder, "outside-objects")
+        : "https://example.invalid/private-objects";
+      await writeFile(join(root, ".git", "objects", "info", alternateName), `${alternate}\n`, "utf8");
+      let spawned = false;
+
+      await assert.rejects(
+        runHardenedGitRead(
+          root,
+          { operation: "status" },
+          async () => {
+            spawned = true;
+            return { code: 0, stdout: "", stderr: "", truncated: false, timedOut: false, aborted: false };
+          },
+        ),
+        /Git-Metadaten|Alternat|nicht sicher/i,
+      );
+      assert.equal(spawned, false, `${alternateName} reached Git spawn`);
+    });
+  }
+});
+
 test("automatic Git canonicalizes a symlinked workspace before approval and execution", { skip: process.platform === "win32" ? "POSIX symlink fixture" : false }, async (t) => {
   const holder = await mkdtemp(join(tmpdir(), "routercode-git-canonical-"));
   t.after(() => rm(holder, { recursive: true, force: true }));
@@ -1392,6 +1620,45 @@ test("automatic Git revalidates repository launchers after approval before spawn
   );
   assert.equal(spawned, false, "Git spawned after approval-time launcher injection");
   assert.equal(existsSync(marker), false);
+});
+
+test("automatic Git revalidates bound metadata after the visible process start and before spawning", { skip: process.platform === "win32" ? "POSIX symlink fixture" : false }, async (t) => {
+  if (!(await gitAvailable())) {
+    t.skip("git ist nicht installiert");
+    return;
+  }
+  const holder = await mkdtemp(join(tmpdir(), "routercode-git-process-start-swap-"));
+  t.after(() => rm(holder, { recursive: true, force: true }));
+  const root = join(holder, "workspace");
+  await mkdir(root);
+  await initCommittedGitRepository(root);
+  const retiredIndex = join(holder, "outside-index");
+  const retiredObjects = join(holder, "outside-objects");
+  let spawned = false;
+
+  await assert.rejects(
+    runHardenedGitRead(
+      root,
+      { operation: "diff", staged: false },
+      async () => {
+        spawned = true;
+        return { code: 0, stdout: "external sentinel", stderr: "", truncated: false, timedOut: false, aborted: false };
+      },
+      undefined,
+      {
+        processCallbacks: {
+          onProcessStart: () => {
+            renameSync(join(root, ".git", "index"), retiredIndex);
+            symlinkSync(retiredIndex, join(root, ".git", "index"));
+            renameSync(join(root, ".git", "objects"), retiredObjects);
+            symlinkSync(retiredObjects, join(root, ".git", "objects"), "dir");
+          },
+        },
+      },
+    ),
+    /Git-Metadaten|ausgetauscht|nicht sicher/i,
+  );
+  assert.equal(spawned, false, "Git spawned after the process-start observer swapped metadata");
 });
 
 test("automatic Git rejects an approval-time workspace identity replacement", { skip: process.platform === "win32" ? "POSIX directory replacement fixture" : false }, async (t) => {

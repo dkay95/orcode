@@ -9,13 +9,14 @@ import {
   open,
   readdir,
   readFile,
+  readlink,
   realpath,
   rename,
   stat,
   unlink,
   writeFile,
 } from "node:fs/promises";
-import { basename, delimiter, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { basename, delimiter, dirname, isAbsolute, join, parse, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import fg from "fast-glob";
 import { tool } from "@openrouter/agent";
@@ -76,6 +77,7 @@ const DIFF_PREVIEW_CHANGED_LINES = 60;
 const DIFF_CONTEXT_LINES = 3;
 const DIFF_LCS_BUDGET = 2_000_000;
 const MAX_GIT_CONFIG_BYTES = 1_000_000;
+const MAX_GIT_METADATA_ENTRIES = 250_000;
 
 /** Directories that never contain search hits worth showing. */
 const SEARCH_IGNORES = ["**/.git/**", "**/node_modules/**"] as const;
@@ -1615,6 +1617,15 @@ interface GitExecutableIdentity extends GitPathIdentity {
   ctimeNs: bigint;
 }
 
+interface GitMetadataIdentity extends GitExecutableIdentity {
+  kind: "file" | "directory";
+}
+
+interface GitRepositoryIdentity {
+  root: GitPathIdentity;
+  metadata: GitMetadataIdentity[];
+}
+
 function sameGitPathIdentity(
   left: GitPathIdentity | null,
   right: GitPathIdentity | null,
@@ -1686,12 +1697,216 @@ async function resolveTrustedGitExecutable(
   canonicalRoot: string,
   environment: NodeJS.ProcessEnv,
   platform: NodeJS.Platform = process.platform,
+  workspaceNames: readonly string[] = [canonicalRoot],
 ): Promise<GitExecutableIdentity> {
   for (const candidate of executableCandidates("git", environment, platform, process.cwd())) {
+    // Check the name supplied by PATH before realpath. Otherwise a symlink
+    // owned by the repository can point at an outside fake executable and
+    // acquire a superficially trusted canonical path.
+    if (workspaceNames.some((workspaceName) => pathIsWithinRoot(workspaceName, candidate))) {
+      continue;
+    }
+    if (await gitCandidateTraversalTouchesWorkspace(candidate, canonicalRoot)) {
+      continue;
+    }
     const identity = await executableIdentity(candidate);
     if (identity !== null && !pathIsWithinRoot(canonicalRoot, identity.path)) return identity;
   }
   throw new Error("Keine vertrauenswürdige git-Programmdatei außerhalb des Workspace gefunden.");
+}
+
+async function gitCandidateTraversalTouchesWorkspace(
+  candidate: string,
+  canonicalRoot: string,
+): Promise<boolean> {
+  const componentsFor = (absolutePath: string): { root: string; parts: string[] } => {
+    const root = parse(absolutePath).root;
+    return {
+      root,
+      parts: absolutePath.slice(root.length).split(sep).filter(Boolean),
+    };
+  };
+  let { root: resolvedRoot, parts: pending } = componentsFor(resolve(candidate));
+  let prefix = resolvedRoot;
+  let symlinkHops = 0;
+  while (pending.length > 0) {
+    const component = pending.shift();
+    if (component === undefined) break;
+    if (component === ".") continue;
+    if (component === "..") {
+      prefix = dirname(prefix);
+      if (pathIsWithinRoot(canonicalRoot, prefix)) return true;
+      continue;
+    }
+    prefix = join(prefix, component);
+    if (pathIsWithinRoot(canonicalRoot, prefix)) return true;
+    let before: BigIntStats;
+    try {
+      before = await lstat(prefix, { bigint: true });
+    } catch {
+      // A candidate whose complete prefix chain cannot be inspected is not a
+      // trustworthy automatic launcher. The caller will try the next PATH
+      // candidate instead of guessing through an unresolved alias.
+      return true;
+    }
+    if (!before.isSymbolicLink()) continue;
+    symlinkHops += 1;
+    if (symlinkHops > 64) return true;
+    try {
+      const linkTarget = await readlink(prefix);
+      // Preserve dot components exactly. Resolving the whole target here would
+      // collapse `..` before an intermediate symlink is followed, which is not
+      // how the kernel walks the eventual executable path.
+      const target = isAbsolute(linkTarget)
+        ? linkTarget
+        : `${dirname(prefix)}${sep}${linkTarget}`;
+      const after = await lstat(prefix, { bigint: true });
+      if (!after.isSymbolicLink() || !sameStableGitFile(before, after)) return true;
+      const targetComponents = componentsFor(target);
+      resolvedRoot = targetComponents.root;
+      prefix = resolvedRoot;
+      pending = [...targetComponents.parts, ...pending];
+    } catch {
+      return true;
+    }
+  }
+  return false;
+}
+
+function gitMetadataIdentity(
+  path: string,
+  info: BigIntStats,
+): GitMetadataIdentity {
+  return {
+    path,
+    dev: info.dev,
+    ino: info.ino,
+    size: info.size,
+    mode: info.mode,
+    mtimeNs: info.mtimeNs,
+    ctimeNs: info.ctimeNs,
+    kind: info.isDirectory() ? "directory" : "file",
+  };
+}
+
+function sameGitMetadataIdentity(
+  left: GitMetadataIdentity,
+  right: GitMetadataIdentity,
+): boolean {
+  return left.kind === right.kind && sameGitExecutableIdentity(left, right);
+}
+
+function sameGitRepositoryIdentity(
+  left: GitRepositoryIdentity | null,
+  right: GitRepositoryIdentity | null,
+): boolean {
+  if (left === null) return right === null;
+  if (right === null || !sameGitPathIdentity(left.root, right.root)) return false;
+  if (left.metadata.length !== right.metadata.length) return false;
+  return left.metadata.every((entry, index) => {
+    const candidate = right.metadata[index];
+    return candidate !== undefined && sameGitMetadataIdentity(entry, candidate);
+  });
+}
+
+async function snapshotGitMetadataEntry(
+  path: string,
+  canonicalGitDirectory: string,
+  identities: GitMetadataIdentity[],
+  counter: { value: number },
+  optional = false,
+): Promise<void> {
+  let before: BigIntStats;
+  try {
+    before = await lstat(path, { bigint: true });
+  } catch (error) {
+    if (optional && hasCode(error, "ENOENT")) return;
+    throw error;
+  }
+  counter.value += 1;
+  if (counter.value > MAX_GIT_METADATA_ENTRIES) {
+    throw new Error("Zu viele Git-Metadaten für einen sicheren automatischen Lesevorgang.");
+  }
+  if (before.isSymbolicLink() || (!before.isFile() && !before.isDirectory())) {
+    throw new Error(`Git-Metadaten sind nicht sicher gebunden: ${path}`);
+  }
+  const canonical = await realpath(path);
+  if (!pathIsWithinRoot(canonicalGitDirectory, canonical)) {
+    throw new Error(`Git-Metadaten liegen außerhalb des Workspace: ${path}`);
+  }
+  const relativeMetadataPath = relative(canonicalGitDirectory, canonical)
+    .split(sep)
+    .join("/");
+  if (
+    relativeMetadataPath === "objects/info/alternates" ||
+    relativeMetadataPath === "objects/info/http-alternates"
+  ) {
+    throw new Error("Externe Git-Objekt-Alternativen sind für automatische Lesevorgänge nicht sicher.");
+  }
+
+  if (before.isDirectory()) {
+    const children = await readdir(path);
+    children.sort((left, right) => left.localeCompare(right, "en"));
+    for (const child of children) {
+      await snapshotGitMetadataEntry(
+        join(path, child),
+        canonicalGitDirectory,
+        identities,
+        counter,
+      );
+    }
+    const after = await lstat(path, { bigint: true });
+    if (
+      after.isSymbolicLink() ||
+      !after.isDirectory() ||
+      !sameStableGitFile(before, after)
+    ) {
+      throw new Error(`Git-Metadaten wurden während der Sicherheitsprüfung ausgetauscht: ${path}`);
+    }
+    identities.push(gitMetadataIdentity(canonical, after));
+    return;
+  }
+
+  const after = await lstat(path, { bigint: true });
+  if (after.isSymbolicLink() || !after.isFile() || !sameStableGitFile(before, after)) {
+    throw new Error(`Git-Metadaten wurden während der Sicherheitsprüfung ausgetauscht: ${path}`);
+  }
+  identities.push(gitMetadataIdentity(canonical, after));
+}
+
+async function snapshotAutomaticGitMetadata(
+  canonicalGitDirectory: string,
+): Promise<GitMetadataIdentity[]> {
+  const identities: GitMetadataIdentity[] = [];
+  const counter = { value: 0 };
+  await snapshotGitMetadataEntry(
+    join(canonicalGitDirectory, "HEAD"),
+    canonicalGitDirectory,
+    identities,
+    counter,
+  );
+  await snapshotGitMetadataEntry(
+    join(canonicalGitDirectory, "objects"),
+    canonicalGitDirectory,
+    identities,
+    counter,
+  );
+  await snapshotGitMetadataEntry(
+    join(canonicalGitDirectory, "refs"),
+    canonicalGitDirectory,
+    identities,
+    counter,
+  );
+  for (const optionalName of ["index", "packed-refs", "shallow", "info"] as const) {
+    await snapshotGitMetadataEntry(
+      join(canonicalGitDirectory, optionalName),
+      canonicalGitDirectory,
+      identities,
+      counter,
+      true,
+    );
+  }
+  return identities.sort((left, right) => left.path.localeCompare(right.path, "en"));
 }
 
 function sameStableGitFile(
@@ -1746,7 +1961,7 @@ async function readStableGitConfig(configPath: string): Promise<string | null> {
   }
 }
 
-async function assertSafeAutomaticGitRepository(canonicalRoot: string): Promise<GitPathIdentity | null> {
+async function assertSafeAutomaticGitRepository(canonicalRoot: string): Promise<GitRepositoryIdentity | null> {
   const gitDirectory = join(canonicalRoot, ".git");
   let gitDirectoryInfo;
   try {
@@ -1801,7 +2016,10 @@ async function assertSafeAutomaticGitRepository(canonicalRoot: string): Promise<
   ) {
     throw new Error("Git-Repository wurde während der Sicherheitsprüfung ausgetauscht.");
   }
-  return gitIdentity;
+  return {
+    root: gitIdentity,
+    metadata: await snapshotAutomaticGitMetadata(canonicalGitDirectory),
+  };
 }
 
 export async function runHardenedGitRead(
@@ -1814,9 +2032,15 @@ export async function runHardenedGitRead(
   const operation: GitReadOperation = request.operation;
   const policy = evaluateGitReadCapability(operation);
   const sourceEnvironment = runtime.environment ?? process.env;
+  const lexicalRoot = resolve(root);
   const canonicalRoot = await realpath(root);
   const rootIdentity = await gitDirectoryIdentity(canonicalRoot);
-  const executableIdentity = await resolveTrustedGitExecutable(canonicalRoot, sourceEnvironment);
+  const executableIdentity = await resolveTrustedGitExecutable(
+    canonicalRoot,
+    sourceEnvironment,
+    process.platform,
+    [lexicalRoot, canonicalRoot],
+  );
   const repositoryIdentity = await assertSafeAutomaticGitRepository(canonicalRoot);
   const effectiveEnvironment = gitSafeEnvironment(canonicalRoot, sourceEnvironment);
   const {
@@ -1833,20 +2057,26 @@ export async function runHardenedGitRead(
     env: effectiveEnvironment,
   };
   await beforeRun?.(invocation, policy);
-  const currentRepositoryIdentity = await assertSafeAutomaticGitRepository(canonicalRoot);
-  if (!sameGitPathIdentity(repositoryIdentity, currentRepositoryIdentity)) {
-    throw new Error("Git-Repository wurde vor dem Start ausgetauscht.");
-  }
-  await assertSameGitDirectoryIdentity(rootIdentity);
-  await assertSameGitExecutableIdentity(executableIdentity);
-  const execute = (onChunk: RunProcessOptions["onChunk"]) =>
-    runner(invocation.executable, invocation.args, {
+  const execute = async (onChunk: RunProcessOptions["onChunk"]) => {
+    // With process observers, runObservedProcess emits the visible start event
+    // before invoking this closure. Keep the final identity checks here so an
+    // observational callback cannot open an unchecked mutation window before
+    // the actual spawn. The repository snapshot is deliberately last and the
+    // runner is invoked immediately after it, without another callback.
+    await assertSameGitDirectoryIdentity(rootIdentity);
+    await assertSameGitExecutableIdentity(executableIdentity);
+    const currentRepositoryIdentity = await assertSafeAutomaticGitRepository(canonicalRoot);
+    if (!sameGitRepositoryIdentity(repositoryIdentity, currentRepositoryIdentity)) {
+      throw new Error("Git-Repository wurde vor dem Start ausgetauscht.");
+    }
+    return runner(invocation.executable, invocation.args, {
       cwd: invocation.cwd,
       timeoutMs: request.operation === "diff" ? 20_000 : 3_000,
       env: invocation.env,
       ...processRuntime,
       ...(onChunk ? { onChunk } : {}),
     });
+  };
   const result = processCallbacks
     ? await runObservedProcess(
         processName ?? policy.id,
