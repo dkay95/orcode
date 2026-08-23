@@ -2,6 +2,7 @@ node_modules/
 dist/
 .routercode/
 .ai-collab/
+.worktrees/
 .env
 *.log
 *.jpg
