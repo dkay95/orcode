@@ -1,6 +1,6 @@
 {
   "name": "orcode",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "description": "A local, terminal-based coding agent CLI that runs against any tool-capable model on OpenRouter, with per-workspace cost tracking, explicit approval modes, and a separate compressor model for long context.",
   "keywords": [
     "openrouter",
@@ -24,13 +24,17 @@
   "author": "Dogancan Kaya <dogancan.kaya424@gmail.com>",
   "type": "module",
   "bin": {
-    "orcode": "./dist/cli.js"
+    "orcode": "./dist/cli.js",
+    "routercode": "./dist/cli.js"
   },
   "files": [
     "dist",
     "README.md",
     "LICENSE",
-    "NOTICE"
+    "NOTICE",
+    "CHANGELOG.md",
+    "scripts/install-user.mjs",
+    "scripts/check-package.mjs"
   ],
   "scripts": {
     "build": "tsc -p tsconfig.json && node -e \"require('node:fs').chmodSync('dist/cli.js', 0o755)\"",
@@ -38,7 +42,7 @@
     "start": "node dist/cli.js",
     "test": "node --import tsx --test tests/*.test.ts",
     "check": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.tests.json --noEmit && npm test",
-    "install:user": "npm run build && node scripts/install-user.mjs",
+    "install:user": "node scripts/install-user.mjs",
     "prepublishOnly": "npm run check && npm run build"
   },
   "engines": {

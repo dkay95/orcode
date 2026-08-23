@@ -9,6 +9,29 @@ breaking changes.
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-08-23
+
+### Added
+
+- Both `orcode` and the backwards-compatible `routercode` command are shipped
+  by the npm package and by the non-destructive per-user installer.
+- Live process output, bounded automatic verification and repair, hardened Git,
+  browser and SSH execution, and explicit reconnectable credential state.
+
+### Changed
+
+- Command help, completion, dispatch, and README documentation now share one
+  generated catalog and package-derived version metadata.
+- Chat-owned local data now follows one private, migratable, retention-aware
+  storage boundary, including redacted human-readable logs and exact recovery
+  artifacts with separate limits.
+
+### Security
+
+- Approval rules use exact structured subjects, model routing validates every
+  main-role candidate, and automatic Git reads bind repository metadata and
+  configuration immediately before process launch.
+
 ## [0.4.0] - 2026-07-27
 
 ### Added
