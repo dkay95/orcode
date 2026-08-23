@@ -110,6 +110,9 @@ export class ProviderComingSoonError extends Error {
 }
 
 export class ProviderSetupRequiredError extends Error {
+  readonly code = "provider-setup-required" as const;
+  readonly exitCode = 1 as const;
+
   constructor(message = "Provider setup is required.") {
     super(message);
     this.name = "ProviderSetupRequiredError";

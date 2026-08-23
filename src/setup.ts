@@ -1,0 +1,1329 @@
+import {
+  ProviderSetupRequiredError,
+  deriveProviderHeadline,
+  type BackendAdapter,
+  type BackendId,
+  type BackendMaturity,
+  type BackendModelDescriptor,
+  type BackendRegistry,
+  type BillingRealm,
+  type ProviderHeadline,
+  type ProviderHealth,
+  type ProviderInspection,
+  type RouteIdentityV1,
+} from "./backends.js";
+import type {
+  ProviderActivationCoordinator,
+  ProviderActivationRequest,
+  ProviderActivationResult,
+} from "./provider-activation.js";
+import {
+  type ProviderConnectionStateV1,
+  type ProviderSetupStateV1,
+  type ProviderStateStore,
+} from "./provider-state.js";
+
+export { ProviderSetupRequiredError };
+
+const DEFAULT_PROVIDER_TIMEOUT_MS = 5_000;
+const MAX_PROVIDER_TIMEOUT_MS = 15_000;
+const DEFAULT_STARTUP_TIMEOUT_MS = 8_000;
+const MAX_STARTUP_TIMEOUT_MS = 30_000;
+
+export interface SetupClock {
+  now(): number;
+  setTimeout(callback: () => void, delayMs: number): unknown;
+  clearTimeout(handle: unknown): void;
+}
+
+export type StartupSetupMode =
+  | "ready"
+  | "ready-with-warning"
+  | "route-choice-required"
+  | "setup-required";
+
+export type SetupEvent =
+  | { version: 1; type: "inspection-start"; backendId: BackendId; generation: number }
+  | { version: 1; type: "inspection-end"; backendId: BackendId; maturity: BackendMaturity; generation: number; durationMs: number; health: ProviderHealth; headline: ProviderHeadline; accountFingerprint: string | null; billingRealm: BillingRealm }
+  | { version: 1; type: "inspection-discarded"; backendId: BackendId; generation: number; reason: "stale-generation" }
+  | { version: 1; type: "candidate-activation"; backendId: BackendId; generation: number; connectionId: string; route: RouteIdentityV1 }
+  | { version: 1; type: "setup-required"; generation: number }
+  | { version: 1; type: "route-choice-required"; generation: number; routeIds: readonly string[] }
+  | { version: 1; type: "warning"; generation: number; code: string; message: string }
+  | { version: 1; type: "terminal-failure"; backendId: BackendId | null; generation: number; code: string; retryable: boolean; message: string };
+
+export interface StartupSetupResult {
+  mode: StartupSetupMode;
+  generation: number;
+  defaultRoute: RouteIdentityV1 | null;
+  readyRoutes: readonly RouteIdentityV1[];
+  warnings: readonly string[];
+  crossEnabled: false;
+}
+
+export interface StartupInspectionOptions {
+  signal?: AbortSignal;
+  providerTimeoutMs?: number;
+  startupTimeoutMs?: number;
+}
+
+export class ProviderInspectionTimeoutError extends Error {
+  readonly code = "provider-inspection-timeout" as const;
+
+  constructor(
+    readonly scope: "provider" | "startup",
+    readonly backendId: BackendId | null,
+    readonly timeoutMs: number,
+  ) {
+    super(scope === "provider"
+      ? "Provider inspection reached its deadline."
+      : "Provider startup inspection reached its deadline.");
+    this.name = "ProviderInspectionTimeoutError";
+  }
+}
+
+interface ActivationCoordinatorLike {
+  activate(
+    request: ProviderActivationRequest,
+  ): ReturnType<ProviderActivationCoordinator["activate"]>;
+}
+
+export interface SetupOrchestratorOptions {
+  registry: BackendRegistry;
+  stateStore: ProviderStateStore;
+  activationCoordinator: ActivationCoordinatorLike;
+  clock?: SetupClock;
+  providerTimeoutMs?: number;
+  startupTimeoutMs?: number;
+  emit?: (event: SetupEvent) => void;
+}
+
+interface ProbeTarget {
+  connection: ProviderConnectionStateV1;
+  adapter: BackendAdapter;
+  maturity: BackendMaturity;
+}
+
+interface AttemptToken {
+  generation: number;
+  backendId: BackendId;
+  connectionId: string;
+  controller: AbortController;
+  closed: boolean;
+  superseded: boolean;
+  discardEmitted: boolean;
+}
+
+interface NormalizedInspection {
+  backendId: BackendId;
+  connectionId: string;
+  health: ProviderHealth;
+  headline: ProviderHeadline;
+  accountFingerprint: string | null;
+  billingRealm: BillingRealm;
+  routeEligible: boolean;
+}
+
+type ProbeOutcome =
+  | { kind: "completed"; target: ProbeTarget; token: AttemptToken; durationMs: number; inspection: NormalizedInspection }
+  | { kind: "timeout" | "error"; target: ProbeTarget; token: AttemptToken; durationMs: number; inspection: NormalizedInspection }
+  | { kind: "invalid" | "stale" | "cancelled"; target: ProbeTarget; token: AttemptToken; durationMs: number };
+
+interface InspectionProof {
+  generation: number;
+  stateRevision: number;
+  backendId: BackendId;
+  connectionId: string;
+  accountFingerprint: string;
+  billingRealm: BillingRealm;
+}
+
+interface ApplyResult {
+  state: ProviderSetupStateV1;
+  changed: boolean;
+}
+
+interface BoundedModelsResult {
+  kind: "models" | "timeout" | "error" | "stale" | "cancelled";
+  models?: readonly BackendModelDescriptor[];
+}
+
+const SYSTEM_CLOCK: SetupClock = {
+  now: () => Date.now(),
+  setTimeout: (callback, delayMs) => globalThis.setTimeout(callback, delayMs),
+  clearTimeout: (handle) => globalThis.clearTimeout(handle as ReturnType<typeof setTimeout>),
+};
+
+export class SetupOrchestrator {
+  readonly #registry: BackendRegistry;
+  readonly #stateStore: ProviderStateStore;
+  readonly #activationCoordinator: ActivationCoordinatorLike;
+  readonly #clock: SetupClock;
+  readonly #emitCallback: (event: SetupEvent) => void;
+  readonly #providerTimeoutMs: number;
+  readonly #startupTimeoutMs: number;
+  readonly #activeProbes = new Set<AttemptToken>();
+  readonly #proofs = new Map<string, InspectionProof>();
+  readonly #legacyResolutionAttempts = new Set<string>();
+  #generation = 0;
+  #latestResult: StartupSetupResult | null = null;
+  #activationInFlight: Promise<void> | null = null;
+
+  constructor(options: SetupOrchestratorOptions) {
+    this.#registry = options.registry;
+    this.#stateStore = options.stateStore;
+    this.#activationCoordinator = options.activationCoordinator;
+    this.#clock = options.clock ?? SYSTEM_CLOCK;
+    this.#emitCallback = options.emit ?? (() => undefined);
+    this.#providerTimeoutMs = boundedTimeout(
+      options.providerTimeoutMs,
+      DEFAULT_PROVIDER_TIMEOUT_MS,
+      MAX_PROVIDER_TIMEOUT_MS,
+      "provider",
+    );
+    this.#startupTimeoutMs = boundedTimeout(
+      options.startupTimeoutMs,
+      DEFAULT_STARTUP_TIMEOUT_MS,
+      MAX_STARTUP_TIMEOUT_MS,
+      "startup",
+    );
+    assertFiniteNow(this.#clock.now());
+  }
+
+  async inspectStartup(options: StartupInspectionOptions = {}): Promise<StartupSetupResult> {
+    const generation = await this.#beginGeneration();
+    return this.#inspectGeneration(generation, "inspect", undefined, options);
+  }
+
+  async reconnect(
+    backendId: BackendId,
+    options: StartupInspectionOptions = {},
+  ): Promise<StartupSetupResult> {
+    const generation = await this.#beginGeneration();
+    return this.#inspectGeneration(generation, "reconnect", backendId, options);
+  }
+
+  async cancelSetup(): Promise<StartupSetupResult> {
+    const generation = await this.#beginGeneration();
+    const captured = this.#stateStore.read();
+    const state = await this.#commitCancelled(captured, generation);
+    const result = this.#setupRequiredResult(state, generation);
+    this.#latestResult = result;
+    this.#proofs.clear();
+    this.#emit({ version: 1, type: "setup-required", generation });
+    return result;
+  }
+
+  ensureRunnableRoute(): RouteIdentityV1 {
+    const result = this.#latestResult;
+    const current = this.#stateStore.read().defaultRoute;
+    if (
+      result
+      && (result.mode === "ready" || result.mode === "ready-with-warning")
+      && current
+      && isResolvedRoute(current)
+      && result.readyRoutes.some((candidate) => sameResolvedRoute(candidate, current))
+    ) {
+      return structuredClone(current);
+    }
+    throw new ProviderSetupRequiredError();
+  }
+
+  async activateCandidate(
+    request: Omit<ProviderActivationRequest, "generation">,
+  ): Promise<ProviderActivationResult> {
+    let releaseActivation!: () => void;
+    const ownGate = new Promise<void>((resolve) => {
+      releaseActivation = resolve;
+    });
+    const priorActivation = this.#activationInFlight;
+    const activationTail = priorActivation
+      ? priorActivation.then(() => ownGate)
+      : ownGate;
+    this.#activationInFlight = activationTail;
+    try {
+      if (priorActivation) await priorActivation;
+      this.#supersedeActiveProbes();
+      this.#generation += 1;
+      const generation = this.#generation;
+      const result = await this.#activationCoordinator.activate({
+        ...request,
+        generation,
+      });
+      if (generation !== this.#generation) return result;
+      const state = result.state ?? this.#stateStore.read();
+      const connection = state.connections.find((candidate) =>
+        candidate.enabled
+        && candidate.backendId === result.route.backendId
+        && candidate.accountFingerprint === result.route.accountFingerprint
+        && candidate.billingRealm === result.route.billingRealm
+      );
+      if (connection) {
+        this.#emit({
+          version: 1,
+          type: "candidate-activation",
+          backendId: result.route.backendId,
+          generation,
+          connectionId: connection.id,
+          route: structuredClone(result.route),
+        });
+      }
+      return result;
+    } finally {
+      releaseActivation();
+      if (this.#activationInFlight === activationTail) this.#activationInFlight = null;
+    }
+  }
+
+  async resolveLegacyDefaultRoute(
+    options: Pick<StartupInspectionOptions, "signal" | "providerTimeoutMs"> = {},
+  ): Promise<StartupSetupResult> {
+    const generation = this.#generation;
+    const captured = this.#stateStore.read();
+    const legacyRoute = captured.defaultRoute;
+    if (!legacyRoute || legacyRoute.resolutionState !== "legacy-unverified") {
+      const result = this.#reduce(captured, generation, []);
+      this.#latestResult = result;
+      return result;
+    }
+
+    const connection = captured.connections.find((candidate) =>
+      candidate.enabled
+      && candidate.accountFingerprintState === "verified"
+      && candidate.backendId === legacyRoute.backendId
+      && candidate.accountFingerprint === legacyRoute.accountFingerprint
+      && candidate.billingRealm === legacyRoute.billingRealm
+    );
+    const proof = connection ? this.#proofs.get(connection.id) : undefined;
+    if (
+      !connection
+      || !proof
+      || proof.generation !== generation
+      || proof.stateRevision !== captured.revision
+      || proof.accountFingerprint !== connection.accountFingerprint
+      || proof.billingRealm !== connection.billingRealm
+    ) {
+      return this.#publishRouteChoice(captured, generation, legacyRoute);
+    }
+
+    const attemptKey = `${generation}:${captured.revision}:${routeId(legacyRoute)}`;
+    if (this.#legacyResolutionAttempts.has(attemptKey)) {
+      return this.#publishRouteChoice(captured, generation, legacyRoute);
+    }
+    this.#legacyResolutionAttempts.add(attemptKey);
+
+    let adapter: BackendAdapter;
+    try {
+      adapter = this.#registry.adapter(connection.backendId);
+    } catch {
+      return this.#publishRouteChoice(captured, generation, legacyRoute);
+    }
+
+    const modelsResult = await this.#listModelsBounded(
+      adapter,
+      generation,
+      boundedTimeout(
+        options.providerTimeoutMs,
+        this.#providerTimeoutMs,
+        MAX_PROVIDER_TIMEOUT_MS,
+        "provider",
+      ),
+      options.signal,
+    );
+    if (modelsResult.kind === "cancelled") throw abortReason(options.signal!);
+    if (modelsResult.kind === "stale") {
+      return this.#latestResult
+        ?? this.#setupRequiredResult(this.#stateStore.read(), generation);
+    }
+    if (modelsResult.kind !== "models") {
+      return this.#publishRouteChoice(this.#stateStore.read(), generation, legacyRoute);
+    }
+
+    const current = this.#stateStore.read();
+    if (generation !== this.#generation) {
+      return this.#latestResult ?? this.#setupRequiredResult(current, generation);
+    }
+    if (
+      current.revision !== captured.revision
+      || JSON.stringify(current) !== JSON.stringify(captured)
+    ) {
+      return this.#publishRouteChoice(current, generation, current.defaultRoute ?? legacyRoute);
+    }
+
+    const exact = (modelsResult.models ?? []).filter((candidate) =>
+      candidate.backendId === legacyRoute.backendId
+      && candidate.requestedModelId === legacyRoute.requestedModelId
+      && candidate.canonicalModelId.length > 0
+      && candidate.capabilities.textInput
+      && candidate.capabilities.textOutput
+    );
+    const canonicalIds = new Set(exact.map((candidate) => candidate.canonicalModelId));
+    if (exact.length === 0 || canonicalIds.size !== 1) {
+      return this.#publishRouteChoice(captured, generation, legacyRoute);
+    }
+    const canonicalModelId = exact[0]!.canonicalModelId;
+
+    try {
+      const committed = await this.#stateStore.commit(
+        captured.revision,
+        (authoritative) => {
+          if (JSON.stringify(authoritative) !== JSON.stringify(captured)) {
+            throw new Error("Provider state changed during legacy model resolution.");
+          }
+          return {
+            ...authoritative,
+            defaultRoute: {
+              ...legacyRoute,
+              canonicalModelId,
+              resolutionState: "resolved",
+            },
+          };
+        },
+        () => {
+          if (generation !== this.#generation) {
+            throw new Error("Legacy model resolution generation is stale.");
+          }
+        },
+      );
+      const currentProof = this.#proofs.get(connection.id);
+      if (currentProof && currentProof.generation === generation) {
+        this.#proofs.set(connection.id, {
+          ...currentProof,
+          stateRevision: committed.revision,
+        });
+      }
+      const result = this.#reduce(committed, generation, []);
+      this.#latestResult = result;
+      return result;
+    } catch {
+      if (generation !== this.#generation) {
+        return this.#latestResult
+          ?? this.#setupRequiredResult(this.#stateStore.read(), generation);
+      }
+      return this.#publishRouteChoice(this.#stateStore.read(), generation, legacyRoute);
+    }
+  }
+
+  async #beginGeneration(): Promise<number> {
+    this.#supersedeActiveProbes();
+    while (this.#activationInFlight) {
+      await this.#activationInFlight;
+    }
+    this.#supersedeActiveProbes();
+    this.#generation += 1;
+    return this.#generation;
+  }
+
+  #supersedeActiveProbes(): void {
+    for (const token of [...this.#activeProbes]) {
+      if (token.closed) continue;
+      token.superseded = true;
+      token.controller.abort(new DOMException("Provider inspection superseded.", "AbortError"));
+    }
+  }
+
+  async #inspectGeneration(
+    generation: number,
+    method: "inspect" | "reconnect",
+    backendId: BackendId | undefined,
+    options: StartupInspectionOptions,
+  ): Promise<StartupSetupResult> {
+    const captured = this.#stateStore.read();
+    if (options.signal?.aborted) {
+      await this.#handleCallerCancellation(captured, generation, options.signal);
+    }
+    const targets = this.#targets(captured, backendId);
+    if (targets.length === 0) {
+      const result = this.#reduce(captured, generation, []);
+      this.#latestResult = result;
+      this.#proofs.clear();
+      this.#publishModeEvent(result, captured.defaultRoute);
+      return result;
+    }
+
+    const providerTimeoutMs = boundedTimeout(
+      options.providerTimeoutMs,
+      this.#providerTimeoutMs,
+      MAX_PROVIDER_TIMEOUT_MS,
+      "provider",
+    );
+    const startupTimeoutMs = boundedTimeout(
+      options.startupTimeoutMs,
+      this.#startupTimeoutMs,
+      MAX_STARTUP_TIMEOUT_MS,
+      "startup",
+    );
+    const probePromises = targets.map((target) =>
+      this.#runProbe(target, method, generation, providerTimeoutMs)
+    );
+    const cancelOutstanding = () => {
+      const reason = abortReason(options.signal!);
+      for (const token of this.#activeProbes) {
+        if (token.generation === generation && !token.closed) token.controller.abort(reason);
+      }
+    };
+    options.signal?.addEventListener("abort", cancelOutstanding, { once: true });
+    const wholeTimer = this.#clock.setTimeout(() => {
+      for (const token of this.#activeProbes) {
+        if (token.generation !== generation || token.closed) continue;
+        token.controller.abort(new ProviderInspectionTimeoutError(
+          "startup",
+          null,
+          startupTimeoutMs,
+        ));
+      }
+    }, startupTimeoutMs);
+
+    let outcomes: ProbeOutcome[];
+    try {
+      outcomes = await Promise.all(probePromises);
+    } finally {
+      this.#clock.clearTimeout(wholeTimer);
+      options.signal?.removeEventListener("abort", cancelOutstanding);
+    }
+
+    if (options.signal?.aborted) {
+      await this.#handleCallerCancellation(captured, generation, options.signal);
+    }
+    if (generation !== this.#generation || outcomes.some((outcome) => outcome.kind === "stale")) {
+      return this.#latestResult ?? this.#setupRequiredResult(this.#stateStore.read(), generation);
+    }
+
+    const preview = applyOutcomes(captured, outcomes);
+    let authoritative = captured;
+    if (preview.changed) {
+      try {
+        authoritative = await this.#stateStore.commit(
+          captured.revision,
+          (current) => {
+            if (JSON.stringify(current) !== JSON.stringify(captured)) {
+              throw new Error("Provider state changed during inspection.");
+            }
+            return applyOutcomes(current, outcomes).state;
+          },
+          () => {
+            if (generation !== this.#generation) {
+              throw new Error("Provider inspection generation is stale.");
+            }
+          },
+        );
+      } catch {
+        this.#invalidateGeneration(generation, outcomes);
+        return this.#latestResult ?? this.#setupRequiredResult(this.#stateStore.read(), generation);
+      }
+    } else {
+      const current = this.#stateStore.read();
+      if (
+        current.revision !== captured.revision
+        || JSON.stringify(current) !== JSON.stringify(captured)
+      ) {
+        this.#invalidateGeneration(generation, outcomes);
+        return this.#latestResult ?? this.#setupRequiredResult(current, generation);
+      }
+    }
+
+    this.#proofs.clear();
+    this.#publishInspectionEvents(outcomes, authoritative, generation);
+    this.#recordProofs(outcomes, authoritative, generation);
+    const result = this.#reduce(authoritative, generation, outcomes);
+    this.#latestResult = result;
+    this.#publishModeEvent(result, authoritative.defaultRoute);
+    return result;
+  }
+
+  #targets(state: ProviderSetupStateV1, backendId?: BackendId): ProbeTarget[] {
+    const targets: ProbeTarget[] = [];
+    for (const current of state.connections) {
+      if (!current.enabled || (backendId && current.backendId !== backendId)) continue;
+      try {
+        const descriptor = this.#registry.descriptor(current.backendId);
+        if (!descriptor.connectable || descriptor.maturity === "coming-soon") continue;
+        targets.push({
+          connection: structuredClone(current),
+          adapter: this.#registry.adapter(current.backendId),
+          maturity: descriptor.maturity,
+        });
+      } catch {
+        continue;
+      }
+    }
+    return targets;
+  }
+
+  #runProbe(
+    target: ProbeTarget,
+    method: "inspect" | "reconnect",
+    generation: number,
+    timeoutMs: number,
+  ): Promise<ProbeOutcome> {
+    const startedAt = this.#clock.now();
+    assertFiniteNow(startedAt);
+    const controller = new AbortController();
+    const token: AttemptToken = {
+      generation,
+      backendId: target.connection.backendId,
+      connectionId: target.connection.id,
+      controller,
+      closed: false,
+      superseded: false,
+      discardEmitted: false,
+    };
+    this.#activeProbes.add(token);
+    this.#emit({
+      version: 1,
+      type: "inspection-start",
+      backendId: target.connection.backendId,
+      generation,
+    });
+
+    return new Promise<ProbeOutcome>((resolve) => {
+      let providerTimer: unknown;
+      const duration = () => Math.max(0, this.#clock.now() - startedAt);
+      const finish = (outcome: ProbeOutcome) => {
+        if (token.closed) return;
+        token.closed = true;
+        this.#clock.clearTimeout(providerTimer);
+        controller.signal.removeEventListener("abort", onAbort);
+        this.#activeProbes.delete(token);
+        resolve(outcome);
+      };
+      const discard = () => {
+        if (token.discardEmitted) return;
+        token.discardEmitted = true;
+        this.#emit({
+          version: 1,
+          type: "inspection-discarded",
+          backendId: target.connection.backendId,
+          generation,
+          reason: "stale-generation",
+        });
+      };
+      const onAbort = () => {
+        const reason = controller.signal.reason;
+        if (token.superseded) {
+          discard();
+          finish({ kind: "stale", target, token, durationMs: duration() });
+          return;
+        }
+        if (reason instanceof ProviderInspectionTimeoutError) {
+          finish({
+            kind: "timeout",
+            target,
+            token,
+            durationMs: duration(),
+            inspection: syntheticInspection(target, generation, this.#clock.now()),
+          });
+          return;
+        }
+        finish({ kind: "cancelled", target, token, durationMs: duration() });
+      };
+      controller.signal.addEventListener("abort", onAbort, { once: true });
+
+      const request = {
+        generation,
+        deadlineAt: startedAt + timeoutMs,
+        signal: controller.signal,
+      };
+      const operation = Promise.resolve().then(() => target.adapter[method](request));
+      operation.then(
+        (raw) => {
+          if (token.closed) {
+            discard();
+            return;
+          }
+          if (generation !== this.#generation) {
+            discard();
+            finish({ kind: "stale", target, token, durationMs: duration() });
+            return;
+          }
+          let normalized: NormalizedInspection | null = null;
+          try {
+            normalized = normalizeInspection(raw, target, generation);
+          } catch {
+            // Treat adversarial getters like any other invalid adapter result.
+          }
+          if (!normalized) {
+            finish({ kind: "invalid", target, token, durationMs: duration() });
+            return;
+          }
+          finish({
+            kind: "completed",
+            target,
+            token,
+            durationMs: duration(),
+            inspection: normalized,
+          });
+        },
+        () => {
+          if (token.closed) {
+            discard();
+            return;
+          }
+          if (controller.signal.aborted) {
+            onAbort();
+            return;
+          }
+          finish({
+            kind: "error",
+            target,
+            token,
+            durationMs: duration(),
+            inspection: syntheticInspection(target, generation, this.#clock.now()),
+          });
+        },
+      );
+
+      providerTimer = this.#clock.setTimeout(() => {
+        controller.abort(new ProviderInspectionTimeoutError(
+          "provider",
+          target.connection.backendId,
+          timeoutMs,
+        ));
+      }, timeoutMs);
+    });
+  }
+
+  #invalidateGeneration(generation: number, outcomes: readonly ProbeOutcome[]): void {
+    if (generation === this.#generation) this.#generation += 1;
+    this.#proofs.clear();
+    for (const outcome of outcomes) {
+      if (outcome.kind === "stale" || outcome.kind === "cancelled") continue;
+      if (outcome.token.discardEmitted) continue;
+      outcome.token.discardEmitted = true;
+      this.#emit({
+        version: 1,
+        type: "inspection-discarded",
+        backendId: outcome.target.connection.backendId,
+        generation,
+        reason: "stale-generation",
+      });
+    }
+  }
+
+  #publishInspectionEvents(
+    outcomes: readonly ProbeOutcome[],
+    state: ProviderSetupStateV1,
+    generation: number,
+  ): void {
+    for (const outcome of outcomes) {
+      if (outcome.kind === "invalid") {
+        this.#emit({
+          version: 1,
+          type: "terminal-failure",
+          backendId: outcome.target.connection.backendId,
+          generation,
+          code: "provider-inspection-invalid",
+          retryable: true,
+          message: "Provider inspection returned invalid metadata.",
+        });
+        continue;
+      }
+      if (
+        outcome.kind !== "completed"
+        && outcome.kind !== "timeout"
+        && outcome.kind !== "error"
+      ) continue;
+      const connection = state.connections.find((candidate) =>
+        candidate.id === outcome.target.connection.id
+        && candidate.backendId === outcome.target.connection.backendId
+      );
+      const accountFingerprint = outcome.inspection.accountFingerprint
+        ?? (connection?.accountFingerprintState === "verified"
+          ? connection.accountFingerprint
+          : null);
+      this.#emit({
+        version: 1,
+        type: "inspection-end",
+        backendId: outcome.inspection.backendId,
+        maturity: outcome.target.maturity,
+        generation,
+        durationMs: outcome.durationMs,
+        health: structuredClone(outcome.inspection.health),
+        headline: outcome.inspection.headline,
+        accountFingerprint,
+        billingRealm: outcome.inspection.billingRealm,
+      });
+      if (outcome.inspection.headline === "ready" && outcome.inspection.routeEligible) continue;
+      if (outcome.inspection.health.credential === "rejected") {
+        this.#emit({
+          version: 1,
+          type: "terminal-failure",
+          backendId: outcome.inspection.backendId,
+          generation,
+          code: "provider-auth-replacement-required",
+          retryable: false,
+          message: "Provider credential replacement is required.",
+        });
+      } else {
+        this.#emit({
+          version: 1,
+          type: "warning",
+          generation,
+          code: "provider-inspection-retryable",
+          message: "Provider inspection can be retried.",
+        });
+      }
+    }
+  }
+
+  #recordProofs(
+    outcomes: readonly ProbeOutcome[],
+    state: ProviderSetupStateV1,
+    generation: number,
+  ): void {
+    for (const outcome of outcomes) {
+      if (outcome.kind !== "completed") continue;
+      const inspection = outcome.inspection;
+      if (
+        inspection.headline !== "ready"
+        || !inspection.routeEligible
+        || !inspection.accountFingerprint
+      ) continue;
+      const connection = state.connections.find((candidate) =>
+        candidate.enabled
+        && candidate.accountFingerprintState === "verified"
+        && candidate.id === inspection.connectionId
+        && candidate.backendId === inspection.backendId
+        && candidate.accountFingerprint === inspection.accountFingerprint
+        && candidate.billingRealm === inspection.billingRealm
+      );
+      if (!connection) continue;
+      this.#proofs.set(connection.id, {
+        generation,
+        stateRevision: state.revision,
+        backendId: connection.backendId,
+        connectionId: connection.id,
+        accountFingerprint: connection.accountFingerprint,
+        billingRealm: connection.billingRealm,
+      });
+    }
+  }
+
+  #reduce(
+    state: ProviderSetupStateV1,
+    generation: number,
+    outcomes: readonly ProbeOutcome[],
+  ): StartupSetupResult {
+    const configuredRoutes = uniqueRoutes([
+      state.defaultRoute,
+      state.cross.preferredLead,
+      state.cross.preferredChallenger,
+    ]);
+    const candidates = uniqueRoutes([
+      ...state.connections.flatMap((connection) =>
+        configuredRoutes.filter((route) =>
+          route.backendId === connection.backendId
+          && route.accountFingerprint === connection.accountFingerprint
+          && route.billingRealm === connection.billingRealm
+        )
+      ),
+      ...configuredRoutes,
+    ]);
+    const readyRoutes = candidates.filter((candidate) =>
+      isResolvedRoute(candidate) && this.#routeHasProof(candidate, state, generation)
+    );
+    const defaultReady = state.defaultRoute !== null
+      && isResolvedRoute(state.defaultRoute)
+      && readyRoutes.some((candidate) => sameResolvedRoute(candidate, state.defaultRoute!));
+    const unresolvedDefaultHealthy = state.defaultRoute?.resolutionState === "legacy-unverified"
+      && this.#routeHasProof(state.defaultRoute, state, generation);
+    const degraded = outcomes.some((outcome) =>
+      outcome.kind === "invalid"
+      || outcome.kind === "timeout"
+      || outcome.kind === "error"
+      || (outcome.kind === "completed"
+        && (outcome.inspection.headline !== "ready" || !outcome.inspection.routeEligible))
+    );
+    const authReplacementRequired = outcomes.some((outcome) =>
+      outcome.kind === "completed"
+      && outcome.inspection.health.credential === "rejected"
+    );
+    let mode: StartupSetupMode;
+    if (defaultReady) mode = degraded ? "ready-with-warning" : "ready";
+    else if (readyRoutes.length > 0 || unresolvedDefaultHealthy) mode = "route-choice-required";
+    else mode = "setup-required";
+    const warnings = degraded
+      ? [authReplacementRequired
+        ? "Provider credential replacement is required."
+        : "Provider inspection can be retried."]
+      : [];
+    return freezeResult({
+      mode,
+      generation,
+      defaultRoute: state.defaultRoute ? structuredClone(state.defaultRoute) : null,
+      readyRoutes: structuredClone(readyRoutes),
+      warnings,
+      crossEnabled: false,
+    });
+  }
+
+  #routeHasProof(
+    route: RouteIdentityV1,
+    state: ProviderSetupStateV1,
+    generation: number,
+  ): boolean {
+    const connection = state.connections.find((candidate) =>
+      candidate.enabled
+      && candidate.accountFingerprintState === "verified"
+      && candidate.backendId === route.backendId
+      && candidate.accountFingerprint === route.accountFingerprint
+      && candidate.billingRealm === route.billingRealm
+    );
+    if (!connection) return false;
+    const proof = this.#proofs.get(connection.id);
+    return proof?.generation === generation
+      && proof.stateRevision === state.revision
+      && proof.backendId === route.backendId
+      && proof.accountFingerprint === route.accountFingerprint
+      && proof.billingRealm === route.billingRealm;
+  }
+
+  #publishModeEvent(result: StartupSetupResult, unresolved: RouteIdentityV1 | null): void {
+    if (result.mode === "route-choice-required") {
+      const routes = result.readyRoutes.length > 0
+        ? result.readyRoutes
+        : unresolved ? [unresolved] : [];
+      this.#emit({
+        version: 1,
+        type: "route-choice-required",
+        generation: result.generation,
+        routeIds: routes.map(routeId),
+      });
+    } else if (result.mode === "setup-required") {
+      this.#emit({ version: 1, type: "setup-required", generation: result.generation });
+    }
+  }
+
+  #publishRouteChoice(
+    state: ProviderSetupStateV1,
+    generation: number,
+    route: RouteIdentityV1,
+  ): StartupSetupResult {
+    const result = freezeResult({
+      mode: "route-choice-required",
+      generation,
+      defaultRoute: state.defaultRoute ? structuredClone(state.defaultRoute) : null,
+      readyRoutes: [],
+      warnings: [],
+      crossEnabled: false,
+    });
+    this.#latestResult = result;
+    this.#emit({
+      version: 1,
+      type: "route-choice-required",
+      generation,
+      routeIds: [routeId(route)],
+    });
+    return result;
+  }
+
+  #setupRequiredResult(
+    state: ProviderSetupStateV1,
+    generation: number,
+  ): StartupSetupResult {
+    return freezeResult({
+      mode: "setup-required",
+      generation,
+      defaultRoute: state.defaultRoute ? structuredClone(state.defaultRoute) : null,
+      readyRoutes: [],
+      warnings: [],
+      crossEnabled: false,
+    });
+  }
+
+  async #handleCallerCancellation(
+    captured: ProviderSetupStateV1,
+    generation: number,
+    signal: AbortSignal,
+  ): Promise<never> {
+    if (generation === this.#generation) {
+      try {
+        const state = await this.#commitCancelled(captured, generation);
+        const result = this.#setupRequiredResult(state, generation);
+        this.#latestResult = result;
+        this.#proofs.clear();
+        this.#emit({ version: 1, type: "setup-required", generation });
+      } catch {
+        this.#proofs.clear();
+      }
+    }
+    throw abortReason(signal);
+  }
+
+  #commitCancelled(
+    captured: ProviderSetupStateV1,
+    generation: number,
+  ): Promise<ProviderSetupStateV1> {
+    return this.#stateStore.commit(
+      captured.revision,
+      (current) => {
+        if (JSON.stringify(current) !== JSON.stringify(captured)) {
+          throw new Error("Provider state changed before setup cancellation.");
+        }
+        return {
+          ...current,
+          lifecycle: "cancelled",
+          cross: {
+            enabled: false,
+            preferredLead: current.cross.preferredLead,
+            preferredChallenger: current.cross.preferredChallenger,
+          },
+        };
+      },
+      () => {
+        if (generation !== this.#generation) {
+          throw new Error("Setup cancellation generation is stale.");
+        }
+      },
+    );
+  }
+
+  #listModelsBounded(
+    adapter: BackendAdapter,
+    generation: number,
+    timeoutMs: number,
+    callerSignal?: AbortSignal,
+  ): Promise<BoundedModelsResult> {
+    const controller = new AbortController();
+    const token: AttemptToken = {
+      generation,
+      backendId: adapter.backendId,
+      connectionId: "legacy-model-resolution",
+      controller,
+      closed: false,
+      superseded: false,
+      discardEmitted: false,
+    };
+    this.#activeProbes.add(token);
+    return new Promise<BoundedModelsResult>((resolve) => {
+      let timer: unknown;
+      const finish = (result: BoundedModelsResult) => {
+        if (token.closed) return;
+        token.closed = true;
+        this.#clock.clearTimeout(timer);
+        controller.signal.removeEventListener("abort", onAbort);
+        callerSignal?.removeEventListener("abort", onCallerAbort);
+        this.#activeProbes.delete(token);
+        resolve(result);
+      };
+      const onAbort = () => {
+        if (token.superseded || generation !== this.#generation) finish({ kind: "stale" });
+        else if (callerSignal?.aborted) finish({ kind: "cancelled" });
+        else finish({ kind: "timeout" });
+      };
+      const onCallerAbort = () => controller.abort(abortReason(callerSignal!));
+      controller.signal.addEventListener("abort", onAbort, { once: true });
+      callerSignal?.addEventListener("abort", onCallerAbort, { once: true });
+      if (callerSignal?.aborted) onCallerAbort();
+      const operation = Promise.resolve().then(() =>
+        adapter.listModels({ signal: controller.signal })
+      );
+      operation.then(
+        (models) => {
+          if (token.closed) return;
+          if (generation !== this.#generation) finish({ kind: "stale" });
+          else {
+            let normalized: readonly BackendModelDescriptor[] | null = null;
+            try {
+              normalized = normalizeModelList(models);
+            } catch {
+              // Treat adversarial getters like any other invalid catalog result.
+            }
+            finish(normalized
+              ? { kind: "models", models: normalized }
+              : { kind: "error" });
+          }
+        },
+        () => {
+          if (token.closed) return;
+          if (controller.signal.aborted) onAbort();
+          else finish({ kind: "error" });
+        },
+      );
+      timer = this.#clock.setTimeout(() => {
+        controller.abort(new ProviderInspectionTimeoutError(
+          "provider",
+          adapter.backendId,
+          timeoutMs,
+        ));
+      }, timeoutMs);
+    });
+  }
+
+  #emit(event: SetupEvent): void {
+    this.#emitCallback(deepFreeze(structuredClone(event)));
+  }
+}
+
+function applyOutcomes(
+  state: ProviderSetupStateV1,
+  outcomes: readonly ProbeOutcome[],
+): ApplyResult {
+  const next = structuredClone(state);
+  let changed = false;
+  for (const outcome of outcomes) {
+    if (
+      outcome.kind !== "completed"
+      && outcome.kind !== "timeout"
+      && outcome.kind !== "error"
+    ) continue;
+    const index = next.connections.findIndex((candidate) =>
+      candidate.id === outcome.target.connection.id
+      && candidate.backendId === outcome.target.connection.backendId
+    );
+    if (index < 0) continue;
+    const current = next.connections[index]!;
+    const inspected = outcome.inspection;
+    if (current.accountFingerprintState === "provisional") {
+      if (
+        outcome.kind !== "completed"
+        || inspected.headline !== "ready"
+        || !inspected.routeEligible
+        || !inspected.accountFingerprint
+        || inspected.billingRealm !== current.billingRealm
+      ) continue;
+      const oldFingerprint = current.accountFingerprint;
+      current.accountFingerprint = inspected.accountFingerprint;
+      current.accountFingerprintState = "verified";
+      current.lastHealth = structuredClone(inspected.health);
+      next.defaultRoute = rewriteFingerprint(
+        next.defaultRoute,
+        current,
+        oldFingerprint,
+      );
+      next.cross.preferredLead = rewriteFingerprint(
+        next.cross.preferredLead,
+        current,
+        oldFingerprint,
+      );
+      next.cross.preferredChallenger = rewriteFingerprint(
+        next.cross.preferredChallenger,
+        current,
+        oldFingerprint,
+      );
+      changed = true;
+      continue;
+    }
+    if (
+      outcome.kind === "completed"
+      && inspected.headline === "ready"
+      && inspected.accountFingerprint !== current.accountFingerprint
+    ) continue;
+    current.lastHealth = structuredClone(inspected.health);
+    changed = true;
+  }
+  return { state: next, changed };
+}
+
+function rewriteFingerprint(
+  route: RouteIdentityV1 | null,
+  connection: ProviderConnectionStateV1,
+  oldFingerprint: string,
+): RouteIdentityV1 | null {
+  if (
+    !route
+    || route.backendId !== connection.backendId
+    || route.accountFingerprint !== oldFingerprint
+    || route.billingRealm !== connection.billingRealm
+  ) return route;
+  return {
+    ...route,
+    accountFingerprint: connection.accountFingerprint,
+  };
+}
+
+function normalizeInspection(
+  raw: unknown,
+  target: ProbeTarget,
+  generation: number,
+): NormalizedInspection | null {
+  if (!isRecord(raw)) return null;
+  const healthValue = raw.health;
+  if (
+    raw.backendId !== target.connection.backendId
+    || raw.connectionId !== target.connection.id
+    || raw.billingRealm !== target.connection.billingRealm
+    || !validHealth(healthValue, generation)
+    || !(raw.accountFingerprint === null
+      || (typeof raw.accountFingerprint === "string" && raw.accountFingerprint.length > 0))
+    || (target.connection.accountFingerprintState === "verified"
+      && raw.accountFingerprint !== null
+      && raw.accountFingerprint !== target.connection.accountFingerprint)
+  ) return null;
+  const health: ProviderHealth = {
+    credential: healthValue.credential,
+    connectivity: healthValue.connectivity,
+    spend: healthValue.spend,
+    runtime: healthValue.runtime,
+    observedAt: healthValue.observedAt,
+    generation: healthValue.generation,
+  };
+  const headline = deriveProviderHeadline(health);
+  const fingerprintEligible = raw.accountFingerprint !== null
+    && (target.connection.accountFingerprintState === "verified"
+      || raw.accountFingerprint !== target.connection.accountFingerprint);
+  return {
+    backendId: target.connection.backendId,
+    connectionId: target.connection.id,
+    health,
+    headline,
+    accountFingerprint: raw.accountFingerprint,
+    billingRealm: target.connection.billingRealm,
+    routeEligible: headline === "ready" && fingerprintEligible,
+  };
+}
+
+function syntheticInspection(
+  target: ProbeTarget,
+  generation: number,
+  observedAt: number,
+): NormalizedInspection {
+  assertFiniteNow(observedAt);
+  const health: ProviderHealth = {
+    credential: "unknown",
+    connectivity: "unknown",
+    spend: "unknown",
+    runtime: "not-applicable",
+    observedAt,
+    generation,
+  };
+  return {
+    backendId: target.connection.backendId,
+    connectionId: target.connection.id,
+    health,
+    headline: "unknown",
+    accountFingerprint: null,
+    billingRealm: target.connection.billingRealm,
+    routeEligible: false,
+  };
+}
+
+function validHealth(value: unknown, generation: number): value is ProviderHealth {
+  if (!isRecord(value)) return false;
+  return includes([
+    "valid", "rejected", "expired", "login-required", "unknown", "not-applicable",
+  ] as const, value.credential)
+    && includes(["connected", "offline", "unknown"] as const, value.connectivity)
+    && includes(["available", "limit-reached", "unknown"] as const, value.spend)
+    && includes([
+      "ready", "missing", "incompatible", "policy-unavailable", "not-applicable",
+    ] as const, value.runtime)
+    && Number.isFinite(value.observedAt)
+    && Number.isInteger(value.generation)
+    && value.generation === generation;
+}
+
+function normalizeModelList(value: unknown): readonly BackendModelDescriptor[] | null {
+  if (!Array.isArray(value)) return null;
+  const normalized: BackendModelDescriptor[] = [];
+  for (const candidate of value) {
+    if (!isRecord(candidate) || !isRecord(candidate.capabilities)) continue;
+    if (
+      !includes(["openrouter", "codex", "anthropic"] as const, candidate.backendId)
+      || typeof candidate.requestedModelId !== "string"
+      || candidate.requestedModelId.length === 0
+      || typeof candidate.canonicalModelId !== "string"
+      || candidate.canonicalModelId.length === 0
+      || typeof candidate.capabilities.textInput !== "boolean"
+      || typeof candidate.capabilities.textOutput !== "boolean"
+      || typeof candidate.capabilities.tools !== "boolean"
+      || typeof candidate.capabilities.reasoning !== "boolean"
+    ) continue;
+    normalized.push({
+      backendId: candidate.backendId,
+      requestedModelId: candidate.requestedModelId,
+      canonicalModelId: candidate.canonicalModelId,
+      displayName: typeof candidate.displayName === "string" ? candidate.displayName : "",
+      capabilities: {
+        textInput: candidate.capabilities.textInput,
+        textOutput: candidate.capabilities.textOutput,
+        tools: candidate.capabilities.tools,
+        reasoning: candidate.capabilities.reasoning,
+      },
+    });
+  }
+  return normalized;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
+}
+
+function boundedTimeout(
+  requested: number | undefined,
+  fallback: number,
+  maximum: number,
+  label: string,
+): number {
+  const value = requested ?? fallback;
+  if (!Number.isFinite(value) || !Number.isSafeInteger(value) || value < 0) {
+    throw new Error(`Provider ${label} timeout is invalid.`);
+  }
+  return Math.min(value, maximum);
+}
+
+function abortReason(signal: AbortSignal): unknown {
+  return signal.reason ?? new DOMException("Provider setup cancelled.", "AbortError");
+}
+
+function assertFiniteNow(value: number): void {
+  if (!Number.isFinite(value)) throw new Error("Setup clock returned an invalid time.");
+}
+
+function routeId(route: RouteIdentityV1): string {
+  return JSON.stringify({
+    version: route.version,
+    backendId: route.backendId,
+    accountFingerprint: route.accountFingerprint,
+    billingRealm: route.billingRealm,
+    requestedModelId: route.requestedModelId,
+    canonicalModelId: route.canonicalModelId,
+    resolutionState: route.resolutionState,
+  });
+}
+
+function uniqueRoutes(
+  routes: readonly (RouteIdentityV1 | null)[],
+): RouteIdentityV1[] {
+  const seen = new Set<string>();
+  const result: RouteIdentityV1[] = [];
+  for (const route of routes) {
+    if (!route) continue;
+    const id = routeId(route);
+    if (seen.has(id)) continue;
+    seen.add(id);
+    result.push(structuredClone(route));
+  }
+  return result;
+}
+
+function isResolvedRoute(route: RouteIdentityV1): boolean {
+  return route.resolutionState === "resolved"
+    && typeof route.canonicalModelId === "string"
+    && route.canonicalModelId.length > 0;
+}
+
+function sameResolvedRoute(left: RouteIdentityV1, right: RouteIdentityV1): boolean {
+  return isResolvedRoute(left)
+    && isResolvedRoute(right)
+    && left.backendId === right.backendId
+    && left.accountFingerprint === right.accountFingerprint
+    && left.billingRealm === right.billingRealm
+    && left.canonicalModelId === right.canonicalModelId;
+}
+
+function freezeResult(result: StartupSetupResult): StartupSetupResult {
+  return deepFreeze(structuredClone(result));
+}
+
+function deepFreeze<T>(value: T): T {
+  if (value && typeof value === "object" && !Object.isFrozen(value)) {
+    for (const nested of Object.values(value as Record<string, unknown>)) deepFreeze(nested);
+    Object.freeze(value);
+  }
+  return value;
+}
+
+function includes<T extends string>(values: readonly T[], value: unknown): value is T {
+  return typeof value === "string" && values.includes(value as T);
+}

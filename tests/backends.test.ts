@@ -3,6 +3,7 @@ import test from "node:test";
 import {
   BackendRegistry,
   ProviderComingSoonError,
+  ProviderSetupRequiredError,
   deriveProviderHeadline,
   sameRoute,
   type BackendAdapter,
@@ -188,4 +189,11 @@ test("Slice 1 rejects a runnable non-coming-soon Anthropic registration", () => 
     () => new BackendRegistry([{ descriptor: anthropic, adapter: adapter("anthropic") }]),
     /coming-soon/i,
   );
+});
+
+test("provider setup required errors expose the stable non-interactive contract", () => {
+  const error = new ProviderSetupRequiredError();
+  assert.equal(error.name, "ProviderSetupRequiredError");
+  assert.equal(error.code, "provider-setup-required");
+  assert.equal(error.exitCode, 1);
 });

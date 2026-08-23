@@ -7,6 +7,7 @@ import {
   createNeverConfiguredProviderState,
   migrateLegacyOpenRouterState,
   projectLegacyModelRoutes,
+  ProviderStateStore,
   type ProviderConnectionStateV1,
   validateProviderSetupState,
 } from "../src/provider-state.js";
@@ -173,4 +174,65 @@ test("future and corrupt provider state remain distinct and cannot be saved over
   await writeFile(path, raw);
   await assert.rejects(saveConfig({ ...DEFAULT_CONFIG, budget: { dailyLimitUsd: 2, totalLimitUsd: null, onExceed: "warn" } }, path), /future-version/);
   assert.equal(await readFile(path, "utf8"), raw);
+});
+
+test("provider state revisions reject unsafe integers and cannot overflow", () => {
+  const unsafe = createNeverConfiguredProviderState();
+  unsafe.revision = Number.MAX_SAFE_INTEGER + 1;
+  assert.deepEqual(validateProviderSetupState(unsafe), { kind: "corrupt" });
+
+  const maximal = createNeverConfiguredProviderState();
+  maximal.revision = Number.MAX_SAFE_INTEGER;
+  const store = new ProviderStateStore(maximal);
+  assert.throws(
+    () => store.replace({ ...maximal, lifecycle: "cancelled" }, maximal.revision),
+    /revision|overflow|safe/i,
+  );
+  assert.deepEqual(store.read(), maximal);
+});
+
+test("provider state replace accepts one already-incremented candidate under explicit CAS", () => {
+  const initial = createNeverConfiguredProviderState();
+  const store = new ProviderStateStore(initial);
+  const candidate = {
+    ...initial,
+    revision: initial.revision + 1,
+    lifecycle: "cancelled" as const,
+  };
+
+  const committed = store.replace(candidate, initial.revision);
+
+  assert.deepEqual(committed, candidate);
+  assert.deepEqual(store.read(), candidate);
+});
+
+test("provider state commit delegates one exact captured-revision CAS with a generation fence", async () => {
+  const initial = createNeverConfiguredProviderState();
+  const observed: Array<{ expectedRevision: number; nextRevision: number }> = [];
+  let fenceChecks = 0;
+  const store = new ProviderStateStore(initial, {
+    persist: async (request) => {
+      const next = request.build(initial);
+      observed.push({
+        expectedRevision: request.expectedRevision,
+        nextRevision: next.revision,
+      });
+      request.adopt(next);
+      return structuredClone(next);
+    },
+  });
+
+  const committed = await store.commit(
+    initial.revision,
+    (current) => ({ ...current, lifecycle: "cancelled" }),
+    () => {
+      fenceChecks += 1;
+    },
+  );
+
+  assert.deepEqual(observed, [{ expectedRevision: 0, nextRevision: 1 }]);
+  assert.equal(fenceChecks, 2);
+  assert.equal(committed.revision, 1);
+  assert.equal(committed.lifecycle, "cancelled");
+  assert.deepEqual(store.read(), committed);
 });

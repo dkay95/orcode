@@ -47,6 +47,22 @@ export type ProviderStateIssue =
 
 export type ProviderSetupState = ProviderSetupStateV1 | ProviderStateIssue;
 
+export interface ProviderStateCommitRequest {
+  expectedRevision: number;
+  build(current: ProviderSetupStateV1): ProviderSetupStateV1;
+  assertCurrent(): void;
+  adopt(committed: ProviderSetupStateV1): void;
+}
+
+export interface ProviderStateStoreOptions {
+  /**
+   * Durable implementations run this request under their exact providerSetup
+   * writer/CAS ownership. They must build from the authoritative snapshot and
+   * adopt the committed snapshot before releasing that ownership.
+   */
+  persist?: (request: ProviderStateCommitRequest) => Promise<ProviderSetupStateV1>;
+}
+
 export interface LegacyOpenRouterModelPreferences {
   mainModel: string;
   fallbackModels: string[];
@@ -168,7 +184,7 @@ export function validateProviderSetupState(value: unknown): ProviderSetupState {
     return { kind: "corrupt" };
   }
   if (
-    !Number.isInteger(value.revision)
+    !Number.isSafeInteger(value.revision)
     || Number(value.revision) < 0
     || !isLifecycle(value.lifecycle)
     || !Array.isArray(value.connections)
@@ -213,27 +229,118 @@ export function requirePersistableProviderState(
  */
 export class ProviderStateStore {
   #state: ProviderSetupStateV1;
+  readonly #persist: ProviderStateStoreOptions["persist"];
 
-  constructor(initial: ProviderSetupState) {
+  constructor(initial: ProviderSetupState, options: ProviderStateStoreOptions = {}) {
     this.#state = structuredClone(requirePersistableProviderState(initial));
+    this.#persist = options.persist;
   }
 
   read(): ProviderSetupStateV1 {
     return structuredClone(this.#state);
   }
 
-  replace(next: ProviderSetupState, expectedRevision = this.#state.revision): ProviderSetupStateV1 {
+  replace(next: ProviderSetupState, expectedRevision: number): ProviderSetupStateV1 {
+    this.#assertExpectedRevision(expectedRevision);
+    this.#state = this.#prepareNext(next, expectedRevision, true);
+    return this.read();
+  }
+
+  async commit(
+    expectedRevision: number,
+    build: (current: ProviderSetupStateV1) => ProviderSetupStateV1,
+    assertCurrent: () => void = () => undefined,
+  ): Promise<ProviderSetupStateV1> {
+    this.#assertExpectedRevision(expectedRevision);
+    let buildCalls = 0;
+    let adopted = false;
+
+    const buildCandidate = (current: ProviderSetupStateV1): ProviderSetupStateV1 => {
+      buildCalls += 1;
+      if (buildCalls !== 1) {
+        throw new Error("Provider state CAS may build exactly one candidate.");
+      }
+      assertCurrent();
+      const authoritative = requirePersistableProviderState(
+        validateProviderSetupState(current),
+      );
+      if (authoritative.revision !== expectedRevision) {
+        throw new Error(
+          `Stale provider state revision ${expectedRevision}; authoritative revision is ${authoritative.revision}.`,
+        );
+      }
+      return this.#prepareNext(build(structuredClone(authoritative)), expectedRevision);
+    };
+
+    const adopt = (committed: ProviderSetupStateV1): void => {
+      if (adopted) throw new Error("Provider state CAS may adopt exactly once.");
+      this.#assertExpectedRevision(expectedRevision);
+      assertCurrent();
+      const validated = requirePersistableProviderState(
+        validateProviderSetupState(committed),
+      );
+      if (validated.revision !== expectedRevision + 1) {
+        throw new Error("Provider state CAS returned an invalid committed revision.");
+      }
+      this.#state = structuredClone(validated);
+      adopted = true;
+    };
+
+    if (!this.#persist) {
+      const candidate = buildCandidate(this.read());
+      adopt(candidate);
+      return this.read();
+    }
+
+    const returned = await this.#persist({
+      expectedRevision,
+      build: buildCandidate,
+      assertCurrent,
+      adopt,
+    });
+    if (!adopted) {
+      throw new Error("Provider state durable commit was not adopted under writer ownership.");
+    }
+    const validatedReturn = requirePersistableProviderState(
+      validateProviderSetupState(returned),
+    );
+    if (JSON.stringify(validatedReturn) !== JSON.stringify(this.#state)) {
+      throw new Error("Provider state durable commit readback is ambiguous.");
+    }
+    return this.read();
+  }
+
+  #assertExpectedRevision(expectedRevision: number): void {
+    if (!Number.isSafeInteger(expectedRevision) || expectedRevision < 0) {
+      throw new Error("Provider state revision must be a non-negative safe integer.");
+    }
     if (expectedRevision !== this.#state.revision) {
       throw new Error(
         `Stale provider state revision ${expectedRevision}; current revision is ${this.#state.revision}.`,
       );
     }
+    if (expectedRevision >= Number.MAX_SAFE_INTEGER) {
+      throw new Error("Provider state revision cannot overflow the safe-integer range.");
+    }
+  }
+
+  #prepareNext(
+    next: ProviderSetupState,
+    expectedRevision: number,
+    acceptAlreadyIncremented = false,
+  ): ProviderSetupStateV1 {
     const validated = requirePersistableProviderState(validateProviderSetupState(next));
-    this.#state = {
+    if (
+      validated.revision !== expectedRevision
+      && !(acceptAlreadyIncremented && validated.revision === expectedRevision + 1)
+    ) {
+      throw new Error("Provider state transform must preserve the captured revision.");
+    }
+    const candidate = {
       ...structuredClone(validated),
       revision: expectedRevision + 1,
     };
-    return this.read();
+    return requirePersistableProviderState(validateProviderSetupState(candidate));
   }
 }
 
