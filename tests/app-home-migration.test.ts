@@ -2,24 +2,46 @@ import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import {
   access,
+  cp,
   lstat,
   mkdir,
   mkdtemp,
   readFile,
   readdir,
+  rm,
   stat,
   symlink,
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import test from "node:test";
-import { createInitialState, serializeConversationState } from "@openrouter/agent";
+import {
+  createInitialState,
+  deserializeConversationState,
+  serializeConversationState,
+} from "@openrouter/agent";
+import { initializeStartupStorage } from "../src/cli.js";
 import { migrateAppHome } from "../src/config.js";
+import { CredentialStore } from "../src/credentials.js";
 import { approvalSubjectFingerprint } from "../src/rules.js";
+import {
+  migrationManifestPath,
+  parseCheckpointEntries,
+  parseConversationStateFile,
+} from "../src/storage.js";
 
 const WORKSPACE = "/synthetic/workspace";
 const WORKSPACE_HASH = createHash("sha256").update(WORKSPACE).digest("hex").slice(0, 16);
+const HISTORICAL_FIXTURE_WORKSPACE = "/fixture/workspace";
+const HISTORICAL_FIXTURE_HASH = "c55218afb5a1f354";
+const HISTORICAL_FIXTURE_CHAT_ID = "legacy-fixture-chat";
+const HISTORICAL_FIXTURE_ROOT = join(
+  dirname(fileURLToPath(import.meta.url)),
+  "fixtures",
+  "app-home-v0",
+);
 
 function serializedState(tag: string): string {
   const state = createInitialState();
@@ -75,6 +97,24 @@ async function treeBytes(path: string): Promise<number> {
     total += entry.isDirectory() ? await treeBytes(child) : (await stat(child)).size;
   }
   return total;
+}
+
+async function snapshotFileTree(root: string): Promise<Record<string, string>> {
+  const snapshot: Record<string, string> = {};
+  async function walk(directory: string, prefix: string): Promise<void> {
+    const entries = await readdir(directory, { withFileTypes: true });
+    for (const entry of entries.sort((left, right) => left.name.localeCompare(right.name))) {
+      const relativePath = prefix ? `${prefix}/${entry.name}` : entry.name;
+      const path = join(directory, entry.name);
+      if (entry.isDirectory()) {
+        await walk(path, relativePath);
+      } else {
+        snapshot[relativePath] = (await readFile(path)).toString("base64");
+      }
+    }
+  }
+  await walk(root, "");
+  return snapshot;
 }
 
 test("ChatArtifactRegistry centrally classifies every 0.4 chat artifact and only reserves task sidecars", async () => {
@@ -663,4 +703,198 @@ test("new-only unversioned config is validated and atomically upgraded with one 
   assert.equal((upgraded as { maxSteps?: number }).maxSteps, 12);
   assert.equal(backups.length, 1);
   assert.equal(await readFile(join(target, "migration-backups", backups[0]!), "utf8"), original);
+});
+
+test("committed v0 app-home fixture migrates through real startup without external access and is byte-idempotent", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "orcode-historical-fixture-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const legacyHome = join(root, ".routercode");
+  const appHome = join(root, ".orcode");
+  await cp(HISTORICAL_FIXTURE_ROOT, legacyHome, { recursive: true });
+  const fixtureSnapshot = await snapshotFileTree(HISTORICAL_FIXTURE_ROOT);
+  const fixtureChatPath = join(
+    HISTORICAL_FIXTURE_ROOT,
+    "chats",
+    HISTORICAL_FIXTURE_HASH,
+    `${HISTORICAL_FIXTURE_CHAT_ID}.json`,
+  );
+  const expectedChat = JSON.parse(await readFile(fixtureChatPath, "utf8")) as Record<string, unknown>;
+  const expectedState = JSON.parse(await readFile(`${fixtureChatPath}.state.json`, "utf8")) as {
+    chatId: string;
+    state: string;
+  } & Record<string, unknown>;
+  const expectedRun = (await readFile(
+    join(HISTORICAL_FIXTURE_ROOT, "runs", HISTORICAL_FIXTURE_CHAT_ID, "fixture-run.ndjson"),
+    "utf8",
+  )).trim().split("\n").map((line) => JSON.parse(line) as Record<string, unknown>);
+  const expectedCheckpointBytes = await readFile(
+    join(HISTORICAL_FIXTURE_ROOT, "checkpoints", HISTORICAL_FIXTURE_CHAT_ID, "fixture-run.json"),
+  );
+
+  let networkCalls = 0;
+  let credentialCalls = 0;
+  const originalFetch = globalThis.fetch;
+  const originalGet = CredentialStore.prototype.get;
+  const originalSet = CredentialStore.prototype.set;
+  const originalDelete = CredentialStore.prototype.delete;
+  const originalHas = CredentialStore.prototype.has;
+  globalThis.fetch = (async () => {
+    networkCalls += 1;
+    throw new Error("historical fixture startup must remain offline");
+  }) as typeof fetch;
+  CredentialStore.prototype.get = async function() {
+    credentialCalls += 1;
+    throw new Error("historical fixture startup must not read credentials");
+  };
+  CredentialStore.prototype.set = async function() {
+    credentialCalls += 1;
+    throw new Error("historical fixture startup must not write credentials");
+  };
+  CredentialStore.prototype.delete = async function() {
+    credentialCalls += 1;
+    throw new Error("historical fixture startup must not delete credentials");
+  };
+  CredentialStore.prototype.has = async function() {
+    credentialCalls += 1;
+    throw new Error("historical fixture startup must not inspect credentials");
+  };
+
+  const start = () => initializeStartupStorage(
+    { workspace: HISTORICAL_FIXTURE_WORKSPACE, newChat: false },
+    {
+      migrateAppHome: () => migrateAppHome(appHome, legacyHome),
+      pruneRunLogs: async () => undefined,
+      pruneCheckpoints: async () => undefined,
+      pruneBrowserTempArtifacts: async () => undefined,
+    },
+  );
+
+  try {
+    const first = await start();
+    const manifest = JSON.parse(await readFile(migrationManifestPath(appHome), "utf8")) as {
+      version: number;
+      phase: string;
+      complete: boolean;
+      backupPath: string;
+      chatIdMap: Record<string, string>;
+    };
+    const currentChatId = manifest.chatIdMap[HISTORICAL_FIXTURE_CHAT_ID]!;
+    assert.match(currentChatId, /^legacy-[a-f0-9]{32}$/);
+    assert.notEqual(currentChatId, HISTORICAL_FIXTURE_CHAT_ID);
+    assert.equal(first.appHome, appHome);
+    assert.equal(first.migrationWarning, null);
+    assert.equal(first.session.data.id, currentChatId);
+    assert.equal(manifest.version, 1);
+    assert.equal(manifest.phase, "complete");
+    assert.equal(manifest.complete, true);
+    assert.equal(await exists(legacyHome), false);
+
+    const migratedChatPath = join(appHome, "chats", HISTORICAL_FIXTURE_HASH, `${currentChatId}.json`);
+    const migratedChat = JSON.parse(await readFile(migratedChatPath, "utf8")) as Record<string, unknown>;
+    assert.deepEqual({ ...migratedChat, id: HISTORICAL_FIXTURE_CHAT_ID }, expectedChat);
+    assert.equal(migratedChat.version, 2);
+
+    const migratedState = parseConversationStateFile(
+      await readFile(`${migratedChatPath}.state.json`, "utf8"),
+      currentChatId,
+    );
+    assert.deepEqual(
+      { ...migratedState, chatId: HISTORICAL_FIXTURE_CHAT_ID },
+      expectedState,
+    );
+    assert.deepEqual(
+      deserializeConversationState(migratedState.state).messages,
+      [{ role: "user", content: "Historische SDK-Nachricht" }],
+    );
+
+    const migratedRun = (await readFile(
+      join(appHome, "runs", currentChatId, "fixture-run.ndjson"),
+      "utf8",
+    )).trim().split("\n").map((line) => JSON.parse(line) as {
+      version: number;
+      event: Record<string, unknown>;
+    });
+    assert.deepEqual(migratedRun.map((line) => line.version), [1, 1, 1]);
+    assert.deepEqual(migratedRun.map((line) => line.event), expectedRun);
+
+    const migratedCheckpointPath = join(appHome, "checkpoints", currentChatId, "fixture-run.json");
+    const migratedCheckpointBytes = await readFile(migratedCheckpointPath);
+    assert.deepEqual(migratedCheckpointBytes, expectedCheckpointBytes);
+    assert.equal(parseCheckpointEntries(migratedCheckpointBytes.toString("utf8"), "fixture-run").length, 1);
+
+    const storedConfig = JSON.parse(await readFile(join(appHome, "config.json"), "utf8")) as {
+      schemaVersion: number;
+      mainModel: string;
+      compressorModel: string;
+      reasoningByModel: Record<string, unknown>;
+      verify: Record<string, unknown>;
+    };
+    assert.equal(storedConfig.schemaVersion, 1);
+    assert.equal(storedConfig.mainModel, "synthetic/main-v0");
+    assert.equal(storedConfig.compressorModel, "synthetic/compressor-v0");
+    assert.deepEqual(storedConfig.reasoningByModel["synthetic/main-v0"], { mode: "effort", effort: "high" });
+    assert.deepEqual(storedConfig.verify, {
+      commands: ["npm test -- --fixture"],
+      mode: "on-edit",
+      maxRepairRounds: 1,
+    });
+    assert.equal("maxRounds" in storedConfig.verify, false);
+    assert.deepEqual(first.config.verify, storedConfig.verify);
+
+    const storedRules = JSON.parse(await readFile(join(appHome, "permissions.json"), "utf8")) as {
+      version: number;
+      rules: Array<{ id: string; match: { kind: string; fingerprint?: string; reason?: string } }>;
+    };
+    assert.equal(storedRules.version, 2);
+    assert.equal(storedRules.rules.length, 2);
+    assert.equal(
+      storedRules.rules.find((rule) => rule.id === "fixture-safe-path")?.match.fingerprint,
+      approvalSubjectFingerprint({ kind: "selected-path", path: "src/legacy.ts" }),
+    );
+    assert.equal(
+      storedRules.rules.find((rule) => rule.id === "fixture-command-prefix")?.match.kind,
+      "disabled",
+    );
+    assert.match(
+      storedRules.rules.find((rule) => rule.id === "fixture-command-prefix")?.match.reason ?? "",
+      /nicht exakt/,
+    );
+    assert.deepEqual(
+      first.ruleStore.list(HISTORICAL_FIXTURE_WORKSPACE).map((rule) => ({
+        id: rule.id,
+        decision: rule.decision,
+        match: rule.match.kind,
+      })),
+      [
+        { id: "fixture-safe-path", decision: "allow", match: "exact-subject" },
+        { id: "fixture-command-prefix", decision: "allow", match: "disabled" },
+      ],
+    );
+
+    assert.deepEqual(await snapshotFileTree(manifest.backupPath), fixtureSnapshot);
+    const beforeSecondStart = await snapshotFileTree(appHome);
+    const firstRuntimeState = {
+      config: first.config,
+      session: first.session.data,
+      rules: first.ruleStore.list(HISTORICAL_FIXTURE_WORKSPACE),
+    };
+    const second = await start();
+    assert.deepEqual(await snapshotFileTree(appHome), beforeSecondStart);
+    assert.deepEqual(
+      {
+        config: second.config,
+        session: second.session.data,
+        rules: second.ruleStore.list(HISTORICAL_FIXTURE_WORKSPACE),
+      },
+      firstRuntimeState,
+    );
+    assert.equal(networkCalls, 0);
+    assert.equal(credentialCalls, 0);
+  } finally {
+    globalThis.fetch = originalFetch;
+    CredentialStore.prototype.get = originalGet;
+    CredentialStore.prototype.set = originalSet;
+    CredentialStore.prototype.delete = originalDelete;
+    CredentialStore.prototype.has = originalHas;
+  }
 });

@@ -1,0 +1,9 @@
+[
+  {
+    "path": "/fixture/workspace/src/legacy.ts",
+    "before": "export const generation = 0;\n",
+    "after": "export const generation = 1;\n",
+    "createdAt": "2024-08-20T10:00:00.000Z",
+    "runId": "fixture-run"
+  }
+]
