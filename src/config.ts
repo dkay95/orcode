@@ -27,6 +27,14 @@ import {
   type AppHomeMigrationOptions,
   type AppHomeMigrationResult,
 } from "./storage.js";
+import {
+  createNeverConfiguredProviderState,
+  isProviderStateIssue,
+  migrateLegacyOpenRouterState,
+  requirePersistableProviderState,
+  validateProviderSetupState,
+  type ProviderSetupState,
+} from "./provider-state.js";
 
 export const APP_HOME = join(homedir(), ".orcode");
 /** Pre-rename state directory (the tool was called RouterCode before). `migrateAppHome` moves it once, on first startup. */
@@ -110,6 +118,8 @@ export interface OrcodeConfigWithBudget extends OrcodeConfig {
   browserPath: string;
   /** Hard timeout for one `browser_check`/`/browser` inspection. Default 30s, capped at 120s — a headless page load that hangs must not hang the agent run. */
   browserTimeoutSeconds: number;
+  /** Versioned, non-secret backend/account routing state. Independent of `provider`. */
+  providerSetup: ProviderSetupState;
 }
 
 /** Anything that may be handed to `validateConfig`/`saveConfig`. */
@@ -125,6 +135,7 @@ export type ConfigInput = OrcodeConfig & {
   panelJudge?: unknown;
   browserPath?: unknown;
   browserTimeoutSeconds?: unknown;
+  providerSetup?: unknown;
 };
 
 export const DEFAULT_BUDGET: BudgetConfig = {
@@ -171,6 +182,7 @@ export const DEFAULT_CONFIG: OrcodeConfigWithBudget = {
   panelJudge: false,
   browserPath: "",
   browserTimeoutSeconds: 30,
+  providerSetup: createNeverConfiguredProviderState(),
 };
 
 export interface ConfigLoadOutcome {
@@ -178,6 +190,10 @@ export interface ConfigLoadOutcome {
   /** German, user facing. `null` when everything was fine. */
   warning: string | null;
   source: "file" | "defaults";
+}
+
+export interface ConfigLoadDependencies {
+  randomUUID?: () => string;
 }
 
 let pendingWarning: string | null = null;
@@ -188,6 +204,7 @@ let pendingWarning: string | null = null;
  */
 export async function loadConfigDetailed(
   path = CONFIG_PATH,
+  dependencies: ConfigLoadDependencies = {},
 ): Promise<ConfigLoadOutcome> {
   let raw: string;
   try {
@@ -234,10 +251,16 @@ export async function loadConfigDetailed(
   }
 
   try {
+    const providerSetup = "providerSetup" in parsed
+      ? validateProviderSetupState(parsed.providerSetup)
+      : migrateLegacyOpenRouterState(parsed, {
+        connectionId: (dependencies.randomUUID ?? randomUUID)(),
+      });
     return {
       config: validateConfig({
         ...DEFAULT_CONFIG,
         ...(parsed as Partial<OrcodeConfigWithBudget>),
+        providerSetup,
       }),
       warning: null,
       source: "file",
@@ -272,8 +295,9 @@ export async function saveConfig(
   config: ConfigInput,
   path = CONFIG_PATH,
 ): Promise<void> {
-  await refuseFutureConfig(path);
+  await refuseUnsafeStoredConfig(path);
   const validated = validateConfig(config);
+  requirePersistableProviderState(validated.providerSetup);
   await preserveBrokenConfig(path);
   await writeFileAtomicSecure(path, `${JSON.stringify(validated, null, 2)}\n`);
 }
@@ -333,15 +357,27 @@ export async function writeFileAtomicSecure(
 export async function migrateAppHome(
   newHome: string = APP_HOME,
   legacyHome: string = LEGACY_APP_HOME,
-  options: AppHomeMigrationOptions = {},
+  options: AppHomeMigrationOptions & ConfigLoadDependencies = {},
 ): Promise<AppHomeMigrationResult> {
-  return migrateStorageHome(newHome, legacyHome, {
-    ...options,
-    normalizeConfig: (value) => validateConfig({
-      ...DEFAULT_CONFIG,
-      ...value,
-    } as ConfigInput) as unknown as Record<string, unknown>,
+  const { randomUUID: createConnectionId = randomUUID, ...storageOptions } = options;
+  const result = await migrateStorageHome(newHome, legacyHome, {
+    ...storageOptions,
+    normalizeConfig: (value) => {
+      const providerSetup = "providerSetup" in value
+        ? validateProviderSetupState(value.providerSetup)
+        : migrateLegacyOpenRouterState(value, { connectionId: createConnectionId() });
+      requirePersistableProviderState(providerSetup);
+      return validateConfig({
+        ...DEFAULT_CONFIG,
+        ...value,
+        providerSetup,
+      } as ConfigInput) as unknown as Record<string, unknown>;
+    },
   });
+  if (result.status === "ready" && result.appHome === newHome) {
+    await persistMissingProviderSetup(newHome, createConnectionId);
+  }
+  return result;
 }
 
 export function validateConfig(value: ConfigInput): OrcodeConfigWithBudget {
@@ -390,6 +426,7 @@ export function validateConfig(value: ConfigInput): OrcodeConfigWithBudget {
       120,
       DEFAULT_CONFIG.browserTimeoutSeconds,
     ),
+    providerSetup: normalizeProviderSetupInput(value.providerSetup),
   };
 }
 
@@ -632,10 +669,11 @@ function defaults(): OrcodeConfigWithBudget {
     provider: { ...DEFAULT_PROVIDER },
     verify: { ...DEFAULT_VERIFY },
     panelModels: [],
+    providerSetup: createNeverConfiguredProviderState(),
   };
 }
 
-async function refuseFutureConfig(path: string): Promise<void> {
+async function refuseUnsafeStoredConfig(path: string): Promise<void> {
   try {
     const parsed: unknown = JSON.parse(await readFile(path, "utf8"));
     if (
@@ -647,10 +685,50 @@ async function refuseFutureConfig(path: string): Promise<void> {
         `Konfiguration ${path} hat die zukünftige schemaVersion ${parsed.schemaVersion} und wird nicht überschrieben.`,
       );
     }
+    if (isRecord(parsed) && "providerSetup" in parsed) {
+      const providerSetup = validateProviderSetupState(parsed.providerSetup);
+      if (isProviderStateIssue(providerSetup)) {
+        throw new Error(
+          `Konfiguration ${path} hat providerSetup ${providerSetup.kind} und wird nicht überschrieben.`,
+        );
+      }
+    }
   } catch (error) {
     if (error instanceof SyntaxError || hasCode(error, "ENOENT")) return;
     throw error;
   }
+}
+
+function normalizeProviderSetupInput(value: unknown): ProviderSetupState {
+  if (
+    isRecord(value)
+    && (value.kind === "corrupt" || value.kind === "future-version")
+  ) {
+    return value as unknown as ProviderSetupState;
+  }
+  return validateProviderSetupState(value);
+}
+
+async function persistMissingProviderSetup(
+  appHome: string,
+  createConnectionId: () => string,
+): Promise<void> {
+  const path = configPath(appHome);
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(await readFile(path, "utf8"));
+  } catch {
+    return;
+  }
+  if (!isRecord(parsed) || "providerSetup" in parsed) {
+    return;
+  }
+  const outcome = await loadConfigDetailed(path, { randomUUID: createConnectionId });
+  if (outcome.source !== "file" || outcome.warning !== null) {
+    return;
+  }
+  requirePersistableProviderState(outcome.config.providerSetup);
+  await saveConfig(outcome.config, path);
 }
 
 /**

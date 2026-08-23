@@ -432,3 +432,70 @@ test("config schema v0 reads as current while unknown future versions are visibl
   await assert.rejects(saveConfig(DEFAULT_CONFIG, futurePath), /zukünftige|Version/i);
   assert.equal(await readFile(futurePath, "utf8"), futureRaw);
 });
+
+test("missing config is never-configured while an existing legacy config is source-aware migrated", async () => {
+  const missingPath = await configPath("provider-never-configured");
+  const missing = await loadConfigDetailed(missingPath, {
+    randomUUID: () => {
+      throw new Error("missing files must not allocate a migration connection");
+    },
+  });
+  assert.equal(missing.source, "defaults");
+  assert.ok(!("kind" in missing.config.providerSetup));
+  assert.equal(missing.config.providerSetup.lifecycle, "never-configured");
+
+  const legacyPath = await configPath("provider-existing-legacy");
+  const legacyPreferences = {
+    mainModel: "vendor/main/exact",
+    fallbackModels: ["vendor/fallback/one"],
+    compressorModel: "vendor/compressor",
+    transcriptionModel: "vendor/audio",
+    panelModels: ["vendor/judge"],
+    reasoningByModel: { "vendor/main/exact": { mode: "effort", effort: "high" } },
+    provider: { sort: "latency", dataCollection: "allow", only: ["exact-provider"], allowFallbacks: false },
+  };
+  await writeFile(legacyPath, JSON.stringify(legacyPreferences));
+  let uuidCalls = 0;
+  const migrated = await loadConfigDetailed(legacyPath, {
+    randomUUID: () => {
+      uuidCalls += 1;
+      return "injected-legacy-id";
+    },
+  });
+  assert.equal(uuidCalls, 1);
+  assert.equal(migrated.source, "file");
+  assert.ok(!("kind" in migrated.config.providerSetup));
+  assert.equal(migrated.config.providerSetup.lifecycle, "migrated");
+  assert.equal(migrated.config.providerSetup.connections[0]?.id, "injected-legacy-id");
+  assert.equal(migrated.config.providerSetup.connections[0]?.accountFingerprint, "acct_legacy_injected-legacy-id");
+  assert.deepEqual(migrated.config.provider, legacyPreferences.provider);
+  assert.equal(migrated.config.mainModel, legacyPreferences.mainModel);
+  assert.deepEqual(migrated.config.fallbackModels, legacyPreferences.fallbackModels);
+  assert.equal(migrated.config.compressorModel, legacyPreferences.compressorModel);
+  assert.equal(migrated.config.transcriptionModel, legacyPreferences.transcriptionModel);
+  assert.deepEqual(migrated.config.panelModels, legacyPreferences.panelModels);
+  assert.deepEqual(migrated.config.reasoningByModel, legacyPreferences.reasoningByModel);
+});
+
+test("persisting a source-aware migration is stable and never reallocates its legacy connection", async () => {
+  const path = await configPath("provider-migration-idempotent");
+  await writeFile(path, JSON.stringify({ mainModel: "vendor/main", provider: { dataCollection: "allow" } }));
+  const first = await loadConfigDetailed(path, { randomUUID: () => "stable-csprng-id" });
+  await saveConfig(first.config, path);
+  const firstBytes = await readFile(path, "utf8");
+
+  let uuidCalls = 0;
+  const second = await loadConfigDetailed(path, {
+    randomUUID: () => {
+      uuidCalls += 1;
+      return "must-not-replace";
+    },
+  });
+  await saveConfig(second.config, path);
+  assert.equal(uuidCalls, 0);
+  assert.ok(!("kind" in second.config.providerSetup));
+  assert.equal(second.config.providerSetup.lifecycle, "migrated");
+  assert.equal(second.config.providerSetup.connections[0]?.credentialSlot, "legacy:inference");
+  assert.equal(second.config.providerSetup.connections[0]?.id, "stable-csprng-id");
+  assert.equal(await readFile(path, "utf8"), firstBytes);
+});

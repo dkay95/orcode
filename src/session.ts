@@ -33,6 +33,12 @@ import {
   workspaceStorageHash,
 } from "./storage.js";
 import { formatUsd, hasCode, isRecord } from "./utils.js";
+import type { RouteIdentityV1 } from "./backends.js";
+import {
+  mapLegacyOpenRouterModel,
+  validateRouteIdentityV1,
+  type ProviderConnectionStateV1,
+} from "./provider-state.js";
 
 const MAX_TURNS = 80;
 const MAX_CHECKPOINTS = 50;
@@ -108,13 +114,14 @@ export class SessionStore {
   static async open(
     workspace: string,
     appHome = APP_HOME,
+    providerConnection?: ProviderConnectionStateV1,
   ): Promise<SessionStore> {
     // The one explicit place where a v1 file is imported; list()/search() stay
     // read only (B15).
     await migrateLegacySession(workspace, appHome);
-    const chats = await SessionStore.list(workspace, appHome);
+    const chats = await SessionStore.list(workspace, appHome, providerConnection);
     if (chats[0]) {
-      return SessionStore.openById(workspace, chats[0].id, appHome);
+      return SessionStore.openById(workspace, chats[0].id, appHome, providerConnection);
     }
     return SessionStore.create(workspace, appHome);
   }
@@ -137,6 +144,7 @@ export class SessionStore {
     workspace: string,
     id: string,
     appHome = APP_HOME,
+    providerConnection?: ProviderConnectionStateV1,
   ): Promise<SessionStore> {
     assertChatId(id);
     const path = chatPath(appHome, workspace, id);
@@ -145,6 +153,7 @@ export class SessionStore {
         JSON.parse(await readFile(path, "utf8")),
         workspace,
         id,
+        providerConnection,
       );
       if (parsed) {
         return new SessionStore(appHome, path, parsed);
@@ -177,8 +186,9 @@ export class SessionStore {
   static async list(
     workspace: string,
     appHome = APP_HOME,
+    providerConnection?: ProviderConnectionStateV1,
   ): Promise<ChatSummary[]> {
-    const sessions = await loadAllSessions(workspace, appHome);
+    const sessions = await loadAllSessions(workspace, appHome, providerConnection);
     return sessions.map(toSummary);
   }
 
@@ -187,12 +197,13 @@ export class SessionStore {
     workspace: string,
     query: string,
     appHome = APP_HOME,
+    providerConnection?: ProviderConnectionStateV1,
   ): Promise<ChatSearchHit[]> {
     const normalized = query.trim().toLowerCase();
     if (!normalized) {
       return [];
     }
-    const sessions = await loadAllSessions(workspace, appHome);
+    const sessions = await loadAllSessions(workspace, appHome, providerConnection);
     const hits: ChatSearchHit[] = [];
     for (const data of sessions) {
       const titleMatch = data.title.toLowerCase().includes(normalized);
@@ -240,8 +251,13 @@ export class SessionStore {
     this.#data.updatedAt = new Date().toISOString();
   }
 
-  setPreferences(model: string, reasoning: ReasoningSetting): void {
+  setPreferences(model: string, reasoning: ReasoningSetting, route?: RouteIdentityV1): void {
     this.#data.model = model.trim();
+    if (route) {
+      this.#data.route = structuredClone(route);
+    } else if (this.#data.route?.requestedModelId !== this.#data.model) {
+      delete this.#data.route;
+    }
     this.#data.reasoning = structuredClone(reasoning);
     this.#data.updatedAt = new Date().toISOString();
   }
@@ -258,6 +274,7 @@ export class SessionStore {
       ...checkpoint,
     }));
     fork.#data.model = this.#data.model;
+    fork.#data.route = this.#data.route ? structuredClone(this.#data.route) : undefined;
     fork.#data.reasoning = this.#data.reasoning
       ? structuredClone(this.#data.reasoning)
       : undefined;
@@ -300,10 +317,11 @@ export class SessionStore {
    * accounting must not be resettable with /clear.
    */
   clear(): void {
-    const { id, title, workspace, model, reasoning, createdAt } = this.#data;
+    const { id, title, workspace, model, route, reasoning, createdAt } = this.#data;
     this.#data = {
       ...emptySession(workspace, id, title),
       model,
+      route,
       reasoning,
       createdAt,
       revision: this.#data.revision,
@@ -749,6 +767,7 @@ async function markLegacyMigrated(path: string, marker: string): Promise<void> {
 async function loadAllSessions(
   workspace: string,
   appHome: string,
+  providerConnection?: ProviderConnectionStateV1,
 ): Promise<PersistedSessionData[]> {
   const directory = chatDirectory(appHome, workspace);
   let files: string[];
@@ -774,6 +793,7 @@ async function loadAllSessions(
         JSON.parse(await readFile(join(directory, file), "utf8")),
         workspace,
         id,
+        providerConnection,
       );
       if (parsed) {
         sessions.push(parsed);
@@ -850,6 +870,7 @@ function normalizeSession(
   value: unknown,
   workspace: string,
   id: string,
+  providerConnection?: ProviderConnectionStateV1,
 ): PersistedSessionData | null {
   if (!isRecord(value) || value.version !== 2) {
     return null;
@@ -863,6 +884,15 @@ function normalizeSession(
   const turns = normalizeTurns(value.turns);
   const updatedAt = validDate(value.updatedAt) ?? new Date().toISOString();
   const createdAt = validDate(value.createdAt) ?? turns[0]?.createdAt ?? updatedAt;
+  const model = typeof value.model === "string" && value.model.trim()
+    ? value.model.trim()
+    : null;
+  const persistedRoute = validateRouteIdentityV1(value.route);
+  const route = persistedRoute ?? (
+    model !== null && isActiveMigratedOpenRouterConnection(providerConnection)
+      ? mapLegacyOpenRouterModel(model, providerConnection)
+      : null
+  );
   return {
     version: 2,
     id,
@@ -875,15 +905,25 @@ function normalizeSession(
     checkpoints: normalizeCheckpoints(value.checkpoints),
     toolCalls: normalizeToolCalls(value.toolCalls),
     dailySpendUsd: normalizeSpend(value.dailySpendUsd),
-    ...(typeof value.model === "string" && value.model.trim()
-      ? { model: value.model.trim() }
+    ...(model !== null
+      ? { model }
       : {}),
+    ...(route !== null ? { route } : {}),
     ...(isReasoningSetting(value.reasoning)
       ? { reasoning: structuredClone(value.reasoning) }
       : {}),
     createdAt,
     updatedAt,
   };
+}
+
+function isActiveMigratedOpenRouterConnection(
+  value: ProviderConnectionStateV1 | undefined,
+): value is ProviderConnectionStateV1 {
+  return value?.backendId === "openrouter"
+    && value.enabled
+    && value.credentialSlot === "legacy:inference"
+    && value.accountFingerprintState === "provisional";
 }
 
 function normalizeTurns(value: unknown): ChatTurn[] {
@@ -1005,6 +1045,7 @@ function toSummary(data: PersistedSessionData): ChatSummary {
     turnCount: data.turns.length,
     costUsd: data.costs.totalUsd,
     model: data.model,
+    route: data.route ? structuredClone(data.route) : undefined,
     reasoning: data.reasoning,
     createdAt: data.createdAt,
     updatedAt: data.updatedAt,
@@ -1357,6 +1398,9 @@ export function mergeSessions(
     ),
     ...(pickField(base.model, mine.model, theirs.model) !== undefined
       ? { model: pickField(base.model, mine.model, theirs.model) }
+      : {}),
+    ...(pickField(base.route, mine.route, theirs.route) !== undefined
+      ? { route: pickField(base.route, mine.route, theirs.route) }
       : {}),
     ...(pickField(base.reasoning, mine.reasoning, theirs.reasoning) !== undefined
       ? { reasoning: pickField(base.reasoning, mine.reasoning, theirs.reasoning) }

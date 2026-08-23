@@ -1,3 +1,5 @@
+import type { RouteIdentityV1 } from "./backends.js";
+
 export const APPROVAL_MODES = ["read-only", "ask", "auto-edit", "allow-all"] as const;
 export type ApprovalMode = (typeof APPROVAL_MODES)[number];
 
@@ -114,6 +116,7 @@ export interface SessionData {
   turns: ChatTurn[];
   costs: CostLedger;
   model?: string;
+  route?: RouteIdentityV1;
   reasoning?: ReasoningSetting;
   createdAt: string;
   updatedAt: string;
@@ -126,6 +129,7 @@ export interface ChatSummary {
   turnCount: number;
   costUsd: number;
   model?: string;
+  route?: RouteIdentityV1;
   reasoning?: ReasoningSetting;
   createdAt: string;
   updatedAt: string;

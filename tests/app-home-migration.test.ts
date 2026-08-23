@@ -705,6 +705,38 @@ test("new-only unversioned config is validated and atomically upgraded with one 
   assert.equal(await readFile(join(target, "migration-backups", backups[0]!), "utf8"), original);
 });
 
+test("a current top-level config persists source-aware provider migration once", async () => {
+  const root = await mkdtemp(join(tmpdir(), "orcode-current-provider-config-"));
+  const legacy = join(root, ".routercode");
+  const target = join(root, ".orcode");
+  await mkdir(target, { recursive: true });
+  await writeFile(join(target, "config.json"), JSON.stringify({
+    schemaVersion: 1,
+    mainModel: "vendor/current/model",
+  }));
+  let uuidCalls = 0;
+  const options = {
+    randomUUID: () => {
+      uuidCalls += 1;
+      return `current-provider-${uuidCalls}`;
+    },
+  } as never;
+
+  const first = await migrateAppHome(target, legacy, options);
+  const firstBytes = await readFile(join(target, "config.json"), "utf8");
+  const second = await migrateAppHome(target, legacy, options);
+  const stored = JSON.parse(firstBytes) as {
+    providerSetup: { lifecycle: string; connections: Array<{ id: string }> };
+  };
+
+  assert.equal(first.appHome, target);
+  assert.equal(second.appHome, target);
+  assert.equal(stored.providerSetup.lifecycle, "migrated");
+  assert.equal(stored.providerSetup.connections[0]?.id, "current-provider-1");
+  assert.equal(uuidCalls, 1);
+  assert.equal(await readFile(join(target, "config.json"), "utf8"), firstBytes);
+});
+
 test("committed v0 app-home fixture migrates through real startup without external access and is byte-idempotent", async (t) => {
   const root = await mkdtemp(join(tmpdir(), "orcode-historical-fixture-"));
   t.after(() => rm(root, { recursive: true, force: true }));
@@ -762,7 +794,9 @@ test("committed v0 app-home fixture migrates through real startup without extern
   const start = () => initializeStartupStorage(
     { workspace: HISTORICAL_FIXTURE_WORKSPACE, newChat: false },
     {
-      migrateAppHome: () => migrateAppHome(appHome, legacyHome),
+      migrateAppHome: () => migrateAppHome(appHome, legacyHome, {
+        randomUUID: () => "fixture-provider-id",
+      } as never),
       pruneRunLogs: async () => undefined,
       pruneCheckpoints: async () => undefined,
       pruneBrowserTempArtifacts: async () => undefined,
@@ -828,6 +862,12 @@ test("committed v0 app-home fixture migrates through real startup without extern
       compressorModel: string;
       reasoningByModel: Record<string, unknown>;
       verify: Record<string, unknown>;
+      providerSetup: {
+        schemaVersion: number;
+        lifecycle: string;
+        connections: Array<{ id: string; credentialSlot: string; accountFingerprint: string }>;
+        defaultRoute: { requestedModelId: string; canonicalModelId: string | null; resolutionState: string } | null;
+      };
     };
     assert.equal(storedConfig.schemaVersion, 1);
     assert.equal(storedConfig.mainModel, "synthetic/main-v0");
@@ -838,6 +878,22 @@ test("committed v0 app-home fixture migrates through real startup without extern
       mode: "on-edit",
       maxRepairRounds: 1,
     });
+    assert.equal(storedConfig.providerSetup.schemaVersion, 1);
+    assert.equal(storedConfig.providerSetup.lifecycle, "migrated");
+    assert.deepEqual(storedConfig.providerSetup.connections[0], {
+      id: "fixture-provider-id",
+      backendId: "openrouter",
+      enabled: true,
+      maturity: "stable",
+      credentialSlot: "legacy:inference",
+      accountFingerprint: "acct_legacy_fixture-provider-id",
+      accountFingerprintState: "provisional",
+      billingRealm: "openrouter-payg",
+      lastHealth: null,
+    });
+    assert.equal(storedConfig.providerSetup.defaultRoute?.requestedModelId, "synthetic/main-v0");
+    assert.equal(storedConfig.providerSetup.defaultRoute?.canonicalModelId, null);
+    assert.equal(storedConfig.providerSetup.defaultRoute?.resolutionState, "legacy-unverified");
     assert.equal("maxRounds" in storedConfig.verify, false);
     assert.deepEqual(first.config.verify, storedConfig.verify);
 

@@ -31,6 +31,7 @@ import {
   workspaceStorageHash,
 } from "../src/storage.js";
 import type { ChatSummary, SessionData } from "../src/types.js";
+import type { ProviderConnectionStateV1 } from "../src/provider-state.js";
 
 async function workspaceRoot(prefix: string): Promise<{
   workspace: string;
@@ -950,6 +951,82 @@ test("save sanitizes normalized and direct legacy fields in the raw chat JSON", 
   assert.ok(store.data.title.includes(secret));
   assert.ok(store.data.workspace.includes(secret));
   assert.ok(store.data.model?.includes(secret));
+});
+
+test("two historical chats derive one migrated route lazily and persist only on ordinary save", async () => {
+  const { workspace, appHome } = await workspaceRoot("provider-route-lazy");
+  const directory = join(appHome, "chats", workspaceStorageHash(workspace));
+  await mkdir(directory, { recursive: true });
+  const timestamp = "2026-08-23T08:00:00.000Z";
+  const makeLegacyChat = (id: string, model: string, content: string) => ({
+    version: 2,
+    id,
+    title: id,
+    workspace,
+    summary: "",
+    turns: [{ role: "user", content, createdAt: timestamp }],
+    costs: { mainUsd: 0.25, compressorUsd: 0.05, voiceUsd: 0.01, totalUsd: 0.31 },
+    model,
+    reasoning: { mode: "effort", effort: "high" },
+    revision: 4,
+    checkpoints: [],
+    toolCalls: [],
+    dailySpendUsd: { "2026-08-23": 0.31 },
+    createdAt: timestamp,
+    updatedAt: timestamp,
+  });
+  const firstId = "legacy-chat-one";
+  const secondId = "legacy-chat-two";
+  const firstPath = join(directory, `${firstId}.json`);
+  const secondPath = join(directory, `${secondId}.json`);
+  await writeFile(firstPath, `${JSON.stringify(makeLegacyChat(firstId, "vendor/a/b", "first"), null, 2)}\n`);
+  await writeFile(secondPath, `${JSON.stringify(makeLegacyChat(secondId, "vendor/second", "second"), null, 2)}\n`);
+  const firstOriginal = await readFile(firstPath, "utf8");
+  const secondOriginal = await readFile(secondPath, "utf8");
+  const connection: ProviderConnectionStateV1 = {
+    id: "legacy-csprng-id",
+    backendId: "openrouter",
+    enabled: true,
+    maturity: "stable",
+    credentialSlot: "legacy:inference",
+    accountFingerprint: "acct_legacy_legacy-csprng-id",
+    accountFingerprintState: "provisional",
+    billingRealm: "openrouter-payg",
+    lastHealth: null,
+  };
+
+  const listed = await SessionStore.list(workspace, appHome, connection);
+  assert.deepEqual(new Set(listed.map((chat) => chat.route?.requestedModelId)), new Set(["vendor/a/b", "vendor/second"]));
+  assert.equal(await readFile(firstPath, "utf8"), firstOriginal);
+  assert.equal(await readFile(secondPath, "utf8"), secondOriginal);
+
+  const first = await SessionStore.openById(workspace, firstId, appHome, connection);
+  assert.deepEqual(first.data.route, {
+    version: 1,
+    backendId: "openrouter",
+    accountFingerprint: "acct_legacy_legacy-csprng-id",
+    billingRealm: "openrouter-payg",
+    requestedModelId: "vendor/a/b",
+    canonicalModelId: null,
+    resolutionState: "legacy-unverified",
+  });
+  assert.equal(await readFile(firstPath, "utf8"), firstOriginal);
+  assert.equal(await readFile(secondPath, "utf8"), secondOriginal);
+  const turns = structuredClone(first.data.turns);
+  const costs = structuredClone(first.data.costs);
+
+  await first.save();
+  const firstSaved = await readFile(firstPath, "utf8");
+  const firstPersisted = JSON.parse(firstSaved) as SessionData;
+  assert.deepEqual(firstPersisted.route, first.data.route);
+  assert.deepEqual(firstPersisted.turns, turns);
+  assert.deepEqual(firstPersisted.costs, costs);
+  assert.equal(await readFile(secondPath, "utf8"), secondOriginal);
+
+  const reopened = await SessionStore.openById(workspace, firstId, appHome, connection);
+  assert.deepEqual(reopened.data.route, first.data.route);
+  assert.equal(await readFile(firstPath, "utf8"), firstSaved);
+  assert.equal(await readFile(secondPath, "utf8"), secondOriginal);
 });
 
 test("summaries are redacted before they are persisted", async () => {
