@@ -262,6 +262,85 @@ test("automatic verification persists only process lifecycle events and one root
   assert.equal(events.find((event) => event.type === "run-end")?.outcome, "unverified");
 });
 
+test("a tool-bound null-exit launch failure keeps one redacted process and root lifecycle", async () => {
+  const home = await appHome("task9-bound-launch");
+  const chatId = "chat-task9-bound-launch";
+  const runId = createRunId();
+  const secret = syntheticCredential();
+  const cause = `spawn shell ENOENT ${secret}`;
+  const events: AgentRunEvent[] = [
+    {
+      type: "tool-start",
+      id: "tool-launch",
+      invocationId: "invocation-launch",
+      number: 1,
+      name: "run_command",
+      input: { command: "task9-bound-command" },
+      timestamp: 1,
+    },
+    {
+      type: "process-start",
+      id: "process-launch",
+      invocationId: "invocation-launch",
+      name: "run_command",
+      input: { command: "task9-bound-command" },
+      toolId: "tool-launch",
+      toolNumber: 1,
+      timestamp: 2,
+    },
+    {
+      type: "process-end",
+      id: "process-launch",
+      invocationId: "invocation-launch",
+      name: "run_command",
+      input: { command: "task9-bound-command" },
+      toolId: "tool-launch",
+      toolNumber: 1,
+      exitCode: null,
+      durationMs: 2,
+      truncated: false,
+      timedOut: false,
+      aborted: false,
+      error: cause,
+      timestamp: 3,
+    },
+    {
+      type: "tool-error",
+      id: "tool-launch",
+      invocationId: "invocation-launch",
+      number: 1,
+      name: "run_command",
+      input: { command: "task9-bound-command" },
+      error: cause,
+      durationMs: 3,
+      timestamp: 4,
+    },
+    { type: "run-end", outcome: "error", durationMs: 4, toolCount: 1, timestamp: 5 },
+  ];
+
+  const log = await RunLog.open(home, chatId, runId);
+  for (const event of events) log.write(event);
+  await log.close();
+
+  const persisted: AgentRunEvent[] = [];
+  for await (const event of RunLog.read(home, chatId, runId)) persisted.push(event);
+  assert.deepEqual(persisted.map((event) => event.type), [
+    "tool-start",
+    "process-start",
+    "process-end",
+    "tool-error",
+    "run-end",
+  ]);
+  const processEnd = persisted.find((event) => event.type === "process-end");
+  assert.equal(processEnd?.type === "process-end" ? processEnd.exitCode : 1, null);
+  assert.equal(persisted.filter((event) => event.type === "process-end").length, 1);
+  assert.equal(persisted.filter((event) => event.type === "tool-error").length, 1);
+  assert.equal(persisted.filter((event) => event.type === "run-end").length, 1);
+  const raw = await readFile(runLogPath(home, chatId, runId), "utf8");
+  assert.doesNotMatch(raw, new RegExp(secret));
+  assert.match(raw, /REDACTED/);
+});
+
 test("new writes use a versioned envelope and redact a clone of the live event", async () => {
   const home = await appHome("envelope-redaction");
   const chatId = "chat-envelope";

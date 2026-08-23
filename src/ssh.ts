@@ -114,7 +114,7 @@ const UNREACHABLE_PATTERN =
 
 /** Classifies a failed `ssh` invocation from its exit status and stderr — shared by `checkHost` and `ssh_command`'s own failure handling. */
 export function classifySshFailure(result: {
-  code: number;
+  code: number | null;
   stderr: string;
   timedOut?: boolean;
 }): "no-auth" | "unreachable" {
@@ -125,7 +125,8 @@ export function classifySshFailure(result: {
 }
 
 function unreachableMessage(alias: string, result: ProcessResult): string {
-  const detail = result.stderr.trim() || `ssh endete mit Code ${result.code}.`;
+  const detail = result.launchError || result.stderr.trim() ||
+    (result.code === null ? "ssh konnte nicht gestartet werden." : `ssh endete mit Code ${result.code}.`);
   return `„${alias}“ ist gerade nicht erreichbar: ${detail}`;
 }
 
@@ -221,6 +222,9 @@ export async function execSshCommand(
     ...(options.signal ? { signal: options.signal } : {}),
     ...(options.onChunk ? { onChunk: options.onChunk } : {}),
   });
+  if (result.launchError || result.code === null) {
+    throw new Error(result.launchError || "ssh konnte nicht gestartet werden.");
+  }
   if (result.code !== 0 && classifySshFailure(result) === "no-auth") {
     throw new SshAuthError(alias);
   }

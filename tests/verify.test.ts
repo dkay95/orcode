@@ -388,7 +388,7 @@ test("real POSIX signal termination is typed and never becomes a repairable exit
 test("real POSIX command-not-found is typed and never becomes repairable exit 127", needsPosixShell, async () => {
   const guard = await tempWorkspace();
   const events: VerifyCommandEvent[] = [];
-  const ends: Array<{ exitCode: number | null; stderr?: string }> = [];
+  const ends: Array<{ exitCode: number | null; error?: string }> = [];
   const command = "routercode_task9_command_that_does_not_exist";
 
   const outcome = await runVerify(
@@ -399,19 +399,19 @@ test("real POSIX command-not-found is typed and never becomes repairable exit 12
     {
       onProcessEnd: (_operation, completion) => ends.push({
         exitCode: completion.exitCode,
-        ...(completion.stderr ? { stderr: completion.stderr } : {}),
+        ...(completion.error ? { error: completion.error } : {}),
       }),
     },
   );
 
   assert.equal(outcome.status, "spawn-failed");
   if (outcome.status === "spawn-failed") {
-    assert.match(outcome.error, /not found/i);
+    assert.match(outcome.error, /not found|nicht.*gefunden|aufgelöst/i);
   }
   assert.deepEqual(events, []);
   assert.equal(ends.length, 1);
-  assert.equal(ends[0]?.exitCode, 127);
-  assert.match(ends[0]?.stderr ?? "", /not found/i);
+  assert.equal(ends[0]?.exitCode, null);
+  assert.match(ends[0]?.error ?? "", /not found|nicht.*gefunden|aufgelöst|PATH/i);
 });
 
 test("an ordinary explicit exit 127 stays repairable without command-resolution evidence", needsPosixShell, async () => {
@@ -431,14 +431,14 @@ test("an ordinary explicit exit 127 stays repairable without command-resolution 
   assert.equal(events[0]?.exitCode, 127);
 });
 
-test("Windows-equivalent command resolution and launch causes are deterministically nonrepairable", async (t) => {
-  const cases = [
+test("ordinary failures cannot spoof command resolution through their output", async (t) => {
+  const fixtures = [
     {
-      name: "cmd command-not-found exit 9009",
+      name: "exit 127 mentioning not found",
       result: {
-        code: 9009,
+        code: 127,
         stdout: "",
-        stderr: "is not recognized as an internal or external command",
+        stderr: "AssertionError: fixture not found",
         truncated: false,
         timedOut: false,
         aborted: false,
@@ -446,9 +446,45 @@ test("Windows-equivalent command resolution and launch causes are deterministica
       },
     },
     {
-      name: "Windows launch error",
+      name: "exit 1 mentioning PowerShell documentation",
       result: {
         code: 1,
+        stdout: "",
+        stderr: "AssertionError: expected CommandNotFoundException documentation",
+        truncated: false,
+        timedOut: false,
+        aborted: false,
+        signal: null,
+      },
+    },
+  ] as const;
+
+  for (const fixture of fixtures) {
+    await t.test(fixture.name, async () => {
+      const guard = await tempWorkspace();
+      const events: VerifyCommandEvent[] = [];
+      const outcome = await runVerify(
+        ["ordinary-test-fixture"],
+        guard,
+        undefined,
+        (event) => events.push(event),
+        {},
+        { execute: async () => fixture.result },
+      );
+
+      assert.equal(outcome.status, "failed");
+      assert.equal(events.length, 1);
+      assert.equal(events[0]?.exitCode, fixture.result.code);
+    });
+  }
+});
+
+test("structured Windows launch causes are deterministically nonrepairable", async (t) => {
+  const cases = [
+    {
+      name: "Windows launch error",
+      result: {
+        code: null,
         stdout: "",
         stderr: "",
         truncated: false,
@@ -456,18 +492,6 @@ test("Windows-equivalent command resolution and launch causes are deterministica
         aborted: false,
         signal: null,
         launchError: "spawn UNKNOWN",
-      },
-    },
-    {
-      name: "PowerShell CommandNotFoundException",
-      result: {
-        code: 1,
-        stdout: "",
-        stderr: "CommandNotFoundException: The term 'missing' is not recognized as the name of a cmdlet",
-        truncated: false,
-        timedOut: false,
-        aborted: false,
-        signal: null,
       },
     },
   ] as const;
@@ -487,6 +511,247 @@ test("Windows-equivalent command resolution and launch causes are deterministica
 
       assert.equal(outcome.status, "spawn-failed");
       assert.deepEqual(events, []);
+    });
+  }
+});
+
+test("cmd and PowerShell use structured simple-command preflight instead of output heuristics", async (t) => {
+  for (const shell of ["cmd.exe", "powershell.exe"] as const) {
+    await t.test(shell, async () => {
+      const guard = await tempWorkspace();
+      const lifecycle: Array<{ type: "start" | "end"; exitCode?: number | null }> = [];
+      let executions = 0;
+      const outcome = await runVerify(
+        ["routercode_missing_windows_command"],
+        guard,
+        undefined,
+        () => undefined,
+        {
+          onProcessStart: () => lifecycle.push({ type: "start" }),
+          onProcessEnd: (_operation, completion) => lifecycle.push({
+            type: "end",
+            exitCode: completion.exitCode,
+          }),
+        },
+        {
+          environment: { ORCODE_SHELL: shell, Path: "C:\\Windows\\System32" },
+          platform: "win32",
+          resolveExecutable: async (requested) => {
+            if (requested === shell) return `C:\\Windows\\System32\\${shell}`;
+            throw new Error(`Ausführbare Datei nicht in PATH gefunden: ${requested}`);
+          },
+          execute: async (_executable, args) => {
+            if (args.includes("-EncodedCommand")) {
+              return {
+                code: 1,
+                stdout: "",
+                stderr: "Get-Command failed",
+                truncated: false,
+                timedOut: false,
+                aborted: false,
+                signal: null,
+              };
+            }
+            executions += 1;
+            return {
+              code: 0,
+              stdout: "",
+              stderr: "",
+              truncated: false,
+              timedOut: false,
+              aborted: false,
+              signal: null,
+            };
+          },
+        },
+      );
+
+      assert.equal(outcome.status, "spawn-failed");
+      assert.equal(executions, 0);
+      assert.deepEqual(lifecycle, [
+        { type: "start" },
+        { type: "end", exitCode: null },
+      ]);
+    });
+  }
+});
+
+test("shell-native POSIX, cmd and PowerShell commands are never rejected by executable preflight", async (t) => {
+  const fixtures = [
+    { shell: "/bin/sh", command: "builtin true", platform: "linux" },
+    { shell: "cmd.exe", command: "dir", platform: "win32" },
+    { shell: "powershell.exe", command: "Get-ChildItem", platform: "win32" },
+  ] as const;
+
+  for (const fixture of fixtures) {
+    await t.test(fixture.shell, async () => {
+      const guard = await tempWorkspace();
+      let executions = 0;
+      const outcome = await runVerify(
+        [fixture.command],
+        guard,
+        undefined,
+        () => undefined,
+        {},
+        {
+          environment: fixture.platform === "win32"
+            ? { ORCODE_SHELL: fixture.shell, Path: "C:\\Windows\\System32" }
+            : { ORCODE_SHELL: fixture.shell, PATH: "/usr/bin:/bin" },
+          platform: fixture.platform,
+          resolveExecutable: async (requested) => {
+            if (requested === fixture.shell) {
+              return fixture.platform === "win32"
+                ? `C:\\Windows\\System32\\${fixture.shell}`
+                : fixture.shell;
+            }
+            throw new Error(`Ausführbare Datei nicht in PATH gefunden: ${requested}`);
+          },
+          execute: async (_executable, args) => {
+            if (args.includes("-EncodedCommand") || args.includes("orcode-verify-preflight")) {
+              return {
+                code: 0,
+                stdout: "",
+                stderr: "",
+                truncated: false,
+                timedOut: false,
+                aborted: false,
+                signal: null,
+              };
+            }
+            executions += 1;
+            return {
+              code: 0,
+              stdout: "",
+              stderr: "",
+              truncated: false,
+              timedOut: false,
+              aborted: false,
+              signal: null,
+            };
+          },
+        },
+      );
+
+      assert.equal(outcome.status, "passed");
+      assert.equal(executions, 1);
+    });
+  }
+});
+
+test("compound and wrapped POSIX commands keep the shell's actual final result", async (t) => {
+  const missing = "routercode_missing_wrapped_command";
+  const fixtures = [
+    { command: `${missing} || true`, code: 0, status: "passed" },
+    { command: `true && ${missing}`, code: 127, status: "failed" },
+    { command: `VALUE=ok ${missing}`, code: 127, status: "failed" },
+    { command: `env VALUE=ok ${missing}`, code: 127, status: "failed" },
+  ] as const;
+
+  for (const fixture of fixtures) {
+    await t.test(fixture.command, async () => {
+      const guard = await tempWorkspace();
+      let executions = 0;
+      const outcome = await runVerify(
+        [fixture.command],
+        guard,
+        undefined,
+        () => undefined,
+        {},
+        {
+          environment: { ORCODE_SHELL: "/bin/sh", PATH: "/usr/bin:/bin" },
+          platform: "linux",
+          resolveExecutable: async (requested) => {
+            if (requested === "/bin/sh") return "/bin/sh";
+            if (requested === "env") return "/usr/bin/env";
+            throw new Error(`Ausführbare Datei nicht in PATH gefunden: ${requested}`);
+          },
+          execute: async (_executable, args) => {
+            if (args.includes("orcode-verify-preflight")) {
+              return {
+                code: 0,
+                stdout: "",
+                stderr: "",
+                truncated: false,
+                timedOut: false,
+                aborted: false,
+                signal: null,
+              };
+            }
+            executions += 1;
+            return {
+              code: fixture.code,
+              stdout: "",
+              stderr: "fixture not found",
+              truncated: false,
+              timedOut: false,
+              aborted: false,
+              signal: null,
+            };
+          },
+        },
+      );
+
+      assert.equal(outcome.status, fixture.status);
+      assert.equal(executions, 1);
+    });
+  }
+});
+
+test("PowerShell language constructs stay ordinary shell results instead of fake launch failures", async (t) => {
+  const fixtures = [
+    { command: "exit 127", code: 127, status: "failed" },
+    { command: 'throw "ordinary failure"', code: 1, status: "failed" },
+    { command: '"plain value"', code: 0, status: "passed" },
+  ] as const;
+
+  for (const fixture of fixtures) {
+    await t.test(fixture.command, async () => {
+      const guard = await tempWorkspace();
+      let probes = 0;
+      let executions = 0;
+      const outcome = await runVerify(
+        [fixture.command],
+        guard,
+        undefined,
+        () => undefined,
+        {},
+        {
+          environment: { ORCODE_SHELL: "powershell.exe", Path: "C:\\Windows\\System32" },
+          platform: "win32",
+          resolveExecutable: async (requested) => {
+            if (requested === "powershell.exe") return "C:\\Windows\\System32\\powershell.exe";
+            throw new Error(`Ausführbare Datei nicht in PATH gefunden: ${requested}`);
+          },
+          execute: async (_executable, args) => {
+            if (args.includes("-EncodedCommand")) {
+              probes += 1;
+              return {
+                code: 1,
+                stdout: "",
+                stderr: "Get-Command cannot resolve language syntax",
+                truncated: false,
+                timedOut: false,
+                aborted: false,
+                signal: null,
+              };
+            }
+            executions += 1;
+            return {
+              code: fixture.code,
+              stdout: "",
+              stderr: fixture.code === 0 ? "" : "ordinary PowerShell result",
+              truncated: false,
+              timedOut: false,
+              aborted: false,
+              signal: null,
+            };
+          },
+        },
+      );
+
+      assert.equal(outcome.status, fixture.status);
+      assert.equal(probes, 0);
+      assert.equal(executions, 1);
     });
   }
 });

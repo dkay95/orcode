@@ -31,6 +31,7 @@ import {
 } from "./config.js";
 import {
   resolveCommandShell,
+  resolveExecutablePath,
   runObservedProcess,
   runProcess,
   type ProcessResult,
@@ -113,11 +114,21 @@ export type VerifyOutcome =
 
 const VERIFY_TIMEOUT_MS = 120_000;
 const VERIFY_FAILURE_MAX_CHARS = 4_000;
-const COMMAND_RESOLUTION_EXIT_CODES = new Set([126, 127, 9009]);
-const COMMAND_RESOLUTION_DIAGNOSTIC =
-  /(?:command not found|not found|not recognized as an internal or external command|cannot execute|permission denied)/i;
-const POWERSHELL_RESOLUTION_DIAGNOSTIC =
-  /(?:CommandNotFoundException|The term .+ is not recognized as the name of)/i;
+const CMD_NATIVE_COMMANDS = new Set([
+  "assoc", "break", "call", "cd", "chdir", "cls", "color", "copy", "date",
+  "del", "dir", "echo", "endlocal", "erase", "exit", "for", "ftype", "goto",
+  "if", "md", "mkdir", "mklink", "move", "path", "pause", "popd", "prompt",
+  "pushd", "rd", "rem", "ren", "rename", "rmdir", "set", "setlocal", "shift",
+  "start", "time", "title", "type", "ver", "verify", "vol",
+]);
+const POWERSHELL_LANGUAGE_KEYWORDS = new Set([
+  "begin", "break", "catch", "class", "clean", "configuration", "continue",
+  "data", "define", "do", "dynamicparam", "else", "elseif", "end", "enum",
+  "exit", "filter", "finally", "for", "foreach", "from", "function", "hidden",
+  "if", "in", "inlinescript", "parallel", "param", "process", "return",
+  "sequence", "static", "switch", "throw", "trap", "try", "until", "using",
+  "var", "while", "workflow",
+]);
 
 /** Same pattern the render layer (2.5) uses to pick the informative lines out of red output. */
 const FAILURE_LINE_PATTERN = /(^|\s)(error|ERROR|FAIL|✗|panic|Traceback|error TS\d+)/;
@@ -130,6 +141,10 @@ export interface VerifyExecutionOptions {
     args: string[],
     options: RunProcessOptions,
   ) => Promise<ProcessResult>;
+  /** Deterministic cross-platform command preflight dependencies for tests. */
+  environment?: NodeJS.ProcessEnv;
+  platform?: NodeJS.Platform;
+  resolveExecutable?: typeof resolveExecutablePath;
 }
 
 /**
@@ -165,15 +180,39 @@ export async function runVerify(
         { command },
         processCallbacks,
         async (onChunk) => {
+          const environment = execution.environment ?? process.env;
+          const platform = execution.platform ?? process.platform;
+          const resolveExecutable = execution.resolveExecutable ?? resolveExecutablePath;
           let shell: Awaited<ReturnType<typeof resolveCommandShell>>;
           try {
-            shell = await resolveCommandShell();
+            shell = await resolveCommandShell(environment, platform, resolveExecutable);
           } catch (error) {
-            // Resolution belongs to this visible attempt. Sanitize before the
-            // observed terminal callback can expose the configured path.
-            throw new Error(compactExecutionError(error));
+            return launchFailure(error);
           }
-          const executed = await (execution.execute ?? runProcess)(
+          // Production preflights only an unambiguous top-level simple
+          // executable. Ambiguous/compound shell programs are never
+          // reclassified from their freely controlled stdout/stderr. Tests
+          // with an injected executor own their structured launch fixture.
+          const execute = execution.execute ?? runProcess;
+          if (!execution.execute || execution.resolveExecutable) {
+            try {
+              const preflightFailure = await preflightSimpleVerifyCommand(
+                command,
+                shell.executable,
+                shell.args,
+                guard.root,
+                environment,
+                platform,
+                resolveExecutable,
+                execute,
+                signal,
+              );
+              if (preflightFailure) return preflightFailure;
+            } catch (error) {
+              return launchFailure(error);
+            }
+          }
+          const executed = await execute(
             shell.executable,
             [...shell.args, command],
             {
@@ -184,7 +223,7 @@ export async function runVerify(
             },
           );
           return executed.launchError
-            ? { ...executed, launchError: compactExecutionError(executed.launchError) }
+            ? { ...executed, code: null, launchError: compactExecutionError(executed.launchError) }
             : executed;
         },
       );
@@ -209,9 +248,14 @@ export async function runVerify(
     if (result.signal) {
       return { status: "terminated", command, signal: result.signal };
     }
-    const resolutionError = commandResolutionError(result);
-    if (resolutionError) {
-      return { status: "spawn-failed", command, error: resolutionError };
+    if (result.launchError || result.code === null) {
+      return {
+        status: "spawn-failed",
+        command,
+        error: compactExecutionError(
+          result.launchError || "Kommando konnte nicht gestartet werden.",
+        ),
+      };
     }
     onEvent({
       command,
@@ -235,22 +279,101 @@ function compactExecutionError(error: unknown): string {
   return truncate(redactText(errorMessage(error)), 1_000);
 }
 
-function commandResolutionError(result: ProcessResult): string | null {
-  if (result.launchError) {
-    return compactExecutionError(result.launchError);
+function launchFailure(error: unknown): ProcessResult {
+  return {
+    code: null,
+    stdout: "",
+    stderr: "",
+    truncated: false,
+    timedOut: false,
+    aborted: false,
+    signal: null,
+    launchError: compactExecutionError(error),
+  };
+}
+
+async function preflightSimpleVerifyCommand(
+  command: string,
+  shellExecutable: string,
+  shellArgs: string[],
+  cwd: string,
+  environment: NodeJS.ProcessEnv,
+  platform: NodeJS.Platform,
+  resolveExecutable: typeof resolveExecutablePath,
+  execute: NonNullable<VerifyExecutionOptions["execute"]>,
+  signal: AbortSignal | undefined,
+): Promise<ProcessResult | null> {
+  const shellKind = verifyShellKind(shellExecutable);
+  const token = simpleVerifyExecutable(command, shellKind);
+  if (!token) return null;
+  const normalized = token.toLowerCase();
+  if (shellKind === "cmd" &&
+      (CMD_NATIVE_COMMANDS.has(normalized) || /^echo[.:/]/i.test(token))) return null;
+  if (shellKind === "powershell") {
+    const quoted = token.replaceAll("'", "''");
+    const script = `$ErrorActionPreference='Stop'; Get-Command -Name '${quoted}' -ErrorAction Stop | Out-Null`;
+    const probe = await execute(
+      shellExecutable,
+      ["-NoProfile", "-NonInteractive", "-EncodedCommand", Buffer.from(script, "utf16le").toString("base64")],
+      {
+        cwd,
+        timeoutMs: Math.min(VERIFY_TIMEOUT_MS, 10_000),
+        ...(signal ? { signal } : {}),
+      },
+    );
+    return resolutionProbeFailure(token, probe);
   }
-  const detail = `${result.stderr}\n${result.stdout}`.trim();
-  const conventionalShellFailure =
-    COMMAND_RESOLUTION_EXIT_CODES.has(result.code) &&
-    COMMAND_RESOLUTION_DIAGNOSTIC.test(detail);
-  const powershellFailure =
-    result.code !== 0 && POWERSHELL_RESOLUTION_DIAGNOSTIC.test(detail);
-  if (!conventionalShellFailure && !powershellFailure) {
+  if (shellKind === "posix") {
+    const probe = await execute(
+      shellExecutable,
+      [...shellArgs, 'command -v -- "$1" >/dev/null 2>&1', "orcode-verify-preflight", token],
+      {
+        cwd,
+        timeoutMs: Math.min(VERIFY_TIMEOUT_MS, 10_000),
+        ...(signal ? { signal } : {}),
+      },
+    );
+    return resolutionProbeFailure(token, probe);
+  }
+  await resolveExecutable(token, environment, platform);
+  return null;
+}
+
+function resolutionProbeFailure(token: string, probe: ProcessResult): ProcessResult | null {
+  if (probe.aborted || probe.timedOut || probe.signal || probe.launchError || probe.code === null) {
+    return probe.launchError
+      ? { ...probe, code: null, launchError: compactExecutionError(probe.launchError) }
+      : probe;
+  }
+  return probe.code === 0
+    ? null
+    : launchFailure(`Kommando konnte nicht aufgelöst werden: ${token}`);
+}
+
+function verifyShellKind(shellExecutable: string): "posix" | "cmd" | "powershell" {
+  const name = shellExecutable.split(/[\\/]/).at(-1)?.toLowerCase() ?? "";
+  if (name === "cmd" || name === "cmd.exe") return "cmd";
+  if (name.includes("pwsh") || name.includes("powershell")) return "powershell";
+  return "posix";
+}
+
+/** Returns only a literal executable whose first shell segment is safe to inspect. */
+function simpleVerifyExecutable(
+  command: string,
+  shellKind: "posix" | "cmd" | "powershell",
+): string | null {
+  const trimmed = command.trim();
+  if (!trimmed) return null;
+  if (/[\r\n;&|<>()`$\\*?\[\]{}!~^%@]/.test(trimmed)) return null;
+  if (shellKind === "powershell" &&
+      (/^['"#-]/.test(trimmed) || /^\d/.test(trimmed))) return null;
+  const match = /^(?:'([^']+)'|"([^"\\]+)"|([^\s'"]+))(?:\s|$)/.exec(trimmed);
+  const token = match?.[1] ?? match?.[2] ?? match?.[3];
+  if (!token || token.includes("=")) return null;
+  if (shellKind === "powershell" && POWERSHELL_LANGUAGE_KEYWORDS.has(token.toLowerCase())) {
     return null;
   }
-  return compactExecutionError(
-    detail || `Kommando konnte nicht aufgelöst werden (exit ${result.code}).`,
-  );
+  return token;
 }
 
 function distillFailure(stdout: string, stderr: string): string {

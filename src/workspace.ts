@@ -55,6 +55,7 @@ import {
 } from "./rules.js";
 import { findSshHost, loadSshHosts, type SshHost } from "./ssh-config.js";
 import { execSshCommand, sshApprovalSubject, type RunSsh } from "./ssh.js";
+import { redactText } from "./redaction.js";
 import type {
   ProcessCallbacks,
   ProcessCompletion,
@@ -735,6 +736,9 @@ export function createCodingTools(
       );
       const stdout = truncate(result.stdout, MAX_TOOL_OUTPUT);
       const stderr = truncate(result.stderr, MAX_TOOL_OUTPUT);
+      if (result.launchError || result.code === null) {
+        throw new Error(result.launchError || "Shell-Prozess konnte nicht gestartet werden.");
+      }
       return {
         command: executionCommand,
         exitCode: result.code,
@@ -2279,7 +2283,8 @@ export interface RunProcessOptions {
 }
 
 export interface ProcessResult {
-  code: number;
+  /** Null means the executable never produced an ordinary process exit. */
+  code: number | null;
   stdout: string;
   stderr: string;
   truncated: boolean;
@@ -2328,7 +2333,7 @@ export async function runObservedProcess(
     const stderr = boundedProcessCompletionText(result.stderr);
     const signal = result.signal ?? null;
     finish({
-      exitCode: signal ? null : result.code,
+      exitCode: signal || result.launchError ? null : result.code,
       ...(signal ? { signal } : {}),
       durationMs: Date.now() - startedAt,
       truncated:
@@ -2472,14 +2477,14 @@ export function runProcess(
     });
     child.on("error", (error) => {
       finish({
-        code: 1,
+        code: null,
         stdout,
         stderr,
         truncated,
         timedOut: false,
         aborted: false,
         signal: null,
-        launchError: errorMessage(error),
+        launchError: compactProcessLaunchError(error),
       });
     });
     child.on("close", (code, signal) => {
@@ -2494,6 +2499,10 @@ export function runProcess(
       });
     });
   });
+}
+
+function compactProcessLaunchError(error: unknown): string {
+  return truncate(redactText(errorMessage(error)), 1_000);
 }
 
 function appendBounded(

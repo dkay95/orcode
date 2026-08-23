@@ -88,6 +88,11 @@ async function sandbox(options: {
   runSsh?: RunSsh;
   ruleStore?: RuleStore;
   workspace?: string;
+  onProcessStart?: (operation: { id: string }) => void;
+  onProcessEnd?: (
+    operation: { id: string },
+    completion: { exitCode: number | null; error?: string },
+  ) => void;
 }): Promise<Sandbox> {
   const root = await mkdtemp(join(tmpdir(), "routercode-sshtool-"));
   const guard = await WorkspaceGuard.create(root);
@@ -105,6 +110,8 @@ async function sandbox(options: {
   const runner = options.runSsh ? { runSsh: options.runSsh, calls: [] } : recordingRunner(okResult());
   const tools = createCodingTools(guard, approvals, journal, {
     ssh: { hosts: HOSTS, runSsh: runner.runSsh, appHome: join(root, ".routercode-ssh") },
+    ...(options.onProcessStart ? { onProcessStart: options.onProcessStart } : {}),
+    ...(options.onProcessEnd ? { onProcessEnd: options.onProcessEnd } : {}),
   });
   return {
     tools,
@@ -152,6 +159,38 @@ test("ssh_command allow-all runs without asking", async () => {
     const output = await invoke(tools, "ssh_command", { host: "vps", command: "uptime" });
     assert.equal(asked.length, 0);
     assert.equal(output.exitCode, 0);
+  } finally {
+    await cleanup();
+  }
+});
+
+test("ssh_command preserves a structured launch failure after one null-exit lifecycle", async () => {
+  const lifecycle: Array<{ type: "start" | "end"; id: string; exitCode?: number | null; error?: string }> = [];
+  const runner = recordingRunner(okResult({
+    code: null,
+    launchError: "spawn ssh ENOENT",
+  }));
+  const { tools, cleanup } = await sandbox({
+    mode: "allow-all",
+    runSsh: runner.runSsh,
+    onProcessStart: (operation) => lifecycle.push({ type: "start", id: operation.id }),
+    onProcessEnd: (operation, completion) => lifecycle.push({
+      type: "end",
+      id: operation.id,
+      exitCode: completion.exitCode,
+      ...(completion.error ? { error: completion.error } : {}),
+    }),
+  });
+  try {
+    await assert.rejects(
+      invoke(tools, "ssh_command", { host: "vps", command: "uptime" }),
+      /spawn ssh ENOENT/,
+    );
+    assert.equal(runner.calls.length, 1);
+    assert.deepEqual(lifecycle.map((event) => event.type), ["start", "end"]);
+    assert.equal(new Set(lifecycle.map((event) => event.id)).size, 1);
+    assert.equal(lifecycle[1]?.exitCode, null);
+    assert.match(lifecycle[1]?.error ?? "", /spawn ssh ENOENT/);
   } finally {
     await cleanup();
   }

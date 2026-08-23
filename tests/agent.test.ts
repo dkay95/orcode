@@ -1539,7 +1539,7 @@ test("Task 9 real signal and command-not-found verification stay unverified with
       name: "command not found",
       command: "routercode_task9_agent_command_that_does_not_exist",
       signal: undefined,
-      exitCode: 127,
+      exitCode: null,
     },
   ] as const;
 

@@ -106,7 +106,13 @@ async function sandbox(
     ) => void;
     onProcessEnd?: (
       operation: { id: string; name: string; input: Record<string, unknown> },
-      result: { exitCode: number | null; durationMs: number; timedOut: boolean; aborted: boolean },
+      result: {
+        exitCode: number | null;
+        durationMs: number;
+        timedOut: boolean;
+        aborted: boolean;
+        error?: string;
+      },
     ) => void;
     ssh?: CodingToolOptions["ssh"];
     inspectUrlFn?: CodingToolOptions["inspectUrlFn"];
@@ -785,6 +791,47 @@ test("an unresolvable shell cannot ask for remembered authority or execute a gue
   assert.equal(prompts, 0);
   assert.equal(existsSync(marker), false);
   assert.deepEqual(ruleStore.list(box.root), []);
+});
+
+test("run_command keeps an actual post-approval ENOENT as one null-exit launch failure", { skip: process.platform === "win32" ? "POSIX fixture" : false }, async (t) => {
+  const lifecycle: Array<{
+    type: "start" | "end";
+    id: string;
+    exitCode?: number | null;
+    error?: string;
+  }> = [];
+  const box = await sandbox("ask", {
+    prefix: "shell-launch-race",
+    onProcessStart: (operation) => lifecycle.push({ type: "start", id: operation.id }),
+    onProcessEnd: (operation, completion) => lifecycle.push({
+      type: "end",
+      id: operation.id,
+      exitCode: completion.exitCode,
+      ...(completion.error ? { error: completion.error } : {}),
+    }),
+  });
+  const shell = join(box.root, "ephemeral-shell");
+  await writeFile(shell, "#!/bin/sh\nexec /bin/sh \"$@\"\n", { mode: 0o700 });
+  const previous = process.env.ORCODE_SHELL;
+  process.env.ORCODE_SHELL = shell;
+  t.after(async () => {
+    if (previous === undefined) delete process.env.ORCODE_SHELL;
+    else process.env.ORCODE_SHELL = previous;
+    await rm(box.root, { recursive: true, force: true });
+  });
+  box.approvals.setPromptHandler(async () => {
+    await rm(shell, { force: true });
+    return { accepted: true };
+  });
+
+  await assert.rejects(
+    invoke(box.tools, "run_command", { command: "printf unreachable", timeoutSeconds: 5 }),
+    /ENOENT|not found|nicht gefunden/i,
+  );
+  assert.deepEqual(lifecycle.map((event) => event.type), ["start", "end"]);
+  assert.equal(new Set(lifecycle.map((event) => event.id)).size, 1);
+  assert.equal(lifecycle[1]?.exitCode, null);
+  assert.match(lifecycle[1]?.error ?? "", /ENOENT|not found|nicht gefunden/i);
 });
 
 test("shell environment removes credential-like variables", () => {
@@ -1634,7 +1681,12 @@ test("consumer callback failures never change the canonical process result", { s
 test("runProcess preserves a real launch error through one observed terminal result", async () => {
   const root = await mkdtemp(join(tmpdir(), "routercode-launch-result-"));
   const missing = join(root, "missing-executable");
-  const lifecycle: Array<{ type: "start" | "end"; id: string; error?: string }> = [];
+  const lifecycle: Array<{
+    type: "start" | "end";
+    id: string;
+    exitCode?: number | null;
+    error?: string;
+  }> = [];
 
   const result = await runObservedProcess(
     "launch-fixture",
@@ -1644,6 +1696,7 @@ test("runProcess preserves a real launch error through one observed terminal res
       onProcessEnd: (operation, completion) => lifecycle.push({
         type: "end",
         id: operation.id,
+        exitCode: completion.exitCode,
         ...(completion.error ? { error: completion.error } : {}),
       }),
     },
@@ -1654,11 +1707,12 @@ test("runProcess preserves a real launch error through one observed terminal res
     }),
   );
 
-  assert.equal(result.code, 1);
+  assert.equal(result.code, null);
   assert.equal(result.signal, null);
   assert.match(result.launchError ?? "", /ENOENT|not found/i);
   assert.deepEqual(lifecycle.map((event) => event.type), ["start", "end"]);
   assert.equal(new Set(lifecycle.map((event) => event.id)).size, 1);
+  assert.equal(lifecycle[1]?.exitCode, null);
   assert.match(lifecycle[1]?.error ?? "", /ENOENT|not found/i);
 });
 

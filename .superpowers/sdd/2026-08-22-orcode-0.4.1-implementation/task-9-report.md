@@ -274,3 +274,76 @@ Base: clean `9e14260a0b9a64415aacc3cd9e4bfe4a47387034`.
   focused and full gates.
 
 Requested commit: `fix: keep verification terminal failures unrepairable`.
+
+## Fix Round 2 — structured process launch failures
+
+Base: clean `099036aa9cabef34de59bd77eb2f3d2925ca4874`.
+
+### Findings and RED evidence
+
+- Ordinary child output was still treated as authority for command resolution:
+  explicit exit 127/1 could become non-repairable merely by printing phrases
+  such as `not found` or `CommandNotFoundException`. A real executable launch
+  error also invented exit code 1, and `run_command`/SSH discarded its
+  structured cause. The initial named Round-2 selection reached 7 tests: 2
+  passed and the 5 intended assertions failed before production edits.
+- The first implementation used one POSIX-oriented PATH preflight for every
+  shell. Fail-first probes showed valid `dir` and `Get-ChildItem` commands being
+  rejected; the shell-native selection reached 3 tests with 0 passes and 3
+  failures.
+- Review then exposed two further authority errors: inspecting only the first
+  segment changed the actual result of `missing || true`/`;`/pipelines, while
+  PowerShell language constructs such as `exit`, `throw`, and a quoted
+  expression were sent to `Get-Command`. The combined adversarial selection
+  reached 13 tests: 3 passed and 10 failed before the final production fix.
+
+### Implementation
+
+- `ProcessResult.code` is nullable. A real spawn error now returns
+  `code: null` with one compact centrally redacted `launchError`;
+  `runObservedProcess` emits exactly one `exitCode: null` terminal. Existing
+  public tool schemas stay numeric because `run_command` and SSH throw the
+  retained cause only after that observed terminal.
+- Verification no longer infers authority from stdout or stderr. It preflights
+  only a strictly simple, literal top-level command. Compound commands,
+  assignments, wrappers, redirections, expansions, and language expressions
+  run normally and keep the shell's actual final exit semantics.
+- Resolution is shell-causal: a POSIX shell resolves the token in the same
+  no-profile shell via a silent `command -v` probe; cmd uses its finite native
+  command set plus executable-path resolution; PowerShell uses an encoded
+  `Get-Command` probe only for command-shaped tokens. PowerShell keywords,
+  quoted/numeric expressions, and cmd/POSIX native commands bypass external
+  executable classification.
+- The bound UI path keeps the process terminal attached to its tool card, then
+  renders one tool-error cause. RunLog persists the structured process/tool/root
+  lifecycle with the cause redacted. Unbound verify, real `run_command`, and
+  SSH paths retain the same one-start/one-end contract.
+
+### GREEN evidence
+
+- Final shell-authority matrix: 19/19 passed, including deceptive output,
+  simple missing commands, POSIX/cmd/PowerShell native commands, compound and
+  wrapped POSIX semantics, and PowerShell language constructs.
+- Independent final re-review passed 33/33 adversarial probes with no open
+  Critical or Important finding.
+- Complete verifier suite: 55/55 passed. Task-9/Task-8 process, SSH, TUI,
+  RunLog, conversation, config, and command focus: 346/346 passed.
+- Both TypeScript checks passed. Full `npm test`: 836 passed, 0 failed, and 1
+  existing platform-only skip (837 total).
+- Central credential scanner and literal credential audit returned no findings;
+  `git diff --check` passed.
+
+### Self-review and limits
+
+- Bound TUI and RunLog tests prove one visible cause, one process terminal, one
+  root terminal, `exitCode: null`, and central redaction without a duplicate
+  tail. Real post-approval POSIX ENOENT covers `run_command`; SSH and Windows
+  shell behavior use deterministic injected runners.
+- Ambiguous shell programs deliberately receive no preflight classification:
+  their actual exit remains repairable or successful exactly as the configured
+  shell reports it. This prevents the preflight from becoming a second parser
+  with different semantics.
+- No native Windows or live SSH-host result is claimed. The existing native
+  Windows platform test remains the single expected skip on this macOS host.
+
+Requested commit: `fix: preserve structured process launch failures`.

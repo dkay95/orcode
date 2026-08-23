@@ -827,6 +827,83 @@ test("invalid verification shell shows one redacted process-card reason and one 
   }
 });
 
+test("a tool-bound null-exit launch failure renders one cause and one terminal tool card", () => {
+  const stdin = new FakeInput();
+  const stdout = new FakeOutput();
+  stdout.rows = 36;
+  const terminal = ui(stdin, stdout);
+  terminal.start();
+  try {
+    terminal.handleRunEvent({
+      type: "run-start",
+      model: "vendor/model",
+      maxSteps: 6,
+      prompt: "run",
+      timestamp: NOW,
+    });
+    terminal.handleRunEvent({
+      type: "tool-start",
+      id: "tool-launch",
+      invocationId: "invocation-launch",
+      number: 1,
+      name: "run_command",
+      input: { command: "task9-bound-command" },
+      timestamp: NOW + 1,
+    });
+    terminal.handleRunEvent({
+      type: "process-start",
+      id: "process-launch",
+      invocationId: "invocation-launch",
+      name: "run_command",
+      input: { command: "task9-bound-command" },
+      toolId: "tool-launch",
+      toolNumber: 1,
+      timestamp: NOW + 2,
+    });
+    terminal.handleRunEvent({
+      type: "process-end",
+      id: "process-launch",
+      invocationId: "invocation-launch",
+      name: "run_command",
+      input: { command: "task9-bound-command" },
+      toolId: "tool-launch",
+      toolNumber: 1,
+      exitCode: null,
+      durationMs: 2,
+      truncated: false,
+      timedOut: false,
+      aborted: false,
+      error: "spawn shell ENOENT [REDACTED]",
+      timestamp: NOW + 3,
+    });
+    terminal.handleRunEvent({
+      type: "tool-error",
+      id: "tool-launch",
+      invocationId: "invocation-launch",
+      number: 1,
+      name: "run_command",
+      input: { command: "task9-bound-command" },
+      error: "spawn shell ENOENT [REDACTED]",
+      durationMs: 3,
+      timestamp: NOW + 4,
+    });
+    terminal.handleRunEvent({
+      type: "run-end",
+      outcome: "error",
+      durationMs: 4,
+      toolCount: 1,
+      timestamp: NOW + 5,
+    });
+
+    const screen = text(terminal.frame().lines);
+    assert.equal(screen.match(/task9-bound-command/g)?.length, 1, screen);
+    assert.equal(screen.match(/spawn shell ENOENT \[REDACTED\]/g)?.length, 1, screen);
+    assert.equal(screen.match(/Lauf fehlgeschlagen/g)?.length, 1, screen);
+  } finally {
+    terminal.stop();
+  }
+});
+
 test("fullscreen /diff terminal frames distinguish dirty, clean, and failed repositories without duplicate tails", async (t) => {
   try {
     execFileSync("git", ["--version"], { stdio: "ignore" });
