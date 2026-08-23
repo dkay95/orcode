@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
+import { createHash } from "node:crypto";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import test from "node:test";
@@ -31,9 +32,27 @@ interface InstallerModule {
 }
 
 interface PackageCheckModule {
+  assertPackageManifest(manifest: unknown): void;
   assertExactPackageFiles(actual: string[], expected: string[]): void;
+  assertMatchingPackResults(left: unknown, right: unknown): void;
+  assertSafePackageText(
+    path: string,
+    text: string,
+    options: {
+      checkoutRoot: string;
+      scanForSecrets(value: string): readonly { category: string }[];
+    },
+  ): void;
+  assertTarballIntegrity(content: Buffer, integrity: string): void;
   expectedPackageFiles(sourceFiles: string[]): string[];
+  packageInstallArguments(prefix: string, tarball: string, runScripts: boolean): string[];
+  packagePackArguments(packDirectory: string, dryRun: boolean): string[];
   packageShimPath(prefix: string, command: string, platform: NodeJS.Platform): string;
+  resolvePackageOutputDirectory(argv: string[], projectRoot: string): string | undefined;
+  sanitizedPackageEnvironment(
+    environment: NodeJS.ProcessEnv,
+    isolatedHome: string,
+  ): NodeJS.ProcessEnv;
 }
 
 type FakePath = { kind: "file" } | { kind: "symlink"; target: string };
@@ -180,6 +199,28 @@ test("release metadata packages both CLI names at version 0.4.1", async () => {
     routercode: "dist/cli.js",
   });
   assert.match(changelog, /^## \[0\.4\.1\] - \d{4}-\d{2}-\d{2}$/m);
+});
+
+test("release scripts expose bounded package, metadata, migration, regression, and PTY gates", async () => {
+  const manifest = JSON.parse(
+    await readFile(join(PROJECT_ROOT, "package.json"), "utf8"),
+  ) as { scripts: Record<string, string> };
+
+  assert.equal(manifest.scripts["check:package"], "node scripts/check-package.mjs");
+  assert.equal(
+    manifest.scripts["check:release"],
+    "node scripts/check-release-metadata.mjs",
+  );
+  assert.match(manifest.scripts["test:migration"] ?? "", /app-home-migration\.test\.ts/);
+  assert.match(manifest.scripts["test:migration"] ?? "", /private-store\.test\.ts/);
+  assert.match(manifest.scripts["test:release-regressions"] ?? "", /cli\.test\.ts/);
+  assert.match(manifest.scripts["test:release-regressions"] ?? "", /tui\.test\.ts/);
+  assert.equal(manifest.scripts["test:pty"], "node scripts/check-pty.mjs");
+  assert.equal(
+    manifest.scripts.prepublishOnly,
+    "npm run check && npm run check:package",
+  );
+  assert.doesNotMatch(manifest.scripts.prepublishOnly, /publish|check:release/i);
 });
 
 test("importing the user installer is side-effect free and exposes injected seams", async () => {
@@ -351,14 +392,43 @@ test("a foreign replacement during partial installation is never unlinked", asyn
 
 test("the package checker derives an exact public allowlist and rejects drift", async () => {
   const {
+    assertPackageManifest,
     assertExactPackageFiles,
+    assertMatchingPackResults,
+    assertSafePackageText,
+    assertTarballIntegrity,
     expectedPackageFiles,
+    packageInstallArguments,
+    packagePackArguments,
     packageShimPath,
+    resolvePackageOutputDirectory,
+    sanitizedPackageEnvironment,
   } = await loadPackageCheck();
   const expected = expectedPackageFiles([
     "src/cli.ts",
     "src/ui/theme.ts",
   ]);
+
+  const packageManifest = {
+    name: "orcode",
+    version: "0.4.1",
+    repository: {
+      type: "git",
+      url: "git+https://github.com/dkay95/orcode.git",
+    },
+    bin: {
+      orcode: "./dist/cli.js",
+      routercode: "./dist/cli.js",
+    },
+  };
+  assert.doesNotThrow(() => assertPackageManifest(packageManifest));
+  assert.throws(
+    () => assertPackageManifest({
+      ...packageManifest,
+      repository: { ...packageManifest.repository, url: "https://github.com/other/repo" },
+    }),
+    /repository|github/i,
+  );
 
   assert.deepEqual(expected, [
     "CHANGELOG.md",
@@ -388,8 +458,160 @@ test("the package checker derives an exact public allowlist and rejects drift", 
     packageShimPath("/tmp/prefix", "orcode", "linux"),
     join("/tmp/prefix", "node_modules", ".bin", "orcode"),
   );
+  assert.equal(resolvePackageOutputDirectory([], "/repo/orcode"), undefined);
+  assert.equal(
+    resolvePackageOutputDirectory(["--output", "release-artifact"], "/repo/orcode"),
+    resolve("/repo/orcode", "release-artifact"),
+  );
+  assert.throws(
+    () => resolvePackageOutputDirectory(["--output", "../outside"], "/repo/orcode"),
+    /output|ausgabe.*projekt|unsicher/i,
+  );
+  assert.throws(
+    () => resolvePackageOutputDirectory(["--output"], "/repo/orcode"),
+    /output.*benötigt|ausgabe.*fehlt/i,
+  );
+  assert.throws(
+    () => resolvePackageOutputDirectory(["--output", "a", "--output", "b"], "/repo/orcode"),
+    /nur einmal|doppelt/i,
+  );
   assert.equal(
     packageShimPath("C:\\prefix", "routercode", "win32"),
     join("C:\\prefix", "node_modules", ".bin", "routercode.cmd"),
+  );
+
+  assert.deepEqual(packagePackArguments("/tmp/pack", true), [
+    "pack",
+    "--dry-run",
+    "--json",
+    "--ignore-scripts",
+    "--pack-destination",
+    "/tmp/pack",
+  ]);
+  assert.deepEqual(packagePackArguments("/tmp/pack", false), [
+    "pack",
+    "--json",
+    "--ignore-scripts",
+    "--pack-destination",
+    "/tmp/pack",
+  ]);
+  assert.deepEqual(packageInstallArguments("/tmp/install", "/tmp/orcode.tgz", true), [
+    "install",
+    "--prefix",
+    "/tmp/install",
+    "--no-save",
+    "--ignore-scripts=false",
+    "--no-audit",
+    "--no-fund",
+    "/tmp/orcode.tgz",
+  ]);
+
+  const packResult = {
+    filename: "orcode-0.4.1.tgz",
+    integrity: "sha512-synthetic",
+    shasum: "synthetic-sha1",
+    size: 100,
+    unpackedSize: 200,
+    entryCount: 1,
+    files: [{ path: "package.json", size: 200, mode: 0o644 }],
+  };
+  assert.doesNotThrow(() => assertMatchingPackResults(packResult, { ...packResult }));
+  assert.throws(
+    () => assertMatchingPackResults(packResult, { ...packResult, integrity: "sha512-other" }),
+    /integrity|inhalt|dry.*real/i,
+  );
+  assert.throws(
+    () => assertMatchingPackResults(packResult, { ...packResult, size: 101 }),
+    /size|größe|dry.*real/i,
+  );
+  const tarballBytes = Buffer.from("synthetic tarball bytes", "utf8");
+  const tarballIntegrity = `sha512-${createHash("sha512").update(tarballBytes).digest("base64")}`;
+  assert.doesNotThrow(() => assertTarballIntegrity(tarballBytes, tarballIntegrity));
+  assert.throws(
+    () => assertTarballIntegrity(Buffer.from("changed"), tarballIntegrity),
+    /integrity|hash/i,
+  );
+
+  const lowerNpmConfigName = ["npm", "config", "ignore", "scripts"].join("_");
+  const isolated = sanitizedPackageEnvironment({
+    PATH: "/usr/bin",
+    LANG: "de_DE.UTF-8",
+    NPM_CONFIG_GLOBALCONFIG: "/untrusted/global-npmrc",
+    [lowerNpmConfigName]: "true",
+    NODE_OPTIONS: "--require=/untrusted/hook.cjs",
+    OPENROUTER_API_KEY: "synthetic-not-a-real-key",
+  }, "/isolated/home");
+  assert.equal(isolated.PATH, "/usr/bin");
+  assert.equal(isolated.LANG, "de_DE.UTF-8");
+  assert.equal(isolated.NODE_OPTIONS, undefined);
+  assert.equal(isolated.OPENROUTER_API_KEY, undefined);
+  assert.equal(isolated[lowerNpmConfigName], undefined);
+  assert.equal(isolated.HOME, "/isolated/home");
+  assert.equal(isolated.USERPROFILE, "/isolated/home");
+  assert.equal(isolated.APPDATA, join("/isolated/home", ".appdata", "roaming"));
+  assert.equal(isolated.LOCALAPPDATA, join("/isolated/home", ".appdata", "local"));
+  assert.equal(
+    isolated.NPM_CONFIG_GLOBALCONFIG,
+    join("/isolated/home", ".npm-globalrc"),
+  );
+  assert.equal(isolated.NPM_CONFIG_IGNORE_SCRIPTS, "false");
+
+  const syntheticSecret = `${["sk", "or", "v1"].join("-")}-package-fixture-value`;
+  const scanner = (value: string): readonly { category: string }[] =>
+    value.includes(syntheticSecret) ? [{ category: "OpenRouter-Key" }] : [];
+  assert.throws(
+    () =>
+      assertSafePackageText("dist/example.js", `const key = ${syntheticSecret}`, {
+        checkoutRoot: "/checkout/orcode",
+        scanForSecrets: scanner,
+      }),
+    (error: unknown) => {
+      assert.match(String(error), /dist\/example\.js.*OpenRouter-Key/i);
+      assert.doesNotMatch(String(error), new RegExp(syntheticSecret));
+      return true;
+    },
+  );
+  assert.throws(
+    () =>
+      assertSafePackageText(
+        "dist/example.js.map",
+        "sourceRoot=/checkout/orcode/src",
+        { checkoutRoot: "/checkout/orcode", scanForSecrets: () => [] },
+      ),
+    /dist\/example\.js\.map.*checkout/i,
+  );
+  assert.throws(
+    () =>
+      assertSafePackageText("README.md", "path=/Users/example/private/file", {
+        checkoutRoot: "/checkout/orcode",
+        scanForSecrets: () => [],
+      }),
+    /README\.md.*private/i,
+  );
+  for (const privatePath of [
+    "file:///Users/alice/project/file.ts",
+    "file:///Users/alice",
+    "file:///home/alice/project/file.ts",
+    "/home/alice/",
+    "C:/Users/alice/project/file.ts",
+    "C:/Users/alice",
+    String.raw`C:\\Users\\alice\\project\\file.ts`,
+    String.raw`C:\\Users\\alice`,
+  ]) {
+    assert.throws(
+      () =>
+        assertSafePackageText("dist/example.js.map", privatePath, {
+          checkoutRoot: "/checkout/orcode",
+          scanForSecrets: () => [],
+        }),
+      /dist\/example\.js\.map.*private/i,
+      privatePath,
+    );
+  }
+  assert.doesNotThrow(() =>
+    assertSafePackageText("dist/example.js", "export const safe = true;", {
+      checkoutRoot: "/checkout/orcode",
+      scanForSecrets: () => [],
+    }),
   );
 });

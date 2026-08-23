@@ -71,6 +71,10 @@ function validInput(
     packageJson: {
       name: "orcode",
       version: "0.4.1",
+      repository: {
+        type: "git",
+        url: "git+https://github.com/dkay95/orcode.git",
+      },
       bin: {
         orcode: "./dist/cli.js",
         routercode: "./dist/cli.js",
@@ -185,6 +189,7 @@ test("the validator rejects package, lockfile, and bin-path drift", async () => 
   const wrongPackage = validInput().packageJson as {
     name: string;
     version: string;
+    repository: { type: string; url: string };
     bin: Record<string, string>;
   };
   const wrongLock = validInput().packageLock as {
@@ -200,6 +205,18 @@ test("the validator rejects package, lockfile, and bin-path drift", async () => 
   assert.throws(
     () => assertReleaseMetadata(validInput({ packageJson: { ...wrongPackage, name: "routercode" } })),
     /package\.json.*name/i,
+  );
+  assert.throws(
+    () => assertReleaseMetadata(validInput({
+      packageJson: {
+        ...wrongPackage,
+        repository: {
+          ...wrongPackage.repository,
+          url: "git+https://github.com/someone-else/orcode.git",
+        },
+      },
+    })),
+    /package\.json.*repository|github.*repository/i,
   );
   assert.throws(
     () => assertReleaseMetadata(validInput({

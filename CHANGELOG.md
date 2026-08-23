@@ -13,8 +13,9 @@ breaking changes.
 
 ### Added
 
-- Both `orcode` and the backwards-compatible `routercode` command are shipped
-  by the npm package and by the non-destructive per-user installer.
+- The npm package manifest and non-destructive per-user installer expose both
+  `orcode` and the backwards-compatible `routercode` command. Registry
+  publication remains a separate owner action.
 - Live process output, bounded automatic verification and repair, hardened Git,
   browser and SSH execution, and explicit reconnectable credential state.
 
@@ -25,6 +26,15 @@ breaking changes.
 - Chat-owned local data now follows one private, migratable, retention-aware
   storage boundary, including redacted human-readable logs and exact recovery
   artifacts with separate limits.
+- Release preparation now uses a four-entry OS/Node CI matrix, an exact
+  dry-run/real tarball gate, a historical migration fixture, and a real POSIX
+  PTY smoke. Publishing is manual through npm Trusted Publishing / OIDC after
+  the package owner completes the first-publication bootstrap and externally
+  configures the `npm-production` GitHub environment with a Required Reviewer,
+  self-review prevention plus a distinct trusted initiator, protected `v*`
+  deployment refs, and separate owner-only creation plus no-bypass
+  update/delete rulesets for `v*` tags; no long-lived npm token is stored in the
+  workflow.
 
 ### Security
 

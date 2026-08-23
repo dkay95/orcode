@@ -33,6 +33,18 @@ fallback. The override must name a shell orcode can actually invoke.
 
 ## Install
 
+The registry commands below become available only after the package owner's
+first registry publication. If `npm` still reports that `orcode` does not
+exist, run the checked-out source instead:
+
+```bash
+npm ci
+npm run build
+node dist/cli.js
+```
+
+After that first publication, run without installing globally:
+
 ```bash
 npx orcode
 ```
@@ -58,9 +70,12 @@ orcode
    input, validates it live against OpenRouter, and then stores it in your
    OS's native credential store (Keychain on macOS, Credential Manager on
    Windows, Secret Service/libsecret on Linux). Later starts load and
-   re-validate that saved key automatically; you are asked again only if it
-   is missing, expired, exhausted, or rejected outright — not on a
-   transient network error.
+   re-validate that saved key automatically. A valid but unfunded key stays
+   saved and active: paid runs are blocked until credit is available, but the
+   key is not erased and you are not asked to replace it. Expiry or exhausted
+   limit metadata likewise does not erase a key; replacement is reserved for a
+   missing key or an explicit authentication rejection, never a transient
+   network error.
 
 3. Pick a model with `/model` (interactive search over OpenRouter's
    tool-capable models — shows pricing, context size, and capabilities), or
@@ -131,8 +146,9 @@ ask.
 
 ## The compressor pipeline
 
-orcode uses two distinct model roles. The compressor receives the
-existing session context plus your current request and produces a dense
+orcode uses two distinct model roles. The compressor receives only the prior
+session context — it never receives the current prompt or current attachments —
+and produces a dense
 handoff that tries to preserve constraints, paths, commands, errors,
 decisions, tests, and unfinished work; the main model then receives both
 that handoff and your original request, sent separately and unmodified, so
@@ -281,8 +297,13 @@ full-screen support or for debugging), `--json`, `-h`/`--help`,
 ├── checkpoints/
 │   └── <chat-id>/
 │       └── <run-id>.json           # exact ChangeJournal restore data
-└── sessions/                  # legacy pre-multi-chat session files, left untouched
+├── migrations/               # validated migration manifests
+└── migration-backups/        # bounded exact backups of imported legacy state
 ```
+
+Legacy pre-multi-chat session data is imported and mapped to the current chat
+layout during the awaited startup migration. Exact source bytes are retained
+only in the bounded migration backup, rather than being treated as live state.
 
 Two orcode instances editing the same chat merge their state on write
 instead of overwriting each other's turns. If a chat or config file on disk
@@ -302,6 +323,51 @@ npm run build   # compile to dist/
 ```
 
 The test suite never calls a paid model.
+
+### Release boundary
+
+`npm run check:package`, `npm run test:migration`,
+`npm run test:release-regressions`, and `npm run test:pty` are local release
+gates. Run the metadata gate with the exact intended tag, for example
+`npm run check:release -- --tag v0.4.1`. The package check performs both
+`npm pack --dry-run --json` and a real
+tarball install, scans publishable text for recognizable credentials and
+private checkout paths, and runs both CLI aliases. The PTY gate is a real POSIX
+PTY test on macOS/Linux; it is explicitly not ConPTY coverage on Windows.
+
+These gates are intended for a source checkout; they are not an installed-package
+API. The first registry publication is an explicit package-owner bootstrap
+action: npm requires the package to exist before its Trusted Publisher can be
+configured. After that bootstrap, configure npm
+[Trusted Publishing](https://docs.npmjs.com/trusted-publishers/) for repository
+`dkay95/orcode`, workflow `release.yml`, and GitHub environment
+`npm-production`. Before the workflow is authorized for use, the repository
+owner must configure that environment in GitHub with an owner as Required
+Reviewer, enable prevent self-review, and arrange for a distinct trusted
+maintainer or restricted release bot to dispatch the workflow. A sole-owner
+setup cannot both initiate and approve the same protected deployment, so it is
+not release-authorized until that second identity exists. Restrict environment
+deployment refs to protected `v*` tags. Configure two separate repository tag
+rulesets for `v*`: a creation restriction whose only bypass actor is the owner,
+and a second update/delete restriction with no bypass actors. This lets the
+owner create a release tag without granting anyone a route to move or delete it.
+Naming the environment or either ruleset in documentation does not prove those
+external settings exist.
+
+After those settings have been verified, later releases use the manual workflow,
+OIDC, and npm provenance without a long-lived npm token. Pushing a tag alone
+never publishes. A trusted initiator dispatches the workflow explicitly from the
+existing release tag and repeats the same tag as input:
+
+```bash
+TAG=v0.4.1
+gh workflow run release.yml --repo dkay95/orcode --ref "$TAG" -f tag="$TAG"
+```
+
+The owner Required Reviewer then approves the environment review from a
+different account than the initiator. The workflow refuses to publish unless
+the protected dispatch tag, workflow-definition ref, immutable dispatch-event
+commit, metadata, and artifact all agree.
 
 ## License
 

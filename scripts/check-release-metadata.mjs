@@ -14,6 +14,10 @@ const PACKAGE_BINS = {
   orcode: "./dist/cli.js",
   routercode: "./dist/cli.js",
 };
+const PACKAGE_REPOSITORY = {
+  type: "git",
+  url: "git+https://github.com/dkay95/orcode.git",
+};
 const LOCKFILE_BINS = {
   orcode: "dist/cli.js",
   routercode: "dist/cli.js",
@@ -64,6 +68,7 @@ export function assertReleaseMetadata(input) {
     throw new Error("package.json name muss exakt orcode sein.");
   }
   const version = requireStableVersion(manifest.version, "package.json version");
+  assertExactRepository(manifest.repository, "package.json repository");
   assertExactBins(manifest.bin, PACKAGE_BINS, "package.json bin");
 
   if (lockfile.name !== "orcode") {
@@ -227,6 +232,16 @@ function assertExactBins(value, expected, label) {
     expectedKeys.some((key) => bins[key] !== expected[key])
   ) {
     throw new Error(`${label} ist unsicher oder weicht von den beiden dist/cli.js-Aliasen ab.`);
+  }
+}
+
+function assertExactRepository(value, label) {
+  const repository = requireRecord(value, label);
+  if (
+    repository.type !== PACKAGE_REPOSITORY.type ||
+    repository.url !== PACKAGE_REPOSITORY.url
+  ) {
+    throw new Error(`${label} muss exakt auf dkay95/orcode bei GitHub zeigen.`);
   }
 }
 
