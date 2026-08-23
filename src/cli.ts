@@ -38,9 +38,9 @@ import {
   rankModels,
   resolveCompressorModelCandidate,
   resolveMainModelCandidate,
+  isAuthenticationRejection,
   shouldReplaceCredential,
-  validateAndStoreInferenceKey,
-  validateAndStoreManagementKey,
+  validateAndActivateInferenceKey,
   type CommandContext,
   type CommandOutput,
 } from "./commands.js";
@@ -258,6 +258,22 @@ function readPackageVersion(): string {
   return "unbekannt";
 }
 
+export function createOpenRouterServiceForStartup(keys: {
+  storedInferenceKey: string | null;
+  environmentInferenceKey: string | null;
+  storedManagementKey?: string | null;
+  environmentManagementKey?: string | null;
+}): OpenRouterService {
+  return new OpenRouterService(
+    keys.storedInferenceKey ?? keys.environmentInferenceKey ?? undefined,
+    keys.storedManagementKey ?? keys.environmentManagementKey ?? undefined,
+    {
+      inference: keys.storedInferenceKey ? "keychain" : "environment",
+      management: keys.storedManagementKey ? "keychain" : "environment",
+    },
+  );
+}
+
 async function main(): Promise<void> {
   const options = parseArgs(process.argv.slice(2));
   if (options.version) {
@@ -322,14 +338,12 @@ async function main(): Promise<void> {
   const environmentInferenceKey = process.env.OPENROUTER_API_KEY?.trim() || null;
   const environmentManagementKey =
     process.env.OPENROUTER_MANAGEMENT_KEY?.trim() || null;
-  const openRouter = new OpenRouterService(
-    storedInferenceKey ?? environmentInferenceKey ?? undefined,
-    storedManagementKey ?? environmentManagementKey ?? undefined,
-    {
-      inference: storedInferenceKey ? "keychain" : "environment",
-      management: storedManagementKey ? "keychain" : "environment",
-    },
-  );
+  const openRouter = createOpenRouterServiceForStartup({
+    storedInferenceKey,
+    environmentInferenceKey,
+    storedManagementKey,
+    environmentManagementKey,
+  });
   const approvals = new ApprovalManager(config.approvalMode);
   approvals.setRuleStore(ruleStore, workspace);
   const sshSession = createSshSession();
@@ -415,6 +429,11 @@ async function main(): Promise<void> {
   );
 
   if (options.json) {
+    if (!startupBalance) {
+      throw new Error(
+        "OpenRouter ist noch nicht einsatzbereit. Prüfe Verbindung, Key und Guthaben und versuche es erneut.",
+      );
+    }
     const prompt = options.prompt ?? (!process.stdin.isTTY ? await readStdinPrompt() : "");
     if (!prompt.trim()) {
       throw new CliUsageError(
@@ -435,6 +454,11 @@ async function main(): Promise<void> {
   }
 
   if (options.prompt) {
+    if (!startupBalance) {
+      throw new Error(
+        "OpenRouter ist noch nicht einsatzbereit. Prüfe Verbindung, Key und Guthaben und versuche es erneut.",
+      );
+    }
     await printBalance(startupBalance, out);
     await ensureRunnableModelConfiguration(openRouter, config);
     const effectivePrompt = await applyInterruptedRunNonInteractive(
@@ -447,7 +471,9 @@ async function main(): Promise<void> {
     return;
   }
 
-  await printBalance(startupBalance, out);
+  if (startupBalance) {
+    await printBalance(startupBalance, out);
+  }
   await runPlainLoop(
     {
       workspace,
@@ -489,6 +515,9 @@ interface RuntimeContext {
   ) => void;
   /** Fullscreen destructive-chat confirmation; plain mode leaves this unset for Inquirer. */
   confirmChatDeletion?: (title: string, details: string) => Promise<boolean>;
+  confirmCredentialForget?: CommandContext["confirmCredentialForget"];
+  confirmProcessOnlyCredential?: CommandContext["confirmProcessOnlyCredential"];
+  readCredentialSecret?: CommandContext["readCredentialSecret"];
   /** Direct slash-command process events (currently `/diff`) for the active dashboard. */
   onRunEvent?: (event: AgentRunEvent) => void;
 }
@@ -546,16 +575,16 @@ async function runPlainLoop(
       }
       if (
         !context.openRouter.hasKey ||
-        shouldReplaceCredential(error)
+        shouldReplaceCredential(error, context.openRouter)
       ) {
-        await printBalance(
-          await promptForValidKey(
-            context.openRouter,
-            context.credentials,
-            context.out,
-          ),
+        const balance = await promptForValidKey(
+          context.openRouter,
+          context.credentials,
           context.out,
         );
+        if (balance) {
+          await printBalance(balance, context.out);
+        }
       }
     }
   }
@@ -839,7 +868,7 @@ async function runDashboard(
       sessionCost: formatUsd(context.session.data.costs.totalUsd),
       maxCost: formatUsd(context.config.maxCostUsd),
       maxSteps: context.config.maxSteps,
-      keyStatus: dashboardKeyStatus(context.openRouter.keyOrigin),
+      keyStatus: dashboardKeyStatus(context.openRouter),
       sshHost: context.sshSession.active ?? undefined,
     };
   });
@@ -856,6 +885,21 @@ async function runDashboard(
   context.onRunEvent = (event) => ui.handleRunEvent(event);
   context.confirmChatDeletion = async (title, details) =>
     (await ui.confirmAction(title, details)).accepted;
+  context.confirmCredentialForget = async (kind, details) =>
+    (await ui.confirmAction(
+      kind === "inference" ? "API-Key wirklich entfernen?" : "Management-Key wirklich entfernen?",
+      details,
+    )).accepted;
+  context.confirmProcessOnlyCredential = async (kind, reason) =>
+    (await ui.confirmAction(
+      kind === "inference"
+        ? "Key nur für diesen Prozess verwenden?"
+        : "Management-Key nur für diesen Prozess verwenden?",
+      `${reason}\nEs wird keine Klartextdatei oder alternative Speicherung angelegt.`,
+    )).accepted;
+  context.readCredentialSecret = (kind) => ui.readSecret(
+    kind === "inference" ? "OpenRouter API-Key" : "OpenRouter Management-Key",
+  );
   // Showing a transcript behind the chat chooser contradicts the question it
   // asks: the user is picking a chat while already looking at one. Load only
   // once the choice is settled.
@@ -1194,36 +1238,6 @@ async function runDashboard(
             continue;
           }
 
-          if (
-            completedCommand === "key" &&
-            commandArgs[0]?.toLowerCase() === "set"
-          ) {
-            const nextBalance = await promptDashboardInferenceKey(ui, context);
-            if (nextBalance) {
-              balance = nextBalance;
-              ui.addMessage(
-                "system",
-                `Neuer OpenRouter-Key ist gültig und im ${context.credentials.location} gespeichert.`,
-                "/key",
-              );
-            }
-            ui.setStatus("Bereit", false);
-            continue;
-          }
-
-          if (
-            completedCommand === "key" &&
-            commandArgs[0]?.toLowerCase() === "management" &&
-            commandArgs[1]?.toLowerCase() === "set"
-          ) {
-            const stored = await promptDashboardManagementKey(ui, context);
-            if (stored) {
-              balance = await context.openRouter.checkBalance();
-            }
-            ui.setStatus("Bereit", false);
-            continue;
-          }
-
           if (completedCommand === "clear" && commandArgs.length === 0) {
             const { accepted } = await ui.confirmAction(
               "Gespräch und Sitzungskosten zurücksetzen?",
@@ -1444,18 +1458,13 @@ async function runDashboard(
         }
         if (
           !cancelled &&
-          (!context.openRouter.hasKey || shouldReplaceCredential(error))
+          (!context.openRouter.hasKey || shouldReplaceCredential(error, context.openRouter))
         ) {
-          await discardRejectedInferenceKey(context);
           balance = null;
-          balanceLabel = "kein Key";
+          balanceLabel = context.openRouter.hasKey ? "Key abgelehnt" : "kein Key";
           const nextBalance = await promptDashboardInferenceKey(ui, context);
           if (nextBalance) {
             balance = nextBalance;
-            ui.addMessage(
-              "system",
-              `Neuer OpenRouter-Key ist gültig und im ${context.credentials.location} gespeichert.`,
-            );
           }
         }
         ui.setStatus("Bereit", false);
@@ -2060,7 +2069,7 @@ async function chooseDashboardImage(
   });
 }
 
-async function initializeDashboardKey(
+export async function initializeDashboardKey(
   ui: TerminalUi,
   context: RuntimeContext,
   fallbackKey?: string,
@@ -2070,42 +2079,31 @@ async function initializeDashboardKey(
   }
 
   const activeKey = context.openRouter.requireKey();
-  const origin = context.openRouter.keyOrigin;
   const controller = new AbortController();
-  ui.setStatus("Gespeicherten API-Key und Guthaben prüfen");
+  ui.setStatus("Aktiven API-Key und Guthaben prüfen");
   ui.setCancelHandler(() => {
     controller.abort(new Error("Die OpenRouter-Startprüfung wurde abgebrochen."));
   });
   try {
-    let currentBalance: BalanceInfo;
-    if (origin === "keychain") {
-      currentBalance = await context.openRouter.checkBalance(controller.signal);
-      assertSpendAvailable(currentBalance);
-    } else {
-      currentBalance = await validateAndStoreInferenceKey(
-        activeKey,
-        context,
-        controller.signal,
-      );
-    }
+    const currentBalance = await context.openRouter.checkBalance(controller.signal);
+    assertSpendAvailable(currentBalance);
     return currentBalance;
   } catch (error) {
     if (controller.signal.aborted || isAbortError(error)) {
       return null;
     }
-    if (!shouldReplaceCredential(error)) {
+    if (!shouldReplaceCredential(error, context.openRouter)) {
       throw error;
     }
     ui.addMessage(
       "error",
-      `Der bisherige API-Key wurde abgelehnt oder ist nicht mehr nutzbar: ${context.openRouter.safeMessage(error)}`,
+      `Der bisherige API-Key wurde von OpenRouter abgelehnt, bleibt aber bis zu einer validierten Ersetzung unverändert: ${context.openRouter.safeMessage(error)}`,
       "OpenRouter",
     );
   } finally {
     ui.setCancelHandler();
   }
 
-  await discardRejectedInferenceKey(context);
   if (fallbackKey && fallbackKey.trim() !== activeKey.trim()) {
     const fallbackController = new AbortController();
     ui.setStatus("OPENROUTER_API_KEY als Ersatz prüfen");
@@ -2113,16 +2111,28 @@ async function initializeDashboardKey(
       fallbackController.abort(new Error("Die Ersatz-Key-Prüfung wurde abgebrochen."));
     });
     try {
-      return await validateAndStoreInferenceKey(
+      const activated = await validateAndActivateInferenceKey(
         fallbackKey,
         context,
-        fallbackController.signal,
+        {
+          persist: false,
+          processOrigin: "environment",
+          signal: fallbackController.signal,
+        },
       );
+      if (activated) {
+        ui.addMessage(
+          "system",
+          "OPENROUTER_API_KEY ist validiert und nur für diesen Prozess aktiv. Dauerhaft speichern mit /key save.",
+          "/key",
+        );
+        return activated.balance;
+      }
     } catch (error) {
       if (fallbackController.signal.aborted || isAbortError(error)) {
         return null;
       }
-      if (!shouldReplaceCredential(error)) {
+      if (!isAuthenticationRejection(error)) {
         throw error;
       }
       ui.addMessage(
@@ -2222,11 +2232,35 @@ async function promptDashboardInferenceKey(
       controller.abort(new Error("Die Key-Prüfung wurde abgebrochen."));
     });
     try {
-      return await validateAndStoreInferenceKey(
+      const activated = await validateAndActivateInferenceKey(
         candidate,
         context,
-        controller.signal,
+        {
+          signal: controller.signal,
+          confirmProcessOnly: async (error) => (
+            await ui.confirmAction(
+              "Key nur für diesen Prozess verwenden?",
+              `${errorMessage(error)}\nEs wird keine Klartextdatei oder alternative Speicherung angelegt.`,
+            )
+          ).accepted,
+        },
       );
+      if (!activated) {
+        ui.addMessage(
+          "system",
+          "Key unverändert; prozesslokale Verwendung abgebrochen.",
+          "/key",
+        );
+        return null;
+      }
+      ui.addMessage(
+        "system",
+        activated.persisted
+          ? `OpenRouter-Key validiert und im ${context.credentials.location} gespeichert.`
+          : "OpenRouter-Key validiert und nur für diesen Prozess aktiv.",
+        "/key",
+      );
+      return activated.balance;
     } catch (error) {
       if (controller.signal.aborted || isAbortError(error)) {
         ui.addMessage("system", "Key-Prüfung abgebrochen.", "/key");
@@ -2235,67 +2269,6 @@ async function promptDashboardInferenceKey(
       ui.addMessage("error", context.openRouter.safeMessage(error), "/key");
     } finally {
       ui.setCancelHandler();
-    }
-  }
-}
-
-async function promptDashboardManagementKey(
-  ui: TerminalUi,
-  context: RuntimeContext,
-): Promise<boolean> {
-  while (true) {
-    const candidate = await ui.readSecret("OpenRouter Management-Key");
-    if (candidate === null) {
-      ui.addMessage("system", "Management-Key-Eingabe abgebrochen.", "/key");
-      return false;
-    }
-    if (candidate.length < 20 || /\s/.test(candidate)) {
-      ui.addMessage(
-        "error",
-        "Der Management-Key ist zu kurz oder enthält Leerzeichen.",
-        "/key",
-      );
-      continue;
-    }
-    const controller = new AbortController();
-    ui.setStatus("Management-Key wird geprüft");
-    ui.setCancelHandler(() => {
-      controller.abort(new Error("Die Management-Key-Prüfung wurde abgebrochen."));
-    });
-    try {
-      const credits = await validateAndStoreManagementKey(
-        candidate,
-        context,
-        controller.signal,
-      );
-      ui.addMessage(
-        "system",
-        `Management-Key gespeichert · Kontoguthaben ${formatUsd(credits.remaining)}.`,
-        "/key",
-      );
-      return true;
-    } catch (error) {
-      if (controller.signal.aborted || isAbortError(error)) {
-        ui.addMessage("system", "Management-Key-Prüfung abgebrochen.", "/key");
-        return false;
-      }
-      ui.addMessage("error", context.openRouter.safeMessage(error), "/key");
-    } finally {
-      ui.setCancelHandler();
-    }
-  }
-}
-
-async function discardRejectedInferenceKey(
-  context: RuntimeContext,
-): Promise<void> {
-  const origin = context.openRouter.keyOrigin;
-  context.openRouter.forgetKey();
-  if (origin === "keychain") {
-    try {
-      await context.credentials.delete("inference");
-    } catch {
-      // A replacement can still be used in memory if Keychain cleanup fails.
     }
   }
 }
@@ -2318,13 +2291,28 @@ async function loadStoredCredential(
   }
 }
 
-function dashboardKeyStatus(
-  origin: OpenRouterService["keyOrigin"],
-): string {
-  if (origin === "keychain") return "Schlüsselbund";
-  if (origin === "environment") return "Umgebung";
-  if (origin === "interactive") return "Speicher";
-  return "fehlt";
+function dashboardKeyStatus(openRouter: OpenRouterService): string {
+  const origin = openRouter.keyOrigin === "keychain"
+    ? "Schlüsselbund"
+    : openRouter.keyOrigin === "environment"
+      ? "Umgebung · prozesslokal"
+      : openRouter.keyOrigin === "interactive"
+        ? "Prozessspeicher"
+        : "fehlt";
+  const state = openRouter.runtimeState;
+  const validity = state.inferenceValidity === "valid"
+    ? "gültig"
+    : state.inferenceValidity === "rejected"
+      ? "abgelehnt"
+      : "ungeprüft";
+  const connection = state.connectivity === "connected"
+    ? "verbunden"
+    : state.connectivity === "reconnecting"
+      ? "Reconnect"
+      : state.connectivity === "disconnected"
+        ? "offline"
+        : "Verbindung ungeprüft";
+  return `${origin} · ${validity} · ${connection}`;
 }
 
 async function inspectWorkspace(workspace: string): Promise<string> {

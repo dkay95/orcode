@@ -8,10 +8,13 @@ import { promisify } from "node:util";
 import { SpendUnavailableError, assertSpendAvailable } from "../src/agent.js";
 import {
   handleSlashCommand,
+  promptForValidKey,
   shouldReplaceCredential,
   type CommandContext,
 } from "../src/commands.js";
-import { OpenRouterHttpError } from "../src/openrouter.js";
+import { OpenRouterHttpError, OpenRouterService } from "../src/openrouter.js";
+import type { CredentialStoreLike } from "../src/credentials.js";
+import { CredentialStoreError } from "../src/credentials.js";
 import { SessionStore } from "../src/session.js";
 import { DEFAULT_CONFIG } from "../src/config.js";
 import { migrationManifestPath } from "../src/storage.js";
@@ -19,20 +22,21 @@ import type { AgentRunEvent, ModelInfo } from "../src/types.js";
 
 const run = promisify(execFile);
 
-test("only unusable credentials trigger replacement", () => {
+test("only an observed active-scope rejection triggers replacement", () => {
   assert.equal(
     shouldReplaceCredential(new OpenRouterHttpError(401, "User not found")),
-    true,
+    false,
+    "a context-free 401 may belong to a replacement candidate",
   );
   assert.equal(
     shouldReplaceCredential(new OpenRouterHttpError(403, "Forbidden")),
-    true,
+    false,
   );
   assert.equal(
     shouldReplaceCredential(
       new SpendUnavailableError("key-expired", "Der OpenRouter-Key ist abgelaufen."),
     ),
-    true,
+    false,
   );
   assert.equal(
     shouldReplaceCredential(new Error("OpenRouter ist nicht erreichbar")),
@@ -40,6 +44,27 @@ test("only unusable credentials trigger replacement", () => {
   );
   assert.equal(
     shouldReplaceCredential(new OpenRouterHttpError(500, "Provider down")),
+    false,
+  );
+});
+
+test("an SDK-shaped error replaces only after the active runtime observed a real 401", async () => {
+  const key = `${KEY_PREFIX}sdk-active-auth-key-12345`;
+  const service = new OpenRouterService(key, undefined, {}, {
+    fetchImpl: async () => new Response(JSON.stringify({ error: { message: "rejected" } }), {
+      status: 401,
+      headers: { "content-type": "application/json" },
+    }),
+  });
+  await assert.rejects(service.getCurrentKey());
+
+  assert.equal(
+    shouldReplaceCredential(new Error("opaque SDK request failure"), service),
+    true,
+  );
+  const unverified = lifecycleService(`${KEY_PREFIX}sdk-unknown-key-456`);
+  assert.equal(
+    shouldReplaceCredential(new Error("opaque SDK request failure"), unverified),
     false,
   );
 });
@@ -82,7 +107,7 @@ test("an exhausted balance never deletes a valid key (B3)", () => {
   );
 });
 
-test("an expired key is still replaced", () => {
+test("an expired key stays loaded and can be saved or forgotten explicitly", () => {
   const expired = spendError({
     key: {
       limit: null,
@@ -91,7 +116,484 @@ test("an expired key is still replaced", () => {
     },
   });
   assert.equal(expired.reason, "key-expired");
-  assert.equal(shouldReplaceCredential(expired), true);
+  assert.equal(shouldReplaceCredential(expired), false);
+});
+
+test("explicit key save authenticates and persists even when run spending is unavailable", async (t) => {
+  const fixtures = [
+    {
+      name: "expired metadata",
+      data: {
+        expires_at: new Date(Date.now() - 60_000).toISOString(),
+        limit: null,
+        limit_remaining: null,
+      },
+    },
+    {
+      name: "exhausted key limit",
+      data: { limit: 1, limit_remaining: 0 },
+    },
+  ];
+
+  for (const fixture of fixtures) {
+    await t.test(fixture.name, async () => {
+      const key = `${KEY_PREFIX}save-nonspendable-${fixture.name.replace(/\s/g, "-")}-123`;
+      const service = new OpenRouterService(
+        key,
+        undefined,
+        { inference: "environment" },
+        {
+          fetchImpl: async () => new Response(JSON.stringify({
+            data: {
+              label: fixture.name,
+              is_free_tier: false,
+              is_management_key: false,
+              usage: 1,
+              usage_daily: 1,
+              usage_weekly: 1,
+              usage_monthly: 1,
+              ...fixture.data,
+            },
+          }), { status: 200, headers: { "content-type": "application/json" } }),
+        },
+      );
+      const credentials = lifecycleCredentials();
+      const { context } = lifecycleContext(service, credentials.store);
+
+      await handleSlashCommand("/key save", context);
+
+      assert.equal(credentials.current(), key);
+      assert.equal(service.requireKey(), key);
+      assert.equal(service.keyOrigin, "keychain");
+      assert.equal(service.runtimeState.inferenceValidity, "valid");
+    });
+  }
+});
+
+const KEY_PREFIX = `${["sk", "or", "v1"].join("-")}-`;
+
+function lifecycleService(
+  key: string,
+  origin: "environment" | "keychain" | "interactive" = "environment",
+): OpenRouterService {
+  return new OpenRouterService(key, undefined, { inference: origin }, {
+    fetchImpl: async () => new Response(JSON.stringify({
+      data: {
+        label: "Lifecycle fixture",
+        is_free_tier: false,
+        is_management_key: false,
+        usage: 1,
+        usage_daily: 1,
+        usage_weekly: 1,
+        usage_monthly: 1,
+        limit: 100,
+        limit_remaining: 99,
+      },
+    }), { status: 200, headers: { "content-type": "application/json" } }),
+  });
+}
+
+function lifecycleCredentials(initial: string | null = null): {
+  store: CredentialStoreLike;
+  calls: string[];
+  current: () => string | null;
+  failDelete: { value: boolean };
+  failSet: { value: boolean };
+} {
+  let stored = initial;
+  const calls: string[] = [];
+  const failDelete = { value: false };
+  const failSet = { value: false };
+  return {
+    store: {
+      location: "Test-Schlüsselbund",
+      async get() {
+        calls.push("get");
+        return stored;
+      },
+      async set(_kind, secret) {
+        calls.push("set");
+        if (failSet.value) throw new Error("synthetic keychain unavailable");
+        stored = secret;
+      },
+      async delete() {
+        calls.push("delete");
+        if (failDelete.value) throw new Error("synthetic delete failure");
+        const existed = stored !== null;
+        stored = null;
+        return existed;
+      },
+      async has() {
+        calls.push("has");
+        return stored !== null;
+      },
+    },
+    calls,
+    current: () => stored,
+    failDelete,
+    failSet,
+  };
+}
+
+function lifecycleContext(
+  openRouter: OpenRouterService,
+  credentials: CredentialStoreLike,
+  overrides: Partial<CommandContext> = {},
+): { context: CommandContext; output: string[] } {
+  const output: string[] = [];
+  return {
+    context: {
+      openRouter,
+      credentials,
+      out: {
+        text: (value: string) => output.push(value),
+        error: (value: string) => output.push(value),
+      },
+      ...overrides,
+    } as unknown as CommandContext,
+    output,
+  };
+}
+
+test("a valid environment key remains process-only during startup validation", async () => {
+  const key = `${KEY_PREFIX}environment-process-only-123`;
+  const service = lifecycleService(key, "environment");
+  const credentials = lifecycleCredentials();
+  const output: string[] = [];
+
+  await promptForValidKey(service, credentials.store, {
+    text: (value) => output.push(value),
+    error: (value) => output.push(value),
+  });
+
+  assert.equal(service.keyOrigin, "environment");
+  assert.equal(service.requireKey(), key);
+  assert.equal(credentials.current(), null);
+  assert.equal(credentials.calls.includes("set"), false);
+});
+
+test("plain startup keeps a saved key loaded when connection, permission, or credit is unavailable", async (t) => {
+  const key = `${KEY_PREFIX}plain-reconnectable-key-123`;
+  const fixtures = [
+    {
+      name: "offline",
+      fetchImpl: async () => {
+        throw Object.assign(new TypeError("fetch failed"), {
+          cause: { code: "ENETUNREACH" },
+        });
+      },
+    },
+    {
+      name: "permission 403",
+      fetchImpl: async () => new Response(JSON.stringify({
+        error: { message: "forbidden" },
+      }), { status: 403, headers: { "content-type": "application/json" } }),
+    },
+    {
+      name: "insufficient key limit",
+      fetchImpl: async () => new Response(JSON.stringify({
+        data: {
+          label: "no remaining limit",
+          is_free_tier: false,
+          is_management_key: false,
+          usage: 1,
+          limit: 1,
+          limit_remaining: 0,
+        },
+      }), { status: 200, headers: { "content-type": "application/json" } }),
+    },
+  ];
+
+  for (const fixture of fixtures) {
+    await t.test(fixture.name, async () => {
+      const service = new OpenRouterService(
+        key,
+        undefined,
+        { inference: "keychain" },
+        {
+          clock: { sleep: async () => undefined },
+          fetchImpl: fixture.fetchImpl,
+        },
+      );
+      const credentials = lifecycleCredentials(key);
+      const output: string[] = [];
+
+      const balance = await promptForValidKey(service, credentials.store, {
+        text: (value) => output.push(value),
+        error: (value) => output.push(value),
+      });
+
+      assert.equal(balance, null);
+      assert.equal(service.requireKey(), key);
+      assert.equal(credentials.current(), key);
+      assert.equal(credentials.calls.includes("delete"), false);
+      assert.match(output.join("\n"), /geladen|unverändert|reconnect/i);
+    });
+  }
+});
+
+test("key save is the explicit validated transition from environment to keychain", async () => {
+  const key = `${KEY_PREFIX}explicit-save-key-123456`;
+  const service = lifecycleService(key, "environment");
+  const credentials = lifecycleCredentials();
+  const { context } = lifecycleContext(service, credentials.store);
+
+  await handleSlashCommand("/key save", context);
+
+  assert.equal(credentials.current(), key);
+  assert.equal(service.keyOrigin, "keychain");
+  assert.equal(service.runtimeState.inferenceValidity, "valid");
+});
+
+test("key save failure keeps the active process-only key unchanged and retryable", async () => {
+  const key = `${KEY_PREFIX}save-failure-key-123456`;
+  const service = lifecycleService(key, "environment");
+  const credentials = lifecycleCredentials();
+  credentials.failSet.value = true;
+  const { context } = lifecycleContext(service, credentials.store);
+
+  await assert.rejects(handleSlashCommand("/key save", context), /keychain unavailable/);
+  assert.equal(service.requireKey(), key);
+  assert.equal(service.keyOrigin, "environment");
+  assert.equal(credentials.current(), null);
+});
+
+test("key forget asks exactly once and a decline mutates neither persistence nor memory", async () => {
+  const key = `${KEY_PREFIX}forget-decline-key-12345`;
+  const service = lifecycleService(key, "keychain");
+  const credentials = lifecycleCredentials(key);
+  let confirmations = 0;
+  const { context } = lifecycleContext(service, credentials.store, {
+    confirmCredentialForget: async () => {
+      confirmations += 1;
+      return false;
+    },
+  } as Partial<CommandContext>);
+
+  await handleSlashCommand("/key forget", context);
+
+  assert.equal(confirmations, 1);
+  assert.equal(credentials.calls.includes("delete"), false);
+  assert.equal(credentials.current(), key);
+  assert.equal(service.requireKey(), key);
+});
+
+test("accepted key forget deletes persistence before memory and stays retryable on failure", async () => {
+  const key = `${KEY_PREFIX}forget-retry-key-123456`;
+  const service = lifecycleService(key, "keychain");
+  const credentials = lifecycleCredentials(key);
+  credentials.failDelete.value = true;
+  let confirmations = 0;
+  let activeDuringDelete = false;
+  const originalDelete = credentials.store.delete.bind(credentials.store);
+  credentials.store.delete = async (kind) => {
+    activeDuringDelete = service.hasKey;
+    return originalDelete(kind);
+  };
+  const { context } = lifecycleContext(service, credentials.store, {
+    confirmCredentialForget: async () => {
+      confirmations += 1;
+      return true;
+    },
+  } as Partial<CommandContext>);
+
+  await assert.rejects(handleSlashCommand("/key forget", context), /delete failure/);
+  assert.equal(confirmations, 1);
+  assert.equal(activeDuringDelete, true);
+  assert.equal(service.requireKey(), key);
+  assert.equal(credentials.current(), key);
+
+  credentials.failDelete.value = false;
+  await handleSlashCommand("/key forget", context);
+  assert.equal(confirmations, 2, "one confirmation for each explicit retry");
+  assert.equal(credentials.current(), null);
+  assert.equal(service.hasKey, false);
+});
+
+test("key replace keeps the old key when process-only fallback is declined", async () => {
+  const previous = `${KEY_PREFIX}replace-previous-key-123`;
+  const candidate = `${KEY_PREFIX}replace-candidate-key-456`;
+  const service = lifecycleService(previous, "keychain");
+  const credentials = lifecycleCredentials(previous);
+  credentials.failSet.value = true;
+  let confirmations = 0;
+  const { context } = lifecycleContext(service, credentials.store, {
+    readCredentialSecret: async () => candidate,
+    confirmProcessOnlyCredential: async () => {
+      confirmations += 1;
+      return false;
+    },
+  } as Partial<CommandContext>);
+
+  await handleSlashCommand("/key replace", context);
+
+  assert.equal(confirmations, 1);
+  assert.equal(service.requireKey(), previous);
+  assert.equal(service.keyOrigin, "keychain");
+  assert.equal(credentials.current(), previous);
+});
+
+test("key replace may use a validated candidate process-only after explicit consent", async () => {
+  const previous = `${KEY_PREFIX}replace-old-key-123456`;
+  const candidate = `${KEY_PREFIX}replace-process-key-456`;
+  const service = lifecycleService(previous, "keychain");
+  const credentials = lifecycleCredentials(previous);
+  credentials.failSet.value = true;
+  let confirmations = 0;
+  const { context } = lifecycleContext(service, credentials.store, {
+    readCredentialSecret: async () => candidate,
+    confirmProcessOnlyCredential: async () => {
+      confirmations += 1;
+      return true;
+    },
+  } as Partial<CommandContext>);
+
+  await handleSlashCommand("/key replace", context);
+
+  assert.equal(confirmations, 1);
+  assert.equal(service.requireKey(), candidate);
+  assert.equal(service.keyOrigin, "interactive");
+  assert.equal(credentials.current(), previous);
+});
+
+test("an unsafe keychain rollback never offers or activates process-only use", async () => {
+  const previous = `${KEY_PREFIX}unsafe-rollback-old-key-123`;
+  const candidate = `${KEY_PREFIX}unsafe-rollback-candidate-456`;
+  const service = lifecycleService(previous, "keychain");
+  const credentials = lifecycleCredentials(previous);
+  credentials.store.set = async () => {
+    throw Object.assign(
+      new CredentialStoreError("Schlüsselbund-Zustand ist unbekannt."),
+      { persistenceState: "unknown" as const },
+    );
+  };
+  let confirmations = 0;
+  const { context } = lifecycleContext(service, credentials.store, {
+    readCredentialSecret: async () => candidate,
+    confirmProcessOnlyCredential: async () => {
+      confirmations += 1;
+      return true;
+    },
+  } as Partial<CommandContext>);
+
+  await assert.rejects(handleSlashCommand("/key replace", context), /unbekannt/i);
+
+  assert.equal(confirmations, 0);
+  assert.equal(service.requireKey(), previous);
+  assert.equal(service.keyOrigin, "keychain");
+});
+
+test("a rejected replacement candidate never reaches persistence or process-only consent", async () => {
+  const previous = `${KEY_PREFIX}rejected-old-key-12345`;
+  const candidate = `${KEY_PREFIX}rejected-candidate-key-456`;
+  const credentials = lifecycleCredentials(previous);
+  let confirmations = 0;
+  const service = new OpenRouterService(
+    previous,
+    undefined,
+    { inference: "keychain" },
+    {
+      fetchImpl: async (_url, init) => {
+        const authorization = (init.headers as Record<string, string>).Authorization;
+        return authorization === `Bearer ${candidate}`
+          ? new Response(JSON.stringify({ error: { message: "candidate rejected" } }), {
+              status: 401,
+              headers: { "content-type": "application/json" },
+            })
+          : new Response(JSON.stringify({ data: {} }), {
+              status: 200,
+              headers: { "content-type": "application/json" },
+            });
+      },
+    },
+  );
+  const { context } = lifecycleContext(service, credentials.store, {
+    readCredentialSecret: async () => candidate,
+    confirmProcessOnlyCredential: async () => {
+      confirmations += 1;
+      return true;
+    },
+  } as Partial<CommandContext>);
+
+  let candidateError: unknown;
+  try {
+    await handleSlashCommand("/key replace", context);
+  } catch (error) {
+    candidateError = error;
+  }
+  assert.ok(candidateError instanceof Error);
+  assert.match(candidateError.message, /abgelehnt|401/);
+  assert.equal(
+    shouldReplaceCredential(candidateError, service),
+    false,
+    "a candidate rejection must not trigger the outer startup/replacement flow",
+  );
+  assert.equal(confirmations, 0);
+  assert.equal(credentials.calls.includes("set"), false);
+  assert.equal(credentials.current(), previous);
+  assert.equal(service.requireKey(), previous);
+});
+
+test("key status reports an offline active key as reconnectable without deleting or throwing", async () => {
+  const key = `${KEY_PREFIX}offline-status-key-123456`;
+  const service = new OpenRouterService(
+    key,
+    undefined,
+    { inference: "keychain" },
+    {
+      clock: { sleep: async () => undefined },
+      fetchImpl: async () => {
+        throw Object.assign(new TypeError("fetch failed"), {
+          cause: { code: "ENETUNREACH" },
+        });
+      },
+    },
+  );
+  const credentials = lifecycleCredentials(key);
+  const { context, output } = lifecycleContext(service, credentials.store);
+
+  await handleSlashCommand("/key status", context);
+
+  assert.equal(service.requireKey(), key);
+  assert.equal(credentials.current(), key);
+  assert.equal(service.runtimeState.connectivity, "disconnected");
+  assert.match(output.join("\n"), /getrennt|offline/i);
+  assert.match(output.join("\n"), /reconnect/i);
+});
+
+test("management replace uses the same explicit process-only fallback contract", async () => {
+  const inference = `${KEY_PREFIX}management-flow-inference-123`;
+  const previous = `${KEY_PREFIX}management-flow-previous-456`;
+  const candidate = `${KEY_PREFIX}management-flow-candidate-789`;
+  const service = new OpenRouterService(
+    inference,
+    previous,
+    { inference: "keychain", management: "keychain" },
+    {
+      fetchImpl: async () => new Response(JSON.stringify({
+        data: { total_credits: 20, total_usage: 5 },
+      }), { status: 200, headers: { "content-type": "application/json" } }),
+    },
+  );
+  const credentials = lifecycleCredentials(previous);
+  credentials.failSet.value = true;
+  let confirmations = 0;
+  const { context } = lifecycleContext(service, credentials.store, {
+    readCredentialSecret: async () => candidate,
+    confirmProcessOnlyCredential: async (kind) => {
+      assert.equal(kind, "management");
+      confirmations += 1;
+      return true;
+    },
+  } as Partial<CommandContext>);
+
+  await handleSlashCommand("/key management replace", context);
+
+  assert.equal(confirmations, 1);
+  assert.equal(service.requireManagementKey(), candidate);
+  assert.equal(service.managementKeyOrigin, "interactive");
+  assert.equal(service.runtimeState.managementValidity, "valid");
+  assert.equal(credentials.current(), previous);
 });
 
 test("direct /diff streams through the hardened Git event path without duplicating the final diff", async (t) => {

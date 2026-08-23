@@ -8,11 +8,15 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 import {
   CliUsageError,
+  createOpenRouterServiceForStartup,
   homeWorkspaceWarning,
+  initializeDashboardKey,
   parseArgs,
   runOutcomeExitCode,
 } from "../src/cli.js";
 import { DEFAULT_CONFIG } from "../src/config.js";
+import { OpenRouterService } from "../src/openrouter.js";
+import type { CredentialStoreLike } from "../src/credentials.js";
 import type { ModelInfo } from "../src/types.js";
 
 test("homeWorkspaceWarning warnt nur bei Workspace === Home-Verzeichnis", () => {
@@ -33,6 +37,142 @@ test("parseArgs accepts -p and known flags", () => {
   assert.equal(options.prompt, "fix the bug");
   assert.equal(options.model, "gpt-5");
   assert.equal(options.json, false);
+});
+
+const STARTUP_KEY_PREFIX = `${["sk", "or", "v1"].join("-")}-`;
+
+function startupKeyResponse(status = 200): Response {
+  return new Response(JSON.stringify(status === 200 ? {
+    data: {
+      label: "startup fixture",
+      is_free_tier: false,
+      is_management_key: false,
+      usage: 1,
+      usage_daily: 1,
+      usage_weekly: 1,
+      usage_monthly: 1,
+      limit: 100,
+      limit_remaining: 99,
+    },
+  } : { error: { message: "rejected" } }), {
+    status,
+    headers: { "content-type": "application/json" },
+  });
+}
+
+function dashboardKeyUi() {
+  const messages: string[] = [];
+  return {
+    messages,
+    ui: {
+      setStatus: () => undefined,
+      setCancelHandler: () => undefined,
+      addMessage: (_level: string, message: string) => messages.push(message),
+      readSecret: async () => null,
+    },
+  };
+}
+
+test("startup reuses a saved key and otherwise marks environment keys process-only", () => {
+  const stored = `${STARTUP_KEY_PREFIX}stored-startup-key-123`;
+  const environment = `${STARTUP_KEY_PREFIX}environment-startup-key-456`;
+
+  const saved = createOpenRouterServiceForStartup({
+    storedInferenceKey: stored,
+    environmentInferenceKey: environment,
+  });
+  assert.equal(saved.requireKey(), stored);
+  assert.equal(saved.keyOrigin, "keychain");
+
+  const processOnly = createOpenRouterServiceForStartup({
+    storedInferenceKey: null,
+    environmentInferenceKey: environment,
+    environmentManagementKey: `${STARTUP_KEY_PREFIX}environment-management-key-789`,
+  });
+  assert.equal(processOnly.requireKey(), environment);
+  assert.equal(processOnly.keyOrigin, "environment");
+  assert.equal(processOnly.managementKeyOrigin, "environment");
+  assert.equal(processOnly.runtimeState.inferenceValidity, "unknown");
+});
+
+test("dashboard startup validation never persists an environment key implicitly", async () => {
+  const key = `${STARTUP_KEY_PREFIX}dashboard-environment-key-123`;
+  const openRouter = new OpenRouterService(
+    key,
+    undefined,
+    { inference: "environment" },
+    { fetchImpl: async () => startupKeyResponse() },
+  );
+  const calls: string[] = [];
+  const credentials: CredentialStoreLike = {
+    location: "Test-Schlüsselbund",
+    async get() { return null; },
+    async has() { return false; },
+    async set() { calls.push("set"); },
+    async delete() { calls.push("delete"); return false; },
+  };
+  const { ui } = dashboardKeyUi();
+
+  const balance = await initializeDashboardKey(
+    ui as never,
+    { openRouter, credentials } as never,
+  );
+
+  assert.equal(balance?.key.limitRemaining, 99);
+  assert.deepEqual(calls, []);
+  assert.equal(openRouter.keyOrigin, "environment");
+});
+
+test("a rejected saved key stays persisted until a valid environment fallback is activated", async () => {
+  const stored = `${STARTUP_KEY_PREFIX}dashboard-rejected-stored-123`;
+  const environment = `${STARTUP_KEY_PREFIX}dashboard-valid-environment-456`;
+  const openRouter = new OpenRouterService(
+    stored,
+    undefined,
+    { inference: "keychain" },
+    {
+      fetchImpl: async (_url, init) => {
+        const authorization = (init.headers as Record<string, string>).Authorization;
+        return authorization === `Bearer ${stored}`
+          ? startupKeyResponse(401)
+          : startupKeyResponse();
+      },
+    },
+  );
+  const calls: string[] = [];
+  let persisted: string | null = stored;
+  const credentials: CredentialStoreLike = {
+    location: "Test-Schlüsselbund",
+    async get() { return persisted; },
+    async has() { return persisted !== null; },
+    async set(_kind, secret) { calls.push("set"); persisted = secret; },
+    async delete() { calls.push("delete"); persisted = null; return true; },
+  };
+  const { ui } = dashboardKeyUi();
+
+  const balance = await initializeDashboardKey(
+    ui as never,
+    { openRouter, credentials } as never,
+    environment,
+  );
+
+  assert.equal(balance?.key.limitRemaining, 99);
+  assert.equal(openRouter.requireKey(), environment);
+  assert.equal(openRouter.keyOrigin, "environment");
+  assert.equal(persisted, stored);
+  assert.deepEqual(calls, []);
+});
+
+test("fullscreen key commands use the shared command lifecycle callbacks", () => {
+  const source = readFileSync(new URL("../src/cli.ts", import.meta.url), "utf8");
+  assert.match(source, /context\.readCredentialSecret\s*=/);
+  assert.match(source, /context\.confirmCredentialForget\s*=/);
+  assert.match(source, /context\.confirmProcessOnlyCredential\s*=/);
+  assert.equal(
+    source.includes('commandArgs[0]?.toLowerCase() === "set"'),
+    false,
+    "the dashboard must not bypass keyCommand with its old private /key set flow",
+  );
 });
 
 test("parseArgs sets json and treats it independently of prompt", () => {

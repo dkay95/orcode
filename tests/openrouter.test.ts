@@ -257,6 +257,113 @@ test("management candidate failures redact the candidate and never mutate active
   assert.equal(service.hasManagementKey, true);
 });
 
+test("inference candidate validation uses the candidate scope without replacing active state", async () => {
+  const candidate = `${TEST_KEY_PREFIX}${["inference", "candidate", "secret"].join("-")}`;
+  const service = new OpenRouterService(
+    INFERENCE_KEY,
+    undefined,
+    { inference: "keychain" },
+    {
+      fetchImpl: async (_url, init) => {
+        assert.equal(bearerOf(init), `Bearer ${candidate}`);
+        return keyResponse({
+          is_management_key: false,
+          limit: 25,
+          limit_remaining: 20,
+        });
+      },
+    },
+  );
+  const before = service.runtimeState;
+
+  const balance = await service.validateInferenceKey(candidate);
+
+  assert.equal(balance.key.limitRemaining, 20);
+  assert.equal(balance.capabilities?.creditsSource, "none");
+  assert.deepEqual(service.runtimeState, before);
+  assert.equal(service.requireKey(), INFERENCE_KEY);
+  assert.equal(service.keyOrigin, "keychain");
+});
+
+test("candidate validation stays isolated even when candidate bytes equal an active key", async (t) => {
+  await t.test("inference candidate", async () => {
+    let reject = false;
+    const service = new OpenRouterService(
+      INFERENCE_KEY,
+      undefined,
+      { inference: "keychain" },
+      {
+        fetchImpl: async () => reject
+          ? jsonResponse({ error: { message: "candidate unauthorized" } }, { status: 401 })
+          : keyResponse({ is_management_key: false, limit: 10, limit_remaining: 9 }),
+      },
+    );
+    await service.checkBalance();
+    assert.equal(service.runtimeState.inferenceValidity, "valid");
+    reject = true;
+
+    await assert.rejects(service.validateInferenceKey(INFERENCE_KEY));
+
+    assert.equal(service.runtimeState.inferenceValidity, "valid");
+    assert.equal(service.runtimeState.connectivity, "connected");
+  });
+
+  await t.test("management candidate", async () => {
+    let reject = false;
+    const service = new OpenRouterService(
+      INFERENCE_KEY,
+      MANAGEMENT_KEY,
+      { inference: "keychain", management: "keychain" },
+      {
+        fetchImpl: async (url) => {
+          if (url.endsWith("/credits")) {
+            return reject
+              ? jsonResponse({ error: { message: "candidate unauthorized" } }, { status: 401 })
+              : creditsResponse();
+          }
+          return keyResponse({ is_management_key: false });
+        },
+      },
+    );
+    await service.checkBalance();
+    assert.equal(service.runtimeState.managementValidity, "valid");
+    reject = true;
+
+    await assert.rejects(service.validateManagementKey(MANAGEMENT_KEY));
+
+    assert.equal(service.runtimeState.managementValidity, "valid");
+    assert.equal(service.runtimeState.connectivity, "connected");
+  });
+});
+
+test("active inference and management scopes never collide when their key bytes are equal", async () => {
+  const shared = `${TEST_KEY_PREFIX}same-bytes-two-active-slots-123`;
+  let rejectInference = false;
+  const service = new OpenRouterService(
+    shared,
+    shared,
+    { inference: "keychain", management: "keychain" },
+    {
+      fetchImpl: async (url) => {
+        if (url.endsWith("/credits")) return creditsResponse();
+        return rejectInference
+          ? jsonResponse({ error: { message: "inference unauthorized" } }, { status: 401 })
+          : keyResponse({ is_management_key: false });
+      },
+    },
+  );
+
+  await service.checkBalance();
+  assert.equal(service.runtimeState.inferenceValidity, "valid");
+  assert.equal(service.runtimeState.managementValidity, "valid");
+  assert.equal(service.runtimeState.credit, "available");
+
+  rejectInference = true;
+  await assert.rejects(service.getCurrentKey());
+  assert.equal(service.runtimeState.inferenceValidity, "rejected");
+  assert.equal(service.runtimeState.managementValidity, "valid");
+});
+
 test("reconnect exposes reconnecting during the attempt and preserves validity on transport failure", async () => {
   let shouldFail = false;
   let service: OpenRouterService;

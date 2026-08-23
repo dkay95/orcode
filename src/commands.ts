@@ -2,7 +2,6 @@ import { confirm, password, search } from "@inquirer/prompts";
 import { readFile, writeFile } from "node:fs/promises";
 import chalk from "chalk";
 import {
-  SpendUnavailableError,
   assertSpendAvailable,
   type OrcodeAgent,
 } from "./agent.js";
@@ -45,7 +44,10 @@ import { approvalDescription, ApprovalManager } from "./approval.js";
 import { RuleStore } from "./rules.js";
 import { loadSshHosts } from "./ssh-config.js";
 import { checkHost, closeSshControl, createSshSession, type RunSsh, type SshSession } from "./ssh.js";
-import type { CredentialStoreLike } from "./credentials.js";
+import {
+  CredentialStoreError,
+  type CredentialStoreLike,
+} from "./credentials.js";
 import {
   OpenRouterHttpError,
   OpenRouterService,
@@ -179,6 +181,20 @@ export interface CommandContext {
   ) => void;
   /** One destructive chat-deletion confirmation. Fullscreen UI injects its modal; plain mode uses Inquirer. */
   confirmChatDeletion?: (title: string, details: string) => Promise<boolean>;
+  /** One confirmation per explicit credential-forget attempt. */
+  confirmCredentialForget?: (
+    kind: "inference" | "management",
+    details: string,
+  ) => Promise<boolean>;
+  /** Required before a validated key may stay process-only after Keychain failure. */
+  confirmProcessOnlyCredential?: (
+    kind: "inference" | "management",
+    reason: string,
+  ) => Promise<boolean>;
+  /** Secret-input seam shared by plain Inquirer and the fullscreen modal. */
+  readCredentialSecret?: (
+    kind: "inference" | "management",
+  ) => Promise<string | null>;
   /** Active surface event sink; the dashboard uses it for direct `/diff` live output. */
   onRunEvent?: (event: AgentRunEvent) => void;
 }
@@ -397,7 +413,7 @@ export async function promptForValidKey(
     key: string;
     origin: Exclude<KeyOrigin, "none">;
   },
-): Promise<BalanceReport> {
+): Promise<BalanceReport | null> {
   let nextFallback = fallback;
   while (true) {
     if (openRouter.hasKey) {
@@ -406,42 +422,53 @@ export async function promptForValidKey(
       try {
         const balance = await openRouter.checkBalance();
         assertSpendAvailable(balance);
-        if (origin !== "keychain") {
-          const saved = await persistCredential(
-            credentials,
-            "inference",
-            activeKey,
-            out,
+        if (origin === "environment") {
+          out.text(
+            chalk.dim(
+              "OPENROUTER_API_KEY ist gültig und bleibt prozesslokal. Dauerhaft speichern mit /key save.",
+            ),
           );
-          if (saved) {
-            openRouter.setKey(activeKey, "keychain");
-            out.text(
-              chalk.green(
-                `API-Key gültig und sicher im ${credentials.location} gespeichert.`,
-              ),
-            );
-          }
         }
         return balance;
       } catch (error) {
-        if (!shouldReplaceCredential(error)) {
-          throw error;
+        if (!shouldReplaceCredential(error, openRouter)) {
+          out.error(
+            `OpenRouter-Startprüfung nicht verfügbar: ${openRouter.safeMessage(error)} Der Key bleibt geladen; prüfe ihn mit /key status oder /reconnect erneut.`,
+          );
+          return null;
         }
         const message = openRouter.safeMessage(error).replace(/[.!?]+$/, "");
-        openRouter.forgetKey();
-        let removedFromKeychain = false;
-        if (origin === "keychain") {
+        if (nextFallback && nextFallback.key.trim() !== activeKey.trim()) {
+          const candidate = nextFallback;
+          nextFallback = undefined;
           try {
-            removedFromKeychain = await credentials.delete("inference");
-          } catch (deleteError) {
-            out.text(
-              chalk.yellow(
-                `Der abgelehnte Key konnte nicht aus dem Schlüsselbund entfernt werden: ${
-                  deleteError instanceof Error
-                    ? deleteError.message
-                    : String(deleteError)
-                }`,
-              ),
+            const activated = await validateAndActivateInferenceKey(
+              candidate.key,
+              { credentials, openRouter },
+              {
+                persist: false,
+                processOrigin: candidate.origin === "environment"
+                  ? "environment"
+                  : "interactive",
+              },
+            );
+            if (activated) {
+              out.text(
+                chalk.yellow(
+                  `${originLabel(origin)} wurde abgelehnt. OPENROUTER_API_KEY ist geprüft und für diesen Prozess aktiv; dauerhaft speichern mit /key save.`,
+                ),
+              );
+              return activated.balance;
+            }
+          } catch (fallbackError) {
+            if (!isAuthenticationRejection(fallbackError)) {
+              out.error(
+                `OPENROUTER_API_KEY konnte nicht geprüft werden: ${openRouter.safeMessage(fallbackError)} Der bisherige Key bleibt unverändert geladen; /reconnect versucht es erneut.`,
+              );
+              return null;
+            }
+            out.error(
+              `Auch OPENROUTER_API_KEY wurde abgelehnt: ${openRouter.safeMessage(fallbackError)}`,
             );
           }
         }
@@ -451,18 +478,8 @@ export async function promptForValidKey(
           );
         }
         out.error(
-          `${originLabel(origin)} wurde abgelehnt${
-            removedFromKeychain ? " und aus dem Schlüsselbund entfernt" : ""
-          }: ${message}`,
+          `${originLabel(origin)} wurde abgelehnt, bleibt aber bis zu einer validierten Ersetzung unverändert gespeichert: ${message}`,
         );
-        if (
-          nextFallback &&
-          nextFallback.key.trim() !== activeKey.trim()
-        ) {
-          openRouter.setKey(nextFallback.key, nextFallback.origin);
-          nextFallback = undefined;
-          continue;
-        }
       }
     }
     if (!process.stdin.isTTY) {
@@ -475,27 +492,32 @@ export async function promptForValidKey(
       mask: "•",
       validate: (value) => value.trim().length >= 20 || "Der Key ist zu kurz.",
     });
-    const temporary = new OpenRouterService(candidate);
     try {
-      const balance = await temporary.checkBalance();
-      assertSpendAvailable(balance);
-      const saved = await persistCredential(
-        credentials,
-        "inference",
+      const activated = await validateAndActivateInferenceKey(
         candidate,
-        out,
+        { credentials, openRouter },
+        {
+          persist: true,
+          confirmProcessOnly: async (error) => confirm({
+            message: `Der Key ist gültig, aber ${credentials.location} ist nicht verfügbar (${errorMessage(error)}). Nur für diesen Prozess verwenden?`,
+            default: false,
+          }),
+        },
       );
-      openRouter.setKey(candidate, saved ? "keychain" : "interactive");
+      if (!activated) {
+        out.text("Key unverändert; prozesslokale Verwendung abgebrochen.");
+        continue;
+      }
       out.text(
         chalk.green(
-          saved
+          activated.persisted
             ? `API-Key gültig und sicher im ${credentials.location} gespeichert.`
             : "API-Key gültig. Er bleibt für diese Sitzung im Prozessspeicher.",
         ),
       );
-      return balance;
+      return activated.balance;
     } catch (error) {
-      out.error(temporary.safeMessage(error));
+      out.error(openRouter.safeMessage(error));
     }
   }
 }
@@ -600,18 +622,48 @@ async function keyCommand(args: string[], context: CommandContext): Promise<void
   const action = (args[0] ?? "status").toLowerCase();
   if (action === "status") {
     const stored = await context.credentials.has("inference");
+    let balance: BalanceReport | null = null;
+    let balanceError: unknown;
+    if (context.openRouter.hasKey) {
+      try {
+        balance = await context.openRouter.checkBalance();
+      } catch (error) {
+        balanceError = error;
+      }
+    }
     context.out.text(`Aktiver API-Key: ${keyStatusLabel(context.openRouter.keyOrigin, context.credentials.location)}`);
+    context.out.text(`Key-Gültigkeit: ${credentialValidityLabel(context.openRouter.runtimeState.inferenceValidity)}`);
+    context.out.text(`Verbindung: ${connectivityLabel(context.openRouter.runtimeState.connectivity)}`);
+    context.out.text(`Guthabenstatus: ${creditStateLabel(context.openRouter.runtimeState.credit)}`);
     context.out.text(
       `Gespeicherter API-Key: ${
         stored ? `ja, im ${context.credentials.location}` : "nein"
       }`,
     );
-    if (context.openRouter.hasKey) {
-      await printBalance(await context.openRouter.checkBalance(), context.out);
+    if (balance) {
+      await printBalance(balance, context.out);
+    } else if (balanceError) {
+      context.out.error(
+        `Live-Prüfung nicht verfügbar: ${context.openRouter.safeMessage(balanceError)}`,
+        "Der Key bleibt geladen. Verbindung mit /reconnect erneut prüfen.",
+      );
     }
     return;
   }
   if (action === "forget") {
+    const accepted = context.confirmCredentialForget
+      ? await context.confirmCredentialForget(
+        "inference",
+        `Der API-Key wird zuerst aus ${context.credentials.location} und danach aus dem Prozessspeicher entfernt.`,
+      )
+      : await confirm({
+        message: `API-Key aus ${context.credentials.location} und Prozessspeicher entfernen?`,
+        default: false,
+      });
+    if (!accepted) {
+      context.out.text("API-Key unverändert; Entfernen abgebrochen.");
+      return;
+    }
     const removed = await context.credentials.delete("inference");
     context.openRouter.forgetKey();
     context.out.text(
@@ -621,19 +673,52 @@ async function keyCommand(args: string[], context: CommandContext): Promise<void
     );
     return;
   }
-  if (action === "set") {
-    const candidate = await password({
-      message: "Neuer OpenRouter API-Key (verdeckt):",
-      mask: "•",
-      validate: (value) => value.trim().length >= 20 || "Der Key ist zu kurz.",
-    });
-    const balance = await validateAndStoreInferenceKey(candidate, context);
+  if (action === "save") {
+    if (!context.openRouter.hasKey) {
+      throw new Error("Kein aktiver API-Key zum Speichern. Verwende /key replace.");
+    }
+    const balance = await validateAndStoreInferenceKey(
+      context.openRouter.requireKey(),
+      context,
+    );
     context.out.text(
       chalk.green(
-        `Neuer Key ist gültig und im ${context.credentials.location} gespeichert.`,
+        `API-Key geprüft und im ${context.credentials.location} gespeichert.`,
       ),
     );
     await printBalance(balance, context.out);
+    return;
+  }
+  if (action === "set" || action === "replace") {
+    const candidate = await readCredentialSecret("inference", context);
+    if (candidate === null) {
+      context.out.text("Key-Eingabe abgebrochen; aktiver Key unverändert.");
+      return;
+    }
+    const activated = await validateAndActivateInferenceKey(candidate, context, {
+      persist: true,
+      confirmProcessOnly: context.confirmProcessOnlyCredential
+        ? (error) => context.confirmProcessOnlyCredential!(
+          "inference",
+          errorMessage(error),
+        )
+        : async (error) => confirm({
+          message: `Der Key ist gültig, aber ${context.credentials.location} ist nicht verfügbar (${errorMessage(error)}). Nur für diesen Prozess verwenden?`,
+          default: false,
+        }),
+    });
+    if (!activated) {
+      context.out.text("Aktiver und gespeicherter Key unverändert.");
+      return;
+    }
+    context.out.text(
+      chalk.green(
+        activated.persisted
+          ? `Neuer Key ist gültig und im ${context.credentials.location} gespeichert.`
+          : "Neuer Key ist gültig und nur für diesen Prozess aktiv.",
+      ),
+    );
+    await printBalance(activated.balance, context.out);
     return;
   }
   if (action === "management") {
@@ -650,9 +735,25 @@ async function keyCommand(args: string[], context: CommandContext): Promise<void
           stored ? `ja, im ${context.credentials.location}` : "nein"
         }`,
       );
+      context.out.text(
+        `Management-Gültigkeit: ${credentialValidityLabel(context.openRouter.runtimeState.managementValidity)}`,
+      );
       return;
     }
     if (managementAction === "forget") {
+      const accepted = context.confirmCredentialForget
+        ? await context.confirmCredentialForget(
+          "management",
+          `Der Management-Key wird zuerst aus ${context.credentials.location} und danach aus dem Prozessspeicher entfernt.`,
+        )
+        : await confirm({
+          message: `Management-Key aus ${context.credentials.location} und Prozessspeicher entfernen?`,
+          default: false,
+        });
+      if (!accepted) {
+        context.out.text("Management-Key unverändert; Entfernen abgebrochen.");
+        return;
+      }
       await context.credentials.delete("management");
       context.openRouter.forgetManagementKey();
       context.out.text(
@@ -660,26 +761,158 @@ async function keyCommand(args: string[], context: CommandContext): Promise<void
       );
       return;
     }
-    if (managementAction === "set") {
-      const candidate = await password({
-        message: "OpenRouter Management-Key für /credits (verdeckt):",
-        mask: "•",
-        validate: (value) => value.trim().length >= 20 || "Der Key ist zu kurz.",
-      });
-      const credits = await validateAndStoreManagementKey(candidate, context);
+    if (managementAction === "save") {
+      if (!context.openRouter.hasManagementKey) {
+        throw new Error(
+          "Kein aktiver Management-Key zum Speichern. Verwende /key management replace.",
+        );
+      }
+      const credits = await validateAndStoreManagementKey(
+        context.openRouter.requireManagementKey(),
+        context,
+      );
       context.out.text(
         chalk.green(
-          `Management-Key gültig und im ${context.credentials.location} gespeichert. Kontoguthaben: ${usd(credits.remaining)} verbleibend.`,
+          `Management-Key geprüft und im ${context.credentials.location} gespeichert. Kontoguthaben: ${usd(credits.remaining)} verbleibend.`,
         ),
       );
       return;
     }
-    context.out.text("Verwendung: /key management set | status | forget");
+    if (managementAction === "set" || managementAction === "replace") {
+      const candidate = await readCredentialSecret("management", context);
+      if (candidate === null) {
+        context.out.text("Management-Key-Eingabe abgebrochen; aktiver Key unverändert.");
+        return;
+      }
+      const activated = await validateAndActivateManagementKey(candidate, context, {
+        confirmProcessOnly: context.confirmProcessOnlyCredential
+          ? (error) => context.confirmProcessOnlyCredential!(
+            "management",
+            errorMessage(error),
+          )
+          : async (error) => confirm({
+            message: `Der Management-Key ist gültig, aber ${context.credentials.location} ist nicht verfügbar (${errorMessage(error)}). Nur für diesen Prozess verwenden?`,
+            default: false,
+          }),
+      });
+      if (!activated) {
+        context.out.text("Aktiver und gespeicherter Management-Key unverändert.");
+        return;
+      }
+      context.out.text(
+        chalk.green(
+          activated.persisted
+            ? `Management-Key gültig und im ${context.credentials.location} gespeichert. Kontoguthaben: ${usd(activated.credits.remaining)} verbleibend.`
+            : `Management-Key gültig und nur für diesen Prozess aktiv. Kontoguthaben: ${usd(activated.credits.remaining)} verbleibend.`,
+        ),
+      );
+      return;
+    }
+    context.out.text(
+      "Verwendung: /key management replace | save | status | forget",
+    );
     return;
   }
   context.out.text(
-    "Verwendung: /key set | status | forget | /key management set | status | forget",
+    "Verwendung: /key replace | save | status | forget | /key management replace | save | status | forget",
   );
+}
+
+async function readCredentialSecret(
+  kind: "inference" | "management",
+  context: CommandContext,
+): Promise<string | null> {
+  if (context.readCredentialSecret) {
+    return context.readCredentialSecret(kind);
+  }
+  return password({
+    message: kind === "inference"
+      ? "Neuer OpenRouter API-Key (verdeckt):"
+      : "OpenRouter Management-Key für /credits (verdeckt):",
+    mask: "•",
+    validate: (value) => value.trim().length >= 20 || "Der Key ist zu kurz.",
+  });
+}
+
+interface CredentialActivationOptions {
+  persist?: boolean;
+  requireSpendAvailable?: boolean;
+  processOrigin?: Exclude<KeyOrigin, "none" | "keychain">;
+  signal?: AbortSignal;
+  confirmProcessOnly?: (error: unknown) => Promise<boolean>;
+}
+
+export async function validateAndActivateInferenceKey(
+  candidate: string,
+  context: Pick<CommandContext, "credentials" | "openRouter">,
+  options: CredentialActivationOptions = {},
+): Promise<{ balance: BalanceReport; persisted: boolean } | null> {
+  const balance = await context.openRouter.validateInferenceKey(
+    candidate,
+    options.signal,
+  );
+  if (options.requireSpendAvailable !== false) {
+    assertSpendAvailable(balance);
+  }
+  let persisted = options.persist !== false;
+  if (persisted) {
+    try {
+      await context.credentials.set("inference", candidate);
+    } catch (error) {
+      if (
+        error instanceof CredentialStoreError &&
+        error.persistenceState === "unknown"
+      ) {
+        throw error;
+      }
+      if (!options.confirmProcessOnly || !(await options.confirmProcessOnly(error))) {
+        if (options.confirmProcessOnly) return null;
+        throw error;
+      }
+      persisted = false;
+    }
+  }
+  context.openRouter.activateValidatedKey(
+    candidate,
+    persisted ? "keychain" : (options.processOrigin ?? "interactive"),
+    balance,
+  );
+  return { balance, persisted };
+}
+
+export async function validateAndActivateManagementKey(
+  candidate: string,
+  context: Pick<CommandContext, "credentials" | "openRouter">,
+  options: Omit<CredentialActivationOptions, "processOrigin"> = {},
+): Promise<{ credits: CreditInfo; persisted: boolean } | null> {
+  const credits = await context.openRouter.validateManagementKey(
+    candidate,
+    options.signal,
+  );
+  let persisted = options.persist !== false;
+  if (persisted) {
+    try {
+      await context.credentials.set("management", candidate);
+    } catch (error) {
+      if (
+        error instanceof CredentialStoreError &&
+        error.persistenceState === "unknown"
+      ) {
+        throw error;
+      }
+      if (!options.confirmProcessOnly || !(await options.confirmProcessOnly(error))) {
+        if (options.confirmProcessOnly) return null;
+        throw error;
+      }
+      persisted = false;
+    }
+  }
+  context.openRouter.activateValidatedManagementKey(
+    candidate,
+    persisted ? "keychain" : "interactive",
+    credits,
+  );
+  return { credits, persisted };
 }
 
 export async function validateAndStoreInferenceKey(
@@ -687,12 +920,12 @@ export async function validateAndStoreInferenceKey(
   context: Pick<CommandContext, "credentials" | "openRouter">,
   signal?: AbortSignal,
 ): Promise<BalanceReport> {
-  const temporary = new OpenRouterService(candidate);
-  const balance = await temporary.checkBalance(signal);
-  assertSpendAvailable(balance);
-  await context.credentials.set("inference", candidate);
-  context.openRouter.setKey(candidate, "keychain");
-  return balance;
+  const activated = await validateAndActivateInferenceKey(candidate, context, {
+    signal,
+    requireSpendAvailable: false,
+  });
+  if (!activated) throw new Error("API-Key-Aktivierung wurde abgebrochen.");
+  return activated.balance;
 }
 
 export async function validateAndStoreManagementKey(
@@ -700,10 +933,11 @@ export async function validateAndStoreManagementKey(
   context: Pick<CommandContext, "credentials" | "openRouter">,
   signal?: AbortSignal,
 ): Promise<CreditInfo> {
-  const credits = await context.openRouter.validateManagementKey(candidate, signal);
-  await context.credentials.set("management", candidate);
-  context.openRouter.setManagementKey(candidate, "keychain");
-  return credits;
+  const activated = await validateAndActivateManagementKey(candidate, context, {
+    signal,
+  });
+  if (!activated) throw new Error("Management-Key-Aktivierung wurde abgebrochen.");
+  return activated.credits;
 }
 
 async function modelCommand(args: string[], context: CommandContext): Promise<void> {
@@ -2449,41 +2683,23 @@ function escapeRegExp(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
-async function persistCredential(
-  credentials: CredentialStoreLike,
-  kind: "inference" | "management",
-  secret: string,
-  out: CommandOutput,
-): Promise<boolean> {
-  try {
-    await credentials.set(kind, secret);
-    return true;
-  } catch (error) {
-    out.text(
-      chalk.yellow(
-        `Der Key ist gültig, konnte aber nicht dauerhaft gespeichert werden: ${errorMessage(error)}`,
-      ),
-    );
-    return false;
-  }
-}
-
 /**
  * Should the stored key be thrown away and replaced?
  *
- * Only for credentials the server actually rejected (401/403) or a key whose
- * validity has run out. Empty credit and an exhausted spending limit are money
- * problems with a perfectly valid key — the old regex on the German message
- * deleted exactly those keys from the keychain (B3).
+ * Only a structured HTTP 401 from the active OpenRouter request invalidates
+ * the credential. Permission, money, expiry metadata and connectivity are
+ * separate states and never authorize deleting a saved key.
  */
-export function shouldReplaceCredential(error: unknown): boolean {
-  if (error instanceof SpendUnavailableError) {
-    return error.reason === "key-expired";
-  }
-  return (
-    error instanceof OpenRouterHttpError &&
-    (error.status === 401 || error.status === 403)
-  );
+export function shouldReplaceCredential(
+  _error: unknown,
+  openRouter?: OpenRouterService,
+): boolean {
+  return openRouter?.runtimeState.inferenceValidity === "rejected";
+}
+
+/** A raw 401 is only meaningful inside the request that owns its scope. */
+export function isAuthenticationRejection(error: unknown): boolean {
+  return error instanceof OpenRouterHttpError && error.status === 401;
 }
 
 function originLabel(origin: KeyOrigin): string {
@@ -2497,4 +2713,30 @@ function keyStatusLabel(origin: KeyOrigin, location: string): string {
   if (origin === "environment") return "aus Umgebungsvariable";
   if (origin === "interactive") return "nur im Prozessspeicher";
   return "nicht gesetzt";
+}
+
+function credentialValidityLabel(
+  value: OpenRouterService["runtimeState"]["inferenceValidity"],
+): string {
+  if (value === "valid") return "zuletzt gültig";
+  if (value === "rejected") return "von OpenRouter abgelehnt";
+  return "noch nicht geprüft";
+}
+
+function connectivityLabel(
+  value: OpenRouterService["runtimeState"]["connectivity"],
+): string {
+  if (value === "connected") return "verbunden";
+  if (value === "reconnecting") return "Reconnect läuft";
+  if (value === "disconnected") return "getrennt · /reconnect möglich";
+  return "noch nicht geprüft";
+}
+
+function creditStateLabel(
+  value: OpenRouterService["runtimeState"]["credit"],
+): string {
+  if (value === "available") return "verfügbar";
+  if (value === "insufficient") return "nicht ausreichend";
+  if (value === "unavailable") return "nicht abrufbar";
+  return "unbekannt";
 }

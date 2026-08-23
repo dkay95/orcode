@@ -712,6 +712,17 @@ export class OpenRouterService {
     this.dropClients();
   }
 
+  activateValidatedKey(
+    apiKey: string,
+    origin: Exclude<KeyOrigin, "none">,
+    balance: BalanceReport,
+  ): void {
+    this.setKey(apiKey, origin);
+    this.#state.inferenceValidity = "valid";
+    this.#state.connectivity = "connected";
+    this.#state.credit = creditStateFromBalance(balance);
+  }
+
   forgetKey(): void {
     this.#apiKey = null;
     this.#keyOrigin = "none";
@@ -730,6 +741,17 @@ export class OpenRouterService {
     this.#managementKeyOrigin = origin;
     this.#state.managementValidity = "unknown";
     this.#state.credit = "unknown";
+  }
+
+  activateValidatedManagementKey(
+    apiKey: string,
+    origin: Exclude<KeyOrigin, "none">,
+    credits: CreditInfo,
+  ): void {
+    this.setManagementKey(apiKey, origin);
+    this.#state.managementValidity = "valid";
+    this.#state.connectivity = "connected";
+    this.#state.credit = credits.remaining > 0 ? "available" : "insufficient";
   }
 
   forgetManagementKey(): void {
@@ -874,7 +896,13 @@ export class OpenRouterService {
         ? (this.#managementKey ?? this.requireKey())
         : this.requireKey();
     try {
-      const credits = await this.getCredits(bearer, signal);
+      const credits = await this.getCredits(
+        bearer,
+        signal,
+        capabilities.creditsSource === "management-key"
+          ? "management"
+          : "inference",
+      );
       return { key, credits, capabilities };
     } catch (error) {
       if (
@@ -907,14 +935,63 @@ export class OpenRouterService {
     if (!normalized || normalized.length < 20 || /\s/.test(normalized)) {
       throw new Error("Der OpenRouter Management-Key sieht ungültig aus.");
     }
-    return this.getCredits(normalized, signal);
+    return this.getCredits(normalized, signal, "candidate");
+  }
+
+  async validateInferenceKey(
+    apiKey: string,
+    signal?: AbortSignal,
+  ): Promise<BalanceReport> {
+    const normalized = normalizeKey(apiKey);
+    if (!normalized || normalized.length < 20 || /\s/.test(normalized)) {
+      throw new Error("Der OpenRouter API-Key sieht ungültig aus.");
+    }
+    const payload = await this.request("/key", normalized, signal, "candidate");
+    const key = keyInfoFromPayload(payload);
+    const capabilities = describeKeyCapabilities(key, false);
+    if (!capabilities.accountCredits) {
+      return {
+        key,
+        capabilities,
+        creditsUnavailableReason: capabilities.summary,
+      };
+    }
+    try {
+      const credits = await this.getCredits(normalized, signal, "candidate");
+      return { key, credits, capabilities };
+    } catch (error) {
+      if (
+        error instanceof OpenRouterHttpError &&
+        (error.status === 401 || error.status === 403)
+      ) {
+        const reason =
+          "Der /credits-Endpunkt benötigt einen Management-Key; das Limit des geprüften Inference-Keys ist gültig.";
+        return {
+          key,
+          capabilities: {
+            ...capabilities,
+            accountCredits: false,
+            creditsSource: "none",
+            summary: reason,
+          },
+          creditsUnavailableReason: reason,
+        };
+      }
+      throw error;
+    }
   }
 
   async getCredits(
     bearerKey: string,
-    signal?: AbortSignal,
+    signal: AbortSignal | undefined,
+    requestScope: "inference" | "management" | "candidate",
   ): Promise<CreditInfo> {
-    const payload = await this.request("/credits", bearerKey, signal);
+    const payload = await this.request(
+      "/credits",
+      bearerKey,
+      signal,
+      requestScope,
+    );
     const data = requireRecord(payload.data, "Ungültige Guthaben-Antwort");
     const totalCredits = numberOf(data.total_credits);
     const totalUsage = numberOf(data.total_usage);
@@ -923,27 +1000,20 @@ export class OpenRouterService {
       totalUsage,
       remaining: Math.max(0, totalCredits - totalUsage),
     };
-    if (this.#credentialScope(bearerKey) !== "candidate") {
+    if (requestScope !== "candidate") {
       this.#state.credit = credits.remaining > 0 ? "available" : "insufficient";
     }
     return credits;
   }
 
   async getCurrentKey(signal?: AbortSignal): Promise<KeyInfo> {
-    const payload = await this.request("/key", this.requireKey(), signal);
-    const data = requireRecord(payload.data, "Ungültige Key-Antwort");
-    return {
-      label: stringOf(data.label),
-      isFreeTier: booleanOf(data.is_free_tier),
-      isManagementKey: booleanOf(data.is_management_key),
-      limit: nullableNumberOf(data.limit),
-      limitRemaining: nullableNumberOf(data.limit_remaining),
-      usage: numberOf(data.usage),
-      usageDaily: numberOf(data.usage_daily),
-      usageWeekly: numberOf(data.usage_weekly),
-      usageMonthly: numberOf(data.usage_monthly),
-      expiresAt: nullableStringOf(data.expires_at),
-    };
+    const payload = await this.request(
+      "/key",
+      this.requireKey(),
+      signal,
+      "inference",
+    );
+    return keyInfoFromPayload(payload);
   }
 
   /** Full model catalogue, cached for `modelCacheTtlMs`. */
@@ -1031,6 +1101,15 @@ export class OpenRouterService {
     return this.#apiKey;
   }
 
+  requireManagementKey(): string {
+    if (!this.#managementKey) {
+      throw new Error(
+        "Kein OpenRouter Management-Key gesetzt. Verwende /key management replace.",
+      );
+    }
+    return this.#managementKey;
+  }
+
   /** Structured, German translation of an OpenRouter or network failure. */
   explain(error: unknown): OpenRouterFailure {
     return describeOpenRouterFailure(error, [this.#apiKey, this.#managementKey]);
@@ -1042,10 +1121,11 @@ export class OpenRouterService {
 
   async request(
     path: string,
-    bearerKey = this.requireKey(),
-    signal?: AbortSignal,
+    bearerKey: string,
+    signal: AbortSignal | undefined,
+    requestScope: "inference" | "management" | "candidate",
   ): Promise<Record<string, unknown>> {
-    const scope = this.#credentialScope(bearerKey);
+    const scope = requestScope;
     let response: Response;
     try {
       response = await this.#send(
@@ -1111,12 +1191,6 @@ export class OpenRouterService {
       clock: this.#runtime.clock,
       fetchImpl: this.#runtime.fetchImpl,
     });
-  }
-
-  #credentialScope(bearerKey: string): "inference" | "management" | "candidate" {
-    if (this.#managementKey && bearerKey === this.#managementKey) return "management";
-    if (this.#apiKey && bearerKey === this.#apiKey) return "inference";
-    return "candidate";
   }
 
   #recordResponse(
@@ -1535,6 +1609,35 @@ function requireRecord(value: unknown, message: string): Record<string, unknown>
     throw new Error(message);
   }
   return value;
+}
+
+function keyInfoFromPayload(payload: Record<string, unknown>): KeyInfo {
+  const data = requireRecord(payload.data, "Ungültige Key-Antwort");
+  return {
+    label: stringOf(data.label),
+    isFreeTier: booleanOf(data.is_free_tier),
+    isManagementKey: booleanOf(data.is_management_key),
+    limit: nullableNumberOf(data.limit),
+    limitRemaining: nullableNumberOf(data.limit_remaining),
+    usage: numberOf(data.usage),
+    usageDaily: numberOf(data.usage_daily),
+    usageWeekly: numberOf(data.usage_weekly),
+    usageMonthly: numberOf(data.usage_monthly),
+    expiresAt: nullableStringOf(data.expires_at),
+  };
+}
+
+function creditStateFromBalance(balance: BalanceReport): CreditState {
+  if (balance.credits) {
+    return balance.credits.remaining > 0 ? "available" : "insufficient";
+  }
+  if (
+    balance.key.limitRemaining !== null &&
+    balance.key.limitRemaining !== undefined
+  ) {
+    return balance.key.limitRemaining > 0 ? "available" : "insufficient";
+  }
+  return "unavailable";
 }
 
 function stringOf(value: unknown): string | undefined {
