@@ -25,6 +25,7 @@ import {
 } from "./attachments.js";
 import { ApprovalManager } from "./approval.js";
 import { pruneBrowserTempArtifacts } from "./browser.js";
+import { resolveSlashCommand } from "./command-catalog.js";
 import { RuleStore } from "./rules.js";
 import { createSshSession, type SshSession } from "./ssh.js";
 import {
@@ -244,7 +245,7 @@ export async function initializeStartupStorage(
  * Reads the version from package.json so it is stated in exactly one place.
  * Works from both src/ (tsx) and dist/ because both sit one level below the root.
  */
-function readPackageVersion(): string {
+export function readPackageVersion(): string {
   try {
     const here = dirname(fileURLToPath(import.meta.url));
     const raw = readFileSync(join(here, "..", "package.json"), "utf8");
@@ -1006,14 +1007,15 @@ async function runDashboard(
         if (trimmed.startsWith("/")) {
           ui.setStatus("Befehl wird ausgeführt");
           const modelBefore = context.config.mainModel;
-          const completedCommand = commandName(trimmed);
+          const resolvedCommand = resolveSlashCommand(trimmed);
+          const completedCommand = resolveCliCommandName(trimmed);
+          const completedCommandLabel = resolvedCommand
+            ? `/${resolvedCommand.command.name}`
+            : trimmed.split(/\s+/)[0];
           const commandArgs = commandArguments(trimmed);
           const sessionBefore = context.session;
 
-          if (
-            completedCommand === "image" ||
-            completedCommand === "attach"
-          ) {
+          if (completedCommand === "image") {
             const action = commandTail(trimmed);
             if (action.toLowerCase() === "clear") {
               pendingImages = [];
@@ -1065,7 +1067,7 @@ async function runDashboard(
             continue;
           }
 
-          if (completedCommand === "whisper" || completedCommand === "voice") {
+          if (completedCommand === "whisper") {
             await runVoiceCapture(ui, context);
             ui.setStatus("Bereit", false);
             continue;
@@ -1099,8 +1101,7 @@ async function runDashboard(
           }
 
           if (
-            (completedCommand === "compress" ||
-              completedCommand === "compressor") &&
+            completedCommand === "compress" &&
             commandArgs.length === 1 &&
             commandArgs[0]?.toLowerCase() === "model"
           ) {
@@ -1128,8 +1129,7 @@ async function runDashboard(
           }
 
           if (
-            (completedCommand === "think" ||
-              completedCommand === "reasoning") &&
+            completedCommand === "think" &&
             commandArgs.length === 0
           ) {
             if (!currentModelInfo) {
@@ -1178,7 +1178,7 @@ async function runDashboard(
           }
 
           if (
-            isApprovalCommand(completedCommand) &&
+            completedCommand === "allow" &&
             commandArgs.length === 0
           ) {
             const selected = await ui.pickChoice(
@@ -1209,13 +1209,13 @@ async function runDashboard(
                 ui.addMessage(
                   "system",
                   `✓ Approval geändert: ${previous} → ${mode}\n${approvalDescription(mode)}`,
-                  "/approval",
+                  "/allow",
                 );
               } else {
                 ui.addMessage(
                   "system",
                   "Approval-Modus blieb unverändert.",
-                  "/approval",
+                  "/allow",
                 );
               }
             }
@@ -1224,7 +1224,7 @@ async function runDashboard(
           }
 
           if (
-            isChatCommand(completedCommand) &&
+            completedCommand === "chat" &&
             commandArgs.length === 0
           ) {
             const switched = await pickDashboardChat(ui, context, false);
@@ -1261,7 +1261,7 @@ async function runDashboard(
           }
 
           if (
-            isApprovalCommand(completedCommand) &&
+            completedCommand === "allow" &&
             commandArgs[0]?.toLowerCase() === "allow-all"
           ) {
             const { accepted } = await ui.confirmAction(
@@ -1275,13 +1275,13 @@ async function runDashboard(
               ui.addMessage(
                 "system",
                 "Approval-Modus: allow-all. Änderungen und Shell-Befehle laufen ohne Rückfrage.",
-                "/approval",
+                "/allow",
               );
             } else {
               ui.addMessage(
                 "system",
                 "Approval-Modus blieb unverändert.",
-                "/approval",
+                "/allow",
               );
             }
             ui.setStatus("Bereit", false);
@@ -1301,12 +1301,11 @@ async function runDashboard(
             ui.addMessage(
               captured.level === "error" ? "error" : "system",
               captured.output,
-              trimmed.split(/\s+/)[0],
+              completedCommandLabel,
             );
           }
           if (
             completedCommand === "balance" ||
-            completedCommand === "credits" ||
             completedCommand === "reconnect"
           ) {
             balance = await context.openRouter.checkBalance();
@@ -1480,14 +1479,6 @@ async function runDashboard(
     ui.stop();
   }
   console.log("Bis bald.");
-}
-
-function isApprovalCommand(command: string): boolean {
-  return ["approval", "allow", "approvals", "permissions"].includes(command);
-}
-
-function isChatCommand(command: string): boolean {
-  return ["chat", "chats", "switch"].includes(command);
 }
 
 function approvalChoiceLabel(mode: ApprovalMode): string {
@@ -1718,15 +1709,41 @@ export function homeWorkspaceWarning(
   return resolve(workspace) === resolve(home) ? HOME_WORKSPACE_WARNING : null;
 }
 
-function printBanner(workspace: string, model: string): void {
-  console.log(chalk.bold.cyan("\norcode 0.3"));
-  console.log(`${chalk.dim("Workspace")} ${workspace}`);
-  console.log(`${chalk.dim("Main")}      ${model}`);
+function cliBannerParts(
+  workspace: string,
+  model: string,
+  version: string = readPackageVersion(),
+): { headline: string; workspace: string; model: string } {
+  return {
+    headline: `orcode ${version}`,
+    workspace,
+    model,
+  };
 }
 
-function printUsage(): void {
-  console.log(`
-orcode – lokaler Coding-Agent über OpenRouter
+export function renderCliBanner(
+  workspace: string,
+  model: string,
+  version: string = readPackageVersion(),
+): string {
+  const parts = cliBannerParts(workspace, model, version);
+  return [
+    parts.headline,
+    `Workspace ${parts.workspace}`,
+    `Main      ${parts.model}`,
+  ].join("\n");
+}
+
+function printBanner(workspace: string, model: string): void {
+  const parts = cliBannerParts(workspace, model);
+  console.log(chalk.bold.cyan(`\n${parts.headline}`));
+  console.log(`${chalk.dim("Workspace")} ${parts.workspace}`);
+  console.log(`${chalk.dim("Main")}      ${parts.model}`);
+}
+
+export function renderCliHelp(version: string = readPackageVersion()): string {
+  return `
+orcode ${version} – lokaler Coding-Agent über OpenRouter
 
 Verwendung:
   orcode [optionen] -p "aufgabe"
@@ -1757,10 +1774,24 @@ Optionen:
 Exit-Codes: 0 erfolgreich · 1 Laufzeitfehler · 2 Bedienfehler ·
 3 unverifiziert · 124 Schritt-/Kostenlimit erreicht.
 
-Der API-Key wird ausschließlich über OPENROUTER_API_KEY oder die verdeckte
-Eingabe beim Start angenommen und nach erfolgreicher Prüfung sicher im
-System-Schlüsselbund gespeichert. Ein --key-Argument gibt es absichtlich nicht.
-`);
+Shell-Ausführung:
+  macOS/Linux: /bin/sh -c ohne Login-Shell.
+  Windows: powershell.exe -NoProfile -NonInteractive -Command.
+  ORCODE_SHELL gewinnt; ROUTERCODE_SHELL wird nur ohne ORCODE_SHELL zur Kompatibilität verwendet.
+
+Bildauswahl:
+  Der native /image-Picker ist macOS-spezifisch. Unter Windows und Linux wird
+  ein Bild mit /image <pfad> angehängt.
+
+Ein Schlüssel aus OPENROUTER_API_KEY bleibt zunächst nur im Prozess; /key save
+speichert ihn nach erfolgreicher Prüfung. Verdeckte interaktive Eingaben werden
+validiert und sicher im System-Schlüsselbund gespeichert. Ein --key-Argument
+gibt es absichtlich nicht.
+`;
+}
+
+function printUsage(): void {
+  console.log(renderCliHelp());
 }
 
 /** K8: reads the whole of stdin as the prompt for `--json` when it is a pipe, not a TTY. */
@@ -1889,7 +1920,11 @@ function formatBalanceSummary(balance: BalanceInfo, spentSinceStart: number): st
 }
 
 function commandName(raw: string): string {
-  return raw.slice(1).trim().split(/\s+/)[0]?.toLowerCase() ?? "";
+  return raw.trimStart().replace(/^\//, "").split(/\s+/)[0]?.toLowerCase() ?? "";
+}
+
+export function resolveCliCommandName(raw: string): string {
+  return resolveSlashCommand(raw)?.handlerId ?? commandName(raw);
 }
 
 function commandArguments(raw: string): string[] {

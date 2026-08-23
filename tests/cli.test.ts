@@ -12,8 +12,13 @@ import {
   homeWorkspaceWarning,
   initializeDashboardKey,
   parseArgs,
+  readPackageVersion,
+  renderCliBanner,
+  renderCliHelp,
+  resolveCliCommandName,
   runOutcomeExitCode,
 } from "../src/cli.js";
+import { COMMAND_CATALOG } from "../src/command-catalog.js";
 import { DEFAULT_CONFIG } from "../src/config.js";
 import { OpenRouterService } from "../src/openrouter.js";
 import type { CredentialStoreLike } from "../src/credentials.js";
@@ -37,6 +42,41 @@ test("parseArgs accepts -p and known flags", () => {
   assert.equal(options.prompt, "fix the bug");
   assert.equal(options.model, "gpt-5");
   assert.equal(options.json, false);
+});
+
+test("banner, help, and version derive from the same package metadata", () => {
+  const version = readPackageVersion();
+  assert.equal(version, "0.4.1");
+  assert.match(renderCliBanner("/tmp/workspace", "provider/model"), new RegExp(`orcode ${version}`));
+  assert.match(renderCliHelp(), new RegExp(`orcode ${version}`));
+  const source = readFileSync(new URL("../src/cli.ts", import.meta.url), "utf8");
+  assert.doesNotMatch(source, /orcode 0\.3/);
+});
+
+test("CLI help states only the implemented Windows and override shell contract", () => {
+  const help = renderCliHelp();
+  assert.match(help, /Windows.*powershell\.exe.*-NoProfile.*-NonInteractive.*-Command/is);
+  assert.match(help, /ORCODE_SHELL/);
+  assert.match(help, /ROUTERCODE_SHELL.*Kompatibilit/i);
+  assert.doesNotMatch(help, /Windows.*\/bin\/sh/is);
+});
+
+test("dashboard pre-dispatch uses exact catalog aliases and preserves unknown tokens", () => {
+  for (const command of COMMAND_CATALOG) {
+    assert.equal(resolveCliCommandName(`/${command.name}`), command.handlerId);
+    for (const alias of "aliases" in command ? command.aliases : []) {
+      assert.equal(resolveCliCommandName(`/${alias} fixture`), command.handlerId, alias);
+    }
+  }
+  assert.equal(resolveCliCommandName("  /ApPrOvAl allow-all"), "allow");
+  assert.equal(resolveCliCommandName("/permissions allow-all"), "allow");
+  assert.equal(resolveCliCommandName("/compressor MODEL"), "compress");
+  assert.equal(resolveCliCommandName('/attach "/tmp/image with spaces.png"'), "image");
+  assert.equal(resolveCliCommandName("/?"), "help");
+  assert.equal(resolveCliCommandName("/q"), "quit");
+  assert.equal(resolveCliCommandName("/"), "");
+  assert.equal(resolveCliCommandName("/att clear"), "att");
+  assert.equal(resolveCliCommandName("/UNKNOWN"), "unknown");
 });
 
 const STARTUP_KEY_PREFIX = `${["sk", "or", "v1"].join("-")}-`;
