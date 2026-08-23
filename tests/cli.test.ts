@@ -1,7 +1,9 @@
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import test from "node:test";
+import { fileURLToPath } from "node:url";
 import {
   CliUsageError,
   homeWorkspaceWarning,
@@ -87,6 +89,37 @@ test("runOutcomeExitCode maps the documented five codes (K8)", () => {
   // Forward-compatible with A4's future "unverified" outcome (exit 3) even
   // though `AgentRunOutcome` does not carry that member yet.
   assert.equal(runOutcomeExitCode("unverified" as never), 3);
+});
+
+test("tracked TypeScript source contains no embedded NUL bytes", () => {
+  const repository = fileURLToPath(new URL("..", import.meta.url));
+  const tracked = execFileSync(
+    "git",
+    ["ls-files", "-z", "--", "*.ts", "*.tsx", "*.mts", "*.cts"],
+    { cwd: repository },
+  )
+    .toString("utf8")
+    .split("\0")
+    .filter(Boolean);
+  assert.ok(tracked.length > 0, "the tracked TypeScript set must not be empty");
+
+  const violations: string[] = [];
+  for (const relativePath of tracked) {
+    const source = readFileSync(join(repository, relativePath));
+    for (
+      let offset = source.indexOf(0);
+      offset !== -1;
+      offset = source.indexOf(0, offset + 1)
+    ) {
+      violations.push(`${relativePath}:${offset}`);
+    }
+  }
+
+  assert.deepEqual(
+    violations,
+    [],
+    `embedded NUL bytes found at ${violations.join(", ")}`,
+  );
 });
 
 test("the visible-turn count is one value, not three", () => {

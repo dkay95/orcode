@@ -500,6 +500,23 @@ export function modelCapabilities(model: ModelInfo): ModelCapabilities {
   };
 }
 
+/** Complete capability contract for the tool-using main agent role. */
+export function isMainModelCandidate(model: ModelInfo): boolean {
+  if (model.id === "openrouter/auto") {
+    return true;
+  }
+  return (
+    model.supportedParameters.includes("tools") &&
+    model.inputModalities.includes("text") &&
+    model.outputModalities.includes("text")
+  );
+}
+
+/** Compressor calls only require a model that can produce text. */
+export function isCompressorModelCandidate(model: ModelInfo): boolean {
+  return model.outputModalities.includes("text");
+}
+
 export function filterModels(
   models: readonly ModelInfo[],
   query: ModelQuery = {},

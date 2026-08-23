@@ -1382,7 +1382,11 @@ function sameRedactedProjection(left: unknown, right: unknown): boolean {
 }
 
 function turnKey(turn: ChatTurn): string {
-  return `${turn.createdAt} ${turn.role} ${redactText(turn.content)}`;
+  return JSON.stringify([
+    turn.createdAt,
+    turn.role,
+    redactText(turn.content),
+  ]);
 }
 
 function mergeTurns(
