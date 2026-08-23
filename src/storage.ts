@@ -660,7 +660,7 @@ export async function migrateStorageHome(
 
   const sourceSize = await treeSize(activeSource);
   const managedBackupSize = await optionalTreeSize(join(newHome, "migration-backups"));
-  const configBackupSize = await pendingConfigBackupSize(newHome);
+  const configBackupSize = await pendingConfigBackupSize(newHome, options.normalizeConfig);
   const postMigrationBackupSize = sourceSize + managedBackupSize + configBackupSize;
   if (postMigrationBackupSize > maxBackupBytes) {
     return {
@@ -1011,7 +1011,14 @@ async function stageConfig(
   if (!(await pathExists(source))) return;
   const raw = await readFile(source, "utf8");
   const value = parseRecord(raw);
-  if (currentExists && value.schemaVersion === STORAGE_SCHEMA_VERSION) return;
+  const originalVersion = value.schemaVersion;
+  value.schemaVersion = STORAGE_SCHEMA_VERSION;
+  const normalized = normalizeConfig ? normalizeConfig(value) : value;
+  if (
+    currentExists
+    && originalVersion === STORAGE_SCHEMA_VERSION
+    && JSON.stringify(normalized) === JSON.stringify(value)
+  ) return;
   if (currentExists) {
     const checksum = createHash("sha256").update(raw).digest("hex");
     const backup = join(
@@ -1021,8 +1028,6 @@ async function stageConfig(
     );
     await stageText(manifest, newHome, backup, raw, store);
   }
-  value.schemaVersion = STORAGE_SCHEMA_VERSION;
-  const normalized = normalizeConfig ? normalizeConfig(value) : value;
   await stageText(manifest, newHome, destination, `${JSON.stringify(normalized, null, 2)}\n`, store);
 }
 
@@ -1107,7 +1112,21 @@ async function migrateCurrentConfig(
   if (typeof version === "number" && version > STORAGE_SCHEMA_VERSION) {
     return { status: "future", appHome, warning: `Konfiguration hat die zukünftige schemaVersion ${version}; sie wurde nicht überschrieben.` };
   }
-  if (version === STORAGE_SCHEMA_VERSION) return { status: "ready", appHome, warning: null };
+  value.schemaVersion = STORAGE_SCHEMA_VERSION;
+  let normalized: Record<string, unknown>;
+  try {
+    normalized = normalizeConfig ? normalizeConfig(value) : value;
+  } catch (error) {
+    return {
+      status: "recovery-required",
+      appHome,
+      warning: `Config-Migration wurde vor dem Schreiben abgelehnt: ${errorText(error)}`,
+    };
+  }
+  if (
+    version === STORAGE_SCHEMA_VERSION
+    && JSON.stringify(normalized) === JSON.stringify(value)
+  ) return { status: "ready", appHome, warning: null };
   const checksum = createHash("sha256").update(raw).digest("hex");
   const backup = join(appHome, "migration-backups", `config-v0-${checksum.slice(0, 16)}.json`);
   const managedBackupSize = await optionalTreeSize(join(appHome, "migration-backups"));
@@ -1120,8 +1139,6 @@ async function migrateCurrentConfig(
     return { status: "declined", appHome, warning: "Config-Migration abgebrochen: PrivateStore ist nicht verfügbar." };
   }
   if (!(await pathExists(backup))) await store.writeTextAtomic(backup, raw);
-  value.schemaVersion = STORAGE_SCHEMA_VERSION;
-  const normalized = normalizeConfig ? normalizeConfig(value) : value;
   await store.writeTextAtomic(path, `${JSON.stringify(normalized, null, 2)}\n`);
   return { status: "ready", appHome, warning: null };
 }
@@ -1536,12 +1553,21 @@ async function optionalTreeSize(root: string): Promise<number> {
   }
 }
 
-async function pendingConfigBackupSize(appHome: string): Promise<number> {
+async function pendingConfigBackupSize(
+  appHome: string,
+  normalizeConfig: AppHomeMigrationOptions["normalizeConfig"],
+): Promise<number> {
   const path = join(appHome, "config.json");
   try {
     const raw = await readFile(path, "utf8");
     const value = parseRecord(raw);
-    if (value.schemaVersion === STORAGE_SCHEMA_VERSION) return 0;
+    const originalVersion = value.schemaVersion;
+    value.schemaVersion = STORAGE_SCHEMA_VERSION;
+    const normalized = normalizeConfig ? normalizeConfig(value) : value;
+    if (
+      originalVersion === STORAGE_SCHEMA_VERSION
+      && JSON.stringify(normalized) === JSON.stringify(value)
+    ) return 0;
     const checksum = createHash("sha256").update(raw).digest("hex");
     const backup = join(appHome, "migration-backups", `config-v0-${checksum.slice(0, 16)}.json`);
     return await pathExists(backup) ? 0 : Buffer.byteLength(raw);

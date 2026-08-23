@@ -33,6 +33,7 @@ import {
   migrateLegacyOpenRouterState,
   requirePersistableProviderState,
   validateProviderSetupState,
+  type ProviderStateIssue,
   type ProviderSetupState,
 } from "./provider-state.js";
 
@@ -359,13 +360,21 @@ export async function migrateAppHome(
   legacyHome: string = LEGACY_APP_HOME,
   options: AppHomeMigrationOptions & ConfigLoadDependencies = {},
 ): Promise<AppHomeMigrationResult> {
+  const providerPreflight = await preflightProviderMigration(newHome, legacyHome);
+  if (providerPreflight !== null) {
+    return providerPreflight;
+  }
   const { randomUUID: createConnectionId = randomUUID, ...storageOptions } = options;
-  const result = await migrateStorageHome(newHome, legacyHome, {
+  let legacyConnectionId: string | null = null;
+  return migrateStorageHome(newHome, legacyHome, {
     ...storageOptions,
     normalizeConfig: (value) => {
-      const providerSetup = "providerSetup" in value
+      const hasProviderSetup = "providerSetup" in value;
+      const providerSetup = hasProviderSetup
         ? validateProviderSetupState(value.providerSetup)
-        : migrateLegacyOpenRouterState(value, { connectionId: createConnectionId() });
+        : migrateLegacyOpenRouterState(value, {
+          connectionId: legacyConnectionId ??= createConnectionId(),
+        });
       requirePersistableProviderState(providerSetup);
       return validateConfig({
         ...DEFAULT_CONFIG,
@@ -374,10 +383,6 @@ export async function migrateAppHome(
       } as ConfigInput) as unknown as Record<string, unknown>;
     },
   });
-  if (result.status === "ready" && result.appHome === newHome) {
-    await persistMissingProviderSetup(newHome, createConnectionId);
-  }
-  return result;
 }
 
 export function validateConfig(value: ConfigInput): OrcodeConfigWithBudget {
@@ -709,26 +714,49 @@ function normalizeProviderSetupInput(value: unknown): ProviderSetupState {
   return validateProviderSetupState(value);
 }
 
-async function persistMissingProviderSetup(
-  appHome: string,
-  createConnectionId: () => string,
-): Promise<void> {
-  const path = configPath(appHome);
+async function preflightProviderMigration(
+  newHome: string,
+  legacyHome: string,
+): Promise<AppHomeMigrationResult | null> {
+  const target = await readProviderPreflight(configPath(newHome));
+  const authoritative = target.kind === "absent"
+    ? await readProviderPreflight(configPath(legacyHome))
+    : target;
+  if (authoritative.kind !== "issue") {
+    return null;
+  }
+  return {
+    status: authoritative.issue.kind === "future-version" ? "future" : "recovery-required",
+    appHome: target.kind === "absent" ? legacyHome : newHome,
+    warning: `Provider-Setup-Migration abgelehnt: providerSetup ist ${authoritative.issue.kind}; es wurde nichts geschrieben.`,
+  };
+}
+
+type ProviderPreflight =
+  | { kind: "absent" }
+  | { kind: "clear" }
+  | { kind: "issue"; issue: ProviderStateIssue };
+
+async function readProviderPreflight(path: string): Promise<ProviderPreflight> {
+  let raw: string;
+  try {
+    raw = await readFile(path, "utf8");
+  } catch (error) {
+    return hasCode(error, "ENOENT") ? { kind: "absent" } : { kind: "clear" };
+  }
   let parsed: unknown;
   try {
-    parsed = JSON.parse(await readFile(path, "utf8"));
+    parsed = JSON.parse(raw);
   } catch {
-    return;
+    return { kind: "clear" };
   }
-  if (!isRecord(parsed) || "providerSetup" in parsed) {
-    return;
+  if (!isRecord(parsed) || !("providerSetup" in parsed)) {
+    return { kind: "clear" };
   }
-  const outcome = await loadConfigDetailed(path, { randomUUID: createConnectionId });
-  if (outcome.source !== "file" || outcome.warning !== null) {
-    return;
-  }
-  requirePersistableProviderState(outcome.config.providerSetup);
-  await saveConfig(outcome.config, path);
+  const providerSetup = validateProviderSetupState(parsed.providerSetup);
+  return isProviderStateIssue(providerSetup)
+    ? { kind: "issue", issue: providerSetup }
+    : { kind: "clear" };
 }
 
 /**

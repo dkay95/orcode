@@ -679,6 +679,80 @@ test("an unavailable exact-private boundary aborts before migration writes and k
   assert.equal(await exists(join(legacy, "config.json")), true);
 });
 
+test("current-home v0 future provider state preflights before any migration write", async () => {
+  const root = await mkdtemp(join(tmpdir(), "orcode-provider-preflight-v0-future-"));
+  const legacy = join(root, ".routercode");
+  const target = join(root, ".orcode");
+  await mkdir(target, { recursive: true });
+  await writeFile(join(target, "config.json"), JSON.stringify({
+    schemaVersion: 0,
+    mainModel: "vendor/main",
+    providerSetup: { schemaVersion: 99, opaque: "future-bytes" },
+  }));
+  const before = await snapshotFileTree(target);
+
+  const result = await migrateAppHome(target, legacy).catch(() => null);
+
+  assert.deepEqual(await snapshotFileTree(target), before);
+  assert.equal(result?.status, "future");
+});
+
+test("current-home v0 corrupt provider state preflights before any migration write", async () => {
+  const root = await mkdtemp(join(tmpdir(), "orcode-provider-preflight-v0-corrupt-"));
+  const legacy = join(root, ".routercode");
+  const target = join(root, ".orcode");
+  await mkdir(target, { recursive: true });
+  await writeFile(join(target, "config.json"), JSON.stringify({
+    schemaVersion: 0,
+    mainModel: "vendor/main",
+    providerSetup: { schemaVersion: 1, connections: "wrong" },
+  }));
+  const before = await snapshotFileTree(target);
+
+  const result = await migrateAppHome(target, legacy).catch(() => null);
+
+  assert.deepEqual(await snapshotFileTree(target), before);
+  assert.equal(result?.status, "recovery-required");
+});
+
+test("legacy-home future provider state preflights before target artifacts exist", async () => {
+  const root = await mkdtemp(join(tmpdir(), "orcode-provider-preflight-legacy-future-"));
+  const legacy = join(root, ".routercode");
+  const target = join(root, ".orcode");
+  await seedHome(legacy);
+  await writeFile(join(legacy, "config.json"), JSON.stringify({
+    mainModel: "vendor/main",
+    providerSetup: { schemaVersion: 99, opaque: "future-bytes" },
+  }));
+  const before = await snapshotFileTree(legacy);
+
+  const result = await migrateAppHome(target, legacy).catch(() => null);
+
+  assert.equal(await exists(target), false);
+  assert.deepEqual(await snapshotFileTree(legacy), before);
+  assert.equal(result?.status, "future");
+  assert.equal(result?.appHome, legacy);
+});
+
+test("legacy-home corrupt provider state preflights before target artifacts exist", async () => {
+  const root = await mkdtemp(join(tmpdir(), "orcode-provider-preflight-legacy-corrupt-"));
+  const legacy = join(root, ".routercode");
+  const target = join(root, ".orcode");
+  await seedHome(legacy);
+  await writeFile(join(legacy, "config.json"), JSON.stringify({
+    mainModel: "vendor/main",
+    providerSetup: { schemaVersion: 1, connections: "wrong" },
+  }));
+  const before = await snapshotFileTree(legacy);
+
+  const result = await migrateAppHome(target, legacy).catch(() => null);
+
+  assert.equal(await exists(target), false);
+  assert.deepEqual(await snapshotFileTree(legacy), before);
+  assert.equal(result?.status, "recovery-required");
+  assert.equal(result?.appHome, legacy);
+});
+
 test("new-only unversioned config is validated and atomically upgraded with one private backup", async () => {
   const root = await mkdtemp(join(tmpdir(), "orcode-migration-config-"));
   const legacy = join(root, ".routercode");
@@ -705,15 +779,48 @@ test("new-only unversioned config is validated and atomically upgraded with one 
   assert.equal(await readFile(join(target, "migration-backups", backups[0]!), "utf8"), original);
 });
 
+test("v0 config with valid nested provider state still normalizes legacy top-level fields", async () => {
+  const root = await mkdtemp(join(tmpdir(), "orcode-v0-valid-provider-normalize-"));
+  const legacy = join(root, ".routercode");
+  const target = join(root, ".orcode");
+  await mkdir(target, { recursive: true });
+  await writeFile(join(target, "config.json"), JSON.stringify({
+    schemaVersion: 0,
+    mainModel: "vendor/main",
+    approvalMode: "unsafe",
+    maxSteps: 0,
+    providerSetup: {
+      schemaVersion: 1,
+      revision: 0,
+      lifecycle: "never-configured",
+      connections: [],
+      defaultRoute: null,
+      cross: { enabled: false, preferredLead: null, preferredChallenger: null },
+    },
+  }));
+
+  await migrateAppHome(target, legacy);
+  const stored = JSON.parse(await readFile(join(target, "config.json"), "utf8")) as {
+    approvalMode: string;
+    maxSteps: number;
+    providerSetup: { lifecycle: string };
+  };
+
+  assert.equal(stored.approvalMode, "ask");
+  assert.equal(stored.maxSteps, 12);
+  assert.equal(stored.providerSetup.lifecycle, "never-configured");
+});
+
 test("a current top-level config persists source-aware provider migration once", async () => {
   const root = await mkdtemp(join(tmpdir(), "orcode-current-provider-config-"));
   const legacy = join(root, ".routercode");
   const target = join(root, ".orcode");
   await mkdir(target, { recursive: true });
-  await writeFile(join(target, "config.json"), JSON.stringify({
+  const original = JSON.stringify({
     schemaVersion: 1,
     mainModel: "vendor/current/model",
-  }));
+  });
+  await writeFile(join(target, "config.json"), original);
   let uuidCalls = 0;
   const options = {
     randomUUID: () => {
@@ -725,6 +832,9 @@ test("a current top-level config persists source-aware provider migration once",
   const first = await migrateAppHome(target, legacy, options);
   const firstBytes = await readFile(join(target, "config.json"), "utf8");
   const second = await migrateAppHome(target, legacy, options);
+  const backupDirectory = join(target, "migration-backups");
+  assert.equal(await exists(backupDirectory), true);
+  const backups = await readdir(backupDirectory);
   const stored = JSON.parse(firstBytes) as {
     providerSetup: { lifecycle: string; connections: Array<{ id: string }> };
   };
@@ -734,6 +844,8 @@ test("a current top-level config persists source-aware provider migration once",
   assert.equal(stored.providerSetup.lifecycle, "migrated");
   assert.equal(stored.providerSetup.connections[0]?.id, "current-provider-1");
   assert.equal(uuidCalls, 1);
+  assert.equal(backups.length, 1);
+  assert.equal(await readFile(join(backupDirectory, backups[0]!), "utf8"), original);
   assert.equal(await readFile(join(target, "config.json"), "utf8"), firstBytes);
 });
 

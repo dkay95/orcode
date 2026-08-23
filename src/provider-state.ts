@@ -182,6 +182,15 @@ export function validateProviderSetupState(value: unknown): ProviderSetupState {
   ) {
     return { kind: "corrupt" };
   }
+  const connections = value.connections as unknown as ProviderConnectionStateV1[];
+  const routes = [
+    value.defaultRoute,
+    value.cross.preferredLead,
+    value.cross.preferredChallenger,
+  ].filter((route): route is RouteIdentityV1 => route !== null);
+  if (!routes.every((route) => routeMatchesConnection(route, connections))) {
+    return { kind: "corrupt" };
+  }
   return structuredClone(value) as unknown as ProviderSetupStateV1;
 }
 
@@ -240,7 +249,7 @@ function isLifecycle(value: unknown): value is ProviderSetupStateV1["lifecycle"]
 }
 
 function isProviderConnectionStateV1(value: unknown): value is ProviderConnectionStateV1 {
-  return isRecord(value)
+  if (!(isRecord(value)
     && nonEmptyString(value.id)
     && isBackendId(value.backendId)
     && typeof value.enabled === "boolean"
@@ -249,7 +258,50 @@ function isProviderConnectionStateV1(value: unknown): value is ProviderConnectio
     && nonEmptyString(value.accountFingerprint)
     && (value.accountFingerprintState === "provisional" || value.accountFingerprintState === "verified")
     && isBillingRealm(value.billingRealm)
-    && (value.lastHealth === null || isProviderHealth(value.lastHealth));
+    && (value.lastHealth === null || isProviderHealth(value.lastHealth)))) {
+    return false;
+  }
+  if (!matchesBackendContract(value as unknown as ProviderConnectionStateV1)) {
+    return false;
+  }
+  if (value.accountFingerprintState === "provisional") {
+    return value.backendId === "openrouter"
+      && value.enabled === true
+      && value.maturity === "stable"
+      && value.credentialSlot === "legacy:inference"
+      && value.accountFingerprint === `acct_legacy_${value.id}`
+      && value.billingRealm === "openrouter-payg"
+      && value.lastHealth === null;
+  }
+  return true;
+}
+
+function matchesBackendContract(connection: ProviderConnectionStateV1): boolean {
+  if (connection.backendId === "openrouter") {
+    return connection.maturity === "stable"
+      && connection.billingRealm === "openrouter-payg";
+  }
+  if (connection.backendId === "codex") {
+    return connection.maturity === "preview"
+      && (
+        connection.billingRealm === "chatgpt-subscription-provider-managed-overage"
+        || connection.billingRealm === "chatgpt-account-provider-managed-limits"
+      );
+  }
+  return false;
+}
+
+function routeMatchesConnection(
+  route: RouteIdentityV1,
+  connections: readonly ProviderConnectionStateV1[],
+): boolean {
+  const connection = connections.find((candidate) =>
+    candidate.backendId === route.backendId
+    && candidate.accountFingerprint === route.accountFingerprint
+    && candidate.billingRealm === route.billingRealm
+  );
+  return connection !== undefined
+    && !(route.resolutionState === "resolved" && connection.accountFingerprintState === "provisional");
 }
 
 function isNullableRoute(value: unknown): value is RouteIdentityV1 | null {

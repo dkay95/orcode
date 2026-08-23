@@ -83,6 +83,82 @@ test("validation accepts the exact current schema and rejects malformed nested m
   );
 });
 
+test("provider state rejects Anthropic connections while the backend is coming-soon in Slice 1", () => {
+  const state = createNeverConfiguredProviderState();
+  state.lifecycle = "configured";
+  state.connections = [{
+    ...legacyConnectionFixture(),
+    backendId: "anthropic",
+  }];
+
+  assert.deepEqual(validateProviderSetupState(state), { kind: "corrupt" });
+});
+
+test("provider state rejects backend-specific maturity mismatches", () => {
+  const state = createNeverConfiguredProviderState();
+  state.lifecycle = "configured";
+  state.connections = [{
+    ...legacyConnectionFixture(),
+    maturity: "preview",
+    credentialSlot: "openrouter:verified",
+    accountFingerprint: "acct_verified_openrouter",
+    accountFingerprintState: "verified",
+  }];
+
+  assert.deepEqual(validateProviderSetupState(state), { kind: "corrupt" });
+});
+
+test("provider state rejects backend-specific billing realm mismatches", () => {
+  const state = createNeverConfiguredProviderState();
+  state.lifecycle = "configured";
+  state.connections = [{
+    ...legacyConnectionFixture(),
+    credentialSlot: "openrouter:verified",
+    accountFingerprint: "acct_verified_openrouter",
+    accountFingerprintState: "verified",
+    billingRealm: "none",
+  }];
+
+  assert.deepEqual(validateProviderSetupState(state), { kind: "corrupt" });
+});
+
+test("provisional fingerprints are valid only for the exact migrated OpenRouter legacy slot", () => {
+  const state = migrateLegacyOpenRouterState(
+    { mainModel: "vendor/main" },
+    { connectionId: "legacy-exact-id" },
+  );
+  state.connections[0]!.credentialSlot = "openrouter:v1-candidate";
+
+  assert.deepEqual(validateProviderSetupState(state), { kind: "corrupt" });
+});
+
+test("provider routes must match one persisted connection identity tuple", () => {
+  const state = migrateLegacyOpenRouterState(
+    { mainModel: "vendor/main" },
+    { connectionId: "legacy-route-id" },
+  );
+  state.defaultRoute = {
+    ...state.defaultRoute!,
+    accountFingerprint: "acct_unmatched",
+  };
+
+  assert.deepEqual(validateProviderSetupState(state), { kind: "corrupt" });
+});
+
+test("resolved routes cannot be backed by a provisional account identity", () => {
+  const state = migrateLegacyOpenRouterState(
+    { mainModel: "vendor/main" },
+    { connectionId: "legacy-provisional-id" },
+  );
+  state.defaultRoute = {
+    ...state.defaultRoute!,
+    canonicalModelId: "vendor/main",
+    resolutionState: "resolved",
+  };
+
+  assert.deepEqual(validateProviderSetupState(state), { kind: "corrupt" });
+});
+
 test("future and corrupt provider state remain distinct and cannot be saved over", async () => {
   const root = await mkdtemp(join(tmpdir(), "orcode-provider-state-refusal-"));
   const path = join(root, "config.json");
