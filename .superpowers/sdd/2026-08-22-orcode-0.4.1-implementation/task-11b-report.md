@@ -58,3 +58,47 @@
 - Command catalog, runtime help/banner, generated README, and workflows are
   owned by the adjacent Task 11a/Task 12 slices and are intentionally outside
   this commit.
+
+## Review Fix R1 — recover partial alias creation
+
+The package review found one transactional gap after the original commit: if
+`orcode` was created successfully and creating `routercode` then failed, the
+first new link remained even though installation reported failure.
+
+### RED
+
+- An injected second-`symlink` failure left the newly created `orcode` alias in
+  the fake filesystem instead of restoring the pre-call state.
+- A timing fixture replaced that just-created link with an unrelated regular
+  file before failure. The old implementation surfaced only the original
+  error, with no indication that safe rollback was impossible.
+
+### Fix
+
+- Alias creation is now a transaction over only the missing aliases from the
+  completed all-target preflight. Newly created links are recorded with their
+  post-create file identity and removed in reverse order on failure.
+- Rollback rechecks link type, exact resolved target, and captured file identity
+  before `unlink`. A missing link is already restored; a replaced/foreign path
+  is never removed. Any rollback error is combined with the original install
+  error so the unsafe partial state cannot be hidden.
+- Pre-existing correct aliases are never added to the rollback set. Success
+  messages are emitted only after every required alias has been created.
+- `mkdir` and executable `chmod` are intentionally not rolled back. The bin
+  directory may have gained concurrent user content, making directory removal
+  unsafe, while `dist/cli.js` is the installer-owned executable and mode `0755`
+  is its required steady state. The binding invariant is exact restoration of
+  the two alias paths.
+
+### GREEN
+
+- Focused rollback matrix: 2/2 passed, covering exact restoration,
+  pre-existing-link preservation, unrelated-path preservation, and explicit
+  unsafe-rollback reporting.
+- Complete CLI-entrypoint/installer suite: 12/12 passed; production and test
+  TypeScript checks and installer syntax check exited 0.
+- A real-filesystem injected second-alias failure removed the first new link,
+  left both alias paths absent as before the call, and removed its temporary
+  home afterward.
+- The fresh 148-file tarball check and both installed npm bin shims remained
+  green; `git diff --check` remained clean.

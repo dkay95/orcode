@@ -18,6 +18,7 @@ interface InstallerFileSystem {
   mkdir(path: string, options: { recursive: boolean; mode: number }): Promise<void>;
   chmod(path: string, mode: number): Promise<void>;
   symlink(target: string, path: string): Promise<void>;
+  unlink(path: string): Promise<void>;
 }
 
 interface InstallerModule {
@@ -37,7 +38,13 @@ interface PackageCheckModule {
 
 type FakePath = { kind: "file" } | { kind: "symlink"; target: string };
 
-function installerFileSystem(initial: Map<string, FakePath>): {
+function installerFileSystem(
+  initial: Map<string, FakePath>,
+  options: {
+    failSymlinkPaths?: ReadonlySet<string>;
+    onSymlink?(target: string, path: string, paths: Map<string, FakePath>): void;
+  } = {},
+): {
   fileSystem: InstallerFileSystem;
   paths: Map<string, FakePath>;
   events: string[];
@@ -76,10 +83,19 @@ function installerFileSystem(initial: Map<string, FakePath>): {
       async symlink(target, path) {
         events.push(`symlink:${path}`);
         mutations.push(`symlink:${path}`);
+        options.onSymlink?.(target, path, paths);
+        if (options.failSymlinkPaths?.has(path)) {
+          throw Object.assign(new Error(`synthetic symlink failure: ${path}`), { code: "EIO" });
+        }
         if (paths.has(path)) {
           throw Object.assign(new Error("EEXIST"), { code: "EEXIST" });
         }
         paths.set(path, { kind: "symlink", target });
+      },
+      async unlink(path) {
+        events.push(`unlink:${path}`);
+        mutations.push(`unlink:${path}`);
+        if (!paths.delete(path)) throw missing();
       },
     },
   };
@@ -257,6 +273,85 @@ test("a conflict on either alias prevents every installer mutation", async () =>
     /kein Symlink|nichts überschrieben/i,
   );
   assert.deepEqual(fake.mutations, []);
+});
+
+test("a second alias creation failure restores the exact pre-call alias state", async () => {
+  const projectRoot = resolve(PROJECT_ROOT, ".installer-project");
+  const homeDirectory = resolve(PROJECT_ROOT, ".installer-home");
+  const target = join(projectRoot, "dist", "cli.js");
+  const binDirectory = join(homeDirectory, ".local", "bin");
+  const orcodeLink = join(binDirectory, "orcode");
+  const routercodeLink = join(binDirectory, "routercode");
+  const fake = installerFileSystem(
+    new Map([[target, { kind: "file" }]]),
+    { failSymlinkPaths: new Set([routercodeLink]) },
+  );
+  const { installUserAliases } = await loadInstaller();
+
+  await assert.rejects(
+    installUserAliases({
+      projectRoot,
+      homeDirectory,
+      fileSystem: fake.fileSystem,
+      log: () => {},
+    }),
+    /synthetic symlink failure/,
+  );
+  assert.equal(fake.paths.has(orcodeLink), false);
+  assert.equal(fake.paths.has(routercodeLink), false);
+  assert.ok(fake.mutations.includes(`unlink:${orcodeLink}`));
+});
+
+test("rollback keeps pre-existing aliases and surfaces an unsafe replacement", async () => {
+  const projectRoot = resolve(PROJECT_ROOT, ".installer-project");
+  const homeDirectory = resolve(PROJECT_ROOT, ".installer-home");
+  const target = join(projectRoot, "dist", "cli.js");
+  const binDirectory = join(homeDirectory, ".local", "bin");
+  const orcodeLink = join(binDirectory, "orcode");
+  const routercodeLink = join(binDirectory, "routercode");
+  const { installUserAliases } = await loadInstaller();
+
+  const preExisting = installerFileSystem(
+    new Map([
+      [target, { kind: "file" }],
+      [orcodeLink, { kind: "symlink", target }],
+    ]),
+    { failSymlinkPaths: new Set([routercodeLink]) },
+  );
+  await assert.rejects(
+    installUserAliases({
+      projectRoot,
+      homeDirectory,
+      fileSystem: preExisting.fileSystem,
+      log: () => {},
+    }),
+    /synthetic symlink failure/,
+  );
+  assert.deepEqual(preExisting.paths.get(orcodeLink), { kind: "symlink", target });
+  assert.equal(preExisting.mutations.some((event) => event === `unlink:${orcodeLink}`), false);
+
+  const replaced = installerFileSystem(
+    new Map([[target, { kind: "file" }]]),
+    {
+      onSymlink(_target, path, paths) {
+        if (path === routercodeLink) {
+          paths.set(orcodeLink, { kind: "file" });
+          throw Object.assign(new Error("synthetic second alias failure"), { code: "EIO" });
+        }
+      },
+    },
+  );
+  await assert.rejects(
+    installUserAliases({
+      projectRoot,
+      homeDirectory,
+      fileSystem: replaced.fileSystem,
+      log: () => {},
+    }),
+    /Rückrollen|unsicher|rollback/i,
+  );
+  assert.deepEqual(replaced.paths.get(orcodeLink), { kind: "file" });
+  assert.equal(replaced.mutations.some((event) => event === `unlink:${orcodeLink}`), false);
 });
 
 test("the package checker derives an exact public allowlist and rejects drift", async () => {
