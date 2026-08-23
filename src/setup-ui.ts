@@ -53,7 +53,6 @@ export async function runSetupHub(options: SetupHubOptions): Promise<SetupHubRes
   let pendingEnvironment = savedSecret ? null : nonEmpty(options.environmentSecret);
   let savedAvailable = savedSecret !== null;
   let environmentOffered = false;
-  let lastCompatibleModels: readonly BackendModelDescriptor[] = [];
 
   while (true) {
     if (pendingEnvironment) {
@@ -64,10 +63,9 @@ export async function runSetupHub(options: SetupHubOptions): Promise<SetupHubRes
         "process-only",
         false,
         options,
-        (models) => { lastCompatibleModels = models; },
       );
-      if (outcome === "ready") return completeCrossSetup(surface, stateStore, lastCompatibleModels);
-      if (outcome === "cancelled") return { kind: "cancelled", mode: "setup-required" };
+      if (outcome.kind === "ready") return completeCrossSetup(surface, stateStore, outcome);
+      if (outcome.kind === "cancelled") return { kind: "cancelled", mode: "setup-required" };
       continue;
     }
 
@@ -78,9 +76,9 @@ export async function runSetupHub(options: SetupHubOptions): Promise<SetupHubRes
     if (selected === "openrouter:environment" && environmentOffered) {
       const environment = nonEmpty(options.environmentSecret);
       if (!environment) continue;
-      const outcome = await activateOpenRouter(environment, "process-only", false, options, (models) => { lastCompatibleModels = models; });
-      if (outcome === "ready") return completeCrossSetup(surface, stateStore, lastCompatibleModels);
-      if (outcome === "cancelled") return { kind: "cancelled", mode: "setup-required" };
+      const outcome = await activateOpenRouter(environment, "process-only", false, options);
+      if (outcome.kind === "ready") return completeCrossSetup(surface, stateStore, outcome);
+      if (outcome.kind === "cancelled") return { kind: "cancelled", mode: "setup-required" };
       continue;
     }
 
@@ -97,12 +95,12 @@ export async function runSetupHub(options: SetupHubOptions): Promise<SetupHubRes
     let candidate: string | null = null;
     let persistence: "persisted" | "process-only" = "persisted";
     let askPersistence = true;
-    if (descriptor.id === "openrouter" && savedAvailable) {
+    const usingSaved = descriptor.id === "openrouter" && savedAvailable;
+    if (usingSaved) {
       candidate = savedSecret;
       // A saved credential is already persistent; it remains authoritative
       // until its validation fails and is never silently replaced by env.
       askPersistence = false;
-      savedAvailable = false;
     } else {
       candidate = await surface.readSecret({
         backendId: descriptor.id,
@@ -111,20 +109,33 @@ export async function runSetupHub(options: SetupHubOptions): Promise<SetupHubRes
       if (candidate === null) return { kind: "cancelled", mode: "setup-required" };
     }
 
-    const outcome = await activateOpenRouter(candidate!, persistence, askPersistence, options, (models) => { lastCompatibleModels = models; });
-    if (outcome === "ready") return completeCrossSetup(surface, stateStore, lastCompatibleModels);
-    if (outcome === "cancelled") return { kind: "cancelled", mode: "setup-required" };
-    if (!askPersistence && nonEmpty(options.environmentSecret)) environmentOffered = true;
+    const outcome = await activateOpenRouter(candidate!, persistence, askPersistence, options);
+    if (outcome.kind === "ready") return completeCrossSetup(surface, stateStore, outcome);
+    if (outcome.kind === "cancelled") return { kind: "cancelled", mode: "setup-required" };
+    if (usingSaved && outcome.kind === "rejected") {
+      savedAvailable = false;
+      environmentOffered = nonEmpty(options.environmentSecret) !== null;
+    }
   }
 }
+
+type ActivationFlow =
+  | { kind: "retry" }
+  | { kind: "rejected" }
+  | { kind: "cancelled" }
+  | {
+    kind: "ready";
+    route: RouteIdentityV1;
+    state: ReturnType<ProviderStateStore["read"]> | null;
+    models: readonly BackendModelDescriptor[];
+  };
 
 async function activateOpenRouter(
   rawSecret: string,
   persistence: "persisted" | "process-only",
   askPersistence: boolean,
   options: SetupHubOptions,
-  onModels: (models: readonly BackendModelDescriptor[]) => void,
-): Promise<"retry" | "cancelled" | "ready"> {
+): Promise<ActivationFlow> {
   const { surface, registry, orchestrator, stateStore } = options;
   let candidateId: string | null = null;
   try {
@@ -139,29 +150,28 @@ async function activateOpenRouter(
       || candidate.health.connectivity !== "connected"
     ) {
       surface.present(notice("OpenRouter konnte den Zugangsschlüssel nicht bestätigen."));
-      return "retry";
+      return candidate.health.credential === "rejected" ? { kind: "rejected" } : { kind: "retry" };
     }
     const models = compatibleMainModels(await adapter.listModels({ candidateId, signal: controller.signal }));
     if (!models.length) {
       surface.present(notice("OpenRouter stellt keine kompatiblen Main-Modelle bereit."));
-      return "retry";
+      return { kind: "retry" };
     }
     const selectedCanonicalModelId = await surface.chooseModel({ backendId: "openrouter", models });
-    if (selectedCanonicalModelId === null) return "cancelled";
+    if (selectedCanonicalModelId === null) return { kind: "cancelled" };
     if (!models.some((model) => model.canonicalModelId === selectedCanonicalModelId)) {
       surface.present(notice("Die gewählte Modellroute ist nicht verfügbar."));
-      return "retry";
+      return { kind: "retry" };
     }
-    onModels(models);
     if (askPersistence) {
       const accepted = await surface.confirm({
         id: "save-openrouter-key",
         message: "OpenRouter-Schlüssel sicher speichern?",
         defaultValue: true,
       });
-      if (!accepted) return "cancelled";
+      if (!accepted) return { kind: "cancelled" };
     }
-    await orchestrator.activateCandidate({
+    const activation = await orchestrator.activateCandidate({
       expectedRevision: stateStore.read().revision,
       candidate: secret,
       selectedCanonicalModelId,
@@ -169,11 +179,11 @@ async function activateOpenRouter(
       persistence,
     });
     surface.present(notice("OpenRouter ist eingerichtet."));
-    return "ready";
+    return { kind: "ready", route: activation.route, state: activation.state, models };
   } catch {
     // This boundary must never reveal credential bytes or provider error text.
     surface.present(notice("OpenRouter konnte nicht eingerichtet werden. Bitte erneut versuchen."));
-    return "retry";
+    return { kind: "retry" };
   } finally {
     if (candidateId) {
       try {
@@ -189,7 +199,7 @@ async function activateOpenRouter(
 async function completeCrossSetup(
   surface: SetupSurface,
   stateStore: ProviderStateStore,
-  models: readonly BackendModelDescriptor[],
+  activation: Extract<ActivationFlow, { kind: "ready" }>,
 ): Promise<SetupHubResult> {
   const action = await surface.chooseHub([
     { id: "cross-later", label: "Later", description: "Collaboration remains off.", disabled: false, current: true, generation: stateStore.read().revision },
@@ -198,12 +208,12 @@ async function completeCrossSetup(
   if (action === null || action === "cross-later") return { kind: "ready" };
   if (action !== "cross-prepare") return { kind: "ready" };
 
-  const current = stateStore.read().defaultRoute;
-  const choices = models.filter((model) =>
-    current?.resolutionState === "resolved"
+  const current = activation.route;
+  const choices = activation.models.filter((model) =>
+    current.resolutionState === "resolved"
     && current.canonicalModelId !== model.canonicalModelId,
   );
-  if (!current || current.resolutionState !== "resolved" || !current.canonicalModelId || !choices.length) {
+  if (current.resolutionState !== "resolved" || !current.canonicalModelId || !choices.length) {
     surface.present(notice("Prepare roles benötigt zwei unterschiedliche vollständig aufgelöste Modelle."));
     return { kind: "ready" };
   }
@@ -211,6 +221,10 @@ async function completeCrossSetup(
   const challenger = choices.find((model) => model.canonicalModelId === chosen);
   if (!challenger || challenger.canonicalModelId === current.canonicalModelId) {
     surface.present(notice("Prepare roles benötigt zwei unterschiedliche vollständig aufgelöste Modelle."));
+    return { kind: "ready" };
+  }
+  if (activation.state === null) {
+    surface.present(notice("Rollen sind nur für diese Prozessroute vorbereitet. Cross bleibt ausgeschaltet."));
     return { kind: "ready" };
   }
   await stateStore.commit(stateStore.read().revision, (state) => ({
@@ -332,18 +346,24 @@ export interface TuiSetupPromptUi {
   ): Promise<{ id: string } | null>;
   confirmAction(title: string, details: string, rememberAvailable?: boolean): Promise<{ accepted: boolean }>;
   addMessage(role: "user" | "assistant" | "system" | "error", content: string, meta?: string): void;
+  setStatus(status: string, busy?: boolean): void;
 }
 
 /** The fullscreen UI supplies its existing picker and secret primitives. */
 export function createTuiSetupSurface(ui: TuiSetupPromptUi): SetupSurface {
   return {
     async chooseHub(entries) {
+      const current = entries.find((entry) => entry.current)?.id ?? "";
       const items = entries.map((entry) => ({
         value: entry.id,
-        label: entry.disabled ? `${entry.label} · Coming soon` : entry.label,
+        label: entry.disabled
+          ? `${entry.label} · Coming soon`
+          : entry.current
+            ? `${entry.label} · Aktuell r${entry.generation}`
+            : entry.label,
         description: entry.description,
       }));
-      return (await ui.pickChoice("Provider-Setup", items, "", items[0]?.value ?? ""))?.value ?? null;
+      return (await ui.pickChoice("Provider-Setup", items, current, current || (items[0]?.value ?? "")))?.value ?? null;
     },
     readSecret(request) {
       return ui.readSecret(request.message);
@@ -358,7 +378,7 @@ export function createTuiSetupSurface(ui: TuiSetupPromptUi): SetupSurface {
       return (await ui.confirmAction(request.message, "", false)).accepted;
     },
     present(event) {
-      if (event.type === "notice") ui.addMessage("system", event.message, "Provider-Setup");
+      if (event.type === "notice") ui.setStatus(event.message, false);
     },
   };
 }

@@ -165,6 +165,7 @@ test("setup TUI surface uses the existing picker, secret, model, and confirm pri
     async pickModel(search) { calls.push(`model:${search("")[0]?.id}`); return search("")[0] ?? null; },
     async confirmAction() { calls.push("confirm"); return { accepted: true }; },
     addMessage(_role, message) { calls.push(`notice:${message}`); },
+    setStatus(status) { calls.push(`status:${status}`); },
   };
   const surface = createTuiSetupSurface(promptUi);
 
@@ -173,7 +174,68 @@ test("setup TUI surface uses the existing picker, secret, model, and confirm pri
   assert.equal(await surface.chooseModel({ backendId: "openrouter", models: [{ backendId: "openrouter", requestedModelId: "vendor/a", canonicalModelId: "vendor/a", displayName: "A", capabilities: { textInput: true, textOutput: true, tools: true, reasoning: false } }] }), "vendor/a");
   assert.equal(await surface.confirm({ id: "save", message: "Save?", defaultValue: true }), true);
   surface.present({ version: 1, type: "notice", message: "Coming soon" });
-  assert.deepEqual(calls, ["choice:anthropic", "secret", "model:vendor/a", "confirm", "notice:Coming soon"]);
+  assert.deepEqual(calls, ["choice:anthropic", "secret", "model:vendor/a", "confirm", "status:Coming soon"]);
+});
+
+test("choice picker accepts keyboard and mouse selection through the same primitive", async () => {
+  async function select(method: "keyboard" | "mouse"): Promise<string | null> {
+    const stdin = new FakeInput();
+    const stdout = new FakeOutput();
+    const terminal = ui(stdin, stdout);
+    terminal.start();
+    try {
+      const picked = terminal.pickChoice("Provider", [
+        { value: "openrouter", label: "OpenRouter", description: "Ready" },
+        { value: "anthropic", label: "Anthropic · Coming soon", description: "Coming soon" },
+      ], "openrouter");
+      if (method === "keyboard") {
+        press(stdin, "down");
+        press(stdin, "return");
+      } else {
+        stdin.emit("mouse", { action: "click", button: "left", index: 1 });
+      }
+      return (await picked)?.value ?? null;
+    } finally {
+      terminal.stop();
+    }
+  }
+
+  assert.equal(await select("keyboard"), "anthropic");
+  assert.equal(await select("mouse"), "anthropic");
+});
+
+test("setup TUI retry shows one latest current revision card at narrow and wide widths and replaces status", async () => {
+  for (const columns of [58, 120]) {
+    const stdin = new FakeInput();
+    const stdout = new FakeOutput();
+    stdout.columns = columns;
+    const terminal = ui(stdin, stdout);
+    const surface = createTuiSetupSurface(terminal);
+    terminal.start();
+    try {
+      const initial = surface.chooseHub([
+        { id: "openrouter", label: "OpenRouter", description: "Nicht verbunden", disabled: false, current: true, generation: 6 },
+        { id: "anthropic", label: "Anthropic", description: "Coming soon", disabled: true, current: false, generation: 6 },
+      ]);
+      press(stdin, "escape");
+      await initial;
+      surface.present({ version: 1, type: "notice", message: "Alter Fehler" });
+      const choice = surface.chooseHub([
+        { id: "openrouter", label: "OpenRouter", description: "Verbunden", disabled: false, current: true, generation: 7 },
+        { id: "anthropic", label: "Anthropic", description: "Coming soon", disabled: true, current: false, generation: 7 },
+      ]);
+      surface.present({ version: 1, type: "notice", message: "Erfolgreich erneut verbunden" });
+      const screen = terminal.frame().lines.map(plainText).join("\n");
+      press(stdin, "escape");
+      await choice;
+      assert.equal((screen.match(/Aktuell r7/g) ?? []).length, 1, `width ${columns}\n${screen}`);
+      assert.match(screen, /Anthropic · Coming soon/);
+      assert.match(screen, /Erfolgreich erneut verbunden/);
+      assert.doesNotMatch(screen, /Alter Fehler/);
+    } finally {
+      terminal.stop();
+    }
+  }
 });
 
 test("frame fills the screen and keeps chrome, divider and input in place", () => {

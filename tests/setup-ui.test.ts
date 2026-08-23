@@ -59,6 +59,8 @@ class ScriptedSurface implements SetupSurface {
   readonly entries: SetupHubEntry[][] = [];
   readonly events: Array<SetupEvent | { version: 1; type: "notice"; message: string }> = [];
   readonly calls: string[] = [];
+  activePrompts = 0;
+  maxActivePrompts = 0;
 
   constructor(
     private readonly hub: Array<string | null>,
@@ -70,26 +72,37 @@ class ScriptedSurface implements SetupSurface {
   async chooseHub(entries: readonly SetupHubEntry[]): Promise<string | null> {
     this.calls.push("hub");
     this.entries.push([...entries]);
-    return this.hub.shift() ?? null;
+    return this.prompt(this.hub.shift() ?? null);
   }
 
   async readSecret(): Promise<string | null> {
     this.calls.push("secret");
-    return this.secrets.shift() ?? null;
+    return this.prompt(this.secrets.shift() ?? null);
   }
 
   async chooseModel(): Promise<string | null> {
     this.calls.push("model");
-    return this.models.shift() ?? null;
+    return this.prompt(this.models.shift() ?? null);
   }
 
   async confirm(): Promise<boolean> {
     this.calls.push("confirm");
-    return this.confirms.shift() ?? false;
+    return this.prompt(this.confirms.shift() ?? false);
   }
 
   present(event: SetupEvent | { version: 1; type: "notice"; message: string }): void {
     this.events.push(structuredClone(event));
+  }
+
+  private async prompt<T>(result: T): Promise<T> {
+    this.activePrompts += 1;
+    this.maxActivePrompts = Math.max(this.maxActivePrompts, this.activePrompts);
+    try {
+      await Promise.resolve();
+      return result;
+    } finally {
+      this.activePrompts -= 1;
+    }
   }
 }
 
@@ -98,6 +111,7 @@ class Adapter implements BackendAdapter {
   readonly calls: string[] = [];
   readonly connected: string[] = [];
   readonly rejected = new Set<string>();
+  readonly offline = new Set<string>();
   models: readonly BackendModelDescriptor[] = [MODEL];
 
   async inspect(): Promise<ProviderInspection> { throw new Error("not used"); }
@@ -115,6 +129,8 @@ class Adapter implements BackendAdapter {
       billingRealm: "openrouter-payg",
       health: this.rejected.has(String(request.candidate))
         ? { credential: "rejected", connectivity: "connected", spend: "available", runtime: "ready", observedAt: 1, generation: 1 }
+        : this.offline.has(String(request.candidate))
+          ? { credential: "valid", connectivity: "offline", spend: "available", runtime: "ready", observedAt: 1, generation: 1 }
         : { credential: "valid", connectivity: "connected", spend: "available", runtime: "ready", observedAt: 1, generation: 1 },
     };
   }
@@ -125,7 +141,7 @@ class Adapter implements BackendAdapter {
   async activate(): Promise<CandidateProviderState> { throw new Error("not used"); }
 }
 
-function fixture(surface: SetupSurface) {
+function fixture(surface: SetupSurface, options: { processOnlyNullState?: boolean } = {}) {
   const adapter = new Adapter();
   const stateStore = new ProviderStateStore(createNeverConfiguredProviderState());
   const registry = new BackendRegistry([{ descriptor: OPENROUTER, adapter }, { descriptor: ANTHROPIC }]);
@@ -137,6 +153,9 @@ function fixture(surface: SetupSurface) {
         version: 1 as const, backendId: "openrouter" as const, accountFingerprint: "acct", billingRealm: "openrouter-payg" as const,
         requestedModelId: request.selectedCanonicalModelId, canonicalModelId: request.selectedCanonicalModelId, resolutionState: "resolved" as const,
       };
+      if (options.processOnlyNullState && request.persistence === "process-only") {
+        return { persisted: false, warnings: [], state: null, route };
+      }
       const previous = stateStore.read();
       const state = stateStore.replace({
         ...previous,
@@ -174,6 +193,16 @@ test("hub connects OpenRouter in secret, model, and explicit persistence order",
   assert.equal(context.activations[0]?.selectedCanonicalModelId, MODEL.canonicalModelId);
 });
 
+test("hub keeps exactly one setup prompt active at a time", async () => {
+  const surface = new ScriptedSurface(["openrouter", "cross-later"], ["sk-or-v1-test-key"], [MODEL.canonicalModelId], [true]);
+  const context = fixture(surface);
+
+  const result = await runSetupHub({ ...context, surface });
+
+  assert.deepEqual(result, { kind: "ready" });
+  assert.equal(surface.maxActivePrompts, 1);
+});
+
 test("coming-soon provider explains itself without adapter or activation effects", async () => {
   const surface = new ScriptedSurface(["anthropic", null]);
   const context = fixture(surface);
@@ -184,6 +213,44 @@ test("coming-soon provider explains itself without adapter or activation effects
   assert.deepEqual(context.adapter.calls, []);
   assert.equal(context.activations.length, 0);
   assert.match(surface.events.map((event) => "message" in event ? event.message : "").join("\n"), /coming soon/i);
+});
+
+test("a non-connectable provider cannot replace an existing default route", async () => {
+  const surface = new ScriptedSurface(["anthropic", null]);
+  const context = fixture(surface);
+  const previous = context.stateStore.read();
+  const existing = {
+    version: 1 as const,
+    backendId: "openrouter" as const,
+    accountFingerprint: "acct",
+    billingRealm: "openrouter-payg" as const,
+    requestedModelId: "existing/default",
+    canonicalModelId: "existing/default",
+    resolutionState: "resolved" as const,
+  };
+  context.stateStore.replace({
+    ...previous,
+    lifecycle: "configured",
+    connections: [{
+      id: "connection",
+      backendId: "openrouter",
+      enabled: true,
+      maturity: "stable",
+      credentialSlot: "inference:connection",
+      accountFingerprint: "acct",
+      accountFingerprintState: "verified",
+      billingRealm: "openrouter-payg",
+      lastHealth: null,
+    }],
+    defaultRoute: existing,
+  }, previous.revision);
+
+  const result = await runSetupHub({ ...context, surface });
+
+  assert.deepEqual(result, { kind: "cancelled", mode: "setup-required" });
+  assert.deepEqual(context.stateStore.read().defaultRoute, existing);
+  assert.deepEqual(context.adapter.calls, []);
+  assert.equal(context.activations.length, 0);
 });
 
 test("cancel before activation leaves setup required and does not connect", async () => {
@@ -234,6 +301,32 @@ test("cancelling persistence returns setup-required without a second hub prompt"
   assert.equal(context.activations.length, 0);
 });
 
+test("cancelling the explicit model choice leaves setup required without an activation", async () => {
+  const surface = new ScriptedSurface(["openrouter"], ["sk-or-v1-test-key"], [null]);
+  const context = fixture(surface);
+
+  const result = await runSetupHub({ ...context, surface });
+
+  assert.deepEqual(result, { kind: "cancelled", mode: "setup-required" });
+  assert.deepEqual(surface.calls, ["hub", "secret", "model"]);
+  assert.deepEqual(context.adapter.calls, ["connect", "models", "discard"]);
+  assert.equal(context.activations.length, 0);
+  assert.equal(context.stateStore.read().defaultRoute, null);
+});
+
+test("Escape after activation is exactly Later and keeps the committed route with Cross off", async () => {
+  const surface = new ScriptedSurface(["openrouter", null], ["sk-or-v1-test-key"], [MODEL.canonicalModelId], [true]);
+  const context = fixture(surface);
+
+  const result = await runSetupHub({ ...context, surface });
+  const state = context.stateStore.read();
+
+  assert.deepEqual(result, { kind: "ready" });
+  assert.equal(state.lifecycle, "configured");
+  assert.equal(state.defaultRoute?.canonicalModelId, MODEL.canonicalModelId);
+  assert.equal(state.cross.enabled, false);
+});
+
 test("prepare roles stores distinct resolved models while Cross remains off and starts no collaboration", async () => {
   const surface = new ScriptedSurface(
     ["openrouter", "cross-prepare"],
@@ -254,6 +347,27 @@ test("prepare roles stores distinct resolved models while Cross remains off and 
   assert.deepEqual(context.adapter.calls, ["connect", "models", "discard"]);
 });
 
+test("prepare roles rejects a second realm that resolves to the current canonical model", async () => {
+  const surface = new ScriptedSurface(
+    ["openrouter", "cross-prepare"],
+    ["sk-or-v1-test-key"],
+    [MODEL.canonicalModelId],
+    [true],
+  );
+  const context = fixture(surface);
+  context.adapter.models = [{ ...MODEL, requestedModelId: "alias/gpt-5", displayName: "GPT-5 alias" }];
+
+  const result = await runSetupHub({ ...context, surface });
+  const state = context.stateStore.read();
+
+  assert.deepEqual(result, { kind: "ready" });
+  assert.deepEqual(surface.calls, ["hub", "secret", "model", "confirm", "hub"]);
+  assert.equal(state.cross.enabled, false);
+  assert.equal(state.cross.preferredLead, null);
+  assert.equal(state.cross.preferredChallenger, null);
+  assert.match(surface.events.map((event) => "message" in event ? event.message : "").join("\n"), /unterschiedliche vollständig aufgelöste Modelle/i);
+});
+
 test("invalid secret bytes never reach an adapter or presentation event", async () => {
   const secret = `invalid\0${"x".repeat(20)}`;
   const surface = new ScriptedSurface(["openrouter", null], [secret]);
@@ -263,4 +377,45 @@ test("invalid secret bytes never reach an adapter or presentation event", async 
 
   assert.deepEqual(context.adapter.calls, []);
   assert.equal(JSON.stringify(surface.events).includes(secret), false);
+});
+
+test("a process-only activation with null durable state keeps Later ready without inventing persistence", async () => {
+  const surface = new ScriptedSurface(["cross-later"], [], [MODEL.canonicalModelId]);
+  const context = fixture(surface, { processOnlyNullState: true });
+
+  const result = await runSetupHub({ ...context, surface, environmentSecret: "sk-or-v1-environment" });
+
+  assert.deepEqual(result, { kind: "ready" });
+  assert.equal(context.stateStore.read().defaultRoute, null);
+  assert.equal(context.activations[0]?.persistence, "process-only");
+});
+
+test("process-only role preparation sees the transient route but leaves durable state untouched", async () => {
+  const surface = new ScriptedSurface(
+    ["cross-prepare"],
+    [],
+    [MODEL.canonicalModelId, CHALLENGER.canonicalModelId],
+  );
+  const context = fixture(surface, { processOnlyNullState: true });
+  context.adapter.models = [MODEL, CHALLENGER];
+
+  const result = await runSetupHub({ ...context, surface, environmentSecret: "sk-or-v1-environment" });
+
+  assert.deepEqual(result, { kind: "ready" });
+  assert.deepEqual(surface.calls, ["model", "hub", "model"]);
+  assert.equal(context.stateStore.read().defaultRoute, null);
+});
+
+test("offline saved credential stays authoritative and never exposes environment fallback", async () => {
+  const saved = "sk-or-v1-saved";
+  const environment = "sk-or-v1-environment";
+  const surface = new ScriptedSurface(["openrouter", null]);
+  const context = fixture(surface);
+  context.adapter.offline.add(saved);
+
+  const result = await runSetupHub({ ...context, surface, savedSecret: saved, environmentSecret: environment });
+
+  assert.deepEqual(result, { kind: "cancelled", mode: "setup-required" });
+  assert.deepEqual(context.adapter.connected, [saved]);
+  assert.equal(surface.entries[1]?.some((entry) => entry.id === "openrouter:environment"), false);
 });

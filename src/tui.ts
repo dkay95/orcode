@@ -78,6 +78,13 @@ export interface ChoicePickerItem {
   description: string;
 }
 
+/** Normalized by the terminal input bridge before it reaches a picker. */
+export interface PickerMouseEvent {
+  action: "click";
+  button: "left";
+  index: number;
+}
+
 export class UiExitError extends Error {
   constructor() {
     super("orcode wurde beendet.");
@@ -753,6 +760,7 @@ export class TerminalUi {
     this.#pasting = false;
     this.#pasteBuffer = "";
     this.stdin.on("keypress", this.#onKeypress);
+    this.stdin.on("mouse", this.#onMouse);
     process.on("SIGWINCH", this.#onResize);
     for (const [signal, handler] of this.#signalHandlers) process.on(signal, handler);
     process.on("exit", this.#onProcessExit);
@@ -1071,6 +1079,7 @@ export class TerminalUi {
       this.#renderTimer = null;
     }
     this.stdin.off("keypress", this.#onKeypress);
+    this.stdin.off("mouse", this.#onMouse);
     process.off("SIGWINCH", this.#onResize);
     for (const [signal, handler] of this.#signalHandlers) process.off(signal, handler);
     process.off("exit", this.#onProcessExit);
@@ -1292,6 +1301,19 @@ export class TerminalUi {
     }
     if (!this.#atToken()) this.#atClosed = false;
     this.scheduleRender(this.#inputChars[0] === "/");
+  };
+
+  #onMouse = (event: PickerMouseEvent): void => {
+    if (
+      (this.#mode !== "model-picker" && this.#mode !== "choice-picker")
+      || event.action !== "click"
+      || event.button !== "left"
+      || !Number.isSafeInteger(event.index)
+    ) return;
+    const items: Array<ModelInfo | ChoicePickerItem> = this.#mode === "model-picker"
+      ? this.#pickerModels
+      : this.#choiceItems;
+    this.#resolveSelection(items[event.index] ?? null);
   };
 
   #interrupt(): void {
