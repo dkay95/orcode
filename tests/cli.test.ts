@@ -8,6 +8,7 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 import {
   CliUsageError,
+  createCliPlainSetupSurface,
   createOpenRouterServiceForStartup,
   homeWorkspaceWarning,
   initializeDashboardKey,
@@ -96,6 +97,67 @@ test("plain setup surface keeps secret input masked and maps cancelled prompts t
   assert.equal(await surface.readSecret({ backendId: "openrouter", message: "Key" }), null);
   assert.equal(await surface.confirm({ id: "save", message: "Save?", defaultValue: true }), true);
   assert.equal(calls[1]?.mask, "•");
+});
+
+test("CLI setup adapter never erases intervening foreign prompt output", () => {
+  const foreignOutput = "Inquirer: Modell ausgewählt";
+  const writes: string[] = [];
+  const stderr = process.stderr;
+  const originalWrite = stderr.write;
+  const surface = createCliPlainSetupSurface();
+
+  (stderr as unknown as { write(value: string): boolean }).write = (value: string) => {
+    writes.push(value);
+    return true;
+  };
+  try {
+    surface.present({ version: 1, type: "notice", message: "Alter Setup-Fehler" });
+    writes.push(foreignOutput);
+    surface.present({
+      version: 1,
+      type: "provider-state",
+      entries: [
+        { id: "openrouter", label: "OpenRouter", description: "Connect provider", disabled: false, current: true, generation: 9 },
+        { id: "anthropic", label: "Anthropic", description: "Coming soon", disabled: true, current: false, generation: 9 },
+      ],
+    });
+
+  } finally {
+    (stderr as unknown as { write: typeof originalWrite }).write = originalWrite;
+  }
+
+  assert.deepEqual(writes, [foreignOutput]);
+  assert.doesNotMatch(writes.join(""), /\u001b\[1A|\u001b\[2K/);
+});
+
+test("plain setup status replaces the error in the next Cross prompt", async () => {
+  const promptMessages: string[] = [];
+  const surface = createPlainSetupSurface({
+    select: async (request: { message: string }) => {
+      promptMessages.push(request.message);
+      return "cross-later";
+    },
+    password: async () => "",
+    confirm: async () => false,
+    setStatus: () => undefined,
+  } as never);
+
+  surface.present({ version: 1, type: "notice", message: "Alter Setup-Fehler" });
+  surface.present({
+    version: 1,
+    type: "provider-state",
+    entries: [
+      { id: "openrouter", label: "OpenRouter", description: "Connect provider", disabled: false, current: true, generation: 9 },
+      { id: "anthropic", label: "Anthropic", description: "Coming soon", disabled: true, current: false, generation: 9 },
+    ],
+  });
+  assert.equal(await surface.chooseHub([
+    { id: "cross-later", label: "Later", description: "Keep collaboration off", disabled: false, current: true, generation: 9 },
+  ]), "cross-later");
+
+  assert.match(promptMessages[0] ?? "", /OpenRouter.*Aktuell r9/);
+  assert.match(promptMessages[0] ?? "", /Anthropic.*Coming soon/);
+  assert.doesNotMatch(promptMessages[0] ?? "", /Alter Setup-Fehler/);
 });
 
 function startupKeyResponse(status = 200): Response {

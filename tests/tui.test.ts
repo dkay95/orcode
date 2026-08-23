@@ -209,6 +209,97 @@ test("choice picker parses real SGR mouse bytes into the same Anthropic selectio
   assert.equal(await select("mouse"), "anthropic");
 });
 
+test("SGR mouse parsing accepts every split escape prefix without leaking into the picker", async () => {
+  for (const prefixLength of [1, 2, 3]) {
+    const stdin = new FakeInput();
+    const stdout = new FakeOutput();
+    const terminal = ui(stdin, stdout);
+    terminal.start();
+    let picked: Promise<{ value: string } | null> | null = null;
+    try {
+      picked = terminal.pickChoice("Provider", [
+        { value: "openrouter", label: "OpenRouter", description: "Ready" },
+        { value: "anthropic", label: "Anthropic · Coming soon", description: "Coming soon" },
+      ], "openrouter");
+      const row = terminal.frame().lines.findIndex((line) => plainText(line).includes("Anthropic")) + 1;
+      const packet = `\u001b[<0;1;${row}M`;
+      stdin.emit("data", Buffer.from(packet.slice(0, prefixLength)));
+      stdin.emit("data", Buffer.from(packet.slice(prefixLength)));
+
+      const selected = await Promise.race([
+        picked.then((item) => item?.value ?? null),
+        new Promise<null>((resolve) => setImmediate(() => resolve(null))),
+      ]);
+      assert.equal(selected, "anthropic", `split ${prefixLength}`);
+    } finally {
+      press(stdin, "escape");
+      await picked;
+      terminal.stop();
+    }
+  }
+});
+
+test("a malformed SGR prefix resets before the next ordinary input key", async () => {
+  const stdin = new FakeInput();
+  const stdout = new FakeOutput();
+  const terminal = ui(stdin, stdout);
+  terminal.start();
+  try {
+    const input = terminal.readInput();
+    stdin.emit("data", Buffer.from("\u001b[<x"));
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    type(stdin, "a");
+    press(stdin, "return");
+    assert.equal(await input, "a");
+  } finally {
+    terminal.stop();
+  }
+});
+
+test("mouse reporting belongs only to a pending picker and ends at settlement", async () => {
+  const enable = "\u001b[?1000h\u001b[?1006h";
+  const disable = "\u001b[?1000l\u001b[?1006l";
+  const stdin = new FakeInput();
+  const stdout = new FakeOutput();
+  const terminal = ui(stdin, stdout);
+  terminal.start();
+  try {
+    assert.doesNotMatch(stdout.output, /\u001b\[\?1000h\u001b\[\?1006h/);
+    const picker = terminal.pickChoice("Provider", [
+      { value: "openrouter", label: "OpenRouter", description: "Ready" },
+    ], "openrouter");
+    assert.equal(stdout.output.split(enable).length - 1, 1, stdout.output);
+    press(stdin, "return");
+    assert.equal((await picker)?.value, "openrouter");
+    assert.equal(stdout.output.split(disable).length - 1, 1, stdout.output);
+    assert.ok(stdout.output.lastIndexOf(disable) > stdout.output.lastIndexOf(enable), stdout.output);
+  } finally {
+    terminal.stop();
+  }
+});
+
+test("a pending picker re-enables SGR mouse only after suspend resumes it", async () => {
+  const enable = "\u001b[?1000h\u001b[?1006h";
+  const disable = "\u001b[?1000l\u001b[?1006l";
+  const stdin = new FakeInput();
+  const stdout = new FakeOutput();
+  const terminal = ui(stdin, stdout);
+  terminal.start();
+  try {
+    const picker = terminal.pickChoice("Provider", [
+      { value: "openrouter", label: "OpenRouter", description: "Ready" },
+    ], "openrouter");
+    await terminal.suspend(async () => undefined);
+    assert.equal(stdout.output.split(enable).length - 1, 2, stdout.output);
+    assert.equal(stdout.output.split(disable).length - 1, 1, stdout.output);
+    press(stdin, "escape");
+    assert.equal(await picker, null);
+    assert.equal(stdout.output.split(disable).length - 1, 2, stdout.output);
+  } finally {
+    terminal.stop();
+  }
+});
+
 test("mouse protocol rejects malformed, non-left, release, and out-of-range bytes without leaking into chat", async () => {
   const ignored = [
     "\u001b[<x;1;1M",
@@ -250,7 +341,7 @@ test("mouse protocol rejects malformed, non-left, release, and out-of-range byte
   }
 });
 
-test("mouse reporting is disabled and re-enabled across picker cancel, suspend, and terminal stop", async () => {
+test("mouse reporting stays disabled after picker cancel across suspend and terminal stop", async () => {
   const stdin = new FakeInput();
   const stdout = new FakeOutput();
   const terminal = ui(stdin, stdout);
@@ -268,8 +359,8 @@ test("mouse reporting is disabled and re-enabled across picker cancel, suspend, 
   }
   const enable = "\u001b[?1000h\u001b[?1006h";
   const disable = "\u001b[?1000l\u001b[?1006l";
-  assert.ok(stdout.output.split(enable).length - 1 >= 2, stdout.output);
-  assert.ok(stdout.output.split(disable).length - 1 >= 2, stdout.output);
+  assert.equal(stdout.output.split(enable).length - 1, 1, stdout.output);
+  assert.equal(stdout.output.split(disable).length - 1, 1, stdout.output);
   assert.ok(stdout.output.lastIndexOf(disable) > stdout.output.lastIndexOf(enable), stdout.output);
 });
 

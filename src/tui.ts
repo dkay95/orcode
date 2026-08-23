@@ -63,7 +63,7 @@ const SHOW_CURSOR = "\u001b[?25h";
 const HOME = "\u001b[H";
 const ERASE_LINE = "\u001b[K";
 const ERASE_BELOW = "\u001b[J";
-const LEAVE_TERMINAL = `${DISABLE_SGR_MOUSE}${DISABLE_BRACKETED_PASTE}${SHOW_CURSOR}${LEAVE_ALTERNATE_SCREEN}`;
+const LEAVE_TERMINAL = `${DISABLE_BRACKETED_PASTE}${SHOW_CURSOR}${LEAVE_ALTERNATE_SCREEN}`;
 const CSI_SEQUENCE = /(?:\u001b\[|\u009b)[0-?]*[ -/]*[@-~]/g;
 const OSC_SEQUENCE = /\u001b\][\s\S]*?(?:\u0007|\u001b\\|$)/g;
 const STRING_SEQUENCE = /\u001b[P^_X][\s\S]*?(?:\u001b\\|$)/g;
@@ -264,6 +264,7 @@ export class TerminalUi {
   #spinnerTimer: NodeJS.Timeout | null = null;
   #mouseProtocolBuffer = "";
   #ignoredMouseKeypresses: string[] = [];
+  #mouseReporting = false;
   readonly #signalHandlers = new Map<NodeJS.Signals, () => void>();
 
   constructor(
@@ -617,6 +618,7 @@ export class TerminalUi {
     this.#resetQuery();
     this.#refreshPicker();
     this.#enterMode("model-picker", oneLine(title) || "Modell auswählen");
+    this.#enableMouseReporting();
     return new Promise<ModelInfo | null>((resolve) => {
       this.#pickerResolve = resolve;
     });
@@ -635,6 +637,7 @@ export class TerminalUi {
     this.#resetQuery();
     this.#refreshChoices();
     this.#enterMode("choice-picker", `${oneLine(title)} auswählen`);
+    this.#enableMouseReporting();
     return new Promise<ChoicePickerItem | null>((resolve) => {
       this.#choiceResolve = resolve;
     });
@@ -766,10 +769,11 @@ export class TerminalUi {
     for (const [signal, handler] of this.#signalHandlers) process.on(signal, handler);
     process.on("exit", this.#onProcessExit);
     process.on("uncaughtExceptionMonitor", this.#onFatalError);
-    this.stdout.write(`${ENTER_ALTERNATE_SCREEN}${ENABLE_BRACKETED_PASTE}${ENABLE_SGR_MOUSE}${HOME}${ERASE_BELOW}`);
+    this.stdout.write(`${ENTER_ALTERNATE_SCREEN}${ENABLE_BRACKETED_PASTE}${HOME}${ERASE_BELOW}`);
     this.#forgetGeometry();
     if (this.#run?.running) this.#startSpinner();
     this.render(true);
+    if (this.#mode === "model-picker" || this.#mode === "choice-picker") this.#enableMouseReporting();
   }
 
   stop(): void {
@@ -1085,7 +1089,8 @@ export class TerminalUi {
     process.off("exit", this.#onProcessExit);
     process.off("uncaughtExceptionMonitor", this.#onFatalError);
     try {
-      this.stdout.write(`${DISABLE_SGR_MOUSE}${DISABLE_BRACKETED_PASTE}`);
+      this.#disableMouseReporting();
+      this.stdout.write(DISABLE_BRACKETED_PASTE);
       this.stdin.setRawMode(false);
     } catch {
       // The terminal may already be closed after a fatal signal.
@@ -1124,6 +1129,7 @@ export class TerminalUi {
     if (!this.#active) return;
     try {
       this.stdin.setRawMode(false);
+      if (this.#mouseReporting) this.stdout.write(DISABLE_SGR_MOUSE);
       this.stdout.write(LEAVE_TERMINAL);
     } catch {
       // Process exit must not be delayed by terminal cleanup failures.
@@ -1309,9 +1315,13 @@ export class TerminalUi {
     if (!this.#active) return;
     const text = typeof chunk === "string" ? chunk : chunk.toString("utf8");
     const sequence = `${this.#mouseProtocolBuffer}${text}`;
-    if (!sequence.startsWith("\u001b[<")) return;
+    if (!"\u001b[<".startsWith(sequence) && !sequence.startsWith("\u001b[<")) return;
 
     this.#rememberMouseKeypresses(text);
+    if ("\u001b[<".startsWith(sequence)) {
+      this.#mouseProtocolBuffer = sequence;
+      return;
+    }
     if (sequence.length > MAX_MOUSE_SEQUENCE_LENGTH) {
       this.#finishMouseSequence();
       return;
@@ -1343,23 +1353,45 @@ export class TerminalUi {
   }
 
   #rememberMouseKeypresses(text: string): void {
-    if (text.startsWith("\u001b[<")) {
-      this.#ignoredMouseKeypresses.push("\u001b[<", ...Array.from(text.slice(3)));
-      return;
-    }
     this.#ignoredMouseKeypresses.push(...Array.from(text));
   }
 
   #consumeMouseKeypress(character: string, key: Key): boolean {
-    const expected = this.#ignoredMouseKeypresses[0];
-    if (expected === undefined) return false;
+    const expected = this.#ignoredMouseKeypresses.join("");
+    if (!expected) return false;
     const actual = key.sequence || character || "";
-    if (actual === expected) {
-      this.#ignoredMouseKeypresses.shift();
+    if (!actual) {
+      this.#ignoredMouseKeypresses = [];
+      return false;
+    }
+    if (expected.startsWith(actual)) {
+      this.#ignoredMouseKeypresses.splice(0, Array.from(actual).length);
+      return true;
+    }
+    if (actual.startsWith(expected)) {
+      this.#ignoredMouseKeypresses = [];
+      return true;
+    }
+    if (expected.includes(actual)) {
+      this.#ignoredMouseKeypresses = [];
       return true;
     }
     this.#ignoredMouseKeypresses = [];
     return false;
+  }
+
+  #enableMouseReporting(): void {
+    if (!this.#active || this.#mouseReporting) return;
+    this.#clearMouseProtocol();
+    this.#mouseReporting = true;
+    this.stdout.write(ENABLE_SGR_MOUSE);
+  }
+
+  #disableMouseReporting(): void {
+    this.#clearMouseProtocol();
+    if (!this.#mouseReporting) return;
+    this.#mouseReporting = false;
+    this.stdout.write(DISABLE_SGR_MOUSE);
   }
 
   #selectMouseRow(column: number, row: number): void {
@@ -1637,6 +1669,7 @@ export class TerminalUi {
   }
 
   #resolveSelection(value: ModelInfo | ChoicePickerItem | null): void {
+    this.#disableMouseReporting();
     const pickerResolve = this.#pickerResolve;
     const choiceResolve = this.#choiceResolve;
     this.#pickerResolve = null;

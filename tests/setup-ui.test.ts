@@ -425,14 +425,13 @@ test("offline saved credential stays authoritative and never exposes environment
 });
 
 test("runSetupHub retry through the plain adapter replaces the error with one current revision", async () => {
-  const status: string[] = [];
+  const prompts: string[] = [];
   const selections = ["openrouter", "openrouter", MODEL.canonicalModelId, "cross-later"];
   const passwords = ["offline-key", "working-key"];
   const surface = createPlainSetupSurface({
-    async select() { return selections.shift()!; },
+    async select(request: { message: string }) { prompts.push(request.message); return selections.shift()!; },
     async password() { return passwords.shift()!; },
     async confirm() { return true; },
-    setStatus(message: string) { status.push(message); },
   } as never);
   const context = fixture(surface);
   context.adapter.offline.add("offline-key");
@@ -440,11 +439,11 @@ test("runSetupHub retry through the plain adapter replaces the error with one cu
   const result = await runSetupHub({ ...context, surface });
 
   assert.deepEqual(result, { kind: "ready" });
-  assert.match(status[0] ?? "", /nicht bestätigen/i);
-  assert.match(status.at(-1) ?? "", new RegExp(`OpenRouter.*Aktuell r${context.stateStore.read().revision}`));
-  assert.match(status.at(-1) ?? "", /Anthropic \/ Claude-Abo.*Coming soon/);
-  assert.doesNotMatch(status.at(-1) ?? "", /nicht bestätigen/i);
-  assert.equal((status.at(-1)?.match(/Aktuell r/g) ?? []).length, 1);
+  assert.match(prompts[1] ?? "", /nicht bestätigen/i);
+  assert.match(prompts.at(-1) ?? "", new RegExp(`OpenRouter.*Aktuell r${context.stateStore.read().revision}`));
+  assert.match(prompts.at(-1) ?? "", /Anthropic \/ Claude-Abo.*Coming soon/);
+  assert.doesNotMatch(prompts.at(-1) ?? "", /nicht bestätigen/i);
+  assert.equal((prompts.at(-1)?.match(/Aktuell r/g) ?? []).length, 1);
 });
 
 test("runSetupHub success through the TUI adapter presents one current provider card before Cross", async () => {

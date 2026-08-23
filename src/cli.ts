@@ -136,17 +136,11 @@ const execFileAsync = promisify(execFile);
 const VISIBLE_TURNS = 40;
 
 /** Binds the transport-neutral setup hub to the existing plain prompts. */
-export function createCliPlainSetupSurface() {
-  let renderedStatus = false;
+export function createCliPlainSetupSurface(prompts = { select, password, confirm }) {
   return createPlainSetupSurface({
-    select,
-    password,
-    confirm,
-    setStatus(status) {
-      if (process.stderr.isTTY && renderedStatus) process.stderr.write("\u001b[1A\r\u001b[2K");
-      process.stderr.write(`${status}\n`);
-      renderedStatus = true;
-    },
+    select: prompts.select,
+    password: prompts.password,
+    confirm: prompts.confirm,
   });
 }
 

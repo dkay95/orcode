@@ -359,15 +359,15 @@ export interface PlainSetupPromptIo {
   select(request: { message: string; choices: readonly { name: string; value: string }[] }): Promise<string>;
   password(request: { message: string; mask: string }): Promise<string>;
   confirm(request: { message: string; default: boolean }): Promise<boolean>;
-  setStatus(status: string): void;
 }
 
 /** The CLI supplies the existing Inquirer primitives; this module never does. */
 export function createPlainSetupSurface(io: PlainSetupPromptIo): SetupSurface {
+  let latestStatus = "";
   return {
     async chooseHub(entries) {
       return io.select({
-        message: "Provider auswählen",
+        message: promptMessage("Provider auswählen", latestStatus),
         choices: entries.map((entry) => ({ name: `${providerEntryLabel(entry)} · ${entry.description}`, value: entry.id })),
       }).catch(() => null);
     },
@@ -384,10 +384,14 @@ export function createPlainSetupSurface(io: PlainSetupPromptIo): SetupSurface {
       return io.confirm({ message: request.message, default: request.defaultValue }).catch(() => false);
     },
     present(event) {
-      if (event.type === "provider-state") io.setStatus(providerStateLabel(event.entries));
-      else if (event.type === "notice") io.setStatus(event.message);
+      if (event.type === "provider-state") latestStatus = providerStateLabel(event.entries);
+      else if (event.type === "notice") latestStatus = event.message;
     },
   };
+}
+
+function promptMessage(prompt: string, status: string): string {
+  return status ? `${status}\n${prompt}` : prompt;
 }
 
 export interface TuiSetupPromptUi {
