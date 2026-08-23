@@ -430,6 +430,13 @@ export class SetupOrchestrator {
         },
       );
     } catch {
+      if (options.signal?.aborted) {
+        await this.#handleLegacyCallerCancellation(
+          this.#stateStore.read(),
+          generation,
+          options.signal,
+        );
+      }
       if (generation !== this.#generation) {
         return this.#latestResult
           ?? this.#setupRequiredResult(this.#stateStore.read(), generation);

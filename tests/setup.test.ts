@@ -1440,6 +1440,87 @@ test("caller cancellation during durable legacy-route commit rejects exactly wit
   assert.equal(fixture.clock.activeTimers(), 0);
 });
 
+async function durableLegacyCommitRejectionFixture() {
+  const initial = migrateLegacyOpenRouterState(
+    { mainModel: "vendor/legacy-requested" },
+    { connectionId: "legacy-durable-rejection" },
+  );
+  let durable = structuredClone(initial);
+  let persistCalls = 0;
+  const legacyCommitStarted = deferred<void>();
+  const releaseLegacyCommit = deferred<void>();
+  const stateStore = new ProviderStateStore(initial, {
+    persist: async (request) => {
+      persistCalls += 1;
+      if (persistCalls === 2) {
+        legacyCommitStarted.resolve();
+        await releaseLegacyCommit.promise;
+        throw new Error("durable legacy route commit rejected");
+      }
+      const next = request.build(durable);
+      request.adopt(next);
+      durable = structuredClone(next);
+      return structuredClone(next);
+    },
+  });
+  const adapter = new FakeAdapter();
+  adapter.inspectionScripts = [(request) => inspected(initial.connections[0]!, request, {
+    accountFingerprint: "acct_verified_durable_rejection",
+  })];
+  adapter.models = [model("vendor/legacy-requested", "vendor/canonical")];
+  const fixture = await setupFixture({ state: initial, stateStore, adapter });
+  await fixture.orchestrator.inspectStartup();
+  fixture.events.splice(0);
+  return {
+    fixture,
+    stateStore,
+    legacyCommitStarted,
+    releaseLegacyCommit,
+    durable: () => structuredClone(durable),
+  };
+}
+
+test("caller cancellation dominates a rejected durable legacy-route commit", async () => {
+  const subject = await durableLegacyCommitRejectionFixture();
+  const controller = new AbortController();
+  const reason = new DOMException("exact-rejected-legacy-cancellation", "AbortError");
+
+  const resolving = subject.fixture.orchestrator.resolveLegacyDefaultRoute({
+    signal: controller.signal,
+  });
+  await subject.legacyCommitStarted.promise;
+  controller.abort(reason);
+  subject.releaseLegacyCommit.resolve();
+
+  await assert.rejects(resolving, (error: unknown) => error === reason);
+  assert.equal(subject.stateStore.read().lifecycle, "cancelled");
+  assert.equal(subject.durable().lifecycle, "cancelled");
+  assert.deepEqual(
+    subject.fixture.events.filter((event) =>
+      event.type === "route-choice-required" || event.type === "setup-required"
+    ),
+    [],
+  );
+  assert.equal(subject.fixture.clock.activeTimers(), 0);
+});
+
+test("durable legacy-route commit failure without cancellation requires route choice", async () => {
+  const subject = await durableLegacyCommitRejectionFixture();
+
+  const resolving = subject.fixture.orchestrator.resolveLegacyDefaultRoute();
+  await subject.legacyCommitStarted.promise;
+  subject.releaseLegacyCommit.resolve();
+  const result = await resolving;
+
+  assert.equal(result.mode, "route-choice-required");
+  assert.equal(subject.stateStore.read().lifecycle, "migrated");
+  assert.deepEqual(
+    subject.fixture.events.map((event) => event.type),
+    ["route-choice-required"],
+  );
+  assert.equal(subject.fixture.clock.activeTimers(), 0);
+});
+
 test("caller cancellation during durable inspection commit wins before events and result", async () => {
   const primary = connection();
   const initial = configuredState({ connections: [primary] });

@@ -393,6 +393,64 @@ test("durable provider state commit rejects a suppressed wrong-revision adoption
   assert.deepEqual(store.read(), initial);
 });
 
+test("durable provider state commit rejects a suppressed pre-build fence failure", async () => {
+  const initial = createNeverConfiguredProviderState();
+  let generationCurrent = false;
+  const store = new ProviderStateStore(initial, {
+    persist: async (request) => {
+      try {
+        request.assertCurrent();
+      } catch {
+        // Every failed open capability invocation must poison final settlement.
+      }
+      generationCurrent = true;
+      const built = request.build(initial);
+      request.adopt(built);
+      return structuredClone(built);
+    },
+  });
+
+  const outcome = await store.commit(
+    initial.revision,
+    (current) => ({ ...current, lifecycle: "cancelled" }),
+    () => {
+      if (!generationCurrent) throw new Error("provider generation is stale");
+    },
+  ).then(() => "resolved", () => "rejected");
+
+  assert.equal(outcome, "rejected");
+  assert.deepEqual(store.read(), initial);
+});
+
+test("durable provider state commit rejects a suppressed post-adoption fence failure without state change", async () => {
+  const initial = createNeverConfiguredProviderState();
+  let generationCurrent = true;
+  const store = new ProviderStateStore(initial, {
+    persist: async (request) => {
+      const built = request.build(initial);
+      request.adopt(built);
+      generationCurrent = false;
+      try {
+        request.assertCurrent();
+      } catch {
+        // A stale post-adoption fence must poison settlement even when suppressed.
+      }
+      return structuredClone(built);
+    },
+  });
+
+  const outcome = await store.commit(
+    initial.revision,
+    (current) => ({ ...current, lifecycle: "cancelled" }),
+    () => {
+      if (!generationCurrent) throw new Error("provider generation is stale");
+    },
+  ).then(() => "resolved", () => "rejected");
+
+  assert.equal(outcome, "rejected");
+  assert.deepEqual(store.read(), initial);
+});
+
 test("durable provider state capabilities are closed after successful settlement", async () => {
   const initial = createNeverConfiguredProviderState();
   let retained!: ProviderStateCommitRequest;

@@ -252,6 +252,7 @@ export class ProviderStateStore {
     assertCurrent: () => void = () => undefined,
   ): Promise<ProviderSetupStateV1> {
     this.#assertExpectedRevision(expectedRevision);
+    const stateBeforeCommit = this.read();
     let buildCalls = 0;
     let builtCandidate: ProviderSetupStateV1 | null = null;
     let adoptedCandidate: ProviderSetupStateV1 | null = null;
@@ -266,7 +267,12 @@ export class ProviderStateStore {
 
     const assertCurrentCapability = (): void => {
       assertCapabilityOpen();
-      assertCurrent();
+      try {
+        assertCurrent();
+      } catch (error) {
+        protocolInvalid = true;
+        throw error;
+      }
     };
 
     const buildCandidate = (current: ProviderSetupStateV1): ProviderSetupStateV1 => {
@@ -357,6 +363,15 @@ export class ProviderStateStore {
         throw new Error("Provider state durable commit readback is ambiguous.");
       }
       return this.read();
+    } catch (error) {
+      if (
+        protocolInvalid
+        && adoptedCandidate
+        && JSON.stringify(this.#state) === JSON.stringify(adoptedCandidate)
+      ) {
+        this.#state = structuredClone(stateBeforeCommit);
+      }
+      throw error;
     } finally {
       capabilitiesOpen = false;
     }
