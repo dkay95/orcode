@@ -308,9 +308,6 @@ async function main(): Promise<void> {
   if (configWarning) {
     console.log(chalk.yellow(configWarning));
   }
-  if (options.model) {
-    config.mainModel = options.model;
-  }
   if (options.approval) {
     if (!isApprovalMode(options.approval)) {
       throw new CliUsageError(`Ungültiger Approval-Modus: ${options.approval}`);
@@ -357,9 +354,11 @@ async function main(): Promise<void> {
   if (!options.model && session.data.reasoning) {
     setReasoningSetting(config, session.data.reasoning);
   }
-  session.setPreferences(
-    config.mainModel,
-    getReasoningSetting(config),
+  await applyStartupModelPreference(
+    openRouter,
+    options.model,
+    config,
+    session,
   );
   const agent = await OrcodeAgent.create({
     openRouter,
@@ -2345,14 +2344,39 @@ export interface ModelSnapshot {
   error?: unknown;
 }
 
+/**
+ * Applies an explicit `--model` only after the live catalogue has accepted it
+ * for the main-agent role. The dashboard can save session preferences before
+ * the first run (for example while opening the chat picker), so validation
+ * must precede both the in-memory config change and `setPreferences`.
+ */
+export async function applyStartupModelPreference(
+  openRouter: Pick<OpenRouterService, "listModels">,
+  requestedModel: string | undefined,
+  config: OrcodeConfigWithBudget,
+  session: Pick<SessionStore, "setPreferences">,
+): Promise<void> {
+  if (requestedModel !== undefined) {
+    await resolveMainModelCandidate(openRouter, requestedModel);
+    config.mainModel = requestedModel;
+  }
+  session.setPreferences(
+    config.mainModel,
+    getReasoningSetting(config),
+  );
+}
+
 export async function ensureRunnableModelConfiguration(
   openRouter: Pick<OpenRouterService, "listModels">,
   config: Pick<
     OrcodeConfigWithBudget,
-    "mainModel" | "compressorModel" | "compressionMode"
+    "mainModel" | "fallbackModels" | "compressorModel" | "compressionMode"
   >,
 ): Promise<{ main: ModelInfo | null; compressor: ModelInfo | null }> {
   const main = await resolveMainModelCandidate(openRouter, config.mainModel);
+  for (const modelId of config.fallbackModels) {
+    await resolveMainModelCandidate(openRouter, modelId);
+  }
   const compressor = config.compressionMode === "off"
     ? null
     : await resolveCompressorModelCandidate(

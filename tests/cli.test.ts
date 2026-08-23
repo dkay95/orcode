@@ -566,6 +566,113 @@ test("configured run gate rejects incompatible roles and preserves catalogue fai
   );
 });
 
+test("configured run gate validates every fallback as a main route", async () => {
+  const cli = await import("../src/cli.js");
+  const main = cliRoleModel({ id: "provider/main" });
+  const compatibleFallback = cliRoleModel({ id: "provider/fallback-good" });
+  const incompatibleFallback = cliRoleModel({
+    id: "provider/fallback-no-text",
+    outputModalities: ["image"],
+  });
+  const catalogue = new Map(
+    [main, compatibleFallback, incompatibleFallback].map((model) => [model.id, model]),
+  );
+  const calls: string[] = [];
+  const config = structuredClone(DEFAULT_CONFIG);
+  config.mainModel = main.id;
+  config.fallbackModels = [compatibleFallback.id, incompatibleFallback.id];
+  config.compressionMode = "off";
+
+  await assert.rejects(
+    cli.ensureRunnableModelConfiguration(
+      {
+        listModels: async (search: string) => {
+          calls.push(search);
+          const model = catalogue.get(search);
+          return model ? [model] : [];
+        },
+      },
+      config,
+    ),
+    (error: unknown) =>
+      error instanceof Error &&
+      error.name === "ModelCapabilityError" &&
+      error.message.includes(incompatibleFallback.id),
+  );
+  assert.deepEqual(calls, [main.id, compatibleFallback.id, incompatibleFallback.id]);
+});
+
+test("configured fallback validation preserves catalogue outage identity", async () => {
+  const cli = await import("../src/cli.js");
+  const main = cliRoleModel({ id: "provider/main-online" });
+  const unavailable = new Error("synthetic configured fallback outage");
+  const config = structuredClone(DEFAULT_CONFIG);
+  config.mainModel = main.id;
+  config.fallbackModels = ["provider/fallback-offline"];
+  config.compressionMode = "off";
+
+  await assert.rejects(
+    cli.ensureRunnableModelConfiguration(
+      {
+        listModels: async (search: string) => {
+          if (search === main.id) return [main];
+          throw unavailable;
+        },
+      },
+      config,
+    ),
+    (error: unknown) => error === unavailable,
+  );
+});
+
+test("explicit startup model validates before config and session preference mutation", async () => {
+  const cli = await import("../src/cli.js") as typeof import("../src/cli.js") & {
+    applyStartupModelPreference: (
+      openRouter: { listModels: (...args: unknown[]) => Promise<ModelInfo[]> },
+      requestedModel: string | undefined,
+      config: typeof DEFAULT_CONFIG,
+      session: { setPreferences: (...args: unknown[]) => void },
+    ) => Promise<void>;
+  };
+
+  const incompatible = cliRoleModel({
+    id: "provider/cli-no-tools",
+    supportedParameters: [],
+  });
+  const config = structuredClone(DEFAULT_CONFIG);
+  config.mainModel = "provider/configured";
+  const preferences: unknown[][] = [];
+  const session = {
+    setPreferences: (...args: unknown[]) => preferences.push(args),
+  };
+
+  await assert.rejects(
+    cli.applyStartupModelPreference(
+      { listModels: async () => [incompatible] },
+      incompatible.id,
+      config,
+      session,
+    ),
+    (error: unknown) =>
+      error instanceof Error && error.name === "ModelCapabilityError",
+  );
+  assert.equal(config.mainModel, "provider/configured");
+  assert.deepEqual(preferences, []);
+
+  const unavailable = new Error("synthetic explicit model catalogue outage");
+  await assert.rejects(
+    cli.applyStartupModelPreference(
+      { listModels: async () => { throw unavailable; } },
+      "provider/cli-offline",
+      config,
+      session,
+    ),
+    (error: unknown) => error === unavailable,
+  );
+  assert.equal(config.mainModel, "provider/configured");
+  assert.deepEqual(preferences, []);
+});
+
 test("configured run gate accepts main auto and an input-agnostic text compressor", async () => {
   const cli = await import("../src/cli.js") as typeof import("../src/cli.js") & {
     ensureRunnableModelConfiguration: (

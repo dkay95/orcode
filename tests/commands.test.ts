@@ -1027,6 +1027,57 @@ test("openrouter auto is a catalogue-independent main-only selection", async () 
   assert.equal(fixture.sessionSaves.count, 1);
 });
 
+test("slash fallback addition rejects incompatible main routes before config mutation", async (t) => {
+  const incompatible = [
+    roleModel({ id: "provider/no-tools-fallback", supportedParameters: [] }),
+    roleModel({ id: "provider/no-text-fallback", outputModalities: ["image"] }),
+  ];
+
+  for (const model of incompatible) {
+    await t.test(model.id, async () => {
+      const root = await mkdtemp(join(tmpdir(), "orcode-fallback-role-"));
+      const fixture = roleCommandContext(root, async (search) =>
+        search === model.id ? [model] : []
+      );
+      fixture.context.config.fallbackModels = ["provider/last-known-good"];
+
+      await assert.rejects(
+        handleSlashCommand(`/fallback +${model.id}`, fixture.context),
+        (error: unknown) =>
+          error instanceof Error &&
+          error.name === "ModelCapabilityError" &&
+          error.message.includes(model.id),
+      );
+
+      assert.deepEqual(
+        fixture.context.config.fallbackModels,
+        ["provider/last-known-good"],
+      );
+      await assert.rejects(stat(join(root, "config.json")), /ENOENT/);
+    });
+  }
+});
+
+test("slash fallback addition preserves catalogue outages before config mutation", async () => {
+  const root = await mkdtemp(join(tmpdir(), "orcode-fallback-outage-"));
+  const unavailable = new Error("synthetic fallback catalogue offline");
+  const fixture = roleCommandContext(root, async () => {
+    throw unavailable;
+  });
+  fixture.context.config.fallbackModels = ["provider/last-known-good"];
+
+  await assert.rejects(
+    handleSlashCommand("/fallback +provider/candidate", fixture.context),
+    (error: unknown) => error === unavailable,
+  );
+
+  assert.deepEqual(
+    fixture.context.config.fallbackModels,
+    ["provider/last-known-good"],
+  );
+  await assert.rejects(stat(join(root, "config.json")), /ENOENT/);
+});
+
 test("slash compressor selection requires text output but no text input or tools", async () => {
   const root = await mkdtemp(join(tmpdir(), "orcode-compressor-role-"));
   const imageToText = roleModel({

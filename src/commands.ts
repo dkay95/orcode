@@ -2238,6 +2238,7 @@ async function fallbackCommand(args: string[], context: CommandContext): Promise
     if (!model) {
       throw new Error("Verwendung: /fallback +<anbieter/modell>");
     }
+    await resolveMainModelCandidate(context.openRouter, model);
     const next = new Set(context.config.fallbackModels);
     next.add(model);
     context.config.fallbackModels = [...next];

@@ -388,22 +388,35 @@ test("/provider sort, deny/allow, only, fallback policy, and clear round-trip th
 
 test("/fallback adds, removes, and clears the fallback chain", async () => {
   const { context } = await harness();
+  const compatibleModels = ["test/compatible-one", "test/compatible-two"].map((id) => ({
+    id,
+    name: id,
+    description: "deterministic compatible fallback fixture",
+    contextLength: 32_000,
+    promptPrice: 0,
+    completionPrice: 0,
+    supportedParameters: ["tools"],
+    inputModalities: ["text"],
+    outputModalities: ["text"],
+  }));
+  context.openRouter.listModels = async (search = "") =>
+    compatibleModels.filter((model) => model.id === search);
 
-  await handleSlashCommand("/fallback +anthropic/claude", context);
-  assert.deepEqual(context.config.fallbackModels, ["anthropic/claude"]);
+  await handleSlashCommand("/fallback +test/compatible-one", context);
+  assert.deepEqual(context.config.fallbackModels, ["test/compatible-one"]);
 
-  await handleSlashCommand("/fallback +anthropic/claude", context);
+  await handleSlashCommand("/fallback +test/compatible-one", context);
   assert.deepEqual(
     context.config.fallbackModels,
-    ["anthropic/claude"],
+    ["test/compatible-one"],
     "ein doppelter Eintrag darf die Kette nicht verlängern",
   );
 
-  await handleSlashCommand("/fallback +openai/gpt", context);
-  assert.deepEqual(context.config.fallbackModels, ["anthropic/claude", "openai/gpt"]);
+  await handleSlashCommand("/fallback +test/compatible-two", context);
+  assert.deepEqual(context.config.fallbackModels, ["test/compatible-one", "test/compatible-two"]);
 
-  await handleSlashCommand("/fallback -anthropic/claude", context);
-  assert.deepEqual(context.config.fallbackModels, ["openai/gpt"]);
+  await handleSlashCommand("/fallback -test/compatible-one", context);
+  assert.deepEqual(context.config.fallbackModels, ["test/compatible-two"]);
 
   await handleSlashCommand("/fallback clear", context);
   assert.deepEqual(context.config.fallbackModels, []);
