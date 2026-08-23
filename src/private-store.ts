@@ -377,6 +377,15 @@ interface PathIdentity extends PrivateStoreProtectionIdentity {
   path: string;
 }
 
+const PRIVATE_DIRECTORY_CLAIM_IDENTITY: unique symbol = Symbol(
+  "PrivateStore.directory-claim-identity",
+);
+
+/** Opaque proof that this process created and protected one exact directory. */
+export interface PrivateDirectoryClaim {
+  readonly [PRIVATE_DIRECTORY_CLAIM_IDENTITY]: PathIdentity;
+}
+
 /**
  * Fail-closed boundary for exact recovery data. Content reaches a file only
  * after the directory and empty exclusive temp file have private permissions.
@@ -416,10 +425,10 @@ export class PrivateStore {
   /**
    * Atomically reserves one real, private directory beneath the verified root.
    * Existing real directories are reported as a lost race; links and identity
-   * changes fail closed. The caller releases a winning reservation with
-   * removeTree(), which repeats the same root-bound identity checks.
+   * changes fail closed. Task 3 deliberately has no path-based release API for
+   * this claim. A future release must consume and revalidate the opaque token.
    */
-  async createDirectoryExclusive(path: string): Promise<boolean> {
+  async createDirectoryExclusive(path: string): Promise<PrivateDirectoryClaim | null> {
     await this.assertAvailable();
     const target = resolve(path);
     const root = this.#root ?? dirname(target);
@@ -439,32 +448,28 @@ export class PrivateStore {
       if (existing.isSymbolicLink() || !existing.isDirectory()) {
         throw new Error(`PrivateStore-Lease ist kein echtes Verzeichnis: ${target}`);
       }
-      return false;
+      return null;
     }
 
-    let created: PathIdentity | null = null;
-    try {
-      await assertDirectoryIdentities(ancestors);
-      const info = await lstat(target, { bigint: true });
-      if (info.isSymbolicLink() || !info.isDirectory()) {
-        throw new Error(`PrivateStore-Lease wurde bei der Erstellung ausgetauscht: ${target}`);
-      }
-      created = pathIdentity(target, info, "directory");
-      const protectedIdentity = await protectBoundPath(
-        target,
-        "directory",
-        this.adapter,
-        ancestors,
-        created,
-      );
-      assertSameIdentity(created, protectedIdentity, target);
-      await assertDirectoryIdentities(ancestors);
-      await assertPathIdentity(protectedIdentity);
-      return true;
-    } catch (error) {
-      if (created) await rollbackCreatedDirectories([created]);
-      throw error;
+    await assertDirectoryIdentities(ancestors);
+    const info = await lstat(target, { bigint: true });
+    if (info.isSymbolicLink() || !info.isDirectory()) {
+      throw new Error(`PrivateStore-Lease wurde bei der Erstellung ausgetauscht: ${target}`);
     }
+    const created = pathIdentity(target, info, "directory");
+    const protectedIdentity = await protectBoundPath(
+      target,
+      "directory",
+      this.adapter,
+      ancestors,
+      created,
+    );
+    assertSameIdentity(created, protectedIdentity, target);
+    await assertDirectoryIdentities(ancestors);
+    await assertPathIdentity(protectedIdentity);
+    return Object.freeze({
+      [PRIVATE_DIRECTORY_CLAIM_IDENTITY]: protectedIdentity,
+    });
   }
 
   async writeTextAtomic(path: string, content: string): Promise<void> {

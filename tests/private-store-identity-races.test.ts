@@ -7,8 +7,10 @@ import test, { after } from "node:test";
 
 const nativeOpen = fs.promises.open.bind(fs.promises);
 const nativeLstat = fs.promises.lstat.bind(fs.promises);
+const nativeRmdir = fs.promises.rmdir.bind(fs.promises);
 let pendingOpenSwap: { path: string; run: () => Promise<void> } | null = null;
 let pendingLstatSwap: { path: string; run: () => Promise<void> } | null = null;
+let pendingRmdirSwap: { path: string; run: () => Promise<void> } | null = null;
 let deferredLstatSwap: {
   triggerPath: string | null;
   path: string;
@@ -63,6 +65,22 @@ Object.defineProperty(fs.promises, "lstat", {
   writable: true,
   value: wrappedLstat,
 });
+const wrappedRmdir = (async (...args: unknown[]) => {
+  const path = resolve(String(args[0]));
+  if (pendingRmdirSwap?.path === path) {
+    const swap = pendingRmdirSwap.run;
+    pendingRmdirSwap = null;
+    await swap();
+  }
+  return (nativeRmdir as unknown as (
+    ...callArgs: unknown[]
+  ) => ReturnType<typeof nativeRmdir>)(...args);
+}) as typeof nativeRmdir;
+Object.defineProperty(fs.promises, "rmdir", {
+  configurable: true,
+  writable: true,
+  value: wrappedRmdir,
+});
 syncBuiltinESMExports();
 
 const { PosixPrivateStoreAdapter, PrivateStore } = await import("../src/private-store.js");
@@ -78,6 +96,11 @@ after(() => {
     writable: true,
     value: nativeLstat,
   });
+  Object.defineProperty(fs.promises, "rmdir", {
+    configurable: true,
+    writable: true,
+    value: nativeRmdir,
+  });
   syncBuiltinESMExports();
 });
 
@@ -90,6 +113,11 @@ function swapAtNextOpen(path: string, run: () => Promise<void>): void {
 function swapAtNextLstat(path: string, run: () => Promise<void>): void {
   assert.equal(pendingLstatSwap, null);
   pendingLstatSwap = { path: resolve(path), run };
+}
+
+function swapAtNextRmdir(path: string, run: () => Promise<void>): void {
+  assert.equal(pendingRmdirSwap, null);
+  pendingRmdirSwap = { path: resolve(path), run };
 }
 
 function swapAtNthLstat(path: string, occurrence: number, run: () => Promise<void>): void {
@@ -136,7 +164,7 @@ test("PrivateStore exclusive creation refuses a swapped replacement before prote
     adapter: new PosixPrivateStoreAdapter(),
     root,
   }) as unknown as {
-    createDirectoryExclusive(path: string): Promise<boolean>;
+    createDirectoryExclusive(path: string): Promise<object | null>;
   };
   let rejected = false;
 
@@ -153,6 +181,40 @@ test("PrivateStore exclusive creation refuses a swapped replacement before prote
   assert.equal(await fs.promises.readFile(join(lease, "must-survive.txt"), "utf8"), "outside sentinel");
   assert.equal((await fs.promises.stat(lease)).mode & 0o777, 0o755);
   assert.equal(rejected, true);
+});
+
+test("PrivateStore claim protection failure never rmdirs a replacement during rollback", async () => {
+  const root = await fs.promises.mkdtemp(join(tmpdir(), "orcode-private-exclusive-rmdir-swap-"));
+  const claim = join(root, "hmac-init.lock");
+  const movedClaim = join(root, "hmac-init-before-rmdir");
+  const replacement = join(root, "foreign-empty-replacement");
+  await fs.promises.mkdir(replacement, { mode: 0o755 });
+  swapAtNextRmdir(claim, async () => {
+    await fs.promises.rename(claim, movedClaim);
+    await fs.promises.rename(replacement, claim);
+  });
+  class RejectingClaimAdapter extends PosixPrivateStoreAdapter {
+    override async protectDirectory(path: string): Promise<void> {
+      if (path === claim) throw new Error("synthetic claim protection refusal");
+      await super.protectDirectory(path);
+    }
+  }
+  const store = new PrivateStore({
+    adapter: new RejectingClaimAdapter(),
+    root,
+  }) as unknown as {
+    createDirectoryExclusive(path: string): Promise<object | null>;
+  };
+
+  await assert.rejects(
+    store.createDirectoryExclusive(claim),
+    /protection refusal/,
+  );
+
+  const rollbackAttempted = pendingRmdirSwap === null;
+  pendingRmdirSwap = null;
+  assert.equal(rollbackAttempted, false, "claim creation must never path-rmdir after failure");
+  assert.equal((await fs.promises.stat(claim)).isDirectory(), true);
 });
 
 test("PrivateStore protect compares the pre-open snapshot before changing a replacement", async () => {

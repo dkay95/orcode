@@ -17,11 +17,11 @@ import { basename, dirname, join } from "node:path";
 import test from "node:test";
 
 type ExclusiveDirectoryStore = {
-  createDirectoryExclusive(path: string): Promise<boolean>;
+  createDirectoryExclusive(path: string): Promise<object | null>;
   removeTree(path: string): Promise<void>;
 };
 
-test("PrivateStore exclusive directory creation has exactly one parallel winner", async () => {
+test("PrivateStore exclusive directory creation returns one opaque claim token and null losers", async () => {
   const { PosixPrivateStoreAdapter, PrivateStore } = await import("../src/private-store.js");
   const root = await mkdtemp(join(tmpdir(), "orcode-private-exclusive-"));
   const lease = join(root, "hmac-init.lock");
@@ -33,7 +33,11 @@ test("PrivateStore exclusive directory creation has exactly one parallel winner"
   const outcomes = await Promise.all(
     Array.from({ length: 32 }, () => store.createDirectoryExclusive(lease)),
   );
-  assert.equal(outcomes.filter(Boolean).length, 1);
+  const winners = outcomes.filter((outcome) => outcome !== null);
+  assert.equal(winners.length, 1);
+  assert.equal(typeof winners[0], "object");
+  assert.equal(Object.isFrozen(winners[0]), true);
+  assert.equal(outcomes.filter((outcome) => outcome === null).length, 31);
   assert.equal((await stat(lease)).mode & 0o777, 0o700);
   await store.removeTree(lease);
   await assert.rejects(stat(lease), /ENOENT/);
@@ -57,6 +61,30 @@ test("PrivateStore exclusive directory creation rejects symlinked ancestors with
     /symbol|symlink|link/i,
   );
   assert.deepEqual(await readdir(outside), []);
+});
+
+test("PrivateStore leaves an empty exclusive claim on protection failure instead of path rollback", async () => {
+  const { PrivateStore } = await import("../src/private-store.js");
+  const root = await mkdtemp(join(tmpdir(), "orcode-private-exclusive-protect-failure-"));
+  const claimPath = join(root, "hmac-init.lock");
+  const store = new PrivateStore({
+    root,
+    adapter: {
+      name: "claim-protection-failure",
+      available: async () => true,
+      protectDirectory: async (path) => {
+        if (path === claimPath) throw new Error("synthetic claim protection failure");
+      },
+      protectFile: async () => undefined,
+    },
+  }) as unknown as ExclusiveDirectoryStore;
+
+  await assert.rejects(
+    store.createDirectoryExclusive(claimPath),
+    /protection failure/,
+  );
+  assert.equal((await stat(claimPath)).isDirectory(), true);
+  assert.deepEqual(await readdir(claimPath), []);
 });
 
 test("PrivateStore enforces 0700 directories and 0600 atomic files on POSIX", async () => {

@@ -47,6 +47,7 @@ import {
   type CommandOutput,
 } from "./commands.js";
 import {
+  APP_HOME,
   consumeConfigWarning,
   configPath,
   isApprovalMode,
@@ -60,6 +61,7 @@ import {
   CredentialStore,
   normalizeProviderSecret,
   type CredentialKind,
+  type CredentialStoreLike,
 } from "./credentials.js";
 import { OpenRouterService } from "./openrouter.js";
 import type { PanelJudgment, PanelResult } from "./panel.js";
@@ -265,29 +267,96 @@ export function readPackageVersion(): string {
 }
 
 export function createOpenRouterServiceForStartup(keys: {
-  storedInferenceKey: string | null;
+  storedInferenceKey: StoredCredentialStartupInput;
   environmentInferenceKey: string | null;
-  storedManagementKey?: string | null;
+  storedManagementKey?: StoredCredentialStartupInput;
   environmentManagementKey?: string | null;
 }): OpenRouterService {
-  const storedInferenceKey = normalizeOptionalProviderSecret(keys.storedInferenceKey);
-  const environmentInferenceKey = normalizeOptionalProviderSecret(keys.environmentInferenceKey);
-  const storedManagementKey = normalizeOptionalProviderSecret(keys.storedManagementKey ?? null);
-  const environmentManagementKey = normalizeOptionalProviderSecret(
-    keys.environmentManagementKey ?? null,
+  const inference = selectAuthoritativeStartupCredential(
+    keys.storedInferenceKey,
+    () => keys.environmentInferenceKey,
+    "API-Key",
+  );
+  const management = selectAuthoritativeStartupCredential(
+    keys.storedManagementKey ?? null,
+    () => keys.environmentManagementKey ?? null,
+    "Management-Key",
   );
   return new OpenRouterService(
-    storedInferenceKey ?? environmentInferenceKey ?? undefined,
-    storedManagementKey ?? environmentManagementKey ?? undefined,
+    inference.value,
+    management.value,
     {
-      inference: storedInferenceKey !== null ? "keychain" : "environment",
-      management: storedManagementKey !== null ? "keychain" : "environment",
+      ...(inference.origin ? { inference: inference.origin } : {}),
+      ...(management.origin ? { management: management.origin } : {}),
     },
   );
 }
 
-function normalizeOptionalProviderSecret(value: string | null): string | null {
-  return value === null ? null : normalizeProviderSecret(value);
+export type StoredCredentialStartupState =
+  | { kind: "absent" }
+  | { kind: "present"; value: string }
+  | { kind: "invalid" };
+
+type StoredCredentialStartupInput = string | null | StoredCredentialStartupState;
+
+function selectAuthoritativeStartupCredential(
+  stored: StoredCredentialStartupInput,
+  environment: () => string | null,
+  label: string,
+): { value: string | undefined; origin?: "keychain" | "environment" } {
+  const state: StoredCredentialStartupState = typeof stored === "string"
+    ? { kind: "present", value: stored }
+    : stored === null
+      ? { kind: "absent" }
+      : stored;
+  if (state.kind === "invalid") {
+    throw new Error(`Gespeicherter ${label} ist ungültig oder nicht lesbar.`);
+  }
+  if (state.kind === "present") {
+    return {
+      value: normalizeProviderSecret(state.value),
+      origin: "keychain",
+    };
+  }
+  const processValue = environment();
+  return processValue === null
+    ? { value: undefined }
+    : {
+        value: normalizeProviderSecret(processValue),
+        origin: "environment",
+      };
+}
+
+export async function loadStoredCredentialForStartup(
+  credentials: Pick<CredentialStoreLike, "get">,
+  kind: CredentialKind,
+): Promise<StoredCredentialStartupState> {
+  try {
+    const value = await credentials.get(kind);
+    return value === null
+      ? { kind: "absent" }
+      : { kind: "present", value };
+  } catch {
+    return { kind: "invalid" };
+  }
+}
+
+export interface StartupCredentialStoreOptions {
+  globalHmacLockRoot?: string;
+  instantiate?: (globalHmacLockRoot: string) => CredentialStore;
+}
+
+export function createCredentialStoreForStartup(
+  _selectedAppHome: string,
+  options: StartupCredentialStoreOptions = {},
+): CredentialStore {
+  const globalHmacLockRoot = options.globalHmacLockRoot ?? APP_HOME;
+  return options.instantiate?.(globalHmacLockRoot) ?? new CredentialStore(
+    undefined,
+    undefined,
+    undefined,
+    globalHmacLockRoot,
+  );
 }
 
 async function main(): Promise<void> {
@@ -339,17 +408,12 @@ async function main(): Promise<void> {
     // Plain- und Prompt-Modus gleichermaßen.
     console.error(chalk.yellow(homeWarning));
   }
-  const credentials = new CredentialStore(
-    undefined,
-    undefined,
-    undefined,
-    startup.appHome,
-  );
-  const storedInferenceKey = await loadStoredCredential(
+  const credentials = createCredentialStoreForStartup(startup.appHome);
+  const storedInferenceKey = await loadStoredCredentialForStartup(
     credentials,
     "inference",
   );
-  const storedManagementKey = await loadStoredCredential(
+  const storedManagementKey = await loadStoredCredentialForStartup(
     credentials,
     "management",
   );
@@ -417,7 +481,7 @@ async function main(): Promise<void> {
       showChatPickerOnStart:
         !options.newChat && !options.continueChat && !options.chatId,
       initialKeyFallback:
-        storedInferenceKey && environmentInferenceKey
+        storedInferenceKey.kind === "present" && environmentInferenceKey
           ? environmentInferenceKey
           : undefined,
       resumeFlag: options.resume,
@@ -441,7 +505,7 @@ async function main(): Promise<void> {
     openRouter,
     credentials,
     out,
-    storedInferenceKey && environmentInferenceKey
+    storedInferenceKey.kind === "present" && environmentInferenceKey
       ? {
           key: environmentInferenceKey,
           origin: "environment",
@@ -2317,24 +2381,6 @@ async function promptDashboardInferenceKey(
     } finally {
       ui.setCancelHandler();
     }
-  }
-}
-
-async function loadStoredCredential(
-  credentials: CredentialStore,
-  kind: CredentialKind,
-): Promise<string | null> {
-  try {
-    return await credentials.get(kind);
-  } catch (error) {
-    console.log(
-      chalk.yellow(
-        `Gespeicherter ${
-          kind === "inference" ? "API-Key" : "Management-Key"
-        } konnte nicht geladen werden: ${errorMessage(error)}`,
-      ),
-    );
-    return null;
   }
 }
 

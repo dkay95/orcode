@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { readFileSync } from "node:fs";
-import { mkdtemp } from "node:fs/promises";
+import { mkdir, mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -18,9 +18,11 @@ import {
   resolveCliCommandName,
   runOutcomeExitCode,
 } from "../src/cli.js";
+import * as cliModule from "../src/cli.js";
 import { COMMAND_CATALOG } from "../src/command-catalog.js";
 import { DEFAULT_CONFIG } from "../src/config.js";
 import { OpenRouterService } from "../src/openrouter.js";
+import { CredentialStore } from "../src/credentials.js";
 import type { CredentialStoreLike } from "../src/credentials.js";
 import type { ModelInfo } from "../src/types.js";
 
@@ -135,39 +137,68 @@ test("startup reuses a saved key and otherwise marks environment keys process-on
   assert.equal(processOnly.runtimeState.inferenceValidity, "unknown");
 });
 
-test("startup rejects every saved and environment credential before constructing provider state", () => {
+test("saved provider credentials authoritatively shadow malformed environment values", () => {
   const valid = `${STARTUP_KEY_PREFIX}${"v".repeat(48)}`;
   const invalid = `opaque\u001b[31m${"x".repeat(30)}`;
-  const cases = [
-    { storedInferenceKey: invalid, environmentInferenceKey: null },
-    { storedInferenceKey: null, environmentInferenceKey: invalid },
-    { storedInferenceKey: valid, environmentInferenceKey: invalid },
-    {
-      storedInferenceKey: valid,
-      environmentInferenceKey: null,
-      storedManagementKey: invalid,
-      environmentManagementKey: null,
-    },
-    {
-      storedInferenceKey: valid,
-      environmentInferenceKey: null,
-      storedManagementKey: null,
-      environmentManagementKey: invalid,
-    },
-    {
-      storedInferenceKey: valid,
-      environmentInferenceKey: null,
-      storedManagementKey: valid,
-      environmentManagementKey: invalid,
-    },
-  ];
+  const service = createOpenRouterServiceForStartup({
+    storedInferenceKey: valid,
+    environmentInferenceKey: invalid,
+    storedManagementKey: valid,
+    environmentManagementKey: invalid,
+  });
 
-  for (const keys of cases) {
-    assert.throws(
-      () => createOpenRouterServiceForStartup(keys),
-      /ungültig|Steuer|Leerzeichen/i,
-    );
-  }
+  assert.equal(service.requireKey(), valid);
+  assert.equal(service.requireManagementKey(), valid);
+  assert.equal(service.keyOrigin, "keychain");
+  assert.equal(service.managementKeyOrigin, "keychain");
+});
+
+test("malformed saved credentials block valid automatic environment fallback for both roles", () => {
+  const valid = `${STARTUP_KEY_PREFIX}${"v".repeat(48)}`;
+  const invalid = `saved\u001b[31m${"x".repeat(30)}`;
+
+  assert.throws(() => createOpenRouterServiceForStartup({
+    storedInferenceKey: invalid,
+    environmentInferenceKey: valid,
+  }), /ungültig|Steuer|Leerzeichen/i);
+  assert.throws(() => createOpenRouterServiceForStartup({
+    storedInferenceKey: valid,
+    environmentInferenceKey: null,
+    storedManagementKey: invalid,
+    environmentManagementKey: valid,
+  }), /ungültig|Steuer|Leerzeichen/i);
+});
+
+test("stored credential read errors remain present-invalid and block valid environment fallback", async () => {
+  type StoredState =
+    | { kind: "absent" }
+    | { kind: "present"; value: string }
+    | { kind: "invalid" };
+  const loadStoredCredentialForStartup = (cliModule as typeof cliModule & {
+    loadStoredCredentialForStartup(
+      credentials: Pick<CredentialStoreLike, "get">,
+      kind: "inference" | "management",
+    ): Promise<StoredState>;
+  }).loadStoredCredentialForStartup;
+  const unreadable: Pick<CredentialStoreLike, "get"> = {
+    async get() { throw new Error("opaque backend read failure"); },
+  };
+  const valid = `${STARTUP_KEY_PREFIX}${"e".repeat(48)}`;
+
+  const inference = await loadStoredCredentialForStartup(unreadable, "inference");
+  const management = await loadStoredCredentialForStartup(unreadable, "management");
+  assert.deepEqual(inference, { kind: "invalid" });
+  assert.deepEqual(management, { kind: "invalid" });
+  assert.throws(() => createOpenRouterServiceForStartup({
+    storedInferenceKey: inference as never,
+    environmentInferenceKey: valid,
+  }), /gespeichert|Schlüsselbund|ungültig/i);
+  assert.throws(() => createOpenRouterServiceForStartup({
+    storedInferenceKey: null,
+    environmentInferenceKey: valid,
+    storedManagementKey: management as never,
+    environmentManagementKey: valid,
+  }), /gespeichert|Schlüsselbund|ungültig/i);
 });
 
 test("startup accepts outer Unicode whitespace for all saved and environment credentials", () => {
@@ -196,6 +227,59 @@ test("startup accepts outer Unicode whitespace for all saved and environment cre
   assert.equal(environment.requireManagementKey(), management);
   assert.equal(environment.keyOrigin, "environment");
   assert.equal(environment.managementKeyOrigin, "environment");
+});
+
+test("distinct selected app homes share the one canonical startup HMAC claim namespace", async () => {
+  const createCredentialStoreForStartup = (cliModule as typeof cliModule & {
+    createCredentialStoreForStartup(
+      selectedAppHome: string,
+      options: {
+        globalHmacLockRoot: string;
+        instantiate(lockRoot: string): CredentialStore;
+      },
+    ): CredentialStore;
+  }).createCredentialStoreForStartup;
+  const fixture = await mkdtemp(join(tmpdir(), "orcode-global-hmac-startup-"));
+  const selectedA = join(fixture, "selected-a");
+  const selectedB = join(fixture, "selected-b");
+  const globalHmacLockRoot = join(fixture, "canonical-global");
+  await Promise.all([
+    mkdir(selectedA),
+    mkdir(selectedB),
+    mkdir(globalHmacLockRoot),
+  ]);
+  let persisted: string | undefined;
+  let writes = 0;
+  let generated = 0;
+  const instantiate = (lockRoot: string): CredentialStore => new CredentialStore(
+    () => ({
+      async getPassword() { return persisted; },
+      async setPassword(password: string) {
+        writes += 1;
+        if (writes === 1) await new Promise((resolve) => setTimeout(resolve, 40));
+        persisted = password;
+      },
+      async deleteCredential() { persisted = undefined; return true; },
+    }),
+    undefined,
+    () => new Uint8Array(32).fill(++generated),
+    lockRoot,
+  );
+  const first = createCredentialStoreForStartup(selectedA, {
+    globalHmacLockRoot,
+    instantiate,
+  });
+  const second = createCredentialStoreForStartup(selectedB, {
+    globalHmacLockRoot,
+    instantiate,
+  });
+
+  const [firstKey, secondKey] = await Promise.all([
+    first.getOrCreateAccountHmacKey(),
+    second.getOrCreateAccountHmacKey(),
+  ]);
+  assert.deepEqual(firstKey, secondKey);
+  assert.equal(writes, 1);
 });
 
 test("dashboard startup validation never persists an environment key implicitly", async () => {

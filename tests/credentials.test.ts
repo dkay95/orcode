@@ -1,10 +1,11 @@
 import assert from "node:assert/strict";
-import { mkdtemp } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, rename, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { CredentialStore } from "../src/credentials.js";
 import * as credentialsModule from "../src/credentials.js";
+import { PosixPrivateStoreAdapter, PrivateStore } from "../src/private-store.js";
 
 const TEST_KEY_PREFIX = `${["sk", "or", "v1"].join("-")}-`;
 
@@ -441,6 +442,113 @@ test("independent CredentialStore instances serialize HMAC initialization to one
   ]);
   assert.deepEqual(first, second);
   assert.equal(setCalls, 1);
+});
+
+test("a successful HMAC initialization leaves its permanent claim while future readers use the persisted key", async () => {
+  const globalRoot = await mkdtemp(join(tmpdir(), "orcode-hmac-permanent-claim-"));
+  let stored: string | undefined;
+  let writes = 0;
+  const createEntry = () => ({
+    async getPassword() { return stored; },
+    async setPassword(password: string) { writes += 1; stored = password; },
+    async deleteCredential() { stored = undefined; return true; },
+  });
+  const firstStore = versioned(new CredentialStore(
+    createEntry,
+    undefined,
+    () => new Uint8Array(32).fill(7),
+    globalRoot,
+  ));
+
+  const first = await firstStore.getOrCreateAccountHmacKey();
+  const claimsAfterWrite = await readdir(globalRoot);
+  assert.equal(claimsAfterWrite.length, 1);
+  assert.equal((await stat(join(globalRoot, claimsAfterWrite[0]!))).isDirectory(), true);
+
+  const secondStore = versioned(new CredentialStore(
+    createEntry,
+    undefined,
+    () => new Uint8Array(32).fill(8),
+    globalRoot,
+  ));
+  const second = await secondStore.getOrCreateAccountHmacKey();
+  assert.deepEqual(second, first);
+  assert.equal(writes, 1);
+  assert.deepEqual(await readdir(globalRoot), claimsAfterWrite);
+});
+
+test("HMAC initialization never deletes a foreign directory swapped into the acquired claim path", async () => {
+  const fixture = await mkdtemp(join(tmpdir(), "orcode-hmac-claim-swap-"));
+  const globalRoot = join(fixture, "global");
+  const outside = join(fixture, "foreign-replacement");
+  const movedClaim = join(fixture, "original-claim");
+  const sentinel = "foreign sentinel must survive";
+  await mkdir(globalRoot);
+  await mkdir(outside, { mode: 0o755 });
+  await writeFile(join(outside, "must-survive.txt"), sentinel);
+  let stored: string | undefined;
+  let swapped = false;
+  const store = versioned(new CredentialStore(
+    () => ({
+      async getPassword() { return stored; },
+      async setPassword(password: string) {
+        const [claimName] = await readdir(globalRoot);
+        assert.ok(claimName);
+        const claimPath = join(globalRoot, claimName);
+        await rename(claimPath, movedClaim);
+        await rename(outside, claimPath);
+        swapped = true;
+        stored = password;
+      },
+      async deleteCredential() { stored = undefined; return true; },
+    }),
+    undefined,
+    () => new Uint8Array(32).fill(9),
+    globalRoot,
+  ));
+
+  await store.getOrCreateAccountHmacKey();
+
+  assert.equal(swapped, true);
+  const [claimName] = await readdir(globalRoot);
+  assert.ok(claimName);
+  assert.equal(
+    await readFile(join(globalRoot, claimName, "must-survive.txt"), "utf8"),
+    sentinel,
+  );
+});
+
+test("a stuck permanent HMAC claim without a key fails closed and remains untouched", async () => {
+  const globalRoot = await mkdtemp(join(tmpdir(), "orcode-hmac-stuck-claim-"));
+  const claimPath = join(globalRoot, "provider-account-hmac-init.lock");
+  const privateStore = new PrivateStore({
+    adapter: new PosixPrivateStoreAdapter(),
+    root: globalRoot,
+  });
+  assert.ok(await privateStore.createDirectoryExclusive(claimPath));
+  const store = versioned(new CredentialStore(
+    () => ({
+      async getPassword() { return undefined; },
+      async setPassword() { throw new Error("must not write while claim is stuck"); },
+      async deleteCredential() { throw new Error("must not delete stuck claim"); },
+    }),
+    undefined,
+    () => new Uint8Array(32).fill(4),
+    globalRoot,
+  ));
+
+  await assert.rejects(
+    store.getOrCreateAccountHmacKey(),
+    (error: unknown) => {
+      assert.equal(
+        (error as Error & { persistenceState?: string }).persistenceState,
+        "unknown",
+      );
+      assert.match((error as Error).message, /belegt|Initialisierung/i);
+      return true;
+    },
+  );
+  assert.equal((await stat(claimPath)).isDirectory(), true);
 });
 
 test("account HMAC key fails closed and redacts backend error material", async () => {

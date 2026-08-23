@@ -321,15 +321,15 @@ export class CredentialStore implements VersionedCredentialStoreLike {
     }
 
     if (this.#hmacPrivateStore && this.#hmacLeasePath) {
-      let acquired: boolean;
+      let claim: Awaited<ReturnType<PrivateStore["createDirectoryExclusive"]>>;
       try {
-        acquired = await this.#hmacPrivateStore.createDirectoryExclusive(
+        claim = await this.#hmacPrivateStore.createDirectoryExclusive(
           this.#hmacLeasePath,
         );
       } catch (error) {
         throw credentialError("lesen", error);
       }
-      if (!acquired) {
+      if (claim === null) {
         for (let attempt = 0; attempt < HMAC_WAIT_ATTEMPTS; attempt += 1) {
           await delay(HMAC_WAIT_DELAY_MS);
           let persisted: string | null;
@@ -353,13 +353,6 @@ export class CredentialStore implements VersionedCredentialStoreLike {
       } catch (error) {
         if (error instanceof CredentialStoreError) throw error;
         throw credentialError("speichern", error);
-      } finally {
-        try {
-          await this.#hmacPrivateStore.removeTree(this.#hmacLeasePath);
-        } catch {
-          // The persisted key is exact and future readers do not need the
-          // initialization lease. Never use an unresolved removal fallback.
-        }
       }
     }
 
