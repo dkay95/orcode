@@ -43,6 +43,8 @@ import {
   resolveCommandShell,
   resolveExecutablePath,
   runHardenedGitRead,
+  runObservedProcess,
+  runProcess,
   sanitizedEnvironment,
   toolMetadata,
 } from "../src/workspace.js";
@@ -1627,6 +1629,37 @@ test("consumer callback failures never change the canonical process result", { s
   const result = await invoke(tools, "run_command", { command: "printf canonical", timeoutSeconds: 5 });
   assert.equal(result.exitCode, 0);
   assert.equal(result.stdout, "canonical");
+});
+
+test("runProcess preserves a real launch error through one observed terminal result", async () => {
+  const root = await mkdtemp(join(tmpdir(), "routercode-launch-result-"));
+  const missing = join(root, "missing-executable");
+  const lifecycle: Array<{ type: "start" | "end"; id: string; error?: string }> = [];
+
+  const result = await runObservedProcess(
+    "launch-fixture",
+    { executable: missing },
+    {
+      onProcessStart: (operation) => lifecycle.push({ type: "start", id: operation.id }),
+      onProcessEnd: (operation, completion) => lifecycle.push({
+        type: "end",
+        id: operation.id,
+        ...(completion.error ? { error: completion.error } : {}),
+      }),
+    },
+    (onChunk) => runProcess(missing, [], {
+      cwd: root,
+      timeoutMs: 1_000,
+      onChunk,
+    }),
+  );
+
+  assert.equal(result.code, 1);
+  assert.equal(result.signal, null);
+  assert.match(result.launchError ?? "", /ENOENT|not found/i);
+  assert.deepEqual(lifecycle.map((event) => event.type), ["start", "end"]);
+  assert.equal(new Set(lifecycle.map((event) => event.id)).size, 1);
+  assert.match(lifecycle[1]?.error ?? "", /ENOENT|not found/i);
 });
 
 test("timeout emits one terminal process event and rejects every late chunk", { skip: process.platform === "win32" ? "needs a POSIX shell (ORCODE_SHELL/ROUTERCODE_SHELL)" : false }, async () => {

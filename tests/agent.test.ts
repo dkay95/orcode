@@ -1455,6 +1455,180 @@ test("Task 9 verification cancellation is the one root cancellation and never re
   assert.equal(events.find((event) => event.type === "run-end")?.outcome, "cancelled");
 });
 
+test("Task 9 real Agent root lets abort at verifier process end win over exit 0 and exit 1", async (t) => {
+  const cases = [
+    { name: "exit 0", verifyOutcome: { status: "passed" } as VerifyOutcome },
+    {
+      name: "exit 1",
+      verifyOutcome: {
+        status: "failed",
+        command: "check",
+        exitCode: 1,
+        distilled: "ERROR must not repair",
+      } as VerifyOutcome,
+    },
+  ];
+
+  for (const item of cases) {
+    await t.test(item.name, async () => {
+      const setup = await createAgent({
+        compressionMode: "off",
+        maxSteps: 6,
+        maxCostUsd: 1,
+        verify: { commands: ["check"], mode: "on-edit", maxRepairRounds: 2 },
+      }, new ApprovalManager("auto-edit"));
+      const verification = scriptedVerifyRunner([item.verifyOutcome]);
+      const beforeTurns = structuredClone(setup.session.data.turns);
+      const statePath = ConversationStore.path(setup.appHome, setup.session.path);
+      assert.equal(existsSync(statePath), false);
+      let phase = 0;
+      const client = fakeClient(() => {
+        phase += 1;
+        return {
+          text: [`phase ${phase}`],
+          before: async (emit) => {
+            await emit.modelCall(0, phase === 1 ? 0.01 : 0.02);
+            if (phase === 1) {
+              await emit.tool("write_file", {
+                path: "abort-at-process-end.txt",
+                content: "edited",
+              });
+            }
+          },
+        };
+      });
+      const agent = await setup.agent(client.client, undefined, verification.runner);
+      const controller = new AbortController();
+      const events: AgentRunEvent[] = [];
+
+      await assert.rejects(
+        agent.run("abort at process end", {
+          onText: () => {},
+          signal: controller.signal,
+          onEvent: (event) => {
+            events.push(event);
+            if (event.type === "process-end") controller.abort();
+          },
+        }),
+        (error) =>
+          error instanceof AgentRunError &&
+          error.outcome === "cancelled" &&
+          error.result.mainCostUsd === 0.01,
+      );
+
+      assert.equal(client.requests.length, 1, "abort must start no repair model phase");
+      assert.equal(verification.passes.length, 1);
+      assert.equal(events.filter((event) => event.type === "process-end").length, 1);
+      assert.equal(events.filter((event) => event.type === "run-end").length, 1);
+      assert.equal(events.find((event) => event.type === "run-end")?.outcome, "cancelled");
+      assert.deepEqual(setup.session.data.turns, beforeTurns);
+      assert.equal(existsSync(statePath), false, "cancelled root must not commit conversation state");
+      assert.equal(setup.session.data.costs.mainUsd, 0.01);
+      const persisted = JSON.parse(await readFile(setup.session.path, "utf8")) as {
+        costs: { mainUsd: number };
+      };
+      assert.equal(persisted.costs.mainUsd, 0.01);
+    });
+  }
+});
+
+test("Task 9 real signal and command-not-found verification stay unverified without repair", { skip: process.platform === "win32" ? "real POSIX verification paths" : false }, async (t) => {
+  const cases = [
+    { name: "signal termination", command: "kill -TERM $$", signal: "SIGTERM", exitCode: null },
+    {
+      name: "command not found",
+      command: "routercode_task9_agent_command_that_does_not_exist",
+      signal: undefined,
+      exitCode: 127,
+    },
+  ] as const;
+
+  for (const item of cases) {
+    await t.test(item.name, async () => {
+      const setup = await createAgent({
+        compressionMode: "off",
+        verify: { commands: [item.command], mode: "on-edit", maxRepairRounds: 2 },
+      }, new ApprovalManager("auto-edit"));
+      const client = fakeClient(() => ({
+        text: ["edited"],
+        before: async (emit) => {
+          await emit.modelCall(0, 0.01);
+          await emit.tool("write_file", { path: "terminal-verify.txt", content: "edited" });
+        },
+      }));
+      const agent = await setup.agent(client.client);
+      const events: AgentRunEvent[] = [];
+
+      const result = await agent.run("terminal verify", {
+        onText: () => {},
+        onEvent: (event) => events.push(event),
+      });
+
+      assert.equal(result.outcome, "unverified");
+      assert.equal(client.requests.length, 1, "terminal verification failure must not repair");
+      const starts = events.filter((event) => event.type === "process-start");
+      const ends = events.filter((event) => event.type === "process-end");
+      assert.equal(starts.length, 1);
+      assert.equal(ends.length, 1);
+      assert.equal(ends[0]?.exitCode, item.exitCode);
+      assert.equal(ends[0]?.signal, item.signal);
+      assert.equal(events.filter((event) => event.type === "run-end").length, 1);
+      assert.equal(events.find((event) => event.type === "run-end")?.outcome, "unverified");
+    });
+  }
+});
+
+test("Task 9 invalid ORCODE_SHELL is one redacted Agent process and RunLog terminal", async (t) => {
+  const setup = await createAgent({
+    compressionMode: "off",
+    verify: { commands: ["echo unreachable"], mode: "on-edit", maxRepairRounds: 2 },
+  }, new ApprovalManager("auto-edit"));
+  const secret = `${["sk", "or", "v1"].join("-")}-${"t".repeat(40)}`;
+  const previous = process.env.ORCODE_SHELL;
+  process.env.ORCODE_SHELL = join(setup.workspace, `missing-${secret}`);
+  t.after(() => {
+    if (previous === undefined) delete process.env.ORCODE_SHELL;
+    else process.env.ORCODE_SHELL = previous;
+  });
+  const client = fakeClient(() => ({
+    text: ["edited"],
+    before: async (emit) => {
+      await emit.modelCall(0, 0.01);
+      await emit.tool("write_file", { path: "invalid-shell.txt", content: "edited" });
+    },
+  }));
+  const agent = await setup.agent(client.client);
+  const events: AgentRunEvent[] = [];
+
+  const result = await agent.run("invalid shell", {
+    onText: () => {},
+    onEvent: (event) => events.push(event),
+  });
+
+  assert.equal(result.outcome, "unverified");
+  assert.equal(client.requests.length, 1);
+  assert.deepEqual(
+    events.filter((event) => event.type === "process-start" || event.type === "process-end").map((event) => event.type),
+    ["process-start", "process-end"],
+  );
+  const end = events.find((event) => event.type === "process-end");
+  assert.equal(end?.type === "process-end" ? end.exitCode : 0, null);
+  assert.doesNotMatch(end?.type === "process-end" ? end.error ?? "" : "", new RegExp(secret));
+  assert.match(end?.type === "process-end" ? end.error ?? "" : "", /REDACTED/);
+  assert.equal(events.filter((event) => event.type === "run-end").length, 1);
+  assert.equal(events.find((event) => event.type === "run-end")?.outcome, "unverified");
+
+  const runDirectory = join(setup.appHome, "runs", setup.session.data.id);
+  const runFiles = (await readdir(runDirectory)).filter((name) => name.endsWith(".ndjson"));
+  assert.equal(runFiles.length, 1);
+  const rawLog = await readFile(join(runDirectory, runFiles[0]!), "utf8");
+  assert.doesNotMatch(rawLog, new RegExp(secret));
+  assert.match(rawLog, /REDACTED/);
+  assert.equal((rawLog.match(/\"type\":\"process-start\"/g) ?? []).length, 1);
+  assert.equal((rawLog.match(/\"type\":\"process-end\"/g) ?? []).length, 1);
+  assert.equal((rawLog.match(/\"type\":\"run-end\"/g) ?? []).length, 1);
+});
+
 // --- K7: memory, token budget, cache -------------------------------------
 
 test("K7.4: instructions stay byte-identical across runs with a different approval mode and a resolved model", async () => {

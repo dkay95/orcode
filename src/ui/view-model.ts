@@ -67,7 +67,15 @@ function asRecord(value: unknown): Record<string, unknown> | null {
 function outcomeOf(output: unknown): { state: BlockState; exitCode?: number } {
   const data = asRecord(output);
   const exitCode = data && typeof data.exitCode === "number" ? data.exitCode : undefined;
-  if (exitCode === undefined) return { state: "unverified" };
+  if (exitCode === undefined) {
+    // The process adapter folds a structured completion.error into stderr so
+    // the existing output selector can render it. A null exit plus that
+    // terminal reason is a failed launch, not an ordinary unverified result;
+    // keep the exit code absent instead of inventing one.
+    const terminalReason = data?.exitCode === null &&
+      typeof data.stderr === "string" && data.stderr.trim().length > 0;
+    return { state: terminalReason ? "failed" : "unverified" };
+  }
   return { state: exitCode === 0 ? "ok" : "failed", exitCode };
 }
 

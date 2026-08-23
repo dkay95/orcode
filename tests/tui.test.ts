@@ -775,6 +775,58 @@ test("automatic verification uses one process card and renders the root unverifi
   }
 });
 
+test("invalid verification shell shows one redacted process-card reason and one root terminal", () => {
+  const stdin = new FakeInput();
+  const stdout = new FakeOutput();
+  stdout.rows = 36;
+  const terminal = ui(stdin, stdout);
+  terminal.start();
+  try {
+    terminal.handleRunEvent({
+      type: "run-start",
+      model: "vendor/model",
+      maxSteps: 6,
+      prompt: "edit",
+      timestamp: NOW,
+    });
+    terminal.handleRunEvent({
+      type: "process-start",
+      id: "task9-invalid-shell",
+      name: "verify",
+      input: { command: "task9-shell-check" },
+      timestamp: NOW + 1,
+    });
+    terminal.handleRunEvent({
+      type: "process-end",
+      id: "task9-invalid-shell",
+      name: "verify",
+      input: { command: "task9-shell-check" },
+      exitCode: null,
+      durationMs: 2,
+      truncated: false,
+      timedOut: false,
+      aborted: false,
+      error: "ENOENT: missing shell [REDACTED]",
+      timestamp: NOW + 2,
+    });
+    terminal.handleRunEvent({
+      type: "run-end",
+      outcome: "unverified",
+      durationMs: 3,
+      toolCount: 0,
+      timestamp: NOW + 3,
+    });
+
+    const screen = text(terminal.frame().lines);
+    assert.equal(screen.match(/task9-shell-check/g)?.length, 1);
+    assert.equal(screen.match(/missing shell \[REDACTED\]/g)?.length, 1, screen);
+    assert.equal(screen.match(/Lauf beendet · unbestätigt/g)?.length, 1);
+    assert.doesNotMatch(screen, /Prüflauf.*Runde/);
+  } finally {
+    terminal.stop();
+  }
+});
+
 test("fullscreen /diff terminal frames distinguish dirty, clean, and failed repositories without duplicate tails", async (t) => {
   try {
     execFileSync("git", ["--version"], { stdio: "ignore" });

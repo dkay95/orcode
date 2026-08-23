@@ -139,6 +139,35 @@ test("aborting between two commands cancels before the second one runs", needsPo
   assert.equal(events[0]?.command, "echo first");
 });
 
+test("abort synchronously from onProcessEnd wins over verifier exit 0 and exit 1", needsPosixShell, async (t) => {
+  for (const exitCode of [0, 1] as const) {
+    await t.test(`exit ${exitCode}`, async () => {
+      const guard = await tempWorkspace();
+      const controller = new AbortController();
+      const { onEvent, events } = collect();
+      const lifecycle: string[] = [];
+
+      const outcome = await runVerify(
+        [`exit ${exitCode}`],
+        guard,
+        controller.signal,
+        onEvent,
+        {
+          onProcessStart: () => lifecycle.push("start"),
+          onProcessEnd: () => {
+            lifecycle.push("end");
+            controller.abort();
+          },
+        },
+      );
+
+      assert.deepEqual(outcome, { status: "cancelled" });
+      assert.deepEqual(events, []);
+      assert.deepEqual(lifecycle, ["start", "end"]);
+    });
+  }
+});
+
 // ---------------------------------------------------------------------------
 // Behaviour: sequential execution, stop-at-first-failure, event shape.
 // ---------------------------------------------------------------------------
@@ -327,6 +356,201 @@ test("spawn or shell resolution failure is typed and keeps one terminal process 
   }
   assert.deepEqual(lifecycle.map((event) => event.type), ["start", "end"]);
   assert.match(lifecycle[1]?.error ?? "", /synthetic spawn failure/);
+});
+
+test("real POSIX signal termination is typed and never becomes a repairable exit", needsPosixShell, async () => {
+  const guard = await tempWorkspace();
+  const events: VerifyCommandEvent[] = [];
+  const completions: Array<{ exitCode: number | null; signal?: NodeJS.Signals }> = [];
+
+  const outcome = await runVerify(
+    ["kill -TERM $$"],
+    guard,
+    undefined,
+    (event) => events.push(event),
+    {
+      onProcessEnd: (_operation, completion) => completions.push({
+        exitCode: completion.exitCode,
+        ...(completion.signal ? { signal: completion.signal } : {}),
+      }),
+    },
+  );
+
+  assert.deepEqual(outcome, {
+    status: "terminated",
+    command: "kill -TERM $$",
+    signal: "SIGTERM",
+  });
+  assert.deepEqual(events, []);
+  assert.deepEqual(completions, [{ exitCode: null, signal: "SIGTERM" }]);
+});
+
+test("real POSIX command-not-found is typed and never becomes repairable exit 127", needsPosixShell, async () => {
+  const guard = await tempWorkspace();
+  const events: VerifyCommandEvent[] = [];
+  const ends: Array<{ exitCode: number | null; stderr?: string }> = [];
+  const command = "routercode_task9_command_that_does_not_exist";
+
+  const outcome = await runVerify(
+    [command],
+    guard,
+    undefined,
+    (event) => events.push(event),
+    {
+      onProcessEnd: (_operation, completion) => ends.push({
+        exitCode: completion.exitCode,
+        ...(completion.stderr ? { stderr: completion.stderr } : {}),
+      }),
+    },
+  );
+
+  assert.equal(outcome.status, "spawn-failed");
+  if (outcome.status === "spawn-failed") {
+    assert.match(outcome.error, /not found/i);
+  }
+  assert.deepEqual(events, []);
+  assert.equal(ends.length, 1);
+  assert.equal(ends[0]?.exitCode, 127);
+  assert.match(ends[0]?.stderr ?? "", /not found/i);
+});
+
+test("an ordinary explicit exit 127 stays repairable without command-resolution evidence", needsPosixShell, async () => {
+  const guard = await tempWorkspace();
+  const events: VerifyCommandEvent[] = [];
+
+  const outcome = await runVerify(
+    ["exit 127"],
+    guard,
+    undefined,
+    (event) => events.push(event),
+  );
+
+  assert.equal(outcome.status, "failed");
+  if (outcome.status === "failed") assert.equal(outcome.exitCode, 127);
+  assert.equal(events.length, 1);
+  assert.equal(events[0]?.exitCode, 127);
+});
+
+test("Windows-equivalent command resolution and launch causes are deterministically nonrepairable", async (t) => {
+  const cases = [
+    {
+      name: "cmd command-not-found exit 9009",
+      result: {
+        code: 9009,
+        stdout: "",
+        stderr: "is not recognized as an internal or external command",
+        truncated: false,
+        timedOut: false,
+        aborted: false,
+        signal: null,
+      },
+    },
+    {
+      name: "Windows launch error",
+      result: {
+        code: 1,
+        stdout: "",
+        stderr: "",
+        truncated: false,
+        timedOut: false,
+        aborted: false,
+        signal: null,
+        launchError: "spawn UNKNOWN",
+      },
+    },
+    {
+      name: "PowerShell CommandNotFoundException",
+      result: {
+        code: 1,
+        stdout: "",
+        stderr: "CommandNotFoundException: The term 'missing' is not recognized as the name of a cmdlet",
+        truncated: false,
+        timedOut: false,
+        aborted: false,
+        signal: null,
+      },
+    },
+  ] as const;
+
+  for (const item of cases) {
+    await t.test(item.name, async () => {
+      const guard = await tempWorkspace();
+      const events: VerifyCommandEvent[] = [];
+      const outcome = await runVerify(
+        ["windows fixture"],
+        guard,
+        undefined,
+        (event) => events.push(event),
+        {},
+        { execute: async () => item.result },
+      );
+
+      assert.equal(outcome.status, "spawn-failed");
+      assert.deepEqual(events, []);
+    });
+  }
+});
+
+test("successful output that only mentions a Windows resolution diagnostic still passes", async () => {
+  const guard = await tempWorkspace();
+  const outcome = await runVerify(
+    ["diagnostic fixture"],
+    guard,
+    undefined,
+    () => undefined,
+    {},
+    {
+      execute: async () => ({
+        code: 0,
+        stdout: "CommandNotFoundException is documented here",
+        stderr: "",
+        truncated: false,
+        timedOut: false,
+        aborted: false,
+        signal: null,
+      }),
+    },
+  );
+
+  assert.deepEqual(outcome, { status: "passed" });
+});
+
+test("invalid ORCODE_SHELL owns one redacted visible start/end lifecycle", async (t) => {
+  const guard = await tempWorkspace();
+  const secret = `${["sk", "or", "v1"].join("-")}-${"s".repeat(40)}`;
+  const missingShell = join(guard.root, `missing-${secret}`);
+  const previous = process.env.ORCODE_SHELL;
+  process.env.ORCODE_SHELL = missingShell;
+  t.after(() => {
+    if (previous === undefined) delete process.env.ORCODE_SHELL;
+    else process.env.ORCODE_SHELL = previous;
+  });
+  const lifecycle: Array<{ type: "start" | "end"; id: string; error?: string }> = [];
+
+  const outcome = await runVerify(
+    ["echo unreachable"],
+    guard,
+    undefined,
+    () => undefined,
+    {
+      onProcessStart: (operation) => lifecycle.push({ type: "start", id: operation.id }),
+      onProcessEnd: (operation, completion) => lifecycle.push({
+        type: "end",
+        id: operation.id,
+        ...(completion.error ? { error: completion.error } : {}),
+      }),
+    },
+  );
+
+  assert.equal(outcome.status, "spawn-failed");
+  if (outcome.status === "spawn-failed") {
+    assert.doesNotMatch(outcome.error, new RegExp(secret));
+    assert.match(outcome.error, /REDACTED/);
+  }
+  assert.deepEqual(lifecycle.map((event) => event.type), ["start", "end"]);
+  assert.equal(new Set(lifecycle.map((event) => event.id)).size, 1);
+  assert.doesNotMatch(lifecycle[1]?.error ?? "", new RegExp(secret));
+  assert.match(lifecycle[1]?.error ?? "", /REDACTED/);
 });
 
 test("repair failure reports are centrally redacted and compacted to fixed small bounds", needsPosixShell, async () => {

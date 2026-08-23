@@ -1815,6 +1815,10 @@ async function verifyCommand(args: string[], context: CommandContext): Promise<v
       context.out.text(outcome.distilled);
     } else if (outcome.status === "timed-out") {
       context.out.error(`Verify-Zeitlimit erreicht: ${outcome.command}`);
+    } else if (outcome.status === "terminated") {
+      context.out.error(
+        `Verify-Prozess durch ${outcome.signal} beendet: ${outcome.command}`,
+      );
     } else if (outcome.status === "spawn-failed") {
       context.out.error(
         `Verify konnte nicht gestartet werden: ${outcome.command}`,

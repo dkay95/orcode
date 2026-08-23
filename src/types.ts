@@ -222,6 +222,8 @@ export interface ProcessOperation {
 /** Terminal process data emitted exactly once, independently of a tool's final result. */
 export interface ProcessCompletion {
   exitCode: number | null;
+  /** Child termination signal when the OS ended it without an ordinary exit. */
+  signal?: NodeJS.Signals;
   durationMs: number;
   truncated: boolean;
   timedOut: boolean;

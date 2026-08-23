@@ -176,3 +176,101 @@ DONE
 - As before, provider cost is reported after calls. The SDK receives the exact
   remaining per-phase limit and no later repair starts after exhaustion, but a
   provider can only be charged from the actual usage it eventually reports.
+
+## Fix Round 1 — scope ruling
+
+- Review required an invalid configured shell to expose one redacted reason in
+  the existing process card and RunLog. The structured process-end error
+  already reached both consumers, but `exitCode: null` was classified by
+  `src/ui/view-model.ts` as an unverified collapsed card and its tail was
+  hidden.
+- The controller therefore approved the minimal out-of-brief renderer edit and
+  focused TUI assertion: an explicit completion error is a failed process card
+  with its one redacted line visible, without inventing an exit code, adding a
+  Verify card, or duplicating the tail. The risk is a state change only for
+  structured launch-error cards; the invalid-shell one-card/one-tail probe,
+  Task-9 TUI/RunLog focus, and full suite are the binding gates.
+
+## Fix Round 1 — verification terminal failures
+
+Base: clean `9e14260a0b9a64415aacc3cd9e4bfe4a47387034`.
+
+### Findings and RED evidence
+
+- A root abort raised synchronously by `onProcessEnd` was observed after the
+  verifier returned, so exit 0 committed staged state and exit 1 could enter a
+  repair before the root noticed cancellation. The named real-verifier/root
+  probes produced 3/3 failures (one parent and two exit-code subtests).
+- Signal termination and genuine command-resolution failures lost their cause
+  in `ProcessResult`; both could collapse into ordinary nonzero exits. The
+  named verifier matrix for abort, real POSIX signal, real POSIX missing
+  command, deterministic Windows equivalents, and invalid `ORCODE_SHELL`
+  produced 9/9 failures before production edits.
+- Subsequent bounded RED slices proved the remaining public surfaces: direct
+  `/verify now` signal reporting failed 1/1, the ordinary-exit-127 and
+  PowerShell classification controls failed 3 of 5, the invalid-shell TUI
+  reason failed 1/1, and an exit-0 diagnostic-text false-positive control
+  failed 1/1.
+
+### Implementation
+
+- `ProcessResult` now retains a POSIX signal and a compact launch/resolution
+  error. The observed runner owns exactly one start/end lifecycle even when
+  shell resolution or spawn fails; timeout, abort, signal, launch failure, and
+  ordinary exit remain distinct.
+- The verifier resolves the configured shell inside the observed operation,
+  sanitizes its terminal reason, rechecks root cancellation after the observed
+  await, and classifies only an ordinary proven test nonzero as `failed` and
+  repairable. Genuine POSIX/cmd/PowerShell resolution evidence and signal
+  termination are typed `terminated`/`spawn-failed` and remain unverified.
+- The root rechecks cancellation before interpreting verification, before
+  repair dispatch, and before the one Session/Conversation commit boundary.
+  Cancellation discards staged state and starts no repair while retaining only
+  genuinely incurred positive provider cost.
+- Direct `/verify now` renders a typed signal termination honestly. This
+  `src/commands.ts` change is mechanical exhaustiveness for the new verifier
+  outcome and the focused command test protects the user-visible contract; it
+  does not widen command semantics.
+- `src/types.ts` carries the already-produced signal through the existing
+  process event contract. The focused workspace, verifier, Agent, command, and
+  TUI tests are the smallest proof surfaces for the three review findings.
+- Per the recorded scope ruling, `src/ui/view-model.ts` treats only an explicit
+  structured completion error with no exit code as a failed process card and
+  displays its already-redacted line. It invents no exit code, adds no Verify
+  card, and preserves the one-card/one-tail layout. The cost is limited to
+  structured launch-error cards and is covered by the focused TUI/RunLog and
+  full regressions.
+
+### GREEN evidence
+
+- Exact Task-9 primary focus (`config`, `verify`, `agent`, `workspace`, `tui`,
+  `runlog`): 291/291 passed.
+- Conversation and command focus: 25/25 passed.
+- Privacy/process/conversation focus (`redaction`, `secrets`, `session`,
+  `workspace`, `agent`, `tui`, `runlog`, `conversation`): 296/296 passed.
+- Routing/resume/config/command focus (`config`, `commands`, `resume`,
+  `openrouter`, `models`, `reasoning`): 102/102 passed.
+- Both TypeScript checks passed. Full `npm test`: 815 passed, 0 failed, and 1
+  existing platform-only skip (816 total).
+- Central credential scanner, literal credential audit, and
+  `git diff --check`: passed.
+
+### Self-review and limits
+
+- Confirmed a synchronous abort from process end wins for both exit 0 and exit
+  1, produces one cancelled root terminal, starts no repair, and commits no
+  staged Session/Conversation state.
+- Confirmed real POSIX signal and missing-command paths plus invalid configured
+  shell produce one process terminal and one unverified root terminal, with no
+  repair. The compact visible reason passes through the existing central
+  redaction boundary and is neither duplicated nor expanded into a second
+  card.
+- Confirmed explicit `exit 127` without resolution evidence remains an
+  ordinary repairable failure, while diagnostic-looking text from exit 0 is
+  still a pass. Windows cmd/PowerShell/launch causes are tested
+  deterministically; no native Windows execution is claimed.
+- Confirmed the Task-7 one-history transaction and Task-8 process lifecycle,
+  streaming redaction, and single-terminal invariants remain covered by the
+  focused and full gates.
+
+Requested commit: `fix: keep verification terminal failures unrepairable`.

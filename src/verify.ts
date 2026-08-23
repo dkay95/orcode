@@ -107,11 +107,17 @@ export type VerifyOutcome =
   | { status: "passed" }
   | { status: "failed"; command: string; exitCode: number; distilled: string }
   | { status: "timed-out"; command: string }
+  | { status: "terminated"; command: string; signal: NodeJS.Signals }
   | { status: "spawn-failed"; command: string; error: string }
   | { status: "cancelled" };
 
 const VERIFY_TIMEOUT_MS = 120_000;
 const VERIFY_FAILURE_MAX_CHARS = 4_000;
+const COMMAND_RESOLUTION_EXIT_CODES = new Set([126, 127, 9009]);
+const COMMAND_RESOLUTION_DIAGNOSTIC =
+  /(?:command not found|not found|not recognized as an internal or external command|cannot execute|permission denied)/i;
+const POWERSHELL_RESOLUTION_DIAGNOSTIC =
+  /(?:CommandNotFoundException|The term .+ is not recognized as the name of)/i;
 
 /** Same pattern the render layer (2.5) uses to pick the informative lines out of red output. */
 const FAILURE_LINE_PATTERN = /(^|\s)(error|ERROR|FAIL|✗|panic|Traceback|error TS\d+)/;
@@ -154,21 +160,33 @@ export async function runVerify(
     const start = Date.now();
     let result: ProcessResult;
     try {
-      const shell = await resolveCommandShell();
       result = await runObservedProcess(
         "verify",
         { command },
         processCallbacks,
-        (onChunk) => (execution.execute ?? runProcess)(
-          shell.executable,
-          [...shell.args, command],
-          {
-            cwd: guard.root,
-            timeoutMs: VERIFY_TIMEOUT_MS,
-            ...(signal ? { signal } : {}),
-            onChunk,
-          },
-        ),
+        async (onChunk) => {
+          let shell: Awaited<ReturnType<typeof resolveCommandShell>>;
+          try {
+            shell = await resolveCommandShell();
+          } catch (error) {
+            // Resolution belongs to this visible attempt. Sanitize before the
+            // observed terminal callback can expose the configured path.
+            throw new Error(compactExecutionError(error));
+          }
+          const executed = await (execution.execute ?? runProcess)(
+            shell.executable,
+            [...shell.args, command],
+            {
+              cwd: guard.root,
+              timeoutMs: VERIFY_TIMEOUT_MS,
+              ...(signal ? { signal } : {}),
+              onChunk,
+            },
+          );
+          return executed.launchError
+            ? { ...executed, launchError: compactExecutionError(executed.launchError) }
+            : executed;
+        },
       );
     } catch (error) {
       if (signal?.aborted) {
@@ -177,14 +195,23 @@ export async function runVerify(
       return {
         status: "spawn-failed",
         command,
-        error: truncate(redactText(errorMessage(error)), 1_000),
+        error: compactExecutionError(error),
       };
     }
-    if (result.aborted) {
+    // onProcessEnd is synchronous and may be the callback that aborts the
+    // root. Recheck only after that terminal observer has returned.
+    if (signal?.aborted || result.aborted) {
       return { status: "cancelled" };
     }
     if (result.timedOut) {
       return { status: "timed-out", command };
+    }
+    if (result.signal) {
+      return { status: "terminated", command, signal: result.signal };
+    }
+    const resolutionError = commandResolutionError(result);
+    if (resolutionError) {
+      return { status: "spawn-failed", command, error: resolutionError };
     }
     onEvent({
       command,
@@ -202,6 +229,28 @@ export async function runVerify(
     }
   }
   return { status: "passed" };
+}
+
+function compactExecutionError(error: unknown): string {
+  return truncate(redactText(errorMessage(error)), 1_000);
+}
+
+function commandResolutionError(result: ProcessResult): string | null {
+  if (result.launchError) {
+    return compactExecutionError(result.launchError);
+  }
+  const detail = `${result.stderr}\n${result.stdout}`.trim();
+  const conventionalShellFailure =
+    COMMAND_RESOLUTION_EXIT_CODES.has(result.code) &&
+    COMMAND_RESOLUTION_DIAGNOSTIC.test(detail);
+  const powershellFailure =
+    result.code !== 0 && POWERSHELL_RESOLUTION_DIAGNOSTIC.test(detail);
+  if (!conventionalShellFailure && !powershellFailure) {
+    return null;
+  }
+  return compactExecutionError(
+    detail || `Kommando konnte nicht aufgelöst werden (exit ${result.code}).`,
+  );
 }
 
 function distillFailure(stdout: string, stderr: string): string {

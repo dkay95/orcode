@@ -144,6 +144,31 @@ test("direct /verify now forwards the live process lifecycle to the active surfa
   assert.ok(processEvents.every((event) => event.name === "verify"));
 });
 
+test("direct /verify now reports a signal termination without calling it cancellation", { skip: process.platform === "win32" ? "needs a POSIX shell" : false }, async () => {
+  const workspace = await mkdtemp(join(tmpdir(), "routercode-command-verify-signal-"));
+  const events: AgentRunEvent[] = [];
+  const output: string[] = [];
+  const config = structuredClone(DEFAULT_CONFIG);
+  config.verify.commands = ["kill -TERM $$"];
+  const context = {
+    workspace,
+    config,
+    agent: { guard: { root: workspace } },
+    onRunEvent: (event: AgentRunEvent) => events.push(event),
+    out: {
+      text: (value: string) => output.push(value),
+      error: (...values: string[]) => output.push(...values),
+    },
+  } as unknown as CommandContext;
+
+  await handleSlashCommand("/verify now", context);
+
+  const end = events.find((event) => event.type === "process-end");
+  assert.equal(end?.type === "process-end" ? end.signal : undefined, "SIGTERM");
+  assert.match(output.join("\n"), /SIGTERM/);
+  assert.doesNotMatch(output.join("\n"), /abgebrochen/i);
+});
+
 test("/verify rounds accepts zero, renders repair semantics, and rejects values above two", async () => {
   const workspace = await mkdtemp(join(tmpdir(), "routercode-command-verify-rounds-"));
   const output: string[] = [];

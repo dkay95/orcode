@@ -61,7 +61,7 @@ import type {
   ProcessOperation,
   ToolRisk,
 } from "./types.js";
-import { hasCode, isRecord, sanitizedEnvironment, truncate } from "./utils.js";
+import { errorMessage, hasCode, isRecord, sanitizedEnvironment, truncate } from "./utils.js";
 
 const MAX_FILE_BYTES = 1_500_000;
 const MAX_TOOL_OUTPUT = 80_000;
@@ -2285,6 +2285,10 @@ export interface ProcessResult {
   truncated: boolean;
   timedOut: boolean;
   aborted: boolean;
+  /** Present when the child ended by signal instead of an ordinary exit. */
+  signal?: NodeJS.Signals | null;
+  /** Present when the executable could not be launched at all. */
+  launchError?: string;
 }
 
 function safeNotify<TArgs extends unknown[]>(
@@ -2322,8 +2326,10 @@ export async function runObservedProcess(
     const result = await execute(onChunk);
     const stdout = boundedProcessCompletionText(result.stdout);
     const stderr = boundedProcessCompletionText(result.stderr);
+    const signal = result.signal ?? null;
     finish({
-      exitCode: result.code,
+      exitCode: signal ? null : result.code,
+      ...(signal ? { signal } : {}),
       durationMs: Date.now() - startedAt,
       truncated:
         result.truncated ||
@@ -2333,6 +2339,7 @@ export async function runObservedProcess(
       aborted: result.aborted,
       stdout,
       stderr,
+      ...(result.launchError ? { error: result.launchError } : {}),
     });
     return result;
   } catch (error) {
@@ -2359,7 +2366,7 @@ export function runProcess(
   args: string[],
   options: RunProcessOptions,
 ): Promise<ProcessResult> {
-  return new Promise((resolvePromise, rejectPromise) => {
+  return new Promise((resolvePromise) => {
     let stdout = "";
     let stderr = "";
     let truncated = false;
@@ -2373,6 +2380,7 @@ export function runProcess(
         truncated,
         timedOut: false,
         aborted: true,
+        signal: null,
       });
       return;
     }
@@ -2435,6 +2443,7 @@ export function runProcess(
         truncated,
         timedOut: reason === "timeout",
         aborted: reason === "abort",
+        signal: null,
       });
     };
     const onAbort = () => stop("abort");
@@ -2462,14 +2471,18 @@ export function runProcess(
       }
     });
     child.on("error", (error) => {
-      if (settled) {
-        return;
-      }
-      settled = true;
-      cleanup();
-      rejectPromise(error);
+      finish({
+        code: 1,
+        stdout,
+        stderr,
+        truncated,
+        timedOut: false,
+        aborted: false,
+        signal: null,
+        launchError: errorMessage(error),
+      });
     });
-    child.on("close", (code) => {
+    child.on("close", (code, signal) => {
       finish({
         code: code ?? 1,
         stdout,
@@ -2477,6 +2490,7 @@ export function runProcess(
         truncated,
         timedOut: false,
         aborted: false,
+        signal,
       });
     });
   });

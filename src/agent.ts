@@ -61,6 +61,7 @@ import {
 import { ReadRegistry } from "./read-registry.js";
 import {
   SDK_RETRY_CODES,
+  abortError,
   formatConnectionEvent,
   throwIfAborted,
 } from "./reconnect.js";
@@ -723,6 +724,11 @@ export class OrcodeAgent {
     let resolvedModel = this.config.mainModel;
     let failure: unknown;
     let outcome: AgentRunOutcome = "completed";
+    const captureRootAbort = (): boolean => {
+      if (!observer.signal?.aborted) return false;
+      failure = abortError(observer.signal);
+      return true;
+    };
 
     const executeModelPhase = async (
       input: Item[],
@@ -939,7 +945,14 @@ export class OrcodeAgent {
               processCallbacks,
             );
           } catch (error) {
-            failure = error;
+            failure = observer.signal?.aborted
+              ? abortError(observer.signal)
+              : error;
+            break;
+          }
+          // The verifier's synchronous terminal observer may have aborted the
+          // root even when an injected runner still returned passed/failed.
+          if (captureRootAbort()) {
             break;
           }
           if (verification.status === "passed") {
@@ -962,6 +975,11 @@ export class OrcodeAgent {
             break;
           }
 
+          // Keep the root signal authoritative at the repair-dispatch
+          // boundary as well as at the verifier-return boundary above.
+          if (captureRootAbort()) {
+            break;
+          }
           repairs += 1;
           const repairMessage = buildVerificationRepairMessage(
             verification,
@@ -974,6 +992,9 @@ export class OrcodeAgent {
           observer.onStatus?.(
             `${this.config.mainModel} repariert Verifikationsfehler (${repairs}/${this.config.verify.maxRepairRounds})`,
           );
+          if (captureRootAbort()) {
+            break;
+          }
           const repairPhase = await executeModelPhase(
             [{ role: "developer", content: repairMessage }],
             [repairMessage],
@@ -997,6 +1018,10 @@ export class OrcodeAgent {
         contextLength: modelInfo?.contextLength ?? 0,
       };
     }
+
+    // Final synchronous root boundary: no staged Session/Conversation state
+    // may commit after cancellation, regardless of the verifier outcome.
+    captureRootAbort();
 
     const cancelled =
       failure !== undefined &&
