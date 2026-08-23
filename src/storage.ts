@@ -663,6 +663,16 @@ async function migrateStorageHomeUnderConfigOwnership(
     };
   }
   const existingManifest = manifestState.kind === "valid" ? manifestState.manifest : null;
+  const configRefusal = await classifyAuthoritativeMigrationConfigs(
+    newExists,
+    legacyExists && !existingManifest?.complete,
+    newHome,
+    legacyHome,
+    sourceOwnership,
+    destinationOwnership,
+  );
+  if (configRefusal !== null) return configRefusal;
+
   if (existingManifest?.complete) {
     try {
       await privateStore.removeTree(existingManifest.stagingPath);
@@ -678,25 +688,6 @@ async function migrateStorageHomeUnderConfigOwnership(
 
   if (!legacyExists && !existingManifest) {
     if (!newExists) return { status: "ready", appHome: newHome, warning: null };
-    await destinationOwnership.assertHeld();
-    const destinationConfigFact = await inspectMigrationConfig(
-      destinationOwnership.canonicalPath,
-    );
-    await destinationOwnership.assertHeld();
-    if (destinationConfigFact.kind === "future") {
-      return {
-        status: "future",
-        appHome: newHome,
-        warning: `Config-Migration abgelehnt: providerSetup oder schemaVersion hat die zukünftige Version ${destinationConfigFact.version}.`,
-      };
-    }
-    if (destinationConfigFact.kind === "ambiguous") {
-      return {
-        status: "recovery-required",
-        appHome: newHome,
-        warning: "Config-Migration abgelehnt: Die Konfiguration ist beschädigt oder nicht eindeutig lesbar.",
-      };
-    }
     try {
       return await migrateCurrentConfigUnderLock(
         newHome,
@@ -720,46 +711,6 @@ async function migrateStorageHomeUnderConfigOwnership(
   }
 
   const activeSource = existingManifest?.sourcePath ?? legacyHome;
-  await sourceOwnership.assertHeld();
-  await destinationOwnership.assertHeld();
-  const sourceConfigFact = await inspectMigrationConfig(
-    sourceOwnership.canonicalPath,
-  );
-  await sourceOwnership.assertHeld();
-  if (sourceConfigFact.kind === "future") {
-    return {
-      status: "future",
-      appHome: newExists ? newHome : legacyHome,
-      warning: `Speichermigration abgelehnt: Eine Konfiguration hat die zukünftige schemaVersion ${sourceConfigFact.version}.`,
-    };
-  }
-  if (sourceConfigFact.kind === "ambiguous") {
-    return {
-      status: "recovery-required",
-      appHome: newExists ? newHome : legacyHome,
-      warning: "Speichermigration abgelehnt: Eine Konfiguration ist beschädigt oder nicht eindeutig lesbar.",
-    };
-  }
-  if (newExists) {
-    const destinationConfigFact = await inspectMigrationConfig(
-      destinationOwnership.canonicalPath,
-    );
-    await destinationOwnership.assertHeld();
-    if (destinationConfigFact.kind === "future") {
-      return {
-        status: "future",
-        appHome: newHome,
-        warning: `Speichermigration abgelehnt: Eine Konfiguration hat die zukünftige schemaVersion ${destinationConfigFact.version}.`,
-      };
-    }
-    if (destinationConfigFact.kind === "ambiguous") {
-      return {
-        status: "recovery-required",
-        appHome: newHome,
-        warning: "Speichermigration abgelehnt: Eine Konfiguration ist beschädigt oder nicht eindeutig lesbar.",
-      };
-    }
-  }
 
   if (existingManifest && await checksumTree(activeSource) !== existingManifest.sourceChecksum) {
     return {
@@ -1458,6 +1409,51 @@ type MigrationConfigFact =
   | { kind: "clear" }
   | { kind: "future"; version: number }
   | { kind: "ambiguous" };
+
+async function classifyAuthoritativeMigrationConfigs(
+  destinationIsAuthoritative: boolean,
+  sourceIsAuthoritative: boolean,
+  newHome: string,
+  legacyHome: string,
+  sourceOwnership: ConfigWriteOwnership,
+  destinationOwnership: ConfigWriteOwnership,
+): Promise<AppHomeMigrationResult | null> {
+  if (sourceIsAuthoritative) {
+    const refusal = await classifyMigrationConfigUnderOwnership(
+      sourceOwnership,
+      destinationIsAuthoritative ? newHome : legacyHome,
+    );
+    if (refusal !== null) return refusal;
+  }
+  if (destinationIsAuthoritative) {
+    return classifyMigrationConfigUnderOwnership(destinationOwnership, newHome);
+  }
+  return null;
+}
+
+async function classifyMigrationConfigUnderOwnership(
+  ownership: ConfigWriteOwnership,
+  appHome: string,
+): Promise<AppHomeMigrationResult | null> {
+  await ownership.assertHeld();
+  const fact = await inspectMigrationConfig(ownership.canonicalPath);
+  await ownership.assertHeld();
+  if (fact.kind === "future") {
+    return {
+      status: "future",
+      appHome,
+      warning: `Config-Migration abgelehnt: providerSetup oder schemaVersion hat die zukünftige Version ${fact.version}.`,
+    };
+  }
+  if (fact.kind === "ambiguous") {
+    return {
+      status: "recovery-required",
+      appHome,
+      warning: "Config-Migration abgelehnt: Die Konfiguration ist beschädigt oder nicht eindeutig lesbar.",
+    };
+  }
+  return null;
+}
 
 async function inspectMigrationConfig(path: string): Promise<MigrationConfigFact> {
   let snapshot: ConfigFileSnapshot;

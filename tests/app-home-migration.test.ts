@@ -120,6 +120,69 @@ async function snapshotFileTree(root: string): Promise<Record<string, string>> {
   return snapshot;
 }
 
+interface ManifestResumeFixture {
+  legacy: string;
+  target: string;
+  configPath: string;
+  stagingPath: string;
+}
+
+async function completedManifestResumeFixture(prefix: string): Promise<ManifestResumeFixture> {
+  const root = await mkdtemp(join(tmpdir(), prefix));
+  const legacy = join(root, ".routercode");
+  const target = join(root, ".orcode");
+  await seedHome(legacy);
+  const completed = await migrateAppHome(target, legacy);
+  assert.equal(completed.status, "ready");
+  const manifest = JSON.parse(await readFile(migrationManifestPath(target), "utf8")) as {
+    phase: string;
+    complete: boolean;
+    stagingPath: string;
+  };
+  assert.equal(manifest.phase, "complete");
+  assert.equal(manifest.complete, true);
+  await mkdir(manifest.stagingPath, { recursive: true });
+  await writeFile(join(manifest.stagingPath, "must-remain.txt"), "completed staging sentinel");
+  return {
+    legacy,
+    target,
+    configPath: join(target, "config.json"),
+    stagingPath: manifest.stagingPath,
+  };
+}
+
+async function postRenameManifestResumeFixture(prefix: string): Promise<ManifestResumeFixture> {
+  const root = await mkdtemp(join(tmpdir(), prefix));
+  const legacy = join(root, ".routercode");
+  const target = join(root, ".orcode");
+  await seedHome(legacy);
+  await assert.rejects(
+    migrateAppHome(target, legacy, {
+      onPhase: async (phase: string) => {
+        if (phase === "backed-up") {
+          throw new Error("synthetic stop after legacy rename");
+        }
+      },
+    } as never),
+    /synthetic stop after legacy rename/,
+  );
+  const manifest = JSON.parse(await readFile(migrationManifestPath(target), "utf8")) as {
+    phase: string;
+    complete: boolean;
+    stagingPath: string;
+  };
+  assert.equal(manifest.phase, "backed-up");
+  assert.equal(manifest.complete, false);
+  assert.equal(await exists(legacy), false);
+  await writeFile(join(manifest.stagingPath, "must-remain.txt"), "post-rename staging sentinel");
+  return {
+    legacy,
+    target,
+    configPath: join(target, "config.json"),
+    stagingPath: manifest.stagingPath,
+  };
+}
+
 interface MigrationRaceResult {
   status: "ready" | "declined" | "future" | "recovery-required";
   appHome: string;
@@ -742,6 +805,78 @@ test("legacy root rename holds the source config writer ownership through the mo
   assert.equal(enteredWhileRenamePaused, false);
   void writerOutcome;
   assert.equal((result as typeof result & { status?: string }).status, "ready");
+});
+
+test("completed migration classifies a persistent nested future provider state before staging cleanup", async () => {
+  const fixture = await completedManifestResumeFixture("orcode-migration-complete-future-provider-");
+  const futureBytes = `${JSON.stringify({
+    schemaVersion: 1,
+    mainModel: "future/after-complete",
+    providerSetup: { schemaVersion: 99, opaque: "persistent-future-provider-state" },
+  }, null, 2)}\n`;
+  await writeFile(fixture.configPath, futureBytes);
+  const before = await snapshotFileTree(fixture.target);
+
+  const result = await migrateAppHome(fixture.target, fixture.legacy);
+
+  assert.equal(result.status, "future");
+  assert.deepEqual(await snapshotFileTree(fixture.target), before);
+  assert.equal(await readFile(fixture.configPath, "utf8"), futureBytes);
+  assert.equal(await readFile(join(fixture.stagingPath, "must-remain.txt"), "utf8"), "completed staging sentinel");
+});
+
+test("completed migration classifies corrupt provider state before staging cleanup", async () => {
+  const fixture = await completedManifestResumeFixture("orcode-migration-complete-corrupt-provider-");
+  const corruptBytes = `${JSON.stringify({
+    schemaVersion: 1,
+    mainModel: "corrupt/after-complete",
+    providerSetup: { schemaVersion: 1, connections: "not-an-array" },
+  }, null, 2)}\n`;
+  await writeFile(fixture.configPath, corruptBytes);
+  const before = await snapshotFileTree(fixture.target);
+
+  const result = await migrateAppHome(fixture.target, fixture.legacy);
+
+  assert.equal(result.status, "recovery-required");
+  assert.deepEqual(await snapshotFileTree(fixture.target), before);
+  assert.equal(await readFile(fixture.configPath, "utf8"), corruptBytes);
+  assert.equal(await readFile(join(fixture.stagingPath, "must-remain.txt"), "utf8"), "completed staging sentinel");
+});
+
+test("post-rename resume classifies a nested future provider state before staging or manifest effects", async () => {
+  const fixture = await postRenameManifestResumeFixture("orcode-migration-post-rename-future-provider-");
+  const futureBytes = `${JSON.stringify({
+    schemaVersion: 1,
+    mainModel: "future/after-rename",
+    providerSetup: { schemaVersion: 99, opaque: "post-rename-future-provider-state" },
+  }, null, 2)}\n`;
+  await writeFile(fixture.configPath, futureBytes);
+  const before = await snapshotFileTree(fixture.target);
+
+  const result = await migrateAppHome(fixture.target, fixture.legacy);
+
+  assert.equal(result.status, "future");
+  assert.deepEqual(await snapshotFileTree(fixture.target), before);
+  assert.equal(await readFile(fixture.configPath, "utf8"), futureBytes);
+  assert.equal(await readFile(join(fixture.stagingPath, "must-remain.txt"), "utf8"), "post-rename staging sentinel");
+});
+
+test("post-rename resume classifies corrupt provider state before staging or manifest effects", async () => {
+  const fixture = await postRenameManifestResumeFixture("orcode-migration-post-rename-corrupt-provider-");
+  const corruptBytes = `${JSON.stringify({
+    schemaVersion: 1,
+    mainModel: "corrupt/after-rename",
+    providerSetup: { schemaVersion: 1, connections: "not-an-array" },
+  }, null, 2)}\n`;
+  await writeFile(fixture.configPath, corruptBytes);
+  const before = await snapshotFileTree(fixture.target);
+
+  const result = await migrateAppHome(fixture.target, fixture.legacy);
+
+  assert.equal(result.status, "recovery-required");
+  assert.deepEqual(await snapshotFileTree(fixture.target), before);
+  assert.equal(await readFile(fixture.configPath, "utf8"), corruptBytes);
+  assert.equal(await readFile(join(fixture.stagingPath, "must-remain.txt"), "utf8"), "post-rename staging sentinel");
 });
 
 test("a complete manifest resumes exact staging cleanup before startup reports ready", async () => {
