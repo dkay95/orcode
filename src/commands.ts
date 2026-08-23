@@ -66,6 +66,7 @@ import {
 } from "./openrouter.js";
 import {
   PANEL_MIN_MODELS,
+  PanelAuthenticationRejectedError,
   askPanel,
   estimatePanelCost,
   synthesize,
@@ -130,6 +131,10 @@ export interface ProviderCredentialIntentPort {
   }>;
 }
 
+export interface ProviderRouteIntentPort {
+  transitionModel(modelId: string, canonicalModelId?: string): Promise<void>;
+}
+
 export interface CommandLocalRuntime {
   guard: WorkspaceGuard;
   journal: ChangeJournal;
@@ -145,6 +150,8 @@ export interface CommandContext<Agent extends OrcodeAgent | null = OrcodeAgent> 
   agent: Agent;
   localRuntime?: CommandLocalRuntime;
   providerCredentials?: ProviderCredentialIntentPort;
+  /** Shared provider runtime seam for route-changing model/session commands. */
+  providerRoutes?: ProviderRouteIntentPort;
   workspace: string;
   credentials: CredentialStoreLike;
   out: CommandOutput;
@@ -1038,12 +1045,14 @@ async function modelCommand(args: string[], context: CommandContext): Promise<vo
     await selectModel(exact, context);
     return;
   }
+  await context.providerRoutes?.transitionModel(id, id);
   context.config.mainModel = id;
   context.session.setPreferences(
     context.config.mainModel,
     getReasoningSetting(context.config),
   );
-  await Promise.all([saveContextConfig(context), context.session.save()]);
+  await saveContextConfig(context);
+  await context.session.save();
   context.out.text(chalk.green(`Main-Modell: ${id}`));
 }
 
@@ -1339,13 +1348,26 @@ async function panelAskCommand(question: string, context: CommandContext): Promi
   }
 
   const callModel = context.panelCall ?? createPanelCall(context.openRouter);
-  const result = await askPanel({
-    question,
-    models,
-    callModel,
-    maxCostUsd: context.config.maxCostUsd,
-    estimateCostUsd: estimateForModel,
-  });
+  let result: PanelResult;
+  try {
+    result = await askPanel({
+      question,
+      models,
+      callModel,
+      maxCostUsd: context.config.maxCostUsd,
+      estimateCostUsd: estimateForModel,
+    });
+  } catch (error) {
+    if (
+      error instanceof PanelAuthenticationRejectedError
+      && error.partialResult
+    ) {
+      context.session.addCost("main", error.partialResult.totalCostUsd);
+      context.lastPanelResult = error.partialResult;
+      await context.session.save();
+    }
+    throw error;
+  }
   // Counted as "main" spend so it counts toward the workspace budget
   // (/budget) like every other model call — the session type has no
   // dedicated "panel" cost category, and adding one is out of scope here.
@@ -1363,6 +1385,11 @@ async function panelAskCommand(question: string, context: CommandContext): Promi
       });
       context.session.addCost("main", judgment.costUsd);
     } catch (error) {
+      if (error instanceof PanelAuthenticationRejectedError) {
+        context.lastPanelJudgment = null;
+        await context.session.save();
+        throw error;
+      }
       context.out.text(chalk.yellow(`Auswertung übersprungen: ${errorMessage(error)}`));
     }
   }
@@ -1776,6 +1803,9 @@ async function replaceSession(
 ): Promise<void> {
   if (context.session.data.id !== next.data.id) {
     await saveSessionPreferences(context);
+  }
+  if (next.data.model && next.data.model !== context.config.mainModel) {
+    await context.providerRoutes?.transitionModel(next.data.model);
   }
   context.session = next;
   if (next.data.model) {
@@ -2500,12 +2530,17 @@ async function selectModel(
   model: ModelInfo,
   context: CommandContext,
 ): Promise<void> {
+  await context.providerRoutes?.transitionModel(
+    model.id,
+    model.canonicalSlug ?? model.id,
+  );
   context.config.mainModel = model.id;
   context.session.setPreferences(
     context.config.mainModel,
     getReasoningSetting(context.config),
   );
-  await Promise.all([saveContextConfig(context), context.session.save()]);
+  await saveContextConfig(context);
+  await context.session.save();
   printModelDetails(model, true, context.out);
 }
 

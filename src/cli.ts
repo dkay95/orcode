@@ -45,6 +45,7 @@ import {
   type CommandLocalRuntime,
   type CommandOutput,
   type ProviderCredentialIntentPort,
+  type ProviderRouteIntentPort,
 } from "./commands.js";
 import {
   APP_HOME,
@@ -415,7 +416,7 @@ export interface ProviderRuntimeInput {
   requestedModel?: string;
 }
 
-export interface ProviderRuntime {
+export interface ProviderRuntime extends ProviderRouteIntentPort {
   readonly openRouter: OpenRouterService;
   readonly credentials: CredentialStore;
   readonly preparedRoles: SetupPreparedRoles | null;
@@ -521,6 +522,7 @@ class DefaultProviderRuntime implements ProviderRuntime {
     private savedSecret: string | null,
     private environmentSecret: string | null,
     private readonly requestedModel: string,
+    private readonly config: OrcodeConfigWithBudget,
   ) {}
 
   get preparedRoles(): SetupPreparedRoles | null {
@@ -537,6 +539,9 @@ class DefaultProviderRuntime implements ProviderRuntime {
     this.#preparedRoles = null;
     this.savedSecret = persisted ? secret : null;
     this.environmentSecret = persisted ? null : secret;
+    if (persisted) {
+      this.config.providerSetup = requirePersistableProviderState(this.stateStore.read());
+    }
   }
 
   adoptCredentialForget(): void {
@@ -545,6 +550,7 @@ class DefaultProviderRuntime implements ProviderRuntime {
     this.#preparedRoles = null;
     this.savedSecret = null;
     this.environmentSecret = null;
+    this.config.providerSetup = requirePersistableProviderState(this.stateStore.read());
   }
 
   async inspectStartup(): Promise<StartupSetupResult> {
@@ -644,6 +650,54 @@ class DefaultProviderRuntime implements ProviderRuntime {
       this.#sessionRoutePersisted = false;
     }
     return this.orchestrator.ensureRunnableRoute();
+  }
+
+  async transitionModel(modelId: string, canonicalModelId?: string): Promise<void> {
+    const current = this.ensureRunnableRoute();
+    const resolved = canonicalModelId === undefined
+      ? await resolveMainModelCandidate(this.openRouter, modelId)
+      : null;
+    const selectedCanonicalModelId = canonicalModelId
+      ?? resolved?.canonicalSlug
+      ?? resolved?.id
+      ?? modelId;
+    if (
+      current.requestedModelId === modelId
+      && current.canonicalModelId === selectedCanonicalModelId
+    ) {
+      return;
+    }
+
+    const state = this.stateStore.read();
+    const currentIsPersisted = Boolean(
+      this.savedSecret
+      && state.defaultRoute
+      && sameRoute(state.defaultRoute, current)
+      && state.defaultRoute.requestedModelId === current.requestedModelId
+    );
+    const candidate = this.openRouter.requireKey();
+    const result = await this.orchestrator.activateCandidate({
+      expectedRevision: state.revision,
+      candidate,
+      selectedCanonicalModelId,
+      signal: new AbortController().signal,
+      persistence: this.#sessionRoute
+        ? (this.#sessionRoutePersisted ? "persisted" : "process-only")
+        : (currentIsPersisted ? "persisted" : "process-only"),
+    });
+    const route = validateRouteIdentityV1(result.route);
+    if (
+      !route
+      || route.resolutionState !== "resolved"
+      || route.requestedModelId !== modelId
+      || route.canonicalModelId !== selectedCanonicalModelId
+      || route.backendId !== current.backendId
+      || route.accountFingerprint !== current.accountFingerprint
+      || route.billingRealm !== current.billingRealm
+    ) {
+      throw new ProviderSetupRequiredError();
+    }
+    this.adoptCredentialActivation(route, result.persisted, candidate);
   }
 
   async runWithReadyRoute<T>(
@@ -753,11 +807,12 @@ export function createProviderCredentialController(input: {
   };
   runtimeGuard: ProviderActivationRuntimeGuard;
   activationCoordinator: Pick<ProviderActivationCoordinator, "activate">;
+  getInferenceRoute?(): RouteIdentityV1;
   onInferenceReady?(route: RouteIdentityV1, persisted: boolean, candidate: string): void;
   onInferenceForgotten?(): void;
 }): ProviderCredentialIntentPort {
   const inferenceRoute = (): RouteIdentityV1 => {
-    const route = input.stateStore.read().defaultRoute;
+    const route = input.getInferenceRoute?.() ?? input.stateStore.read().defaultRoute;
     if (!route?.canonicalModelId || route.resolutionState !== "resolved") {
       throw new ProviderSetupRequiredError();
     }
@@ -800,10 +855,13 @@ export function createProviderCredentialController(input: {
           const connection = state.connections.find((candidate) =>
             candidate.backendId === "openrouter" && candidate.enabled
           );
-          await input.stateStore.commit(state.revision, (current) => ({
+          const retiring = await input.stateStore.commit(state.revision, (current) => ({
             ...current,
             lifecycle: "configured",
-            connections: current.connections.filter((candidate) => candidate.id !== connection?.id),
+            // Retain the exact pointer until deletion is confirmed. A crash
+            // after this publication can therefore retry the same versioned
+            // slot instead of falling back to the legacy credential.
+            connections: current.connections,
             defaultRoute: null,
             cross: { enabled: false, preferredLead: null, preferredChallenger: null },
           }));
@@ -817,6 +875,13 @@ export function createProviderCredentialController(input: {
           } else if (input.credentials.delete) {
             removed = await input.credentials.delete("inference");
           }
+          await input.stateStore.commit(retiring.revision, (current) => ({
+            ...current,
+            lifecycle: "configured",
+            connections: current.connections.filter((candidate) => candidate.id !== connection?.id),
+            defaultRoute: null,
+            cross: { enabled: false, preferredLead: null, preferredChallenger: null },
+          }));
           input.openRouter.forgetKey();
           input.onInferenceForgotten?.();
           await lease.assertHeld();
@@ -1149,6 +1214,10 @@ export async function createDefaultProviderRuntime(
     credentials,
     runtimeGuard,
     activationCoordinator,
+    getInferenceRoute: () => {
+      if (!runtimeOwner) throw new ProviderSetupRequiredError();
+      return runtimeOwner.ensureRunnableRoute();
+    },
     onInferenceReady: (route, persisted, candidate) => {
       runtimeOwner?.adoptCredentialActivation(route, persisted, candidate);
     },
@@ -1168,6 +1237,7 @@ export async function createDefaultProviderRuntime(
     savedSecret,
     recoveredInference.environment,
     input.requestedModel ?? startup.config.mainModel,
+    startup.config,
   );
   return runtimeOwner;
 }
@@ -1427,6 +1497,7 @@ export async function runCli(
     agent,
     credentials: providerRuntime.credentials,
     providerCredentials: providerRuntime.providerCredentials,
+    providerRoutes: providerRuntime,
     localRuntime,
     out,
     ruleStore,
@@ -1464,6 +1535,7 @@ interface RuntimeContext {
   agent: OrcodeAgent | null;
   localRuntime: CommandLocalRuntime;
   providerCredentials: ProviderCredentialIntentPort;
+  providerRoutes: ProviderRouteIntentPort;
   providerRuntime: ProviderRuntime;
   credentials: CredentialStore;
   out: CommandOutput;
@@ -1526,12 +1598,16 @@ async function runPlainLoop(
           commandName,
           commandArguments(trimmed),
         );
-        if (requiresRoute) {
+        const transitionsRoute = commandTransitionsRunnableRoute(
+          commandName,
+          commandArguments(trimmed),
+        );
+        if (requiresRoute || transitionsRoute) {
           const agent = await context.ensureAgentForPrompt();
           context.agent = agent;
         }
         const executeCommand = () => handleSlashCommand(trimmed, context as RuntimeContext);
-        const outcome = requiresRoute
+        const outcome = requiresRoute && !transitionsRoute
           ? await context.providerRuntime.runWithReadyRoute((route) => {
               assertModelBoundToRoute(context.config.mainModel, route);
               return executeCommand();
@@ -2041,6 +2117,7 @@ async function runDashboard(
           }
 
           if (completedCommand === "model" && commandArgs.length === 0) {
+            context.agent = await context.ensureAgentForPrompt(setupSurface);
             const selected = await pickDashboardModel(ui, context as RuntimeContext);
             if (selected) {
               context.session.setPreferences(
@@ -2256,11 +2333,16 @@ async function runDashboard(
           }
 
           const executeCommand = () => handleSlashCommand(trimmed, context as RuntimeContext);
-          const outcome = commandRequiresRunnableRoute(
+          const requiresRoute = commandRequiresRunnableRoute(
             completedCommand,
             commandArgs,
             "dashboard",
-          )
+          );
+          if (commandTransitionsRunnableRoute(completedCommand, commandArgs)) {
+            context.agent = await context.ensureAgentForPrompt(setupSurface);
+          }
+          const outcome = requiresRoute
+            && !commandTransitionsRunnableRoute(completedCommand, commandArgs)
             ? await context.providerRuntime.runWithReadyRoute((route) => {
                 assertModelBoundToRoute(context.config.mainModel, route);
                 return executeCommand();
@@ -2508,6 +2590,9 @@ async function pickDashboardChat(
       picked.value,
       context.session.appHome,
     );
+    if (next.data.model && next.data.model !== context.config.mainModel) {
+      await context.providerRuntime.transitionModel(next.data.model);
+    }
     if (next.data.model) {
       context.config.mainModel = next.data.model;
     }
@@ -2932,6 +3017,13 @@ export function commandRequiresRunnableRoute(
   return mode === "dashboard" && command === "whisper";
 }
 
+function commandTransitionsRunnableRoute(
+  command: string,
+  args: readonly string[],
+): boolean {
+  return command === "model" && (args[0] ?? "").toLowerCase() !== "current";
+}
+
 function commandTail(raw: string): string {
   return raw.match(/^\/\S+(?:\s+([\s\S]*))?$/)?.[1]?.trim() ?? "";
 }
@@ -3188,6 +3280,10 @@ export async function pickDashboardModel(
   if (!selected) {
     return null;
   }
+  await context.providerRuntime?.transitionModel(
+    selected.id,
+    selected.canonicalSlug ?? selected.id,
+  );
   context.config.mainModel = selected.id;
   await saveConfig(context.config, context.configPath);
   return selected;

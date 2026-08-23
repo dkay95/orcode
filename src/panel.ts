@@ -60,6 +60,8 @@ export interface PanelAnswer {
   outputTokens: number;
   /** German, user facing. `null` on success. */
   error: string | null;
+  /** Fixed structural marker; never contains provider response data. */
+  failureCode?: "authentication-rejected";
 }
 
 export interface PanelResult {
@@ -112,6 +114,15 @@ export class PanelValidationError extends Error {
   constructor(message: string) {
     super(message);
     this.name = "PanelValidationError";
+  }
+}
+
+export class PanelAuthenticationRejectedError extends Error {
+  readonly code = "provider-authentication-rejected";
+
+  constructor(readonly partialResult?: PanelResult) {
+    super("Provider authentication was rejected.");
+    this.name = "PanelAuthenticationRejectedError";
   }
 }
 
@@ -237,6 +248,7 @@ async function runOneModel(
   } catch (error) {
     // A failing or slow model must never take the others down with it — its
     // place in the result carries the error instead of rejecting the panel.
+    const authenticationRejected = error instanceof PanelAuthenticationRejectedError;
     return {
       model,
       text: "",
@@ -244,7 +256,12 @@ async function runOneModel(
       durationMs: Date.now() - start,
       inputTokens: 0,
       outputTokens: 0,
-      error: errorMessage(error),
+      error: authenticationRejected
+        ? "Provider authentication was rejected."
+        : errorMessage(error),
+      ...(authenticationRejected
+        ? { failureCode: "authentication-rejected" as const }
+        : {}),
     };
   }
 }
@@ -275,13 +292,17 @@ export async function askPanel(options: AskPanelOptions): Promise<PanelResult> {
   const answers = await Promise.all(
     models.map((model) => runOneModel(model, question, context, callModel, signal)),
   );
-  return {
+  const result: PanelResult = {
     question,
     ...(context !== undefined ? { context } : {}),
     answers,
     totalCostUsd: answers.reduce((sum, answer) => sum + answer.costUsd, 0),
     durationMs: Date.now() - start,
   };
+  if (answers.some((answer) => answer.failureCode === "authentication-rejected")) {
+    throw new PanelAuthenticationRejectedError(result);
+  }
+  return result;
 }
 
 // ---------------------------------------------------------------------------
@@ -362,6 +383,7 @@ export async function synthesize(options: SynthesizeOptions): Promise<PanelJudgm
       error: null,
     };
   } catch (error) {
+    if (error instanceof PanelAuthenticationRejectedError) throw error;
     return {
       judgeModel,
       text: "",

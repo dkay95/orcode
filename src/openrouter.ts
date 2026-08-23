@@ -21,7 +21,7 @@ import {
   type FetchLike,
   type RetryClock,
 } from "./reconnect.js";
-import type { PanelCall } from "./panel.js";
+import { PanelAuthenticationRejectedError, type PanelCall } from "./panel.js";
 import { errorMessage, isRecord } from "./utils.js";
 
 const API_BASE = "https://openrouter.ai/api/v1";
@@ -1479,6 +1479,9 @@ export function createPanelCall(service: OpenRouterService): PanelCall {
       // Same redaction/translation every other OpenRouter call gets — a
       // panel error column is exactly the kind of place a raw key leak would
       // otherwise end up.
+      if (service.runtimeState.inferenceValidity === "rejected") {
+        throw new PanelAuthenticationRejectedError();
+      }
       throw new Error(service.safeMessage(error));
     }
   };

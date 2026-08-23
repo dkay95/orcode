@@ -319,6 +319,74 @@ test("inference key replace and forget delegate to the shared provider credentia
   ]);
 });
 
+test("/model proves the selected route before mutating config or session preferences", async () => {
+  const { context } = await harness();
+  context.config.mainModel = "vendor/a";
+  context.session.setPreferences("vendor/a", { mode: "auto" });
+  context.openRouter.listModels = async () => [{
+    id: "vendor/b",
+    name: "Vendor B",
+    description: "",
+    contextLength: 128_000,
+    promptPrice: 0,
+    completionPrice: 0,
+    supportedParameters: ["tools"],
+    inputModalities: ["text"],
+    outputModalities: ["text"],
+  }];
+  const transitions: string[] = [];
+  (context as CommandContext & {
+    providerRoutes: { transitionModel(modelId: string): Promise<void> };
+  }).providerRoutes = {
+    async transitionModel(modelId) {
+      assert.equal(context.config.mainModel, "vendor/a");
+      assert.equal(context.session.data.model, "vendor/a");
+      transitions.push(modelId);
+    },
+  };
+
+  await handleSlashCommand("/model vendor/b", context);
+
+  assert.deepEqual(transitions, ["vendor/b"]);
+  assert.equal(context.config.mainModel, "vendor/b");
+  assert.equal(context.session.data.model, "vendor/b");
+});
+
+test("opening a chat with another saved model rejects before config or active-session mutation without route proof", async () => {
+  const { context } = await harness();
+  context.config.mainModel = "vendor/a";
+  context.session.setPreferences("vendor/a", { mode: "auto" });
+  await context.session.save();
+  const originalId = context.session.data.id;
+  const other = SessionStore.create(context.workspace, context.session.appHome, "Route B Chat");
+  other.setPreferences("vendor/b", { mode: "auto" });
+  await other.save();
+  (context as CommandContext & {
+    providerRoutes: { transitionModel(modelId: string): Promise<void> };
+  }).providerRoutes = {
+    async transitionModel(modelId) {
+      assert.equal(modelId, "vendor/b");
+      throw Object.assign(new Error("route transition required"), {
+        code: "provider-setup-required",
+      });
+    },
+  };
+
+  await assert.rejects(
+    handleSlashCommand("/chat open Route B Chat", context),
+    (error: unknown) => (
+      typeof error === "object"
+      && error !== null
+      && "code" in error
+      && error.code === "provider-setup-required"
+    ),
+  );
+
+  assert.equal(context.config.mainModel, "vendor/a");
+  assert.equal(context.session.data.id, originalId);
+  assert.equal(context.session.data.model, "vendor/a");
+});
+
 test("/checkpoint marks a point and rewinds to it", async () => {
   const { context } = await harness({ approve: true });
   await handleSlashCommand("/checkpoint new Basis", context);
