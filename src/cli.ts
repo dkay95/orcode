@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-import { input, confirm, select } from "@inquirer/prompts";
+import { input, confirm, password, select } from "@inquirer/prompts";
 import chalk from "chalk";
 import { execFile } from "node:child_process";
 import { readFileSync, realpathSync } from "node:fs";
@@ -124,6 +124,7 @@ import {
 import { errorMessage, formatUsd } from "./utils.js";
 import { RunLog } from "./runlog.js";
 import { collectRetentionErrors } from "./storage.js";
+import { createPlainSetupSurface } from "./setup-ui.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -133,6 +134,18 @@ const execFileAsync = promisify(execFile);
  * same chat looked different depending on how you got there.
  */
 const VISIBLE_TURNS = 40;
+
+/** Binds the transport-neutral setup hub to the existing plain prompts. */
+export function createCliPlainSetupSurface() {
+  return createPlainSetupSurface({
+    select,
+    password,
+    confirm,
+    present(event) {
+      if (event.type === "notice") console.error(event.message);
+    },
+  });
+}
 
 /**
  * K8: a "Bedienfehler" — bad CLI usage, caught by `main()`'s top-level

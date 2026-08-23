@@ -19,6 +19,7 @@ import {
   runOutcomeExitCode,
 } from "../src/cli.js";
 import * as cliModule from "../src/cli.js";
+import { createPlainSetupSurface } from "../src/setup-ui.js";
 import { COMMAND_CATALOG } from "../src/command-catalog.js";
 import { DEFAULT_CONFIG } from "../src/config.js";
 import { OpenRouterService } from "../src/openrouter.js";
@@ -82,6 +83,20 @@ test("dashboard pre-dispatch uses exact catalog aliases and preserves unknown to
 });
 
 const STARTUP_KEY_PREFIX = `${["sk", "or", "v1"].join("-")}-`;
+
+test("plain setup surface keeps secret input masked and maps cancelled prompts to null", async () => {
+  const calls: Array<Record<string, unknown>> = [];
+  const surface = createPlainSetupSurface({
+    async select(request: Record<string, unknown>) { calls.push(request); return "openrouter"; },
+    async password(request: Record<string, unknown>) { calls.push(request); throw new Error("cancelled"); },
+    async confirm(request: Record<string, unknown>) { calls.push(request); return true; },
+  } as never);
+
+  assert.equal(await surface.chooseHub([{ id: "openrouter", label: "OpenRouter", description: "Connect provider", disabled: false, current: false, generation: 0 }]), "openrouter");
+  assert.equal(await surface.readSecret({ backendId: "openrouter", message: "Key" }), null);
+  assert.equal(await surface.confirm({ id: "save", message: "Save?", defaultValue: true }), true);
+  assert.equal(calls[1]?.mask, "•");
+});
 
 function startupKeyResponse(status = 200): Response {
   return new Response(JSON.stringify(status === 200 ? {

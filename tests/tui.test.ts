@@ -20,6 +20,7 @@ import { RunViewModel } from "../src/ui/view-model.js";
 import type { AgentRunEvent, ModelInfo } from "../src/types.js";
 import { handleSlashCommand, type CommandContext } from "../src/commands.js";
 import * as credentialsModule from "../src/credentials.js";
+import { createTuiSetupSurface, type TuiSetupPromptUi } from "../src/setup-ui.js";
 
 const theme = createTheme({ level: 0 });
 const NOW = 1_700_000_000_000;
@@ -152,6 +153,28 @@ function type(stdin: FakeInput, value: string): void {
     press(stdin, character.toLowerCase(), character);
   }
 }
+
+test("setup TUI surface uses the existing picker, secret, model, and confirm primitives", async () => {
+  const calls: string[] = [];
+  const promptUi: TuiSetupPromptUi = {
+    async pickChoice(_title, items) {
+      calls.push(`choice:${items[0]?.value}`);
+      return items[0] ?? null;
+    },
+    async readSecret() { calls.push("secret"); return "candidate"; },
+    async pickModel(search) { calls.push(`model:${search("")[0]?.id}`); return search("")[0] ?? null; },
+    async confirmAction() { calls.push("confirm"); return { accepted: true }; },
+    addMessage(_role, message) { calls.push(`notice:${message}`); },
+  };
+  const surface = createTuiSetupSurface(promptUi);
+
+  assert.equal(await surface.chooseHub([{ id: "anthropic", label: "Anthropic", description: "Coming soon", disabled: true, current: false, generation: 3 }]), "anthropic");
+  assert.equal(await surface.readSecret({ backendId: "openrouter", message: "Key" }), "candidate");
+  assert.equal(await surface.chooseModel({ backendId: "openrouter", models: [{ backendId: "openrouter", requestedModelId: "vendor/a", canonicalModelId: "vendor/a", displayName: "A", capabilities: { textInput: true, textOutput: true, tools: true, reasoning: false } }] }), "vendor/a");
+  assert.equal(await surface.confirm({ id: "save", message: "Save?", defaultValue: true }), true);
+  surface.present({ version: 1, type: "notice", message: "Coming soon" });
+  assert.deepEqual(calls, ["choice:anthropic", "secret", "model:vendor/a", "confirm", "notice:Coming soon"]);
+});
 
 test("frame fills the screen and keeps chrome, divider and input in place", () => {
   const frame = buildDashboardFrame(input({ blocks: chat(6), input: "Bitte prüfe die Tests", cursor: 21 }));

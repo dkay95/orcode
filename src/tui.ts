@@ -234,6 +234,10 @@ export class TerminalUi {
   #attachments: ImageAttachment[] = [];
   #pasting = false;
   #pasteBuffer = "";
+  // Kept only while the secret entry is active. Unlike ordinary chat paste,
+  // this remains byte-for-byte so the common credential normalizer can reject
+  // embedded control/ANSI data instead of quietly changing the credential.
+  #rawSecretPaste = "";
   #secretLabel = "";
   #secretResolve: ((value: string | null) => void) | null = null;
   #recordingResolve: ((action: "stop" | "cancel") => void) | null = null;
@@ -633,6 +637,7 @@ export class TerminalUi {
     this.#secretLabel = oneLine(label);
     this.#pasting = false;
     this.#pasteBuffer = "";
+    this.#rawSecretPaste = "";
     this.#resetQuery();
     this.#enterMode("secret", `${this.#secretLabel} eingeben`);
     return new Promise<string | null>((resolve) => {
@@ -1556,11 +1561,15 @@ export class TerminalUi {
     const resolve = this.#secretResolve;
     this.#secretResolve = null;
     this.#secretLabel = "";
-    this.#pasting = false;
-    this.#pasteBuffer = "";
-    this.#resetQuery();
-    this.#enterMode("busy", value === null ? "Eingabe abgebrochen" : "Key wird geprüft");
-    resolve?.(value);
+    try {
+      this.#pasting = false;
+      this.#pasteBuffer = "";
+      this.#resetQuery();
+      this.#enterMode("busy", value === null ? "Eingabe abgebrochen" : "Key wird geprüft");
+      resolve?.(value);
+    } finally {
+      this.#rawSecretPaste = "";
+    }
   }
 
   #resolveRecording(action: "stop" | "cancel"): void {
@@ -1620,6 +1629,7 @@ export class TerminalUi {
   }
 
   #finishPaste(): void {
+    if (this.#mode === "secret") this.#rawSecretPaste += this.#pasteBuffer;
     const clean = this.#mode === "secret"
       ? this.#pasteBuffer
       : sanitizeTerminalText(this.#pasteBuffer)
