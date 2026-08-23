@@ -306,9 +306,7 @@ async function preflightSimpleVerifyCommand(
   const shellKind = verifyShellKind(shellExecutable);
   const token = simpleVerifyExecutable(command, shellKind);
   if (!token) return null;
-  const normalized = token.toLowerCase();
-  if (shellKind === "cmd" &&
-      (CMD_NATIVE_COMMANDS.has(normalized) || /^echo[.:/]/i.test(token))) return null;
+  if (shellKind === "cmd" && isCmdNativeForm(token)) return null;
   if (shellKind === "powershell") {
     const quoted = token.replaceAll("'", "''");
     const script = `$ErrorActionPreference='Stop'; Get-Command -Name '${quoted}' -ErrorAction Stop | Out-Null`;
@@ -335,7 +333,7 @@ async function preflightSimpleVerifyCommand(
     );
     return resolutionProbeFailure(token, probe);
   }
-  await resolveExecutable(token, environment, platform);
+  await resolveExecutable(token, environment, platform, cwd);
   return null;
 }
 
@@ -357,23 +355,139 @@ function verifyShellKind(shellExecutable: string): "posix" | "cmd" | "powershell
   return "posix";
 }
 
+function isCmdNativeForm(token: string): boolean {
+  const normalized = token.toLowerCase();
+  if (CMD_NATIVE_COMMANDS.has(normalized) || /^[a-z]:$/i.test(token)) return true;
+  const slash = normalized.indexOf("/");
+  if (slash > 0 && CMD_NATIVE_COMMANDS.has(normalized.slice(0, slash))) return true;
+  return /^(?:cd|chdir)(?:\.{1,2}|\\)/i.test(token) || /^(?:echo|rem)[.:]/i.test(token);
+}
+
 /** Returns only a literal executable whose first shell segment is safe to inspect. */
 function simpleVerifyExecutable(
   command: string,
   shellKind: "posix" | "cmd" | "powershell",
 ): string | null {
   const trimmed = command.trim();
-  if (!trimmed) return null;
-  if (/[\r\n;&|<>()`$\\*?\[\]{}!~^%@]/.test(trimmed)) return null;
-  if (shellKind === "powershell" &&
-      (/^['"#-]/.test(trimmed) || /^\d/.test(trimmed))) return null;
-  const match = /^(?:'([^']+)'|"([^"\\]+)"|([^\s'"]+))(?:\s|$)/.exec(trimmed);
-  const token = match?.[1] ?? match?.[2] ?? match?.[3];
+  if (!trimmed || (shellKind !== "cmd" && trimmed.startsWith("#"))) return null;
+  const first = literalFirstShellWord(trimmed, shellKind);
+  if (!first || hasAmbiguousShellSuffix(trimmed.slice(first.end), shellKind)) return null;
+  const token = first.token;
   if (!token || token.includes("=")) return null;
+  if (shellKind === "powershell" && token === ".") return null;
+  if (shellKind === "cmd" && token.startsWith(":")) return null;
   if (shellKind === "powershell" && POWERSHELL_LANGUAGE_KEYWORDS.has(token.toLowerCase())) {
     return null;
   }
   return token;
+}
+
+function literalFirstShellWord(
+  command: string,
+  shellKind: "posix" | "cmd" | "powershell",
+): { token: string; end: number } | null {
+  if (shellKind === "powershell" && (/^['"#-]/.test(command) || /^\d/.test(command))) {
+    return null;
+  }
+  let token = "";
+  let quote: "single" | "double" | null = null;
+  for (let index = 0; index < command.length; index += 1) {
+    const char = command[index]!;
+    if (quote === "single") {
+      if (char === "'") quote = null;
+      else token += char;
+      continue;
+    }
+    if (quote === "double") {
+      if (char === '"') {
+        quote = null;
+      } else {
+        if ((shellKind === "posix" && (char === "$" || char === "`" || char === "\\")) ||
+            (shellKind === "cmd" && (char === "%" || char === "!" || char === "^"))) {
+          return null;
+        }
+        token += char;
+      }
+      continue;
+    }
+    if (/\s/.test(char)) {
+      return token.length > 0 ? { token, end: index } : null;
+    }
+    if (shellKind === "powershell" && (char === "'" || char === '"')) return null;
+    if (char === "'" && shellKind === "posix") {
+      quote = "single";
+      continue;
+    }
+    if (char === '"' && shellKind !== "powershell") {
+      quote = "double";
+      continue;
+    }
+    if (isAmbiguousFirstWordCharacter(char, shellKind)) return null;
+    token += char;
+  }
+  return !quote && token.length > 0 ? { token, end: command.length } : null;
+}
+
+function isAmbiguousFirstWordCharacter(
+  char: string,
+  shellKind: "posix" | "cmd" | "powershell",
+): boolean {
+  if (char === "\r" || char === "\n" || char === "|" || char === "&" ||
+      char === "<" || char === ">" || char === "(" || char === ")") return true;
+  if (shellKind !== "cmd" && char === ";") return true;
+  if (shellKind === "posix") {
+    return "$`\\*?[]{}!~".includes(char);
+  }
+  if (shellKind === "powershell") {
+    return "$@`*?[]{}".includes(char);
+  }
+  return "%!^@".includes(char);
+}
+
+function hasAmbiguousShellSuffix(
+  suffix: string,
+  shellKind: "posix" | "cmd" | "powershell",
+): boolean {
+  let quote: "single" | "double" | null = null;
+  for (let index = 0; index < suffix.length; index += 1) {
+    const char = suffix[index]!;
+    if (quote === "single") {
+      if (char === "'") quote = null;
+      continue;
+    }
+    if (quote === "double") {
+      if (char === '"') {
+        quote = null;
+      } else if ((shellKind === "posix" && char === "\\") ||
+                 (shellKind === "powershell" && char === "`") ||
+                 (shellKind === "cmd" && char === "^")) {
+        if (index + 1 >= suffix.length) return true;
+        index += 1;
+      }
+      continue;
+    }
+    if ((shellKind === "posix" && char === "\\") ||
+        (shellKind === "powershell" && char === "`") ||
+        (shellKind === "cmd" && char === "^")) {
+      if (index + 1 >= suffix.length) return true;
+      index += 1;
+      continue;
+    }
+    if (char === "'" && shellKind !== "cmd") {
+      quote = "single";
+      continue;
+    }
+    if (char === '"') {
+      quote = "double";
+      continue;
+    }
+    if (char === "\r" || char === "\n" || char === "|" ||
+        char === "&" || char === "<" || char === ">" || char === "(" || char === ")") {
+      return true;
+    }
+    if (shellKind !== "cmd" && char === ";") return true;
+  }
+  return quote !== null;
 }
 
 function distillFailure(stdout: string, stderr: string): string {

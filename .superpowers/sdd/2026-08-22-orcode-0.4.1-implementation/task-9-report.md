@@ -347,3 +347,67 @@ Base: clean `099036aa9cabef34de59bd77eb2f3d2925ca4874`.
   Windows platform test remains the single expected skip on this macOS host.
 
 Requested commit: `fix: preserve structured process launch failures`.
+
+## Fix Round 3 — literal command identity with opaque arguments
+
+Base: clean `9a039bf2b416383945f7db003a16e049ef7d53c0`.
+
+### Finding and RED evidence
+
+- The strict preflight rejected a command whenever any argument contained a
+  metacharacter. That made a genuinely missing simple command repairable when
+  only an argument contained a quoted glob or Windows path. The named POSIX,
+  PowerShell, and cmd selection reached 4 tests with 0 passes and 4 failures
+  before the production change.
+- A delayed independent review found that the first correction was still too
+  conservative for unquoted POSIX globs and escaped-space arguments, while it
+  incorrectly treated PowerShell dot-sourcing and a cmd `::` comment as
+  executable heads. The expanded shell-native selection reached 16 tests: 9
+  passed and 7 failed, covering four failing leaf behaviours, before the final
+  production correction.
+- The next re-review found four more cmd-native forms (`C:`, `cd..`, `cd\`,
+  and `dir/w`) that an exact-name-only native-command set still sent to
+  executable resolution. Their dedicated RED reached 9 tests: 4 passed and 5
+  failed, with all four new leaf behaviours failing before implementation.
+- The same re-review then proved that a real relative cmd executable was
+  resolved against the RouterCode launcher directory rather than the selected
+  verification workspace. The named workspace-binding test failed 0/1 before
+  implementation: the command became `spawn-failed` and the main shell call
+  never ran.
+
+### Implementation
+
+- The verifier now parses only the literal first shell word. Shell-specific
+  quoting and expansion characters remain conservative for command identity,
+  while argument bytes such as quoted or unquoted globs, escaped spaces, and
+  Windows paths no longer erase that identity.
+- A separate shell-aware suffix scan rejects only syntax that can change the
+  top-level execution contract: chains, pipelines, redirections, grouping, or
+  malformed quotes. It tracks shell-native quotes and escapes but otherwise
+  keeps argument contents opaque. PowerShell dot-sourcing and cmd labels or
+  comments remain owned by their actual shells. Compound/wrapper semantics
+  from Round 2 remain owned by the actual shell.
+- Cmd native detection now also recognizes drive switches, attached
+  slash-option forms, and the narrow glued `cd`/`chdir`, `echo`, and
+  `rem` language forms. It does not treat arbitrary command-name prefixes as
+  native.
+- `resolveExecutablePath` accepts an optional resolution cwd, and verification
+  passes its canonical workspace root through the cmd preflight. Existing
+  callers retain the process-cwd default; relative verification executables no
+  longer depend on where RouterCode itself was launched.
+
+### GREEN evidence and limits
+
+- Expanded shell-authority matrix: 30/30 passed. Complete verifier: 68/68
+  passed. Primary Task-9/process focus: 324/324 passed.
+- Independent final re-review found no Critical or Important issue. Its focused
+  shell matrix passed 28/28, targeted workspace/verify resolution passed
+  17/17, and direct probes kept cmd-native forms in the shell while sending
+  actual relative executable paths through the workspace-bound resolver.
+- Both TypeScript checks passed. Full `npm test`: 849 passed, 0 failed, and 1
+  existing platform-only skip (850 total). The central credential scanner,
+  literal credential audit, and `git diff --check` passed.
+- The implementation remains deterministic for cmd/PowerShell on this macOS
+  host; no native Windows execution is claimed.
+
+Requested commit: `fix: keep verify argument syntax opaque`.

@@ -580,6 +580,11 @@ test("shell-native POSIX, cmd and PowerShell commands are never rejected by exec
   const fixtures = [
     { shell: "/bin/sh", command: "builtin true", platform: "linux" },
     { shell: "cmd.exe", command: "dir", platform: "win32" },
+    { shell: "cmd.exe", command: "C:", platform: "win32" },
+    { shell: "cmd.exe", command: "cd..", platform: "win32" },
+    { shell: "cmd.exe", command: "cd\\", platform: "win32" },
+    { shell: "cmd.exe", command: "dir/w", platform: "win32" },
+    { shell: "cmd.exe", command: ":: harmless comment", platform: "win32" },
     { shell: "powershell.exe", command: "Get-ChildItem", platform: "win32" },
   ] as const;
 
@@ -702,6 +707,7 @@ test("PowerShell language constructs stay ordinary shell results instead of fake
     { command: "exit 127", code: 127, status: "failed" },
     { command: 'throw "ordinary failure"', code: 1, status: "failed" },
     { command: '"plain value"', code: 0, status: "passed" },
+    { command: ". .\\fixture.ps1", code: 1, status: "failed" },
   ] as const;
 
   for (const fixture of fixtures) {
@@ -754,6 +760,136 @@ test("PowerShell language constructs stay ordinary shell results instead of fake
       assert.equal(executions, 1);
     });
   }
+});
+
+test("a simple missing command is still preflighted when only its arguments contain harmless syntax", async (t) => {
+  const fixtures = [
+    {
+      name: "POSIX quoted glob argument",
+      shell: "/bin/sh",
+      platform: "linux",
+      command: 'missing-runner "*.test.ts"',
+    },
+    {
+      name: "POSIX unquoted glob argument",
+      shell: "/bin/sh",
+      platform: "linux",
+      command: "missing-runner *.test.ts",
+    },
+    {
+      name: "POSIX escaped-space argument",
+      shell: "/bin/sh",
+      platform: "linux",
+      command: "missing-runner path\\ with\\ spaces",
+    },
+    {
+      name: "PowerShell Windows path argument",
+      shell: "powershell.exe",
+      platform: "win32",
+      command: "Missing-Cmdlet C:\\work",
+    },
+    {
+      name: "cmd Windows path argument",
+      shell: "cmd.exe",
+      platform: "win32",
+      command: "missing.exe C:\\work",
+    },
+  ] as const;
+
+  for (const fixture of fixtures) {
+    await t.test(fixture.name, async () => {
+      const guard = await tempWorkspace();
+      let mainExecutions = 0;
+      const outcome = await runVerify(
+        [fixture.command],
+        guard,
+        undefined,
+        () => undefined,
+        {},
+        {
+          environment: fixture.platform === "win32"
+            ? { ORCODE_SHELL: fixture.shell, Path: "C:\\Windows\\System32" }
+            : { ORCODE_SHELL: fixture.shell, PATH: "/usr/bin:/bin" },
+          platform: fixture.platform,
+          resolveExecutable: async (requested) => {
+            if (requested === fixture.shell) {
+              return fixture.platform === "win32"
+                ? `C:\\Windows\\System32\\${fixture.shell}`
+                : fixture.shell;
+            }
+            throw new Error(`Ausführbare Datei nicht in PATH gefunden: ${requested}`);
+          },
+          execute: async (_executable, args) => {
+            if (args.includes("orcode-verify-preflight") || args.includes("-EncodedCommand")) {
+              return {
+                code: 1,
+                stdout: "",
+                stderr: "structured resolution miss",
+                truncated: false,
+                timedOut: false,
+                aborted: false,
+                signal: null,
+              };
+            }
+            mainExecutions += 1;
+            return {
+              code: 127,
+              stdout: "",
+              stderr: "ordinary shell failure",
+              truncated: false,
+              timedOut: false,
+              aborted: false,
+              signal: null,
+            };
+          },
+        },
+      );
+
+      assert.equal(outcome.status, "spawn-failed");
+      assert.equal(mainExecutions, 0);
+    });
+  }
+});
+
+test("cmd relative executable preflight resolves from the verification workspace", async () => {
+  const guard = await tempWorkspace();
+  let requestedCwd: string | undefined;
+  let mainExecutions = 0;
+  const outcome = await runVerify(
+    [".\\tools\\check.cmd"],
+    guard,
+    undefined,
+    () => undefined,
+    {},
+    {
+      environment: { ORCODE_SHELL: "cmd.exe", Path: "C:\\Windows\\System32" },
+      platform: "win32",
+      resolveExecutable: async (requested, _environment, _platform, cwd) => {
+        if (requested === "cmd.exe") return "C:\\Windows\\System32\\cmd.exe";
+        requestedCwd = cwd;
+        if (cwd !== guard.root) {
+          throw new Error(`Falscher Auflösungspfad: ${cwd ?? "launcher cwd"}`);
+        }
+        return "C:\\workspace\\tools\\check.cmd";
+      },
+      execute: async () => {
+        mainExecutions += 1;
+        return {
+          code: 0,
+          stdout: "",
+          stderr: "",
+          truncated: false,
+          timedOut: false,
+          aborted: false,
+          signal: null,
+        };
+      },
+    },
+  );
+
+  assert.equal(outcome.status, "passed");
+  assert.equal(requestedCwd, guard.root);
+  assert.equal(mainExecutions, 1);
 });
 
 test("successful output that only mentions a Windows resolution diagnostic still passes", async () => {

@@ -1488,9 +1488,10 @@ export async function resolveExecutablePath(
   executable: string,
   environment: NodeJS.ProcessEnv = process.env,
   platform: NodeJS.Platform = process.platform,
+  cwd: string = process.cwd(),
 ): Promise<string> {
   if (isAbsolute(executable) || executable.includes("/") || executable.includes("\\")) {
-    const candidate = resolve(executable);
+    const candidate = resolve(cwd, executable);
     await access(candidate, fsConstants.X_OK);
     return realpath(candidate);
   }
