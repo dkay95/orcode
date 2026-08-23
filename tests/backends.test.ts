@@ -1,0 +1,157 @@
+import assert from "node:assert/strict";
+import test from "node:test";
+import {
+  BackendRegistry,
+  ProviderComingSoonError,
+  deriveProviderHeadline,
+  sameRoute,
+  type BackendAdapter,
+  type BackendDescriptor,
+  type ProviderHealth,
+  type RouteIdentityV1,
+} from "../src/backends.js";
+
+const ready: ProviderHealth = {
+  credential: "valid",
+  connectivity: "connected",
+  spend: "available",
+  runtime: "not-applicable",
+  observedAt: 100,
+  generation: 7,
+};
+
+const openRouterDescriptor: BackendDescriptor = {
+  id: "openrouter",
+  displayName: "OpenRouter",
+  maturity: "stable",
+  connectable: true,
+  kind: "raw-model",
+  credentialOwner: "orcode-keychain",
+  billingRealmKind: "api-payg",
+  capabilities: { models: true, tools: true, reasoning: true },
+};
+
+function adapter(backendId: BackendAdapter["backendId"] = "openrouter"): BackendAdapter {
+  return {
+    backendId,
+    async inspect() { throw new Error("not used"); },
+    async connect() { throw new Error("not used"); },
+    async listModels() { return []; },
+    async activate() { throw new Error("not used"); },
+    async reconnect() { throw new Error("not used"); },
+    async logout() {},
+    async discardCandidate() {},
+  };
+}
+
+test("health dimensions reduce without turning unknown transport into auth rejection", () => {
+  const cases: ReadonlyArray<{ health: ProviderHealth; expected: ReturnType<typeof deriveProviderHeadline> }> = [
+    { health: ready, expected: "ready" },
+    { health: { ...ready, spend: "unknown" }, expected: "ready" },
+    { health: { ...ready, credential: "login-required" }, expected: "login-required" },
+    { health: { ...ready, credential: "rejected" }, expected: "auth-rejected" },
+    { health: { ...ready, credential: "expired" }, expected: "credential-expired" },
+    { health: { ...ready, connectivity: "offline" }, expected: "offline" },
+    { health: { ...ready, runtime: "missing" }, expected: "runtime-missing" },
+    { health: { ...ready, runtime: "incompatible" }, expected: "incompatible-runtime" },
+    { health: { ...ready, runtime: "policy-unavailable" }, expected: "policy-unavailable" },
+    { health: { ...ready, spend: "limit-reached" }, expected: "limit-reached" },
+    { health: { ...ready, credential: "unknown", connectivity: "unknown" }, expected: "unknown" },
+  ];
+
+  for (const { health, expected } of cases) {
+    assert.equal(deriveProviderHeadline(health), expected);
+  }
+});
+
+test("route identity compares backend account realm and canonical model", () => {
+  const route: RouteIdentityV1 = {
+    version: 1,
+    backendId: "openrouter",
+    accountFingerprint: "acct_local_a",
+    billingRealm: "openrouter-payg",
+    requestedModelId: "openai/gpt",
+    canonicalModelId: "openai/gpt-2026",
+    resolutionState: "resolved",
+  };
+  assert.equal(sameRoute(route, { ...route }), true);
+  assert.equal(sameRoute(route, { ...route, accountFingerprint: "acct_local_b" }), false);
+  assert.equal(sameRoute(route, { ...route, backendId: "codex" }), false);
+  assert.equal(sameRoute(route, { ...route, billingRealm: "none" }), false);
+  assert.equal(sameRoute(route, { ...route, canonicalModelId: "openai/gpt-2027" }), false);
+});
+
+test("coming-soon descriptors have no adapter and reject connect structurally", () => {
+  const descriptor: BackendDescriptor = {
+    id: "anthropic",
+    displayName: "Anthropic / Claude-Abo",
+    maturity: "coming-soon",
+    connectable: false,
+    kind: "managed-agent",
+    credentialOwner: "none",
+    billingRealmKind: "none",
+    capabilities: { models: false, tools: false, reasoning: false },
+  };
+  const registry = new BackendRegistry([{ descriptor }]);
+  assert.equal(registry.descriptor("anthropic").maturity, "coming-soon");
+  assert.throws(() => registry.adapter("anthropic"), ProviderComingSoonError);
+});
+
+test("registry preserves insertion order for valid descriptors", () => {
+  const anthropic: BackendDescriptor = {
+    id: "anthropic",
+    displayName: "Anthropic / Claude-Abo",
+    maturity: "coming-soon",
+    connectable: false,
+    kind: "managed-agent",
+    credentialOwner: "none",
+    billingRealmKind: "none",
+    capabilities: { models: false, tools: false, reasoning: false },
+  };
+  const registry = new BackendRegistry([
+    { descriptor: openRouterDescriptor, adapter: adapter() },
+    { descriptor: anthropic },
+  ]);
+  assert.deepEqual(registry.entries().map(({ id }) => id), ["openrouter", "anthropic"]);
+});
+
+test("registry rejects contradictory descriptor and adapter combinations", () => {
+  const comingSoon: BackendDescriptor = {
+    id: "anthropic",
+    displayName: "Anthropic / Claude-Abo",
+    maturity: "coming-soon",
+    connectable: false,
+    kind: "managed-agent",
+    credentialOwner: "none",
+    billingRealmKind: "none",
+    capabilities: { models: false, tools: false, reasoning: false },
+  };
+
+  const cases: ReadonlyArray<{ entries: ConstructorParameters<typeof BackendRegistry>[0]; expected: RegExp }> = [
+    {
+      entries: [{ descriptor: openRouterDescriptor, adapter: adapter() }, { descriptor: openRouterDescriptor, adapter: adapter() }],
+      expected: /duplicate backend descriptor/i,
+    },
+    {
+      entries: [{ descriptor: openRouterDescriptor, adapter: adapter("codex") }],
+      expected: /does not match descriptor/i,
+    },
+    {
+      entries: [{ descriptor: openRouterDescriptor }],
+      expected: /requires an adapter/i,
+    },
+    {
+      entries: [{ descriptor: comingSoon, adapter: adapter("anthropic") }],
+      expected: /must not have an adapter/i,
+    },
+  ];
+
+  for (const { entries, expected } of cases) {
+    assert.throws(() => new BackendRegistry(entries), expected);
+  }
+});
+
+test("registry distinguishes an unknown backend from a registered coming-soon backend", () => {
+  const registry = new BackendRegistry([{ descriptor: openRouterDescriptor, adapter: adapter() }]);
+  assert.throws(() => registry.adapter("anthropic"), /unknown backend/i);
+});
