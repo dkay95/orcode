@@ -33,7 +33,6 @@ import {
   migrateLegacyOpenRouterState,
   requirePersistableProviderState,
   validateProviderSetupState,
-  type ProviderStateIssue,
   type ProviderSetupState,
 } from "./provider-state.js";
 import { withConfigWriteLock } from "./config-write-lock.js";
@@ -414,10 +413,6 @@ export async function migrateAppHome(
   legacyHome: string = LEGACY_APP_HOME,
   options: AppHomeMigrationOptions & ConfigLoadDependencies = {},
 ): Promise<AppHomeMigrationResult> {
-  const providerPreflight = await preflightProviderMigration(newHome, legacyHome);
-  if (providerPreflight !== null) {
-    return providerPreflight;
-  }
   const { randomUUID: createConnectionId = randomUUID, ...storageOptions } = options;
   let legacyConnectionId: string | null = null;
   return migrateStorageHome(newHome, legacyHome, {
@@ -789,52 +784,6 @@ function normalizeProviderSetupInput(value: unknown): ProviderSetupState {
     return value as unknown as ProviderSetupState;
   }
   return validateProviderSetupState(value);
-}
-
-async function preflightProviderMigration(
-  newHome: string,
-  legacyHome: string,
-): Promise<AppHomeMigrationResult | null> {
-  const target = await readProviderPreflight(configPath(newHome));
-  const authoritative = target.kind === "absent"
-    ? await readProviderPreflight(configPath(legacyHome))
-    : target;
-  if (authoritative.kind !== "issue") {
-    return null;
-  }
-  return {
-    status: authoritative.issue.kind === "future-version" ? "future" : "recovery-required",
-    appHome: target.kind === "absent" ? legacyHome : newHome,
-    warning: `Provider-Setup-Migration abgelehnt: providerSetup ist ${authoritative.issue.kind}; es wurde nichts geschrieben.`,
-  };
-}
-
-type ProviderPreflight =
-  | { kind: "absent" }
-  | { kind: "clear" }
-  | { kind: "issue"; issue: ProviderStateIssue };
-
-async function readProviderPreflight(path: string): Promise<ProviderPreflight> {
-  let snapshot: ConfigFileSnapshot;
-  try {
-    snapshot = await readConfigFileSnapshot(path);
-  } catch {
-    return { kind: "clear" };
-  }
-  if (snapshot.kind === "absent") return { kind: "absent" };
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(snapshot.raw);
-  } catch {
-    return { kind: "clear" };
-  }
-  if (!isRecord(parsed) || !("providerSetup" in parsed)) {
-    return { kind: "clear" };
-  }
-  const providerSetup = validateProviderSetupState(parsed.providerSetup);
-  return isProviderStateIssue(providerSetup)
-    ? { kind: "issue", issue: providerSetup }
-    : { kind: "clear" };
 }
 
 /**

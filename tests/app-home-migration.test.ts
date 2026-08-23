@@ -1000,6 +1000,82 @@ test("current-home v0 corrupt provider state preflights before any migration wri
   assert.equal(result?.status, "recovery-required");
 });
 
+test("current-home migration waits for a future provider writer and classifies its final valid bytes", async () => {
+  const root = await mkdtemp(join(tmpdir(), "orcode-provider-future-writer-final-valid-"));
+  const legacy = join(root, ".routercode");
+  const target = join(root, ".orcode");
+  const config = join(target, "config.json");
+  await mkdir(target, { recursive: true });
+  await writeFile(config, `${JSON.stringify({
+    schemaVersion: 1,
+    mainModel: "temporary/future",
+    providerSetup: { schemaVersion: 99, opaque: "temporary-future-state" },
+  }, null, 2)}\n`);
+  const finalBytes = `${JSON.stringify({
+    schemaVersion: 1,
+    mainModel: "writer/final-valid",
+    unrelatedWriterState: { generation: 11, exact: true },
+    providerSetup: {
+      schemaVersion: 1,
+      revision: 11,
+      lifecycle: "configured",
+      connections: [],
+      defaultRoute: null,
+      cross: { enabled: false, preferredLead: null, preferredChallenger: null },
+    },
+  }, null, 4)}\n`;
+
+  const result = await publishConfigBehindMigrationLockAttempt({
+    target,
+    legacy,
+    blockedConfigPath: config,
+    writerConfigPath: config,
+    writerBytes: finalBytes,
+  });
+
+  assert.equal(result.status, "ready");
+  assert.equal(await readFile(config, "utf8"), finalBytes);
+  assert.equal(await exists(migrationManifestPath(target)), false);
+});
+
+test("current-home migration waits for a corrupt provider writer and classifies its final valid bytes", async () => {
+  const root = await mkdtemp(join(tmpdir(), "orcode-provider-corrupt-writer-final-valid-"));
+  const legacy = join(root, ".routercode");
+  const target = join(root, ".orcode");
+  const config = join(target, "config.json");
+  await mkdir(target, { recursive: true });
+  await writeFile(config, `${JSON.stringify({
+    schemaVersion: 1,
+    mainModel: "temporary/corrupt",
+    providerSetup: { schemaVersion: 1, connections: "wrong" },
+  }, null, 2)}\n`);
+  const finalBytes = `${JSON.stringify({
+    schemaVersion: 1,
+    mainModel: "writer/final-valid-after-corrupt",
+    unrelatedWriterState: { generation: 12, exact: true },
+    providerSetup: {
+      schemaVersion: 1,
+      revision: 12,
+      lifecycle: "configured",
+      connections: [],
+      defaultRoute: null,
+      cross: { enabled: false, preferredLead: null, preferredChallenger: null },
+    },
+  }, null, 4)}\n`;
+
+  const result = await publishConfigBehindMigrationLockAttempt({
+    target,
+    legacy,
+    blockedConfigPath: config,
+    writerConfigPath: config,
+    writerBytes: finalBytes,
+  });
+
+  assert.equal(result.status, "ready");
+  assert.equal(await readFile(config, "utf8"), finalBytes);
+  assert.equal(await exists(migrationManifestPath(target)), false);
+});
+
 test("legacy-home future provider state preflights before target artifacts exist", async () => {
   const root = await mkdtemp(join(tmpdir(), "orcode-provider-preflight-legacy-future-"));
   const legacy = join(root, ".routercode");

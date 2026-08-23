@@ -678,6 +678,25 @@ async function migrateStorageHomeUnderConfigOwnership(
 
   if (!legacyExists && !existingManifest) {
     if (!newExists) return { status: "ready", appHome: newHome, warning: null };
+    await destinationOwnership.assertHeld();
+    const destinationConfigFact = await inspectMigrationConfig(
+      destinationOwnership.canonicalPath,
+    );
+    await destinationOwnership.assertHeld();
+    if (destinationConfigFact.kind === "future") {
+      return {
+        status: "future",
+        appHome: newHome,
+        warning: `Config-Migration abgelehnt: providerSetup oder schemaVersion hat die zukünftige Version ${destinationConfigFact.version}.`,
+      };
+    }
+    if (destinationConfigFact.kind === "ambiguous") {
+      return {
+        status: "recovery-required",
+        appHome: newHome,
+        warning: "Config-Migration abgelehnt: Die Konfiguration ist beschädigt oder nicht eindeutig lesbar.",
+      };
+    }
     try {
       return await migrateCurrentConfigUnderLock(
         newHome,
