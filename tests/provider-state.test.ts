@@ -9,6 +9,7 @@ import {
   projectLegacyModelRoutes,
   ProviderStateStore,
   type ProviderConnectionStateV1,
+  type ProviderStateCommitRequest,
   validateProviderSetupState,
 } from "../src/provider-state.js";
 import { DEFAULT_CONFIG, saveConfig } from "../src/config.js";
@@ -235,4 +236,141 @@ test("provider state commit delegates one exact captured-revision CAS with a gen
   assert.equal(committed.revision, 1);
   assert.equal(committed.lifecycle, "cancelled");
   assert.deepEqual(store.read(), committed);
+});
+
+test("durable provider state commit rejects adopt before its authoritative build", async () => {
+  const initial = createNeverConfiguredProviderState();
+  const forged = { ...initial, revision: 1 };
+  const store = new ProviderStateStore(initial, {
+    persist: async (request) => {
+      try {
+        request.adopt(forged);
+      } catch {
+        // A suppressed out-of-order adopt must poison the entire scoped protocol.
+      }
+      const built = request.build(initial);
+      request.adopt(built);
+      return structuredClone(built);
+    },
+  });
+
+  const outcome = await store.commit(
+    initial.revision,
+    (current) => ({ ...current, lifecycle: "cancelled" }),
+  ).then(() => "resolved", () => "rejected");
+
+  assert.equal(outcome, "rejected");
+  assert.deepEqual(store.read(), initial);
+});
+
+test("durable provider state commit adopts only the byte-exact built candidate", async () => {
+  const initial = createNeverConfiguredProviderState();
+  let builderCalls = 0;
+  const store = new ProviderStateStore(initial, {
+    persist: async (request) => {
+      const built = request.build(initial);
+      const forged = { ...built, lifecycle: "never-configured" as const };
+      try {
+        request.adopt(forged);
+      } catch {
+        // A suppressed non-authoritative adopt must not permit a later retry.
+      }
+      request.adopt(built);
+      return structuredClone(built);
+    },
+  });
+
+  const outcome = await store.commit(
+    initial.revision,
+    (current) => {
+      builderCalls += 1;
+      return { ...current, lifecycle: "cancelled" };
+    },
+  ).then(() => "resolved", () => "rejected");
+
+  assert.equal(outcome, "rejected");
+  assert.equal(builderCalls, 1);
+  assert.deepEqual(store.read(), initial);
+});
+
+test("durable provider state commit rejects a suppressed duplicate build before adoption", async () => {
+  const initial = createNeverConfiguredProviderState();
+  const store = new ProviderStateStore(initial, {
+    persist: async (request) => {
+      const built = request.build(initial);
+      try {
+        request.build(initial);
+      } catch {
+        // The durable boundary must remain invalid even if its caller suppresses this error.
+      }
+      request.adopt(built);
+      return structuredClone(built);
+    },
+  });
+
+  const outcome = await store.commit(
+    initial.revision,
+    (current) => ({ ...current, lifecycle: "cancelled" }),
+  ).then(() => "resolved", () => "rejected");
+
+  assert.equal(outcome, "rejected");
+  assert.deepEqual(store.read(), initial);
+});
+
+test("durable provider state capabilities are closed after successful settlement", async () => {
+  const initial = createNeverConfiguredProviderState();
+  let retained!: ProviderStateCommitRequest;
+  const store = new ProviderStateStore(initial, {
+    persist: async (request) => {
+      retained = request;
+      const built = request.build(initial);
+      request.adopt(built);
+      return structuredClone(built);
+    },
+  });
+  const committed = await store.commit(
+    initial.revision,
+    (current) => ({ ...current, lifecycle: "cancelled" }),
+  );
+  const beforeLateCalls = store.read();
+
+  assert.throws(() => retained.assertCurrent(), /closed|settled|capability/i);
+  assert.throws(() => retained.build(initial), /closed|settled|capability/i);
+  assert.throws(() => retained.adopt(committed), /closed|settled|capability/i);
+  assert.deepEqual(store.read(), beforeLateCalls);
+});
+
+test("durable provider state capabilities are closed after failed settlement", async () => {
+  const initial = createNeverConfiguredProviderState();
+  let retained!: ProviderStateCommitRequest;
+  const store = new ProviderStateStore(initial, {
+    persist: async (request) => {
+      retained = request;
+      throw new Error("durable persistence failed");
+    },
+  });
+  await assert.rejects(
+    store.commit(
+      initial.revision,
+      (current) => ({ ...current, lifecycle: "cancelled" }),
+    ),
+    /durable persistence failed/,
+  );
+  const forged = { ...initial, revision: 1, lifecycle: "cancelled" as const };
+  const lateOutcomes: string[] = [];
+  for (const callback of [
+    () => retained.assertCurrent(),
+    () => retained.build(initial),
+    () => retained.adopt(forged),
+  ]) {
+    try {
+      callback();
+      lateOutcomes.push("resolved");
+    } catch {
+      lateOutcomes.push("rejected");
+    }
+  }
+
+  assert.deepEqual(lateOutcomes, ["rejected", "rejected", "rejected"]);
+  assert.deepEqual(store.read(), initial);
 });

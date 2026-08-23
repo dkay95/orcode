@@ -253,11 +253,30 @@ export class ProviderStateStore {
   ): Promise<ProviderSetupStateV1> {
     this.#assertExpectedRevision(expectedRevision);
     let buildCalls = 0;
-    let adopted = false;
+    let builtCandidate: ProviderSetupStateV1 | null = null;
+    let adoptedCandidate: ProviderSetupStateV1 | null = null;
+    let protocolInvalid = false;
+    let capabilitiesOpen = true;
+
+    const assertCapabilityOpen = (): void => {
+      if (!capabilitiesOpen) {
+        throw new Error("Provider state CAS capability is closed after settlement.");
+      }
+    };
+
+    const assertCurrentCapability = (): void => {
+      assertCapabilityOpen();
+      assertCurrent();
+    };
 
     const buildCandidate = (current: ProviderSetupStateV1): ProviderSetupStateV1 => {
+      assertCapabilityOpen();
+      if (adoptedCandidate) {
+        throw new Error("Provider state CAS build capability is closed after adoption.");
+      }
       buildCalls += 1;
       if (buildCalls !== 1) {
+        protocolInvalid = true;
         throw new Error("Provider state CAS may build exactly one candidate.");
       }
       assertCurrent();
@@ -269,11 +288,20 @@ export class ProviderStateStore {
           `Stale provider state revision ${expectedRevision}; authoritative revision is ${authoritative.revision}.`,
         );
       }
-      return this.#prepareNext(build(structuredClone(authoritative)), expectedRevision);
+      builtCandidate = this.#prepareNext(
+        build(structuredClone(authoritative)),
+        expectedRevision,
+      );
+      return structuredClone(builtCandidate);
     };
 
     const adopt = (committed: ProviderSetupStateV1): void => {
-      if (adopted) throw new Error("Provider state CAS may adopt exactly once.");
+      assertCapabilityOpen();
+      if (adoptedCandidate) throw new Error("Provider state CAS may adopt exactly once.");
+      if (protocolInvalid || buildCalls !== 1 || !builtCandidate) {
+        protocolInvalid = true;
+        throw new Error("Provider state CAS must build exactly once before adoption.");
+      }
       this.#assertExpectedRevision(expectedRevision);
       assertCurrent();
       const validated = requirePersistableProviderState(
@@ -282,8 +310,12 @@ export class ProviderStateStore {
       if (validated.revision !== expectedRevision + 1) {
         throw new Error("Provider state CAS returned an invalid committed revision.");
       }
+      if (JSON.stringify(validated) !== JSON.stringify(builtCandidate)) {
+        protocolInvalid = true;
+        throw new Error("Provider state CAS may adopt only its exact built candidate.");
+      }
       this.#state = structuredClone(validated);
-      adopted = true;
+      adoptedCandidate = structuredClone(validated);
     };
 
     if (!this.#persist) {
@@ -292,22 +324,35 @@ export class ProviderStateStore {
       return this.read();
     }
 
-    const returned = await this.#persist({
-      expectedRevision,
-      build: buildCandidate,
-      assertCurrent,
-      adopt,
-    });
-    if (!adopted) {
-      throw new Error("Provider state durable commit was not adopted under writer ownership.");
+    try {
+      const returned = await this.#persist({
+        expectedRevision,
+        build: buildCandidate,
+        assertCurrent: assertCurrentCapability,
+        adopt,
+      });
+      if (
+        protocolInvalid
+        || buildCalls !== 1
+        || !builtCandidate
+        || !adoptedCandidate
+      ) {
+        throw new Error("Provider state durable commit did not complete its exact CAS protocol.");
+      }
+      const validatedReturn = requirePersistableProviderState(
+        validateProviderSetupState(returned),
+      );
+      if (
+        JSON.stringify(validatedReturn) !== JSON.stringify(builtCandidate)
+        || JSON.stringify(validatedReturn) !== JSON.stringify(adoptedCandidate)
+        || JSON.stringify(validatedReturn) !== JSON.stringify(this.#state)
+      ) {
+        throw new Error("Provider state durable commit readback is ambiguous.");
+      }
+      return this.read();
+    } finally {
+      capabilitiesOpen = false;
     }
-    const validatedReturn = requirePersistableProviderState(
-      validateProviderSetupState(returned),
-    );
-    if (JSON.stringify(validatedReturn) !== JSON.stringify(this.#state)) {
-      throw new Error("Provider state durable commit readback is ambiguous.");
-    }
-    return this.read();
   }
 
   #assertExpectedRevision(expectedRevision: number): void {

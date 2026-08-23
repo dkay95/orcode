@@ -114,6 +114,11 @@ interface AttemptToken {
   discardEmitted: boolean;
 }
 
+interface GenerationToken {
+  generation: number;
+  closed: boolean;
+}
+
 interface NormalizedInspection {
   backendId: BackendId;
   connectionId: string;
@@ -166,8 +171,10 @@ export class SetupOrchestrator {
   readonly #proofs = new Map<string, InspectionProof>();
   readonly #legacyResolutionAttempts = new Set<string>();
   #generation = 0;
+  #nextGeneration = 0;
   #latestResult: StartupSetupResult | null = null;
   #activationInFlight: Promise<void> | null = null;
+  #currentGeneration: GenerationToken | null = null;
 
   constructor(options: SetupOrchestratorOptions) {
     this.#registry = options.registry;
@@ -191,37 +198,59 @@ export class SetupOrchestrator {
   }
 
   async inspectStartup(options: StartupInspectionOptions = {}): Promise<StartupSetupResult> {
-    const generation = await this.#beginGeneration();
-    return this.#inspectGeneration(generation, "inspect", undefined, options);
+    const token = this.#reserveGeneration();
+    try {
+      if (!(await this.#awaitGenerationTurn(token))) return this.#staleResult();
+      return await this.#inspectGeneration(token, "inspect", undefined, options);
+    } finally {
+      token.closed = true;
+    }
   }
 
   async reconnect(
     backendId: BackendId,
     options: StartupInspectionOptions = {},
   ): Promise<StartupSetupResult> {
-    const generation = await this.#beginGeneration();
-    return this.#inspectGeneration(generation, "reconnect", backendId, options);
+    const token = this.#reserveGeneration();
+    try {
+      if (!(await this.#awaitGenerationTurn(token))) return this.#staleResult();
+      return await this.#inspectGeneration(token, "reconnect", backendId, options);
+    } finally {
+      token.closed = true;
+    }
   }
 
   async cancelSetup(): Promise<StartupSetupResult> {
-    const generation = await this.#beginGeneration();
-    const captured = this.#stateStore.read();
-    const state = await this.#commitCancelled(captured, generation);
-    const result = this.#setupRequiredResult(state, generation);
-    this.#latestResult = result;
-    this.#proofs.clear();
-    this.#emit({ version: 1, type: "setup-required", generation });
-    return result;
+    const token = this.#reserveGeneration();
+    try {
+      if (!(await this.#awaitGenerationTurn(token))) return this.#staleResult();
+      const captured = this.#stateStore.read();
+      const state = await this.#commitCancelled(captured, token.generation);
+      if (!this.#ownsGeneration(token)) return this.#staleResult();
+      const result = this.#setupRequiredResult(state, token.generation);
+      this.#latestResult = result;
+      this.#proofs.clear();
+      this.#emit({ version: 1, type: "setup-required", generation: token.generation });
+      if (!this.#ownsGeneration(token)) return this.#staleResult();
+      return result;
+    } finally {
+      token.closed = true;
+    }
   }
 
   ensureRunnableRoute(): RouteIdentityV1 {
     const result = this.#latestResult;
-    const current = this.#stateStore.read().defaultRoute;
+    const state = this.#stateStore.read();
+    const current = state.defaultRoute;
     if (
       result
+      && result.generation === this.#generation
+      && this.#currentGeneration?.generation === this.#generation
+      && this.#currentGeneration.closed
       && (result.mode === "ready" || result.mode === "ready-with-warning")
       && current
       && isResolvedRoute(current)
+      && this.#routeHasProof(current, state, result.generation)
       && result.readyRoutes.some((candidate) => sameResolvedRoute(candidate, current))
     ) {
       return structuredClone(current);
@@ -243,29 +272,34 @@ export class SetupOrchestrator {
     this.#activationInFlight = activationTail;
     try {
       if (priorActivation) await priorActivation;
+      if (this.#currentGeneration) this.#currentGeneration.closed = true;
       this.#supersedeActiveProbes();
-      this.#generation += 1;
-      const generation = this.#generation;
+      this.#proofs.clear();
+      this.#nextGeneration = Math.max(this.#nextGeneration, this.#generation) + 1;
+      const generation = this.#nextGeneration;
+      this.#generation = generation;
       const result = await this.#activationCoordinator.activate({
         ...request,
         generation,
       });
       if (generation !== this.#generation) return result;
+      const safeRoute = safeRouteIdentity(result.route);
+      if (!safeRoute) return result;
       const state = result.state ?? this.#stateStore.read();
       const connection = state.connections.find((candidate) =>
         candidate.enabled
-        && candidate.backendId === result.route.backendId
-        && candidate.accountFingerprint === result.route.accountFingerprint
-        && candidate.billingRealm === result.route.billingRealm
+        && candidate.backendId === safeRoute.backendId
+        && candidate.accountFingerprint === safeRoute.accountFingerprint
+        && candidate.billingRealm === safeRoute.billingRealm
       );
       if (connection) {
         this.#emit({
           version: 1,
           type: "candidate-activation",
-          backendId: result.route.backendId,
+          backendId: safeRoute.backendId,
           generation,
           connectionId: connection.id,
-          route: structuredClone(result.route),
+          route: safeRoute,
         });
       }
       return result;
@@ -280,6 +314,9 @@ export class SetupOrchestrator {
   ): Promise<StartupSetupResult> {
     const generation = this.#generation;
     const captured = this.#stateStore.read();
+    if (options.signal?.aborted) {
+      await this.#handleLegacyCallerCancellation(captured, generation, options.signal);
+    }
     const legacyRoute = captured.defaultRoute;
     if (!legacyRoute || legacyRoute.resolutionState !== "legacy-unverified") {
       const result = this.#reduce(captured, generation, []);
@@ -330,7 +367,13 @@ export class SetupOrchestrator {
       ),
       options.signal,
     );
-    if (modelsResult.kind === "cancelled") throw abortReason(options.signal!);
+    if (modelsResult.kind === "cancelled") {
+      await this.#handleLegacyCallerCancellation(
+        this.#stateStore.read(),
+        generation,
+        options.signal!,
+      );
+    }
     if (modelsResult.kind === "stale") {
       return this.#latestResult
         ?? this.#setupRequiredResult(this.#stateStore.read(), generation);
@@ -385,6 +428,14 @@ export class SetupOrchestrator {
           }
         },
       );
+      if (options.signal?.aborted) {
+        await this.#handleLegacyCallerCancellation(
+          this.#stateStore.read(),
+          generation,
+          options.signal,
+        );
+      }
+      if (generation !== this.#generation) return this.#staleResult();
       const currentProof = this.#proofs.get(connection.id);
       if (currentProof && currentProof.generation === generation) {
         this.#proofs.set(connection.id, {
@@ -404,14 +455,46 @@ export class SetupOrchestrator {
     }
   }
 
-  async #beginGeneration(): Promise<number> {
+  #reserveGeneration(): GenerationToken {
+    if (this.#currentGeneration) this.#currentGeneration.closed = true;
     this.#supersedeActiveProbes();
+    this.#proofs.clear();
+    this.#nextGeneration = Math.max(this.#nextGeneration, this.#generation) + 1;
+    const token: GenerationToken = {
+      generation: this.#nextGeneration,
+      closed: false,
+    };
+    this.#currentGeneration = token;
+    return token;
+  }
+
+  async #awaitGenerationTurn(token: GenerationToken): Promise<boolean> {
     while (this.#activationInFlight) {
       await this.#activationInFlight;
+      if (!this.#ownsReservation(token)) return false;
     }
+    if (!this.#ownsReservation(token)) return false;
+    this.#generation = token.generation;
     this.#supersedeActiveProbes();
-    this.#generation += 1;
-    return this.#generation;
+    return this.#ownsGeneration(token);
+  }
+
+  #ownsReservation(token: GenerationToken): boolean {
+    return !token.closed && token === this.#currentGeneration;
+  }
+
+  #ownsGeneration(token: GenerationToken): boolean {
+    return this.#ownsReservation(token)
+      && token.generation === this.#generation;
+  }
+
+  #staleResult(): StartupSetupResult {
+    if (
+      this.#latestResult?.generation === this.#generation
+      && this.#currentGeneration?.generation === this.#generation
+      && this.#currentGeneration.closed
+    ) return this.#latestResult;
+    return this.#setupRequiredResult(this.#stateStore.read(), this.#generation);
   }
 
   #supersedeActiveProbes(): void {
@@ -423,21 +506,25 @@ export class SetupOrchestrator {
   }
 
   async #inspectGeneration(
-    generation: number,
+    generationToken: GenerationToken,
     method: "inspect" | "reconnect",
     backendId: BackendId | undefined,
     options: StartupInspectionOptions,
   ): Promise<StartupSetupResult> {
+    if (!this.#ownsGeneration(generationToken)) return this.#staleResult();
+    const generation = generationToken.generation;
     const captured = this.#stateStore.read();
     if (options.signal?.aborted) {
-      await this.#handleCallerCancellation(captured, generation, options.signal);
+      await this.#handleCallerCancellation(captured, generationToken, options.signal);
     }
     const targets = this.#targets(captured, backendId);
     if (targets.length === 0) {
+      if (!this.#ownsGeneration(generationToken)) return this.#staleResult();
       const result = this.#reduce(captured, generation, []);
       this.#latestResult = result;
       this.#proofs.clear();
       this.#publishModeEvent(result, captured.defaultRoute);
+      if (!this.#ownsGeneration(generationToken)) return this.#staleResult();
       return result;
     }
 
@@ -454,7 +541,7 @@ export class SetupOrchestrator {
       "startup",
     );
     const probePromises = targets.map((target) =>
-      this.#runProbe(target, method, generation, providerTimeoutMs)
+      this.#runProbe(target, method, generationToken, providerTimeoutMs)
     );
     const cancelOutstanding = () => {
       const reason = abortReason(options.signal!);
@@ -483,10 +570,10 @@ export class SetupOrchestrator {
     }
 
     if (options.signal?.aborted) {
-      await this.#handleCallerCancellation(captured, generation, options.signal);
+      await this.#handleCallerCancellation(this.#stateStore.read(), generationToken, options.signal);
     }
-    if (generation !== this.#generation || outcomes.some((outcome) => outcome.kind === "stale")) {
-      return this.#latestResult ?? this.#setupRequiredResult(this.#stateStore.read(), generation);
+    if (!this.#ownsGeneration(generationToken) || outcomes.some((outcome) => outcome.kind === "stale")) {
+      return this.#staleResult();
     }
 
     const preview = applyOutcomes(captured, outcomes);
@@ -502,14 +589,25 @@ export class SetupOrchestrator {
             return applyOutcomes(current, outcomes).state;
           },
           () => {
-            if (generation !== this.#generation) {
+            if (!this.#ownsGeneration(generationToken)) {
               throw new Error("Provider inspection generation is stale.");
             }
           },
         );
       } catch {
         this.#invalidateGeneration(generation, outcomes);
-        return this.#latestResult ?? this.#setupRequiredResult(this.#stateStore.read(), generation);
+        return this.#staleResult();
+      }
+      if (options.signal?.aborted) {
+        await this.#handleCallerCancellation(
+          this.#stateStore.read(),
+          generationToken,
+          options.signal,
+        );
+      }
+      if (!this.#ownsGeneration(generationToken)) {
+        this.#invalidateGeneration(generation, outcomes);
+        return this.#staleResult();
       }
     } else {
       const current = this.#stateStore.read();
@@ -518,16 +616,26 @@ export class SetupOrchestrator {
         || JSON.stringify(current) !== JSON.stringify(captured)
       ) {
         this.#invalidateGeneration(generation, outcomes);
-        return this.#latestResult ?? this.#setupRequiredResult(current, generation);
+        return this.#staleResult();
       }
     }
 
+    if (!this.#ownsGeneration(generationToken)) {
+      this.#invalidateGeneration(generation, outcomes);
+      return this.#staleResult();
+    }
     this.#proofs.clear();
-    this.#publishInspectionEvents(outcomes, authoritative, generation);
+    if (!this.#publishInspectionEvents(
+      outcomes,
+      authoritative,
+      generationToken,
+    )) return this.#staleResult();
     this.#recordProofs(outcomes, authoritative, generation);
     const result = this.#reduce(authoritative, generation, outcomes);
+    if (!this.#ownsGeneration(generationToken)) return this.#staleResult();
     this.#latestResult = result;
     this.#publishModeEvent(result, authoritative.defaultRoute);
+    if (!this.#ownsGeneration(generationToken)) return this.#staleResult();
     return result;
   }
 
@@ -553,9 +661,26 @@ export class SetupOrchestrator {
   #runProbe(
     target: ProbeTarget,
     method: "inspect" | "reconnect",
-    generation: number,
+    generationToken: GenerationToken,
     timeoutMs: number,
   ): Promise<ProbeOutcome> {
+    const generation = generationToken.generation;
+    if (!this.#ownsGeneration(generationToken)) {
+      return Promise.resolve({
+        kind: "stale",
+        target,
+        token: {
+          generation,
+          backendId: target.connection.backendId,
+          connectionId: target.connection.id,
+          controller: new AbortController(),
+          closed: true,
+          superseded: true,
+          discardEmitted: true,
+        },
+        durationMs: 0,
+      });
+    }
     const startedAt = this.#clock.now();
     assertFiniteNow(startedAt);
     const controller = new AbortController();
@@ -575,6 +700,25 @@ export class SetupOrchestrator {
       backendId: target.connection.backendId,
       generation,
     });
+    if (!this.#ownsGeneration(generationToken)) {
+      token.closed = true;
+      token.superseded = true;
+      this.#activeProbes.delete(token);
+      token.discardEmitted = true;
+      this.#emit({
+        version: 1,
+        type: "inspection-discarded",
+        backendId: target.connection.backendId,
+        generation,
+        reason: "stale-generation",
+      });
+      return Promise.resolve({
+        kind: "stale",
+        target,
+        token,
+        durationMs: Math.max(0, this.#clock.now() - startedAt),
+      });
+    }
 
     return new Promise<ProbeOutcome>((resolve) => {
       let providerTimer: unknown;
@@ -703,11 +847,12 @@ export class SetupOrchestrator {
   #publishInspectionEvents(
     outcomes: readonly ProbeOutcome[],
     state: ProviderSetupStateV1,
-    generation: number,
-  ): void {
+    generationToken: GenerationToken,
+  ): boolean {
+    const generation = generationToken.generation;
     for (const outcome of outcomes) {
       if (outcome.kind === "invalid") {
-        this.#emit({
+        if (!this.#emitForGeneration(generationToken, {
           version: 1,
           type: "terminal-failure",
           backendId: outcome.target.connection.backendId,
@@ -715,7 +860,7 @@ export class SetupOrchestrator {
           code: "provider-inspection-invalid",
           retryable: true,
           message: "Provider inspection returned invalid metadata.",
-        });
+        })) return false;
         continue;
       }
       if (
@@ -731,7 +876,7 @@ export class SetupOrchestrator {
         ?? (connection?.accountFingerprintState === "verified"
           ? connection.accountFingerprint
           : null);
-      this.#emit({
+      if (!this.#emitForGeneration(generationToken, {
         version: 1,
         type: "inspection-end",
         backendId: outcome.inspection.backendId,
@@ -742,10 +887,10 @@ export class SetupOrchestrator {
         headline: outcome.inspection.headline,
         accountFingerprint,
         billingRealm: outcome.inspection.billingRealm,
-      });
+      })) return false;
       if (outcome.inspection.headline === "ready" && outcome.inspection.routeEligible) continue;
       if (outcome.inspection.health.credential === "rejected") {
-        this.#emit({
+        if (!this.#emitForGeneration(generationToken, {
           version: 1,
           type: "terminal-failure",
           backendId: outcome.inspection.backendId,
@@ -753,17 +898,18 @@ export class SetupOrchestrator {
           code: "provider-auth-replacement-required",
           retryable: false,
           message: "Provider credential replacement is required.",
-        });
+        })) return false;
       } else {
-        this.#emit({
+        if (!this.#emitForGeneration(generationToken, {
           version: 1,
           type: "warning",
           generation,
           code: "provider-inspection-retryable",
           message: "Provider inspection can be retried.",
-        });
+        })) return false;
       }
     }
+    return this.#ownsGeneration(generationToken);
   }
 
   #recordProofs(
@@ -933,16 +1079,39 @@ export class SetupOrchestrator {
 
   async #handleCallerCancellation(
     captured: ProviderSetupStateV1,
+    generationToken: GenerationToken,
+    signal: AbortSignal,
+  ): Promise<never> {
+    const generation = generationToken.generation;
+    if (this.#ownsGeneration(generationToken)) {
+      try {
+        const state = await this.#commitCancelled(captured, generation);
+        if (!this.#ownsGeneration(generationToken)) throw abortReason(signal);
+        const result = this.#setupRequiredResult(state, generation);
+        this.#latestResult = result;
+        this.#proofs.clear();
+        this.#emit({ version: 1, type: "setup-required", generation });
+      } catch {
+        this.#proofs.clear();
+      }
+    }
+    throw abortReason(signal);
+  }
+
+  async #handleLegacyCallerCancellation(
+    captured: ProviderSetupStateV1,
     generation: number,
     signal: AbortSignal,
   ): Promise<never> {
     if (generation === this.#generation) {
       try {
         const state = await this.#commitCancelled(captured, generation);
-        const result = this.#setupRequiredResult(state, generation);
-        this.#latestResult = result;
-        this.#proofs.clear();
-        this.#emit({ version: 1, type: "setup-required", generation });
+        if (generation === this.#generation) {
+          const result = this.#setupRequiredResult(state, generation);
+          this.#latestResult = result;
+          this.#proofs.clear();
+          this.#emit({ version: 1, type: "setup-required", generation });
+        }
       } catch {
         this.#proofs.clear();
       }
@@ -984,6 +1153,7 @@ export class SetupOrchestrator {
     timeoutMs: number,
     callerSignal?: AbortSignal,
   ): Promise<BoundedModelsResult> {
+    if (callerSignal?.aborted) return Promise.resolve({ kind: "cancelled" });
     const controller = new AbortController();
     const token: AttemptToken = {
       generation,
@@ -1012,9 +1182,19 @@ export class SetupOrchestrator {
         else finish({ kind: "timeout" });
       };
       const onCallerAbort = () => controller.abort(abortReason(callerSignal!));
+      timer = this.#clock.setTimeout(() => {
+        controller.abort(new ProviderInspectionTimeoutError(
+          "provider",
+          adapter.backendId,
+          timeoutMs,
+        ));
+      }, timeoutMs);
       controller.signal.addEventListener("abort", onAbort, { once: true });
       callerSignal?.addEventListener("abort", onCallerAbort, { once: true });
-      if (callerSignal?.aborted) onCallerAbort();
+      if (callerSignal?.aborted) {
+        onCallerAbort();
+        return;
+      }
       const operation = Promise.resolve().then(() =>
         adapter.listModels({ signal: controller.signal })
       );
@@ -1040,18 +1220,17 @@ export class SetupOrchestrator {
           else finish({ kind: "error" });
         },
       );
-      timer = this.#clock.setTimeout(() => {
-        controller.abort(new ProviderInspectionTimeoutError(
-          "provider",
-          adapter.backendId,
-          timeoutMs,
-        ));
-      }, timeoutMs);
     });
   }
 
   #emit(event: SetupEvent): void {
     this.#emitCallback(deepFreeze(structuredClone(event)));
+  }
+
+  #emitForGeneration(token: GenerationToken, event: SetupEvent): boolean {
+    if (!this.#ownsGeneration(token)) return false;
+    this.#emit(event);
+    return this.#ownsGeneration(token);
   }
 }
 
@@ -1138,36 +1317,74 @@ function normalizeInspection(
   generation: number,
 ): NormalizedInspection | null {
   if (!isRecord(raw)) return null;
-  const healthValue = raw.health;
+  let backendId: unknown;
+  let connectionId: unknown;
+  let healthValue: unknown;
+  let accountFingerprint: unknown;
+  let billingRealm: unknown;
+  try {
+    backendId = raw.backendId;
+    connectionId = raw.connectionId;
+    healthValue = raw.health;
+    accountFingerprint = raw.accountFingerprint;
+    billingRealm = raw.billingRealm;
+  } catch {
+    return null;
+  }
+  if (!isRecord(healthValue)) return null;
+  let credential: unknown;
+  let connectivity: unknown;
+  let spend: unknown;
+  let runtime: unknown;
+  let observedAt: unknown;
+  let healthGeneration: unknown;
+  try {
+    credential = healthValue.credential;
+    connectivity = healthValue.connectivity;
+    spend = healthValue.spend;
+    runtime = healthValue.runtime;
+    observedAt = healthValue.observedAt;
+    healthGeneration = healthValue.generation;
+  } catch {
+    return null;
+  }
+  const healthSnapshot = {
+    credential,
+    connectivity,
+    spend,
+    runtime,
+    observedAt,
+    generation: healthGeneration,
+  };
   if (
-    raw.backendId !== target.connection.backendId
-    || raw.connectionId !== target.connection.id
-    || raw.billingRealm !== target.connection.billingRealm
-    || !validHealth(healthValue, generation)
-    || !(raw.accountFingerprint === null
-      || (typeof raw.accountFingerprint === "string" && raw.accountFingerprint.length > 0))
+    backendId !== target.connection.backendId
+    || connectionId !== target.connection.id
+    || billingRealm !== target.connection.billingRealm
+    || !validHealth(healthSnapshot, generation)
+    || !(accountFingerprint === null
+      || (typeof accountFingerprint === "string" && accountFingerprint.length > 0))
     || (target.connection.accountFingerprintState === "verified"
-      && raw.accountFingerprint !== null
-      && raw.accountFingerprint !== target.connection.accountFingerprint)
+      && accountFingerprint !== null
+      && accountFingerprint !== target.connection.accountFingerprint)
   ) return null;
   const health: ProviderHealth = {
-    credential: healthValue.credential,
-    connectivity: healthValue.connectivity,
-    spend: healthValue.spend,
-    runtime: healthValue.runtime,
-    observedAt: healthValue.observedAt,
-    generation: healthValue.generation,
+    credential: healthSnapshot.credential,
+    connectivity: healthSnapshot.connectivity,
+    spend: healthSnapshot.spend,
+    runtime: healthSnapshot.runtime,
+    observedAt: healthSnapshot.observedAt,
+    generation: healthSnapshot.generation,
   };
   const headline = deriveProviderHeadline(health);
-  const fingerprintEligible = raw.accountFingerprint !== null
+  const fingerprintEligible = accountFingerprint !== null
     && (target.connection.accountFingerprintState === "verified"
-      || raw.accountFingerprint !== target.connection.accountFingerprint);
+      || accountFingerprint !== target.connection.accountFingerprint);
   return {
     backendId: target.connection.backendId,
     connectionId: target.connection.id,
     health,
     headline,
-    accountFingerprint: raw.accountFingerprint,
+    accountFingerprint,
     billingRealm: target.connection.billingRealm,
     routeEligible: headline === "ready" && fingerprintEligible,
   };
@@ -1217,32 +1434,111 @@ function normalizeModelList(value: unknown): readonly BackendModelDescriptor[] |
   if (!Array.isArray(value)) return null;
   const normalized: BackendModelDescriptor[] = [];
   for (const candidate of value) {
-    if (!isRecord(candidate) || !isRecord(candidate.capabilities)) continue;
+    if (!isRecord(candidate)) continue;
+    let backendId: unknown;
+    let requestedModelId: unknown;
+    let canonicalModelId: unknown;
+    let displayName: unknown;
+    let capabilities: unknown;
+    try {
+      backendId = candidate.backendId;
+      requestedModelId = candidate.requestedModelId;
+      canonicalModelId = candidate.canonicalModelId;
+      displayName = candidate.displayName;
+      capabilities = candidate.capabilities;
+    } catch {
+      return null;
+    }
+    if (!isRecord(capabilities)) continue;
+    let textInput: unknown;
+    let textOutput: unknown;
+    let tools: unknown;
+    let reasoning: unknown;
+    try {
+      textInput = capabilities.textInput;
+      textOutput = capabilities.textOutput;
+      tools = capabilities.tools;
+      reasoning = capabilities.reasoning;
+    } catch {
+      return null;
+    }
     if (
-      !includes(["openrouter", "codex", "anthropic"] as const, candidate.backendId)
-      || typeof candidate.requestedModelId !== "string"
-      || candidate.requestedModelId.length === 0
-      || typeof candidate.canonicalModelId !== "string"
-      || candidate.canonicalModelId.length === 0
-      || typeof candidate.capabilities.textInput !== "boolean"
-      || typeof candidate.capabilities.textOutput !== "boolean"
-      || typeof candidate.capabilities.tools !== "boolean"
-      || typeof candidate.capabilities.reasoning !== "boolean"
+      !includes(["openrouter", "codex", "anthropic"] as const, backendId)
+      || typeof requestedModelId !== "string"
+      || requestedModelId.length === 0
+      || typeof canonicalModelId !== "string"
+      || canonicalModelId.length === 0
+      || typeof textInput !== "boolean"
+      || typeof textOutput !== "boolean"
+      || typeof tools !== "boolean"
+      || typeof reasoning !== "boolean"
     ) continue;
     normalized.push({
-      backendId: candidate.backendId,
-      requestedModelId: candidate.requestedModelId,
-      canonicalModelId: candidate.canonicalModelId,
-      displayName: typeof candidate.displayName === "string" ? candidate.displayName : "",
+      backendId,
+      requestedModelId,
+      canonicalModelId,
+      displayName: typeof displayName === "string" ? displayName : "",
       capabilities: {
-        textInput: candidate.capabilities.textInput,
-        textOutput: candidate.capabilities.textOutput,
-        tools: candidate.capabilities.tools,
-        reasoning: candidate.capabilities.reasoning,
+        textInput,
+        textOutput,
+        tools,
+        reasoning,
       },
     });
   }
   return normalized;
+}
+
+function safeRouteIdentity(value: unknown): RouteIdentityV1 | null {
+  if (!isRecord(value)) return null;
+  let version: unknown;
+  let backendId: unknown;
+  let accountFingerprint: unknown;
+  let billingRealm: unknown;
+  let requestedModelId: unknown;
+  let canonicalModelId: unknown;
+  let resolutionState: unknown;
+  try {
+    version = value.version;
+    backendId = value.backendId;
+    accountFingerprint = value.accountFingerprint;
+    billingRealm = value.billingRealm;
+    requestedModelId = value.requestedModelId;
+    canonicalModelId = value.canonicalModelId;
+    resolutionState = value.resolutionState;
+  } catch {
+    return null;
+  }
+  if (
+    version !== 1
+    || !includes(["openrouter", "codex", "anthropic"] as const, backendId)
+    || typeof accountFingerprint !== "string"
+    || accountFingerprint.length === 0
+    || !includes([
+      "openrouter-payg",
+      "chatgpt-subscription-provider-managed-overage",
+      "chatgpt-account-provider-managed-limits",
+      "none",
+    ] as const, billingRealm)
+    || typeof requestedModelId !== "string"
+    || requestedModelId.length === 0
+    || !includes(["legacy-unverified", "resolved"] as const, resolutionState)
+    || (resolutionState === "resolved"
+      ? typeof canonicalModelId !== "string" || canonicalModelId.length === 0
+      : canonicalModelId !== null)
+  ) return null;
+  const safeCanonicalModelId = resolutionState === "resolved"
+    ? canonicalModelId as string
+    : null;
+  return {
+    version: 1,
+    backendId,
+    accountFingerprint,
+    billingRealm,
+    requestedModelId,
+    canonicalModelId: safeCanonicalModelId,
+    resolutionState,
+  };
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

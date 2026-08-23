@@ -132,6 +132,7 @@ class FakeAdapter implements BackendAdapter {
   models: readonly BackendModelDescriptor[] = [];
   modelScript: ((request: Parameters<BackendAdapter["listModels"]>[0]) =>
     readonly BackendModelDescriptor[] | Promise<readonly BackendModelDescriptor[]>) | null = null;
+  cloneModelResults = true;
   readonly modelSignals: AbortSignal[] = [];
 
   inspect(request: InspectionRequest): Promise<ProviderInspection> {
@@ -148,8 +149,8 @@ class FakeAdapter implements BackendAdapter {
   async listModels(request: Parameters<BackendAdapter["listModels"]>[0]): Promise<readonly BackendModelDescriptor[]> {
     this.calls.push("openrouter.listModels");
     this.modelSignals.push(request.signal);
-    if (this.modelScript) return structuredClone(await this.modelScript(request));
-    return structuredClone(this.models);
+    const result = this.modelScript ? await this.modelScript(request) : this.models;
+    return this.cloneModelResults ? structuredClone(result) : result;
   }
 
   async activate(_request: Parameters<BackendAdapter["activate"]>[0]): Promise<CandidateProviderState> {
@@ -323,6 +324,7 @@ async function setupFixture(options: {
   activationCoordinator?: ActivationDouble;
   providerTimeoutMs?: number;
   startupTimeoutMs?: number;
+  onEvent?: (event: Record<string, unknown>) => void;
 } = {}) {
   const api = await import("../src/setup.js");
   const adapter = options.adapter ?? new FakeAdapter();
@@ -342,7 +344,11 @@ async function setupFixture(options: {
     clock,
     providerTimeoutMs: options.providerTimeoutMs,
     startupTimeoutMs: options.startupTimeoutMs,
-    emit: (event: Record<string, unknown>) => events.push(structuredClone(event)),
+    emit: (event: Record<string, unknown>) => {
+      const captured = structuredClone(event);
+      events.push(captured);
+      options.onEvent?.(captured);
+    },
   });
   return {
     api,
@@ -1345,4 +1351,484 @@ test("inspection events use fixed privacy-safe fields and never provider error t
     event.message === "Provider inspection can be retried."
     || event.message === "Provider setup is required."
   ));
+});
+
+test("pre-aborted legacy resolution performs no catalog work and stores exact cancellation", async () => {
+  const state = migrateLegacyOpenRouterState(
+    { mainModel: "vendor/legacy-requested" },
+    { connectionId: "legacy-pre-aborted" },
+  );
+  const adapter = new FakeAdapter();
+  adapter.inspectionScripts = [(request) => inspected(state.connections[0]!, request, {
+    accountFingerprint: "acct_verified_pre_aborted",
+  })];
+  adapter.models = [model("vendor/legacy-requested", "vendor/canonical")];
+  const fixture = await setupFixture({ state, adapter });
+  await fixture.orchestrator.inspectStartup();
+  const controller = new AbortController();
+  const reason = new DOMException("exact-pre-aborted-legacy", "AbortError");
+  controller.abort(reason);
+  const catalogCallsBefore = adapter.calls.filter((call) => call === "openrouter.listModels").length;
+
+  await assert.rejects(
+    fixture.orchestrator.resolveLegacyDefaultRoute({ signal: controller.signal }),
+    (error: unknown) => error === reason,
+  );
+  await flushMicrotasks();
+
+  assert.equal(
+    adapter.calls.filter((call) => call === "openrouter.listModels").length,
+    catalogCallsBefore,
+  );
+  assert.equal(fixture.stateStore.read().lifecycle, "cancelled");
+  assert.equal(fixture.stateStore.read().cross.enabled, false);
+  assert.equal(fixture.stateStore.read().defaultRoute?.resolutionState, "legacy-unverified");
+  assert.equal(fixture.clock.activeTimers(), 0);
+});
+
+test("caller cancellation during durable inspection commit wins before events and result", async () => {
+  const primary = connection();
+  const initial = configuredState({ connections: [primary] });
+  let durable = structuredClone(initial);
+  let persistCalls = 0;
+  const firstAdopted = deferred<void>();
+  const releaseFirst = deferred<void>();
+  const stateStore = new ProviderStateStore(initial, {
+    persist: async (request) => {
+      persistCalls += 1;
+      const next = request.build(durable);
+      request.adopt(next);
+      durable = structuredClone(next);
+      if (persistCalls === 1) {
+        firstAdopted.resolve();
+        await releaseFirst.promise;
+      }
+      return structuredClone(next);
+    },
+  });
+  const adapter = new FakeAdapter();
+  adapter.inspectionScripts = [(request) => inspected(primary, request)];
+  const fixture = await setupFixture({ state: initial, stateStore, adapter });
+  const controller = new AbortController();
+  const reason = new DOMException("exact-durable-cancellation", "AbortError");
+
+  const pending = fixture.orchestrator.inspectStartup({ signal: controller.signal });
+  await firstAdopted.promise;
+  controller.abort(reason);
+  releaseFirst.resolve();
+  await assert.rejects(pending, (error: unknown) => error === reason);
+
+  assert.equal(stateStore.read().lifecycle, "cancelled");
+  assert.equal(durable.lifecycle, "cancelled");
+  assert.equal(stateStore.read().cross.enabled, false);
+  assert.equal(fixture.events.some((event) => event.type === "inspection-end"), false);
+  assert.equal(fixture.events.some((event) => event.type === "warning"), false);
+  assert.equal(fixture.clock.activeTimers(), 0);
+});
+
+test("back-to-back generations register ownership before an activation wait", async () => {
+  const primary = connection();
+  const activatedRoute = route(primary);
+  const activatedState = configuredState({ connections: [primary], defaultRoute: activatedRoute });
+  activatedState.revision = 1;
+  const activationRelease = deferred<ProviderActivationResult>();
+  const activationCoordinator: ActivationDouble = {
+    calls: [],
+    activate(request) {
+      this.calls.push(request);
+      return activationRelease.promise;
+    },
+  };
+  const adapter = new FakeAdapter();
+  adapter.inspectionScripts = [(request) => inspected(primary, request)];
+  adapter.reconnectScripts = [(request) => inspected(primary, request)];
+  const fixture = await setupFixture({
+    state: configuredState({ connections: [primary] }),
+    adapter,
+    activationCoordinator,
+  });
+  const activation = fixture.orchestrator.activateCandidate({
+    expectedRevision: 0,
+    candidate: "candidate-generation-gate",
+    selectedCanonicalModelId: activatedRoute.canonicalModelId!,
+    signal: new AbortController().signal,
+    persistence: "persisted",
+  });
+  await flushMicrotasks();
+
+  const superseded = fixture.orchestrator.inspectStartup();
+  const current = fixture.orchestrator.reconnect("openrouter");
+  await flushMicrotasks();
+  assert.deepEqual(adapter.calls, []);
+  activationRelease.resolve({
+    persisted: true,
+    route: activatedRoute,
+    state: activatedState,
+    warnings: [],
+  });
+  await activation;
+  await Promise.all([superseded, current]);
+
+  assert.deepEqual(adapter.calls, ["openrouter.reconnect"]);
+  assert.deepEqual(
+    fixture.events.filter((event) => event.type === "inspection-start").map((event) => event.generation),
+    [3],
+  );
+  assert.equal(fixture.clock.activeTimers(), 0);
+});
+
+test("a superseded generation cannot publish after durable adoption returns", async () => {
+  const primary = connection();
+  const initial = configuredState({ connections: [primary] });
+  let durable = structuredClone(initial);
+  let persistCalls = 0;
+  const firstAdopted = deferred<void>();
+  const releaseFirst = deferred<void>();
+  const stateStore = new ProviderStateStore(initial, {
+    persist: async (request) => {
+      persistCalls += 1;
+      const next = request.build(durable);
+      request.adopt(next);
+      durable = structuredClone(next);
+      if (persistCalls === 1) {
+        firstAdopted.resolve();
+        await releaseFirst.promise;
+      }
+      return structuredClone(next);
+    },
+  });
+  const reconnectResult = deferred<ProviderInspection>();
+  let reconnectRequest!: InspectionRequest;
+  const adapter = new FakeAdapter();
+  adapter.inspectionScripts = [(request) => inspected(primary, request)];
+  adapter.reconnectScripts = [(request) => {
+    reconnectRequest = request;
+    return reconnectResult.promise;
+  }];
+  const fixture = await setupFixture({ state: initial, stateStore, adapter });
+
+  const older = fixture.orchestrator.inspectStartup();
+  await firstAdopted.promise;
+  const newer = fixture.orchestrator.reconnect("openrouter");
+  await flushMicrotasks();
+  const newerStartIndex = fixture.events.findIndex((event) =>
+    event.type === "inspection-start" && event.generation === 2
+  );
+  assert.notEqual(newerStartIndex, -1);
+  releaseFirst.resolve();
+  await flushMicrotasks();
+  const staleAuthoritativeEvents =
+    fixture.events.slice(newerStartIndex).filter((event) =>
+      event.generation === 1 && event.type !== "inspection-discarded"
+    );
+  reconnectResult.resolve(inspected(primary, reconnectRequest));
+  await Promise.all([older, newer]);
+
+  assert.deepEqual(staleAuthoritativeEvents, []);
+  assert.equal(stateStore.read().connections[0]?.lastHealth?.generation, 2);
+  assert.equal(fixture.clock.activeTimers(), 0);
+});
+
+test("runnable route proof is revoked by current provider state revision or disable", async (t) => {
+  const cases: Array<{
+    name: string;
+    mutate(state: ProviderSetupStateV1): void;
+  }> = [
+    {
+      name: "unrelated revision",
+      mutate(state) {
+        state.lifecycle = "cancelled";
+      },
+    },
+    {
+      name: "disabled connection",
+      mutate(state) {
+        state.connections[0]!.enabled = false;
+      },
+    },
+  ];
+  for (const entry of cases) {
+    await t.test(entry.name, async () => {
+      const primary = connection();
+      const adapter = new FakeAdapter();
+      adapter.inspectionScripts = [(request) => inspected(primary, request)];
+      const fixture = await setupFixture({
+        state: configuredState({ connections: [primary] }),
+        adapter,
+      });
+      await fixture.orchestrator.inspectStartup();
+      const externallyChanged = fixture.stateStore.read();
+      entry.mutate(externallyChanged);
+      fixture.stateStore.replace(externallyChanged, externallyChanged.revision);
+      const before = JSON.stringify(fixture.stateStore.read());
+
+      assert.throws(
+        () => fixture.orchestrator.ensureRunnableRoute(),
+        fixture.api.ProviderSetupRequiredError,
+      );
+      assert.equal(JSON.stringify(fixture.stateStore.read()), before);
+    });
+  }
+});
+
+test("runnable route proof is unavailable while a newer generation is pending", async () => {
+  const primary = connection();
+  const adapter = new FakeAdapter();
+  adapter.inspectionScripts = [(request) => inspected(primary, request)];
+  const reconnectStarted = deferred<void>();
+  const releaseReconnect = deferred<void>();
+  adapter.reconnectScripts = [async (request) => {
+    reconnectStarted.resolve();
+    await releaseReconnect.promise;
+    return inspected(primary, request);
+  }];
+  const fixture = await setupFixture({
+    state: configuredState({ connections: [primary] }),
+    adapter,
+  });
+  await fixture.orchestrator.inspectStartup();
+
+  const pending = fixture.orchestrator.reconnect("openrouter");
+  let thrown: unknown;
+  try {
+    fixture.orchestrator.ensureRunnableRoute();
+  } catch (error) {
+    thrown = error;
+  }
+  await flushMicrotasks();
+  releaseReconnect.resolve();
+  await pending;
+  await reconnectStarted.promise;
+
+  assert.ok(thrown instanceof fixture.api.ProviderSetupRequiredError);
+  assert.equal(fixture.clock.activeTimers(), 0);
+});
+
+test("inspection normalization snapshots untrusted primitive and nested health getters once", async () => {
+  const primary = connection();
+  const fingerprintSentinel = "secret-from-seventh-fingerprint-read";
+  const healthSentinel = "secret-from-second-health-read";
+  let fingerprintReads = 0;
+  let credentialReads = 0;
+  const adversarialHealth = {
+    get credential() {
+      credentialReads += 1;
+      return credentialReads === 1 ? "valid" : healthSentinel;
+    },
+    connectivity: "connected",
+    spend: "available",
+    runtime: "not-applicable",
+    observedAt: 1_000,
+    generation: 1,
+  };
+  const adversarialInspection = {
+    backendId: "openrouter",
+    connectionId: primary.id,
+    health: adversarialHealth,
+    headline: "ready",
+    get accountFingerprint() {
+      fingerprintReads += 1;
+      return fingerprintReads < 7 ? primary.accountFingerprint : fingerprintSentinel;
+    },
+    billingRealm: "openrouter-payg",
+    routeEligible: true,
+    retryable: false,
+    explanationCode: "untrusted-getters",
+  } as unknown as ProviderInspection;
+  const adapter = new FakeAdapter();
+  adapter.inspectionScripts = [() => adversarialInspection];
+  const fixture = await setupFixture({
+    state: configuredState({ connections: [primary] }),
+    adapter,
+  });
+
+  const result = await fixture.orchestrator.inspectStartup();
+  const serialized = JSON.stringify({ result, events: fixture.events, state: fixture.stateStore.read() });
+
+  assert.equal(result.mode, "ready");
+  assert.equal(fingerprintReads, 1);
+  assert.equal(credentialReads, 1);
+  assert.equal(serialized.includes(fingerprintSentinel), false);
+  assert.equal(serialized.includes(healthSentinel), false);
+  assert.equal(fixture.clock.activeTimers(), 0);
+});
+
+test("legacy model normalization snapshots primitive and nested capability getters once", async () => {
+  const state = migrateLegacyOpenRouterState(
+    { mainModel: "vendor/legacy-requested" },
+    { connectionId: "legacy-model-getters" },
+  );
+  const adapter = new FakeAdapter();
+  adapter.inspectionScripts = [(request) => inspected(state.connections[0]!, request, {
+    accountFingerprint: "acct_verified_model_getters",
+  })];
+  const canonicalSentinel = "secret-from-third-canonical-read";
+  let canonicalReads = 0;
+  let toolsReads = 0;
+  const capabilities = {
+    textInput: true,
+    textOutput: true,
+    get tools() {
+      toolsReads += 1;
+      return toolsReads === 1;
+    },
+    reasoning: true,
+  };
+  const adversarialModel = {
+    backendId: "openrouter",
+    requestedModelId: "vendor/legacy-requested",
+    get canonicalModelId() {
+      canonicalReads += 1;
+      return canonicalReads < 3 ? "vendor/canonical-safe" : canonicalSentinel;
+    },
+    displayName: "Legacy model",
+    capabilities,
+  } as unknown as BackendModelDescriptor;
+  adapter.cloneModelResults = false;
+  adapter.modelScript = () => [adversarialModel];
+  const fixture = await setupFixture({ state, adapter });
+  await fixture.orchestrator.inspectStartup();
+
+  const result = await fixture.orchestrator.resolveLegacyDefaultRoute();
+  const serialized = JSON.stringify({ result, state: fixture.stateStore.read() });
+
+  assert.equal(result.mode, "ready");
+  assert.equal(fixture.stateStore.read().defaultRoute?.canonicalModelId, "vendor/canonical-safe");
+  assert.equal(canonicalReads, 1);
+  assert.equal(toolsReads, 1);
+  assert.equal(serialized.includes(canonicalSentinel), false);
+  assert.equal(fixture.clock.activeTimers(), 0);
+});
+
+test("candidate activation event reconstructs only the exact safe route schema", async () => {
+  const primary = connection();
+  const safeRoute = route(primary, "vendor/chosen", "vendor/canonical");
+  const secret = "secret-extra-candidate-route-field";
+  const coordinatorRoute = {
+    ...safeRoute,
+    secret,
+  } as RouteIdentityV1;
+  const activatedState = configuredState({
+    connections: [primary],
+    defaultRoute: safeRoute,
+  });
+  activatedState.revision = 1;
+  const activationCoordinator: ActivationDouble = {
+    calls: [],
+    async activate(request) {
+      this.calls.push(request);
+      return {
+        persisted: true,
+        route: coordinatorRoute,
+        state: activatedState,
+        warnings: [],
+      };
+    },
+  };
+  const fixture = await setupFixture({
+    state: configuredState({ connections: [primary] }),
+    activationCoordinator,
+  });
+
+  await fixture.orchestrator.activateCandidate({
+    expectedRevision: 0,
+    candidate: "candidate-safe-route-event",
+    selectedCanonicalModelId: "vendor/canonical",
+    signal: new AbortController().signal,
+    persistence: "persisted",
+  });
+  const activationEvent = fixture.events.find((event) => event.type === "candidate-activation");
+
+  assert.ok(activationEvent);
+  assert.deepEqual(activationEvent.route, safeRoute);
+  assert.deepEqual(Object.keys(activationEvent.route as unknown as Record<string, unknown>).sort(), [
+    "accountFingerprint",
+    "backendId",
+    "billingRealm",
+    "canonicalModelId",
+    "requestedModelId",
+    "resolutionState",
+    "version",
+  ]);
+  assert.equal(JSON.stringify(activationEvent).includes(secret), false);
+});
+
+test("a reentrant newer generation at inspection start prevents the old adapter effect", async () => {
+  const primary = connection();
+  const secondary = connection("connection-secondary", "acct_secondary");
+  const adapter = new FakeAdapter();
+  adapter.inspectionScripts = [
+    (request) => inspected(primary, request),
+    (request) => inspected(secondary, request),
+  ];
+  adapter.reconnectScripts = [
+    (request) => inspected(primary, request),
+    (request) => inspected(secondary, request),
+  ];
+  let startNewer: ((event: Record<string, unknown>) => void) | null = null;
+  const fixture = await setupFixture({
+    state: configuredState({ connections: [primary, secondary] }),
+    adapter,
+    onEvent: (event) => startNewer?.(event),
+  });
+  let newer: Promise<unknown> | null = null;
+  startNewer = (event) => {
+    if (event.type !== "inspection-start" || event.generation !== 1 || newer) return;
+    newer = fixture.orchestrator.reconnect("openrouter");
+  };
+
+  const older = fixture.orchestrator.inspectStartup();
+  await older;
+  assert.ok(newer);
+  await newer;
+
+  assert.deepEqual(adapter.calls, ["openrouter.reconnect", "openrouter.reconnect"]);
+  assert.equal(
+    fixture.events.filter((event) =>
+      event.type === "inspection-start" && event.generation === 1
+    ).length,
+    1,
+  );
+  assert.equal(fixture.clock.activeTimers(), 0);
+});
+
+test("a reentrant newer generation stops the remaining old authoritative events", async () => {
+  const primary = connection();
+  const secondary = connection("connection-secondary", "acct_secondary");
+  const adapter = new FakeAdapter();
+  adapter.inspectionScripts = [
+    (request) => inspected(primary, request),
+    (request) => inspected(secondary, request),
+  ];
+  adapter.reconnectScripts = [
+    (request) => inspected(primary, request),
+    (request) => inspected(secondary, request),
+  ];
+  const timeline: string[] = [];
+  let handleEvent: ((event: Record<string, unknown>) => void) | null = null;
+  const fixture = await setupFixture({
+    state: configuredState({ connections: [primary, secondary] }),
+    adapter,
+    onEvent: (event) => handleEvent?.(event),
+  });
+  let newer: Promise<unknown> | null = null;
+  handleEvent = (event) => {
+    timeline.push(`${String(event.type)}:${String(event.generation)}`);
+    if (event.type !== "inspection-end" || event.generation !== 1 || newer) return;
+    timeline.push("new-generation-requested");
+    newer = fixture.orchestrator.reconnect("openrouter");
+  };
+
+  const older = fixture.orchestrator.inspectStartup();
+  await older;
+  assert.ok(newer);
+  await newer;
+  const requestIndex = timeline.indexOf("new-generation-requested");
+
+  assert.notEqual(requestIndex, -1);
+  assert.deepEqual(
+    timeline.slice(requestIndex + 1).filter((entry) => entry === "inspection-end:1"),
+    [],
+  );
+  assert.equal(fixture.clock.activeTimers(), 0);
 });
