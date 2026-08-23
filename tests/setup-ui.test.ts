@@ -12,6 +12,8 @@ import {
 import { ProviderStateStore, createNeverConfiguredProviderState } from "../src/provider-state.js";
 import { SetupOrchestrator, type SetupEvent } from "../src/setup.js";
 import {
+  createPlainSetupSurface,
+  createTuiSetupSurface,
   runSetupHub,
   type SetupHubEntry,
   type SetupSurface,
@@ -401,7 +403,9 @@ test("process-only role preparation sees the transient route but leaves durable 
 
   const result = await runSetupHub({ ...context, surface, environmentSecret: "sk-or-v1-environment" });
 
-  assert.deepEqual(result, { kind: "ready" });
+  assert.equal(result.kind, "ready");
+  assert.equal(result.preparedRoles?.lead.canonicalModelId, MODEL.canonicalModelId);
+  assert.equal(result.preparedRoles?.challenger.canonicalModelId, CHALLENGER.canonicalModelId);
   assert.deepEqual(surface.calls, ["model", "hub", "model"]);
   assert.equal(context.stateStore.read().defaultRoute, null);
 });
@@ -418,4 +422,132 @@ test("offline saved credential stays authoritative and never exposes environment
   assert.deepEqual(result, { kind: "cancelled", mode: "setup-required" });
   assert.deepEqual(context.adapter.connected, [saved]);
   assert.equal(surface.entries[1]?.some((entry) => entry.id === "openrouter:environment"), false);
+});
+
+test("runSetupHub retry through the plain adapter replaces the error with one current revision", async () => {
+  const status: string[] = [];
+  const selections = ["openrouter", "openrouter", MODEL.canonicalModelId, "cross-later"];
+  const passwords = ["offline-key", "working-key"];
+  const surface = createPlainSetupSurface({
+    async select() { return selections.shift()!; },
+    async password() { return passwords.shift()!; },
+    async confirm() { return true; },
+    setStatus(message: string) { status.push(message); },
+  } as never);
+  const context = fixture(surface);
+  context.adapter.offline.add("offline-key");
+
+  const result = await runSetupHub({ ...context, surface });
+
+  assert.deepEqual(result, { kind: "ready" });
+  assert.match(status[0] ?? "", /nicht bestätigen/i);
+  assert.match(status.at(-1) ?? "", new RegExp(`OpenRouter.*Aktuell r${context.stateStore.read().revision}`));
+  assert.match(status.at(-1) ?? "", /Anthropic \/ Claude-Abo.*Coming soon/);
+  assert.doesNotMatch(status.at(-1) ?? "", /nicht bestätigen/i);
+  assert.equal((status.at(-1)?.match(/Aktuell r/g) ?? []).length, 1);
+});
+
+test("runSetupHub success through the TUI adapter presents one current provider card before Cross", async () => {
+  const cards: string[] = [];
+  const status: string[] = [];
+  const choices = ["openrouter", "cross-later"];
+  const surface = createTuiSetupSurface({
+    async pickChoice(_title, items) {
+      const choice = choices.shift();
+      return items.find((item) => item.value === choice) ?? null;
+    },
+    async readSecret() { return "sk-or-v1-test-key"; },
+    async pickModel(search) { return search("")[0] ?? null; },
+    async confirmAction() { return { accepted: true }; },
+    addMessage(_role, content) { cards.push(content); },
+    setStatus(message) { status.push(message); },
+  });
+  const context = fixture(surface);
+
+  const result = await runSetupHub({ ...context, surface });
+
+  assert.deepEqual(result, { kind: "ready" });
+  assert.equal(cards.length, 1);
+  assert.match(cards[0] ?? "", new RegExp(`OpenRouter.*Aktuell r${context.stateStore.read().revision}`));
+  assert.match(cards[0] ?? "", /Anthropic \/ Claude-Abo.*Coming soon/);
+  assert.equal((cards[0]?.match(/Aktuell r/g) ?? []).length, 1);
+  assert.doesNotMatch(cards[0] ?? "", /nicht bestätigt|erneut versuchen/i);
+  assert.doesNotMatch(status.at(-1) ?? "", /nicht bestätigt|erneut versuchen/i);
+});
+
+test("process-only Prepare roles returns only safe session routes without durable mutation", async () => {
+  const surface = new ScriptedSurface(
+    ["cross-prepare"],
+    [],
+    [MODEL.canonicalModelId, CHALLENGER.canonicalModelId],
+  );
+  const context = fixture(surface, { processOnlyNullState: true });
+  context.adapter.models = [MODEL, CHALLENGER];
+
+  const result = await runSetupHub({ ...context, surface, environmentSecret: "sk-or-v1-environment" });
+
+  assert.deepEqual(result, {
+    kind: "ready",
+    preparedRoles: {
+      lead: {
+        version: 1,
+        backendId: "openrouter",
+        accountFingerprint: "acct",
+        billingRealm: "openrouter-payg",
+        requestedModelId: MODEL.requestedModelId,
+        canonicalModelId: MODEL.canonicalModelId,
+        resolutionState: "resolved",
+      },
+      challenger: {
+        version: 1,
+        backendId: "openrouter",
+        accountFingerprint: "acct",
+        billingRealm: "openrouter-payg",
+        requestedModelId: CHALLENGER.requestedModelId,
+        canonicalModelId: CHALLENGER.canonicalModelId,
+        resolutionState: "resolved",
+      },
+    },
+  });
+  assert.equal(context.stateStore.read().defaultRoute, null);
+  assert.equal(context.stateStore.read().cross.preferredLead, null);
+});
+
+test("explicit runnable model replacement changes an existing default only through one activation transaction", async () => {
+  const surface = new ScriptedSurface(["openrouter", "cross-later"], ["sk-or-v1-test-key"], [CHALLENGER.canonicalModelId], [true]);
+  const context = fixture(surface);
+  const previous = context.stateStore.read();
+  const existing = {
+    version: 1 as const,
+    backendId: "openrouter" as const,
+    accountFingerprint: "acct",
+    billingRealm: "openrouter-payg" as const,
+    requestedModelId: MODEL.requestedModelId,
+    canonicalModelId: MODEL.canonicalModelId,
+    resolutionState: "resolved" as const,
+  };
+  context.stateStore.replace({
+    ...previous,
+    lifecycle: "configured",
+    connections: [{
+      id: "connection",
+      backendId: "openrouter",
+      enabled: true,
+      maturity: "stable",
+      credentialSlot: "inference:connection",
+      accountFingerprint: "acct",
+      accountFingerprintState: "verified",
+      billingRealm: "openrouter-payg",
+      lastHealth: null,
+    }],
+    defaultRoute: existing,
+  }, previous.revision);
+  context.adapter.models = [MODEL, CHALLENGER];
+
+  const result = await runSetupHub({ ...context, surface });
+
+  assert.deepEqual(result, { kind: "ready" });
+  assert.equal(context.activations.length, 1);
+  assert.equal(context.activations[0]?.selectedCanonicalModelId, CHALLENGER.canonicalModelId);
+  assert.equal(context.stateStore.read().defaultRoute?.canonicalModelId, CHALLENGER.canonicalModelId);
 });

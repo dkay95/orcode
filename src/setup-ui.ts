@@ -6,7 +6,7 @@ import type {
   BackendRegistry,
   RouteIdentityV1,
 } from "./backends.js";
-import type { ProviderStateStore } from "./provider-state.js";
+import { validateRouteIdentityV1, type ProviderStateStore } from "./provider-state.js";
 import type { SetupEvent, SetupOrchestrator } from "./setup.js";
 import type { ModelInfo } from "./types.js";
 
@@ -24,12 +24,28 @@ export interface SetupSurface {
   readSecret(request: { backendId: BackendId; message: string }): Promise<string | null>;
   chooseModel(request: { backendId: BackendId; models: readonly BackendModelDescriptor[] }): Promise<string | null>;
   confirm(request: { id: string; message: string; defaultValue: boolean }): Promise<boolean>;
-  present(event: SetupEvent | { version: 1; type: "notice"; message: string }): void;
+  present(event: SetupPresentation): void;
 }
+
+export interface SetupPreparedRoles {
+  lead: RouteIdentityV1;
+  challenger: RouteIdentityV1;
+}
+
+export interface SetupProviderStatePresentation {
+  version: 1;
+  type: "provider-state";
+  entries: readonly SetupHubEntry[];
+}
+
+export type SetupPresentation =
+  | SetupEvent
+  | { version: 1; type: "notice"; message: string }
+  | SetupProviderStatePresentation;
 
 export type SetupHubResult =
   | { kind: "cancelled"; mode: "setup-required" }
-  | { kind: "ready" };
+  | { kind: "ready"; preparedRoles?: SetupPreparedRoles };
 
 export interface SetupHubOptions {
   surface: SetupSurface;
@@ -64,7 +80,7 @@ export async function runSetupHub(options: SetupHubOptions): Promise<SetupHubRes
         false,
         options,
       );
-      if (outcome.kind === "ready") return completeCrossSetup(surface, stateStore, outcome);
+      if (outcome.kind === "ready") return completeCrossSetup(surface, registry, stateStore, outcome);
       if (outcome.kind === "cancelled") return { kind: "cancelled", mode: "setup-required" };
       continue;
     }
@@ -77,7 +93,7 @@ export async function runSetupHub(options: SetupHubOptions): Promise<SetupHubRes
       const environment = nonEmpty(options.environmentSecret);
       if (!environment) continue;
       const outcome = await activateOpenRouter(environment, "process-only", false, options);
-      if (outcome.kind === "ready") return completeCrossSetup(surface, stateStore, outcome);
+      if (outcome.kind === "ready") return completeCrossSetup(surface, registry, stateStore, outcome);
       if (outcome.kind === "cancelled") return { kind: "cancelled", mode: "setup-required" };
       continue;
     }
@@ -110,7 +126,7 @@ export async function runSetupHub(options: SetupHubOptions): Promise<SetupHubRes
     }
 
     const outcome = await activateOpenRouter(candidate!, persistence, askPersistence, options);
-    if (outcome.kind === "ready") return completeCrossSetup(surface, stateStore, outcome);
+    if (outcome.kind === "ready") return completeCrossSetup(surface, registry, stateStore, outcome);
     if (outcome.kind === "cancelled") return { kind: "cancelled", mode: "setup-required" };
     if (usingSaved && outcome.kind === "rejected") {
       savedAvailable = false;
@@ -198,9 +214,11 @@ async function activateOpenRouter(
 
 async function completeCrossSetup(
   surface: SetupSurface,
+  registry: BackendRegistry,
   stateStore: ProviderStateStore,
   activation: Extract<ActivationFlow, { kind: "ready" }>,
 ): Promise<SetupHubResult> {
+  surface.present(providerState(hubEntries(registry, stateStore, false, activation.route)));
   const action = await surface.chooseHub([
     { id: "cross-later", label: "Later", description: "Collaboration remains off.", disabled: false, current: true, generation: stateStore.read().revision },
     { id: "cross-prepare", label: "Prepare roles", description: "Store two routes without starting collaboration.", disabled: false, current: false, generation: stateStore.read().revision },
@@ -208,7 +226,11 @@ async function completeCrossSetup(
   if (action === null || action === "cross-later") return { kind: "ready" };
   if (action !== "cross-prepare") return { kind: "ready" };
 
-  const current = activation.route;
+  const current = resolvedRoute(activation.route);
+  if (!current) {
+    surface.present(notice("Prepare roles benötigt zwei unterschiedliche vollständig aufgelöste Modelle."));
+    return { kind: "ready" };
+  }
   const choices = activation.models.filter((model) =>
     current.resolutionState === "resolved"
     && current.canonicalModelId !== model.canonicalModelId,
@@ -223,16 +245,21 @@ async function completeCrossSetup(
     surface.present(notice("Prepare roles benötigt zwei unterschiedliche vollständig aufgelöste Modelle."));
     return { kind: "ready" };
   }
+  const challengerRoute = routeForModel(current, challenger);
+  if (!challengerRoute) {
+    surface.present(notice("Prepare roles benötigt zwei unterschiedliche vollständig aufgelöste Modelle."));
+    return { kind: "ready" };
+  }
   if (activation.state === null) {
     surface.present(notice("Rollen sind nur für diese Prozessroute vorbereitet. Cross bleibt ausgeschaltet."));
-    return { kind: "ready" };
+    return { kind: "ready", preparedRoles: { lead: current, challenger: challengerRoute } };
   }
   await stateStore.commit(stateStore.read().revision, (state) => ({
     ...state,
     cross: {
       enabled: false,
       preferredLead: current,
-      preferredChallenger: routeForModel(current, challenger),
+      preferredChallenger: challengerRoute,
     },
   }));
   surface.present(notice("Rollen wurden vorbereitet. Cross bleibt ausgeschaltet."));
@@ -253,6 +280,7 @@ function hubEntries(
   registry: BackendRegistry,
   stateStore: ProviderStateStore,
   environmentOffered: boolean,
+  currentRoute?: RouteIdentityV1,
 ): SetupHubEntry[] {
   const state = stateStore.read();
   const entries: SetupHubEntry[] = registry.entries().map((descriptor) => ({
@@ -260,7 +288,7 @@ function hubEntries(
     label: descriptor.displayName,
     description: descriptor.maturity === "coming-soon" ? "Coming soon" : "Connect provider",
     disabled: !descriptor.connectable,
-    current: state.defaultRoute?.backendId === descriptor.id,
+    current: (currentRoute ?? state.defaultRoute)?.backendId === descriptor.id,
     generation: state.revision,
   }));
   if (environmentOffered) {
@@ -280,11 +308,28 @@ function descriptorFor(registry: BackendRegistry, id: string): BackendDescriptor
   return registry.entries().find((descriptor) => descriptor.id === id) ?? null;
 }
 
-function routeForModel(current: RouteIdentityV1, model: BackendModelDescriptor): RouteIdentityV1 {
-  return {
-    ...current,
+function routeForModel(current: RouteIdentityV1, model: BackendModelDescriptor): RouteIdentityV1 | null {
+  return resolvedRoute({
+    version: 1,
+    backendId: current.backendId,
+    accountFingerprint: current.accountFingerprint,
+    billingRealm: current.billingRealm,
     requestedModelId: model.requestedModelId,
     canonicalModelId: model.canonicalModelId,
+    resolutionState: "resolved",
+  });
+}
+
+function resolvedRoute(value: unknown): RouteIdentityV1 | null {
+  const route = validateRouteIdentityV1(value);
+  if (!route || route.resolutionState !== "resolved" || route.canonicalModelId === null) return null;
+  return {
+    version: 1,
+    backendId: route.backendId,
+    accountFingerprint: route.accountFingerprint,
+    billingRealm: route.billingRealm,
+    requestedModelId: route.requestedModelId,
+    canonicalModelId: route.canonicalModelId,
     resolutionState: "resolved",
   };
 }
@@ -297,11 +342,24 @@ function notice(message: string): { version: 1; type: "notice"; message: string 
   return { version: 1, type: "notice", message };
 }
 
+function providerState(entries: readonly SetupHubEntry[]): SetupProviderStatePresentation {
+  return { version: 1, type: "provider-state", entries: [...entries] };
+}
+
+function providerEntryLabel(entry: SetupHubEntry): string {
+  if (entry.disabled) return `${entry.label} · Coming soon`;
+  return entry.current ? `${entry.label} · Aktuell r${entry.generation}` : entry.label;
+}
+
+function providerStateLabel(entries: readonly SetupHubEntry[]): string {
+  return entries.map(providerEntryLabel).join(" · ");
+}
+
 export interface PlainSetupPromptIo {
   select(request: { message: string; choices: readonly { name: string; value: string }[] }): Promise<string>;
   password(request: { message: string; mask: string }): Promise<string>;
   confirm(request: { message: string; default: boolean }): Promise<boolean>;
-  present?(event: SetupEvent | { version: 1; type: "notice"; message: string }): void;
+  setStatus(status: string): void;
 }
 
 /** The CLI supplies the existing Inquirer primitives; this module never does. */
@@ -310,7 +368,7 @@ export function createPlainSetupSurface(io: PlainSetupPromptIo): SetupSurface {
     async chooseHub(entries) {
       return io.select({
         message: "Provider auswählen",
-        choices: entries.map((entry) => ({ name: `${entry.label} · ${entry.description}`, value: entry.id })),
+        choices: entries.map((entry) => ({ name: `${providerEntryLabel(entry)} · ${entry.description}`, value: entry.id })),
       }).catch(() => null);
     },
     async readSecret(request) {
@@ -326,7 +384,8 @@ export function createPlainSetupSurface(io: PlainSetupPromptIo): SetupSurface {
       return io.confirm({ message: request.message, default: request.defaultValue }).catch(() => false);
     },
     present(event) {
-      io.present?.(event);
+      if (event.type === "provider-state") io.setStatus(providerStateLabel(event.entries));
+      else if (event.type === "notice") io.setStatus(event.message);
     },
   };
 }
@@ -356,11 +415,7 @@ export function createTuiSetupSurface(ui: TuiSetupPromptUi): SetupSurface {
       const current = entries.find((entry) => entry.current)?.id ?? "";
       const items = entries.map((entry) => ({
         value: entry.id,
-        label: entry.disabled
-          ? `${entry.label} · Coming soon`
-          : entry.current
-            ? `${entry.label} · Aktuell r${entry.generation}`
-            : entry.label,
+        label: providerEntryLabel(entry),
         description: entry.description,
       }));
       return (await ui.pickChoice("Provider-Setup", items, current, current || (items[0]?.value ?? "")))?.value ?? null;
@@ -378,7 +433,8 @@ export function createTuiSetupSurface(ui: TuiSetupPromptUi): SetupSurface {
       return (await ui.confirmAction(request.message, "", false)).accepted;
     },
     present(event) {
-      if (event.type === "notice") ui.setStatus(event.message, false);
+      if (event.type === "provider-state") ui.addMessage("system", providerStateLabel(event.entries), "Provider-Setup");
+      else if (event.type === "notice") ui.setStatus(event.message, false);
     },
   };
 }

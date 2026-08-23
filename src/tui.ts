@@ -56,12 +56,14 @@ const ENTER_ALTERNATE_SCREEN = "\u001b[?1049h";
 const LEAVE_ALTERNATE_SCREEN = "\u001b[?1049l";
 const ENABLE_BRACKETED_PASTE = "\u001b[?2004h";
 const DISABLE_BRACKETED_PASTE = "\u001b[?2004l";
+const ENABLE_SGR_MOUSE = "\u001b[?1000h\u001b[?1006h";
+const DISABLE_SGR_MOUSE = "\u001b[?1000l\u001b[?1006l";
 const HIDE_CURSOR = "\u001b[?25l";
 const SHOW_CURSOR = "\u001b[?25h";
 const HOME = "\u001b[H";
 const ERASE_LINE = "\u001b[K";
 const ERASE_BELOW = "\u001b[J";
-const LEAVE_TERMINAL = `${DISABLE_BRACKETED_PASTE}${SHOW_CURSOR}${LEAVE_ALTERNATE_SCREEN}`;
+const LEAVE_TERMINAL = `${DISABLE_SGR_MOUSE}${DISABLE_BRACKETED_PASTE}${SHOW_CURSOR}${LEAVE_ALTERNATE_SCREEN}`;
 const CSI_SEQUENCE = /(?:\u001b\[|\u009b)[0-?]*[ -/]*[@-~]/g;
 const OSC_SEQUENCE = /\u001b\][\s\S]*?(?:\u0007|\u001b\\|$)/g;
 const STRING_SEQUENCE = /\u001b[P^_X][\s\S]*?(?:\u001b\\|$)/g;
@@ -70,19 +72,13 @@ const UNSAFE_CONTROL = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f]/g;
 const SPINNER_INTERVAL_MS = 80;
 const STATUS_FRESH_MS = 6_000;
 const TERMINAL_PROCESS_CAPACITY = 512;
+const MAX_MOUSE_SEQUENCE_LENGTH = 32;
 const SIGNALS: readonly NodeJS.Signals[] = ["SIGINT", "SIGTERM", "SIGHUP"];
 
 export interface ChoicePickerItem {
   value: string;
   label: string;
   description: string;
-}
-
-/** Normalized by the terminal input bridge before it reaches a picker. */
-export interface PickerMouseEvent {
-  action: "click";
-  button: "left";
-  index: number;
 }
 
 export class UiExitError extends Error {
@@ -266,6 +262,8 @@ export class TerminalUi {
   readonly #processRedactor = new ProcessEventRedactor();
   #tick = 0;
   #spinnerTimer: NodeJS.Timeout | null = null;
+  #mouseProtocolBuffer = "";
+  #ignoredMouseKeypresses: string[] = [];
   readonly #signalHandlers = new Map<NodeJS.Signals, () => void>();
 
   constructor(
@@ -278,6 +276,9 @@ export class TerminalUi {
       stdin.isTTY && stdout.isTTY && typeof stdin.setRawMode === "function",
     );
     this.#theme = theme ?? createTheme({ ascii: asciiRequested() });
+    // This listener deliberately precedes readline's keypress decoder. SGR
+    // mouse bytes otherwise arrive as ordinary text after an Escape prefix.
+    this.stdin.on("data", this.#onTerminalData);
     for (const signal of SIGNALS) {
       this.#signalHandlers.set(signal, () => this.#terminate(signal));
     }
@@ -644,6 +645,7 @@ export class TerminalUi {
     this.#secretLabel = oneLine(label);
     this.#pasting = false;
     this.#pasteBuffer = "";
+    this.#clearMouseProtocol();
     this.#rawSecretPaste = "";
     this.#resetQuery();
     this.#enterMode("secret", `${this.#secretLabel} eingeben`);
@@ -760,12 +762,11 @@ export class TerminalUi {
     this.#pasting = false;
     this.#pasteBuffer = "";
     this.stdin.on("keypress", this.#onKeypress);
-    this.stdin.on("mouse", this.#onMouse);
     process.on("SIGWINCH", this.#onResize);
     for (const [signal, handler] of this.#signalHandlers) process.on(signal, handler);
     process.on("exit", this.#onProcessExit);
     process.on("uncaughtExceptionMonitor", this.#onFatalError);
-    this.stdout.write(`${ENTER_ALTERNATE_SCREEN}${ENABLE_BRACKETED_PASTE}${HOME}${ERASE_BELOW}`);
+    this.stdout.write(`${ENTER_ALTERNATE_SCREEN}${ENABLE_BRACKETED_PASTE}${ENABLE_SGR_MOUSE}${HOME}${ERASE_BELOW}`);
     this.#forgetGeometry();
     if (this.#run?.running) this.#startSpinner();
     this.render(true);
@@ -1079,18 +1080,18 @@ export class TerminalUi {
       this.#renderTimer = null;
     }
     this.stdin.off("keypress", this.#onKeypress);
-    this.stdin.off("mouse", this.#onMouse);
     process.off("SIGWINCH", this.#onResize);
     for (const [signal, handler] of this.#signalHandlers) process.off(signal, handler);
     process.off("exit", this.#onProcessExit);
     process.off("uncaughtExceptionMonitor", this.#onFatalError);
     try {
-      this.stdout.write(DISABLE_BRACKETED_PASTE);
+      this.stdout.write(`${DISABLE_SGR_MOUSE}${DISABLE_BRACKETED_PASTE}`);
       this.stdin.setRawMode(false);
     } catch {
       // The terminal may already be closed after a fatal signal.
     }
     this.#active = false;
+    this.#clearMouseProtocol();
     this.#forgetGeometry();
     this.#stopSpinner();
   }
@@ -1135,6 +1136,7 @@ export class TerminalUi {
   };
 
   #onKeypress = (character: string, key: Key): void => {
+    if (this.#consumeMouseKeypress(character, key)) return;
     // Ctrl+C is evaluated before everything else, especially before the paste
     // buffer: a paste without an end marker must never freeze the exit (B12).
     if (key.ctrl && key.name === "c") {
@@ -1303,18 +1305,91 @@ export class TerminalUi {
     this.scheduleRender(this.#inputChars[0] === "/");
   };
 
-  #onMouse = (event: PickerMouseEvent): void => {
+  #onTerminalData = (chunk: string | Buffer): void => {
+    if (!this.#active) return;
+    const text = typeof chunk === "string" ? chunk : chunk.toString("utf8");
+    const sequence = `${this.#mouseProtocolBuffer}${text}`;
+    if (!sequence.startsWith("\u001b[<")) return;
+
+    this.#rememberMouseKeypresses(text);
+    if (sequence.length > MAX_MOUSE_SEQUENCE_LENGTH) {
+      this.#finishMouseSequence();
+      return;
+    }
+    if (/^\u001b\[<\d{0,3}(?:;\d{0,5}(?:;\d{0,5})?)?$/.test(sequence)) {
+      this.#mouseProtocolBuffer = sequence;
+      return;
+    }
+    this.#mouseProtocolBuffer = "";
+    const match = /^\u001b\[<(\d{1,3});(\d{1,5});(\d{1,5})([Mm])$/.exec(sequence);
+    if (match) {
+      const button = Number(match[1]);
+      const column = Number(match[2]);
+      const row = Number(match[3]);
+      if (match[4] === "M" && button === 0 && Number.isSafeInteger(column) && Number.isSafeInteger(row)) {
+        this.#selectMouseRow(column, row);
+      }
+    }
+    this.#finishMouseSequence();
+  };
+
+  #finishMouseSequence(): void {
+    this.#mouseProtocolBuffer = "";
+  }
+
+  #clearMouseProtocol(): void {
+    this.#mouseProtocolBuffer = "";
+    this.#ignoredMouseKeypresses = [];
+  }
+
+  #rememberMouseKeypresses(text: string): void {
+    if (text.startsWith("\u001b[<")) {
+      this.#ignoredMouseKeypresses.push("\u001b[<", ...Array.from(text.slice(3)));
+      return;
+    }
+    this.#ignoredMouseKeypresses.push(...Array.from(text));
+  }
+
+  #consumeMouseKeypress(character: string, key: Key): boolean {
+    const expected = this.#ignoredMouseKeypresses[0];
+    if (expected === undefined) return false;
+    const actual = key.sequence || character || "";
+    if (actual === expected) {
+      this.#ignoredMouseKeypresses.shift();
+      return true;
+    }
+    this.#ignoredMouseKeypresses = [];
+    return false;
+  }
+
+  #selectMouseRow(column: number, row: number): void {
     if (
       (this.#mode !== "model-picker" && this.#mode !== "choice-picker")
-      || event.action !== "click"
-      || event.button !== "left"
-      || !Number.isSafeInteger(event.index)
+      || column < 1
+      || column > Math.max(1, this.stdout.columns || 1)
+      || row < 1
     ) return;
-    const items: Array<ModelInfo | ChoicePickerItem> = this.#mode === "model-picker"
+    const models = this.#mode === "model-picker";
+    const items: Array<ModelInfo | ChoicePickerItem> = models
       ? this.#pickerModels
       : this.#choiceItems;
-    this.#resolveSelection(items[event.index] ?? null);
-  };
+    const visibleRows = Math.min((this.stdout.rows || 24) >= 20 ? 6 : 4, items.length);
+    if (!visibleRows) return;
+    const visibleStart = clamp(
+      this.#selectedIndex - Math.floor(visibleRows / 2),
+      0,
+      items.length - visibleRows,
+    );
+    const frame = this.frame();
+    const dividerIndex = frame.lines.findIndex((line) => line.spans.some((span) => span.role === "structure"));
+    const firstRow = dividerIndex - visibleRows + 1;
+    const offset = row - firstRow;
+    const item = items[visibleStart + offset];
+    const line = frame.lines[row - 1];
+    const itemLabel = item && (models ? (item as ModelInfo).id : (item as ChoicePickerItem).label);
+    if (!item || offset < 0 || offset >= visibleRows || !line || !itemLabel || !line.spans.some((span) => span.text.includes(itemLabel))) return;
+    this.#resolveSelection(item);
+  }
 
   #interrupt(): void {
     if (this.#mode === "model-picker" || this.#mode === "choice-picker") {

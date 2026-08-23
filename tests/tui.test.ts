@@ -177,7 +177,7 @@ test("setup TUI surface uses the existing picker, secret, model, and confirm pri
   assert.deepEqual(calls, ["choice:anthropic", "secret", "model:vendor/a", "confirm", "status:Coming soon"]);
 });
 
-test("choice picker accepts keyboard and mouse selection through the same primitive", async () => {
+test("choice picker parses real SGR mouse bytes into the same Anthropic selection as keyboard", async () => {
   async function select(method: "keyboard" | "mouse"): Promise<string | null> {
     const stdin = new FakeInput();
     const stdout = new FakeOutput();
@@ -192,16 +192,103 @@ test("choice picker accepts keyboard and mouse selection through the same primit
         press(stdin, "down");
         press(stdin, "return");
       } else {
-        stdin.emit("mouse", { action: "click", button: "left", index: 1 });
+        const row = terminal.frame().lines.findIndex((line) => plainText(line).includes("Anthropic")) + 1;
+        assert.ok(row > 0, "Anthropic must occupy a visible picker row");
+        stdin.emit("data", Buffer.from(`\u001b[<0;1;${row}M`));
       }
-      return (await picked)?.value ?? null;
+      const selected = await picked;
+      assert.match(stdout.output, /\u001b\[\?1000h\u001b\[\?1006h/);
+      return selected?.value ?? null;
     } finally {
       terminal.stop();
+      assert.match(stdout.output, /\u001b\[\?1000l\u001b\[\?1006l/);
     }
   }
 
   assert.equal(await select("keyboard"), "anthropic");
   assert.equal(await select("mouse"), "anthropic");
+});
+
+test("mouse protocol rejects malformed, non-left, release, and out-of-range bytes without leaking into chat", async () => {
+  const ignored = [
+    "\u001b[<x;1;1M",
+    "\u001b[<2;1;1M",
+    "\u001b[<0;1;1m",
+    "\u001b[<0;1;999M",
+  ];
+  for (const sequence of ignored) {
+    const stdin = new FakeInput();
+    const stdout = new FakeOutput();
+    const terminal = ui(stdin, stdout);
+    terminal.start();
+    try {
+      const picked = terminal.pickChoice("Provider", [
+        { value: "openrouter", label: "OpenRouter", description: "Ready" },
+        { value: "anthropic", label: "Anthropic · Coming soon", description: "Coming soon" },
+      ], "openrouter");
+      stdin.emit("data", Buffer.from(sequence));
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      press(stdin, "escape");
+      assert.equal(await picked, null, sequence);
+    } finally {
+      terminal.stop();
+    }
+  }
+
+  const stdin = new FakeInput();
+  const stdout = new FakeOutput();
+  const terminal = ui(stdin, stdout);
+  terminal.start();
+  try {
+    const input = terminal.readInput();
+    stdin.emit("data", Buffer.from("\u001b[<0;1;1M"));
+    type(stdin, "a");
+    press(stdin, "return");
+    assert.equal(await input, "a");
+  } finally {
+    terminal.stop();
+  }
+});
+
+test("mouse reporting is disabled and re-enabled across picker cancel, suspend, and terminal stop", async () => {
+  const stdin = new FakeInput();
+  const stdout = new FakeOutput();
+  const terminal = ui(stdin, stdout);
+  terminal.start();
+  try {
+    const picker = terminal.pickChoice("Provider", [
+      { value: "openrouter", label: "OpenRouter", description: "Ready" },
+      { value: "anthropic", label: "Anthropic · Coming soon", description: "Coming soon" },
+    ], "openrouter");
+    press(stdin, "escape");
+    assert.equal(await picker, null);
+    await terminal.suspend(async () => undefined);
+  } finally {
+    terminal.stop();
+  }
+  const enable = "\u001b[?1000h\u001b[?1006h";
+  const disable = "\u001b[?1000l\u001b[?1006l";
+  assert.ok(stdout.output.split(enable).length - 1 >= 2, stdout.output);
+  assert.ok(stdout.output.split(disable).length - 1 >= 2, stdout.output);
+  assert.ok(stdout.output.lastIndexOf(disable) > stdout.output.lastIndexOf(enable), stdout.output);
+});
+
+test("partial SGR bytes are cleared before a restarted terminal accepts ordinary input", async () => {
+  const stdin = new FakeInput();
+  const stdout = new FakeOutput();
+  const terminal = ui(stdin, stdout);
+  terminal.start();
+  stdin.emit("data", Buffer.from("\u001b[<0;1"));
+  terminal.stop();
+  terminal.start();
+  try {
+    const input = terminal.readInput();
+    stdin.emit("data", Buffer.from("a"));
+    press(stdin, "return");
+    assert.equal(await input, "a");
+  } finally {
+    terminal.stop();
+  }
 });
 
 test("setup TUI retry shows one latest current revision card at narrow and wide widths and replaces status", async () => {

@@ -137,12 +137,15 @@ const VISIBLE_TURNS = 40;
 
 /** Binds the transport-neutral setup hub to the existing plain prompts. */
 export function createCliPlainSetupSurface() {
+  let renderedStatus = false;
   return createPlainSetupSurface({
     select,
     password,
     confirm,
-    present(event) {
-      if (event.type === "notice") console.error(event.message);
+    setStatus(status) {
+      if (process.stderr.isTTY && renderedStatus) process.stderr.write("\u001b[1A\r\u001b[2K");
+      process.stderr.write(`${status}\n`);
+      renderedStatus = true;
     },
   });
 }
