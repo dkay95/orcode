@@ -182,3 +182,22 @@ test("README command bytes are rendered and checked from the shared catalog", as
   assert.match(generated, /chat \[new\\\|list\\\|open\\\|search\\\|rename\\\|fork\\\|delete\]/);
   assert.match(generated, /ORCODE\.md/);
 });
+
+test("README states the real platform shell defaults and image-picker boundary", async () => {
+  const readme = await readFile(new URL("../README.md", import.meta.url), "utf8");
+
+  assert.match(
+    readme,
+    /Windows[\s\S]{0,240}powershell\.exe[\s\S]{0,120}-NoProfile[\s\S]{0,120}-NonInteractive[\s\S]{0,120}-Command/i,
+  );
+  assert.match(
+    readme,
+    /ORCODE_SHELL[\s\S]{0,300}ROUTERCODE_SHELL[\s\S]{0,160}(?:compatibility|Kompatibilität)[\s-]*(?:fallback|Fallback)/,
+  );
+  assert.doesNotMatch(readme, /POSIX-compatible shell[^.]*Windows/i);
+  assert.doesNotMatch(readme, /\/bin\/sh -c`? by default on every platform/i);
+  assert.match(
+    readme,
+    /native file picker[\s\S]{0,180}macOS[\s\S]{0,180}Windows(?: and| und) Linux[\s\S]{0,180}\/image <path>/i,
+  );
+});

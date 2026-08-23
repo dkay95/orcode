@@ -20,17 +20,16 @@ the work.
   least an inference key; an optional separate management key unlocks the
   `/balance` full-account view (see [Privacy and data flow](#privacy-and-data-flow)).
 
-Optional, not required:
+Shell execution is platform-native; Windows does not require an additional
+POSIX shell:
 
-- **A POSIX-compatible shell for `run_command` on Windows.** Shell commands
-  run through `/bin/sh -c` by default on every platform. macOS and Linux
-  ship `/bin/sh`; a native Windows install does not. Until this is fixed
-  upstream, set the `ROUTERCODE_SHELL` environment variable to a shell
-  orcode can actually invoke — for example the `bash.exe` that ships
-  with [Git for Windows](https://git-scm.com/download/win) — if you need
-  the shell-command tool on Windows. `/model`, `/chat`, file edits, search,
-  and everything else that isn't `run_command` (or `git_diff`, `/diff`,
-  `/verify`) works without it.
+- macOS and Linux use `/bin/sh -c` by default.
+- Windows uses `powershell.exe -NoProfile -NonInteractive -Command` by
+  default.
+
+Set `ORCODE_SHELL` to override that platform default. If `ORCODE_SHELL` is
+unset, the legacy `ROUTERCODE_SHELL` variable is used as a compatibility
+fallback. The override must name a shell orcode can actually invoke.
 
 ## Install
 
@@ -119,9 +118,11 @@ boundary**: it is not an OS-level sandbox, and any shell command it does
 allow can reach anything the current user account can reach — including,
 in `allow-all`, without asking first.
 
-`run_command` runs through a non-login shell (`/bin/sh -c` by default, see
-[Requirements](#requirements) for the Windows caveat) specifically so it does
-not source your shell's login/profile files, which would undo the
+`run_command` uses the selected platform shell without loading a user profile:
+macOS and Linux use `/bin/sh -c`; Windows uses
+`powershell.exe -NoProfile -NonInteractive -Command`. `ORCODE_SHELL` overrides
+the default, with `ROUTERCODE_SHELL` retained only as its compatibility
+fallback. Avoiding profile startup prevents it from undoing the
 credential-scrubbing described below. `git_diff` is treated like a shell
 command for approval purposes — it still launches a process and can read
 repository-controlled configuration — and is blocked in `read-only` mode;
@@ -203,8 +204,8 @@ drift from what the app actually offers:
 `/compress model` also has its own sub-menu: `model`, `auto`, `always`,
 `off`, `threshold <characters>`, and `max-cost <USD>`.
 
-`/image` with no argument opens a native file picker, but that picker is
-implemented with `osascript` and only works on macOS; on other platforms use
+`/image` with no argument opens a native file picker implemented with
+`osascript`; that picker is macOS-only. On Windows and Linux, use
 `/image <path>` directly.
 
 `/whisper` records up to 120 seconds or 25 MB, whichever comes first; Enter

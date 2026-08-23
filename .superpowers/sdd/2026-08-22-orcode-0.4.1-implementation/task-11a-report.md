@@ -50,3 +50,21 @@ Before production edits:
 The catalog intentionally remains flat. Contextual compressor suggestions stay
 in the existing completion helper; this slice does not introduce the recursive
 0.5 command architecture.
+
+## Review fix R1 — truthful platform help
+
+The holistic Task-11 review found that README prose still described the old
+Windows POSIX-shell limitation even though the runtime already defaults to
+PowerShell.
+
+- RED: `node --import tsx --test --test-name-pattern='real platform shell defaults' tests/commands-catalog.test.ts`
+  reached 1 test, with 0 passed and 1 failed on the missing Windows PowerShell
+  contract.
+- The README now documents macOS/Linux `/bin/sh -c`, native Windows
+  `powershell.exe -NoProfile -NonInteractive -Command`, `ORCODE_SHELL`
+  precedence, and the `ROUTERCODE_SHELL` compatibility fallback.
+- The image picker is explicitly macOS-only; Windows and Linux users are told
+  to use `/image <path>`.
+- GREEN: the same exact test passed 1/1 and
+  `node --import tsx scripts/render-command-docs.ts --check` remained current,
+  proving the generated command block was unchanged.
