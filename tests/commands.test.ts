@@ -284,6 +284,26 @@ function lifecycleContext(
   };
 }
 
+test("slash help renders every shared catalog usage and catalog aliases dispatch", async () => {
+  const catalogModule = await import("../src/command-catalog.js") as unknown as {
+    COMMAND_CATALOG: ReadonlyArray<{ usage: string }>;
+  };
+  const output: string[] = [];
+  const context = {
+    out: {
+      text: (value: string) => output.push(value),
+      error: (value: string) => output.push(value),
+    },
+  } as unknown as CommandContext;
+
+  assert.equal(await handleSlashCommand("/?", context), "continue");
+  const help = output.join("\n");
+  for (const entry of catalogModule.COMMAND_CATALOG) {
+    assert.ok(help.includes(entry.usage), `help is missing ${entry.usage}`);
+  }
+  assert.equal(await handleSlashCommand("/q", context), "exit");
+});
+
 test("a valid environment key remains process-only during startup validation", async () => {
   const key = `${KEY_PREFIX}environment-process-only-123`;
   const service = lifecycleService(key, "environment");

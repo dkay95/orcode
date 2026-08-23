@@ -1,9 +1,20 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
+import { readFile } from "node:fs/promises";
+import { fileURLToPath } from "node:url";
 import test from "node:test";
 import {
   commandTokenIsExact,
   rankSlashCommands,
 } from "../src/command-catalog.js";
+
+interface TestCatalogEntry {
+  name: string;
+  usage: string;
+  description: string;
+  aliases?: readonly string[];
+  handlerId: string;
+}
 
 test("slash catalog opens on slash and includes descriptions", () => {
   const commands = rankSlashCommands("/");
@@ -38,6 +49,45 @@ test("slash catalog exposes /resume", () => {
   assert.match(resume?.usage ?? "", /fortsetzen/);
   assert.match(resume?.usage ?? "", /undo/);
   assert.match(resume?.usage ?? "", /verwerfen/);
+});
+
+test("the flat command catalog owns every canonical token, alias, and handler id", async () => {
+  const module = await import("../src/command-catalog.js") as unknown as Record<string, unknown>;
+  const catalog = module.COMMAND_CATALOG;
+  const resolve = module.resolveSlashCommand;
+
+  assert.ok(Array.isArray(catalog), "COMMAND_CATALOG must be the shared flat catalog");
+  assert.equal(typeof resolve, "function", "the catalog must expose its resolver");
+
+  const entries = catalog as TestCatalogEntry[];
+  const handlerIds = entries.map((entry) => entry.handlerId);
+  assert.ok(handlerIds.every(Boolean), "every catalog entry needs a handler id");
+  assert.equal(new Set(handlerIds).size, handlerIds.length, "handler ids must be unique");
+
+  const tokens = entries.flatMap((entry) => [entry.name, ...(entry.aliases ?? [])]);
+  assert.equal(new Set(tokens).size, tokens.length, "canonical tokens and aliases must be unique");
+
+  const resolveCommand = resolve as (input: string) => {
+    command: TestCatalogEntry;
+    handlerId: string;
+    matchedToken: string;
+  } | undefined;
+  for (const entry of entries) {
+    for (const token of [entry.name, ...(entry.aliases ?? [])]) {
+      assert.deepEqual(resolveCommand(`/${token} ignored`), {
+        command: entry,
+        handlerId: entry.handlerId,
+        matchedToken: token,
+      });
+    }
+  }
+});
+
+test("completion exposes every documented top-level command", () => {
+  const names = new Set(rankSlashCommands("/").map((command) => command.name));
+  assert.ok(names.has("panel"));
+  assert.ok(names.has("resume"));
+  assert.ok(names.has("ssh"));
 });
 
 test("slash catalog exposes voice input under /whisper and /voice", () => {
@@ -104,4 +154,31 @@ test("compress command exposes selectable contextual subcommands", () => {
     commandTokenIsExact("/compress", root[1]!),
     false,
   );
+});
+
+test("README command bytes are rendered and checked from the shared catalog", async () => {
+  const root = fileURLToPath(new URL("..", import.meta.url));
+  const script = fileURLToPath(new URL("../scripts/render-command-docs.ts", import.meta.url));
+  const check = spawnSync(
+    process.execPath,
+    ["--import", "tsx", script, "--check"],
+    { cwd: root, encoding: "utf8" },
+  );
+  assert.equal(check.status, 0, check.stderr || check.stdout);
+
+  const docsModule = await import("../scripts/render-command-docs.js") as unknown as Record<string, unknown>;
+  assert.equal(typeof docsModule.renderCommandDocs, "function");
+  assert.equal(typeof docsModule.commandDocsBlock, "function");
+  const catalogModule = await import("../src/command-catalog.js") as unknown as Record<string, unknown>;
+  const render = docsModule.renderCommandDocs as (entries: readonly TestCatalogEntry[]) => string;
+  const block = docsModule.commandDocsBlock as (table: string) => string;
+  const generated = render(catalogModule.COMMAND_CATALOG as TestCatalogEntry[]);
+  const readme = await readFile(new URL("../README.md", import.meta.url), "utf8");
+
+  assert.ok(readme.includes(block(generated)), "README must contain the exact generated block");
+  assert.match(generated, /`\/panel`/);
+  assert.match(generated, /`\/resume`/);
+  assert.match(generated, /`\/ssh`/);
+  assert.match(generated, /chat \[new\\\|list\\\|open\\\|search\\\|rename\\\|fork\\\|delete\]/);
+  assert.match(generated, /ORCODE\.md/);
 });

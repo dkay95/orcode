@@ -160,40 +160,45 @@ Slash commands, generated from the same catalog orcode's `/help` and
 in-app command palette use (`src/command-catalog.ts`), so this list cannot
 drift from what the app actually offers:
 
+<!-- orcode:command-docs:start -->
 | Command | Aliases | Usage | Description |
 | --- | --- | --- | --- |
-| `/model` | | `/model [provider/model\|current]` | Search, select, or show the main model |
-| `/think` | `/reasoning` | `/think [auto\|off\|level\|budget tokens]` | Control reasoning effort or thinking-token budget |
-| `/allow` | `/approval`, `/approvals`, `/permissions` | `/allow [mode\|list\|forget <id>\|forget all]` | Choose the approval mode; list or forget remembered rules |
-| `/chat` | `/chats`, `/switch` | `/chat [new\|list\|open\|search\|rename\|fork]` | Browse, select, create, rename, or fork chats |
-| `/new` | | `/new [title]` | Start a new, separate chat in this workspace |
-| `/fork` | | `/fork [title]` | Fork the current chat, including context, into a new chat |
-| `/compress` | `/compressor` | `/compress [mode\|model]` | Interactively choose the compressor model or configure its mode |
-| `/image` | `/attach` | `/image [path\|clear]` | Pick an image (macOS only, see below), attach one by path, or clear pending attachments |
-| `/whisper` | `/voice` | `/whisper` | Record from the microphone and insert the transcript into the input line |
-| `/status` | | `/status` | Show models, modes, limits, and workspace |
-| `/key` | | `/key [set\|status\|forget\|management]` | Manage the OpenRouter API key securely |
-| `/balance` | `/credits` | `/balance` | Re-check account balance and key limit |
-| `/reconnect` | | `/reconnect` | Rebuild and verify the OpenRouter connection |
-| `/models` | | `/models [search]` | List tool-capable OpenRouter models |
-| `/cost` | `/costs` | `/cost` | Show costs for this workspace session |
-| `/max-cost` | | `/max-cost [USD]` | Set a cost limit per main-agent run |
-| `/steps` | | `/steps [count]` | Set the maximum tool steps per run |
-| `/budget` | | `/budget [day <USD>\|total <USD>\|on-exceed warn\|block]` | Show workspace budget or set a daily/total limit |
-| `/verify` | | `/verify [on\|off\|now\|suggest\|clear\|rounds <n>\|<command>]` | Configure verification commands to run after changes |
-| `/web` | | `/web [on\|off\|auto]` | Control the web-search plugin for the main run |
-| `/provider` | | `/provider [sort <mode>\|allow\|deny\|only …\|ignore …\|clear]` | Set OpenRouter provider routing policy |
-| `/fallback` | `/fallbacks` | `/fallback [+<model>\|-<model>\|clear]` | Maintain a fallback model chain behind the main model |
-| `/history` | | `/history [count]` | Show recent conversation turns |
-| `/checkpoint` | `/checkpoints` | `/checkpoint [list\|new [name]\|restore <id\|name>]` | Mark a point in the chat, or restore to a mark |
-| `/export` | | `/export [file]` | Print the chat as Markdown, or write it to a file |
-| `/diff` | | `/diff` | Show the current Git diff |
-| `/undo` | | `/undo [--dry-run]` | Undo the last orcode run as a unit |
-| `/clear` | | `/clear` | Reset conversation context and session costs |
-| `/init` | | `/init` | Create a `ROUTERCODE.md` template in the workspace |
-| `/config` | | `/config` | Show saved, non-secret configuration |
-| `/help` | `/?` | `/help` | Show all commands and their usage |
-| `/quit` | `/exit`, `/q` | `/quit` | Exit orcode |
+| `/model` |  | `/model [anbieter/modell\|current]` | Main-Modell suchen, auswählen oder anzeigen |
+| `/think` | `/reasoning` | `/think [auto\|off\|Stufe\|budget Tokens]` | Reasoning-Stufe oder Thinking-Budget steuern |
+| `/allow` | `/approval`, `/approvals`, `/permissions` | `/allow [Modus\|list\|forget <id>\|forget all]` | Freigaben wählen; gemerkte Regeln (K6) auflisten oder vergessen |
+| `/chat` | `/chats`, `/switch` | `/chat [new\|list\|open\|search\|rename\|fork\|delete]` | Chats durchsuchen, auswählen, anlegen, umbenennen oder verzweigen |
+| `/new` |  | `/new [Titel]` | Einen neuen, getrennten Chat im Workspace beginnen |
+| `/fork` |  | `/fork [Titel]` | Aktuellen Chat samt Kontext als neuen Chat verzweigen |
+| `/compress` | `/compressor` | `/compress [Modus\|model]` | Kompressor-Modell interaktiv wählen oder Modus konfigurieren |
+| `/image` | `/attach` | `/image [Pfad\|clear]` | Bild auswählen, per Pfad anhängen oder Anhänge leeren |
+| `/whisper` | `/voice` | `/whisper` | Spracheingabe aufnehmen und als Text in die Eingabezeile einfügen |
+| `/status` |  | `/status` | Modelle, Modi, Limits und Workspace anzeigen |
+| `/key` |  | `/key [set\|status\|forget\|management]` | OpenRouter-Schlüssel sicher verwalten |
+| `/balance` | `/credits` | `/balance` | Guthaben und Key-Limit erneut prüfen |
+| `/reconnect` |  | `/reconnect` | OpenRouter-Verbindung neu aufbauen und prüfen |
+| `/models` |  | `/models [Suche]` | Tool-fähige OpenRouter-Modelle auflisten |
+| `/panel` |  | `/panel <frage> \| models <a>,<b>,… \| judge on\|off \| show <n> \| use <n>` | Mehrere Modelle parallel befragen und Antworten vergleichen |
+| `/cost` | `/costs` | `/cost` | Kosten dieser Workspace-Sitzung anzeigen |
+| `/max-cost` |  | `/max-cost [USD]` | Kostenlimit pro Main-Agent-Lauf setzen |
+| `/steps` |  | `/steps [Anzahl]` | Maximale Tool-Schritte pro Lauf setzen |
+| `/budget` |  | `/budget [day <USD>\|total <USD>\|on-exceed warn\|block]` | Workspace-Budget anzeigen oder Tages-/Gesamtlimit setzen |
+| `/verify` |  | `/verify [on\|off\|now\|suggest\|clear\|rounds <n>\|<befehl>]` | Verifikationskommandos nach Änderungen konfigurieren (A4) |
+| `/web` |  | `/web [on\|off\|auto]` | Websuche-Plugin für den Hauptlauf steuern (A2) |
+| `/provider` |  | `/provider [sort <modus>\|allow\|deny\|only …\|ignore …\|clear]` | OpenRouter-Anbieterpolitik setzen (A3) |
+| `/fallback` | `/fallbacks` | `/fallback [+<modell>\|-<modell>\|clear]` | Fallback-Modellkette hinter dem Main-Modell pflegen (A3) |
+| `/history` |  | `/history [Anzahl]` | Letzte Gesprächsrunden anzeigen |
+| `/checkpoint` | `/checkpoints` | `/checkpoint [list\|new [Name]\|restore <ID\|Name>]` | Stand im Chat markieren oder auf eine Marke zurücksetzen |
+| `/export` |  | `/export [Datei]` | Chat als Markdown ausgeben oder in eine Datei schreiben |
+| `/diff` |  | `/diff` | Aktuellen Git-Diff anzeigen |
+| `/undo` |  | `/undo [--dry-run]` | Letzten orcode-Lauf als Einheit zurücknehmen |
+| `/resume` |  | `/resume [fortsetzen\|undo\|verwerfen]` | Abgebrochenen vorherigen Lauf prüfen, fortsetzen, zurücknehmen oder verwerfen |
+| `/clear` |  | `/clear` | Gesprächskontext und Sitzungskosten zurücksetzen |
+| `/init` |  | `/init` | ORCODE.md im Workspace anlegen |
+| `/ssh` |  | `/ssh [<alias>\|status\|off]` | SSH-Ziel aus ~/.ssh/config wählen, prüfen oder trennen |
+| `/config` |  | `/config` | Gespeicherte, nicht geheime Konfiguration anzeigen |
+| `/help` | `/?` | `/help` | Alle Befehle und ihre Verwendung anzeigen |
+| `/quit` | `/exit`, `/q` | `/quit` | orcode beenden |
+<!-- orcode:command-docs:end -->
 
 `/compress model` also has its own sub-menu: `model`, `auto`, `always`,
 `off`, `threshold <characters>`, and `max-cost <USD>`.

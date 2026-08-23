@@ -6,15 +6,21 @@ export interface SlashCommandDefinition {
   acceptsArguments?: boolean;
 }
 
-export const SLASH_COMMANDS: readonly SlashCommandDefinition[] = [
+export interface CommandCatalogDefinition extends SlashCommandDefinition {
+  handlerId: string;
+}
+
+export const COMMAND_CATALOG = [
   {
     name: "model",
+    handlerId: "model",
     usage: "/model [anbieter/modell|current]",
     description: "Main-Modell suchen, auswählen oder anzeigen",
     acceptsArguments: true,
   },
   {
     name: "think",
+    handlerId: "think",
     usage: "/think [auto|off|Stufe|budget Tokens]",
     description: "Reasoning-Stufe oder Thinking-Budget steuern",
     aliases: ["reasoning"],
@@ -22,6 +28,7 @@ export const SLASH_COMMANDS: readonly SlashCommandDefinition[] = [
   },
   {
     name: "allow",
+    handlerId: "allow",
     usage: "/allow [Modus|list|forget <id>|forget all]",
     description: "Freigaben wählen; gemerkte Regeln (K6) auflisten oder vergessen",
     aliases: ["approval", "approvals", "permissions"],
@@ -29,6 +36,7 @@ export const SLASH_COMMANDS: readonly SlashCommandDefinition[] = [
   },
   {
     name: "chat",
+    handlerId: "chat",
     usage: "/chat [new|list|open|search|rename|fork|delete]",
     description: "Chats durchsuchen, auswählen, anlegen, umbenennen oder verzweigen",
     aliases: ["chats", "switch"],
@@ -36,18 +44,21 @@ export const SLASH_COMMANDS: readonly SlashCommandDefinition[] = [
   },
   {
     name: "new",
+    handlerId: "new",
     usage: "/new [Titel]",
     description: "Einen neuen, getrennten Chat im Workspace beginnen",
     acceptsArguments: true,
   },
   {
     name: "fork",
+    handlerId: "fork",
     usage: "/fork [Titel]",
     description: "Aktuellen Chat samt Kontext als neuen Chat verzweigen",
     acceptsArguments: true,
   },
   {
     name: "compress",
+    handlerId: "compress",
     usage: "/compress [Modus|model]",
     description: "Kompressor-Modell interaktiv wählen oder Modus konfigurieren",
     aliases: ["compressor"],
@@ -55,6 +66,7 @@ export const SLASH_COMMANDS: readonly SlashCommandDefinition[] = [
   },
   {
     name: "image",
+    handlerId: "image",
     usage: "/image [Pfad|clear]",
     description: "Bild auswählen, per Pfad anhängen oder Anhänge leeren",
     aliases: ["attach"],
@@ -62,88 +74,103 @@ export const SLASH_COMMANDS: readonly SlashCommandDefinition[] = [
   },
   {
     name: "whisper",
+    handlerId: "whisper",
     usage: "/whisper",
     description: "Spracheingabe aufnehmen und als Text in die Eingabezeile einfügen",
     aliases: ["voice"],
   },
   {
     name: "status",
+    handlerId: "status",
     usage: "/status",
     description: "Modelle, Modi, Limits und Workspace anzeigen",
   },
   {
     name: "key",
+    handlerId: "key",
     usage: "/key [set|status|forget|management]",
     description: "OpenRouter-Schlüssel sicher verwalten",
     acceptsArguments: true,
   },
   {
     name: "balance",
+    handlerId: "balance",
     usage: "/balance",
     description: "Guthaben und Key-Limit erneut prüfen",
     aliases: ["credits"],
   },
   {
     name: "reconnect",
+    handlerId: "reconnect",
     usage: "/reconnect",
     description: "OpenRouter-Verbindung neu aufbauen und prüfen",
   },
   {
     name: "models",
+    handlerId: "models",
     usage: "/models [Suche]",
     description: "Tool-fähige OpenRouter-Modelle auflisten",
     acceptsArguments: true,
   },
   {
     name: "panel",
+    handlerId: "panel",
     usage: "/panel <frage> | models <a>,<b>,… | judge on|off | show <n> | use <n>",
     description: "Mehrere Modelle parallel befragen und Antworten vergleichen",
     acceptsArguments: true,
   },
   {
     name: "cost",
+    handlerId: "cost",
     usage: "/cost",
     description: "Kosten dieser Workspace-Sitzung anzeigen",
     aliases: ["costs"],
   },
   {
     name: "max-cost",
+    handlerId: "max-cost",
     usage: "/max-cost [USD]",
     description: "Kostenlimit pro Main-Agent-Lauf setzen",
     acceptsArguments: true,
   },
   {
     name: "steps",
+    handlerId: "steps",
     usage: "/steps [Anzahl]",
     description: "Maximale Tool-Schritte pro Lauf setzen",
     acceptsArguments: true,
   },
   {
     name: "budget",
+    handlerId: "budget",
     usage: "/budget [day <USD>|total <USD>|on-exceed warn|block]",
     description: "Workspace-Budget anzeigen oder Tages-/Gesamtlimit setzen",
     acceptsArguments: true,
   },
   {
     name: "verify",
+    handlerId: "verify",
     usage: "/verify [on|off|now|suggest|clear|rounds <n>|<befehl>]",
     description: "Verifikationskommandos nach Änderungen konfigurieren (A4)",
     acceptsArguments: true,
   },
   {
     name: "web",
+    handlerId: "web",
     usage: "/web [on|off|auto]",
     description: "Websuche-Plugin für den Hauptlauf steuern (A2)",
     acceptsArguments: true,
   },
   {
     name: "provider",
+    handlerId: "provider",
     usage: "/provider [sort <modus>|allow|deny|only …|ignore …|clear]",
     description: "OpenRouter-Anbieterpolitik setzen (A3)",
     acceptsArguments: true,
   },
   {
     name: "fallback",
+    handlerId: "fallback",
     usage: "/fallback [+<modell>|-<modell>|clear]",
     description: "Fallback-Modellkette hinter dem Main-Modell pflegen (A3)",
     aliases: ["fallbacks"],
@@ -151,12 +178,14 @@ export const SLASH_COMMANDS: readonly SlashCommandDefinition[] = [
   },
   {
     name: "history",
+    handlerId: "history",
     usage: "/history [Anzahl]",
     description: "Letzte Gesprächsrunden anzeigen",
     acceptsArguments: true,
   },
   {
     name: "checkpoint",
+    handlerId: "checkpoint",
     usage: "/checkpoint [list|new [Name]|restore <ID|Name>]",
     description: "Stand im Chat markieren oder auf eine Marke zurücksetzen",
     aliases: ["checkpoints"],
@@ -164,61 +193,117 @@ export const SLASH_COMMANDS: readonly SlashCommandDefinition[] = [
   },
   {
     name: "export",
+    handlerId: "export",
     usage: "/export [Datei]",
     description: "Chat als Markdown ausgeben oder in eine Datei schreiben",
     acceptsArguments: true,
   },
   {
     name: "diff",
+    handlerId: "diff",
     usage: "/diff",
     description: "Aktuellen Git-Diff anzeigen",
   },
   {
     name: "undo",
+    handlerId: "undo",
     usage: "/undo [--dry-run]",
     description: "Letzten orcode-Lauf als Einheit zurücknehmen",
     acceptsArguments: true,
   },
   {
     name: "resume",
+    handlerId: "resume",
     usage: "/resume [fortsetzen|undo|verwerfen]",
     description: "Abgebrochenen vorherigen Lauf prüfen, fortsetzen, zurücknehmen oder verwerfen",
     acceptsArguments: true,
   },
   {
     name: "clear",
+    handlerId: "clear",
     usage: "/clear",
     description: "Gesprächskontext und Sitzungskosten zurücksetzen",
   },
   {
     name: "init",
+    handlerId: "init",
     usage: "/init",
     description: "ORCODE.md im Workspace anlegen",
   },
   {
     name: "ssh",
+    handlerId: "ssh",
     usage: "/ssh [<alias>|status|off]",
     description: "SSH-Ziel aus ~/.ssh/config wählen, prüfen oder trennen",
     acceptsArguments: true,
   },
   {
     name: "config",
+    handlerId: "config",
     usage: "/config",
     description: "Gespeicherte, nicht geheime Konfiguration anzeigen",
   },
   {
     name: "help",
+    handlerId: "help",
     usage: "/help",
     description: "Alle Befehle und ihre Verwendung anzeigen",
     aliases: ["?"],
   },
   {
     name: "quit",
+    handlerId: "quit",
     usage: "/quit",
     description: "orcode beenden",
     aliases: ["exit", "q"],
   },
-] as const;
+] as const satisfies readonly CommandCatalogDefinition[];
+
+export type CommandCatalogEntry = (typeof COMMAND_CATALOG)[number];
+export type SlashCommandHandlerId = CommandCatalogEntry["handlerId"];
+
+/** Backward-compatible completion surface; the catalog above is the owner. */
+export const SLASH_COMMANDS: readonly SlashCommandDefinition[] = COMMAND_CATALOG;
+
+export interface ResolvedSlashCommand {
+  command: CommandCatalogEntry;
+  handlerId: SlashCommandHandlerId;
+  matchedToken: string;
+}
+
+const COMMAND_BY_TOKEN = buildCommandTokenIndex(COMMAND_CATALOG);
+
+export function resolveSlashCommand(input: string): ResolvedSlashCommand | undefined {
+  const withoutSlash = input.trimStart().replace(/^\//, "");
+  const matchedToken = withoutSlash.split(/\s+/, 1)[0]?.toLowerCase() ?? "";
+  if (!matchedToken) return undefined;
+  const command = COMMAND_BY_TOKEN.get(matchedToken);
+  return command
+    ? { command, handlerId: command.handlerId, matchedToken }
+    : undefined;
+}
+
+function buildCommandTokenIndex(
+  catalog: readonly CommandCatalogEntry[],
+): ReadonlyMap<string, CommandCatalogEntry> {
+  const commands = new Map<string, CommandCatalogEntry>();
+  const handlerIds = new Set<string>();
+  for (const command of catalog) {
+    if (handlerIds.has(command.handlerId)) {
+      throw new Error(`Doppelte Command-Handler-ID: ${command.handlerId}`);
+    }
+    handlerIds.add(command.handlerId);
+    const aliases = "aliases" in command ? command.aliases : [];
+    for (const rawToken of [command.name, ...aliases]) {
+      const token = rawToken.toLowerCase();
+      if (!token || /\s/.test(token) || commands.has(token)) {
+        throw new Error(`Doppeltes oder ungültiges Command-Token: ${rawToken}`);
+      }
+      commands.set(token, command);
+    }
+  }
+  return commands;
+}
 
 const COMPRESSOR_SUBCOMMANDS: readonly SlashCommandDefinition[] = [
   {

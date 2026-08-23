@@ -5,7 +5,10 @@ import {
   assertSpendAvailable,
   type OrcodeAgent,
 } from "./agent.js";
-import { SLASH_COMMANDS } from "./command-catalog.js";
+import {
+  COMMAND_CATALOG,
+  resolveSlashCommand,
+} from "./command-catalog.js";
 import {
   APPROVAL_MODES,
   COMPRESSION_MODES,
@@ -254,17 +257,21 @@ export async function handleSlashCommand(
   context: CommandContext,
 ): Promise<"continue" | "exit"> {
   const [commandToken = "", ...args] = tokenize(raw.slice(1));
-  const command = commandToken.toLowerCase();
+  const resolution = resolveSlashCommand(commandToken || "help");
+  if (!resolution) {
+    context.out.error(
+      `Unbekannter Befehl: /${commandToken.toLowerCase()}.`,
+      "Nutze /help.",
+    );
+    return "continue";
+  }
+  const command = resolution.handlerId;
 
   switch (command) {
-    case "":
     case "help":
-    case "?":
       printHelp(context.out);
       return "continue";
     case "quit":
-    case "exit":
-    case "q":
       return "exit";
     case "status":
       printStatus(context);
@@ -273,7 +280,6 @@ export async function handleSlashCommand(
       await keyCommand(args, context);
       return "continue";
     case "balance":
-    case "credits":
       await printBalance(await context.openRouter.checkBalance(), context.out);
       return "continue";
     case "reconnect": {
@@ -292,18 +298,12 @@ export async function handleSlashCommand(
       await modelsCommand(args, context);
       return "continue";
     case "think":
-    case "reasoning":
       await reasoningCommand(args, context);
       return "continue";
-    case "approval":
     case "allow":
-    case "approvals":
-    case "permissions":
       await approvalCommand(args, context);
       return "continue";
     case "chat":
-    case "chats":
-    case "switch":
       await chatCommand(args, context);
       return "continue";
     case "new":
@@ -313,17 +313,14 @@ export async function handleSlashCommand(
       await chatCommand(["fork", ...args], context);
       return "continue";
     case "compress":
-    case "compressor":
       await compressorCommand(args, context);
       return "continue";
     case "image":
-    case "attach":
       context.out.text(
         "Bildanhänge sind in der Fullscreen-TUI verfügbar: /image oder /image <pfad>",
       );
       return "continue";
     case "whisper":
-    case "voice":
       context.out.text(
         "Spracheingabe ist in der Fullscreen-TUI verfügbar: /whisper.",
       );
@@ -332,7 +329,6 @@ export async function handleSlashCommand(
       await panelCommand(args, context);
       return "continue";
     case "cost":
-    case "costs":
       printCosts(context.session, context.out);
       return "continue";
     case "max-cost":
@@ -374,7 +370,6 @@ export async function handleSlashCommand(
       await exportCommand(args, context);
       return "continue";
     case "checkpoint":
-    case "checkpoints":
       await checkpointCommand(args, context);
       return "continue";
     case "budget":
@@ -390,7 +385,6 @@ export async function handleSlashCommand(
       await providerCommand(args, context);
       return "continue";
     case "fallback":
-    case "fallbacks":
       await fallbackCommand(args, context);
       return "continue";
     case "init":
@@ -399,10 +393,13 @@ export async function handleSlashCommand(
     case "ssh":
       await sshCommand(args, context);
       return "continue";
-    default:
-      context.out.error(`Unbekannter Befehl: /${command}.`, "Nutze /help.");
-      return "continue";
   }
+
+  return unreachableSlashHandler(command);
+}
+
+function unreachableSlashHandler(handlerId: never): never {
+  throw new Error(`Nicht implementierte Command-Handler-ID: ${handlerId}`);
 }
 
 export async function promptForValidKey(
@@ -560,8 +557,8 @@ export async function printBalance(
 
 function printHelp(out: CommandOutput): void {
   out.text(`\n${chalk.bold("orcode Befehle")}`);
-  const width = Math.max(...SLASH_COMMANDS.map((command) => command.usage.length));
-  for (const command of SLASH_COMMANDS) {
+  const width = Math.max(...COMMAND_CATALOG.map((command) => command.usage.length));
+  for (const command of COMMAND_CATALOG) {
     out.text(`  ${command.usage.padEnd(width)}  ${command.description}`);
   }
   out.text("");
