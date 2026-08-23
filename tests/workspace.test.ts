@@ -2,9 +2,9 @@ import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
-import { chmod, mkdir, mkdtemp, readFile, readdir, realpath, rm, stat, symlink, utimes, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, readdir, realpath, rename, rm, stat, symlink, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { isAbsolute, join } from "node:path";
+import { delimiter, dirname, isAbsolute, join } from "node:path";
 import test from "node:test";
 import { promisify } from "node:util";
 import { ApprovalManager, PermissionDeniedError } from "../src/approval.js";
@@ -36,6 +36,7 @@ import {
   type CodingToolOptions,
   diffText,
   getGitDiff,
+  getGitStatus,
   gitDiffArgs,
   isCatastrophic,
   isWithinWorkspace,
@@ -155,6 +156,30 @@ async function gitAvailable(): Promise<boolean> {
   } catch {
     return false;
   }
+}
+
+async function realGitExecutable(): Promise<string> {
+  return resolveExecutablePath("git", process.env, process.platform, process.cwd());
+}
+
+async function initCommittedGitRepository(root: string): Promise<void> {
+  const git = await realGitExecutable();
+  await run(git, ["init", "-q"], { cwd: root });
+  await run(git, ["config", "user.email", "test@example.invalid"], { cwd: root });
+  await run(git, ["config", "user.name", "RouterCode Test"], { cwd: root });
+  await writeFile(join(root, "a.txt"), "alt\n", "utf8");
+  await run(git, ["add", "a.txt"], { cwd: root });
+  await run(git, ["commit", "-qm", "init"], { cwd: root });
+}
+
+async function writeMarkerLauncher(root: string, marker: string, name = "launcher.sh"): Promise<string> {
+  const script = join(root, name);
+  await writeFile(
+    script,
+    `#!/bin/sh\nprintf marker > ${JSON.stringify(marker)}\ncat\n`,
+    { encoding: "utf8", mode: 0o755 },
+  );
+  return script;
 }
 
 test("exact-artifact retention clamps age and terminal-run count downward and excludes an active run", async () => {
@@ -992,23 +1017,29 @@ test("catastrophic shell commands stay blocked even in allow-all", async () => {
 // git_diff (H2)
 // ---------------------------------------------------------------------------
 
-test("git diff is called without external drivers, textconv, or pager", () => {
+test("automatic Git uses --no-pager and command-line launcher neutralizers", () => {
   const args = gitDiffArgs(false);
-  assert.deepEqual(args.slice(0, 6), [
-    "-c",
-    "diff.external=",
-    "-c",
-    "core.pager=cat",
-    "-c",
-    "core.fsmonitor=false",
-  ]);
+  assert.equal(args[0], "--no-pager");
+  assert.ok(args.includes("--git-dir=.git"));
+  assert.ok(args.includes("--work-tree=."));
+  assert.ok(args.includes("diff.external="));
+  assert.ok(args.includes("core.pager="));
+  assert.ok(args.includes("pager.diff=false"));
+  assert.ok(args.includes("core.fsmonitor=false"));
+  assert.ok(args.includes("credential.helper="));
+  assert.ok(args.includes("credential.interactive=never"));
+  assert.ok(args.some((value) => value.startsWith("core.hooksPath=")));
   assert.ok(args.includes("--no-ext-diff"));
   assert.ok(args.includes("--no-textconv"));
+  assert.ok(args.includes("--ignore-submodules=all"));
+  assert.equal(args.some((value) => /(^|[/\\])cat(?:\.exe)?$/i.test(value)), false);
   assert.equal(args.includes("--cached"), false);
   assert.ok(gitDiffArgs(true).includes("--cached"));
 });
 
-test("/diff is a central hardened read-only Git capability, never a remembered mutation", async () => {
+test("/diff is a central hardened read-only Git capability, never a remembered mutation", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "routercode-git-capability-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
   const policy = evaluateGitReadCapability("diff");
   assert.deepEqual(policy, {
     id: "git.diff",
@@ -1022,34 +1053,59 @@ test("/diff is a central hardened read-only Git capability, never a remembered m
     calls.push({ executable, args, cwd: options.cwd });
     return { code: 0, stdout: "synthetic diff", stderr: "", truncated: false, timedOut: false, aborted: false };
   };
-  assert.equal(await getGitDiff("/workspace", fakeRun), "synthetic diff");
+  assert.equal(await getGitDiff(root, fakeRun), "synthetic diff");
   assert.equal(calls.length, 1);
   assert.equal(calls[0]?.executable.endsWith("git"), true);
   assert.deepEqual(calls[0]?.args, gitDiffArgs(false));
 
-  const direct = await runHardenedGitRead("/workspace", { operation: "diff", staged: true }, fakeRun);
+  const direct = await runHardenedGitRead(root, { operation: "diff", staged: true }, fakeRun);
   assert.equal(direct.policy.id, "git.diff");
   assert.ok(direct.invocation.args.includes("--cached"));
 });
 
-test("Git subject names come from the one filtered environment passed unchanged to the runner", async () => {
+test("Git subject names come from one minimal fixed environment passed unchanged to the runner", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "routercode-git-env-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  let git: string;
+  try {
+    git = await realGitExecutable();
+  } catch {
+    t.skip("git ist nicht installiert");
+    return;
+  }
+  const pathName = process.platform === "win32" ? "Path" : "PATH";
   const sourceEnvironment: NodeJS.ProcessEnv = {
-    PATH: process.env.PATH,
-    HOME: "/fixture/home",
-    LANG: "fixture-locale",
+    [pathName]: dirname(git),
+    HOME: join(root, "hostile-home"),
+    LANG: "hostile-locale",
     NORMAL_SETTING: "synthetic-value",
     FIXTURE_TOKEN: "filtered-value",
+    PAGER: join(root, "pager-launcher"),
+    GIT_EDITOR: join(root, "editor-launcher"),
+    GIT_ASKPASS: join(root, "askpass-launcher"),
+    SSH_ASKPASS: join(root, "ssh-askpass-launcher"),
+    GIT_SSH: join(root, "ssh-launcher"),
+    GIT_SSH_COMMAND: join(root, "ssh-command-launcher"),
+    GIT_CONFIG_COUNT: "1",
+    GIT_CONFIG_KEY_0: "filter.hostile.clean",
+    GIT_CONFIG_VALUE_0: join(root, "filter-launcher"),
+    GIT_NO_LAZY_FETCH: "0",
     UNDEFINED_SETTING: undefined,
   };
   const expectedNames = [
+    "GIT_ATTR_NOSYSTEM",
+    "GIT_CEILING_DIRECTORIES",
+    "GIT_CONFIG_GLOBAL",
+    "GIT_CONFIG_NOSYSTEM",
+    "GIT_CONFIG_SYSTEM",
     "GIT_EXTERNAL_DIFF",
+    "GIT_NO_LAZY_FETCH",
     "GIT_OPTIONAL_LOCKS",
     "GIT_PAGER",
+    "GIT_PROTOCOL_FROM_USER",
     "GIT_TERMINAL_PROMPT",
-    "HOME",
     "LANG",
-    "NORMAL_SETTING",
-    "PATH",
+    "LC_ALL",
   ].sort();
   let invocationEnvironment: NodeJS.ProcessEnv | undefined;
   let subject: Extract<ApprovalSubject, { kind: "structured-process" }> | undefined;
@@ -1063,7 +1119,7 @@ test("Git subject names come from the one filtered environment passed unchanged 
   };
 
   await runHardenedGitRead(
-    "/workspace",
+    root,
     { operation: "diff", staged: false },
     fakeRun,
     async (invocation) => {
@@ -1079,20 +1135,345 @@ test("Git subject names come from the one filtered environment passed unchanged 
   );
 
   assert.deepEqual(subject?.environment, expectedNames);
+  assert.equal(invocationEnvironment?.GIT_OPTIONAL_LOCKS, "0");
+  assert.equal(invocationEnvironment?.GIT_NO_LAZY_FETCH, "1");
+  assert.equal(invocationEnvironment?.GIT_PAGER, "");
+  assert.equal(invocationEnvironment?.LANG, "C");
+  assert.equal(invocationEnvironment?.LC_ALL, "C");
+  assert.equal(invocationEnvironment?.GIT_CEILING_DIRECTORIES, await realpath(root));
   const display = approvalSubjectDisplay(subject!);
-  assert.doesNotMatch(display, /fixture\/home|fixture-locale|synthetic-value|filtered-value/);
-  assert.doesNotMatch(display, /FIXTURE_TOKEN|UNDEFINED_SETTING/);
+  assert.doesNotMatch(display, /hostile-home|hostile-locale|synthetic-value|filtered-value/);
+  for (const hostileName of [
+    "HOME", "NORMAL_SETTING", "FIXTURE_TOKEN", "UNDEFINED_SETTING", "PAGER",
+    "GIT_EDITOR", "GIT_ASKPASS", "SSH_ASKPASS", "GIT_SSH", "GIT_SSH_COMMAND",
+    "GIT_CONFIG_COUNT", "GIT_CONFIG_KEY_0", "GIT_CONFIG_VALUE_0",
+  ]) {
+    assert.doesNotMatch(display, new RegExp(`"${hostileName}"`));
+  }
 
   const appHome = await mkdtemp(join(tmpdir(), "routercode-git-env-rules-"));
   try {
     const store = await RuleStore.load(appHome);
-    await store.remember({ workspace: "/workspace", tool: "git_diff", subject: subject!, decision: "allow" });
+    await store.remember({ workspace: root, tool: "git_diff", subject: subject!, decision: "allow" });
     const persisted = await readFile(rulesPath(appHome), "utf8");
-    assert.doesNotMatch(persisted, /fixture\/home|fixture-locale|synthetic-value|filtered-value/);
-    assert.doesNotMatch(persisted, /FIXTURE_TOKEN|UNDEFINED_SETTING/);
+    assert.doesNotMatch(persisted, /hostile-home|hostile-locale|synthetic-value|filtered-value/);
+    for (const hostileName of [
+      "HOME", "NORMAL_SETTING", "FIXTURE_TOKEN", "UNDEFINED_SETTING", "PAGER",
+      "GIT_EDITOR", "GIT_ASKPASS", "SSH_ASKPASS", "GIT_SSH", "GIT_SSH_COMMAND",
+      "GIT_CONFIG_COUNT", "GIT_CONFIG_KEY_0", "GIT_CONFIG_VALUE_0",
+    ]) {
+      assert.doesNotMatch(persisted, new RegExp(`"${hostileName}"`));
+    }
   } finally {
     await rm(appHome, { recursive: true, force: true });
   }
+});
+
+test("automatic Git skips a repo-local PATH executable and approves the exact trusted binary", { skip: process.platform === "win32" ? "POSIX launcher fixture" : false }, async (t) => {
+  if (!(await gitAvailable())) {
+    t.skip("git ist nicht installiert");
+    return;
+  }
+  const root = await mkdtemp(join(tmpdir(), "routercode-git-path-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  await initCommittedGitRepository(root);
+  const trustedGit = await realGitExecutable();
+  const fakeBin = join(root, "bin");
+  const marker = join(root, "fake-git-ran");
+  await mkdir(fakeBin);
+  await writeFile(
+    join(fakeBin, "git"),
+    `#!/bin/sh\nprintf fake > ${JSON.stringify(marker)}\nexec ${JSON.stringify(trustedGit)} "$@"\n`,
+    { encoding: "utf8", mode: 0o755 },
+  );
+  let approvedExecutable = "";
+
+  const execution = await runHardenedGitRead(
+    root,
+    { operation: "status" },
+    runProcess,
+    async (invocation) => {
+      approvedExecutable = invocation.executable;
+      assert.equal(existsSync(marker), false, "repo-local git ran before approval");
+    },
+    { environment: { PATH: `${fakeBin}${delimiter}${dirname(trustedGit)}` } },
+  );
+
+  assert.equal(existsSync(marker), false, "repo-local git was executed");
+  assert.equal(execution.result.code, 0);
+  assert.equal(execution.invocation.executable, await realpath(trustedGit));
+  assert.equal(approvedExecutable, execution.invocation.executable);
+});
+
+test("automatic diff, status/dashboard, and direct diff cannot launch repository helpers", { skip: process.platform === "win32" ? "POSIX launcher fixture" : false }, async (t) => {
+  if (!(await gitAvailable())) {
+    t.skip("git ist nicht installiert");
+    return;
+  }
+  const box = await sandbox("allow-all", { prefix: "git-hostile-config" });
+  t.after(() => rm(box.root, { recursive: true, force: true }));
+  await initCommittedGitRepository(box.root);
+  const git = await realGitExecutable();
+  const marker = join(box.root, "repo-launcher-ran");
+  const launcher = await writeMarkerLauncher(box.root, marker);
+  const hooks = join(box.root, "hooks");
+  await mkdir(hooks);
+  await writeMarkerLauncher(hooks, marker, "post-index-change");
+  await run(git, ["config", "core.pager", launcher], { cwd: box.root });
+  await run(git, ["config", "pager.diff", launcher], { cwd: box.root });
+  await run(git, ["config", "pager.status", launcher], { cwd: box.root });
+  await run(git, ["config", "core.editor", launcher], { cwd: box.root });
+  await run(git, ["config", "core.askPass", launcher], { cwd: box.root });
+  await run(git, ["config", "credential.helper", `!${launcher}`], { cwd: box.root });
+  await run(git, ["config", "core.hooksPath", hooks], { cwd: box.root });
+  await run(git, ["config", "core.fsmonitor", launcher], { cwd: box.root });
+  await run(git, ["config", "diff.external", launcher], { cwd: box.root });
+  await run(git, ["config", "diff.hostile.command", launcher], { cwd: box.root });
+  await run(git, ["config", "diff.hostile.textconv", launcher], { cwd: box.root });
+  await writeFile(join(box.root, ".gitattributes"), "*.txt diff=hostile\n", "utf8");
+  await writeFile(join(box.root, "a.txt"), "neu\n", "utf8");
+
+  const modelDiff = await invoke(box.tools, "git_diff", { staged: false });
+  assert.match(String(modelDiff.diff), /\+neu/);
+  assert.equal(existsSync(marker), false, "model git_diff launched repository code");
+
+  const directDiff = await getGitDiff(box.root);
+  assert.match(directDiff, /\+neu/);
+  assert.equal(existsSync(marker), false, "direct /diff boundary launched repository code");
+
+  const dashboardStatus = await getGitStatus(box.root);
+  assert.equal(dashboardStatus.code, 0);
+  assert.match(dashboardStatus.stdout, /a\.txt/);
+  assert.equal(existsSync(marker), false, "dashboard status boundary launched repository code");
+});
+
+test("automatic Git fails closed on local clean, smudge, process filters and includes", { skip: process.platform === "win32" ? "POSIX launcher fixture" : false }, async (t) => {
+  if (!(await gitAvailable())) {
+    t.skip("git ist nicht installiert");
+    return;
+  }
+  for (const unsafeKey of [
+    "filter.hostile.clean",
+    "filter.hostile.smudge",
+    "filter.hostile.process",
+    "include.path",
+  ]) {
+    await t.test(unsafeKey, async () => {
+      const root = await mkdtemp(join(tmpdir(), "routercode-git-filter-"));
+      t.after(() => rm(root, { recursive: true, force: true }));
+      await initCommittedGitRepository(root);
+      const git = await realGitExecutable();
+      const marker = join(root, "filter-ran");
+      const launcher = await writeMarkerLauncher(root, marker);
+      if (unsafeKey === "include.path") {
+        const included = join(root, "included.gitconfig");
+        await writeFile(included, `[filter "hostile"]\n\tclean = ${launcher}\n`, "utf8");
+        await run(git, ["config", "include.path", included], { cwd: root });
+      } else {
+        await run(git, ["config", unsafeKey, launcher], { cwd: root });
+      }
+      await writeFile(join(root, ".gitattributes"), "*.txt filter=hostile\n", "utf8");
+      await writeFile(join(root, "a.txt"), "neu\n", "utf8");
+
+      await assert.rejects(
+        runHardenedGitRead(root, { operation: "status" }),
+        /Git-(?:Filter|Include).*nicht sicher|nicht sicher.*Git-(?:Filter|Include)/i,
+      );
+      assert.equal(existsSync(marker), false, `${unsafeKey} launched before fail-closed`);
+    });
+  }
+});
+
+test("automatic Git never discovers a parent repository outside the canonical workspace", { skip: process.platform === "win32" ? "POSIX launcher fixture" : false }, async (t) => {
+  if (!(await gitAvailable())) {
+    t.skip("git ist nicht installiert");
+    return;
+  }
+  const parent = await mkdtemp(join(tmpdir(), "routercode-git-parent-"));
+  t.after(() => rm(parent, { recursive: true, force: true }));
+  const root = join(parent, "workspace");
+  await mkdir(root);
+  await initCommittedGitRepository(parent);
+  const git = await realGitExecutable();
+  await writeFile(join(root, "nested.txt"), "eins\n", "utf8");
+  await run(git, ["add", "workspace/nested.txt"], { cwd: parent });
+  await run(git, ["commit", "-qm", "nested"], { cwd: parent });
+  const marker = join(parent, "parent-filter-ran");
+  const launcher = await writeMarkerLauncher(parent, marker, "parent-filter.sh");
+  await run(git, ["config", "filter.parent.clean", launcher], { cwd: parent });
+  await writeFile(join(parent, ".gitattributes"), "workspace/*.txt filter=parent\n", "utf8");
+  await writeFile(join(root, "nested.txt"), "zwei\n", "utf8");
+
+  const status = await getGitStatus(root);
+  assert.notEqual(status.code, 0, "workspace status escaped into its parent repository");
+  assert.equal(existsSync(marker), false, "parent repository filter was executed");
+});
+
+test("automatic Git rejects a commondir that delegates repository metadata outside the workspace", async (t) => {
+  if (!(await gitAvailable())) {
+    t.skip("git ist nicht installiert");
+    return;
+  }
+  const holder = await mkdtemp(join(tmpdir(), "routercode-git-commondir-"));
+  t.after(() => rm(holder, { recursive: true, force: true }));
+  const root = join(holder, "workspace");
+  await mkdir(join(root, ".git"), { recursive: true });
+  await writeFile(join(root, ".git", "commondir"), "../../outside-git-metadata\n", "utf8");
+  let spawned = false;
+
+  await assert.rejects(
+    runHardenedGitRead(
+      root,
+      { operation: "status" },
+      async () => {
+        spawned = true;
+        return { code: 0, stdout: "", stderr: "", truncated: false, timedOut: false, aborted: false };
+      },
+    ),
+    /gemeinsame Git-Metadaten.*nicht sicher/i,
+  );
+  assert.equal(spawned, false, "Git spawned with external common metadata");
+});
+
+test("automatic Git canonicalizes a symlinked workspace before approval and execution", { skip: process.platform === "win32" ? "POSIX symlink fixture" : false }, async (t) => {
+  const holder = await mkdtemp(join(tmpdir(), "routercode-git-canonical-"));
+  t.after(() => rm(holder, { recursive: true, force: true }));
+  const root = join(holder, "real-workspace");
+  const alias = join(holder, "workspace-alias");
+  await mkdir(root);
+  await symlink(root, alias, "dir");
+  const canonical = await realpath(root);
+  let approvedCwd = "";
+  let executedCwd = "";
+
+  await runHardenedGitRead(
+    alias,
+    { operation: "status" },
+    async (_executable, _args, options) => {
+      executedCwd = options.cwd;
+      return { code: 1, stdout: "", stderr: "not a repository", truncated: false, timedOut: false, aborted: false };
+    },
+    async (invocation) => {
+      approvedCwd = invocation.cwd;
+    },
+  );
+
+  assert.equal(approvedCwd, canonical);
+  assert.equal(executedCwd, canonical);
+});
+
+test("automatic Git revalidates repository launchers after approval before spawning", { skip: process.platform === "win32" ? "POSIX launcher fixture" : false }, async (t) => {
+  if (!(await gitAvailable())) {
+    t.skip("git ist nicht installiert");
+    return;
+  }
+  const root = await mkdtemp(join(tmpdir(), "routercode-git-late-config-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  await initCommittedGitRepository(root);
+  const git = await realGitExecutable();
+  const marker = join(root, "late-filter-ran");
+  const launcher = await writeMarkerLauncher(root, marker);
+  let spawned = false;
+
+  await assert.rejects(
+    runHardenedGitRead(
+      root,
+      { operation: "status" },
+      async () => {
+        spawned = true;
+        return { code: 0, stdout: "", stderr: "", truncated: false, timedOut: false, aborted: false };
+      },
+      async () => {
+        await run(git, ["config", "filter.late.clean", launcher], { cwd: root });
+        await writeFile(join(root, ".gitattributes"), "*.txt filter=late\n", "utf8");
+      },
+    ),
+    /Git-Filter.*nicht sicher/i,
+  );
+  assert.equal(spawned, false, "Git spawned after approval-time launcher injection");
+  assert.equal(existsSync(marker), false);
+});
+
+test("automatic Git rejects an approval-time workspace identity replacement", { skip: process.platform === "win32" ? "POSIX directory replacement fixture" : false }, async (t) => {
+  const holder = await mkdtemp(join(tmpdir(), "routercode-git-root-swap-"));
+  t.after(() => rm(holder, { recursive: true, force: true }));
+  const root = join(holder, "workspace");
+  const retired = join(holder, "retired-workspace");
+  await mkdir(root);
+  let spawned = false;
+
+  await assert.rejects(
+    runHardenedGitRead(
+      root,
+      { operation: "status" },
+      async () => {
+        spawned = true;
+        return { code: 0, stdout: "", stderr: "", truncated: false, timedOut: false, aborted: false };
+      },
+      async () => {
+        await rename(root, retired);
+        await mkdir(root);
+      },
+    ),
+    /Workspace.*ausgetauscht/i,
+  );
+  assert.equal(spawned, false, "Git spawned in a replacement workspace");
+});
+
+test("automatic Git rejects approval-time replacement of its resolved executable", { skip: process.platform === "win32" ? "POSIX executable replacement fixture" : false }, async (t) => {
+  const holder = await mkdtemp(join(tmpdir(), "routercode-git-executable-swap-"));
+  t.after(() => rm(holder, { recursive: true, force: true }));
+  const root = join(holder, "workspace");
+  const trustedBin = join(holder, "trusted-bin");
+  const executable = join(trustedBin, "git");
+  const retired = join(trustedBin, "git-approved");
+  const marker = join(holder, "replacement-git-ran");
+  await mkdir(root);
+  await mkdir(trustedBin);
+  await writeFile(executable, "#!/bin/sh\nexit 0\n", { encoding: "utf8", mode: 0o755 });
+
+  await assert.rejects(
+    runHardenedGitRead(
+      root,
+      { operation: "status" },
+      runProcess,
+      async () => {
+        await rename(executable, retired);
+        await writeFile(
+          executable,
+          `#!/bin/sh\nprintf marker > ${JSON.stringify(marker)}\nexit 0\n`,
+          { encoding: "utf8", mode: 0o755 },
+        );
+      },
+      { environment: { PATH: trustedBin } },
+    ),
+    /git-Programmdatei.*ausgetauscht/i,
+  );
+  assert.equal(existsSync(marker), false, "replacement Git executable was launched");
+});
+
+test("automatic Git skips a PATH directory named git and selects a regular executable", { skip: process.platform === "win32" ? "POSIX executable fixture" : false }, async (t) => {
+  const holder = await mkdtemp(join(tmpdir(), "routercode-git-file-kind-"));
+  t.after(() => rm(holder, { recursive: true, force: true }));
+  const root = join(holder, "workspace");
+  const badBin = join(holder, "bad-bin");
+  const trustedBin = join(holder, "trusted-bin");
+  await mkdir(root);
+  await mkdir(badBin);
+  await mkdir(trustedBin);
+  await mkdir(join(badBin, "git"));
+  await writeFile(join(trustedBin, "git"), "#!/bin/sh\nexit 0\n", { encoding: "utf8", mode: 0o755 });
+
+  const execution = await runHardenedGitRead(
+    root,
+    { operation: "status" },
+    runProcess,
+    undefined,
+    { environment: { PATH: `${badBin}${delimiter}${trustedBin}` } },
+  );
+
+  assert.equal(execution.result.code, 0);
+  assert.equal(execution.invocation.executable, await realpath(join(trustedBin, "git")));
 });
 
 test("model git_diff shows its exact subject but cannot apply or persist remembered rules", async (t) => {

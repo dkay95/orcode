@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { constants as fsConstants } from "node:fs";
+import { constants as fsConstants, type BigIntStats } from "node:fs";
 import { randomUUID } from "node:crypto";
 import {
   access,
@@ -75,6 +75,7 @@ const PROCESS_KILL_GRACE_MS = 1_500;
 const DIFF_PREVIEW_CHANGED_LINES = 60;
 const DIFF_CONTEXT_LINES = 3;
 const DIFF_LCS_BUDGET = 2_000_000;
+const MAX_GIT_CONFIG_BYTES = 1_000_000;
 
 /** Directories that never contain search hits worth showing. */
 const SEARCH_IGNORES = ["**/.git/**", "**/node_modules/**"] as const;
@@ -1419,29 +1420,78 @@ async function authorizeRead(
 // git
 // ---------------------------------------------------------------------------
 
-/**
- * Config keys that turn `git diff` into an arbitrary program launcher. They are
- * overridden on the command line (`-c` wins over every config file) *and* in
- * the environment, because a repository can ship its own `.git/config`.
- */
-const GIT_HARDENING = [
-  "-c",
-  "diff.external=",
-  "-c",
-  "core.pager=cat",
-  "-c",
-  "core.fsmonitor=false",
-] as const;
+function gitNullDevice(platform: NodeJS.Platform = process.platform): string {
+  return platform === "win32" ? "NUL" : "/dev/null";
+}
 
-const GIT_SAFE_ENVIRONMENT: NodeJS.ProcessEnv = {
-  GIT_EXTERNAL_DIFF: "",
-  GIT_OPTIONAL_LOCKS: "0",
-  GIT_PAGER: "cat",
-  GIT_TERMINAL_PROMPT: "0",
-};
+/**
+ * Global options shared by every automatic read. Each launcher Git can
+ * neutralize is overridden at the highest config priority. Filters are the
+ * exception: their driver names are arbitrary, so local filter/include
+ * configuration is rejected before Git starts instead of guessing names.
+ */
+function gitHardeningArgs(platform: NodeJS.Platform = process.platform): string[] {
+  const nullDevice = gitNullDevice(platform);
+  return [
+    "--no-pager",
+    "--git-dir=.git",
+    "--work-tree=.",
+    "-c", "diff.external=",
+    "-c", "core.pager=",
+    "-c", "pager.diff=false",
+    "-c", "pager.status=false",
+    "-c", "core.fsmonitor=false",
+    "-c", `core.hooksPath=${nullDevice}`,
+    "-c", "credential.helper=",
+    "-c", "credential.interactive=never",
+    "-c", "core.askPass=",
+    "-c", "core.editor=",
+    "-c", "sequence.editor=",
+    "-c", `core.attributesFile=${nullDevice}`,
+    "-c", "color.ui=false",
+    "-c", "protocol.allow=never",
+    "-c", "submodule.recurse=false",
+  ];
+}
+
+function gitSafeEnvironment(
+  canonicalRoot: string,
+  sourceEnvironment: NodeJS.ProcessEnv,
+  platform: NodeJS.Platform = process.platform,
+): NodeJS.ProcessEnv {
+  const nullDevice = gitNullDevice(platform);
+  const environment: NodeJS.ProcessEnv = {
+    GIT_ATTR_NOSYSTEM: "1",
+    GIT_CEILING_DIRECTORIES: canonicalRoot,
+    GIT_CONFIG_GLOBAL: nullDevice,
+    GIT_CONFIG_NOSYSTEM: "1",
+    GIT_CONFIG_SYSTEM: nullDevice,
+    GIT_EXTERNAL_DIFF: "",
+    GIT_NO_LAZY_FETCH: "1",
+    GIT_OPTIONAL_LOCKS: "0",
+    GIT_PAGER: "",
+    GIT_PROTOCOL_FROM_USER: "0",
+    GIT_TERMINAL_PROMPT: "0",
+    LANG: "C",
+    LC_ALL: "C",
+  };
+  if (platform === "win32") {
+    for (const name of ["SystemRoot", "WINDIR"] as const) {
+      const value = environmentVariable(sourceEnvironment, name, platform);
+      if (value !== undefined) environment[name] = value;
+    }
+  }
+  return environment;
+}
 
 export function gitDiffArgs(staged: boolean): string[] {
-  const args = [...GIT_HARDENING, "diff", "--no-ext-diff", "--no-textconv"];
+  const args = [
+    ...gitHardeningArgs(),
+    "diff",
+    "--no-ext-diff",
+    "--no-textconv",
+    "--ignore-submodules=all",
+  ];
   if (staged) {
     args.push("--cached");
   }
@@ -1450,7 +1500,14 @@ export function gitDiffArgs(staged: boolean): string[] {
 }
 
 export function gitStatusArgs(): string[] {
-  return [...GIT_HARDENING, "status", "--short", "--branch", "--untracked-files=normal"];
+  return [
+    ...gitHardeningArgs(),
+    "status",
+    "--porcelain=v1",
+    "--branch",
+    "--untracked-files=normal",
+    "--ignore-submodules=all",
+  ];
 }
 
 export type RunProcess = (
@@ -1484,6 +1541,40 @@ export type HardenedGitRuntime = Pick<RunProcessOptions, "signal" | "onChunk"> &
   processInput?: Record<string, unknown>;
 };
 
+function environmentVariable(
+  environment: NodeJS.ProcessEnv,
+  name: "PATH" | "PATHEXT" | "SystemRoot" | "WINDIR",
+  platform: NodeJS.Platform,
+): string | undefined {
+  if (platform !== "win32") return environment[name];
+  return Object.entries(environment).find(
+    ([candidate, value]) => candidate.toLowerCase() === name.toLowerCase() && value !== undefined,
+  )?.[1];
+}
+
+function executableCandidates(
+  executable: string,
+  environment: NodeJS.ProcessEnv,
+  platform: NodeJS.Platform,
+  cwd: string,
+): string[] {
+  if (isAbsolute(executable) || executable.includes("/") || executable.includes("\\")) {
+    return [resolve(cwd, executable)];
+  }
+  const pathDelimiter = platform === "win32" ? ";" : delimiter;
+  const directories = (environmentVariable(environment, "PATH", platform) ?? "")
+    .split(pathDelimiter)
+    .filter(Boolean);
+  const extensions = platform === "win32" && !/\.[^\\/.]+$/.test(executable)
+    ? (environmentVariable(environment, "PATHEXT", platform) ?? ".EXE;.CMD;.BAT;.COM").split(";")
+    : [""];
+  return directories.flatMap((directory) =>
+    extensions.map((extension) =>
+      resolve(cwd, directory, platform === "win32" ? `${executable}${extension}` : executable),
+    ),
+  );
+}
+
 export async function resolveExecutablePath(
   executable: string,
   environment: NodeJS.ProcessEnv = process.env,
@@ -1495,31 +1586,222 @@ export async function resolveExecutablePath(
     await access(candidate, fsConstants.X_OK);
     return realpath(candidate);
   }
-  const environmentValue = (name: "PATH" | "PATHEXT"): string | undefined => {
-    if (platform !== "win32") {
-      return environment[name];
-    }
-    return Object.entries(environment).find(
-      ([candidate, value]) => candidate.toLowerCase() === name.toLowerCase() && value !== undefined,
-    )?.[1];
-  };
-  const pathDelimiter = platform === "win32" ? ";" : delimiter;
-  const directories = (environmentValue("PATH") ?? "").split(pathDelimiter).filter(Boolean);
-  const extensions = platform === "win32" && !/\.[^\\/.]+$/.test(executable)
-    ? (environmentValue("PATHEXT") ?? ".EXE;.CMD;.BAT;.COM").split(";")
-    : [""];
-  for (const directory of directories) {
-    for (const extension of extensions) {
-      const candidate = join(directory, platform === "win32" ? `${executable}${extension}` : executable);
-      try {
-        await access(candidate, fsConstants.X_OK);
-        return await realpath(candidate);
-      } catch {
-        // Try the next PATH entry.
-      }
+  for (const candidate of executableCandidates(executable, environment, platform, cwd)) {
+    try {
+      await access(candidate, fsConstants.X_OK);
+      return await realpath(candidate);
+    } catch {
+      // Try the next PATH entry.
     }
   }
   throw new Error(`Ausführbare Datei nicht in PATH gefunden: ${executable}`);
+}
+
+function pathIsWithinRoot(root: string, candidate: string): boolean {
+  const value = relative(root, candidate);
+  return value === "" || (value !== ".." && !value.startsWith(`..${sep}`) && !isAbsolute(value));
+}
+
+interface GitPathIdentity {
+  path: string;
+  dev: bigint;
+  ino: bigint;
+}
+
+interface GitExecutableIdentity extends GitPathIdentity {
+  size: bigint;
+  mode: bigint;
+  mtimeNs: bigint;
+  ctimeNs: bigint;
+}
+
+function sameGitPathIdentity(
+  left: GitPathIdentity | null,
+  right: GitPathIdentity | null,
+): boolean {
+  return left === null
+    ? right === null
+    : right !== null && left.path === right.path && left.dev === right.dev && left.ino === right.ino;
+}
+
+function sameGitExecutableIdentity(
+  left: GitExecutableIdentity,
+  right: GitExecutableIdentity,
+): boolean {
+  return sameGitPathIdentity(left, right)
+    && left.size === right.size
+    && left.mode === right.mode
+    && left.mtimeNs === right.mtimeNs
+    && left.ctimeNs === right.ctimeNs;
+}
+
+async function gitDirectoryIdentity(path: string): Promise<GitPathIdentity> {
+  const info = await lstat(path, { bigint: true });
+  if (info.isSymbolicLink() || !info.isDirectory()) {
+    throw new Error(`Workspace-Verzeichnis wurde ausgetauscht: ${path}`);
+  }
+  return { path, dev: info.dev, ino: info.ino };
+}
+
+async function assertSameGitDirectoryIdentity(expected: GitPathIdentity): Promise<void> {
+  let current: GitPathIdentity;
+  try {
+    current = await gitDirectoryIdentity(expected.path);
+  } catch {
+    throw new Error(`Workspace-Verzeichnis wurde vor dem Git-Start ausgetauscht: ${expected.path}`);
+  }
+  if (!sameGitPathIdentity(expected, current)) {
+    throw new Error(`Workspace-Verzeichnis wurde vor dem Git-Start ausgetauscht: ${expected.path}`);
+  }
+}
+
+async function executableIdentity(candidate: string): Promise<GitExecutableIdentity | null> {
+  try {
+    await access(candidate, fsConstants.X_OK);
+    const canonical = await realpath(candidate);
+    const info = await lstat(canonical, { bigint: true });
+    if (info.isSymbolicLink() || !info.isFile()) return null;
+    return {
+      path: canonical,
+      dev: info.dev,
+      ino: info.ino,
+      size: info.size,
+      mode: info.mode,
+      mtimeNs: info.mtimeNs,
+      ctimeNs: info.ctimeNs,
+    };
+  } catch {
+    return null;
+  }
+}
+
+async function assertSameGitExecutableIdentity(expected: GitExecutableIdentity): Promise<void> {
+  const current = await executableIdentity(expected.path);
+  if (current === null || !sameGitExecutableIdentity(expected, current)) {
+    throw new Error("Die genehmigte git-Programmdatei wurde vor dem Start ausgetauscht.");
+  }
+}
+
+async function resolveTrustedGitExecutable(
+  canonicalRoot: string,
+  environment: NodeJS.ProcessEnv,
+  platform: NodeJS.Platform = process.platform,
+): Promise<GitExecutableIdentity> {
+  for (const candidate of executableCandidates("git", environment, platform, process.cwd())) {
+    const identity = await executableIdentity(candidate);
+    if (identity !== null && !pathIsWithinRoot(canonicalRoot, identity.path)) return identity;
+  }
+  throw new Error("Keine vertrauenswürdige git-Programmdatei außerhalb des Workspace gefunden.");
+}
+
+function sameStableGitFile(
+  left: BigIntStats,
+  right: BigIntStats,
+): boolean {
+  return left.dev === right.dev
+    && left.ino === right.ino
+    && left.size === right.size
+    && left.mode === right.mode
+    && left.mtimeNs === right.mtimeNs
+    && left.ctimeNs === right.ctimeNs;
+}
+
+async function readStableGitConfig(configPath: string): Promise<string | null> {
+  let namedBefore;
+  try {
+    namedBefore = await lstat(configPath, { bigint: true });
+  } catch (error) {
+    if (hasCode(error, "ENOENT")) return null;
+    throw error;
+  }
+  if (namedBefore.isSymbolicLink() || !namedBefore.isFile() || namedBefore.size > BigInt(MAX_GIT_CONFIG_BYTES)) {
+    throw new Error("Lokale Git-Konfiguration ist für automatische Lesevorgänge nicht sicher.");
+  }
+
+  const handle = await open(
+    configPath,
+    fsConstants.O_RDONLY | (process.platform === "win32" ? 0 : fsConstants.O_NOFOLLOW),
+  );
+  try {
+    const openedBefore = await handle.stat({ bigint: true });
+    if (!openedBefore.isFile() || !sameStableGitFile(namedBefore, openedBefore)) {
+      throw new Error("Lokale Git-Konfiguration wurde während der Sicherheitsprüfung ausgetauscht.");
+    }
+    const config = await handle.readFile("utf8");
+    const [openedAfter, namedAfter] = await Promise.all([
+      handle.stat({ bigint: true }),
+      lstat(configPath, { bigint: true }),
+    ]);
+    if (
+      namedAfter.isSymbolicLink()
+      || !namedAfter.isFile()
+      || !sameStableGitFile(openedBefore, openedAfter)
+      || !sameStableGitFile(openedAfter, namedAfter)
+    ) {
+      throw new Error("Lokale Git-Konfiguration wurde während der Sicherheitsprüfung ausgetauscht.");
+    }
+    return config;
+  } finally {
+    await handle.close();
+  }
+}
+
+async function assertSafeAutomaticGitRepository(canonicalRoot: string): Promise<GitPathIdentity | null> {
+  const gitDirectory = join(canonicalRoot, ".git");
+  let gitDirectoryInfo;
+  try {
+    gitDirectoryInfo = await lstat(gitDirectory, { bigint: true });
+  } catch (error) {
+    if (hasCode(error, "ENOENT")) return null;
+    throw error;
+  }
+  if (gitDirectoryInfo.isSymbolicLink() || !gitDirectoryInfo.isDirectory()) {
+    throw new Error("Git-Metadaten außerhalb des kanonischen Workspace sind nicht sicher.");
+  }
+  const canonicalGitDirectory = await realpath(gitDirectory);
+  if (!pathIsWithinRoot(canonicalRoot, canonicalGitDirectory)) {
+    throw new Error("Git-Metadaten außerhalb des kanonischen Workspace sind nicht sicher.");
+  }
+  const gitIdentity: GitPathIdentity = {
+    path: canonicalGitDirectory,
+    dev: gitDirectoryInfo.dev,
+    ino: gitDirectoryInfo.ino,
+  };
+
+  try {
+    await lstat(join(gitDirectory, "commondir"));
+    throw new Error("Externe gemeinsame Git-Metadaten sind für automatische Lesevorgänge nicht sicher.");
+  } catch (error) {
+    if (!hasCode(error, "ENOENT")) throw error;
+  }
+
+  for (const name of ["config", "config.worktree"] as const) {
+    const configPath = join(gitDirectory, name);
+    const config = await readStableGitConfig(configPath);
+    if (config === null) continue;
+    if (config.includes("\0")) {
+      throw new Error("Lokale Git-Konfiguration ist für automatische Lesevorgänge nicht sicher.");
+    }
+    for (const line of config.split(/\r?\n/)) {
+      const section = /^\s*\[\s*([a-z][a-z0-9-]*)/i.exec(line)?.[1]?.toLowerCase();
+      if (section === "filter") {
+        throw new Error("Lokale Git-Filter-Konfiguration ist für automatische Lesevorgänge nicht sicher.");
+      }
+      if (section === "include" || section === "includeif") {
+        throw new Error("Lokale Git-Include-Konfiguration ist für automatische Lesevorgänge nicht sicher.");
+      }
+    }
+  }
+  const gitDirectoryAfter = await lstat(gitDirectory, { bigint: true });
+  if (
+    gitDirectoryAfter.isSymbolicLink()
+    || !gitDirectoryAfter.isDirectory()
+    || gitDirectoryAfter.dev !== gitIdentity.dev
+    || gitDirectoryAfter.ino !== gitIdentity.ino
+  ) {
+    throw new Error("Git-Repository wurde während der Sicherheitsprüfung ausgetauscht.");
+  }
+  return gitIdentity;
 }
 
 export async function runHardenedGitRead(
@@ -1532,15 +1814,11 @@ export async function runHardenedGitRead(
   const operation: GitReadOperation = request.operation;
   const policy = evaluateGitReadCapability(operation);
   const sourceEnvironment = runtime.environment ?? process.env;
-  const filteredEnvironment = Object.fromEntries(
-    Object.entries(sanitizedEnvironment(sourceEnvironment)).filter(
-      (entry): entry is [string, string] => entry[1] !== undefined,
-    ),
-  );
-  const effectiveEnvironment: NodeJS.ProcessEnv = {
-    ...filteredEnvironment,
-    ...GIT_SAFE_ENVIRONMENT,
-  };
+  const canonicalRoot = await realpath(root);
+  const rootIdentity = await gitDirectoryIdentity(canonicalRoot);
+  const executableIdentity = await resolveTrustedGitExecutable(canonicalRoot, sourceEnvironment);
+  const repositoryIdentity = await assertSafeAutomaticGitRepository(canonicalRoot);
+  const effectiveEnvironment = gitSafeEnvironment(canonicalRoot, sourceEnvironment);
   const {
     environment: _environment,
     processCallbacks,
@@ -1549,12 +1827,18 @@ export async function runHardenedGitRead(
     ...processRuntime
   } = runtime;
   const invocation: HardenedGitInvocation = {
-    executable: await resolveExecutablePath("git", effectiveEnvironment),
+    executable: executableIdentity.path,
     args: request.operation === "diff" ? gitDiffArgs(request.staged) : gitStatusArgs(),
-    cwd: root,
+    cwd: canonicalRoot,
     env: effectiveEnvironment,
   };
   await beforeRun?.(invocation, policy);
+  const currentRepositoryIdentity = await assertSafeAutomaticGitRepository(canonicalRoot);
+  if (!sameGitPathIdentity(repositoryIdentity, currentRepositoryIdentity)) {
+    throw new Error("Git-Repository wurde vor dem Start ausgetauscht.");
+  }
+  await assertSameGitDirectoryIdentity(rootIdentity);
+  await assertSameGitExecutableIdentity(executableIdentity);
   const execute = (onChunk: RunProcessOptions["onChunk"]) =>
     runner(invocation.executable, invocation.args, {
       cwd: invocation.cwd,
