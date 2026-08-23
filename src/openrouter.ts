@@ -1479,7 +1479,7 @@ export function createPanelCall(service: OpenRouterService): PanelCall {
       // Same redaction/translation every other OpenRouter call gets — a
       // panel error column is exactly the kind of place a raw key leak would
       // otherwise end up.
-      if (service.runtimeState.inferenceValidity === "rejected") {
+      if (error instanceof OpenRouterHttpError && error.status === 401) {
         throw new PanelAuthenticationRejectedError();
       }
       throw new Error(service.safeMessage(error));

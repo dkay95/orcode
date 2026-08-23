@@ -175,10 +175,14 @@ async function activateOpenRouter(
     }
     const selectedCanonicalModelId = await surface.chooseModel({ backendId: "openrouter", models });
     if (selectedCanonicalModelId === null) return { kind: "cancelled" };
-    if (!models.some((model) => model.canonicalModelId === selectedCanonicalModelId)) {
+    const selectedModels = models.filter(
+      (model) => model.canonicalModelId === selectedCanonicalModelId,
+    );
+    if (selectedModels.length !== 1) {
       surface.present(notice("Die gewählte Modellroute ist nicht verfügbar."));
       return { kind: "retry" };
     }
+    const selectedModel = selectedModels[0]!;
     if (askPersistence) {
       const accepted = await surface.confirm({
         id: "save-openrouter-key",
@@ -190,6 +194,7 @@ async function activateOpenRouter(
     const activation = await orchestrator.activateCandidate({
       expectedRevision: stateStore.read().revision,
       candidate: secret,
+      expectedRequestedModelId: selectedModel.requestedModelId,
       selectedCanonicalModelId,
       signal: controller.signal,
       persistence,

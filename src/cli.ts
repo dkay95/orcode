@@ -165,7 +165,7 @@ import {
   type ProviderStateCommitRequest,
 } from "./provider-state.js";
 import { SetupOrchestrator, type StartupSetupResult } from "./setup.js";
-import { PrivateStore } from "./private-store.js";
+import { PrivateStore, type PrivateDirectoryClaim } from "./private-store.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -652,10 +652,24 @@ class DefaultProviderRuntime implements ProviderRuntime {
     return this.orchestrator.ensureRunnableRoute();
   }
 
-  async transitionModel(modelId: string, canonicalModelId?: string): Promise<void> {
+  async runModelCatalog<T>(
+    run: () => Promise<T>,
+    surface?: SetupSurface | "plain" | "fullscreen",
+  ): Promise<T> {
+    return this.runWithReadyRoute(() => run(), surface);
+  }
+
+  async transitionModel(
+    modelId: string,
+    canonicalModelId?: string,
+    surface?: SetupSurface | "plain" | "fullscreen",
+  ): Promise<void> {
     const current = this.ensureRunnableRoute();
     const resolved = canonicalModelId === undefined
-      ? await resolveMainModelCandidate(this.openRouter, modelId)
+      ? await this.runModelCatalog(
+          () => resolveMainModelCandidate(this.openRouter, modelId),
+          surface,
+        )
       : null;
     const selectedCanonicalModelId = canonicalModelId
       ?? resolved?.canonicalSlug
@@ -679,6 +693,7 @@ class DefaultProviderRuntime implements ProviderRuntime {
     const result = await this.orchestrator.activateCandidate({
       expectedRevision: state.revision,
       candidate,
+      expectedRequestedModelId: modelId,
       selectedCanonicalModelId,
       signal: new AbortController().signal,
       persistence: this.#sessionRoute
@@ -750,9 +765,264 @@ async function loadCredentialReferenceForStartup(
   }
 }
 
+const PROVIDER_FORGET_JOURNAL_DIRECTORY = "provider-forget-v1";
+
+type ProviderCredentialForgetTarget =
+  | { kind: "versioned"; slot: CredentialSlotRef }
+  | { kind: "legacy" };
+
+interface ProviderCredentialForgetManifestV1 {
+  version: 1;
+  phase: "prepared" | "credential-deleted";
+  connectionId: string | null;
+  target: ProviderCredentialForgetTarget;
+}
+
+interface ProviderCredentialForgetTransaction {
+  claim: PrivateDirectoryClaim;
+  rawManifest: string;
+  manifest: ProviderCredentialForgetManifestV1;
+}
+
+export class ProviderCredentialForgetJournal {
+  readonly #path: string;
+
+  constructor(private readonly input: {
+    appHome: string;
+    privateStore: PrivateStore;
+  }) {
+    this.#path = join(input.appHome, PROVIDER_FORGET_JOURNAL_DIRECTORY);
+  }
+
+  async begin(input: {
+    connectionId: string | null;
+    target: ProviderCredentialForgetTarget;
+  }): Promise<ProviderCredentialForgetTransaction> {
+    const manifest = validateProviderForgetManifest({
+      version: 1,
+      phase: "prepared",
+      connectionId: input.connectionId,
+      target: input.target,
+    });
+    const acquired = await this.input.privateStore.createDirectoryExclusive(this.#path);
+    if (!acquired) {
+      const existing = await this.resume();
+      if (
+        existing
+        && existing.manifest.connectionId === manifest.connectionId
+        && sameProviderForgetTarget(existing.manifest.target, manifest.target)
+      ) {
+        return existing;
+      }
+      throw new Error("Provider credential cleanup is already pending.");
+    }
+    const transaction: ProviderCredentialForgetTransaction = {
+      claim: acquired,
+      rawManifest: "",
+      manifest,
+    };
+    await this.#write(transaction, manifest);
+    return transaction;
+  }
+
+  async resume(): Promise<ProviderCredentialForgetTransaction | null> {
+    const acquired = await this.input.privateStore.createDirectoryExclusive(this.#path);
+    if (acquired) {
+      await this.input.privateStore.releaseDirectoryClaim(acquired, null);
+      return null;
+    }
+    const adopted = await this.input.privateStore.adoptDirectoryClaim(this.#path);
+    let rawManifest: string;
+    try {
+      rawManifest = await this.input.privateStore.readClaimManifest(adopted.claim);
+    } catch {
+      try {
+        await this.input.privateStore.releaseDirectoryClaim(adopted.claim, null);
+        return null;
+      } catch {
+        throw new Error("Provider credential cleanup journal is invalid.");
+      }
+    }
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(rawManifest);
+    } catch {
+      throw new Error("Provider credential cleanup journal is invalid.");
+    }
+    return {
+      claim: adopted.claim,
+      rawManifest,
+      manifest: validateProviderForgetManifest(parsed),
+    };
+  }
+
+  async markDeleted(transaction: ProviderCredentialForgetTransaction): Promise<void> {
+    if (transaction.manifest.phase === "credential-deleted") return;
+    await this.#write(transaction, {
+      ...transaction.manifest,
+      phase: "credential-deleted",
+    });
+  }
+
+  async complete(transaction: ProviderCredentialForgetTransaction): Promise<void> {
+    await this.input.privateStore.removeClaimManifest(
+      transaction.claim,
+      transaction.rawManifest,
+    );
+    await this.input.privateStore.releaseDirectoryClaim(transaction.claim, null);
+  }
+
+  async readPending(): Promise<{
+    phase: ProviderCredentialForgetManifestV1["phase"];
+    target: ProviderCredentialForgetTarget;
+  } | null> {
+    const pending = await this.resume();
+    return pending
+      ? {
+          phase: pending.manifest.phase,
+          target: structuredClone(pending.manifest.target),
+        }
+      : null;
+  }
+
+  async #write(
+    transaction: ProviderCredentialForgetTransaction,
+    manifest: ProviderCredentialForgetManifestV1,
+  ): Promise<void> {
+    const validated = validateProviderForgetManifest(manifest);
+    const serialized = `${JSON.stringify(validated)}\n`;
+    await this.input.privateStore.writeClaimManifest(
+      transaction.claim,
+      serialized,
+      transaction.rawManifest || null,
+    );
+    const readback = await this.input.privateStore.readClaimManifest(transaction.claim);
+    if (readback !== serialized) {
+      throw new Error("Provider credential cleanup journal readback failed.");
+    }
+    transaction.rawManifest = readback;
+    transaction.manifest = validated;
+  }
+}
+
+function validateProviderForgetManifest(value: unknown): ProviderCredentialForgetManifestV1 {
+  if (!isRecord(value)) throw new Error("Provider credential cleanup journal is invalid.");
+  const keys = Object.keys(value).sort();
+  if (keys.join(",") !== "connectionId,phase,target,version"
+    || value.version !== 1
+    || (value.phase !== "prepared" && value.phase !== "credential-deleted")
+    || (value.connectionId !== null
+      && (typeof value.connectionId !== "string"
+        || value.connectionId.length === 0
+        || value.connectionId.length > 512))
+    || !isRecord(value.target)) {
+    throw new Error("Provider credential cleanup journal is invalid.");
+  }
+  let target: ProviderCredentialForgetTarget;
+  if (value.target.kind === "legacy" && Object.keys(value.target).join(",") === "kind") {
+    target = { kind: "legacy" };
+  } else if (
+    value.target.kind === "versioned"
+    && Object.keys(value.target).sort().join(",") === "kind,slot"
+    && isRecord(value.target.slot)
+    && Object.keys(value.target.slot).sort().join(",") === "id,kind,version"
+    && value.target.slot.version === 1
+    && value.target.slot.kind === "inference"
+    && typeof value.target.slot.id === "string"
+    && /^v1:inference:[0-9a-f-]{36}$/.test(value.target.slot.id)
+  ) {
+    target = {
+      kind: "versioned",
+      slot: { version: 1, kind: "inference", id: value.target.slot.id },
+    };
+  } else {
+    throw new Error("Provider credential cleanup journal is invalid.");
+  }
+  return {
+    version: 1,
+    phase: value.phase,
+    connectionId: value.connectionId,
+    target,
+  };
+}
+
+function sameProviderForgetTarget(
+  left: ProviderCredentialForgetTarget,
+  right: ProviderCredentialForgetTarget,
+): boolean {
+  return left.kind === right.kind
+    && (left.kind === "legacy"
+      || (right.kind === "versioned" && left.slot.id === right.slot.id));
+}
+
+export async function recoverProviderCredentialForget(input: {
+  journal: ProviderCredentialForgetJournal;
+  stateStore: ProviderStateStore;
+  credentials: {
+    delete?(kind: CredentialKind): Promise<boolean>;
+    deleteSlot(slot: CredentialSlotRef): Promise<boolean>;
+  };
+  onStatePublished?(state: ProviderSetupStateV1): void;
+}): Promise<{ cleanupPending: boolean }> {
+  try {
+    const transaction = await input.journal.resume();
+    if (!transaction) return { cleanupPending: false };
+    const { connectionId, target } = transaction.manifest;
+    let state = input.stateStore.read();
+    const connection = connectionId === null
+      ? undefined
+      : state.connections.find((candidate) => candidate.id === connectionId);
+    if (connection) {
+      const targetMatches = target.kind === "versioned"
+        ? connection.credentialSlot === target.slot.id
+        : !connection.credentialSlot || connection.credentialSlot === "legacy:inference";
+      if (!targetMatches || connection.backendId !== "openrouter") {
+        return { cleanupPending: true };
+      }
+      if (state.defaultRoute !== null || state.cross.enabled) {
+        state = await input.stateStore.commit(state.revision, (current) => ({
+          ...current,
+          lifecycle: "configured",
+          connections: current.connections,
+          defaultRoute: null,
+          cross: { enabled: false, preferredLead: null, preferredChallenger: null },
+        }));
+        input.onStatePublished?.(state);
+      }
+    } else if (state.defaultRoute !== null) {
+      return { cleanupPending: true };
+    }
+
+    if (target.kind === "versioned") {
+      await input.credentials.deleteSlot(target.slot);
+    } else if (input.credentials.delete) {
+      await input.credentials.delete("inference");
+    } else {
+      return { cleanupPending: true };
+    }
+    await input.journal.markDeleted(transaction);
+
+    state = input.stateStore.read();
+    if (connectionId !== null && state.connections.some((candidate) => candidate.id === connectionId)) {
+      state = await input.stateStore.commit(state.revision, (current) => ({
+        ...current,
+        lifecycle: "configured",
+        connections: current.connections.filter((candidate) => candidate.id !== connectionId),
+        defaultRoute: null,
+        cross: { enabled: false, preferredLead: null, preferredChallenger: null },
+      }));
+      input.onStatePublished?.(state);
+    }
+    await input.journal.complete(transaction);
+    return { cleanupPending: false };
+  } catch {
+    return { cleanupPending: true };
+  }
+}
+
 export async function recoverProviderCredentialBinding(input: {
   stateStore: ProviderStateStore;
-  recover(): Promise<void>;
+  recover(): Promise<void | { cleanupPending: boolean }>;
   readCredential(
     reference: "legacy:inference" | CredentialSlotRef,
   ): Promise<StoredCredentialStartupState>;
@@ -762,12 +1032,15 @@ export async function recoverProviderCredentialBinding(input: {
   stored: { kind: "absent" } | { kind: "present"; value: string };
   environment: string | null;
 }> {
-  await input.recover();
+  const recovery = await input.recover();
   const reference = credentialSlotFromState(input.stateStore.read());
   const selected = providerServiceStartupCredential(
     await input.readCredential(reference),
     input.environmentCredential,
   );
+  if (recovery?.cleanupPending) {
+    return { reference, stored: { kind: "absent" }, environment: null };
+  }
   return { reference, ...selected };
 }
 
@@ -807,7 +1080,12 @@ export function createProviderCredentialController(input: {
   };
   runtimeGuard: ProviderActivationRuntimeGuard;
   activationCoordinator: Pick<ProviderActivationCoordinator, "activate">;
+  forgetJournal?: Pick<
+    ProviderCredentialForgetJournal,
+    "begin" | "markDeleted" | "complete"
+  >;
   getInferenceRoute?(): RouteIdentityV1;
+  onInferenceStatePublished?(state: ProviderSetupStateV1): void;
   onInferenceReady?(route: RouteIdentityV1, persisted: boolean, candidate: string): void;
   onInferenceForgotten?(): void;
 }): ProviderCredentialIntentPort {
@@ -829,6 +1107,7 @@ export function createProviderCredentialController(input: {
         const result = await input.activationCoordinator.activate({
           expectedRevision: state.revision,
           candidate,
+          expectedRequestedModelId: route.requestedModelId,
           selectedCanonicalModelId: route.canonicalModelId!,
           generation: state.connections.find((connection) => connection.enabled)?.lastHealth?.generation ?? 0,
           signal: new AbortController().signal,
@@ -851,41 +1130,68 @@ export function createProviderCredentialController(input: {
       try {
         await lease.assertHeld();
         if (intent.credentialKind === "inference") {
-          const state = input.stateStore.read();
-          const connection = state.connections.find((candidate) =>
-            candidate.backendId === "openrouter" && candidate.enabled
-          );
-          const retiring = await input.stateStore.commit(state.revision, (current) => ({
-            ...current,
-            lifecycle: "configured",
-            // Retain the exact pointer until deletion is confirmed. A crash
-            // after this publication can therefore retry the same versioned
-            // slot instead of falling back to the legacy credential.
-            connections: current.connections,
-            defaultRoute: null,
-            cross: { enabled: false, preferredLead: null, preferredChallenger: null },
-          }));
-          let removed = false;
-          if (connection?.credentialSlot?.startsWith("v1:inference:")) {
-            removed = await input.credentials.deleteSlot({
-              version: 1,
-              kind: "inference",
-              id: connection.credentialSlot,
-            });
-          } else if (input.credentials.delete) {
-            removed = await input.credentials.delete("inference");
+          try {
+            const state = input.stateStore.read();
+            const connection = state.connections.find((candidate) =>
+              candidate.backendId === "openrouter" && candidate.enabled
+            );
+            const target: ProviderCredentialForgetTarget =
+              connection?.credentialSlot?.startsWith("v1:inference:")
+                ? {
+                    kind: "versioned",
+                    slot: {
+                      version: 1,
+                      kind: "inference",
+                      id: connection.credentialSlot,
+                    },
+                  }
+                : { kind: "legacy" };
+            const forgetTransaction = input.forgetJournal
+              ? await input.forgetJournal.begin({
+                  connectionId: connection?.id ?? null,
+                  target,
+                })
+              : null;
+            const retiring = await input.stateStore.commit(state.revision, (current) => ({
+              ...current,
+              lifecycle: "configured",
+              // Retain the exact pointer until deletion is confirmed. A crash
+              // after this publication can therefore retry the same versioned
+              // slot instead of falling back to the legacy credential.
+              connections: current.connections,
+              defaultRoute: null,
+              cross: { enabled: false, preferredLead: null, preferredChallenger: null },
+            }));
+            input.onInferenceStatePublished?.(retiring);
+            let removed = false;
+            if (target.kind === "versioned") {
+              removed = await input.credentials.deleteSlot(target.slot);
+            } else if (input.credentials.delete) {
+              removed = await input.credentials.delete("inference");
+            }
+            if (forgetTransaction) {
+              await input.forgetJournal!.markDeleted(forgetTransaction);
+            }
+            const forgotten = await input.stateStore.commit(retiring.revision, (current) => ({
+              ...current,
+              lifecycle: "configured",
+              connections: current.connections.filter((candidate) => candidate.id !== connection?.id),
+              defaultRoute: null,
+              cross: { enabled: false, preferredLead: null, preferredChallenger: null },
+            }));
+            input.onInferenceStatePublished?.(forgotten);
+            if (forgetTransaction) {
+              await input.forgetJournal!.complete(forgetTransaction);
+            }
+            input.openRouter.forgetKey();
+            input.onInferenceForgotten?.();
+            await lease.assertHeld();
+            return { kind: "forgotten", credentialKind: "inference", removed };
+          } catch {
+            throw new Error(
+              "Provider credential cleanup is pending and will resume on restart.",
+            );
           }
-          await input.stateStore.commit(retiring.revision, (current) => ({
-            ...current,
-            lifecycle: "configured",
-            connections: current.connections.filter((candidate) => candidate.id !== connection?.id),
-            defaultRoute: null,
-            cross: { enabled: false, preferredLead: null, preferredChallenger: null },
-          }));
-          input.openRouter.forgetKey();
-          input.onInferenceForgotten?.();
-          await lease.assertHeld();
-          return { kind: "forgotten", credentialKind: "inference", removed };
         }
 
         if (intent.kind === "forget") {
@@ -1128,6 +1434,10 @@ export async function createDefaultProviderRuntime(
   });
   const runtimeGuard = new SessionProviderRuntimeGuard();
   const privateStore = new PrivateStore({ root: startup.appHome });
+  const forgetJournal = new ProviderCredentialForgetJournal({
+    appHome: startup.appHome,
+    privateStore,
+  });
 
   // Recovery must own the authoritative provider pointer before the active
   // service derives its credential. This adapter is recovery-only: committed
@@ -1163,6 +1473,14 @@ export async function createDefaultProviderRuntime(
       await recoveryCoordinator.recover({
         signal: new AbortController().signal,
         inspectCommitted: true,
+      });
+      return recoverProviderCredentialForget({
+        journal: forgetJournal,
+        stateStore,
+        credentials,
+        onStatePublished: (state) => {
+          startup.config.providerSetup = requirePersistableProviderState(state);
+        },
       });
     },
     readCredential: (reference) => loadCredentialReferenceForStartup(credentials, reference),
@@ -1214,12 +1532,16 @@ export async function createDefaultProviderRuntime(
     credentials,
     runtimeGuard,
     activationCoordinator,
+    forgetJournal,
     getInferenceRoute: () => {
       if (!runtimeOwner) throw new ProviderSetupRequiredError();
       return runtimeOwner.ensureRunnableRoute();
     },
     onInferenceReady: (route, persisted, candidate) => {
       runtimeOwner?.adoptCredentialActivation(route, persisted, candidate);
+    },
+    onInferenceStatePublished: (state) => {
+      startup.config.providerSetup = requirePersistableProviderState(state);
     },
     onInferenceForgotten: () => runtimeOwner?.adoptCredentialForget(),
   });
@@ -1498,6 +1820,7 @@ export async function runCli(
     credentials: providerRuntime.credentials,
     providerCredentials: providerRuntime.providerCredentials,
     providerRoutes: providerRuntime,
+    providerRouteSurface: "plain",
     localRuntime,
     out,
     ruleStore,
@@ -1536,6 +1859,7 @@ interface RuntimeContext {
   localRuntime: CommandLocalRuntime;
   providerCredentials: ProviderCredentialIntentPort;
   providerRoutes: ProviderRouteIntentPort;
+  providerRouteSurface: SetupSurface | "plain" | "fullscreen";
   providerRuntime: ProviderRuntime;
   credentials: CredentialStore;
   out: CommandOutput;
@@ -1954,6 +2278,7 @@ async function runDashboard(
   ui.start();
   try {
     const setupSurface = createTuiSetupSurface(ui);
+    context.providerRouteSurface = setupSurface;
     if (context.setupRequired) {
       const setup = await context.providerRuntime.runSetup(setupSurface);
       if (setup.kind === "ready") {
@@ -2118,7 +2443,11 @@ async function runDashboard(
 
           if (completedCommand === "model" && commandArgs.length === 0) {
             context.agent = await context.ensureAgentForPrompt(setupSurface);
-            const selected = await pickDashboardModel(ui, context as RuntimeContext);
+            const selected = await pickDashboardModel(
+              ui,
+              context as RuntimeContext,
+              setupSurface,
+            );
             if (selected) {
               context.session.setPreferences(
                 context.config.mainModel,
@@ -2591,7 +2920,11 @@ async function pickDashboardChat(
       context.session.appHome,
     );
     if (next.data.model && next.data.model !== context.config.mainModel) {
-      await context.providerRuntime.transitionModel(next.data.model);
+      await context.providerRuntime.transitionModel(
+        next.data.model,
+        undefined,
+        context.providerRouteSurface,
+      );
     }
     if (next.data.model) {
       context.config.mainModel = next.data.model;
@@ -3259,6 +3592,7 @@ export async function initializeDashboardKey(
 export async function pickDashboardModel(
   ui: TerminalUi,
   context: RuntimeContext,
+  setupSurface?: SetupSurface,
 ): Promise<ModelInfo | null> {
   const controller = new AbortController();
   ui.setStatus("Tool-fähige OpenRouter-Modelle werden geladen");
@@ -3267,8 +3601,11 @@ export async function pickDashboardModel(
   });
   let models: ModelInfo[];
   try {
+    const loadModels = () => context.openRouter.listModels("", false, controller.signal);
     models = mainModelCandidates(
-      await context.openRouter.listModels("", false, controller.signal),
+      context.providerRuntime?.runModelCatalog
+        ? await context.providerRuntime.runModelCatalog(loadModels, setupSurface)
+        : await loadModels(),
     );
   } finally {
     ui.setCancelHandler();
@@ -3283,6 +3620,7 @@ export async function pickDashboardModel(
   await context.providerRuntime?.transitionModel(
     selected.id,
     selected.canonicalSlug ?? selected.id,
+    setupSurface,
   );
   context.config.mainModel = selected.id;
   await saveConfig(context.config, context.configPath);

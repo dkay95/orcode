@@ -371,6 +371,7 @@ async function activationFixture(options: ActivationFixtureOptions = {}) {
   const request = {
     expectedRevision: oldState.revision,
     candidate: NEW_SECRET,
+    expectedRequestedModelId: MODEL.requestedModelId,
     selectedCanonicalModelId: MODEL.canonicalModelId,
     generation: 4,
     signal: new AbortController().signal,
@@ -417,6 +418,61 @@ async function activationFixture(options: ActivationFixtureOptions = {}) {
     }),
     coordinator: () => coordinator,
   };
+}
+
+for (const persistence of ["persisted", "process-only"] as const) {
+  test(`${persistence} activation rejects a reordered duplicate canonical alias before route, slot, or config mutation`, async () => {
+    const fixture = await activationFixture();
+    const selected = {
+      ...MODEL,
+      requestedModelId: "openai/selected-alias",
+    };
+    const reordered = {
+      ...MODEL,
+      requestedModelId: "openai/reordered-alias",
+    };
+    const duplicate = {
+      ...MODEL,
+      requestedModelId: "openai/duplicate-alias",
+    };
+    fixture.adapter.listModels = async () => [reordered, duplicate];
+    fixture.adapter.activate = async (request) => ({
+      candidateId: request.candidateId,
+      backendId: "openrouter",
+      connectionId: CONNECTION_ID,
+      accountFingerprint: NEW_FINGERPRINT,
+      billingRealm: "openrouter-payg",
+      route: {
+        ...newRoute(),
+        requestedModelId: request.model.requestedModelId,
+        canonicalModelId: request.model.canonicalModelId,
+      },
+    });
+    const configBefore = await readFile(fixture.path, "utf8");
+    const stateBefore = fixture.stateStore.read();
+    const slotsBefore = new Map(fixture.credentials.slots);
+    const runtimeBefore = structuredClone(fixture.adapter.runtimeRoute);
+
+    await assert.rejects(
+      fixture.coordinator().activate({
+        ...fixture.request,
+        expectedRequestedModelId: selected.requestedModelId,
+        selectedCanonicalModelId: selected.canonicalModelId,
+        persistence,
+      }),
+      (error: unknown) => (
+        typeof error === "object"
+        && error !== null
+        && "code" in error
+        && error.code === "provider-model-selection-invalid"
+      ),
+    );
+
+    assert.equal(await readFile(fixture.path, "utf8"), configBefore);
+    assert.deepEqual(fixture.stateStore.read(), stateBefore);
+    assert.deepEqual(fixture.credentials.slots, slotsBefore);
+    assert.deepEqual(fixture.adapter.runtimeRoute, runtimeBefore);
+  });
 }
 
 for (const boundary of boundaries) {

@@ -98,6 +98,7 @@ export interface ProviderActivationRuntimeGuard {
 export interface ProviderActivationRequest {
   expectedRevision: number;
   candidate: string;
+  expectedRequestedModelId: string;
   selectedCanonicalModelId: string;
   generation: number;
   signal: AbortSignal;
@@ -276,7 +277,11 @@ export class ProviderActivationCoordinator {
       await this.#boundary("candidate-validated");
       const models = await this.#listModels(candidate.candidateId, request.signal);
       await this.#boundary("models-loaded");
-      const selectedModel = selectExplicitModel(models, request.selectedCanonicalModelId);
+      const selectedModel = selectExplicitModel(
+        models,
+        request.expectedRequestedModelId,
+        request.selectedCanonicalModelId,
+      );
       const candidateRoute = routeForCandidate(candidate, selectedModel);
       await this.#boundary("model-selected");
 
@@ -1288,10 +1293,12 @@ function routeForCandidate(
 
 function selectExplicitModel(
   models: readonly BackendModelDescriptor[],
+  requestedModelId: string,
   canonicalModelId: string,
 ): BackendModelDescriptor {
   const selected = models.find((model) =>
     model.backendId === "openrouter"
+    && model.requestedModelId === requestedModelId
     && model.canonicalModelId === canonicalModelId
     && model.capabilities.textInput
     && model.capabilities.textOutput

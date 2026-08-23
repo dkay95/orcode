@@ -13,7 +13,8 @@ import {
 } from "../src/commands.js";
 import { DEFAULT_CONFIG } from "../src/config.js";
 import type { CredentialStoreLike } from "../src/credentials.js";
-import { OpenRouterService } from "../src/openrouter.js";
+import { executeProviderModelAction } from "../src/cli.js";
+import { OpenRouterHttpError, OpenRouterService } from "../src/openrouter.js";
 import { createRunId, RunLog } from "../src/runlog.js";
 import { RuleStore, rulesPath, shellApprovalSubject } from "../src/rules.js";
 import { SessionStore } from "../src/session.js";
@@ -350,6 +351,69 @@ test("/model proves the selected route before mutating config or session prefere
   assert.deepEqual(transitions, ["vendor/b"]);
   assert.equal(context.config.mainModel, "vendor/b");
   assert.equal(context.session.data.model, "vendor/b");
+});
+
+test("/model catalog authentication rejection uses shared recovery before activation or preference bytes", async () => {
+  const { context } = await harness();
+  context.config.mainModel = "vendor/a";
+  context.session.setPreferences("vendor/a", { mode: "auto" });
+  const configBefore = structuredClone(context.config);
+  const sessionBefore = structuredClone(context.session.data);
+  const calls: string[] = [];
+  const rejected = new OpenRouterHttpError(401, "raw private catalog response");
+  context.openRouter.listModels = async () => {
+    calls.push("catalog");
+    throw rejected;
+  };
+  (context as CommandContext & {
+    providerRoutes: {
+      runModelCatalog<T>(run: () => Promise<T>): Promise<T>;
+      transitionModel(modelId: string): Promise<void>;
+    };
+  }).providerRoutes = {
+    runModelCatalog: (run) => executeProviderModelAction({
+        ensureRunnableRoute() {
+          calls.push("route:ensure");
+          return {
+            version: 1,
+            backendId: "openrouter",
+            accountFingerprint: "acct_fixture",
+            billingRealm: "openrouter-payg",
+            requestedModelId: "vendor/a",
+            canonicalModelId: "vendor/a",
+            resolutionState: "resolved",
+          };
+        },
+        beginRun() {
+          calls.push("run:begin");
+          return () => calls.push("run:release");
+        },
+        run,
+        isAuthenticationFailure: (error) => error === rejected,
+        async invalidateAndInspect() { calls.push("route:invalidate+inspect"); },
+        async runSetup() {
+          calls.push("setup:plain");
+          return { kind: "cancelled" };
+        },
+        surface: "plain",
+      }),
+    async transitionModel() {
+      calls.push("activation");
+    },
+  };
+
+  await assert.rejects(handleSlashCommand("/model vendor/b", context), (error) => error === rejected);
+
+  assert.deepEqual(calls, [
+    "route:ensure",
+    "run:begin",
+    "catalog",
+    "run:release",
+    "route:invalidate+inspect",
+    "setup:plain",
+  ]);
+  assert.deepEqual(context.config, configBefore);
+  assert.deepEqual(context.session.data, sessionBefore);
 });
 
 test("opening a chat with another saved model rejects before config or active-session mutation without route proof", async () => {

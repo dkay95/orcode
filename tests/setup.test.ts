@@ -1194,6 +1194,7 @@ test("candidate activation delegates once and emits only privacy-safe normalized
   const result = await fixture.orchestrator.activateCandidate({
     expectedRevision: 0,
     candidate: secret,
+    expectedRequestedModelId: "vendor/chosen",
     selectedCanonicalModelId: "vendor/canonical",
     signal: new AbortController().signal,
     persistence: "persisted",
@@ -1238,6 +1239,7 @@ test("concurrent candidate activations are serialized before coordinator commit"
   const activationRequest = {
     expectedRevision: 0,
     candidate: "sk-or-v1-private-candidate",
+    expectedRequestedModelId: activatedRoute.requestedModelId,
     selectedCanonicalModelId: "vendor/canonical",
     signal: new AbortController().signal,
     persistence: "persisted" as const,
@@ -1288,6 +1290,7 @@ test("new inspection generation waits for an in-flight activation before taking 
   const activation = fixture.orchestrator.activateCandidate({
     expectedRevision: 0,
     candidate: "sk-or-v1-private-candidate",
+    expectedRequestedModelId: `vendor/${primary.id}`,
     selectedCanonicalModelId: "vendor/canonical",
     signal: new AbortController().signal,
     persistence: "persisted",
@@ -1585,6 +1588,7 @@ test("back-to-back generations register ownership before an activation wait", as
   const activation = fixture.orchestrator.activateCandidate({
     expectedRevision: 0,
     candidate: "candidate-generation-gate",
+    expectedRequestedModelId: activatedRoute.requestedModelId,
     selectedCanonicalModelId: activatedRoute.canonicalModelId!,
     signal: new AbortController().signal,
     persistence: "persisted",
@@ -1868,6 +1872,7 @@ test("candidate activation event reconstructs only the exact safe route schema",
   await fixture.orchestrator.activateCandidate({
     expectedRevision: 0,
     candidate: "candidate-safe-route-event",
+    expectedRequestedModelId: "vendor/chosen",
     selectedCanonicalModelId: "vendor/canonical",
     signal: new AbortController().signal,
     persistence: "persisted",

@@ -75,6 +75,7 @@ import {
   type PanelResult,
 } from "./panel.js";
 import { renderPanel } from "./ui/panel-view.js";
+import type { SetupSurface } from "./setup-ui.js";
 import { renderLines } from "./ui/compose.js";
 import { createTheme } from "./ui/theme.js";
 import {
@@ -101,7 +102,7 @@ import {
   validateReasoningSetting,
 } from "./reasoning.js";
 import { suggestVerifyCommands } from "./verify.js";
-import { errorMessage, hasCode, truncate } from "./utils.js";
+import { errorMessage, hasCode, isRecord, truncate } from "./utils.js";
 import { ProcessEventRedactor } from "./redaction.js";
 
 /** Sink for command output — replaces the direct `console.log`/`console.error` calls. */
@@ -132,7 +133,15 @@ export interface ProviderCredentialIntentPort {
 }
 
 export interface ProviderRouteIntentPort {
-  transitionModel(modelId: string, canonicalModelId?: string): Promise<void>;
+  runModelCatalog?<T>(
+    run: () => Promise<T>,
+    surface?: SetupSurface | "plain" | "fullscreen",
+  ): Promise<T>;
+  transitionModel(
+    modelId: string,
+    canonicalModelId?: string,
+    surface?: SetupSurface | "plain" | "fullscreen",
+  ): Promise<void>;
 }
 
 export interface CommandLocalRuntime {
@@ -152,6 +161,7 @@ export interface CommandContext<Agent extends OrcodeAgent | null = OrcodeAgent> 
   providerCredentials?: ProviderCredentialIntentPort;
   /** Shared provider runtime seam for route-changing model/session commands. */
   providerRoutes?: ProviderRouteIntentPort;
+  providerRouteSurface?: SetupSurface | "plain" | "fullscreen";
   workspace: string;
   credentials: CredentialStoreLike;
   out: CommandOutput;
@@ -1022,7 +1032,7 @@ async function modelCommand(args: string[], context: CommandContext): Promise<vo
   const id = args.join(" ").trim();
   if (!id) {
     const models = mainModelCandidates(
-      await context.openRouter.listModels("", false),
+      await runTransitionCatalog(context, () => context.openRouter.listModels("", false)),
     );
     const selected = await pickModel(models, context.config.mainModel);
     await selectModel(selected, context);
@@ -1040,12 +1050,15 @@ async function modelCommand(args: string[], context: CommandContext): Promise<vo
     }
     return;
   }
-  const exact = await resolveMainModelCandidate(context.openRouter, id);
+  const exact = await runTransitionCatalog(
+    context,
+    () => resolveMainModelCandidate(context.openRouter, id),
+  );
   if (exact) {
     await selectModel(exact, context);
     return;
   }
-  await context.providerRoutes?.transitionModel(id, id);
+  await context.providerRoutes?.transitionModel(id, id, context.providerRouteSurface);
   context.config.mainModel = id;
   context.session.setPreferences(
     context.config.mainModel,
@@ -1054,6 +1067,15 @@ async function modelCommand(args: string[], context: CommandContext): Promise<vo
   await saveContextConfig(context);
   await context.session.save();
   context.out.text(chalk.green(`Main-Modell: ${id}`));
+}
+
+function runTransitionCatalog<T>(
+  context: CommandContext,
+  run: () => Promise<T>,
+): Promise<T> {
+  return context.providerRoutes?.runModelCatalog
+    ? context.providerRoutes.runModelCatalog(run, context.providerRouteSurface)
+    : run();
 }
 
 async function modelsCommand(args: string[], context: CommandContext): Promise<void> {
@@ -1805,7 +1827,11 @@ async function replaceSession(
     await saveSessionPreferences(context);
   }
   if (next.data.model && next.data.model !== context.config.mainModel) {
-    await context.providerRoutes?.transitionModel(next.data.model);
+    await context.providerRoutes?.transitionModel(
+      next.data.model,
+      undefined,
+      context.providerRouteSurface,
+    );
   }
   context.session = next;
   if (next.data.model) {
@@ -2533,6 +2559,7 @@ async function selectModel(
   await context.providerRoutes?.transitionModel(
     model.id,
     model.canonicalSlug ?? model.id,
+    context.providerRouteSurface,
   );
   context.config.mainModel = model.id;
   context.session.setPreferences(
@@ -2811,10 +2838,12 @@ function escapeRegExp(value: string): string {
  * separate states and never authorize deleting a saved key.
  */
 export function shouldReplaceCredential(
-  _error: unknown,
+  error: unknown,
   openRouter?: OpenRouterService,
 ): boolean {
-  return openRouter?.runtimeState.inferenceValidity === "rejected";
+  return error instanceof PanelAuthenticationRejectedError
+    || (isRecord(error) && error.code === "provider-authentication-rejected")
+    || openRouter?.runtimeState.inferenceValidity === "rejected";
 }
 
 /** A raw 401 is only meaningful inside the request that owns its scope. */

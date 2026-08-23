@@ -11,6 +11,7 @@ import {
   commandRequiresRunnableRoute,
   createCliPlainSetupSurface,
   createOpenRouterServiceForStartup,
+  executeProviderModelAction,
   homeWorkspaceWarning,
   initializeDashboardKey,
   parseArgs,
@@ -23,13 +24,19 @@ import {
 import * as cliModule from "../src/cli.js";
 import { createPlainSetupSurface } from "../src/setup-ui.js";
 import { COMMAND_CATALOG } from "../src/command-catalog.js";
-import { DEFAULT_CONFIG } from "../src/config.js";
-import { createPanelCall, OpenRouterService } from "../src/openrouter.js";
+import { shouldReplaceCredential } from "../src/commands.js";
+import { DEFAULT_CONFIG, saveConfig } from "../src/config.js";
+import { createPanelCall, OpenRouterHttpError, OpenRouterService } from "../src/openrouter.js";
 import { askPanel } from "../src/panel.js";
 import * as panelModule from "../src/panel.js";
 import { CredentialStore } from "../src/credentials.js";
 import type { CredentialSlotRef, CredentialStoreLike } from "../src/credentials.js";
-import { ProviderStateStore, type ProviderSetupStateV1 } from "../src/provider-state.js";
+import {
+  ProviderStateStore,
+  type ProviderSetupStateV1,
+  type ProviderStateCommitRequest,
+} from "../src/provider-state.js";
+import { PrivateStore } from "../src/private-store.js";
 import type { ModelInfo } from "../src/types.js";
 
 type BootstrapRuntimeDouble = {
@@ -352,6 +359,84 @@ test("dashboard model selection proves the new route before persisting the selec
   assert.equal(JSON.parse(await readFile(context.configPath, "utf8")).mainModel, "vendor/b");
 });
 
+test("dashboard model catalog authentication rejection releases the action lease and opens shared setup before picker or activation", async () => {
+  const pickDashboardModel = (cliModule as typeof cliModule & {
+    pickDashboardModel?: (
+      ui: Record<string, unknown>,
+      context: Record<string, unknown>,
+      surface?: unknown,
+    ) => Promise<ModelInfo | null>;
+  }).pickDashboardModel;
+  assert.equal(typeof pickDashboardModel, "function");
+  const config = structuredClone(DEFAULT_CONFIG);
+  config.mainModel = "vendor/a";
+  const configBefore = structuredClone(config);
+  const calls: string[] = [];
+  const rejected = new OpenRouterHttpError(401, "raw private dashboard catalog response");
+  const runtime = {
+    async runModelCatalog<T>(run: () => Promise<T>, surface?: unknown): Promise<T> {
+      assert.equal(surface, "dashboard-setup-surface");
+      return executeProviderModelAction({
+        ensureRunnableRoute() {
+          calls.push("route:ensure");
+          return bootstrapRoute("vendor/a") as never;
+        },
+        beginRun() {
+          calls.push("run:begin");
+          return () => calls.push("run:release");
+        },
+        run,
+        isAuthenticationFailure: (error) => error === rejected,
+        async invalidateAndInspect() { calls.push("route:invalidate+inspect"); },
+        async runSetup() {
+          calls.push("setup:dashboard");
+          return { kind: "cancelled" };
+        },
+        surface: "fullscreen",
+      });
+    },
+    async transitionModel() {
+      calls.push("activation");
+    },
+  };
+
+  await assert.rejects(
+    pickDashboardModel!(
+      {
+        setStatus() {},
+        setCancelHandler() {},
+        async pickModel() {
+          calls.push("picker");
+          return null;
+        },
+      },
+      {
+        config,
+        configPath: "/synthetic/must-not-write.json",
+        openRouter: {
+          async listModels() {
+            calls.push("catalog");
+            throw rejected;
+          },
+        },
+        providerRuntime: runtime,
+      },
+      "dashboard-setup-surface",
+    ),
+    (error) => error === rejected,
+  );
+
+  assert.deepEqual(calls, [
+    "route:ensure",
+    "run:begin",
+    "catalog",
+    "run:release",
+    "route:invalidate+inspect",
+    "setup:dashboard",
+  ]);
+  assert.deepEqual(config, configBefore);
+});
+
 test("plain setup cancellation keeps commands alive and the next model input reopens setup before agent creation", async () => {
   const calls: string[] = [];
   let setupCalls = 0;
@@ -487,7 +572,7 @@ test("a real panel authentication rejection settles every call then reaches shar
     runtimeState: { inferenceValidity: "rejected" },
     client() {
       calls.push("panel:model-call");
-      throw new Error(rawProviderBody);
+      throw new OpenRouterHttpError(401, rawProviderBody);
     },
     safeMessage() {
       return "fixed-safe-auth-error";
@@ -539,6 +624,101 @@ test("a real panel authentication rejection settles every call then reaches shar
     "route:invalidate+inspect",
     "setup:fullscreen",
   ]);
+});
+
+test("mixed delayed panel results recover from the request-local 401 even after a later success restores global validity", async () => {
+  const AuthenticationError = (panelModule as typeof panelModule & {
+    PanelAuthenticationRejectedError?: new (...args: never[]) => Error & {
+      partialResult?: { answers: Array<{ model: string; text: string; error: string | null }> };
+    };
+  }).PanelAuthenticationRejectedError;
+  assert.equal(typeof AuthenticationError, "function");
+  const calls: string[] = [];
+  let inferenceValidity: "unknown" | "valid" | "rejected" = "unknown";
+  const raw401 = "raw private panel 401 response";
+  const raw500 = "raw private panel 500 response";
+  const service = {
+    get runtimeState() {
+      return { inferenceValidity };
+    },
+    client() {
+      return {
+        callModel(request: { model: string }) {
+          return {
+            async getText() {
+              if (request.model === "vendor/auth") {
+                calls.push("panel:auth-settled");
+                inferenceValidity = "rejected";
+                throw new OpenRouterHttpError(401, raw401);
+              }
+              if (request.model === "vendor/success") {
+                await new Promise<void>((resolve) => setTimeout(resolve, 20));
+                calls.push("panel:success-settled");
+                inferenceValidity = "valid";
+                return "successful answer";
+              }
+              await new Promise<void>((resolve) => setTimeout(resolve, 10));
+              calls.push("panel:ordinary-failure-settled");
+              throw new OpenRouterHttpError(500, raw500);
+            },
+            async getResponse() {
+              return { usage: { cost: 0.002, inputTokens: 3, outputTokens: 4 } };
+            },
+          };
+        },
+      };
+    },
+    safeMessage(error: unknown) {
+      return error instanceof OpenRouterHttpError && error.status === 500
+        ? "fixed safe panel provider failure"
+        : "fixed safe panel authentication failure";
+    },
+  } as unknown as OpenRouterService;
+  let caught: InstanceType<NonNullable<typeof AuthenticationError>> | null = null;
+
+  await assert.rejects(
+    executeProviderModelAction({
+      ensureRunnableRoute() {
+        calls.push("route:ensure");
+        return bootstrapRoute("vendor/auth") as never;
+      },
+      beginRun() {
+        calls.push("run:begin");
+        return () => calls.push("run:release");
+      },
+      run: () => askPanel({
+        question: "same question",
+        models: ["vendor/auth", "vendor/success", "vendor/ordinary"],
+        callModel: createPanelCall(service),
+      }),
+      isAuthenticationFailure: (error) => shouldReplaceCredential(error, service),
+      async invalidateAndInspect() { calls.push("route:invalidate+inspect"); },
+      async runSetup() {
+        calls.push("setup:fullscreen");
+        return { kind: "cancelled" };
+      },
+      surface: "fullscreen",
+    }),
+    (error: unknown) => {
+      assert.ok(error instanceof AuthenticationError!);
+      caught = error;
+      return true;
+    },
+  );
+
+  assert.equal(inferenceValidity, "valid");
+  assert.equal(calls.filter((entry) => entry === "route:invalidate+inspect").length, 1);
+  assert.equal(calls.filter((entry) => entry === "setup:fullscreen").length, 1);
+  assert.ok(calls.indexOf("panel:success-settled") < calls.indexOf("run:release"));
+  assert.ok(calls.indexOf("panel:ordinary-failure-settled") < calls.indexOf("run:release"));
+  assert.ok(calls.indexOf("run:release") < calls.indexOf("route:invalidate+inspect"));
+  const answers = caught!.partialResult!.answers;
+  assert.equal(answers.find((answer) => answer.model === "vendor/success")?.text, "successful answer");
+  assert.equal(
+    answers.find((answer) => answer.model === "vendor/ordinary")?.error,
+    "fixed safe panel provider failure",
+  );
+  assert.doesNotMatch(JSON.stringify(caught), /raw private|panel 401|panel 500/i);
 });
 
 test("voice transcription executes inside the shared provider action and lets 401 recovery finish first", async () => {
@@ -1278,6 +1458,7 @@ test("saving a process-only environment route persists that exact route and vers
       async activate(request: Record<string, unknown>) {
         assert.equal(request.candidate, environmentKey);
         assert.equal(request.persistence, "persisted");
+        assert.equal(request.expectedRequestedModelId, route.requestedModelId);
         assert.equal(request.selectedCanonicalModelId, route.canonicalModelId);
         const next: ProviderSetupStateV1 = {
           schemaVersion: 1,
@@ -1383,7 +1564,11 @@ test("forget retry retains the exact versioned pointer across a crash before slo
   });
   await assert.rejects(
     first.apply({ kind: "forget", credentialKind: "inference" }),
-    /synthetic crash/,
+    (error: unknown) => {
+      assert.match(String(error), /Provider credential cleanup is pending/);
+      assert.doesNotMatch(String(error), /synthetic crash|v1:inference/);
+      return true;
+    },
   );
   assert.equal(durable.defaultRoute, null);
   assert.equal(durable.connections[0]?.credentialSlot, slotId);
@@ -1406,6 +1591,269 @@ test("forget retry retains the exact versioned pointer across a crash before slo
   assert.equal(durable.defaultRoute, null);
   assert.deepEqual(durable.connections, []);
   assert.equal(openRouter.hasKey, false);
+});
+
+test("failed pre-delete forget journals the exact target and synchronizes the first durable publication before unrelated config save", async () => {
+  const api = cliModule as typeof cliModule & {
+    ProviderCredentialForgetJournal?: new (input: {
+      appHome: string;
+      privateStore: PrivateStore;
+    }) => {
+      readPending(): Promise<{
+        phase: "prepared" | "credential-deleted";
+        target: { kind: "versioned"; slot: CredentialSlotRef } | { kind: "legacy" };
+      } | null>;
+    };
+    createProviderCredentialController?: (input: Record<string, unknown>) => {
+      apply(intent: Record<string, unknown>): Promise<Record<string, unknown>>;
+    };
+    persistProviderSetupState?: (
+      path: string,
+      request: ProviderStateCommitRequest,
+    ) => Promise<ProviderSetupStateV1>;
+  };
+  assert.equal(typeof api.ProviderCredentialForgetJournal, "function");
+  assert.equal(typeof api.createProviderCredentialController, "function");
+  const root = await mkdtemp(join(tmpdir(), "orcode-forget-journal-pre-delete-"));
+  const configPath = join(root, "config.json");
+  const slotId = "v1:inference:00000000-0000-4000-8000-000000000061";
+  const route = bootstrapRoute("vendor/main") as unknown as NonNullable<ProviderSetupStateV1["defaultRoute"]>;
+  const initial: ProviderSetupStateV1 = {
+    schemaVersion: 1,
+    revision: 0,
+    lifecycle: "configured",
+    connections: [{
+      id: "00000000-0000-4000-8000-000000000069",
+      backendId: "openrouter",
+      enabled: true,
+      maturity: "stable",
+      credentialSlot: slotId,
+      accountFingerprint: route.accountFingerprint,
+      accountFingerprintState: "verified",
+      billingRealm: "openrouter-payg",
+      lastHealth: null,
+    }],
+    defaultRoute: route,
+    cross: { enabled: false, preferredLead: null, preferredChallenger: null },
+  };
+  const config = structuredClone(DEFAULT_CONFIG);
+  config.providerSetup = structuredClone(initial);
+  await saveConfig(config, configPath);
+  let durable = structuredClone(initial);
+  const stateStore = new ProviderStateStore(initial, {
+    persist: async (request) => {
+      const next = await api.persistProviderSetupState!(configPath, request);
+      durable = structuredClone(next);
+      return structuredClone(next);
+    },
+  });
+  const journal = new api.ProviderCredentialForgetJournal!({
+    appHome: root,
+    privateStore: new PrivateStore({ root }),
+  });
+  const openRouter = new OpenRouterService(`${STARTUP_KEY_PREFIX}${"j".repeat(48)}`);
+  const controller = api.createProviderCredentialController!({
+    stateStore,
+    openRouter,
+    credentials: {
+      async deleteSlot(slot: CredentialSlotRef) {
+        assert.equal(slot.id, slotId);
+        throw new Error("synthetic delete unavailable");
+      },
+    },
+    runtimeGuard: {
+      async acquire() { return { assertHeld() {}, release() {} }; },
+    },
+    activationCoordinator: { async activate() { throw new Error("unused"); } },
+    forgetJournal: journal,
+    onInferenceStatePublished(state: ProviderSetupStateV1) {
+      config.providerSetup = structuredClone(state);
+    },
+  });
+
+  await assert.rejects(
+    controller.apply({ kind: "forget", credentialKind: "inference" }),
+    (error: unknown) => {
+      assert.match(String(error), /Provider credential cleanup is pending/);
+      assert.doesNotMatch(String(error), /synthetic delete unavailable|v1:inference|orcode-forget-journal/);
+      return true;
+    },
+  );
+  assert.deepEqual(config.providerSetup, durable);
+  assert.equal(
+    (JSON.parse(await readFile(configPath, "utf8")) as { providerSetup: ProviderSetupStateV1 })
+      .providerSetup.defaultRoute,
+    null,
+  );
+  await saveConfig(config, configPath);
+
+  const saved = JSON.parse(await readFile(configPath, "utf8")) as { providerSetup: ProviderSetupStateV1 };
+  assert.equal(saved.providerSetup.defaultRoute, null);
+  assert.equal(saved.providerSetup.connections[0]?.credentialSlot, slotId);
+  assert.deepEqual(saved.providerSetup, durable);
+  assert.deepEqual(await journal.readPending(), {
+    phase: "prepared",
+    target: {
+      kind: "versioned",
+      slot: { version: 1, kind: "inference", id: slotId },
+    },
+  });
+});
+
+test("post-delete forget crash blocks environment fallback until exact journal recovery completes", async () => {
+  const api = cliModule as typeof cliModule & {
+    ProviderCredentialForgetJournal?: new (input: {
+      appHome: string;
+      privateStore: PrivateStore;
+    }) => {
+      begin(...args: unknown[]): Promise<unknown>;
+      markDeleted(transaction: unknown): Promise<void>;
+      complete(transaction: unknown): Promise<void>;
+      readPending(): Promise<{
+        phase: "prepared" | "credential-deleted";
+        target: { kind: "versioned"; slot: CredentialSlotRef } | { kind: "legacy" };
+      } | null>;
+    };
+    createProviderCredentialController?: (input: Record<string, unknown>) => {
+      apply(intent: Record<string, unknown>): Promise<Record<string, unknown>>;
+    };
+    recoverProviderCredentialForget?: (input: Record<string, unknown>) => Promise<{
+      cleanupPending: boolean;
+    }>;
+  };
+  assert.equal(typeof api.ProviderCredentialForgetJournal, "function");
+  assert.equal(typeof api.recoverProviderCredentialForget, "function");
+  const root = await mkdtemp(join(tmpdir(), "orcode-forget-journal-post-delete-"));
+  const slotId = "v1:inference:00000000-0000-4000-8000-000000000071";
+  const route = bootstrapRoute("vendor/main") as unknown as NonNullable<ProviderSetupStateV1["defaultRoute"]>;
+  const initial: ProviderSetupStateV1 = {
+    schemaVersion: 1,
+    revision: 0,
+    lifecycle: "configured",
+    connections: [{
+      id: "00000000-0000-4000-8000-000000000079",
+      backendId: "openrouter",
+      enabled: true,
+      maturity: "stable",
+      credentialSlot: slotId,
+      accountFingerprint: route.accountFingerprint,
+      accountFingerprintState: "verified",
+      billingRealm: "openrouter-payg",
+      lastHealth: null,
+    }],
+    defaultRoute: route,
+    cross: { enabled: false, preferredLead: null, preferredChallenger: null },
+  };
+  let durable = structuredClone(initial);
+  const createStateStore = () => new ProviderStateStore(durable, {
+    persist: async (request) => {
+      const next = request.build(durable);
+      durable = structuredClone(next);
+      request.adopt(next);
+      return structuredClone(next);
+    },
+  });
+  const realJournal = new api.ProviderCredentialForgetJournal!({
+    appHome: root,
+    privateStore: new PrivateStore({ root }),
+  });
+  const slots = new Map([[slotId, `${STARTUP_KEY_PREFIX}${"k".repeat(48)}`]]);
+  const deleted: string[] = [];
+  const controller = api.createProviderCredentialController!({
+    stateStore: createStateStore(),
+    openRouter: new OpenRouterService(slots.get(slotId)!),
+    credentials: {
+      async deleteSlot(slot: CredentialSlotRef) {
+        deleted.push(slot.id);
+        return slots.delete(slot.id);
+      },
+    },
+    runtimeGuard: {
+      async acquire() { return { assertHeld() {}, release() {} }; },
+    },
+    activationCoordinator: { async activate() { throw new Error("unused"); } },
+    forgetJournal: {
+      begin: (input: Parameters<typeof realJournal.begin>[0]) => realJournal.begin(input),
+      async markDeleted(transaction: Parameters<typeof realJournal.markDeleted>[0]) {
+        await realJournal.markDeleted(transaction);
+        throw new Error("synthetic crash after credential deletion");
+      },
+      complete: (transaction: Parameters<typeof realJournal.complete>[0]) =>
+        realJournal.complete(transaction),
+    },
+  });
+  await assert.rejects(
+    controller.apply({ kind: "forget", credentialKind: "inference" }),
+    (error: unknown) => {
+      assert.match(String(error), /Provider credential cleanup is pending/);
+      assert.doesNotMatch(String(error), /synthetic crash|v1:inference|orcode-forget-journal/);
+      return true;
+    },
+  );
+  assert.equal(slots.has(slotId), false);
+  assert.equal((await realJournal.readPending())?.phase, "credential-deleted");
+
+  const environmentKey = `${STARTUP_KEY_PREFIX}${"e".repeat(48)}`;
+  const pendingStore = createStateStore();
+  const pending = await (cliModule as typeof cliModule & {
+    recoverProviderCredentialBinding(input: Record<string, unknown>): Promise<{
+      stored: { kind: string };
+      environment: string | null;
+    }>;
+  }).recoverProviderCredentialBinding({
+    stateStore: pendingStore,
+    recover: () => api.recoverProviderCredentialForget!({
+      journal: realJournal,
+      stateStore: pendingStore,
+      credentials: {
+        async deleteSlot(slot: CredentialSlotRef) {
+          deleted.push(slot.id);
+          throw new Error("synthetic keychain still unavailable");
+        },
+      },
+    }),
+    async readCredential(reference: "legacy:inference" | CredentialSlotRef) {
+      assert.notEqual(reference, "legacy:inference");
+      assert.equal((reference as CredentialSlotRef).id, slotId);
+      return { kind: "absent" };
+    },
+    environmentCredential: environmentKey,
+  });
+  assert.deepEqual(pending, {
+    reference: { version: 1, kind: "inference", id: slotId },
+    stored: { kind: "absent" },
+    environment: null,
+  });
+
+  const recoveredStore = createStateStore();
+  const recovered = await (cliModule as typeof cliModule & {
+    recoverProviderCredentialBinding(input: Record<string, unknown>): Promise<{
+      stored: { kind: string };
+      environment: string | null;
+    }>;
+  }).recoverProviderCredentialBinding({
+    stateStore: recoveredStore,
+    recover: () => api.recoverProviderCredentialForget!({
+      journal: realJournal,
+      stateStore: recoveredStore,
+      credentials: {
+        async deleteSlot(slot: CredentialSlotRef) {
+          deleted.push(slot.id);
+          return false;
+        },
+      },
+    }),
+    async readCredential(reference: "legacy:inference" | CredentialSlotRef) {
+      assert.equal(reference, "legacy:inference");
+      return { kind: "absent" };
+    },
+    environmentCredential: environmentKey,
+  });
+  assert.deepEqual(deleted, [slotId, slotId, slotId]);
+  assert.equal(recovered.environment, environmentKey);
+  assert.deepEqual(durable.connections, []);
+  assert.equal(durable.defaultRoute, null);
+  assert.equal(await realJournal.readPending(), null);
 });
 
 test("startup accepts outer Unicode whitespace for all saved and environment credentials", () => {
