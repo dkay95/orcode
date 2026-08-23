@@ -29,6 +29,7 @@ import { DEFAULT_CONFIG, saveConfig } from "../src/config.js";
 import { createPanelCall, OpenRouterHttpError, OpenRouterService } from "../src/openrouter.js";
 import { askPanel } from "../src/panel.js";
 import * as panelModule from "../src/panel.js";
+import { ProviderActivationCoordinator } from "../src/provider-activation.js";
 import { CredentialStore } from "../src/credentials.js";
 import type { CredentialSlotRef, CredentialStoreLike } from "../src/credentials.js";
 import {
@@ -721,6 +722,176 @@ test("mixed delayed panel results recover from the request-local 401 even after 
   assert.doesNotMatch(JSON.stringify(caught), /raw private|panel 401|panel 500/i);
 });
 
+test("real SDK panel requests preserve a request-local 401 marker across later success, ordinary 500, and cancellation", async (t) => {
+  const AuthenticationError = (panelModule as typeof panelModule & {
+    PanelAuthenticationRejectedError: new (...args: never[]) => Error & {
+      partialResult?: { answers: Array<{ model: string; text: string; error: string | null }> };
+    };
+  }).PanelAuthenticationRejectedError;
+  const originalFetch = globalThis.fetch;
+  const originalNow = Date.now;
+  let nowOffset = 0;
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+    Date.now = originalNow;
+  });
+  Date.now = () => originalNow() + nowOffset;
+  const raw401 = "raw sdk private 401 response bytes";
+  const raw500 = "raw sdk private 500 response bytes";
+  const requests: string[] = [];
+  let cancelStartedResolve!: () => void;
+  const cancelStarted = new Promise<void>((resolve) => { cancelStartedResolve = resolve; });
+
+  const responseBody = (model: string, text: string) => ({
+    completed_at: 1,
+    created_at: 1,
+    error: null,
+    frequency_penalty: null,
+    id: `response-${model}`,
+    incomplete_details: null,
+    instructions: null,
+    metadata: null,
+    model,
+    object: "response",
+    output: [{
+      content: [{ annotations: [], text, type: "output_text" }],
+      id: `message-${model}`,
+      role: "assistant",
+      status: "completed",
+      type: "message",
+    }],
+    parallel_tool_calls: false,
+    presence_penalty: null,
+    status: "completed",
+    temperature: null,
+    tool_choice: "none",
+    tools: [],
+    top_p: null,
+    usage: {
+      input_tokens: 3,
+      input_tokens_details: { cached_tokens: 0 },
+      output_tokens: 4,
+      output_tokens_details: { reasoning_tokens: 0 },
+      total_tokens: 7,
+      cost: 0.002,
+    },
+  });
+  globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const request = input instanceof Request ? input : new Request(input, init);
+    const body = JSON.parse(await request.clone().text()) as { model: string };
+    requests.push(body.model);
+    if (body.model === "vendor/auth") {
+      return new Response(JSON.stringify({ error: { code: 401, message: raw401 } }), {
+        status: 401,
+        headers: { "content-type": "application/json" },
+      });
+    }
+    if (body.model === "vendor/ordinary") {
+      // Finish the SDK's configured 5xx retry window immediately. The real
+      // response and real SDK parser still own the failure classification.
+      nowOffset = 31_000;
+      return new Response(JSON.stringify({ error: { code: 500, message: raw500 } }), {
+        status: 500,
+        headers: { "content-type": "application/json" },
+      });
+    }
+    if (body.model === "vendor/cancel") {
+      cancelStartedResolve();
+      return new Promise<Response>((_resolve, reject) => {
+        const rejectCancelled = () => reject(
+          request.signal.reason ?? new DOMException("cancelled", "AbortError"),
+        );
+        if (request.signal.aborted) rejectCancelled();
+        else request.signal.addEventListener("abort", rejectCancelled, { once: true });
+      });
+    }
+    await new Promise<void>((resolve) => setTimeout(resolve, 20));
+    return new Response(JSON.stringify(responseBody(body.model, "successful real SDK answer")), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  }) as typeof globalThis.fetch;
+
+  const service = new OpenRouterService(`${STARTUP_KEY_PREFIX}${"s".repeat(48)}`);
+  const callPanelModel = createPanelCall(service);
+  const calls: string[] = [];
+  const panelAction = executeProviderModelAction({
+    ensureRunnableRoute() {
+      calls.push("route:ensure");
+      return bootstrapRoute("vendor/auth") as never;
+    },
+    beginRun() {
+      calls.push("run:begin");
+      return () => calls.push("run:release");
+    },
+    run: () => askPanel({
+      question: "same real SDK question",
+      models: ["vendor/auth", "vendor/success", "vendor/ordinary"],
+      callModel: callPanelModel,
+    }),
+    isAuthenticationFailure: (error) => shouldReplaceCredential(error, service),
+    async invalidateAndInspect() { calls.push("route:invalidate+inspect"); },
+    async runSetup() {
+      calls.push("setup:fullscreen");
+      return { kind: "cancelled" };
+    },
+    surface: "fullscreen",
+  });
+  const cancelController = new AbortController();
+  const cancelledCall = callPanelModel({
+    model: "vendor/cancel",
+    question: "cancel this request",
+    signal: cancelController.signal,
+  });
+  await cancelStarted;
+  cancelController.abort(new DOMException("caller cancelled", "AbortError"));
+
+  const [panelSettled, cancellationSettled] = await Promise.allSettled([
+    panelAction,
+    cancelledCall,
+  ]);
+
+  assert.equal(panelSettled.status, "rejected");
+  assert.ok(panelSettled.status === "rejected" && panelSettled.reason instanceof AuthenticationError);
+  assert.equal(cancellationSettled.status, "rejected");
+  assert.ok(
+    cancellationSettled.status === "rejected"
+    && !(cancellationSettled.reason instanceof AuthenticationError),
+  );
+  assert.equal(service.runtimeState.inferenceValidity, "valid");
+  assert.equal(calls.filter((entry) => entry === "route:invalidate+inspect").length, 1);
+  assert.equal(calls.filter((entry) => entry === "setup:fullscreen").length, 1);
+  const partial = panelSettled.status === "rejected"
+    ? (panelSettled.reason as InstanceType<typeof AuthenticationError>).partialResult
+    : undefined;
+  assert.equal(
+    partial?.answers.find((answer) => answer.model === "vendor/success")?.text,
+    "successful real SDK answer",
+  );
+  assert.notEqual(
+    partial?.answers.find((answer) => answer.model === "vendor/ordinary")?.error,
+    null,
+  );
+  assert.ok(requests.includes("vendor/cancel"));
+
+  await executeProviderModelAction({
+    ensureRunnableRoute: () => bootstrapRoute("vendor/later") as never,
+    beginRun: () => () => undefined,
+    async run() {
+      calls.push("later:model-action");
+      return "later-ok";
+    },
+    isAuthenticationFailure: () => false,
+    async invalidateAndInspect() { calls.push("unexpected:recovery"); },
+    async runSetup() { return { kind: "ready" }; },
+  });
+  assert.ok(calls.indexOf("setup:fullscreen") < calls.indexOf("later:model-action"));
+  assert.doesNotMatch(
+    `${JSON.stringify(partial)} ${String(panelSettled.status === "rejected" ? panelSettled.reason : "")}`,
+    /raw sdk private|response bytes/i,
+  );
+});
+
 test("voice transcription executes inside the shared provider action and lets 401 recovery finish first", async () => {
   const transcribeAndInsert = (cliModule as typeof cliModule & {
     transcribeAndInsert?: (
@@ -981,6 +1152,239 @@ test("dashboard pre-dispatch uses exact catalog aliases and preserves unknown to
 });
 
 const STARTUP_KEY_PREFIX = `${["sk", "or", "v1"].join("-")}-`;
+
+function providerRuntimeGuardFixture() {
+  let held = false;
+  return {
+    async acquire() {
+      if (held) throw new Error("fixed provider runtime busy");
+      held = true;
+      let released = false;
+      return {
+        assertHeld() {
+          if (released || !held) throw new Error("fixed provider runtime lease lost");
+        },
+        release() {
+          if (released) return;
+          released = true;
+          held = false;
+        },
+      };
+    },
+  };
+}
+
+function providerCoordinatorMutationFixture(
+  runtimeGuard: {
+    acquire(signal?: AbortSignal): Promise<{
+      assertHeld(): void | Promise<void>;
+      release(): void | Promise<void>;
+    }>;
+  },
+  activate: (...args: never[]) => Promise<unknown> = async () => {
+    throw new Error("unused");
+  },
+) {
+  const recoverAndRun = async <T>(
+    request: { signal: AbortSignal },
+    operation: (lease: { assertHeld(): Promise<void> }) => Promise<T>,
+  ) => {
+    const runtimeLease = await runtimeGuard.acquire(request.signal);
+    try {
+      const lease = {
+        assertHeld: async () => { await runtimeLease.assertHeld(); },
+      };
+      await lease.assertHeld();
+      const value = await operation(lease);
+      await lease.assertHeld();
+      return { warnings: Object.freeze([]), value };
+    } finally {
+      await runtimeLease.release();
+    }
+  };
+  return {
+    activate,
+    recoverAndRun,
+    async runExclusive<T>(
+      request: { signal: AbortSignal },
+      operation: (lease: { assertHeld(): Promise<void> }) => Promise<T>,
+    ) {
+      return (await recoverAndRun(request, operation)).value;
+    },
+  };
+}
+
+async function providerForgetActivationFixture() {
+  const api = cliModule as typeof cliModule & {
+    ProviderCredentialForgetJournal: new (input: {
+      appHome: string;
+      privateStore: PrivateStore;
+    }) => {
+      readPending(): Promise<unknown>;
+    };
+    createProviderCredentialController(input: Record<string, unknown>): {
+      apply(intent: Record<string, unknown>): Promise<Record<string, unknown>>;
+    };
+    persistProviderSetupState(
+      path: string,
+      request: ProviderStateCommitRequest,
+    ): Promise<ProviderSetupStateV1>;
+  };
+  const root = await mkdtemp(join(tmpdir(), "orcode-provider-forget-serialization-"));
+  const configPath = join(root, "config.json");
+  const connectionId = "00000000-0000-4000-8000-000000000081";
+  const oldSlotId = "v1:inference:00000000-0000-4000-8000-000000000082";
+  const route = {
+    ...bootstrapRoute("vendor/main"),
+    accountFingerprint: "acct_forget_serialization",
+  } as NonNullable<ProviderSetupStateV1["defaultRoute"]>;
+  const initial: ProviderSetupStateV1 = {
+    schemaVersion: 1,
+    revision: 0,
+    lifecycle: "configured",
+    connections: [{
+      id: connectionId,
+      backendId: "openrouter",
+      enabled: true,
+      maturity: "stable",
+      credentialSlot: oldSlotId,
+      accountFingerprint: route.accountFingerprint,
+      accountFingerprintState: "verified",
+      billingRealm: "openrouter-payg",
+      lastHealth: null,
+    }],
+    defaultRoute: route,
+    cross: { enabled: false, preferredLead: null, preferredChallenger: null },
+  };
+  const config = structuredClone(DEFAULT_CONFIG);
+  config.providerSetup = structuredClone(initial);
+  await saveConfig(config, configPath);
+  const stateStore = new ProviderStateStore(initial, {
+    persist: (request) => api.persistProviderSetupState(configPath, request),
+  });
+  const privateStore = new PrivateStore({ root });
+  const journal = new api.ProviderCredentialForgetJournal({
+    appHome: root,
+    privateStore,
+  });
+  const oldSecret = `${STARTUP_KEY_PREFIX}${"o".repeat(48)}`;
+  const slots = new Map([[oldSlotId, oldSecret]]);
+  let reservation = 90;
+  let failOldSlotDelete = true;
+  const credentialCalls: string[] = [];
+  const credentials = {
+    reserveSlot() {
+      const id = `v1:inference:00000000-0000-4000-8000-${String(reservation++).padStart(12, "0")}`;
+      credentialCalls.push(`reserve:${id}`);
+      return Object.freeze({ version: 1 as const, kind: "inference" as const, id });
+    },
+    async writeSlot(slot: CredentialSlotRef, secret: string) {
+      credentialCalls.push(`write:${slot.id}`);
+      slots.set(slot.id, secret);
+    },
+    async readSlot(slot: CredentialSlotRef) {
+      credentialCalls.push(`read:${slot.id}`);
+      return slots.get(slot.id) ?? null;
+    },
+    async deleteSlot(slot: CredentialSlotRef) {
+      credentialCalls.push(`delete:${slot.id}`);
+      if (slot.id === oldSlotId && failOldSlotDelete) {
+        throw new Error(`raw delete failure ${slot.id} ${root}`);
+      }
+      return slots.delete(slot.id);
+    },
+  };
+  const adapterCalls: string[] = [];
+  const adapter = {
+    async connect() {
+      adapterCalls.push("connect");
+      return {
+        candidateId: "candidate-forget-serialization",
+        backendId: "openrouter" as const,
+        connectionId,
+        accountFingerprint: route.accountFingerprint,
+        billingRealm: "openrouter-payg" as const,
+        health: {
+          credential: "valid" as const,
+          connectivity: "connected" as const,
+          spend: "available" as const,
+          runtime: "not-applicable" as const,
+          observedAt: 1,
+          generation: 1,
+        },
+      };
+    },
+    async listModels() {
+      adapterCalls.push("models");
+      return [{
+        backendId: "openrouter" as const,
+        requestedModelId: route.requestedModelId,
+        canonicalModelId: route.canonicalModelId!,
+        displayName: "Main",
+        capabilities: { textInput: true, textOutput: true, tools: true, reasoning: true },
+      }];
+    },
+    async activate(request: { candidateId: string; model: { requestedModelId: string; canonicalModelId: string } }) {
+      adapterCalls.push("activate");
+      return {
+        candidateId: request.candidateId,
+        backendId: "openrouter" as const,
+        connectionId,
+        accountFingerprint: route.accountFingerprint,
+        billingRealm: "openrouter-payg" as const,
+        route: {
+          ...route,
+          requestedModelId: request.model.requestedModelId,
+          canonicalModelId: request.model.canonicalModelId,
+        },
+      };
+    },
+    async discardCandidate() {
+      adapterCalls.push("discard");
+    },
+  };
+  const runtimeGuard = providerRuntimeGuardFixture();
+  const coordinator = new ProviderActivationCoordinator({
+    appHome: root,
+    configPath,
+    privateStore,
+    credentials: credentials as never,
+    adapter: adapter as never,
+    stateStore,
+    runtimeGuard,
+  });
+  const openRouter = new OpenRouterService(oldSecret);
+  const controller = api.createProviderCredentialController({
+    stateStore,
+    openRouter,
+    credentials,
+    runtimeGuard,
+    activationCoordinator: coordinator,
+    forgetJournal: journal,
+    getInferenceRoute: () => route,
+  });
+  return {
+    api,
+    root,
+    configPath,
+    connectionId,
+    oldSlotId,
+    oldSecret,
+    route,
+    stateStore,
+    privateStore,
+    journal,
+    slots,
+    credentials,
+    credentialCalls,
+    adapter,
+    adapterCalls,
+    runtimeGuard,
+    coordinator,
+    controller,
+    allowOldSlotDelete() { failOldSlotDelete = false; },
+  };
+}
 
 test("plain setup surface keeps secret input masked and maps cancelled prompts to null", async () => {
   const calls: Array<Record<string, unknown>> = [];
@@ -1303,11 +1707,16 @@ test("startup durable provider commits preserve every unrelated config byte unde
 });
 
 test("versioned inference replace and forget leave one restart-atomic provider tuple", async () => {
-  const createController = (cliModule as typeof cliModule & {
+  const api = cliModule as typeof cliModule & {
     createProviderCredentialController?: (input: Record<string, unknown>) => {
       apply(intent: Record<string, unknown>): Promise<Record<string, unknown>>;
     };
-  }).createProviderCredentialController;
+    ProviderCredentialForgetJournal: new (input: {
+      appHome: string;
+      privateStore: PrivateStore;
+    }) => unknown;
+  };
+  const createController = api.createProviderCredentialController;
   assert.equal(typeof createController, "function");
 
   const oldKey = `${STARTUP_KEY_PREFIX}${"o".repeat(48)}`;
@@ -1347,6 +1756,34 @@ test("versioned inference replace and forget leave one restart-atomic provider t
   const slots = new Map([[oldSlot, oldKey]]);
   const openRouter = new OpenRouterService(oldKey, undefined, { inference: "keychain" });
   const runtimeEvents: string[] = [];
+  const runtimeGuard = {
+    async acquire() {
+      runtimeEvents.push("guard:acquire");
+      return {
+        assertHeld() { runtimeEvents.push("guard:assert"); },
+        release() { runtimeEvents.push("guard:release"); },
+      };
+    },
+  };
+  const forgetRoot = await mkdtemp(join(tmpdir(), "orcode-versioned-forget-"));
+  const forgetJournal = new api.ProviderCredentialForgetJournal({
+    appHome: forgetRoot,
+    privateStore: new PrivateStore({ root: forgetRoot }),
+  });
+  const activate = async (request: { expectedRevision: number; candidate: string }) => {
+    assert.equal(request.expectedRevision, 0);
+    assert.equal(request.candidate, newKey);
+    const next: ProviderSetupStateV1 = {
+      ...structuredClone(initial),
+      revision: 1,
+      connections: [{ ...initial.connections[0]!, credentialSlot: newSlot }],
+    };
+    durable = structuredClone(next);
+    stateStore.replace(next, 0);
+    slots.set(newSlot, newKey);
+    openRouter.setKey(newKey, "keychain");
+    return { persisted: true, route, state: next, warnings: [] };
+  };
   const controller = createController!({
     stateStore,
     openRouter,
@@ -1357,31 +1794,12 @@ test("versioned inference replace and forget leave one restart-atomic provider t
         return slots.delete(slot.id);
       },
     },
-    runtimeGuard: {
-      async acquire() {
-        runtimeEvents.push("guard:acquire");
-        return {
-          assertHeld() { runtimeEvents.push("guard:assert"); },
-          release() { runtimeEvents.push("guard:release"); },
-        };
-      },
-    },
-    activationCoordinator: {
-      async activate(request: { expectedRevision: number; candidate: string }) {
-        assert.equal(request.expectedRevision, 0);
-        assert.equal(request.candidate, newKey);
-        const next: ProviderSetupStateV1 = {
-          ...structuredClone(initial),
-          revision: 1,
-          connections: [{ ...initial.connections[0]!, credentialSlot: newSlot }],
-        };
-        durable = structuredClone(next);
-        stateStore.replace(next, 0);
-        slots.set(newSlot, newKey);
-        openRouter.setKey(newKey, "keychain");
-        return { persisted: true, route, state: next, warnings: [] };
-      },
-    },
+    runtimeGuard,
+    activationCoordinator: providerCoordinatorMutationFixture(
+      runtimeGuard,
+      activate as never,
+    ),
+    forgetJournal,
   });
 
   await controller.apply({
@@ -1399,13 +1817,12 @@ test("versioned inference replace and forget leave one restart-atomic provider t
   assert.deepEqual(restarted.connections, []);
   assert.equal(slots.has(newSlot), false);
   assert.equal(openRouter.hasKey, false);
-  assert.deepEqual(runtimeEvents, [
-    "guard:acquire",
-    "guard:assert",
-    "delete:v1:inference:00000000-0000-4000-8000-000000000032",
-    "guard:assert",
-    "guard:release",
-  ]);
+  assert.equal(runtimeEvents[0], "guard:acquire");
+  assert.equal(runtimeEvents.at(-1), "guard:release");
+  assert.equal(
+    runtimeEvents.filter((event) => event === `delete:${newSlot}`).length,
+    1,
+  );
 });
 
 test("saving a process-only environment route persists that exact route and versioned credential for restart", async () => {
@@ -1508,11 +1925,16 @@ test("saving a process-only environment route persists that exact route and vers
 });
 
 test("forget retry retains the exact versioned pointer across a crash before slot deletion", async () => {
-  const createController = (cliModule as typeof cliModule & {
+  const api = cliModule as typeof cliModule & {
     createProviderCredentialController?: (input: Record<string, unknown>) => {
       apply(intent: Record<string, unknown>): Promise<Record<string, unknown>>;
     };
-  }).createProviderCredentialController;
+    ProviderCredentialForgetJournal: new (input: {
+      appHome: string;
+      privateStore: PrivateStore;
+    }) => unknown;
+  };
+  const createController = api.createProviderCredentialController;
   assert.equal(typeof createController, "function");
   const key = `${STARTUP_KEY_PREFIX}${"f".repeat(48)}`;
   const slotId = "v1:inference:00000000-0000-4000-8000-000000000051";
@@ -1550,6 +1972,11 @@ test("forget retry retains the exact versioned pointer across a crash before slo
     },
   };
   const openRouter = new OpenRouterService(key, undefined, { inference: "keychain" });
+  const forgetRoot = await mkdtemp(join(tmpdir(), "orcode-forget-retry-"));
+  const forgetJournal = new api.ProviderCredentialForgetJournal({
+    appHome: forgetRoot,
+    privateStore: new PrivateStore({ root: forgetRoot }),
+  });
   const first = createController!({
     stateStore: createStateStore(),
     openRouter,
@@ -1560,7 +1987,8 @@ test("forget retry retains the exact versioned pointer across a crash before slo
       },
     },
     runtimeGuard,
-    activationCoordinator: { async activate() { throw new Error("unused"); } },
+    activationCoordinator: providerCoordinatorMutationFixture(runtimeGuard),
+    forgetJournal,
   });
   await assert.rejects(
     first.apply({ kind: "forget", credentialKind: "inference" }),
@@ -1584,7 +2012,8 @@ test("forget retry retains the exact versioned pointer across a crash before slo
       },
     },
     runtimeGuard,
-    activationCoordinator: { async activate() { throw new Error("unused"); } },
+    activationCoordinator: providerCoordinatorMutationFixture(runtimeGuard),
+    forgetJournal,
   });
   await second.apply({ kind: "forget", credentialKind: "inference" });
   assert.deepEqual(deleted, [slotId]);
@@ -1652,6 +2081,7 @@ test("failed pre-delete forget journals the exact target and synchronizes the fi
     privateStore: new PrivateStore({ root }),
   });
   const openRouter = new OpenRouterService(`${STARTUP_KEY_PREFIX}${"j".repeat(48)}`);
+  const runtimeGuard = providerRuntimeGuardFixture();
   const controller = api.createProviderCredentialController!({
     stateStore,
     openRouter,
@@ -1661,10 +2091,8 @@ test("failed pre-delete forget journals the exact target and synchronizes the fi
         throw new Error("synthetic delete unavailable");
       },
     },
-    runtimeGuard: {
-      async acquire() { return { assertHeld() {}, release() {} }; },
-    },
-    activationCoordinator: { async activate() { throw new Error("unused"); } },
+    runtimeGuard,
+    activationCoordinator: providerCoordinatorMutationFixture(runtimeGuard),
     forgetJournal: journal,
     onInferenceStatePublished(state: ProviderSetupStateV1) {
       config.providerSetup = structuredClone(state);
@@ -1700,7 +2128,7 @@ test("failed pre-delete forget journals the exact target and synchronizes the fi
   });
 });
 
-test("post-delete forget crash blocks environment fallback until exact journal recovery completes", async () => {
+test("post-delete forget recovery trusts the durable phase, completes once, and never re-deletes", async () => {
   const api = cliModule as typeof cliModule & {
     ProviderCredentialForgetJournal?: new (input: {
       appHome: string;
@@ -1759,6 +2187,7 @@ test("post-delete forget crash blocks environment fallback until exact journal r
   });
   const slots = new Map([[slotId, `${STARTUP_KEY_PREFIX}${"k".repeat(48)}`]]);
   const deleted: string[] = [];
+  const runtimeGuard = providerRuntimeGuardFixture();
   const controller = api.createProviderCredentialController!({
     stateStore: createStateStore(),
     openRouter: new OpenRouterService(slots.get(slotId)!),
@@ -1768,10 +2197,8 @@ test("post-delete forget crash blocks environment fallback until exact journal r
         return slots.delete(slot.id);
       },
     },
-    runtimeGuard: {
-      async acquire() { return { assertHeld() {}, release() {} }; },
-    },
-    activationCoordinator: { async activate() { throw new Error("unused"); } },
+    runtimeGuard,
+    activationCoordinator: providerCoordinatorMutationFixture(runtimeGuard),
     forgetJournal: {
       begin: (input: Parameters<typeof realJournal.begin>[0]) => realJournal.begin(input),
       async markDeleted(transaction: Parameters<typeof realJournal.markDeleted>[0]) {
@@ -1794,37 +2221,6 @@ test("post-delete forget crash blocks environment fallback until exact journal r
   assert.equal((await realJournal.readPending())?.phase, "credential-deleted");
 
   const environmentKey = `${STARTUP_KEY_PREFIX}${"e".repeat(48)}`;
-  const pendingStore = createStateStore();
-  const pending = await (cliModule as typeof cliModule & {
-    recoverProviderCredentialBinding(input: Record<string, unknown>): Promise<{
-      stored: { kind: string };
-      environment: string | null;
-    }>;
-  }).recoverProviderCredentialBinding({
-    stateStore: pendingStore,
-    recover: () => api.recoverProviderCredentialForget!({
-      journal: realJournal,
-      stateStore: pendingStore,
-      credentials: {
-        async deleteSlot(slot: CredentialSlotRef) {
-          deleted.push(slot.id);
-          throw new Error("synthetic keychain still unavailable");
-        },
-      },
-    }),
-    async readCredential(reference: "legacy:inference" | CredentialSlotRef) {
-      assert.notEqual(reference, "legacy:inference");
-      assert.equal((reference as CredentialSlotRef).id, slotId);
-      return { kind: "absent" };
-    },
-    environmentCredential: environmentKey,
-  });
-  assert.deepEqual(pending, {
-    reference: { version: 1, kind: "inference", id: slotId },
-    stored: { kind: "absent" },
-    environment: null,
-  });
-
   const recoveredStore = createStateStore();
   const recovered = await (cliModule as typeof cliModule & {
     recoverProviderCredentialBinding(input: Record<string, unknown>): Promise<{
@@ -1837,9 +2233,8 @@ test("post-delete forget crash blocks environment fallback until exact journal r
       journal: realJournal,
       stateStore: recoveredStore,
       credentials: {
-        async deleteSlot(slot: CredentialSlotRef) {
-          deleted.push(slot.id);
-          return false;
+        async deleteSlot() {
+          throw new Error("credential-deleted phase must not delete again");
         },
       },
     }),
@@ -1849,11 +2244,261 @@ test("post-delete forget crash blocks environment fallback until exact journal r
     },
     environmentCredential: environmentKey,
   });
-  assert.deepEqual(deleted, [slotId, slotId, slotId]);
   assert.equal(recovered.environment, environmentKey);
+  assert.deepEqual(deleted, [slotId]);
   assert.deepEqual(durable.connections, []);
   assert.equal(durable.defaultRoute, null);
   assert.equal(await realJournal.readPending(), null);
+
+  const repeatedStore = createStateStore();
+  const repeated = await (cliModule as typeof cliModule & {
+    recoverProviderCredentialBinding(input: Record<string, unknown>): Promise<{
+      stored: { kind: string };
+      environment: string | null;
+    }>;
+  }).recoverProviderCredentialBinding({
+    stateStore: repeatedStore,
+    recover: () => api.recoverProviderCredentialForget!({
+      journal: realJournal,
+      stateStore: repeatedStore,
+      credentials: {
+        async deleteSlot() {
+          throw new Error("completed journal must not delete again");
+        },
+      },
+    }),
+    async readCredential(reference: "legacy:inference" | CredentialSlotRef) {
+      assert.equal(reference, "legacy:inference");
+      return { kind: "absent" };
+    },
+    environmentCredential: environmentKey,
+  });
+  assert.equal(repeated.environment, environmentKey);
+  assert.deepEqual(deleted, [slotId]);
+  assert.equal(await realJournal.readPending(), null);
+});
+
+test("a failed pre-delete forget blocks same-process key save before provider candidate work without leaking its slot or journal path", async () => {
+  const fixture = await providerForgetActivationFixture();
+
+  await assert.rejects(
+    fixture.controller.apply({ kind: "forget", credentialKind: "inference" }),
+    /Provider credential cleanup is pending/,
+  );
+  assert.notEqual(await fixture.journal.readPending(), null);
+  fixture.adapterCalls.length = 0;
+  let blocked: unknown;
+
+  await assert.rejects(
+    fixture.controller.apply({ kind: "save", credentialKind: "inference" }),
+    (error: unknown) => {
+      blocked = error;
+      assert.match(String(error), /cleanup|recovery|pending/i);
+      return true;
+    },
+  );
+
+  assert.deepEqual(fixture.adapterCalls, []);
+  assert.doesNotMatch(
+    String(blocked),
+    new RegExp(`${fixture.oldSlotId}|${fixture.root.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}|raw delete`, "i"),
+  );
+});
+
+for (const persistence of ["persisted", "process-only"] as const) {
+  test(`pending forget blocks an independent ${persistence} activation through the provider-wide coordinator`, async () => {
+    const fixture = await providerForgetActivationFixture();
+    await assert.rejects(
+      fixture.controller.apply({ kind: "forget", credentialKind: "inference" }),
+      /Provider credential cleanup is pending/,
+    );
+    fixture.adapterCalls.length = 0;
+    const independentStore = new ProviderStateStore(fixture.stateStore.read(), {
+      persist: (request) => fixture.api.persistProviderSetupState(fixture.configPath, request),
+    });
+    const independentCoordinator = new ProviderActivationCoordinator({
+      appHome: fixture.root,
+      configPath: fixture.configPath,
+      privateStore: new PrivateStore({ root: fixture.root }),
+      credentials: fixture.credentials as never,
+      adapter: fixture.adapter as never,
+      stateStore: independentStore,
+      runtimeGuard: providerRuntimeGuardFixture(),
+    });
+
+    await assert.rejects(
+      independentCoordinator.activate({
+        expectedRevision: independentStore.read().revision,
+        candidate: fixture.oldSecret,
+        expectedRequestedModelId: fixture.route.requestedModelId,
+        selectedCanonicalModelId: fixture.route.canonicalModelId!,
+        generation: 1,
+        signal: new AbortController().signal,
+        persistence,
+      }),
+      /cleanup|recovery|pending/i,
+    );
+
+    assert.deepEqual(fixture.adapterCalls, []);
+    assert.notEqual(await fixture.journal.readPending(), null);
+  });
+}
+
+test("forget recovery cleans an old slot after the same connection committed a new slot and preserves the new route", async () => {
+  const api = cliModule as typeof cliModule & {
+    ProviderCredentialForgetJournal: new (input: {
+      appHome: string;
+      privateStore: PrivateStore;
+    }) => {
+      begin(input: Record<string, unknown>): Promise<unknown>;
+      readPending(): Promise<unknown>;
+    };
+    recoverProviderCredentialForget(input: Record<string, unknown>): Promise<{
+      cleanupPending: boolean;
+    }>;
+  };
+  const root = await mkdtemp(join(tmpdir(), "orcode-forget-same-connection-new-slot-"));
+  const privateStore = new PrivateStore({ root });
+  const journal = new api.ProviderCredentialForgetJournal({ appHome: root, privateStore });
+  const connectionId = "00000000-0000-4000-8000-000000000091";
+  const oldSlotId = "v1:inference:00000000-0000-4000-8000-000000000092";
+  const newSlotId = "v1:inference:00000000-0000-4000-8000-000000000093";
+  await journal.begin({
+    connectionId,
+    target: {
+      kind: "versioned",
+      slot: { version: 1, kind: "inference", id: oldSlotId },
+    },
+  });
+  const route = {
+    ...bootstrapRoute("vendor/new"),
+    accountFingerprint: "acct_same_connection_new_slot",
+  } as NonNullable<ProviderSetupStateV1["defaultRoute"]>;
+  const state: ProviderSetupStateV1 = {
+    schemaVersion: 1,
+    revision: 4,
+    lifecycle: "configured",
+    connections: [{
+      id: connectionId,
+      backendId: "openrouter",
+      enabled: true,
+      maturity: "stable",
+      credentialSlot: newSlotId,
+      accountFingerprint: route.accountFingerprint,
+      accountFingerprintState: "verified",
+      billingRealm: "openrouter-payg",
+      lastHealth: null,
+    }],
+    defaultRoute: route,
+    cross: { enabled: false, preferredLead: null, preferredChallenger: null },
+  };
+  const stateStore = new ProviderStateStore(state);
+  const slots = new Set([oldSlotId, newSlotId]);
+  const deleted: string[] = [];
+
+  const recovered = await api.recoverProviderCredentialForget({
+    journal,
+    stateStore,
+    credentials: {
+      async deleteSlot(slot: CredentialSlotRef) {
+        deleted.push(slot.id);
+        return slots.delete(slot.id);
+      },
+    },
+  });
+
+  assert.deepEqual(recovered, { cleanupPending: false });
+  assert.deepEqual(deleted, [oldSlotId]);
+  assert.equal(slots.has(newSlotId), true);
+  assert.deepEqual(stateStore.read(), state);
+  assert.equal(await journal.readPending(), null);
+});
+
+test("forget recovery retains a slot referenced by another committed connection and settles idempotently across restarts", async () => {
+  const api = cliModule as typeof cliModule & {
+    ProviderCredentialForgetJournal: new (input: {
+      appHome: string;
+      privateStore: PrivateStore;
+    }) => {
+      begin(input: Record<string, unknown>): Promise<unknown>;
+      readPending(): Promise<unknown>;
+    };
+    recoverProviderCredentialForget(input: Record<string, unknown>): Promise<{
+      cleanupPending: boolean;
+    }>;
+  };
+  const root = await mkdtemp(join(tmpdir(), "orcode-forget-shared-slot-reference-"));
+  const journal = new api.ProviderCredentialForgetJournal({
+    appHome: root,
+    privateStore: new PrivateStore({ root }),
+  });
+  const slotId = "v1:inference:00000000-0000-4000-8000-000000000101";
+  const retiringConnectionId = "00000000-0000-4000-8000-000000000102";
+  const survivingConnectionId = "00000000-0000-4000-8000-000000000103";
+  await journal.begin({
+    connectionId: retiringConnectionId,
+    target: {
+      kind: "versioned",
+      slot: { version: 1, kind: "inference", id: slotId },
+    },
+  });
+  const survivingRoute = {
+    ...bootstrapRoute("vendor/surviving"),
+    accountFingerprint: "acct_shared_slot_surviving",
+  } as NonNullable<ProviderSetupStateV1["defaultRoute"]>;
+  const state: ProviderSetupStateV1 = {
+    schemaVersion: 1,
+    revision: 7,
+    lifecycle: "configured",
+    connections: [
+      {
+        id: retiringConnectionId,
+        backendId: "openrouter",
+        enabled: true,
+        maturity: "stable",
+        credentialSlot: slotId,
+        accountFingerprint: "acct_shared_slot_retiring",
+        accountFingerprintState: "verified",
+        billingRealm: "openrouter-payg",
+        lastHealth: null,
+      },
+      {
+        id: survivingConnectionId,
+        backendId: "openrouter",
+        enabled: true,
+        maturity: "stable",
+        credentialSlot: slotId,
+        accountFingerprint: survivingRoute.accountFingerprint,
+        accountFingerprintState: "verified",
+        billingRealm: "openrouter-payg",
+        lastHealth: null,
+      },
+    ],
+    defaultRoute: survivingRoute,
+    cross: { enabled: false, preferredLead: null, preferredChallenger: null },
+  };
+  const stateStore = new ProviderStateStore(state);
+  const deleted: string[] = [];
+  const recover = () => api.recoverProviderCredentialForget({
+    journal,
+    stateStore,
+    credentials: {
+      async deleteSlot(slot: CredentialSlotRef) {
+        deleted.push(slot.id);
+        return true;
+      },
+    },
+  });
+
+  assert.deepEqual(await recover(), { cleanupPending: false });
+  assert.deepEqual(await recover(), { cleanupPending: false });
+  assert.deepEqual(deleted, []);
+  assert.deepEqual(
+    stateStore.read().connections.map((connection) => connection.id),
+    [survivingConnectionId],
+  );
+  assert.deepEqual(stateStore.read().defaultRoute, survivingRoute);
+  assert.equal(await journal.readPending(), null);
 });
 
 test("startup accepts outer Unicode whitespace for all saved and environment credentials", () => {

@@ -46,7 +46,7 @@ export const SDK_RECONNECT_POLICY = {
 export const NETWORK_REASON = "Verbindung unterbrochen oder Zeitüberschreitung";
 
 /** Which logical part of the app produced a request. */
-export type ConnectionScope = "main" | "compressor" | "voice" | "rest";
+export type ConnectionScope = "main" | "compressor" | "voice" | "panel" | "rest";
 
 export type ConnectionEventPhase =
   | "retry-scheduled"

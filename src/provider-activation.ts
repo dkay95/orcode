@@ -40,6 +40,7 @@ const CANONICAL_UUID =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const ACTIVATION_DIRECTORY = "provider-activation";
 const LEASE_DIRECTORY = "provider-setup.lock";
+export const PROVIDER_CREDENTIAL_FORGET_DIRECTORY = "provider-forget-v1";
 const OWNER_FILE_LIMIT = 4_096;
 const MANIFEST_FILE_LIMIT = 64 * 1_024;
 const DEFAULT_LEASE_DURATION_MS = 30_000;
@@ -109,6 +110,10 @@ export interface ProviderActivationRequest {
 export interface ProviderActivationRecoveryRequest {
   signal: AbortSignal;
   inspectCommitted?: boolean;
+}
+
+export interface ProviderCoordinatorLease {
+  assertHeld(): Promise<void>;
 }
 
 interface ActivationAdapter {
@@ -267,6 +272,20 @@ export class ProviderActivationCoordinator {
     let primaryFailed = false;
     try {
       await assertRuntimeLease(runtimeLease);
+      providerLease = await this.#acquireProviderLease(request.signal);
+      await this.#assertFence(providerLease);
+      const recovery = await this.#recoverDisposition({
+        signal: request.signal,
+        inspectCommitted: false,
+      }, providerLease, runtimeLease);
+      if (recovery.kind !== "complete") {
+        throw recovery.kind === "recovery-required"
+          ? recovery.error
+          : new ProviderActivationRecoveryRequiredError();
+      }
+      await this.#assertNoPendingCredentialForget(providerLease);
+      await this.#assertFence(providerLease);
+      await assertRuntimeLease(runtimeLease);
       const normalized = normalizeProviderSecret(request.candidate);
       const candidate = await this.#connectCandidate(
         normalized,
@@ -303,17 +322,6 @@ export class ProviderActivationCoordinator {
         };
       }
 
-      providerLease = await this.#acquireProviderLease(request.signal);
-      await this.#assertFence(providerLease);
-      const recovery = await this.#recoverDisposition({
-        signal: request.signal,
-        inspectCommitted: false,
-      }, providerLease, runtimeLease);
-      if (recovery.kind !== "complete") {
-        throw recovery.kind === "recovery-required"
-          ? recovery.error
-          : new ProviderActivationRecoveryRequiredError();
-      }
       await this.#assertFence(providerLease);
       await assertRuntimeLease(runtimeLease);
       const configFacts = await readConfigFacts(this.#options.configPath);
@@ -418,8 +426,7 @@ export class ProviderActivationCoordinator {
             "Provider credential persistence failed without changing the active route.",
           );
         }
-        await this.#releaseProviderLease(providerLease);
-        providerLease = null;
+        await this.#assertFence(providerLease);
         await assertRuntimeLease(runtimeLease);
         const activated = await this.#activateRuntime(
           candidate.candidateId,
@@ -640,6 +647,88 @@ export class ProviderActivationCoordinator {
       );
       if (disposition.kind === "recovery-required") throw disposition.error;
       return disposition.warnings;
+    } catch (error) {
+      primaryFailed = true;
+      throw error;
+    } finally {
+      let releaseFailed = false;
+      if (providerLease) {
+        try {
+          await this.#releaseProviderLease(providerLease);
+        } catch {
+          releaseFailed = true;
+        }
+      }
+      try {
+        await Promise.resolve(runtimeLease.release());
+      } catch {
+        releaseFailed = true;
+      }
+      if (releaseFailed && !primaryFailed) {
+        throw new ProviderActivationRecoveryRequiredError(
+          "provider-activation-release-failed",
+        );
+      }
+    }
+  }
+
+  async runExclusive<T>(
+    request: ProviderActivationRecoveryRequest,
+    operation: (lease: ProviderCoordinatorLease) => Promise<T>,
+  ): Promise<T> {
+    const result = await this.#recoverAndRun(request, true, operation);
+    return result.value;
+  }
+
+  async recoverAndRun<T>(
+    request: ProviderActivationRecoveryRequest,
+    operation: (lease: ProviderCoordinatorLease) => Promise<T>,
+  ): Promise<{ warnings: readonly string[]; value: T }> {
+    return this.#recoverAndRun(request, false, operation);
+  }
+
+  async #recoverAndRun<T>(
+    request: ProviderActivationRecoveryRequest,
+    rejectPendingForget: boolean,
+    operation: (lease: ProviderCoordinatorLease) => Promise<T>,
+  ): Promise<{ warnings: readonly string[]; value: T }> {
+    throwIfAborted(request.signal);
+    let runtimeLease: ProviderActivationRuntimeLease;
+    try {
+      runtimeLease = await this.#options.runtimeGuard.acquire(request.signal);
+    } catch (error) {
+      if (isAbort(error, request.signal)) throw abortFrom(request.signal);
+      throw new ProviderActivationError(
+        "provider-runtime-not-idle",
+        "Provider runtime is not idle and drained.",
+      );
+    }
+    let providerLease: HeldProviderLease | null = null;
+    let primaryFailed = false;
+    try {
+      providerLease = await this.#acquireProviderLease(request.signal);
+      const disposition = await this.#recoverDisposition(
+        request,
+        providerLease,
+        runtimeLease,
+      );
+      if (disposition.kind === "recovery-required") throw disposition.error;
+      if (disposition.kind === "verification-pending" && !request.inspectCommitted) {
+        throw new ProviderActivationRecoveryRequiredError();
+      }
+      if (rejectPendingForget) {
+        await this.#assertNoPendingCredentialForget(providerLease);
+      }
+      const coordinatorLease: ProviderCoordinatorLease = {
+        assertHeld: async () => {
+          await assertRuntimeLease(runtimeLease);
+          await this.#assertFence(providerLease!);
+        },
+      };
+      await coordinatorLease.assertHeld();
+      const value = await operation(coordinatorLease);
+      await coordinatorLease.assertHeld();
+      return { warnings: disposition.warnings, value };
     } catch (error) {
       primaryFailed = true;
       throw error;
@@ -959,6 +1048,34 @@ export class ProviderActivationCoordinator {
       }
     } catch {
       throw new ProviderActivationRecoveryRequiredError("provider-lease-fence-lost");
+    }
+  }
+
+  async #assertNoPendingCredentialForget(lease: HeldProviderLease): Promise<void> {
+    const path = join(this.#options.appHome, PROVIDER_CREDENTIAL_FORGET_DIRECTORY);
+    let emptyClaim: PrivateDirectoryClaim | null;
+    try {
+      await this.#assertFence(lease);
+      emptyClaim = await this.#options.privateStore.createDirectoryExclusive(path);
+      await this.#assertFence(lease);
+    } catch (error) {
+      if (error instanceof ProviderActivationError) throw error;
+      throw new ProviderActivationRecoveryRequiredError(
+        "provider-credential-cleanup-identity-failed",
+      );
+    }
+    if (!emptyClaim) {
+      throw new ProviderActivationRecoveryRequiredError(
+        "provider-credential-cleanup-pending",
+      );
+    }
+    try {
+      await this.#options.privateStore.releaseDirectoryClaim(emptyClaim, null);
+      await this.#assertFence(lease);
+    } catch {
+      throw new ProviderActivationRecoveryRequiredError(
+        "provider-credential-cleanup-identity-failed",
+      );
     }
   }
 

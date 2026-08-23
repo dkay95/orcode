@@ -798,7 +798,12 @@ export class OpenRouterService {
             } else {
               this.#state.connectivity = "disconnected";
             }
-            return { response, error };
+            return {
+              response,
+              error: scope === "panel" && response?.status === 401
+                ? new PanelAuthenticationRejectedError()
+                : error,
+            };
           },
         },
         {
@@ -1151,6 +1156,15 @@ export class OpenRouterService {
     return formatFailure(this.explain(error));
   }
 
+  safePanelMessage(error: unknown): string {
+    const failure = this.explain(error);
+    if (failure.kind === "cancelled") return "OpenRouter request was cancelled.";
+    if (failure.kind === "unknown") return "OpenRouter request failed.";
+    return failure.action
+      ? `${failure.message} ${failure.action}`
+      : failure.message;
+  }
+
   async request(
     path: string,
     bearerKey: string,
@@ -1441,7 +1455,7 @@ const PANEL_INSTRUCTIONS =
 export function createPanelCall(service: OpenRouterService): PanelCall {
   return async ({ model, question, context, signal }) => {
     try {
-      const client = service.client();
+      const client = service.client({ scope: "panel" });
       let observedCost = 0;
       let inputTokens = 0;
       let outputTokens = 0;
@@ -1479,12 +1493,31 @@ export function createPanelCall(service: OpenRouterService): PanelCall {
       // Same redaction/translation every other OpenRouter call gets — a
       // panel error column is exactly the kind of place a raw key leak would
       // otherwise end up.
-      if (error instanceof OpenRouterHttpError && error.status === 401) {
+      const authenticationRejected = findPanelAuthenticationRejection(error);
+      if (authenticationRejected) throw authenticationRejected;
+      if (statusOf(error) === 401) {
         throw new PanelAuthenticationRejectedError();
       }
-      throw new Error(service.safeMessage(error));
+      const panelMessage = (service as OpenRouterService & {
+        safePanelMessage?(failure: unknown): string;
+      }).safePanelMessage?.(error) ?? service.safeMessage(error);
+      throw new Error(panelMessage);
     }
   };
+}
+
+function findPanelAuthenticationRejection(
+  error: unknown,
+): PanelAuthenticationRejectedError | null {
+  const seen = new Set<unknown>();
+  let current = error;
+  for (let depth = 0; depth < 8 && current !== null && current !== undefined; depth += 1) {
+    if (current instanceof PanelAuthenticationRejectedError) return current;
+    if (seen.has(current) || !isRecord(current)) return null;
+    seen.add(current);
+    current = current.cause;
+  }
+  return null;
 }
 
 /** Rough tokens-per-character ratio for upfront panel cost estimates — same heuristic as the compressor's. */
