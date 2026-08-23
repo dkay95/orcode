@@ -10,8 +10,12 @@ import type {
 import {
   DEFAULT_CONFIG,
   CONFIG_SCHEMA_VERSION,
+  assertConfigFileSnapshot,
+  readConfigFileSnapshot,
   saveConfig as saveConfigDefault,
+  withConfigWriteLock,
   writeFileAtomicSecure,
+  type ConfigFileSnapshot,
 } from "./config.js";
 import {
   normalizeProviderSecret,
@@ -137,7 +141,11 @@ export interface ProviderActivationCoordinatorOptions {
   leaseDurationMs?: number;
   leaseAttempts?: number;
   waitForLease?: () => Promise<void>;
-  writeConfigAtomic?: (path: string, content: string) => Promise<void>;
+  writeConfigAtomic?: (
+    path: string,
+    content: string,
+    beforePublish?: () => Promise<void>,
+  ) => Promise<void>;
   /** @deprecated Transactional activation uses writeConfigAtomic for byte preservation. */
   saveConfig?: typeof saveConfigDefault;
   onBoundary?: (boundary: ProviderActivationBoundary) => void | Promise<void>;
@@ -169,6 +177,7 @@ type ConfigFacts =
     suffix: string;
     state: ProviderSetupStateV1;
     digest: string;
+    target: ConfigFileSnapshot;
   }
   | { kind: "corrupt" | "future" | "unreadable" };
 
@@ -254,6 +263,7 @@ export class ProviderActivationCoordinator {
     let transaction: TransactionJournal | null = null;
     let initialCandidateId: string | null = null;
     let revalidatedCandidateId: string | null = null;
+    let primaryFailed = false;
     try {
       await assertRuntimeLease(runtimeLease);
       const normalized = normalizeProviderSecret(request.candidate);
@@ -425,33 +435,85 @@ export class ProviderActivationCoordinator {
       manifest.phase = "credential-staged";
       await this.#writeJournal(transaction, manifest, providerLease);
       await this.#assertFence(providerLease);
-      const beforeSave = await readConfigFacts(this.#options.configPath);
-      await this.#assertFence(providerLease);
-      if ((beforeSave.kind !== "valid" && beforeSave.kind !== "absent")
-        || beforeSave.digest !== manifest.expectedProviderSetupSha256) {
+      let publication: "candidate" | "old" | "ambiguous";
+      try {
+        publication = await withConfigWriteLock(
+          this.#options.configPath,
+          async (ownership): Promise<"candidate" | "old" | "ambiguous"> => {
+            await ownership.assertHeld();
+            await this.#assertFence(providerLease!);
+            await assertRuntimeLease(runtimeLease);
+            await ownership.assertHeld();
+            const beforeSave = await readConfigFacts(ownership.canonicalPath);
+            await ownership.assertHeld();
+            await this.#assertFence(providerLease!);
+            await ownership.assertHeld();
+            if ((beforeSave.kind !== "valid" && beforeSave.kind !== "absent")
+              || beforeSave.digest !== manifest.expectedProviderSetupSha256) {
+              throw new ProviderActivationRecoveryRequiredError(
+                "provider-config-cas-mismatch",
+              );
+            }
+            const nextRaw = `${beforeSave.prefix}${JSON.stringify(nextState)}${beforeSave.suffix}`;
+            await assertRuntimeLease(runtimeLease);
+            await ownership.assertHeld();
+            try {
+              await this.#options.writeConfigAtomic(
+                ownership.canonicalPath,
+                nextRaw,
+                async () => {
+                  await ownership.assertHeld();
+                  await this.#assertFence(providerLease!);
+                  await assertRuntimeLease(runtimeLease);
+                  await assertConfigFileSnapshot(
+                    ownership.canonicalPath,
+                    beforeSave.target,
+                  );
+                  await ownership.assertHeld();
+                },
+              );
+            } catch {
+              // The exact readback below, not a write outcome, classifies a
+              // possible post-rename failure while ownership is still held.
+            }
+            await assertRuntimeLease(runtimeLease);
+            await ownership.assertHeld();
+            await this.#assertFence(providerLease!);
+            await assertRuntimeLease(runtimeLease);
+            await ownership.assertHeld();
+            await this.#boundary("config-written");
+            await ownership.assertHeld();
+            await this.#assertFence(providerLease!);
+            await ownership.assertHeld();
+            const afterSave = await readConfigFacts(ownership.canonicalPath);
+            await ownership.assertHeld();
+            await this.#assertFence(providerLease!);
+            await ownership.assertHeld();
+            if ((afterSave.kind === "valid" || afterSave.kind === "absent")
+              && exactCandidateState(afterSave, manifest)
+              && afterSave.prefix === beforeSave.prefix
+              && afterSave.suffix === beforeSave.suffix) {
+              return "candidate";
+            }
+            if ((afterSave.kind === "valid" || afterSave.kind === "absent")
+              && exactOldState(afterSave, manifest)) {
+              return "old";
+            }
+            return "ambiguous";
+          },
+          { signal: request.signal },
+        );
+      } catch (error) {
+        if (isBoundaryFault(error)
+          || isAbort(error, request.signal)
+          || error instanceof ProviderActivationError) {
+          throw error;
+        }
         throw new ProviderActivationRecoveryRequiredError(
-          "provider-config-cas-mismatch",
+          "provider-config-writer-ownership-failed",
         );
       }
-      const nextRaw = `${beforeSave.prefix}${JSON.stringify(nextState)}${beforeSave.suffix}`;
-      let saveError: unknown;
-      try {
-        await this.#options.writeConfigAtomic(this.#options.configPath, nextRaw);
-      } catch (error) {
-        saveError = error;
-      }
-      await this.#assertFence(providerLease);
-      await this.#boundary("config-written");
-      await this.#assertFence(providerLease);
-      const afterSave = await readConfigFacts(this.#options.configPath);
-      await this.#assertFence(providerLease);
-      if ((afterSave.kind === "valid" || afterSave.kind === "absent")
-        && exactCandidateState(afterSave, manifest)
-        && afterSave.prefix === beforeSave.prefix
-        && afterSave.suffix === beforeSave.suffix) {
-        // A post-rename error is non-authoritative; exact readback is the fact.
-      } else if ((afterSave.kind === "valid" || afterSave.kind === "absent")
-        && exactOldState(afterSave, manifest)) {
+      if (publication === "old") {
         const cleaned = await this.#cleanupFailedCandidate(
           candidateSlot,
           normalized,
@@ -468,8 +530,8 @@ export class ProviderActivationCoordinator {
           "provider-config-persistence-failed",
           "Provider config persistence failed without changing the active route.",
         );
-      } else {
-        void saveError;
+      }
+      if (publication === "ambiguous") {
         throw new ProviderActivationRecoveryRequiredError("provider-config-commit-ambiguous");
       }
       await this.#boundary("config-readback");
@@ -516,6 +578,7 @@ export class ProviderActivationCoordinator {
         warnings: Object.freeze(warnings),
       };
     } catch (error) {
+      primaryFailed = true;
       if (isBoundaryFault(error)) simulatedCrash = true;
       throw error;
     } finally {
@@ -539,7 +602,7 @@ export class ProviderActivationCoordinator {
         } catch {
           releaseFailed = true;
         }
-        if (releaseFailed) {
+        if (releaseFailed && !primaryFailed) {
           throw new ProviderActivationRecoveryRequiredError(
             "provider-activation-release-failed",
           );
@@ -562,6 +625,7 @@ export class ProviderActivationCoordinator {
       );
     }
     let providerLease: HeldProviderLease | null = null;
+    let primaryFailed = false;
     try {
       providerLease = await this.#acquireProviderLease(request.signal);
       const disposition = await this.#recoverDisposition(
@@ -571,6 +635,9 @@ export class ProviderActivationCoordinator {
       );
       if (disposition.kind === "recovery-required") throw disposition.error;
       return disposition.warnings;
+    } catch (error) {
+      primaryFailed = true;
+      throw error;
     } finally {
       let releaseFailed = false;
       if (providerLease) {
@@ -585,7 +652,7 @@ export class ProviderActivationCoordinator {
       } catch {
         releaseFailed = true;
       }
-      if (releaseFailed) {
+      if (releaseFailed && !primaryFailed) {
         throw new ProviderActivationRecoveryRequiredError(
           "provider-activation-release-failed",
         );
@@ -675,12 +742,14 @@ export class ProviderActivationCoordinator {
       manifest.expectedRevision + 1,
       request.signal,
     );
+    await assertRuntimeLease(runtimeLease);
     if (candidate.connectionId !== manifest.candidateConnectionId
       || candidate.accountFingerprint !== manifest.candidateRoute.accountFingerprint
       || candidate.billingRealm !== manifest.candidateRoute.billingRealm) {
       throw new ProviderActivationRecoveryRequiredError("provider-candidate-identity-mismatch");
     }
     const models = await this.#listModels(candidate.candidateId, request.signal);
+    await assertRuntimeLease(runtimeLease);
     const model = models.find((entry) =>
       entry.backendId === "openrouter"
       && entry.requestedModelId === manifest.candidateRoute.requestedModelId
@@ -690,6 +759,7 @@ export class ProviderActivationCoordinator {
       throw new ProviderActivationRecoveryRequiredError("provider-candidate-model-mismatch");
     }
     await this.#assertFence(lease);
+    await assertRuntimeLease(runtimeLease);
     try {
       const activated = await this.#activateRuntime(candidate.candidateId, model, request.signal);
       await assertRuntimeLease(runtimeLease);
@@ -1298,15 +1368,17 @@ function stateReferencesSlot(state: ProviderSetupStateV1, slotId: string): boole
 async function readConfigFacts(path: string): Promise<ConfigFacts> {
   let raw: string;
   let kind: "valid" | "absent" = "valid";
+  let target: ConfigFileSnapshot;
   try {
-    raw = await readFile(path, "utf8");
-  } catch (error) {
-    if (hasCode(error, "ENOENT")) {
-      kind = "absent";
-      raw = `${JSON.stringify(DEFAULT_CONFIG, null, 2)}\n`;
-    } else {
-      return { kind: "unreadable" };
-    }
+    target = await readConfigFileSnapshot(path);
+  } catch {
+    return { kind: "unreadable" };
+  }
+  if (target.kind === "absent") {
+    kind = "absent";
+    raw = `${JSON.stringify(DEFAULT_CONFIG, null, 2)}\n`;
+  } else {
+    raw = target.raw;
   }
   let parsed: unknown;
   try {
@@ -1335,6 +1407,7 @@ async function readConfigFacts(path: string): Promise<ConfigFacts> {
     suffix: raw.slice(span.end),
     state,
     digest: providerSetupDigest(state),
+    target,
   };
 }
 

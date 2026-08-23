@@ -36,6 +36,22 @@ import {
   type ProviderStateIssue,
   type ProviderSetupState,
 } from "./provider-state.js";
+import { withConfigWriteLock } from "./config-write-lock.js";
+import {
+  assertConfigFileSnapshot,
+  readConfigFileSnapshot,
+  type ConfigFileSnapshot,
+} from "./config-file.js";
+
+export {
+  withConfigWriteLock,
+  withConfigWriteLocks,
+} from "./config-write-lock.js";
+export {
+  assertConfigFileSnapshot,
+  readConfigFileSnapshot,
+  type ConfigFileSnapshot,
+} from "./config-file.js";
 
 export const APP_HOME = join(homedir(), ".orcode");
 /** Pre-rename state directory (the tool was called RouterCode before). `migrateAppHome` moves it once, on first startup. */
@@ -296,11 +312,47 @@ export async function saveConfig(
   config: ConfigInput,
   path = CONFIG_PATH,
 ): Promise<void> {
-  await refuseUnsafeStoredConfig(path);
-  const validated = validateConfig(config);
-  requirePersistableProviderState(validated.providerSetup);
-  await preserveBrokenConfig(path);
-  await writeFileAtomicSecure(path, `${JSON.stringify(validated, null, 2)}\n`);
+  const requested = validateConfig(config);
+  requirePersistableProviderState(requested.providerSetup);
+  await withConfigWriteLock(path, async (ownership) => {
+    const canonicalPath = ownership.canonicalPath;
+    await ownership.assertHeld();
+    await ensureSecureDirectory(dirname(canonicalPath));
+    await ownership.assertHeld();
+    const initialTarget = await readConfigFileSnapshot(canonicalPath);
+    await ownership.assertHeld();
+    refuseUnsafeStoredConfig(canonicalPath, initialTarget);
+    const providerSetup = currentPersistableProviderSetup(initialTarget)
+      ?? requested.providerSetup;
+    const validated = { ...requested, providerSetup };
+    await preserveBrokenConfig(canonicalPath, initialTarget);
+    await ownership.assertHeld();
+    const publishTarget = await readConfigFileSnapshot(canonicalPath);
+    await ownership.assertHeld();
+    const content = `${JSON.stringify(validated, null, 2)}\n`;
+    let writeError: unknown;
+    try {
+      await writeFileAtomicSecure(canonicalPath, content, async () => {
+        await ownership.assertHeld();
+        await assertConfigFileSnapshot(canonicalPath, publishTarget);
+        await ownership.assertHeld();
+      });
+    } catch (error) {
+      writeError = error;
+    }
+    await ownership.assertHeld();
+    let readback: string | null = null;
+    try {
+      const snapshot = await readConfigFileSnapshot(canonicalPath);
+      readback = snapshot.kind === "file" ? snapshot.raw : null;
+    } catch {
+      // Classified below without exposing the underlying path or bytes.
+    }
+    await ownership.assertHeld();
+    if (readback === content) return;
+    if (writeError !== undefined) throw writeError;
+    throw new Error("Config publication could not be verified.");
+  });
 }
 
 /**
@@ -332,6 +384,7 @@ const securedDirectories = new Set<string>();
 export async function writeFileAtomicSecure(
   path: string,
   content: string,
+  beforePublish?: () => Promise<void>,
 ): Promise<void> {
   await ensureSecureDirectory(dirname(path));
   const temporary = `${path}.${randomUUID()}.tmp`;
@@ -341,6 +394,7 @@ export async function writeFileAtomicSecure(
       mode: SECURE_FILE_MODE,
       flag: "wx",
     });
+    await beforePublish?.();
     await rename(temporary, path);
   } catch (error) {
     await unlink(temporary).catch(() => {});
@@ -681,9 +735,13 @@ function defaults(): OrcodeConfigWithBudget {
   };
 }
 
-async function refuseUnsafeStoredConfig(path: string): Promise<void> {
+function refuseUnsafeStoredConfig(
+  path: string,
+  snapshot: ConfigFileSnapshot,
+): void {
+  if (snapshot.kind === "absent") return;
   try {
-    const parsed: unknown = JSON.parse(await readFile(path, "utf8"));
+    const parsed: unknown = JSON.parse(snapshot.raw);
     if (
       isRecord(parsed) &&
       typeof parsed.schemaVersion === "number" &&
@@ -702,9 +760,25 @@ async function refuseUnsafeStoredConfig(path: string): Promise<void> {
       }
     }
   } catch (error) {
-    if (error instanceof SyntaxError || hasCode(error, "ENOENT")) return;
+    if (error instanceof SyntaxError) return;
     throw error;
   }
+}
+
+function currentPersistableProviderSetup(
+  snapshot: ConfigFileSnapshot,
+): ProviderSetupState | null {
+  if (snapshot.kind === "absent") return null;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(snapshot.raw);
+  } catch {
+    return null;
+  }
+  if (!isRecord(parsed) || !("providerSetup" in parsed)) return null;
+  const providerSetup = validateProviderSetupState(parsed.providerSetup);
+  requirePersistableProviderState(providerSetup);
+  return parsed.providerSetup as ProviderSetupState;
 }
 
 function normalizeProviderSetupInput(value: unknown): ProviderSetupState {
@@ -741,15 +815,16 @@ type ProviderPreflight =
   | { kind: "issue"; issue: ProviderStateIssue };
 
 async function readProviderPreflight(path: string): Promise<ProviderPreflight> {
-  let raw: string;
+  let snapshot: ConfigFileSnapshot;
   try {
-    raw = await readFile(path, "utf8");
-  } catch (error) {
-    return hasCode(error, "ENOENT") ? { kind: "absent" } : { kind: "clear" };
+    snapshot = await readConfigFileSnapshot(path);
+  } catch {
+    return { kind: "clear" };
   }
+  if (snapshot.kind === "absent") return { kind: "absent" };
   let parsed: unknown;
   try {
-    parsed = JSON.parse(raw);
+    parsed = JSON.parse(snapshot.raw);
   } catch {
     return { kind: "clear" };
   }
@@ -766,21 +841,20 @@ async function readProviderPreflight(path: string): Promise<ProviderPreflight> {
  * A config we could not parse is user data. Keep a copy instead of letting the
  * next write destroy it silently.
  */
-async function preserveBrokenConfig(path: string): Promise<void> {
-  let raw: string;
+async function preserveBrokenConfig(
+  path: string,
+  snapshot: ConfigFileSnapshot,
+): Promise<void> {
+  if (snapshot.kind === "absent") return;
   try {
-    raw = await readFile(path, "utf8");
-  } catch {
-    return;
-  }
-  try {
-    const parsed: unknown = JSON.parse(raw);
+    const parsed: unknown = JSON.parse(snapshot.raw);
     if (isRecord(parsed)) {
       return;
     }
   } catch {
     // fall through: unparsable
   }
+  await assertConfigFileSnapshot(path, snapshot);
   await rename(path, `${path}.beschaedigt`).catch(() => {});
 }
 

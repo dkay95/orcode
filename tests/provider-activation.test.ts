@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, readFile, readdir, rename, symlink, writeFile } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, readFile, readdir, rename, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -7,6 +7,7 @@ import {
   DEFAULT_CONFIG,
   loadConfigDetailed,
   saveConfig,
+  withConfigWriteLock,
   writeFileAtomicSecure,
   type OrcodeConfigWithBudget,
 } from "../src/config.js";
@@ -215,6 +216,11 @@ class FakeAdapter {
   runtimeSecret = OLD_SECRET;
   runtimeRoute: RouteIdentityV1 | null = oldRoute();
   activateFailure: "before" | "after" | null = null;
+  connectFailure: Error | null = null;
+  connectReached: (() => void) | null = null;
+  connectPause: Promise<void> | null = null;
+  listModelsReached: (() => void) | null = null;
+  listModelsPause: Promise<void> | null = null;
   activateReached: (() => void) | null = null;
   activatePause: Promise<void> | null = null;
 
@@ -226,6 +232,9 @@ class FakeAdapter {
     assert.equal(request.signal.aborted, false);
     assert.equal(typeof request.candidate, "string");
     this.calls.push("connect");
+    this.connectReached?.();
+    if (this.connectPause) await this.connectPause;
+    if (this.connectFailure) throw this.connectFailure;
     const secret = request.candidate as string;
     const candidateId = `candidate-${++this.candidateCounter}`;
     this.candidates.set(candidateId, secret);
@@ -246,6 +255,8 @@ class FakeAdapter {
     assert.equal(request.signal.aborted, false);
     assert.equal(this.candidates.has(request.candidateId ?? ""), true);
     this.calls.push("listModels");
+    this.listModelsReached?.();
+    if (this.listModelsPause) await this.listModelsPause;
     return [MODEL];
   }
 
@@ -500,6 +511,49 @@ test("cancellation while waiting on a live lease is preserved and writes no dura
   assert.equal(await store.readClaimOwner(claim), owner);
 });
 
+test("cancellation while waiting on config writer ownership preserves the exact reason", async () => {
+  const fixture = await activationFixture();
+  let lockReached!: () => void;
+  let releaseLock!: () => void;
+  const reached = new Promise<void>((resolve) => { lockReached = resolve; });
+  const pause = new Promise<void>((resolve) => { releaseLock = resolve; });
+  const held = withConfigWriteLock(fixture.path, async () => {
+    lockReached();
+    await pause;
+  });
+  await reached;
+  let candidateRevalidated!: () => void;
+  const staged = new Promise<void>((resolve) => { candidateRevalidated = resolve; });
+  const controller = new AbortController();
+  const reason = new DOMException("exact config wait cancellation", "AbortError");
+  const coordinator = new fixture.api.ProviderActivationCoordinator({
+    appHome: fixture.appHome,
+    configPath: fixture.path,
+    privateStore: fixture.privateStore,
+    credentials: fixture.credentials,
+    adapter: fixture.adapter,
+    stateStore: fixture.stateStore,
+    runtimeGuard: fixture.runtimeGuard,
+    now: () => 10_000,
+    createUuid: sequentialUuid(),
+    leaseDurationMs: 100,
+    onBoundary: (boundary: Boundary) => {
+      if (boundary === "candidate-revalidated") candidateRevalidated();
+    },
+  });
+  const beforeConfig = await readFile(fixture.path, "utf8");
+  const activation = coordinator.activate({ ...fixture.request, signal: controller.signal });
+  await staged;
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  controller.abort(reason);
+
+  await assert.rejects(activation, (error: unknown) => error === reason);
+  assert.equal(await readFile(fixture.path, "utf8"), beforeConfig);
+  assert.equal(fixture.credentials.slots.get(OLD_SLOT.id), OLD_SECRET);
+  releaseLock();
+  await held;
+});
+
 test("the held runtime guard prevents a run from starting through config commit and runtime bind", async () => {
   const fixture = await activationFixture();
   let tried = false;
@@ -543,6 +597,24 @@ test("a post-rename config throw is classified by exact readback and continues w
   assert.equal(tuple.secret, NEW_SECRET);
 });
 
+test("provider publication rejects a symlinked config target without consuming outside bytes", async () => {
+  const fixture = await activationFixture();
+  const outsideRoot = await mkdtemp(join(tmpdir(), "orcode-provider-config-outside-"));
+  const outside = join(outsideRoot, "outside.json");
+  await rename(fixture.path, outside);
+  await symlink(outside, fixture.path);
+  const beforeOutside = await readFile(outside, "utf8");
+
+  const error = await fixture.activate().catch((reason: unknown) => reason);
+
+  assert.ok(error instanceof fixture.api.ProviderActivationRecoveryRequiredError);
+  assert.doesNotMatch(String(error), /old-provider-secret|outside|secret-marker/i);
+  assert.equal((await lstat(fixture.path)).isSymbolicLink(), true);
+  assert.equal(await readFile(outside, "utf8"), beforeOutside);
+  assert.equal(fixture.credentials.calls.includes("reserveSlot"), false);
+  assert.deepEqual(await journalDirectories(fixture.appHome), []);
+});
+
 test("a paused unrelated config writer is preserved by the final fenced reread and providerSetup-only merge", async () => {
   const fixture = await activationFixture();
   const preservedMainModel = "preserve/concurrent-writer-main";
@@ -569,6 +641,72 @@ test("a paused unrelated config writer is preserved by the final fenced reread a
 
   const saved = JSON.parse(await readFile(fixture.path, "utf8")) as Record<string, unknown>;
   assert.equal(saved.mainModel, preservedMainModel);
+});
+
+test("provider publication serializes an independent saveConfig writer without losing either complete update", async () => {
+  const fixture = await activationFixture();
+  let publishReached!: () => void;
+  let resumePublish!: () => void;
+  const reached = new Promise<void>((resolve) => { publishReached = resolve; });
+  const pause = new Promise<void>((resolve) => { resumePublish = resolve; });
+  const coordinator = new fixture.api.ProviderActivationCoordinator({
+    appHome: fixture.appHome,
+    configPath: fixture.path,
+    privateStore: fixture.privateStore,
+    credentials: fixture.credentials,
+    adapter: fixture.adapter,
+    stateStore: fixture.stateStore,
+    runtimeGuard: fixture.runtimeGuard,
+    now: () => 10_000,
+    createUuid: sequentialUuid(),
+    leaseDurationMs: 100,
+    writeConfigAtomic: async (path: string, content: string) => {
+      publishReached();
+      await pause;
+      await writeFileAtomicSecure(path, content);
+    },
+  });
+  const activation = coordinator.activate(fixture.request);
+  await reached;
+
+  const unrelated = structuredClone(fixture.initialConfig);
+  unrelated.mainModel = "preserve/independent-config-writer";
+  let unrelatedSettled = false;
+  const unrelatedWrite = saveConfig(unrelated, fixture.path).then(() => {
+    unrelatedSettled = true;
+  });
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  const settledWhileProviderOwned = unrelatedSettled;
+  resumePublish();
+  await Promise.all([activation, unrelatedWrite]);
+
+  const saved = JSON.parse(await readFile(fixture.path, "utf8")) as {
+    mainModel: string;
+    providerSetup: ProviderSetupStateV1;
+  };
+  assert.equal(settledWhileProviderOwned, false);
+  assert.equal(saved.mainModel, "preserve/independent-config-writer");
+  assert.equal(saved.providerSetup.revision, fixture.oldState.revision + 1);
+  assert.equal(saved.providerSetup.connections[0]?.credentialSlot, NEW_SLOT_ID);
+  assert.deepEqual(saved.providerSetup.defaultRoute, newRoute());
+});
+
+test("a stale ordinary config writer after activation preserves the committed providerSetup", async () => {
+  const fixture = await activationFixture();
+  const stale = structuredClone(fixture.initialConfig);
+
+  await fixture.activate();
+  stale.mainModel = "preserve/stale-writer-after-activation";
+  await saveConfig(stale, fixture.path);
+
+  const saved = JSON.parse(await readFile(fixture.path, "utf8")) as {
+    mainModel: string;
+    providerSetup: ProviderSetupStateV1;
+  };
+  assert.equal(saved.mainModel, "preserve/stale-writer-after-activation");
+  assert.equal(saved.providerSetup.revision, fixture.oldState.revision + 1);
+  assert.equal(saved.providerSetup.connections[0]?.credentialSlot, NEW_SLOT_ID);
+  assert.deepEqual(saved.providerSetup.defaultRoute, newRoute());
 });
 
 test("raw config CAS preserves every unrelated byte including whitespace unknown fields and 21 fallbacks", async () => {
@@ -924,6 +1062,134 @@ test("lost runtime guard during awaited recovery bind blocks old-slot and journa
   assert.equal((await journalDirectories(fixture.appHome)).length, 1);
 });
 
+test("recovery guard loss during awaited candidate connect prevents runtime bind", async () => {
+  const fixture = await activationFixture({ crashAfter: "config-readback" });
+  await assert.rejects(fixture.activate());
+  let reached!: () => void;
+  let resume!: () => void;
+  const reachedPromise = new Promise<void>((resolve) => { reached = resolve; });
+  fixture.adapter.connectReached = reached;
+  fixture.adapter.connectPause = new Promise<void>((resolve) => { resume = resolve; });
+  const recoveryGuard = new FakeRuntimeGuard();
+  const coordinator = new fixture.api.ProviderActivationCoordinator({
+    appHome: fixture.appHome,
+    configPath: fixture.path,
+    privateStore: fixture.privateStore,
+    credentials: fixture.credentials,
+    adapter: fixture.adapter,
+    stateStore: fixture.stateStore,
+    runtimeGuard: recoveryGuard,
+    now: () => 20_000,
+    createUuid: sequentialUuid(),
+    leaseDurationMs: 100,
+  });
+  const activateCallsBefore = fixture.adapter.calls.filter((call) => call === "activate").length;
+
+  const recovery = coordinator.recover({
+    signal: new AbortController().signal,
+    inspectCommitted: true,
+  });
+  await reachedPromise;
+  recoveryGuard.lose();
+  resume();
+
+  await assert.rejects(recovery, fixture.api.ProviderActivationRecoveryRequiredError);
+  assert.equal(
+    fixture.adapter.calls.filter((call) => call === "activate").length,
+    activateCallsBefore,
+  );
+  assert.equal((await journalDirectories(fixture.appHome)).length, 1);
+});
+
+test("recovery guard loss during awaited model listing prevents runtime bind", async () => {
+  const fixture = await activationFixture({ crashAfter: "config-readback" });
+  await assert.rejects(fixture.activate());
+  let reached!: () => void;
+  let resume!: () => void;
+  const reachedPromise = new Promise<void>((resolve) => { reached = resolve; });
+  fixture.adapter.listModelsReached = reached;
+  fixture.adapter.listModelsPause = new Promise<void>((resolve) => { resume = resolve; });
+  const recoveryGuard = new FakeRuntimeGuard();
+  const coordinator = new fixture.api.ProviderActivationCoordinator({
+    appHome: fixture.appHome,
+    configPath: fixture.path,
+    privateStore: fixture.privateStore,
+    credentials: fixture.credentials,
+    adapter: fixture.adapter,
+    stateStore: fixture.stateStore,
+    runtimeGuard: recoveryGuard,
+    now: () => 20_000,
+    createUuid: sequentialUuid(),
+    leaseDurationMs: 100,
+  });
+  const activateCallsBefore = fixture.adapter.calls.filter((call) => call === "activate").length;
+
+  const recovery = coordinator.recover({
+    signal: new AbortController().signal,
+    inspectCommitted: true,
+  });
+  await reachedPromise;
+  recoveryGuard.lose();
+  resume();
+
+  await assert.rejects(recovery, fixture.api.ProviderActivationRecoveryRequiredError);
+  assert.equal(
+    fixture.adapter.calls.filter((call) => call === "activate").length,
+    activateCallsBefore,
+  );
+  assert.equal((await journalDirectories(fixture.appHome)).length, 1);
+});
+
+test("recovery guard loss during the final provider fence prevents runtime bind", async () => {
+  const fixture = await activationFixture({ crashAfter: "config-readback" });
+  await assert.rejects(fixture.activate());
+  let reached!: () => void;
+  let resume!: () => void;
+  const reachedPromise = new Promise<void>((resolve) => { reached = resolve; });
+  const pause = new Promise<void>((resolve) => { resume = resolve; });
+  let listCompleted = false;
+  let fencePaused = false;
+  fixture.adapter.listModelsReached = () => { listCompleted = true; };
+  const originalAssert = fixture.privateStore.assertDirectoryClaim.bind(fixture.privateStore);
+  fixture.privateStore.assertDirectoryClaim = async (claim) => {
+    await originalAssert(claim);
+    if (listCompleted && !fencePaused) {
+      fencePaused = true;
+      reached();
+      await pause;
+    }
+  };
+  const recoveryGuard = new FakeRuntimeGuard();
+  const coordinator = new fixture.api.ProviderActivationCoordinator({
+    appHome: fixture.appHome,
+    configPath: fixture.path,
+    privateStore: fixture.privateStore,
+    credentials: fixture.credentials,
+    adapter: fixture.adapter,
+    stateStore: fixture.stateStore,
+    runtimeGuard: recoveryGuard,
+    now: () => 20_000,
+    createUuid: sequentialUuid(),
+    leaseDurationMs: 100,
+  });
+  const activateCallsBefore = fixture.adapter.calls.filter((call) => call === "activate").length;
+
+  const recovery = coordinator.recover({
+    signal: new AbortController().signal,
+    inspectCommitted: true,
+  });
+  await reachedPromise;
+  recoveryGuard.lose();
+  resume();
+
+  await assert.rejects(recovery, fixture.api.ProviderActivationRecoveryRequiredError);
+  assert.equal(
+    fixture.adapter.calls.filter((call) => call === "activate").length,
+    activateCallsBefore,
+  );
+  assert.equal((await journalDirectories(fixture.appHome)).length, 1);
+});
+
 test("runtime release failure after process-only bind is fixed recovery-required not success", async () => {
   const fixture = await activationFixture();
   fixture.runtimeGuard.failRelease = true;
@@ -973,6 +1239,54 @@ test("provider and runtime release failures are both attempted and aggregated re
   assert.equal(providerReleaseCalls, 1);
   assert.equal(fixture.runtimeGuard.releaseCalls, 1);
 });
+
+for (const primary of ["abort", "provider-error"] as const) {
+  for (const releaseFailure of ["runtime", "provider", "both"] as const) {
+    test(`${primary} primary survives ${releaseFailure} release failure while both releases are attempted`, async () => {
+      const fixture = await activationFixture({ crashAfter: "config-readback" });
+      await assert.rejects(fixture.activate());
+      const staleLease = await fixture.privateStore.adoptDirectoryClaim(
+        join(fixture.appHome, "provider-setup.lock"),
+      );
+      const staleOwner = await fixture.privateStore.readClaimOwner(staleLease.claim);
+      await fixture.privateStore.releaseDirectoryClaim(staleLease.claim, staleOwner);
+      fixture.runtimeGuard.lose();
+      fixture.runtimeGuard.failRelease = releaseFailure !== "provider";
+      fixture.adapter.connectFailure = primary === "abort"
+        ? new DOMException("raw-abort-primary-secret-marker", "AbortError")
+        : new Error("raw-provider-primary-secret-marker");
+      let providerReleaseCalls = 0;
+      const originalRelease = fixture.privateStore.releaseDirectoryClaim.bind(
+        fixture.privateStore,
+      );
+      fixture.privateStore.releaseDirectoryClaim = async (claim, expectedOwner) => {
+        if (expectedOwner !== null) {
+          providerReleaseCalls += 1;
+          if (releaseFailure !== "runtime") {
+            throw new Error("raw-provider-release-secret-marker");
+          }
+        }
+        return originalRelease(claim, expectedOwner);
+      };
+
+      const error = await fixture.recover(true).catch((reason: unknown) => reason);
+
+      if (primary === "abort") {
+        assert.ok(error instanceof DOMException);
+        assert.equal(error.name, "AbortError");
+      } else {
+        assert.ok(error instanceof fixture.api.ProviderActivationError);
+        assert.equal(error.code, "provider-candidate-validation-failed");
+      }
+      assert.doesNotMatch(
+        String(error),
+        /raw-provider|raw-runtime|raw-abort|secret-marker/i,
+      );
+      assert.equal(providerReleaseCalls, 1);
+      assert.equal(fixture.runtimeGuard.releaseCalls, 1);
+    });
+  }
+}
 
 test("restart inspection after bind failure authenticates binds and only then cleans old v1", async () => {
   const fixture = await activationFixture();

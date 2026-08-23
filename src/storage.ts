@@ -10,6 +10,19 @@ import {
 import { basename, dirname, join, relative, resolve as resolvePath, sep } from "node:path";
 import { deserializeConversationState } from "@openrouter/agent";
 import { PrivateStore } from "./private-store.js";
+import {
+  withConfigWriteLock,
+  withConfigWriteLocks,
+} from "./config-write-lock.js";
+import {
+  assertConfigFileSnapshot,
+  readConfigFileSnapshot,
+  type ConfigFileSnapshot,
+} from "./config-file.js";
+import {
+  isProviderStateIssue,
+  validateProviderSetupState,
+} from "./provider-state.js";
 import { redactRunEvent, redactValue } from "./redaction.js";
 import { normalizePermissionRuleFile, type PermissionRule, type RuleFileV2 } from "./rules.js";
 import type { AgentRunEvent } from "./types.js";
@@ -732,42 +745,95 @@ export async function migrateStorageHome(
     };
   }
 
-  for (const destination of manifest.destinationPaths) {
-    const staged = join(manifest.stagingPath, relative(newHome, destination));
-    await privateStore.writeTextAtomic(destination, await readFile(staged, "utf8"));
-  }
-  manifest.phase = "committed";
-  await persistManifest(newHome, manifest, privateStore);
-  await options.onPhase?.("committed", manifest);
-
-  if (await checksumTree(manifest.sourcePath) !== manifest.sourceChecksum) {
-    return {
-      status: "recovery-required",
-      appHome: newHome,
-      warning: "Migrationsquelle wurde vor dem Backup-Rename verändert; Quelle bleibt erhalten.",
-    };
-  }
-
+  let publicationFailure: AppHomeMigrationResult | null;
   try {
-    if (await pathExists(manifest.sourcePath)) {
-      await privateStore.ensureDirectory(dirname(manifest.backupPath));
-      if (await pathExists(manifest.backupPath)) {
-        throw new Error(`Migration-Backup existiert bereits: ${manifest.backupPath}`);
-      }
-      await privateStore.renameTree(
-        manifest.sourcePath,
-        manifest.backupPath,
-        dirname(manifest.sourcePath),
+    const sourceConfigPath = resolvePath(join(manifest.sourcePath, "config.json"));
+    const destinationConfigPath = resolvePath(join(newHome, "config.json"));
+    publicationFailure = await withConfigWriteLocks([
+      sourceConfigPath,
+      destinationConfigPath,
+    ], async (ownerships) => {
+      const ownershipByPath = new Map(
+        ownerships.map((ownership) => [ownership.canonicalPath, ownership]),
       );
-    }
-    await privateStore.protectTree(manifest.backupPath);
+      const sourceOwnership = ownershipByPath.get(
+        sourceConfigPath,
+      )!;
+      await sourceOwnership.assertHeld();
+      for (const destination of manifest.destinationPaths) {
+        const staged = join(manifest.stagingPath, relative(newHome, destination));
+        const content = await readFile(staged, "utf8");
+        if (basename(destination) === "config.json") {
+          const ownership = ownershipByPath.get(destinationConfigPath)!;
+          await ownership.assertHeld();
+          const merged = await preserveCurrentProviderSetup(
+            ownership.canonicalPath,
+            content,
+          );
+          await ownership.assertHeld();
+          await privateStore.writeTextAtomic(
+            ownership.canonicalPath,
+            merged.content,
+            async () => {
+              await ownership.assertHeld();
+              await assertConfigFileSnapshot(
+                ownership.canonicalPath,
+                merged.target,
+              );
+              await ownership.assertHeld();
+            },
+          );
+          await ownership.assertHeld();
+        } else {
+          await privateStore.writeTextAtomic(destination, content);
+        }
+      }
+      manifest.phase = "committed";
+      await persistManifest(newHome, manifest, privateStore);
+      await options.onPhase?.("committed", manifest);
+      await sourceOwnership.assertHeld();
+
+      if (await checksumTree(manifest.sourcePath) !== manifest.sourceChecksum) {
+        return {
+          status: "recovery-required",
+          appHome: newHome,
+          warning: "Migrationsquelle wurde vor dem Backup-Rename verändert; Quelle bleibt erhalten.",
+        };
+      }
+      await sourceOwnership.assertHeld();
+
+      try {
+        if (await pathExists(manifest.sourcePath)) {
+          await privateStore.ensureDirectory(dirname(manifest.backupPath));
+          if (await pathExists(manifest.backupPath)) {
+            throw new Error(`Migration-Backup existiert bereits: ${manifest.backupPath}`);
+          }
+          await sourceOwnership.assertHeld();
+          await privateStore.renameTree(
+            manifest.sourcePath,
+            manifest.backupPath,
+            dirname(manifest.sourcePath),
+          );
+          await sourceOwnership.assertHeld();
+        }
+        await privateStore.protectTree(manifest.backupPath);
+      } catch (error) {
+        return {
+          status: "recovery-required",
+          appHome: newHome,
+          warning: `Migrations-Backup konnte nicht sicher veröffentlicht werden: ${errorText(error)}`,
+        };
+      }
+      return null;
+    });
   } catch (error) {
     return {
       status: "recovery-required",
       appHome: newHome,
-      warning: `Migrations-Backup konnte nicht sicher veröffentlicht werden: ${errorText(error)}`,
+      warning: `Config-Writer-Serialisierung konnte nicht verifiziert werden: ${errorText(error)}`,
     };
   }
+  if (publicationFailure) return publicationFailure;
   manifest.phase = "backed-up";
   await persistManifest(newHome, manifest, privateStore);
   await options.onPhase?.("backed-up", manifest);
@@ -1011,8 +1077,9 @@ async function stageConfig(
   const source = currentExists
     ? destination
     : join(manifest.sourcePath, "config.json");
-  if (!(await pathExists(source))) return;
-  const raw = await readFile(source, "utf8");
+  const sourceSnapshot = await readConfigFileSnapshot(source);
+  if (sourceSnapshot.kind === "absent") return;
+  const raw = sourceSnapshot.raw;
   const value = parseRecord(raw);
   const originalVersion = value.schemaVersion;
   value.schemaVersion = STORAGE_SCHEMA_VERSION;
@@ -1104,11 +1171,39 @@ async function migrateCurrentConfig(
   normalizeConfig: AppHomeMigrationOptions["normalizeConfig"],
 ): Promise<AppHomeMigrationResult> {
   const path = join(appHome, "config.json");
-  if (!(await pathExists(path))) return { status: "ready", appHome, warning: null };
-  let value: Record<string, unknown>;
-  let raw: string;
   try {
-    raw = await readFile(path, "utf8");
+    return await withConfigWriteLock(path, async (ownership) => migrateCurrentConfigUnderLock(
+      appHome,
+      ownership.canonicalPath,
+      ownership.assertHeld,
+      store,
+      maxBackupBytes,
+      normalizeConfig,
+    ));
+  } catch {
+    return {
+      status: "recovery-required",
+      appHome,
+      warning: "Config-Migration konnte die exakte Zielidentität nicht verifizieren.",
+    };
+  }
+}
+
+async function migrateCurrentConfigUnderLock(
+  appHome: string,
+  path: string,
+  assertHeld: () => Promise<void>,
+  store: PrivateStore,
+  maxBackupBytes: number,
+  normalizeConfig: AppHomeMigrationOptions["normalizeConfig"],
+): Promise<AppHomeMigrationResult> {
+  await assertHeld();
+  const target = await readConfigFileSnapshot(path);
+  await assertHeld();
+  if (target.kind === "absent") return { status: "ready", appHome, warning: null };
+  let value: Record<string, unknown>;
+  const raw = target.raw;
+  try {
     value = parseRecord(raw);
   } catch {
     return { status: "ready", appHome, warning: null };
@@ -1146,8 +1241,35 @@ async function migrateCurrentConfig(
     return { status: "declined", appHome, warning: "Config-Migration abgebrochen: PrivateStore ist nicht verfügbar." };
   }
   if (!(await pathExists(backup))) await store.writeTextAtomic(backup, raw);
-  await store.writeTextAtomic(path, `${JSON.stringify(normalized, null, 2)}\n`);
+  await assertHeld();
+  await store.writeTextAtomic(
+    path,
+    `${JSON.stringify(normalized, null, 2)}\n`,
+    async () => {
+      await assertHeld();
+      await assertConfigFileSnapshot(path, target);
+      await assertHeld();
+    },
+  );
+  await assertHeld();
   return { status: "ready", appHome, warning: null };
+}
+
+async function preserveCurrentProviderSetup(
+  path: string,
+  candidateRaw: string,
+): Promise<{ content: string; target: ConfigFileSnapshot }> {
+  const target = await readConfigFileSnapshot(path);
+  if (target.kind === "absent") return { content: candidateRaw, target };
+  const current = parseRecord(target.raw);
+  if (!("providerSetup" in current)) return { content: candidateRaw, target };
+  const validated = validateProviderSetupState(current.providerSetup);
+  if (isProviderStateIssue(validated)) {
+    throw new Error("Config migration refuses an ambiguous provider setup.");
+  }
+  const candidate = parseRecord(candidateRaw);
+  candidate.providerSetup = current.providerSetup;
+  return { content: `${JSON.stringify(candidate, null, 2)}\n`, target };
 }
 
 async function resumeAfterLegacyRename(
@@ -1286,7 +1408,9 @@ function hasErrorCode(error: unknown, code: string): boolean {
 
 async function futureConfigVersion(home: string): Promise<number | null> {
   try {
-    const value = parseRecord(await readFile(join(home, "config.json"), "utf8"));
+    const snapshot = await readConfigFileSnapshot(join(home, "config.json"));
+    if (snapshot.kind === "absent") return null;
+    const value = parseRecord(snapshot.raw);
     return typeof value.schemaVersion === "number" && value.schemaVersion > STORAGE_SCHEMA_VERSION
       ? value.schemaVersion
       : null;
@@ -1566,7 +1690,9 @@ async function pendingConfigBackupSize(
 ): Promise<number> {
   const path = join(appHome, "config.json");
   try {
-    const raw = await readFile(path, "utf8");
+    const snapshot = await readConfigFileSnapshot(path);
+    if (snapshot.kind === "absent") return 0;
+    const raw = snapshot.raw;
     const value = parseRecord(raw);
     const originalVersion = value.schemaVersion;
     value.schemaVersion = STORAGE_SCHEMA_VERSION;

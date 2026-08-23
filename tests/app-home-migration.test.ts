@@ -8,6 +8,7 @@ import {
   mkdtemp,
   readFile,
   readdir,
+  rename,
   rm,
   stat,
   symlink,
@@ -23,8 +24,9 @@ import {
   serializeConversationState,
 } from "@openrouter/agent";
 import { initializeStartupStorage } from "../src/cli.js";
-import { migrateAppHome } from "../src/config.js";
+import { migrateAppHome, withConfigWriteLock } from "../src/config.js";
 import { CredentialStore } from "../src/credentials.js";
+import { PrivateStore } from "../src/private-store.js";
 import { approvalSubjectFingerprint } from "../src/rules.js";
 import {
   migrationManifestPath,
@@ -459,6 +461,62 @@ test("migration refuses a symlinked legacy source before rename and leaves its t
   assert.equal(await readFile(join(outsideSource, "config.json"), "utf8"), originalConfig);
 });
 
+test("legacy root rename holds the source config writer ownership through the move", async () => {
+  const root = await mkdtemp(join(tmpdir(), "orcode-migration-source-config-lock-"));
+  const legacy = join(root, ".routercode");
+  const target = join(root, ".orcode");
+  await seedHome(legacy);
+  const privateStore = new PrivateStore({ root: target });
+  const originalRename = privateStore.renameTree.bind(privateStore);
+  let renameReached!: () => void;
+  let resumeRename!: () => void;
+  const reached = new Promise<void>((resolve) => { renameReached = resolve; });
+  const pause = new Promise<void>((resolve) => { resumeRename = resolve; });
+  privateStore.renameTree = async (...args) => {
+    if (args[0] === legacy) {
+      renameReached();
+      await pause;
+    }
+    return originalRename(...args);
+  };
+  const migration = migrateAppHome(target, legacy, { privateStore });
+  await reached;
+
+  const controller = new AbortController();
+  const reason = new DOMException("stale legacy writer cancelled", "AbortError");
+  let writerEntered = false;
+  let releaseWriter!: () => void;
+  const writerPause = new Promise<void>((resolve) => { releaseWriter = resolve; });
+  const writer = withConfigWriteLock(join(legacy, "config.json"), async () => {
+    writerEntered = true;
+    await writerPause;
+  }, { signal: controller.signal });
+  const writerOutcomePromise = writer.then(
+    () => null,
+    (error: unknown) => error,
+  );
+  for (let turn = 0; turn < 1_000 && !writerEntered; turn += 1) {
+    await new Promise<void>((resolve) => setImmediate(resolve));
+  }
+  const enteredWhileRenamePaused = writerEntered;
+  if (!writerEntered) {
+    controller.abort(reason);
+  }
+  resumeRename();
+  const result = await migration;
+  for (let turn = 0; turn < 20 && !writerEntered; turn += 1) {
+    await new Promise<void>((resolve) => setImmediate(resolve));
+  }
+  if (writerEntered) {
+    releaseWriter();
+  }
+  const writerOutcome = await writerOutcomePromise;
+
+  assert.equal(enteredWhileRenamePaused, false);
+  void writerOutcome;
+  assert.equal((result as typeof result & { status?: string }).status, "ready");
+});
+
 test("a complete manifest resumes exact staging cleanup before startup reports ready", async () => {
   const root = await mkdtemp(join(tmpdir(), "orcode-migration-cleanup-resume-"));
   const legacy = join(root, ".routercode");
@@ -777,6 +835,62 @@ test("new-only unversioned config is validated and atomically upgraded with one 
   assert.equal((upgraded as { maxSteps?: number }).maxSteps, 12);
   assert.equal(backups.length, 1);
   assert.equal(await readFile(join(target, "migration-backups", backups[0]!), "utf8"), original);
+});
+
+test("current-home migration rejects a symlinked config target without replacing outside bytes", async () => {
+  const root = await mkdtemp(join(tmpdir(), "orcode-current-config-symlink-"));
+  const legacy = join(root, ".routercode");
+  const target = join(root, ".orcode");
+  const outside = join(root, "outside.json");
+  const config = join(target, "config.json");
+  const sentinel = '{"outside":"migration-secret-sentinel"}\n';
+  await mkdir(target, { recursive: true });
+  await writeFile(outside, sentinel, "utf8");
+  await symlink(outside, config);
+
+  const result = await migrateAppHome(target, legacy);
+
+  assert.equal((result as typeof result & { status?: string }).status, "recovery-required");
+  assert.equal((await lstat(config)).isSymbolicLink(), true);
+  assert.equal(await readFile(outside, "utf8"), sentinel);
+  assert.doesNotMatch(String(result.warning), /migration-secret-sentinel/);
+});
+
+test("current-home migration refuses a config target swapped before atomic publish", async () => {
+  const root = await mkdtemp(join(tmpdir(), "orcode-current-config-swap-"));
+  const legacy = join(root, ".routercode");
+  const target = join(root, ".orcode");
+  const config = join(target, "config.json");
+  const originalCopy = join(target, "config.original.json");
+  const outside = join(root, "outside.json");
+  const sentinel = '{"outside":"swap-secret-sentinel"}\n';
+  await mkdir(target, { recursive: true });
+  await writeFile(config, JSON.stringify({ mainModel: "legacy/model" }), "utf8");
+  await writeFile(outside, sentinel, "utf8");
+  const privateStore = new PrivateStore({ root: target });
+  type AtomicWrite = (
+    path: string,
+    content: string,
+    beforePublish?: () => Promise<void>,
+  ) => Promise<void>;
+  const originalWrite = privateStore.writeTextAtomic.bind(privateStore) as AtomicWrite;
+  let swapped = false;
+  privateStore.writeTextAtomic = (async (path, content, beforePublish) => {
+    if (path === config && !swapped) {
+      swapped = true;
+      await rename(config, originalCopy);
+      await symlink(outside, config);
+    }
+    return originalWrite(path, content, beforePublish);
+  }) as typeof privateStore.writeTextAtomic;
+
+  const result = await migrateAppHome(target, legacy, { privateStore });
+
+  assert.equal((result as typeof result & { status?: string }).status, "recovery-required");
+  assert.equal((await lstat(config)).isSymbolicLink(), true);
+  assert.equal(await readFile(outside, "utf8"), sentinel);
+  assert.equal(await exists(originalCopy), true);
+  assert.doesNotMatch(String(result.warning), /swap-secret-sentinel/);
 });
 
 test("v0 config with valid nested provider state still normalizes legacy top-level fields", async () => {

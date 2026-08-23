@@ -1,18 +1,22 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, readdir, readFile, stat, writeFile } from "node:fs/promises";
+import { spawn } from "node:child_process";
+import { lstat, mkdir, mkdtemp, readdir, readFile, rename, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import test from "node:test";
 import {
   consumeConfigWarning,
   DEFAULT_CONFIG,
+  assertConfigFileSnapshot,
   evaluateBudget,
   isApprovalMode,
   isBudgetAction,
   isCompressionMode,
   loadConfig,
   loadConfigDetailed,
+  readConfigFileSnapshot,
   saveConfig,
+  withConfigWriteLock,
   validateBudget,
   validateConfig,
   validateFallbackModels,
@@ -238,6 +242,22 @@ test("saveConfig keeps a copy of a config it could not parse", async () => {
     "kaputt, aber vom Nutzer geschrieben",
   );
   assert.equal((await loadConfigDetailed(path)).source, "file");
+});
+
+test("saveConfig rejects a symlinked config target without consuming or replacing outside bytes", async () => {
+  const path = await configPath("symlink-target");
+  const outsideRoot = await mkdtemp(join(tmpdir(), "routercode-config-outside-"));
+  const outside = join(outsideRoot, "outside.json");
+  const sentinel = "outside-config-secret-sentinel";
+  await writeFile(outside, sentinel, "utf8");
+  await symlink(outside, path);
+
+  const error = await saveConfig(DEFAULT_CONFIG, path).catch((reason: unknown) => reason);
+
+  assert.ok(error instanceof Error);
+  assert.doesNotMatch(String(error), /outside-config-secret-sentinel/);
+  assert.equal((await lstat(path)).isSymbolicLink(), true);
+  assert.equal(await readFile(outside, "utf8"), sentinel);
 });
 
 test("DEFAULT_CONFIG trägt die A2/A3-Defaults", () => {
@@ -498,4 +518,331 @@ test("persisting a source-aware migration is stable and never reallocates its le
   assert.equal(second.config.providerSetup.connections[0]?.credentialSlot, "legacy:inference");
   assert.equal(second.config.providerSetup.connections[0]?.id, "stable-csprng-id");
   assert.equal(await readFile(path, "utf8"), firstBytes);
+});
+
+test("saveConfig waits for an independently held cross-process config writer lock", async () => {
+  const path = await configPath("cross-process-writer-lock");
+  await saveConfig(DEFAULT_CONFIG, path);
+  const moduleUrl = new URL("../src/config.ts", import.meta.url).href;
+  const child = spawn(process.execPath, [
+    "--import",
+    "tsx",
+    "--input-type=module",
+    "--eval",
+    `
+      const api = await import(process.env.ORCODE_FIX2_CONFIG_MODULE_URL);
+      try {
+        await api.withConfigWriteLock(
+          process.env.ORCODE_FIX2_CONFIG_PATH,
+          async () => {
+            process.send({ type: "held" });
+            await new Promise((resolve) => {
+              process.once("message", (message) => {
+                if (message?.type === "release") resolve();
+              });
+            });
+          },
+        );
+        process.send({ type: "done" });
+      } catch (error) {
+        process.send({ type: "error", message: String(error) });
+        process.exitCode = 1;
+      }
+    `,
+  ], {
+    env: {
+      ...process.env,
+      ORCODE_FIX2_CONFIG_MODULE_URL: moduleUrl,
+      ORCODE_FIX2_CONFIG_PATH: path,
+    },
+    stdio: ["ignore", "pipe", "pipe", "ipc"],
+  });
+  const held = new Promise<void>((resolve, reject) => {
+    child.on("message", (message: unknown) => {
+      if (typeof message !== "object" || message === null || !("type" in message)) return;
+      if (message.type === "held") resolve();
+      if (message.type === "error") {
+        reject(new Error(String("message" in message ? message.message : "child error")));
+      }
+    });
+    child.once("error", reject);
+    child.once("exit", (code) => {
+      if (code !== 0) reject(new Error(`config lock child exited ${code}`));
+    });
+  });
+  await held;
+
+  let saveSettled = false;
+  const updated = {
+    ...structuredClone(DEFAULT_CONFIG),
+    mainModel: "preserve/cross-process-writer",
+  };
+  const saving = saveConfig(updated, path).then(() => { saveSettled = true; });
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  const settledWhileHeld = saveSettled;
+  child.send({ type: "release" });
+  await saving;
+  const exitCode = await new Promise<number | null>((resolve) => {
+    if (child.exitCode !== null) resolve(child.exitCode);
+    else child.once("exit", resolve);
+  });
+
+  assert.equal(settledWhileHeld, false);
+  assert.equal(exitCode, 0);
+  const loaded = await loadConfig(path);
+  assert.equal(loaded.mainModel, "preserve/cross-process-writer");
+});
+
+test("a writer retries when the live claim disappears before adoption", async () => {
+  const { PrivateStore } = await import("../src/private-store.js");
+  const path = await configPath("claim-release-before-adoption");
+  const originalCreate = PrivateStore.prototype.createDirectoryExclusive;
+  const originalAdopt = PrivateStore.prototype.adoptDirectoryClaim;
+  let injectContention = true;
+  let injectedAdoptAbsence = false;
+  PrivateStore.prototype.createDirectoryExclusive = async function (claimPath) {
+    if (injectContention) {
+      injectContention = false;
+      return null;
+    }
+    return originalCreate.call(this, claimPath);
+  };
+  PrivateStore.prototype.adoptDirectoryClaim = async function (claimPath) {
+    if (!injectedAdoptAbsence) {
+      injectedAdoptAbsence = true;
+      throw Object.assign(new Error("released before adoption"), { code: "ENOENT" });
+    }
+    return originalAdopt.call(this, claimPath);
+  };
+  let entered = false;
+  try {
+    await withConfigWriteLock(path, async () => {
+      entered = true;
+    });
+  } finally {
+    PrivateStore.prototype.createDirectoryExclusive = originalCreate;
+    PrivateStore.prototype.adoptDirectoryClaim = originalAdopt;
+  }
+
+  assert.equal(injectedAdoptAbsence, true);
+  assert.equal(entered, true);
+});
+
+test("an aborted queued writer cannot let a third writer bypass the live holder", async () => {
+  const path = await configPath("aborted-writer-queue");
+  let holderReached!: () => void;
+  let releaseHolder!: () => void;
+  const reached = new Promise<void>((resolve) => { holderReached = resolve; });
+  const pause = new Promise<void>((resolve) => { releaseHolder = resolve; });
+  const holder = withConfigWriteLock(path, async () => {
+    holderReached();
+    await pause;
+  });
+  await reached;
+
+  const controller = new AbortController();
+  const reason = new DOMException("queued writer cancelled", "AbortError");
+  const queued = withConfigWriteLock(path, async () => {
+    assert.fail("aborted queued writer entered");
+  }, { signal: controller.signal });
+  controller.abort(reason);
+  await assert.rejects(queued, (error: unknown) => error === reason);
+
+  let thirdEntered = false;
+  const third = withConfigWriteLock(path, async () => {
+    thirdEntered = true;
+  });
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  const enteredWhileHeld = thirdEntered;
+  releaseHolder();
+  await Promise.all([holder, third]);
+
+  assert.equal(enteredWhileHeld, false);
+  assert.equal(thirdEntered, true);
+});
+
+test("an expired timestamp never lets a successor reclaim a live cross-process writer", async () => {
+  const path = await configPath("live-expired-writer");
+  await saveConfig(DEFAULT_CONFIG, path);
+  const moduleUrl = new URL("../src/config.ts", import.meta.url).href;
+  const child = spawn(process.execPath, [
+    "--import",
+    "tsx",
+    "--input-type=module",
+    "--eval",
+    `
+      Date.now = () => 0;
+      const api = await import(process.env.ORCODE_FIX2_CONFIG_MODULE_URL);
+      try {
+        await api.withConfigWriteLock(
+          process.env.ORCODE_FIX2_CONFIG_PATH,
+          async () => {
+            process.send({ type: "held" });
+            await new Promise((resolve) => {
+              process.once("message", (message) => {
+                if (message?.type === "release") resolve();
+              });
+            });
+          },
+        );
+        process.send({ type: "done" });
+      } catch (error) {
+        process.send({ type: "error", message: String(error) });
+        process.exitCode = 1;
+      }
+    `,
+  ], {
+    env: {
+      ...process.env,
+      ORCODE_FIX2_CONFIG_MODULE_URL: moduleUrl,
+      ORCODE_FIX2_CONFIG_PATH: path,
+    },
+    stdio: ["ignore", "pipe", "pipe", "ipc"],
+  });
+  let childFailure: string | null = null;
+  const held = new Promise<void>((resolve, reject) => {
+    child.on("message", (message: unknown) => {
+      if (typeof message !== "object" || message === null || !("type" in message)) return;
+      if (message.type === "held") resolve();
+      if (message.type === "error") {
+        childFailure = String("message" in message ? message.message : "child error");
+        reject(new Error(childFailure));
+      }
+    });
+    child.once("error", reject);
+  });
+  await held;
+
+  let successorEntered = false;
+  const successor = withConfigWriteLock(path, async () => { successorEntered = true; });
+  for (let turn = 0; turn < 20 && !successorEntered; turn += 1) {
+    await new Promise<void>((resolve) => setImmediate(resolve));
+  }
+  const enteredWhileLive = successorEntered;
+  child.send({ type: "release" });
+  await successor;
+  const exitCode = await new Promise<number | null>((resolve) => {
+    if (child.exitCode !== null) resolve(child.exitCode);
+    else child.once("exit", resolve);
+  });
+
+  assert.equal(enteredWhileLive, false);
+  assert.equal(exitCode, 0, childFailure ?? "live writer child exited unsuccessfully");
+});
+
+test("case aliases of the same config directory share one writer ownership", async (t) => {
+  const path = await configPath("Case-Alias-Writer");
+  const root = dirname(path);
+  const aliasRoot = join(dirname(root), basename(root).toLowerCase());
+  let original: Awaited<ReturnType<typeof stat>>;
+  let alias: Awaited<ReturnType<typeof stat>>;
+  try {
+    [original, alias] = await Promise.all([stat(root), stat(aliasRoot)]);
+  } catch {
+    t.skip("requires a case-insensitive filesystem");
+    return;
+  }
+  if (original.dev !== alias.dev || original.ino !== alias.ino) {
+    t.skip("requires a case-insensitive filesystem");
+    return;
+  }
+
+  let releaseOriginal!: () => void;
+  let originalReached!: () => void;
+  const originalPause = new Promise<void>((resolve) => { releaseOriginal = resolve; });
+  const reached = new Promise<void>((resolve) => { originalReached = resolve; });
+  const first = withConfigWriteLock(path, async () => {
+    originalReached();
+    await originalPause;
+  });
+  await reached;
+
+  let aliasEntered = false;
+  const second = withConfigWriteLock(join(aliasRoot, "config.json"), async () => {
+    aliasEntered = true;
+  });
+  for (let turn = 0; turn < 500 && !aliasEntered; turn += 1) {
+    await new Promise<void>((resolve) => setImmediate(resolve));
+  }
+  const enteredWhileOriginalHeld = aliasEntered;
+  releaseOriginal();
+  await Promise.all([first, second]);
+
+  assert.equal(enteredWhileOriginalHeld, false);
+  assert.equal(aliasEntered, true);
+});
+
+test("case aliases of the same absent config directory share one writer ownership", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "RouterCode-Absent-Case-Alias-"));
+  const aliasRoot = join(dirname(root), basename(root).toLowerCase());
+  let original: Awaited<ReturnType<typeof stat>>;
+  let alias: Awaited<ReturnType<typeof stat>>;
+  try {
+    [original, alias] = await Promise.all([stat(root), stat(aliasRoot)]);
+  } catch {
+    t.skip("requires a case-insensitive filesystem");
+    return;
+  }
+  if (original.dev !== alias.dev || original.ino !== alias.ino) {
+    t.skip("requires a case-insensitive filesystem");
+    return;
+  }
+  const firstPath = join(root, "Absent-App", "config.json");
+  const aliasPath = join(root, "absent-app", "config.json");
+
+  let releaseFirst!: () => void;
+  let firstReached!: () => void;
+  const pause = new Promise<void>((resolve) => { releaseFirst = resolve; });
+  const reached = new Promise<void>((resolve) => { firstReached = resolve; });
+  const first = withConfigWriteLock(firstPath, async () => {
+    firstReached();
+    await pause;
+  });
+  await reached;
+
+  let aliasEntered = false;
+  const second = withConfigWriteLock(aliasPath, async () => {
+    aliasEntered = true;
+  });
+  for (let turn = 0; turn < 500 && !aliasEntered; turn += 1) {
+    await new Promise<void>((resolve) => setImmediate(resolve));
+  }
+  const enteredWhileFirstHeld = aliasEntered;
+  releaseFirst();
+  await Promise.all([first, second]);
+
+  assert.equal(enteredWhileFirstHeld, false);
+  assert.equal(aliasEntered, true);
+});
+
+test("an absent config snapshot rejects replacement of its parent before publication", async () => {
+  const path = await configPath("parent-swap-before-publication");
+  const root = dirname(path);
+  const movedRoot = `${root}.moved`;
+  const snapshot = await readConfigFileSnapshot(path);
+  assert.equal(snapshot.kind, "absent");
+
+  await rename(root, movedRoot);
+  await mkdir(root);
+
+  await assert.rejects(
+    assertConfigFileSnapshot(path, snapshot),
+    /changed before publication/i,
+  );
+  assert.deepEqual(await readdir(root), []);
+});
+
+test("an exact live writer remains assertable after its wall-clock lease duration", async () => {
+  const path = await configPath("live-writer-past-wall-clock-lease");
+  const originalNow = Date.now;
+  Date.now = () => 0;
+  try {
+    await withConfigWriteLock(path, async (ownership) => {
+      await ownership.assertHeld();
+      Date.now = () => 30_001;
+      await ownership.assertHeld();
+    });
+  } finally {
+    Date.now = originalNow;
+  }
 });

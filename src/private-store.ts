@@ -936,7 +936,11 @@ export class PrivateStore {
     return state;
   }
 
-  async writeTextAtomic(path: string, content: string): Promise<void> {
+  async writeTextAtomic(
+    path: string,
+    content: string,
+    beforePublish?: () => Promise<void>,
+  ): Promise<void> {
     await this.assertAvailable();
     const target = resolve(path);
     const parent = dirname(target);
@@ -966,6 +970,9 @@ export class PrivateStore {
       temporaryIdentity = await assertHandlePathIdentity(handle, temporary, "file");
       await handle.close();
       handle = null;
+      await assertDirectoryIdentities(ancestors);
+      await assertPathIdentity(temporaryIdentity);
+      await beforePublish?.();
       await assertDirectoryIdentities(ancestors);
       await assertPathIdentity(temporaryIdentity);
       await rename(temporary, target);
