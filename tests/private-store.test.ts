@@ -21,6 +21,14 @@ type ExclusiveDirectoryStore = {
   removeTree(path: string): Promise<void>;
 };
 
+type TokenBoundClaimStore = ExclusiveDirectoryStore & {
+  adoptDirectoryClaim(path: string): Promise<{ claim: object; modifiedAtMs: number }>;
+  assertDirectoryClaim(claim: object): Promise<void>;
+  writeClaimOwner(claim: object, content: string): Promise<void>;
+  readClaimOwner(claim: object, maxBytes?: number): Promise<string>;
+  releaseDirectoryClaim(claim: object, expectedOwner: string | null): Promise<void>;
+};
+
 test("PrivateStore exclusive directory creation returns one opaque claim token and null losers", async () => {
   const { PosixPrivateStoreAdapter, PrivateStore } = await import("../src/private-store.js");
   const root = await mkdtemp(join(tmpdir(), "orcode-private-exclusive-"));
@@ -41,6 +49,76 @@ test("PrivateStore exclusive directory creation returns one opaque claim token a
   assert.equal((await stat(lease)).mode & 0o777, 0o700);
   await store.removeTree(lease);
   await assert.rejects(stat(lease), /ENOENT/);
+});
+
+test("PrivateStore claim owner lifecycle is token-bound and releases only exact owner.json plus an empty claim", async () => {
+  const { PosixPrivateStoreAdapter, PrivateStore } = await import("../src/private-store.js");
+  const root = await mkdtemp(join(tmpdir(), "orcode-private-claim-owner-"));
+  const lease = join(root, "provider-setup.lock");
+  const store = new PrivateStore({
+    adapter: new PosixPrivateStoreAdapter(),
+    root,
+  }) as unknown as TokenBoundClaimStore;
+  const claim = await store.createDirectoryExclusive(lease);
+  assert.ok(claim);
+  const owner = `${JSON.stringify({
+    version: 1,
+    ownerId: "40000000-0000-4000-8000-000000000001",
+    acquiredAt: 100,
+    expiresAt: 200,
+  })}\n`;
+
+  await store.writeClaimOwner(claim, owner);
+  assert.equal(await store.readClaimOwner(claim), owner);
+  await store.assertDirectoryClaim(claim);
+  await store.releaseDirectoryClaim(claim, owner);
+  await assert.rejects(stat(lease), /ENOENT/);
+});
+
+test("PrivateStore adopted claims preserve exact inode and owner readback for stale recovery", async () => {
+  const { PosixPrivateStoreAdapter, PrivateStore } = await import("../src/private-store.js");
+  const root = await mkdtemp(join(tmpdir(), "orcode-private-claim-adopt-"));
+  const lease = join(root, "provider-setup.lock");
+  const store = new PrivateStore({
+    adapter: new PosixPrivateStoreAdapter(),
+    root,
+  }) as unknown as TokenBoundClaimStore;
+  const created = await store.createDirectoryExclusive(lease);
+  assert.ok(created);
+  const owner = '{"version":1,"ownerId":"40000000-0000-4000-8000-000000000002","acquiredAt":100,"expiresAt":200}\n';
+  await store.writeClaimOwner(created, owner);
+
+  const adopted = await store.adoptDirectoryClaim(lease);
+  assert.equal(Number.isFinite(adopted.modifiedAtMs), true);
+  assert.equal(await store.readClaimOwner(adopted.claim), owner);
+  await store.releaseDirectoryClaim(adopted.claim, owner);
+  await assert.rejects(stat(lease), /ENOENT/);
+});
+
+test("PrivateStore claim release fails closed on owner mismatch or unexpected content", async () => {
+  const { PosixPrivateStoreAdapter, PrivateStore } = await import("../src/private-store.js");
+  const root = await mkdtemp(join(tmpdir(), "orcode-private-claim-content-"));
+  const lease = join(root, "provider-setup.lock");
+  const store = new PrivateStore({
+    adapter: new PosixPrivateStoreAdapter(),
+    root,
+  }) as unknown as TokenBoundClaimStore;
+  const claim = await store.createDirectoryExclusive(lease);
+  assert.ok(claim);
+  const owner = '{"version":1,"ownerId":"40000000-0000-4000-8000-000000000003","acquiredAt":100,"expiresAt":200}\n';
+  await store.writeClaimOwner(claim, owner);
+  await writeFile(join(lease, "foreign.txt"), "must survive");
+
+  await assert.rejects(
+    store.releaseDirectoryClaim(claim, owner.replace("200", "201")),
+    /owner|claim|identity|Inhalt/i,
+  );
+  await assert.rejects(
+    store.releaseDirectoryClaim(claim, owner),
+    /empty|unerwartet|content|claim/i,
+  );
+  assert.equal(await readFile(join(lease, "foreign.txt"), "utf8"), "must survive");
+  assert.equal(await readFile(join(lease, "owner.json"), "utf8"), owner);
 });
 
 test("PrivateStore exclusive directory creation rejects symlinked ancestors without touching outside", async () => {

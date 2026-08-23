@@ -381,9 +381,16 @@ const PRIVATE_DIRECTORY_CLAIM_IDENTITY: unique symbol = Symbol(
   "PrivateStore.directory-claim-identity",
 );
 
+interface PrivateDirectoryClaimState {
+  readonly owner: object;
+  readonly ancestors: readonly PathIdentity[];
+  readonly directory: PathIdentity;
+  readonly modifiedAtMs: number;
+}
+
 /** Opaque proof that this process created and protected one exact directory. */
 export interface PrivateDirectoryClaim {
-  readonly [PRIVATE_DIRECTORY_CLAIM_IDENTITY]: PathIdentity;
+  readonly [PRIVATE_DIRECTORY_CLAIM_IDENTITY]: PrivateDirectoryClaimState;
 }
 
 /**
@@ -393,6 +400,7 @@ export interface PrivateDirectoryClaim {
 export class PrivateStore {
   readonly adapter: PrivateStoreAdapter;
   readonly #root: string | null;
+  readonly #claimOwner = Object.freeze({});
   #availability: Promise<boolean> | null = null;
 
   constructor(options: PrivateStoreOptions = {}) {
@@ -477,9 +485,240 @@ export class PrivateStore {
     assertSameIdentity(created, protectedIdentity, target);
     await assertDirectoryIdentities(ancestors);
     await assertPathIdentity(protectedIdentity);
-    return Object.freeze({
-      [PRIVATE_DIRECTORY_CLAIM_IDENTITY]: protectedIdentity,
+    return this.#claimToken(ancestors, protectedIdentity, Number(info.mtimeMs));
+  }
+
+  /**
+   * Binds an existing exact directory for stale-lease inspection. This is
+   * read-only: it never protects, creates, removes, or normalizes the path.
+   */
+  async adoptDirectoryClaim(
+    path: string,
+  ): Promise<{ claim: PrivateDirectoryClaim; modifiedAtMs: number }> {
+    await this.assertAvailable();
+    const target = resolve(path);
+    const root = this.#root ?? dirname(target);
+    assertContained(root, target);
+    if (target === root) {
+      throw new Error(`PrivateStore bindet seine eigene Root-Grenze nicht als Claim: ${target}`);
+    }
+    const ancestors = await directoryIdentities(root, dirname(target));
+    await assertDirectoryIdentities(ancestors);
+    const before = await lstat(target, { bigint: true });
+    await assertDirectoryIdentities(ancestors);
+    if (before.isSymbolicLink() || !before.isDirectory()) {
+      throw new Error(`PrivateStore-Claim ist kein echtes Verzeichnis: ${target}`);
+    }
+    const expected = pathIdentity(target, before, "directory");
+    const handle = await openIdentityHandle(target, "directory");
+    let directory = expected;
+    try {
+      await assertDirectoryIdentities(ancestors);
+      if (handle) {
+        directory = await assertHandlePathIdentity(handle, target, "directory");
+        assertSameIdentity(expected, directory, target);
+      } else {
+        await assertPathIdentity(expected);
+      }
+      await assertDirectoryIdentities(ancestors);
+    } finally {
+      await handle?.close().catch(() => undefined);
+    }
+    await assertDirectoryIdentities(ancestors);
+    await assertPathIdentity(directory);
+    const modifiedAtMs = Number(before.mtimeMs);
+    return {
+      claim: this.#claimToken(ancestors, directory, modifiedAtMs),
+      modifiedAtMs,
+    };
+  }
+
+  /** Revalidates the root, ancestors, and exact claimed inode. */
+  async assertDirectoryClaim(claim: PrivateDirectoryClaim): Promise<void> {
+    const state = this.#claimState(claim);
+    await assertDirectoryIdentities(state.ancestors);
+    await assertPathIdentity(state.directory);
+    await assertDirectoryIdentities(state.ancestors);
+    await assertPathIdentity(state.directory);
+  }
+
+  /** Writes only the fixed lease owner file, once, through the opaque claim. */
+  async writeClaimOwner(claim: PrivateDirectoryClaim, content: string): Promise<void> {
+    if (typeof content !== "string" || Buffer.byteLength(content, "utf8") > 4_096) {
+      throw new Error("PrivateStore-Claim-Owner ist ungültig oder zu groß.");
+    }
+    const state = this.#claimState(claim);
+    const ownerPath = join(state.directory.path, "owner.json");
+    const tree = [...state.ancestors, state.directory];
+    let handle: FileHandle | null = null;
+    let ownerIdentity: PathIdentity | null = null;
+    try {
+      await this.assertDirectoryClaim(claim);
+      handle = await open(ownerPath, "wx", PRIVATE_FILE_MODE);
+      await this.assertDirectoryClaim(claim);
+      ownerIdentity = await assertHandlePathIdentity(handle, ownerPath, "file");
+      await protectOpenPath(
+        handle,
+        ownerPath,
+        "file",
+        this.adapter,
+        tree,
+        ownerIdentity,
+      );
+      await this.assertDirectoryClaim(claim);
+      await handle.writeFile(content, "utf8");
+      await this.assertDirectoryClaim(claim);
+      await handle.sync();
+      await this.assertDirectoryClaim(claim);
+      ownerIdentity = await assertHandlePathIdentity(handle, ownerPath, "file");
+    } catch (error) {
+      await unlinkBoundTemporary(ownerIdentity, tree, handle);
+      throw error;
+    } finally {
+      await handle?.close().catch(() => undefined);
+    }
+    await this.assertDirectoryClaim(claim);
+    if (!ownerIdentity) {
+      throw new Error("PrivateStore-Claim-Owner wurde nicht gebunden.");
+    }
+    await assertPathIdentity(ownerIdentity);
+  }
+
+  /** Reads only owner.json with a no-follow handle and bounded size. */
+  async readClaimOwner(
+    claim: PrivateDirectoryClaim,
+    maxBytes = 4_096,
+  ): Promise<string> {
+    if (!Number.isSafeInteger(maxBytes) || maxBytes < 1 || maxBytes > 65_536) {
+      throw new Error("PrivateStore-Claim-Owner-Limit ist ungültig.");
+    }
+    const state = this.#claimState(claim);
+    const ownerPath = join(state.directory.path, "owner.json");
+    let handle: FileHandle | null = null;
+    try {
+      await this.assertDirectoryClaim(claim);
+      handle = await openIdentityHandle(ownerPath, "file");
+      if (!handle) throw new Error("PrivateStore-Claim-Owner konnte nicht gebunden werden.");
+      await this.assertDirectoryClaim(claim);
+      const identity = await assertHandlePathIdentity(handle, ownerPath, "file");
+      await this.assertDirectoryClaim(claim);
+      const info = await handle.stat({ bigint: true });
+      await this.assertDirectoryClaim(claim);
+      if (info.size > BigInt(maxBytes)) {
+        throw new Error("PrivateStore-Claim-Owner ist zu groß.");
+      }
+      const content = await handle.readFile("utf8");
+      await this.assertDirectoryClaim(claim);
+      const current = await assertHandlePathIdentity(handle, ownerPath, "file");
+      assertSameIdentity(identity, current, ownerPath);
+      return content;
+    } finally {
+      await handle?.close().catch(() => undefined);
+    }
+  }
+
+  /**
+   * Releases only the exact claimed inode. The directory must contain either
+   * no entries (ownerless crash claim) or exactly the expected owner.json.
+   * There is intentionally no recursive or path-only release fallback.
+   */
+  async releaseDirectoryClaim(
+    claim: PrivateDirectoryClaim,
+    expectedOwner: string | null,
+  ): Promise<void> {
+    const state = this.#claimState(claim);
+    await this.assertDirectoryClaim(claim);
+    let entries = await readdir(state.directory.path, { withFileTypes: true });
+    await this.assertDirectoryClaim(claim);
+    if (expectedOwner === null) {
+      if (entries.length !== 0) {
+        throw new Error("PrivateStore-Claim ist nicht leer und bleibt erhalten.");
+      }
+    } else {
+      if (
+        entries.length !== 1
+        || entries[0]?.name !== "owner.json"
+        || !entries[0].isFile()
+        || entries[0].isSymbolicLink()
+      ) {
+        throw new Error("PrivateStore-Claim enthält unerwartete Inhalte und bleibt erhalten.");
+      }
+      const ownerPath = join(state.directory.path, "owner.json");
+      const actual = await this.readClaimOwner(claim);
+      await this.assertDirectoryClaim(claim);
+      if (actual !== expectedOwner) {
+        throw new Error("PrivateStore-Claim-Owner stimmt nicht exakt überein.");
+      }
+      const handle = await openIdentityHandle(ownerPath, "file");
+      if (!handle) throw new Error("PrivateStore-Claim-Owner konnte nicht gebunden werden.");
+      try {
+        await this.assertDirectoryClaim(claim);
+        const identity = await assertHandlePathIdentity(handle, ownerPath, "file");
+        await this.assertDirectoryClaim(claim);
+        const readback = await handle.readFile("utf8");
+        await this.assertDirectoryClaim(claim);
+        const current = await assertHandlePathIdentity(handle, ownerPath, "file");
+        assertSameIdentity(identity, current, ownerPath);
+        if (readback !== expectedOwner) {
+          throw new Error("PrivateStore-Claim-Owner änderte sich vor der Freigabe.");
+        }
+        // Node exposes no unlinkat/rmdirat equivalent bound to directoryHandle.
+        // A same-user process can still race the final checked pathname syscall;
+        // every observable boundary is revalidated, but this is not a claim of
+        // protection against an equally privileged local attacker.
+        await unlink(ownerPath);
+        await this.assertDirectoryClaim(claim);
+        await assertMissingPath(ownerPath);
+      } finally {
+        await handle.close().catch(() => undefined);
+      }
+      entries = await readdir(state.directory.path, { withFileTypes: true });
+      await this.assertDirectoryClaim(claim);
+      if (entries.length !== 0) {
+        throw new Error("PrivateStore-Claim ist nach Owner-Freigabe nicht leer.");
+      }
+    }
+    const directoryHandle = await openIdentityHandle(state.directory.path, "directory");
+    try {
+      await this.assertDirectoryClaim(claim);
+      if (directoryHandle) {
+        const current = await assertHandlePathIdentity(
+          directoryHandle,
+          state.directory.path,
+          "directory",
+        );
+        assertSameIdentity(state.directory, current, state.directory.path);
+      }
+      // See the unlink note above: Node cannot issue this rmdir relative to the
+      // already-bound handle, so the final same-user syscall window remains.
+      await rmdir(state.directory.path);
+      await assertDirectoryIdentities(state.ancestors);
+      await assertMissingPath(state.directory.path);
+    } finally {
+      await directoryHandle?.close().catch(() => undefined);
+    }
+  }
+
+  #claimToken(
+    ancestors: readonly PathIdentity[],
+    directory: PathIdentity,
+    modifiedAtMs: number,
+  ): PrivateDirectoryClaim {
+    const state: PrivateDirectoryClaimState = Object.freeze({
+      owner: this.#claimOwner,
+      ancestors: Object.freeze(ancestors.map((identity) => Object.freeze({ ...identity }))),
+      directory: Object.freeze({ ...directory }),
+      modifiedAtMs,
     });
+    return Object.freeze({ [PRIVATE_DIRECTORY_CLAIM_IDENTITY]: state });
+  }
+
+  #claimState(claim: PrivateDirectoryClaim): PrivateDirectoryClaimState {
+    const state = claim?.[PRIVATE_DIRECTORY_CLAIM_IDENTITY];
+    if (!state || state.owner !== this.#claimOwner) {
+      throw new Error("PrivateStore-Claim-Token ist ungültig oder gehört zu einem anderen Store.");
+    }
+    return state;
   }
 
   async writeTextAtomic(path: string, content: string): Promise<void> {

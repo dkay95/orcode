@@ -85,6 +85,14 @@ syncBuiltinESMExports();
 
 const { PosixPrivateStoreAdapter, PrivateStore } = await import("../src/private-store.js");
 
+type TokenBoundClaimStore = InstanceType<typeof PrivateStore> & {
+  adoptDirectoryClaim(path: string): Promise<{ claim: object; modifiedAtMs: number }>;
+  assertDirectoryClaim(claim: object): Promise<void>;
+  writeClaimOwner(claim: object, content: string): Promise<void>;
+  readClaimOwner(claim: object, maxBytes?: number): Promise<string>;
+  releaseDirectoryClaim(claim: object, expectedOwner: string | null): Promise<void>;
+};
+
 after(() => {
   Object.defineProperty(fs.promises, "open", {
     configurable: true,
@@ -181,6 +189,141 @@ test("PrivateStore exclusive creation refuses a swapped replacement before prote
   assert.equal(await fs.promises.readFile(join(lease, "must-survive.txt"), "utf8"), "outside sentinel");
   assert.equal((await fs.promises.stat(lease)).mode & 0o777, 0o755);
   assert.equal(rejected, true);
+});
+
+test("PrivateStore token-bound owner read rejects a swapped claim without reading outside bytes", async () => {
+  const root = await fs.promises.mkdtemp(join(tmpdir(), "orcode-private-owner-read-swap-"));
+  const lease = join(root, "provider-setup.lock");
+  const moved = join(root, "provider-setup-before-read");
+  const replacement = join(root, "foreign-provider-setup");
+  const ownerPath = join(lease, "owner.json");
+  const expectedOwner = '{"version":1,"ownerId":"50000000-0000-4000-8000-000000000001","acquiredAt":100,"expiresAt":200}\n';
+  const foreignOwner = '{"version":1,"ownerId":"50000000-0000-4000-8000-000000000099","acquiredAt":900,"expiresAt":999}\n';
+  const store = new PrivateStore({
+    adapter: new PosixPrivateStoreAdapter(),
+    root,
+  }) as TokenBoundClaimStore;
+  const claim = await store.createDirectoryExclusive(lease);
+  assert.ok(claim);
+  await store.writeClaimOwner(claim, expectedOwner);
+  await fs.promises.mkdir(replacement);
+  await fs.promises.writeFile(join(replacement, "owner.json"), foreignOwner);
+  swapAtNextOpen(ownerPath, async () => {
+    await fs.promises.rename(lease, moved);
+    await fs.promises.rename(replacement, lease);
+  });
+
+  await assert.rejects(
+    store.readClaimOwner(claim),
+    /ausgetauscht|identity|claim|lease/i,
+  );
+
+  assert.equal(await fs.promises.readFile(join(lease, "owner.json"), "utf8"), foreignOwner);
+  assert.equal(await fs.promises.readFile(join(moved, "owner.json"), "utf8"), expectedOwner);
+});
+
+test("PrivateStore token-bound owner write rejects a swapped claim before its first effect", async () => {
+  const root = await fs.promises.mkdtemp(join(tmpdir(), "orcode-private-owner-write-swap-"));
+  const lease = join(root, "provider-setup.lock");
+  const moved = join(root, "provider-setup-before-write");
+  const replacement = join(root, "foreign-provider-setup");
+  const sentinel = join(replacement, "must-survive.txt");
+  const owner = '{"version":1,"ownerId":"50000000-0000-4000-8000-000000000006","acquiredAt":100,"expiresAt":200}\n';
+  const store = new PrivateStore({
+    adapter: new PosixPrivateStoreAdapter(),
+    root,
+  }) as TokenBoundClaimStore;
+  const claim = await store.createDirectoryExclusive(lease);
+  assert.ok(claim);
+  await fs.promises.mkdir(replacement);
+  await fs.promises.writeFile(sentinel, "foreign sentinel");
+  swapAtNextLstat(lease, async () => {
+    await fs.promises.rename(lease, moved);
+    await fs.promises.rename(replacement, lease);
+  });
+
+  await assert.rejects(
+    store.writeClaimOwner(claim, owner),
+    /ausgetauscht|identity|claim|lease/i,
+  );
+
+  assert.equal(await fs.promises.readFile(join(lease, "must-survive.txt"), "utf8"), "foreign sentinel");
+  await assert.rejects(fs.promises.readFile(join(lease, "owner.json")), /ENOENT/);
+  assert.deepEqual(await fs.promises.readdir(moved), []);
+});
+
+test("PrivateStore token-bound release rejects an owner swapped after readback and retains both artifacts", async () => {
+  const root = await fs.promises.mkdtemp(join(tmpdir(), "orcode-private-owner-release-swap-"));
+  const lease = join(root, "provider-setup.lock");
+  const ownerPath = join(lease, "owner.json");
+  const movedOwner = join(lease, "owner-before-release.json");
+  const expectedOwner = '{"version":1,"ownerId":"50000000-0000-4000-8000-000000000002","acquiredAt":100,"expiresAt":200}\n';
+  const replacementOwner = '{"version":1,"ownerId":"50000000-0000-4000-8000-000000000003","acquiredAt":300,"expiresAt":400}\n';
+  const store = new PrivateStore({
+    adapter: new PosixPrivateStoreAdapter(),
+    root,
+  }) as TokenBoundClaimStore;
+  const claim = await store.createDirectoryExclusive(lease);
+  assert.ok(claim);
+  await store.writeClaimOwner(claim, expectedOwner);
+  swapAtNthLstat(ownerPath, 2, async () => {
+    await fs.promises.rename(ownerPath, movedOwner);
+    await fs.promises.writeFile(ownerPath, replacementOwner);
+  });
+
+  await assert.rejects(
+    store.releaseDirectoryClaim(claim, expectedOwner),
+    /ausgetauscht|identity|owner|claim/i,
+  );
+
+  assert.equal(await fs.promises.readFile(ownerPath, "utf8"), replacementOwner);
+  assert.equal(await fs.promises.readFile(movedOwner, "utf8"), expectedOwner);
+  assert.equal((await fs.promises.stat(lease)).isDirectory(), true);
+  deferredLstatSwap = null;
+});
+
+test("a stale claim token cannot release a newer lease inode or owner", async () => {
+  const root = await fs.promises.mkdtemp(join(tmpdir(), "orcode-private-stale-token-"));
+  const lease = join(root, "provider-setup.lock");
+  const ownerA = '{"version":1,"ownerId":"50000000-0000-4000-8000-000000000004","acquiredAt":100,"expiresAt":200}\n';
+  const ownerB = '{"version":1,"ownerId":"50000000-0000-4000-8000-000000000005","acquiredAt":300,"expiresAt":400}\n';
+  const store = new PrivateStore({
+    adapter: new PosixPrivateStoreAdapter(),
+    root,
+  }) as TokenBoundClaimStore;
+  const claimA = await store.createDirectoryExclusive(lease);
+  assert.ok(claimA);
+  await store.writeClaimOwner(claimA, ownerA);
+  const adoptedA = await store.adoptDirectoryClaim(lease);
+  await store.releaseDirectoryClaim(adoptedA.claim, ownerA);
+  const claimB = await store.createDirectoryExclusive(lease);
+  assert.ok(claimB);
+  await store.writeClaimOwner(claimB, ownerB);
+
+  await assert.rejects(
+    store.releaseDirectoryClaim(claimA, ownerA),
+    /ausgetauscht|identity|claim|lease/i,
+  );
+
+  assert.equal(await store.readClaimOwner(claimB), ownerB);
+  assert.equal((await fs.promises.stat(lease)).isDirectory(), true);
+});
+
+test("an adopted ownerless empty crash claim can be released only through its exact token", async () => {
+  const root = await fs.promises.mkdtemp(join(tmpdir(), "orcode-private-ownerless-claim-"));
+  const lease = join(root, "provider-setup.lock");
+  const store = new PrivateStore({
+    adapter: new PosixPrivateStoreAdapter(),
+    root,
+  }) as TokenBoundClaimStore;
+  const crashedClaim = await store.createDirectoryExclusive(lease);
+  assert.ok(crashedClaim);
+  const adopted = await store.adoptDirectoryClaim(lease);
+
+  await store.releaseDirectoryClaim(adopted.claim, null);
+
+  await assert.rejects(fs.promises.stat(lease), /ENOENT/);
+  await assert.rejects(store.assertDirectoryClaim(crashedClaim), /ENOENT|identity|claim/i);
 });
 
 test("PrivateStore claim protection failure never rmdirs a replacement during rollback", async () => {
