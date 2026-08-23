@@ -11,14 +11,22 @@
  */
 
 import { type ChildProcess, spawn } from "node:child_process";
-import { access, mkdtemp, rm, unlink, writeFile } from "node:fs/promises";
+import {
+  access,
+  lstat,
+  mkdir,
+  mkdtemp,
+  readdir,
+  rm,
+  unlink,
+  writeFile,
+} from "node:fs/promises";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { randomUUID } from "node:crypto";
 import type { ApprovalSubject } from "./types.js";
-import { isRecord, sanitizedEnvironment } from "./utils.js";
+import { errorMessage, hasCode, isRecord, sanitizedEnvironment } from "./utils.js";
 
 /** URL authority is the validated origin plus the exact operation, never path/query data. */
 export function browserApprovalSubject(
@@ -46,7 +54,11 @@ export interface FailedRequestReport {
 export interface PageReport {
   url: string;
   title: string;
-  /** Absolute path to a temporary PNG, or `null` when no screenshot was taken. Caller owns cleanup — see `deleteScreenshot`. */
+  /**
+   * Browser screenshots are operation-local and deleted before `inspectUrl`
+   * settles, so a stale path never escapes. This field remains for the 0.4
+   * response shape and is always `null` on return.
+   */
   screenshotPath: string | null;
   consoleMessages: ConsoleMessageReport[];
   pageErrors: string[];
@@ -56,12 +68,81 @@ export interface PageReport {
   truncated: boolean;
 }
 
-/** Deletes a screenshot file produced by `inspectUrl`. Never throws — a missing or already-deleted file is not an error here. */
+/** Legacy helper for pre-0.4 callers. Current inspections delete their whole operation tree internally. */
 export async function deleteScreenshot(path: string | null): Promise<void> {
   if (!path) {
     return;
   }
   await unlink(path).catch(() => undefined);
+}
+
+const BROWSER_TEMP_MAX_AGE_MS = 24 * 60 * 60 * 1_000;
+const BROWSER_OPERATION_NAME = /^orcode-browser-operation-[A-Za-z0-9]{6}$/;
+const LEGACY_BROWSER_PROFILE_NAME = /^orcode-browser-profile-[A-Za-z0-9]{6}$/;
+const LEGACY_BROWSER_SCREENSHOT_NAME =
+  /^orcode-browser-screenshot-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.png$/i;
+
+export interface BrowserTempPruneReport {
+  removed: string[];
+  errors: Array<{ path: string; message: string }>;
+}
+
+export interface BrowserTempPruneOptions {
+  tempDir?: string;
+  nowMs?: number;
+  /** Startup cleanup is best effort; this seam keeps removal failures observable and testable. */
+  removeEntry?: (path: string) => Promise<void>;
+}
+
+/**
+ * Removes abandoned browser artifacts from prior processes. Exact generated
+ * name shapes, entry type, age, current-user ownership and symlink status all
+ * have to agree before deletion; a prefix alone is never authority.
+ */
+export async function pruneBrowserTempArtifacts(
+  options: BrowserTempPruneOptions = {},
+): Promise<BrowserTempPruneReport> {
+  const tempRoot = options.tempDir ?? tmpdir();
+  const nowMs = options.nowMs ?? Date.now();
+  const removeEntry = options.removeEntry ??
+    ((path: string) => rm(path, { recursive: true, force: true }));
+  const report: BrowserTempPruneReport = { removed: [], errors: [] };
+  let names: string[];
+  try {
+    names = (await readdir(tempRoot)).sort();
+  } catch (error) {
+    if (!hasCode(error, "ENOENT")) {
+      report.errors.push({ path: tempRoot, message: errorMessage(error) });
+    }
+    return report;
+  }
+
+  for (const name of names) {
+    const expectedType = browserTempEntryType(name);
+    if (!expectedType) continue;
+    const path = join(tempRoot, name);
+    try {
+      const info = await lstat(path);
+      if (info.isSymbolicLink()) continue;
+      if (expectedType === "directory" ? !info.isDirectory() : !info.isFile()) continue;
+      if (typeof process.getuid === "function" && info.uid !== process.getuid()) continue;
+      if (nowMs - info.mtimeMs <= BROWSER_TEMP_MAX_AGE_MS) continue;
+      await removeEntry(path);
+      report.removed.push(path);
+    } catch (error) {
+      if (!hasCode(error, "ENOENT")) {
+        report.errors.push({ path, message: errorMessage(error) });
+      }
+    }
+  }
+  return report;
+}
+
+function browserTempEntryType(name: string): "directory" | "file" | null {
+  if (BROWSER_OPERATION_NAME.test(name) || LEGACY_BROWSER_PROFILE_NAME.test(name)) {
+    return "directory";
+  }
+  return LEGACY_BROWSER_SCREENSHOT_NAME.test(name) ? "file" : null;
 }
 
 // ---------------------------------------------------------------------------
@@ -295,19 +376,32 @@ export function startManagedProcess(
     stdio: "ignore",
     detached: true,
   });
-  if (child.pid === undefined) {
-    throw new Error(`Prozess ${executable} konnte nicht gestartet werden.`);
-  }
-  const pid = child.pid;
+  // `spawn()` reports ENOENT asynchronously. Own the error event before
+  // looking at `pid`, otherwise the synchronous pid guard can throw first
+  // and leave Node to emit an unhandled child-process error one tick later.
   const exited = new Promise<void>((resolvePromise) => {
     child.once("exit", () => resolvePromise());
     child.once("error", () => resolvePromise());
   });
+  if (child.pid === undefined) {
+    throw new Error(`Prozess ${executable} konnte nicht gestartet werden.`);
+  }
+  const pid = child.pid;
   return {
     pid,
     kill: (signal) => killProcessGroup(child, signal),
     exited,
   };
+}
+
+export class BrowserTimeoutError extends Error {
+  readonly timeoutMs: number;
+
+  constructor(timeoutMs: number) {
+    super(`Zeitlimit von ${(timeoutMs / 1_000).toFixed(1)}s erreicht.`);
+    this.name = "BrowserTimeoutError";
+    this.timeoutMs = timeoutMs;
+  }
 }
 
 /**
@@ -317,45 +411,141 @@ export function startManagedProcess(
  * itself. `deadline` is an absolute `Date.now()`-scale timestamp `body` can
  * use to budget its own sub-steps.
  *
- * Killing the OS process alone does not make a `body` that is stuck awaiting
- * a promise (e.g. a CDP call whose response never arrives) return — so this
- * races `body` itself against the timeout, not just the process. `body`'s
- * promise is allowed to keep running in the background after the race is
- * decided (`CdpClient` rejects its own pending calls once the socket closes,
- * so it settles eventually); `Promise.race` already attaches a rejection
- * handler to it, so a late rejection there never surfaces as an unhandled
- * rejection.
+ * Killing the OS process alone does not release a body stuck in fetch/CDP,
+ * so the body receives an operation signal that fires for either the exact
+ * root cancellation or this hard timeout. Browser awaits race that signal;
+ * the operation tree is removed only after this process owner settles.
  */
 export async function runWithHardTimeout<T>(
   proc: ManagedProcess,
   timeoutMs: number,
-  body: (deadline: number) => Promise<T>,
+  body: (deadline: number, signal: AbortSignal) => Promise<T>,
+  signal?: AbortSignal,
 ): Promise<T> {
-  const deadline = Date.now() + timeoutMs;
+  const boundedTimeoutMs = Math.max(0, timeoutMs);
+  const deadline = Date.now() + boundedTimeoutMs;
+  const operation = new AbortController();
+  const abortFromRoot = () => operation.abort(signalError(signal));
+  if (signal?.aborted) {
+    abortFromRoot();
+  } else {
+    signal?.addEventListener("abort", abortFromRoot, { once: true });
+  }
   let timer: ReturnType<typeof setTimeout> | undefined;
-  const timeoutPromise = new Promise<never>((_resolve, reject) => {
-    timer = setTimeout(() => {
-      reject(new Error(`Zeitlimit von ${(timeoutMs / 1_000).toFixed(0)}s erreicht.`));
-    }, timeoutMs);
-    timer.unref();
+  if (!operation.signal.aborted) {
+    if (boundedTimeoutMs === 0) {
+      operation.abort(new BrowserTimeoutError(boundedTimeoutMs));
+    } else {
+      timer = setTimeout(() => {
+        operation.abort(new BrowserTimeoutError(boundedTimeoutMs));
+      }, boundedTimeoutMs);
+    }
+  }
+  let failure: unknown;
+  const bodyPromise = Promise.resolve().then(() => {
+    if (operation.signal.aborted) throw signalError(operation.signal);
+    return body(deadline, operation.signal);
   });
   try {
-    return await Promise.race([body(deadline), timeoutPromise]);
+    return await awaitWithSignal(bodyPromise, operation.signal);
+  } catch (error) {
+    failure = error;
+    throw error;
   } finally {
-    if (timer) {
-      clearTimeout(timer);
+    if (timer) clearTimeout(timer);
+    signal?.removeEventListener("abort", abortFromRoot);
+    const cleanupErrors: unknown[] = [];
+    try {
+      await stopManagedProcess(proc);
+    } catch (cleanupError) {
+      cleanupErrors.push(cleanupError);
     }
-    proc.kill("SIGTERM");
-    const killer = setTimeout(() => proc.kill("SIGKILL"), PROCESS_KILL_GRACE_MS);
-    killer.unref();
-    await Promise.race([proc.exited, delay(PROCESS_KILL_GRACE_MS + 200)]);
+    const bodySettled = await settlesWithin(
+      bodyPromise.then(() => undefined, () => undefined),
+      PROCESS_KILL_GRACE_MS + 200,
+    );
+    if (!bodySettled) {
+      cleanupErrors.push(new Error("Browser-Body reagierte nicht auf Abbruch oder Zeitlimit."));
+    }
+    if (cleanupErrors.length > 0) {
+      throw new AggregateError(
+        failure === undefined ? cleanupErrors : [failure, ...cleanupErrors],
+        "Browser-Operation konnte nicht vollständig beendet werden.",
+      );
+    }
   }
 }
 
-function delay(ms: number): Promise<void> {
-  return new Promise((resolvePromise) => {
-    const timer = setTimeout(resolvePromise, ms);
-    timer.unref();
+async function stopManagedProcess(proc: ManagedProcess): Promise<void> {
+  proc.kill("SIGTERM");
+  if (await settlesWithin(proc.exited, PROCESS_KILL_GRACE_MS)) {
+    return;
+  }
+  proc.kill("SIGKILL");
+  if (!(await settlesWithin(proc.exited, PROCESS_KILL_GRACE_MS + 200))) {
+    throw new Error("Browser-Prozess konnte nicht bestätigt beendet werden.");
+  }
+}
+
+async function settlesWithin(promise: Promise<void>, timeoutMs: number): Promise<boolean> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      promise.then(() => true),
+      new Promise<boolean>((resolvePromise) => {
+        timer = setTimeout(() => resolvePromise(false), timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+function signalError(signal?: AbortSignal): Error {
+  const reason = signal?.reason;
+  if (reason instanceof Error) {
+    return reason;
+  }
+  const error = new Error("Browser-Inspektion wurde abgebrochen.");
+  error.name = "AbortError";
+  return error;
+}
+
+function awaitWithSignal<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
+  if (!signal) return promise;
+  if (signal.aborted) return Promise.reject(signalError(signal));
+  return new Promise<T>((resolvePromise, rejectPromise) => {
+    const abort = () => {
+      rejectPromise(signalError(signal));
+    };
+    signal.addEventListener("abort", abort, { once: true });
+    promise.then(
+      (value) => {
+        signal.removeEventListener("abort", abort);
+        resolvePromise(value);
+      },
+      (error) => {
+        signal.removeEventListener("abort", abort);
+        rejectPromise(error);
+      },
+    );
+  });
+}
+
+function delay(ms: number, signal?: AbortSignal): Promise<void> {
+  if (signal?.aborted) return Promise.reject(signalError(signal));
+  return new Promise((resolvePromise, rejectPromise) => {
+    const finish = () => {
+      signal?.removeEventListener("abort", abort);
+      resolvePromise();
+    };
+    const timer = setTimeout(finish, Math.max(0, ms));
+    const abort = () => {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", abort);
+      rejectPromise(signalError(signal));
+    };
+    signal?.addEventListener("abort", abort, { once: true });
   });
 }
 
@@ -388,19 +578,29 @@ export async function findFreePort(): Promise<number> {
 
 export type FetchFn = typeof fetch;
 
-async function waitForDevtoolsHttp(port: number, fetchFn: FetchFn, deadline: number): Promise<void> {
+async function waitForDevtoolsHttp(
+  port: number,
+  fetchFn: FetchFn,
+  deadline: number,
+  signal: AbortSignal,
+): Promise<void> {
   let lastError = "";
   while (Date.now() < deadline) {
+    if (signal.aborted) throw signalError(signal);
     try {
-      const response = await fetchFn(`http://127.0.0.1:${port}/json/version`);
+      const response = await awaitWithSignal(
+        fetchFn(`http://127.0.0.1:${port}/json/version`, { signal }),
+        signal,
+      );
       if (response.ok) {
         return;
       }
       lastError = `HTTP ${response.status}`;
     } catch (error) {
+      if (signal.aborted) throw signalError(signal);
       lastError = error instanceof Error ? error.message : String(error);
     }
-    await delay(100);
+    await delay(100, signal);
   }
   throw new Error(
     `Chrome-DevTools-Endpunkt auf Port ${port} antwortet nicht (${lastError || "Zeitlimit"}).`,
@@ -412,12 +612,19 @@ interface DevtoolsTarget {
   webSocketDebuggerUrl: string;
 }
 
-async function openNewTab(port: number, fetchFn: FetchFn): Promise<DevtoolsTarget> {
-  const response = await fetchFn(`http://127.0.0.1:${port}/json/new`, { method: "PUT" });
+async function openNewTab(
+  port: number,
+  fetchFn: FetchFn,
+  signal: AbortSignal,
+): Promise<DevtoolsTarget> {
+  const response = await awaitWithSignal(
+    fetchFn(`http://127.0.0.1:${port}/json/new`, { method: "PUT", signal }),
+    signal,
+  );
   if (!response.ok) {
     throw new Error(`Neuer Chrome-Tab konnte nicht geöffnet werden (HTTP ${response.status}).`);
   }
-  const data: unknown = await response.json();
+  const data: unknown = await awaitWithSignal(response.json(), signal);
   const id = isRecord(data) && typeof data.id === "string" ? data.id : "";
   const webSocketDebuggerUrl =
     isRecord(data) && typeof data.webSocketDebuggerUrl === "string" ? data.webSocketDebuggerUrl : "";
@@ -427,11 +634,19 @@ async function openNewTab(port: number, fetchFn: FetchFn): Promise<DevtoolsTarge
   return { id, webSocketDebuggerUrl };
 }
 
-async function closeTab(port: number, fetchFn: FetchFn, id: string): Promise<void> {
-  if (!id) {
+async function closeTab(
+  port: number,
+  fetchFn: FetchFn,
+  id: string,
+  signal: AbortSignal,
+): Promise<void> {
+  if (!id || signal.aborted) {
     return;
   }
-  await fetchFn(`http://127.0.0.1:${port}/json/close/${id}`).catch(() => undefined);
+  await awaitWithSignal(
+    fetchFn(`http://127.0.0.1:${port}/json/close/${id}`, { signal }),
+    signal,
+  ).catch(() => undefined);
 }
 
 // ---------------------------------------------------------------------------
@@ -665,6 +880,8 @@ export interface InspectUrlDeps {
   wsFactory?: WebSocketFactory;
   fetchFn?: FetchFn;
   findPort?: () => Promise<number>;
+  /** Operation-local removal seam. Production removes recursively and fail-closed. */
+  removeTree?: (path: string) => Promise<void>;
 }
 
 export interface InspectUrlOptions {
@@ -677,8 +894,10 @@ export interface InspectUrlOptions {
   fullPage?: boolean;
   /** Default true. `/browser`'s plain-text report sets this to false — nothing will ever read the screenshot there, so it is not worth taking. */
   captureScreenshot?: boolean;
-  /** Pre-resolved executable; when unset, `findBrowserExecutable` searches. */
+  /** Configured executable; `inspectUrl` validates it before allocating artifacts. */
   browserPath?: string;
+  /** Exact root run signal. Timeout remains independently bounded by `timeoutMs`. */
+  signal?: AbortSignal;
   /** Base directory for the temporary profile and screenshot file. Defaults to `os.tmpdir()`. */
   tempDir?: string;
   deps?: InspectUrlDeps;
@@ -687,6 +906,8 @@ export interface InspectUrlOptions {
 const DEFAULT_VIEWPORT = { width: 1280, height: 800 };
 
 export async function inspectUrl(options: InspectUrlOptions): Promise<PageReport> {
+  if (options.signal?.aborted) throw signalError(options.signal);
+  if (options.timeoutMs <= 0) throw new BrowserTimeoutError(options.timeoutMs);
   const deps = options.deps ?? {};
   const fetchFn = deps.fetchFn ?? fetch;
   const wsFactory = deps.wsFactory ?? ((url: string) => new WebSocket(url) as unknown as WebSocketLike);
@@ -694,36 +915,49 @@ export async function inspectUrl(options: InspectUrlOptions): Promise<PageReport
   const viewport = options.viewport ?? DEFAULT_VIEWPORT;
   const captureScreenshot = options.captureScreenshot ?? true;
   const tempRoot = options.tempDir ?? tmpdir();
-
-  const executable =
-    options.browserPath ?? (await findBrowserExecutable(undefined, deps));
-  const profileDir = await mkdtemp(join(tempRoot, "orcode-browser-profile-"));
-  const port = deps.findPort ? await deps.findPort() : await findFreePort();
-
-  const args = [
-    `--remote-debugging-port=${port}`,
-    `--user-data-dir=${profileDir}`,
-    "--headless=new",
-    "--disable-extensions",
-    "--disable-sync",
-    "--disable-background-networking",
-    "--disable-default-apps",
-    "--no-first-run",
-    "--no-default-browser-check",
-    "--mute-audio",
-    `--window-size=${viewport.width},${viewport.height}`,
-    "about:blank",
-  ];
-
-  const proc = startManagedProcess(executable, args, { spawnFn: deps.spawnFn });
-
+  const deadline = Date.now() + options.timeoutMs;
+  const executable = await awaitUntilDeadline(
+    () => findBrowserExecutable(options.browserPath, deps),
+    deadline,
+    options.timeoutMs,
+    options.signal,
+  );
+  const operationDir = await mkdtemp(join(tempRoot, "orcode-browser-operation-"));
+  let failure: unknown;
   try {
-    return await runWithHardTimeout(proc, options.timeoutMs, async (deadline) => {
-      await waitForDevtoolsHttp(port, fetchFn, deadline);
-      const target = await openNewTab(port, fetchFn);
+    if (options.signal?.aborted) throw signalError(options.signal);
+    if (remaining(deadline) === 0) throw new BrowserTimeoutError(options.timeoutMs);
+    const profileDir = join(operationDir, "profile");
+    const screenshotPath = join(operationDir, "screenshot.png");
+    await mkdir(profileDir);
+    const port = await awaitUntilDeadline(
+      () => deps.findPort ? deps.findPort() : findFreePort(),
+      deadline,
+      options.timeoutMs,
+      options.signal,
+    );
+    const args = [
+      `--remote-debugging-port=${port}`,
+      `--user-data-dir=${profileDir}`,
+      "--headless=new",
+      "--disable-extensions",
+      "--disable-sync",
+      "--disable-background-networking",
+      "--disable-default-apps",
+      "--no-first-run",
+      "--no-default-browser-check",
+      "--mute-audio",
+      `--window-size=${viewport.width},${viewport.height}`,
+      "about:blank",
+    ];
+    const proc = startManagedProcess(executable, args, { spawnFn: deps.spawnFn });
+
+    return await runWithHardTimeout(proc, remaining(deadline), async (bodyDeadline, operationSignal) => {
+      await waitForDevtoolsHttp(port, fetchFn, bodyDeadline, operationSignal);
+      const target = await openNewTab(port, fetchFn, operationSignal);
       const session = new CdpClient(target.webSocketDebuggerUrl, wsFactory);
       try {
-        await session.waitOpen();
+        await awaitWithSignal(session.waitOpen(), operationSignal);
 
         const consoleMessages: ConsoleMessageReport[] = [];
         const pageErrors: string[] = [];
@@ -776,13 +1010,19 @@ export async function inspectUrl(options: InspectUrlOptions): Promise<PageReport
           failedRequests.push(entry);
         });
 
-        await session.send("Page.enable");
-        await session.send("Network.enable");
-        await session.send("Runtime.enable");
+        await awaitWithSignal(session.send("Page.enable"), operationSignal);
+        await awaitWithSignal(session.send("Network.enable"), operationSignal);
+        await awaitWithSignal(session.send("Runtime.enable"), operationSignal);
 
         const navigationStart = Date.now();
-        await session.send("Page.navigate", { url: options.url });
-        const loaded = await session.waitForEvent("Page.loadEventFired", remaining(deadline));
+        await awaitWithSignal(
+          session.send("Page.navigate", { url: options.url }),
+          operationSignal,
+        );
+        const loaded = await awaitWithSignal(
+          session.waitForEvent("Page.loadEventFired", remaining(bodyDeadline)),
+          operationSignal,
+        );
         if (!loaded) {
           truncated = true;
           pageErrors.push(
@@ -790,21 +1030,26 @@ export async function inspectUrl(options: InspectUrlOptions): Promise<PageReport
           );
         }
         if (waitMs > 0) {
-          await delay(Math.min(waitMs, remaining(deadline)));
+          await delay(Math.min(waitMs, remaining(bodyDeadline)), operationSignal);
         }
         const loadTimeMs = Date.now() - navigationStart;
 
-        const title = await readTitle(session);
+        const title = await readTitle(session, operationSignal);
 
-        let screenshotPath: string | null = null;
         if (captureScreenshot) {
-          screenshotPath = await captureScreenshotToFile(session, tempRoot, Boolean(options.fullPage));
+          await captureScreenshotToFile(
+            session,
+            screenshotPath,
+            Boolean(options.fullPage),
+            operationSignal,
+          );
         }
+        if (operationSignal.aborted) throw signalError(operationSignal);
 
         return {
           url: options.url,
           title,
-          screenshotPath,
+          screenshotPath: null,
           consoleMessages,
           pageErrors,
           failedRequests,
@@ -812,34 +1057,86 @@ export async function inspectUrl(options: InspectUrlOptions): Promise<PageReport
           truncated,
         };
       } finally {
-        await closeTab(port, fetchFn, target.id).catch(() => undefined);
         session.close();
+        await closeTab(port, fetchFn, target.id, operationSignal).catch(() => undefined);
       }
-    });
+    }, options.signal);
+  } catch (error) {
+    failure = error;
+    throw error;
   } finally {
-    // `runWithHardTimeout` already guarantees the process group is dead
-    // (and `proc.exited` settled) by the time it returns or throws, on
-    // every path including its own timeout — nothing left to kill here.
-    // Best-effort cleanup: a leftover temp profile dir is not worth failing
-    // the whole inspection over.
-    await rm(profileDir, { recursive: true, force: true }).catch(() => undefined);
+    try {
+      const removeTree = deps.removeTree ?? ((path: string) => rm(path, { recursive: true, force: true }));
+      await removeTree(operationDir);
+    } catch (cleanupError) {
+      const message = `Temporäre Browser-Artefakte konnten nicht entfernt werden: ${errorMessage(cleanupError)}`;
+      if (failure !== undefined) {
+        throw new AggregateError([failure, cleanupError], message);
+      }
+      throw new Error(message, { cause: cleanupError });
+    }
   }
+}
+
+async function awaitUntilDeadline<T>(
+  operation: () => Promise<T>,
+  deadline: number,
+  configuredTimeoutMs: number,
+  signal?: AbortSignal,
+): Promise<T> {
+  if (signal?.aborted) throw signalError(signal);
+  const waitMs = remaining(deadline);
+  if (waitMs === 0) throw new BrowserTimeoutError(configuredTimeoutMs);
+  return new Promise<T>((resolvePromise, rejectPromise) => {
+    let settled = false;
+    const cleanup = () => {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", abort);
+    };
+    const finish = (callback: () => void) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      callback();
+    };
+    const abort = () => finish(() => rejectPromise(signalError(signal)));
+    const timer = setTimeout(
+      () => finish(() => rejectPromise(new BrowserTimeoutError(configuredTimeoutMs))),
+      waitMs,
+    );
+    signal?.addEventListener("abort", abort, { once: true });
+    if (signal?.aborted) abort();
+    Promise.resolve().then(() => {
+      if (signal?.aborted) throw signalError(signal);
+      if (settled || remaining(deadline) === 0) {
+        throw new BrowserTimeoutError(configuredTimeoutMs);
+      }
+      return operation();
+    }).then(
+      (value) => finish(() => resolvePromise(value)),
+      (error) => finish(() => rejectPromise(error)),
+    );
+  });
 }
 
 function remaining(deadline: number): number {
   return Math.max(0, deadline - Date.now());
 }
 
-async function readTitle(session: CdpClient): Promise<string> {
+async function readTitle(session: CdpClient, signal: AbortSignal): Promise<string> {
   try {
-    const result = await session.send("Runtime.evaluate", {
-      expression: "document.title",
-      returnByValue: true,
-    });
+    const result = await awaitWithSignal(
+      session.send("Runtime.evaluate", {
+        expression: "document.title",
+        returnByValue: true,
+      }),
+      signal,
+    );
     if (isRecord(result) && isRecord(result.result) && typeof result.result.value === "string") {
       return result.result.value;
     }
-  } catch {
+  } catch (error) {
+    if (signal.aborted) throw signalError(signal);
     // No title is not fatal — the rest of the report still stands.
   }
   return "";
@@ -847,27 +1144,29 @@ async function readTitle(session: CdpClient): Promise<string> {
 
 async function captureScreenshotToFile(
   session: CdpClient,
-  tempRoot: string,
+  path: string,
   fullPage: boolean,
+  signal: AbortSignal,
 ): Promise<string | null> {
   try {
     const params: Record<string, unknown> = { format: "png" };
     if (fullPage) {
-      const metrics = await session.send("Page.getLayoutMetrics");
+      const metrics = await awaitWithSignal(session.send("Page.getLayoutMetrics"), signal);
       const contentSize = isRecord(metrics) ? metrics.contentSize : null;
       if (isRecord(contentSize) && typeof contentSize.width === "number" && typeof contentSize.height === "number") {
         params.captureBeyondViewport = true;
         params.clip = { x: 0, y: 0, width: contentSize.width, height: contentSize.height, scale: 1 };
       }
     }
-    const shot = await session.send("Page.captureScreenshot", params);
+    const shot = await awaitWithSignal(session.send("Page.captureScreenshot", params), signal);
     if (!isRecord(shot) || typeof shot.data !== "string") {
       return null;
     }
-    const path = join(tempRoot, `orcode-browser-screenshot-${randomUUID()}.png`);
     await writeFile(path, Buffer.from(shot.data, "base64"));
+    if (signal.aborted) throw signalError(signal);
     return path;
-  } catch {
+  } catch (error) {
+    if (signal.aborted) throw signalError(signal);
     return null;
   }
 }
