@@ -10,6 +10,8 @@ import {
   handleSlashCommand,
   promptForValidKey,
   shouldReplaceCredential,
+  validateAndActivateInferenceKey,
+  validateAndActivateManagementKey,
   type CommandContext,
 } from "../src/commands.js";
 import { OpenRouterHttpError, OpenRouterService } from "../src/openrouter.js";
@@ -197,6 +199,94 @@ test("a first valid but unfunded replacement is persisted and activated before t
   assert.equal(service.runtimeState.inferenceValidity, "valid");
   assert.equal(service.runtimeState.connectivity, "connected");
   assert.equal(service.runtimeState.credit, "insufficient");
+});
+
+test("locally rejected setup input makes zero network and keychain calls", async () => {
+  const calls: string[] = [];
+  const context = {
+    credentials: {
+      location: "Test-Schlüsselbund",
+      async set() { calls.push("keychain"); },
+    },
+    openRouter: {
+      async validateInferenceKey() {
+        calls.push("network");
+        return {};
+      },
+      activateValidatedKey() { calls.push("activate"); },
+    },
+  } as unknown as Pick<CommandContext, "credentials" | "openRouter">;
+
+  await assert.rejects(
+    validateAndActivateInferenceKey(`bad\n${"x".repeat(30)}`, context),
+    /ungültig|Steuer|Leerzeichen/i,
+  );
+  assert.deepEqual(calls, []);
+});
+
+test("inference and management activation use the same normalized candidate for network, keychain, and memory", async () => {
+  const body = `${KEY_PREFIX}${"n".repeat(48)}`;
+  const raw = `\u00a0\r\n${body}\r\n\u2003`;
+  const calls: string[] = [];
+  const context = {
+    credentials: {
+      location: "Test-Schlüsselbund",
+      async set(kind: string, secret: string) {
+        calls.push(`store:${kind}:${secret}`);
+      },
+    },
+    openRouter: {
+      async validateInferenceKey(secret: string) {
+        calls.push(`network:inference:${secret}`);
+        return { key: {}, credits: null };
+      },
+      activateValidatedKey(secret: string) {
+        calls.push(`activate:inference:${secret}`);
+      },
+      async validateManagementKey(secret: string) {
+        calls.push(`network:management:${secret}`);
+        return { totalCredits: 10, totalUsage: 2, remaining: 8 };
+      },
+      activateValidatedManagementKey(secret: string) {
+        calls.push(`activate:management:${secret}`);
+      },
+    },
+  } as unknown as Pick<CommandContext, "credentials" | "openRouter">;
+
+  await validateAndActivateInferenceKey(raw, context);
+  await validateAndActivateManagementKey(raw, context);
+
+  assert.deepEqual(calls, [
+    `network:inference:${body}`,
+    `store:inference:${body}`,
+    `activate:inference:${body}`,
+    `network:management:${body}`,
+    `store:management:${body}`,
+    `activate:management:${body}`,
+  ]);
+});
+
+test("key replace and management replace reject embedded controls before provider or store side effects", async () => {
+  for (const command of ["/key replace", "/key management replace"]) {
+    const calls: string[] = [];
+    const service = new OpenRouterService(undefined, undefined, {}, {
+      fetchImpl: async () => {
+        calls.push("network");
+        return new Response(JSON.stringify({ data: {} }), { status: 200 });
+      },
+    });
+    const credentials = lifecycleCredentials();
+    const { context } = lifecycleContext(service, credentials.store, {
+      readCredentialSecret: async () => `bad\u001b[31m${"x".repeat(30)}`,
+    } as Partial<CommandContext>);
+
+    await assert.rejects(
+      handleSlashCommand(command, context),
+      /ungültig|Steuer|Leerzeichen/i,
+    );
+    assert.deepEqual(calls, [], command);
+    assert.equal(credentials.calls.includes("set"), false, command);
+  }
 });
 
 const KEY_PREFIX = `${["sk", "or", "v1"].join("-")}-`;

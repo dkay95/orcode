@@ -631,6 +631,8 @@ export class TerminalUi {
   readSecret(label: string): Promise<string | null> {
     this.#requireActive();
     this.#secretLabel = oneLine(label);
+    this.#pasting = false;
+    this.#pasteBuffer = "";
     this.#resetQuery();
     this.#enterMode("secret", `${this.#secretLabel} eingeben`);
     return new Promise<string | null>((resolve) => {
@@ -1139,8 +1141,15 @@ export class TerminalUi {
       return;
     }
     if (this.#pasting) {
-      if (key.name === "enter" || key.name === "return") this.#pasteBuffer += "\n";
-      else if (key.name === "tab") this.#pasteBuffer += "\t";
+      if (key.name === "enter" || key.name === "return") {
+        this.#pasteBuffer += this.#mode === "secret" && character
+          ? character
+          : "\n";
+      } else if (key.name === "tab") {
+        this.#pasteBuffer += this.#mode === "secret" && character
+          ? character
+          : "\t";
+      }
       else if (character) this.#pasteBuffer += character;
       return;
     }
@@ -1149,7 +1158,7 @@ export class TerminalUi {
       return;
     }
     if (this.#mode === "secret") {
-      if (key.name === "return") this.#resolveSecret(this.#inputChars.join("").trim());
+      if (key.name === "return") this.#resolveSecret(this.#inputChars.join(""));
       else if (key.name === "escape") this.#resolveSecret(null);
       else {
         this.#editInput(character, key, false);
@@ -1542,6 +1551,8 @@ export class TerminalUi {
     const resolve = this.#secretResolve;
     this.#secretResolve = null;
     this.#secretLabel = "";
+    this.#pasting = false;
+    this.#pasteBuffer = "";
     this.#resetQuery();
     this.#enterMode("busy", value === null ? "Eingabe abgebrochen" : "Key wird geprüft");
     resolve?.(value);
@@ -1604,9 +1615,11 @@ export class TerminalUi {
   }
 
   #finishPaste(): void {
-    const clean = sanitizeTerminalText(this.#pasteBuffer)
-      .replace(/\r\n?/g, "\n")
-      .replace(/\t/g, "  ");
+    const clean = this.#mode === "secret"
+      ? this.#pasteBuffer
+      : sanitizeTerminalText(this.#pasteBuffer)
+        .replace(/\r\n?/g, "\n")
+        .replace(/\t/g, "  ");
     this.#pasting = false;
     this.#pasteBuffer = "";
     if (!clean) {

@@ -49,6 +49,7 @@ import { loadSshHosts } from "./ssh-config.js";
 import { checkHost, closeSshControl, createSshSession, type RunSsh, type SshSession } from "./ssh.js";
 import {
   CredentialStoreError,
+  normalizeProviderSecret,
   type CredentialStoreLike,
 } from "./credentials.js";
 import {
@@ -487,7 +488,7 @@ export async function promptForValidKey(
     const candidate = await password({
       message: "OpenRouter API-Key (verdeckt):",
       mask: "•",
-      validate: (value) => value.trim().length >= 20 || "Der Key ist zu kurz.",
+      validate: validateProviderSecretInput,
     });
     try {
       const activated = await validateAndActivateInferenceKey(
@@ -827,8 +828,17 @@ async function readCredentialSecret(
       ? "Neuer OpenRouter API-Key (verdeckt):"
       : "OpenRouter Management-Key für /credits (verdeckt):",
     mask: "•",
-    validate: (value) => value.trim().length >= 20 || "Der Key ist zu kurz.",
+    validate: validateProviderSecretInput,
   });
+}
+
+function validateProviderSecretInput(value: string): true | string {
+  try {
+    normalizeProviderSecret(value);
+    return true;
+  } catch (error) {
+    return errorMessage(error);
+  }
 }
 
 interface CredentialActivationOptions {
@@ -843,14 +853,15 @@ export async function validateAndActivateInferenceKey(
   context: Pick<CommandContext, "credentials" | "openRouter">,
   options: CredentialActivationOptions = {},
 ): Promise<{ balance: BalanceReport; persisted: boolean } | null> {
+  const normalized = normalizeProviderSecret(candidate);
   const balance = await context.openRouter.validateInferenceKey(
-    candidate,
+    normalized,
     options.signal,
   );
   let persisted = options.persist !== false;
   if (persisted) {
     try {
-      await context.credentials.set("inference", candidate);
+      await context.credentials.set("inference", normalized);
     } catch (error) {
       if (
         error instanceof CredentialStoreError &&
@@ -866,7 +877,7 @@ export async function validateAndActivateInferenceKey(
     }
   }
   context.openRouter.activateValidatedKey(
-    candidate,
+    normalized,
     persisted ? "keychain" : (options.processOrigin ?? "interactive"),
     balance,
   );
@@ -878,14 +889,15 @@ export async function validateAndActivateManagementKey(
   context: Pick<CommandContext, "credentials" | "openRouter">,
   options: Omit<CredentialActivationOptions, "processOrigin"> = {},
 ): Promise<{ credits: CreditInfo; persisted: boolean } | null> {
+  const normalized = normalizeProviderSecret(candidate);
   const credits = await context.openRouter.validateManagementKey(
-    candidate,
+    normalized,
     options.signal,
   );
   let persisted = options.persist !== false;
   if (persisted) {
     try {
-      await context.credentials.set("management", candidate);
+      await context.credentials.set("management", normalized);
     } catch (error) {
       if (
         error instanceof CredentialStoreError &&
@@ -901,7 +913,7 @@ export async function validateAndActivateManagementKey(
     }
   }
   context.openRouter.activateValidatedManagementKey(
-    candidate,
+    normalized,
     persisted ? "keychain" : "interactive",
     credits,
   );

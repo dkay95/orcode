@@ -207,6 +207,73 @@ test("dashboard first-key setup keeps a valid unfunded key active for status and
   assert.match(messages.join("\n"), /validiert.*gespeichert/i);
 });
 
+test("dashboard setup normalizes outer Unicode whitespace before network, keychain, and activation", async () => {
+  const body = `${STARTUP_KEY_PREFIX}${"d".repeat(48)}`;
+  const raw = `\u00a0\r\n${body}\r\n\u2003`;
+  const authorizations: string[] = [];
+  const openRouter = new OpenRouterService(undefined, undefined, {}, {
+    fetchImpl: async (_url, init) => {
+      authorizations.push((init.headers as Record<string, string>).Authorization);
+      return startupKeyResponse();
+    },
+  });
+  const persisted: string[] = [];
+  const credentials: CredentialStoreLike = {
+    location: "Test-Schlüsselbund",
+    async get() { return null; },
+    async has() { return false; },
+    async set(_kind, secret) { persisted.push(secret); },
+    async delete() { return false; },
+  };
+  const { ui } = dashboardKeyUi();
+  const candidates: Array<string | null> = [raw, null];
+  (ui as { readSecret(): Promise<string | null> }).readSecret = async () =>
+    candidates.shift() ?? null;
+
+  await initializeDashboardKey(
+    ui as never,
+    { openRouter, credentials } as never,
+  );
+
+  assert.deepEqual(authorizations, [`Bearer ${body}`]);
+  assert.deepEqual(persisted, [body]);
+  assert.equal(openRouter.requireKey(), body);
+});
+
+test("dashboard setup rejects invalid local bytes with zero network and keychain calls", async () => {
+  const calls: string[] = [];
+  const openRouter = new OpenRouterService(undefined, undefined, {}, {
+    fetchImpl: async () => {
+      calls.push("network");
+      return startupKeyResponse();
+    },
+  });
+  const credentials: CredentialStoreLike = {
+    location: "Test-Schlüsselbund",
+    async get() { calls.push("get"); return null; },
+    async has() { calls.push("has"); return false; },
+    async set() { calls.push("set"); },
+    async delete() { calls.push("delete"); return false; },
+  };
+  const messages: string[] = [];
+  const candidates: Array<string | null> = [`bad\0${"x".repeat(30)}`, null];
+  const ui = {
+    setStatus: () => undefined,
+    setCancelHandler: () => undefined,
+    addMessage: (_level: string, message: string) => messages.push(message),
+    readSecret: async () => candidates.shift() ?? null,
+  };
+
+  const result = await initializeDashboardKey(
+    ui as never,
+    { openRouter, credentials } as never,
+  );
+
+  assert.equal(result, null);
+  assert.deepEqual(calls, []);
+  assert.match(messages.join("\n"), /ungültig|Steuer|Leerzeichen/i);
+});
+
 test("a rejected saved key stays persisted until a valid environment fallback is activated", async () => {
   const stored = `${STARTUP_KEY_PREFIX}dashboard-rejected-stored-123`;
   const environment = `${STARTUP_KEY_PREFIX}dashboard-valid-environment-456`;

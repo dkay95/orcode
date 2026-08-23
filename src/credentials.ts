@@ -1,4 +1,5 @@
 import { AsyncEntry } from "@napi-rs/keyring";
+import { randomBytes, randomUUID } from "node:crypto";
 import { redactText } from "./redaction.js";
 import { errorMessage } from "./utils.js";
 
@@ -10,6 +11,34 @@ export interface CredentialStoreLike {
   set(kind: CredentialKind, secret: string): Promise<void>;
   delete(kind: CredentialKind): Promise<boolean>;
   has(kind: CredentialKind): Promise<boolean>;
+}
+
+export interface CredentialSlotRef {
+  version: 1;
+  kind: CredentialKind;
+  id: string;
+}
+
+export interface VersionedCredentialStoreLike extends CredentialStoreLike {
+  reserveSlot(kind: CredentialSlotRef["kind"]): CredentialSlotRef;
+  writeSlot(slot: CredentialSlotRef, secret: string): Promise<void>;
+  readSlot(slot: CredentialSlotRef): Promise<string | null>;
+  deleteSlot(slot: CredentialSlotRef): Promise<boolean>;
+  getOrCreateAccountHmacKey(): Promise<Uint8Array>;
+}
+
+export function normalizeProviderSecret(value: string): string {
+  const normalized = value.trim();
+  if (
+    normalized.length === 0 ||
+    /\s/u.test(normalized) ||
+    /[\0-\x1f\x7f\u001b]/u.test(normalized)
+  ) {
+    throw new Error(
+      "Der Provider-Key ist ungültig oder enthält Leerzeichen/Steuerzeichen.",
+    );
+  }
+  return normalized;
 }
 
 interface KeyringEntry {
@@ -34,8 +63,12 @@ const ACCOUNTS: Record<CredentialKind, string> = {
   inference: "inference-api-key",
   management: "management-api-key",
 };
+const ACCOUNT_HMAC_KEY = "provider-account-hmac-v1";
+const SLOT_ACCOUNT_PREFIX = "provider-slot:";
+const CANONICAL_UUID =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 
-export class CredentialStore implements CredentialStoreLike {
+export class CredentialStore implements VersionedCredentialStoreLike {
   readonly location =
     process.platform === "darwin"
       ? "macOS-Schlüsselbund"
@@ -44,7 +77,148 @@ export class CredentialStore implements CredentialStoreLike {
   constructor(
     private readonly createEntry: EntryFactory = (service, account) =>
       new AsyncEntry(service, account),
+    private readonly createUuid: () => string = randomUUID,
+    private readonly createAccountHmacKey: () => Uint8Array = () =>
+      randomBytes(32),
   ) {}
+
+  reserveSlot(kind: CredentialSlotRef["kind"]): CredentialSlotRef {
+    if (kind !== "inference" && kind !== "management") {
+      throw new Error("Der Credential-Slot-Typ ist ungültig.");
+    }
+    const uuid = this.createUuid();
+    if (!CANONICAL_UUID.test(uuid)) {
+      throw new Error("Der erzeugte Credential-Slot ist ungültig.");
+    }
+    return Object.freeze({
+      version: 1 as const,
+      kind,
+      id: `v1:${kind}:${uuid}`,
+    });
+  }
+
+  async writeSlot(slot: CredentialSlotRef, secret: string): Promise<void> {
+    const normalized = normalizeProviderSecret(secret);
+    const entry = this.slotEntry(slot);
+    let primaryError: unknown;
+    try {
+      await entry.setPassword(normalized);
+    } catch (error) {
+      primaryError = error;
+    }
+
+    let stored: string | null = null;
+    try {
+      stored = rawStored(await entry.getPassword());
+    } catch (error) {
+      primaryError ??= error;
+    }
+    if (!primaryError && stored === normalized) {
+      return;
+    }
+
+    primaryError ??= new Error(
+      "Der Schlüsselbund hat den neuen Provider-Key nicht unverändert gespeichert.",
+    );
+    let cleanupError: unknown;
+    try {
+      await entry.deleteCredential();
+    } catch (error) {
+      cleanupError = error;
+    }
+    let remaining: string | null = null;
+    let cleanupReadSucceeded = false;
+    try {
+      remaining = rawStored(await entry.getPassword());
+      cleanupReadSucceeded = true;
+    } catch (error) {
+      cleanupError ??= error;
+    }
+    if (!cleanupReadSucceeded || remaining !== null) {
+      const primary = credentialError(
+        "speichern",
+        primaryError,
+        normalized,
+        stored ?? undefined,
+      );
+      const cleanup = credentialError(
+        "löschen",
+        cleanupError ?? new Error("der Kandidaten-Slot blieb belegt"),
+        normalized,
+        stored ?? undefined,
+        remaining ?? undefined,
+      );
+      throw new CredentialStoreError(
+        `${primary.message} Der Kandidaten-Slot konnte nicht sicher bereinigt werden: ${cleanup.message}`,
+        "unknown",
+      );
+    }
+    throw credentialError(
+      "speichern",
+      primaryError,
+      normalized,
+      stored ?? undefined,
+    );
+  }
+
+  async readSlot(slot: CredentialSlotRef): Promise<string | null> {
+    try {
+      return rawStored(await this.slotEntry(slot).getPassword());
+    } catch (error) {
+      throw credentialError("lesen", error);
+    }
+  }
+
+  async deleteSlot(slot: CredentialSlotRef): Promise<boolean> {
+    const entry = this.slotEntry(slot);
+    let existing: string | null = null;
+    try {
+      existing = rawStored(await entry.getPassword());
+      if (existing === null) return false;
+      await entry.deleteCredential();
+      if (rawStored(await entry.getPassword()) !== null) {
+        throw new CredentialStoreError(
+          "Der System-Schlüsselbund hat den Provider-Key nicht gelöscht. Versuche es erneut.",
+        );
+      }
+      return true;
+    } catch (error) {
+      throw credentialError("löschen", error, existing ?? undefined);
+    }
+  }
+
+  async getOrCreateAccountHmacKey(): Promise<Uint8Array> {
+    const entry = this.createEntry(SERVICE, ACCOUNT_HMAC_KEY);
+    let existing: string | null;
+    try {
+      existing = rawStored(await entry.getPassword());
+    } catch (error) {
+      throw credentialError("lesen", error);
+    }
+    if (existing !== null) {
+      return decodeAccountHmacKey(existing);
+    }
+
+    const generated = this.createAccountHmacKey();
+    if (generated.byteLength !== 32) {
+      throw new CredentialStoreError(
+        "Der lokale Account-HMAC-Key konnte nicht sicher erzeugt werden.",
+      );
+    }
+    const encoded = Buffer.from(generated).toString("base64url");
+    try {
+      await entry.setPassword(encoded);
+      const readback = rawStored(await entry.getPassword());
+      if (readback !== encoded) {
+        throw new Error(
+          "Der Schlüsselbund hat den Account-HMAC-Key nicht unverändert gespeichert.",
+        );
+      }
+      return decodeAccountHmacKey(readback);
+    } catch (error) {
+      throw credentialError("speichern", error, encoded);
+    }
+  }
 
   async get(kind: CredentialKind): Promise<string | null> {
     try {
@@ -160,11 +334,51 @@ export class CredentialStore implements CredentialStoreLike {
   private entry(kind: CredentialKind): KeyringEntry {
     return this.createEntry(SERVICE, ACCOUNTS[kind]);
   }
+
+  private slotEntry(slot: CredentialSlotRef): KeyringEntry {
+    validateSlotRef(slot);
+    return this.createEntry(SERVICE, `${SLOT_ACCOUNT_PREFIX}${slot.id}`);
+  }
 }
 
 function normalizeStored(value: string | undefined | null): string | null {
   const normalized = value?.trim();
   return normalized || null;
+}
+
+function rawStored(value: string | undefined | null): string | null {
+  return value === undefined || value === null || value.length === 0
+    ? null
+    : value;
+}
+
+function validateSlotRef(slot: CredentialSlotRef): void {
+  if (
+    !slot ||
+    slot.version !== 1 ||
+    (slot.kind !== "inference" && slot.kind !== "management")
+  ) {
+    throw new Error("Der Credential-Slot ist ungültig.");
+  }
+  const prefix = `v1:${slot.kind}:`;
+  if (!slot.id.startsWith(prefix) || !CANONICAL_UUID.test(slot.id.slice(prefix.length))) {
+    throw new Error("Der Credential-Slot ist ungültig oder nicht kanonisch.");
+  }
+}
+
+function decodeAccountHmacKey(value: string): Uint8Array {
+  if (!/^[A-Za-z0-9_-]{43}$/.test(value)) {
+    throw new CredentialStoreError(
+      "Der lokale Account-HMAC-Key im System-Schlüsselbund ist ungültig.",
+    );
+  }
+  const decoded = Buffer.from(value, "base64url");
+  if (decoded.byteLength !== 32 || decoded.toString("base64url") !== value) {
+    throw new CredentialStoreError(
+      "Der lokale Account-HMAC-Key im System-Schlüsselbund ist ungültig.",
+    );
+  }
+  return new Uint8Array(decoded);
 }
 
 export class CredentialStoreError extends Error {

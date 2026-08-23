@@ -19,6 +19,7 @@ import { createTheme } from "../src/ui/theme.js";
 import { RunViewModel } from "../src/ui/view-model.js";
 import type { AgentRunEvent, ModelInfo } from "../src/types.js";
 import { handleSlashCommand, type CommandContext } from "../src/commands.js";
+import * as credentialsModule from "../src/credentials.js";
 
 const theme = createTheme({ level: 0 });
 const NOW = 1_700_000_000_000;
@@ -577,6 +578,83 @@ test("bracketed multiline paste is inserted once and only submits on a later Ent
     terminal.stop();
   }
   assert.match(stdout.output, /\u001b\[\?2004l/);
+});
+
+test("secret bracketed paste preserves raw CRLF until common normalization, masks it, and waits for later Enter", async () => {
+  const stdin = new FakeInput();
+  const stdout = new FakeOutput();
+  const terminal = ui(stdin, stdout);
+  const body = `${["sk", "or", "v1"].join("-")}-${"r".repeat(48)}`;
+  const raw = `\r\n${body}\r\n`;
+
+  terminal.start();
+  try {
+    const value = terminal.readSecret("OpenRouter API-Key");
+    let settled = false;
+    void value.then(() => {
+      settled = true;
+    });
+    press(stdin, "paste-start");
+    press(stdin, "enter", "\r\n");
+    type(stdin, body);
+    press(stdin, "enter", "\r\n");
+    press(stdin, "paste-end");
+    await new Promise((resolve) => setTimeout(resolve, 40));
+
+    assert.equal(settled, false, "paste-end must not submit a secret");
+    assert.doesNotMatch(stdout.output, new RegExp(body));
+    assert.match(stdout.output, /•{8,}/);
+
+    press(stdin, "return");
+    const received = await value;
+    assert.equal(received, raw);
+    assert.equal(
+      (credentialsModule as typeof credentialsModule & {
+        normalizeProviderSecret(value: string): string;
+      }).normalizeProviderSecret(received ?? ""),
+      body,
+    );
+  } finally {
+    terminal.stop();
+  }
+});
+
+test("secret success, validation error, and cancellation leave the next input buffer clean", async () => {
+  const stdin = new FakeInput();
+  const stdout = new FakeOutput();
+  const terminal = ui(stdin, stdout);
+  const normalize = (credentialsModule as typeof credentialsModule & {
+    normalizeProviderSecret(value: string): string;
+  }).normalizeProviderSecret;
+
+  terminal.start();
+  try {
+    const invalid = terminal.readSecret("OpenRouter API-Key");
+    press(stdin, "paste-start");
+    type(stdin, "bad key");
+    press(stdin, "paste-end");
+    press(stdin, "return");
+    const invalidValue = await invalid;
+    assert.throws(() => normalize(invalidValue ?? ""), /ungültig|Leerzeichen/i);
+
+    const afterError = terminal.readInput();
+    type(stdin, "nach-fehler");
+    press(stdin, "return");
+    assert.equal(await afterError, "nach-fehler");
+
+    const cancelled = terminal.readSecret("OpenRouter API-Key");
+    press(stdin, "paste-start");
+    type(stdin, "stale-secret-bytes");
+    press(stdin, "c", "\u0003", { ctrl: true });
+    assert.equal(await cancelled, null);
+
+    const afterCancel = terminal.readInput();
+    type(stdin, "nach-abbruch");
+    press(stdin, "return");
+    assert.equal(await afterCancel, "nach-abbruch");
+  } finally {
+    terminal.stop();
+  }
 });
 
 test("a paste without its end marker still lets Ctrl+C through", () => {

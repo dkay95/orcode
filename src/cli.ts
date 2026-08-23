@@ -2257,14 +2257,6 @@ async function promptDashboardInferenceKey(
       ui.addMessage("system", "Key-Eingabe abgebrochen.", "/key");
       return null;
     }
-    if (candidate.length < 20 || /\s/.test(candidate)) {
-      ui.addMessage(
-        "error",
-        "Der Key ist zu kurz oder enthält Leerzeichen.",
-        "/key",
-      );
-      continue;
-    }
     const controller = new AbortController();
     ui.setStatus("API-Key und Guthaben werden geprüft");
     ui.setCancelHandler(() => {

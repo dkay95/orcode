@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { CredentialStore } from "../src/credentials.js";
+import * as credentialsModule from "../src/credentials.js";
 
 const TEST_KEY_PREFIX = `${["sk", "or", "v1"].join("-")}-`;
 
@@ -15,11 +16,14 @@ function fakeStore(options: {
   getFailureDetail?: string;
 } = {}) {
   const values = new Map<string, string>();
+  const calls: string[] = [];
   let getCalls = 0;
   const store = new CredentialStore((service, account) => {
     const key = `${service}/${account}`;
+    calls.push(`entry:${key}`);
     return {
       async getPassword() {
+        calls.push(`get:${key}`);
         getCalls += 1;
         if (options.failGetCalls?.includes(getCalls)) {
           throw new Error(options.getFailureDetail ?? "synthetic read failure");
@@ -27,6 +31,7 @@ function fakeStore(options: {
         return values.get(key);
       },
       async setPassword(password: string) {
+        calls.push(`set:${key}`);
         if (options.failOnSet) {
           throw new Error(`backend rejected ${password}`);
         }
@@ -39,6 +44,7 @@ function fakeStore(options: {
         }
       },
       async deleteCredential() {
+        calls.push(`delete:${key}`);
         if (options.failOnDelete) {
           throw new Error(`backend rejected ${values.get(key)}`);
         }
@@ -53,8 +59,181 @@ function fakeStore(options: {
       },
     };
   });
-  return { store, values };
+  return { store, values, calls };
 }
+
+type SlotKind = "inference" | "management";
+type SlotRef = { version: 1; kind: SlotKind; id: string };
+type FutureCredentialStore = CredentialStore & {
+  reserveSlot(kind: SlotKind): SlotRef;
+  writeSlot(slot: SlotRef, secret: string): Promise<void>;
+  readSlot(slot: SlotRef): Promise<string | null>;
+  deleteSlot(slot: SlotRef): Promise<boolean>;
+  getOrCreateAccountHmacKey(): Promise<Uint8Array>;
+};
+
+function versioned(store: CredentialStore): FutureCredentialStore {
+  return store as FutureCredentialStore;
+}
+
+function normalizeProviderSecret(value: string): string {
+  return (credentialsModule as typeof credentialsModule & {
+    normalizeProviderSecret(value: string): string;
+  }).normalizeProviderSecret(value);
+}
+
+test("provider secret normalization strips only outer Unicode whitespace and has no shape rule", () => {
+  const body = `${["sk", "or", "v1"].join("-")}-${"a".repeat(48)}`;
+  assert.equal(normalizeProviderSecret(`\u00a0\r\n${body}\r\n\u2003`), body);
+  assert.equal(normalizeProviderSecret("x"), "x");
+});
+
+test("provider secret normalization rejects embedded whitespace, NUL, ANSI, and controls", () => {
+  for (const invalid of [
+    `prefix ${"a".repeat(30)}`,
+    `prefix\t${"a".repeat(30)}`,
+    `prefix\0${"a".repeat(30)}`,
+    `prefix\u001b[31m${"a".repeat(30)}`,
+    `prefix\u0007${"a".repeat(30)}`,
+    "\u00a0\r\n\u2003",
+  ]) {
+    assert.throws(
+      () => normalizeProviderSecret(invalid),
+      /ungültig|Steuer|Leerzeichen/i,
+      JSON.stringify(invalid.slice(0, 8)),
+    );
+  }
+});
+
+test("versioned slots are unique, exact, isolated from legacy slots, and reserve without keychain calls", async () => {
+  const { store: legacyStore, values, calls } = fakeStore();
+  const store = versioned(legacyStore);
+  const legacyKey = `${TEST_KEY_PREFIX}legacy-inference-key-123456`;
+  const keyA = `${TEST_KEY_PREFIX}candidate-a-123456789012`;
+  const keyB = `${TEST_KEY_PREFIX}candidate-b-123456789012`;
+  await store.set("inference", legacyKey);
+  calls.length = 0;
+
+  const first = store.reserveSlot("inference");
+  const second = store.reserveSlot("inference");
+  assert.notEqual(first.id, second.id);
+  assert.match(first.id, /^v1:inference:[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
+  assert.deepEqual(calls, [], "reservation must not instantiate or call a keychain entry");
+
+  await store.writeSlot(first, keyA);
+  await store.writeSlot(second, keyB);
+  assert.equal(await store.readSlot(first), keyA);
+  assert.equal(await store.readSlot(second), keyB);
+  assert.equal(await store.get("inference"), legacyKey);
+  assert.equal(await store.deleteSlot(first), true);
+  assert.equal(await store.readSlot(first), null);
+  assert.equal(await store.get("inference"), legacyKey);
+  assert.equal(
+    values.has(`de.routercode.openrouter/provider-slot:${second.id}`),
+    true,
+  );
+  assert.equal(
+    values.has("de.routercode.openrouter/inference-api-key"),
+    true,
+  );
+});
+
+test("concurrent slot reservations are collision-free and still make zero keychain calls", async () => {
+  const { store: legacyStore, calls } = fakeStore();
+  const store = versioned(legacyStore);
+  const refs = await Promise.all(
+    Array.from({ length: 512 }, async () => store.reserveSlot("management")),
+  );
+  assert.equal(new Set(refs.map((slot) => slot.id)).size, refs.length);
+  assert.deepEqual(calls, []);
+});
+
+test("versioned slot methods reject forged and noncanonical references before keychain access", async () => {
+  const { store: legacyStore, calls } = fakeStore();
+  const store = versioned(legacyStore);
+  const forged = [
+    { version: 1, kind: "inference", id: "inference-api-key" },
+    { version: 1, kind: "inference", id: "v1:management:123e4567-e89b-42d3-a456-426614174000" },
+    { version: 1, kind: "inference", id: "v1:inference:123E4567-E89B-42D3-A456-426614174000" },
+    { version: 2, kind: "inference", id: "v1:inference:123e4567-e89b-42d3-a456-426614174000" },
+  ] as unknown as SlotRef[];
+
+  for (const ref of forged) {
+    await assert.rejects(store.readSlot(ref), /ungültig|Slot/i);
+    await assert.rejects(store.writeSlot(ref, "x"), /ungültig|Slot/i);
+    await assert.rejects(store.deleteSlot(ref), /ungültig|Slot/i);
+  }
+  assert.deepEqual(calls, []);
+});
+
+test("candidate slot write verifies exact readback, cleans failure, and redacts the candidate", async () => {
+  const options = { ignoreSet: true };
+  const { store: legacyStore, values } = fakeStore(options);
+  const store = versioned(legacyStore);
+  const slot = store.reserveSlot("inference");
+  const secret = `${TEST_KEY_PREFIX}slot-readback-secret-123456`;
+
+  await assert.rejects(store.writeSlot(slot, secret), (error: unknown) => {
+    assert.ok(error instanceof Error);
+    assert.doesNotMatch(error.message, new RegExp(secret));
+    assert.match(error.message, /nicht unverändert|speichern/i);
+    return true;
+  });
+  assert.equal(values.has(`de.routercode.openrouter/provider-slot:${slot.id}`), false);
+});
+
+test("candidate slot partial-write and delete failures fail closed without exposing secret bytes", async () => {
+  const options = { failAfterSet: true, failOnDelete: false };
+  const { store: legacyStore } = fakeStore(options);
+  const store = versioned(legacyStore);
+  const slot = store.reserveSlot("management");
+  const secret = `${TEST_KEY_PREFIX}slot-partial-write-secret-123456`;
+  await assert.rejects(store.writeSlot(slot, secret), (error: unknown) => {
+    assert.ok(error instanceof Error);
+    assert.doesNotMatch(error.message, new RegExp(secret));
+    assert.match(error.message, /speichern/i);
+    return true;
+  });
+  options.failAfterSet = false;
+  await store.writeSlot(slot, secret);
+  options.failOnDelete = true;
+  await assert.rejects(store.deleteSlot(slot), (error: unknown) => {
+    assert.ok(error instanceof Error);
+    assert.doesNotMatch(error.message, new RegExp(secret));
+    assert.match(error.message, /löschen/i);
+    return true;
+  });
+  assert.equal(await store.readSlot(slot), secret);
+});
+
+test("account HMAC key is stable, exactly 32 bytes, and uses only the fixed internal account", async () => {
+  const { store: legacyStore, values } = fakeStore();
+  const store = versioned(legacyStore);
+  const first = await store.getOrCreateAccountHmacKey();
+  const second = await store.getOrCreateAccountHmacKey();
+
+  assert.equal(first.byteLength, 32);
+  assert.deepEqual(second, first);
+  assert.deepEqual([...values.keys()], [
+    "de.routercode.openrouter/provider-account-hmac-v1",
+  ]);
+});
+
+test("account HMAC key fails closed and redacts backend error material", async () => {
+  const unknown = `${TEST_KEY_PREFIX}hmac-backend-error-secret-123456`;
+  const { store: legacyStore } = fakeStore({
+    failGetCalls: [1],
+    getFailureDetail: `backend exposed ${unknown}`,
+  });
+  const store = versioned(legacyStore);
+
+  await assert.rejects(store.getOrCreateAccountHmacKey(), (error: unknown) => {
+    assert.ok(error instanceof Error);
+    assert.doesNotMatch(error.message, new RegExp(unknown));
+    assert.match(error.message, /Schlüsselbund|lesen/i);
+    return true;
+  });
+});
 
 test("credential store separates inference and management keys", async () => {
   const { store, values } = fakeStore();
