@@ -368,7 +368,7 @@ export async function migrateAppHome(
   let legacyConnectionId: string | null = null;
   return migrateStorageHome(newHome, legacyHome, {
     ...storageOptions,
-    normalizeConfig: (value) => {
+    normalizeConfig: (value, { originalSchemaVersion }) => {
       const hasProviderSetup = "providerSetup" in value;
       const providerSetup = hasProviderSetup
         ? validateProviderSetupState(value.providerSetup)
@@ -376,6 +376,9 @@ export async function migrateAppHome(
           connectionId: legacyConnectionId ??= createConnectionId(),
         });
       requirePersistableProviderState(providerSetup);
+      if (originalSchemaVersion === CONFIG_SCHEMA_VERSION && hasProviderSetup) {
+        return value;
+      }
       return validateConfig({
         ...DEFAULT_CONFIG,
         ...value,

@@ -811,6 +811,75 @@ test("v0 config with valid nested provider state still normalizes legacy top-lev
   assert.equal(stored.providerSetup.lifecycle, "never-configured");
 });
 
+test("current v1 config with valid provider state remains byte-exact and preserves every model preference", async () => {
+  const root = await mkdtemp(join(tmpdir(), "orcode-v1-provider-byte-stability-"));
+  const legacy = join(root, ".routercode");
+  const target = join(root, ".orcode");
+  await mkdir(target, { recursive: true });
+  const originalBytes = `${JSON.stringify({
+    schemaVersion: 1,
+    mainModel: " vendor/main ",
+    compressorModel: " vendor/compressor ",
+    fallbackModels: [
+      "vendor/fallback-01",
+      "vendor/fallback-02",
+      "vendor/fallback-03",
+      "vendor/fallback-04",
+      "vendor/fallback-05",
+      "vendor/fallback-06",
+      "vendor/fallback-07",
+      "vendor/fallback-08",
+      "vendor/fallback-09",
+      "vendor/fallback-10",
+      "vendor/fallback-11",
+      "vendor/fallback-12",
+      "vendor/fallback-13",
+      "vendor/fallback-14",
+      "vendor/fallback-15",
+      "vendor/fallback-16",
+      "vendor/fallback-17",
+      "vendor/fallback-18",
+      "vendor/fallback-19",
+      "vendor/fallback-20",
+      "vendor/fallback-21",
+    ],
+    providerSetup: {
+      schemaVersion: 1,
+      revision: 0,
+      lifecycle: "never-configured",
+      connections: [],
+      defaultRoute: null,
+      cross: { enabled: false, preferredLead: null, preferredChallenger: null },
+    },
+  }, null, 4)}\n`;
+  await writeFile(join(target, "config.json"), originalBytes);
+
+  const result = await migrateAppHome(target, legacy);
+  const storedBytes = await readFile(join(target, "config.json"), "utf8");
+  const stored = JSON.parse(storedBytes) as {
+    mainModel: string;
+    compressorModel: string;
+    fallbackModels: string[];
+  };
+
+  assert.equal(result.status, "ready");
+  assert.deepEqual(
+    {
+      mainModel: stored.mainModel,
+      compressorModel: stored.compressorModel,
+      fallbackCount: stored.fallbackModels.length,
+      lastFallback: stored.fallbackModels.at(-1),
+    },
+    {
+      mainModel: " vendor/main ",
+      compressorModel: " vendor/compressor ",
+      fallbackCount: 21,
+      lastFallback: "vendor/fallback-21",
+    },
+  );
+  assert.equal(storedBytes, originalBytes);
+});
+
 test("a current top-level config persists source-aware provider migration once", async () => {
   const root = await mkdtemp(join(tmpdir(), "orcode-current-provider-config-"));
   const legacy = join(root, ".routercode");

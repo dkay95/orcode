@@ -568,7 +568,10 @@ export interface AppHomeMigrationOptions {
   privateStore?: PrivateStore;
   maxBackupBytes?: number;
   onPhase?: (phase: MigrationPhase, manifest: Readonly<StorageMigrationManifest>) => Promise<void> | void;
-  normalizeConfig?: (value: Record<string, unknown>) => Record<string, unknown>;
+  normalizeConfig?: (
+    value: Record<string, unknown>,
+    context: { originalSchemaVersion: unknown },
+  ) => Record<string, unknown>;
 }
 
 export async function migrateStorageHome(
@@ -1013,7 +1016,9 @@ async function stageConfig(
   const value = parseRecord(raw);
   const originalVersion = value.schemaVersion;
   value.schemaVersion = STORAGE_SCHEMA_VERSION;
-  const normalized = normalizeConfig ? normalizeConfig(value) : value;
+  const normalized = normalizeConfig
+    ? normalizeConfig(value, { originalSchemaVersion: originalVersion })
+    : value;
   if (
     currentExists
     && originalVersion === STORAGE_SCHEMA_VERSION
@@ -1115,7 +1120,9 @@ async function migrateCurrentConfig(
   value.schemaVersion = STORAGE_SCHEMA_VERSION;
   let normalized: Record<string, unknown>;
   try {
-    normalized = normalizeConfig ? normalizeConfig(value) : value;
+    normalized = normalizeConfig
+      ? normalizeConfig(value, { originalSchemaVersion: version })
+      : value;
   } catch (error) {
     return {
       status: "recovery-required",
@@ -1563,7 +1570,9 @@ async function pendingConfigBackupSize(
     const value = parseRecord(raw);
     const originalVersion = value.schemaVersion;
     value.schemaVersion = STORAGE_SCHEMA_VERSION;
-    const normalized = normalizeConfig ? normalizeConfig(value) : value;
+    const normalized = normalizeConfig
+      ? normalizeConfig(value, { originalSchemaVersion: originalVersion })
+      : value;
     if (
       originalVersion === STORAGE_SCHEMA_VERSION
       && JSON.stringify(normalized) === JSON.stringify(value)
