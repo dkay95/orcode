@@ -1481,6 +1481,7 @@ function gitSafeEnvironment(
   const environment: NodeJS.ProcessEnv = {
     GIT_ATTR_NOSYSTEM: "1",
     GIT_CEILING_DIRECTORIES: canonicalRoot,
+    GIT_COMMON_DIR: join(canonicalRoot, ".git"),
     GIT_CONFIG_GLOBAL: nullDevice,
     GIT_CONFIG_NOSYSTEM: "1",
     GIT_CONFIG_SYSTEM: nullDevice,
@@ -1640,6 +1641,12 @@ interface GitMetadataIdentity extends GitExecutableIdentity {
 interface GitRepositoryIdentity {
   root: GitPathIdentity;
   metadata: GitMetadataIdentity[];
+  config: GitConfigIdentity | null;
+}
+
+interface GitConfigIdentity {
+  file: GitMetadataIdentity;
+  sha256: string;
 }
 
 function sameGitPathIdentity(
@@ -1818,6 +1825,15 @@ function sameGitRepositoryIdentity(
 ): boolean {
   if (left === null) return right === null;
   if (right === null || !sameGitPathIdentity(left.root, right.root)) return false;
+  if (
+    left.config === null
+      ? right.config !== null
+      : right.config === null
+        || left.config.sha256 !== right.config.sha256
+        || !sameGitMetadataIdentity(left.config.file, right.config.file)
+  ) {
+    return false;
+  }
   if (left.metadata.length !== right.metadata.length) return false;
   return left.metadata.every((entry, index) => {
     const candidate = right.metadata[index];
@@ -1937,7 +1953,12 @@ function sameStableGitFile(
     && left.ctimeNs === right.ctimeNs;
 }
 
-async function readStableGitConfig(configPath: string): Promise<string | null> {
+interface StableGitConfig {
+  content: string;
+  identity: GitConfigIdentity;
+}
+
+async function readStableGitConfig(configPath: string): Promise<StableGitConfig | null> {
   let namedBefore;
   try {
     namedBefore = await lstat(configPath, { bigint: true });
@@ -1971,9 +1992,55 @@ async function readStableGitConfig(configPath: string): Promise<string | null> {
     ) {
       throw new Error("Lokale Git-Konfiguration wurde während der Sicherheitsprüfung ausgetauscht.");
     }
-    return config;
+    return {
+      content: config,
+      identity: {
+        file: gitMetadataIdentity(configPath, namedAfter),
+        sha256: sha256Hex(config),
+      },
+    };
   } finally {
     await handle.close();
+  }
+}
+
+function assertSafeAutomaticGitConfig(config: string): void {
+  if (config.includes("\0")) {
+    throw new Error("Lokale Git-Konfiguration ist für automatische Lesevorgänge nicht sicher.");
+  }
+  let currentSection = "";
+  const declaresWorktreeConfig = (value: string) =>
+    /^\s*worktreeconfig(?:\s*=|\s*(?:[#;].*)?$)/i.test(value);
+  for (const line of config.split(/\r?\n/)) {
+    const section = /^\s*\[\s*([a-z][a-z0-9-]*)[^\]]*\](.*)$/i.exec(line);
+    if (section !== null) {
+      currentSection = section[1]?.toLowerCase() ?? "";
+      if (currentSection === "filter") {
+        throw new Error("Lokale Git-Filter-Konfiguration ist für automatische Lesevorgänge nicht sicher.");
+      }
+      if (currentSection === "include" || currentSection === "includeif") {
+        throw new Error("Lokale Git-Include-Konfiguration ist für automatische Lesevorgänge nicht sicher.");
+      }
+      if (currentSection === "extensions" && declaresWorktreeConfig(section[2] ?? "")) {
+        throw new Error("Lokale Git-Worktree-Konfiguration ist für automatische Lesevorgänge nicht sicher.");
+      }
+      continue;
+    }
+    if (
+      currentSection === "extensions"
+      && declaresWorktreeConfig(line)
+    ) {
+      throw new Error("Lokale Git-Worktree-Konfiguration ist für automatische Lesevorgänge nicht sicher.");
+    }
+  }
+}
+
+async function assertNoGitCommonDirectory(gitDirectory: string): Promise<void> {
+  try {
+    await lstat(join(gitDirectory, "commondir"));
+    throw new Error("Externe gemeinsame Git-Metadaten sind für automatische Lesevorgänge nicht sicher.");
+  } catch (error) {
+    if (!hasCode(error, "ENOENT")) throw error;
   }
 }
 
@@ -1999,30 +2066,8 @@ async function assertSafeAutomaticGitRepository(canonicalRoot: string): Promise<
     ino: gitDirectoryInfo.ino,
   };
 
-  try {
-    await lstat(join(gitDirectory, "commondir"));
-    throw new Error("Externe gemeinsame Git-Metadaten sind für automatische Lesevorgänge nicht sicher.");
-  } catch (error) {
-    if (!hasCode(error, "ENOENT")) throw error;
-  }
-
-  for (const name of ["config", "config.worktree"] as const) {
-    const configPath = join(gitDirectory, name);
-    const config = await readStableGitConfig(configPath);
-    if (config === null) continue;
-    if (config.includes("\0")) {
-      throw new Error("Lokale Git-Konfiguration ist für automatische Lesevorgänge nicht sicher.");
-    }
-    for (const line of config.split(/\r?\n/)) {
-      const section = /^\s*\[\s*([a-z][a-z0-9-]*)/i.exec(line)?.[1]?.toLowerCase();
-      if (section === "filter") {
-        throw new Error("Lokale Git-Filter-Konfiguration ist für automatische Lesevorgänge nicht sicher.");
-      }
-      if (section === "include" || section === "includeif") {
-        throw new Error("Lokale Git-Include-Konfiguration ist für automatische Lesevorgänge nicht sicher.");
-      }
-    }
-  }
+  await assertNoGitCommonDirectory(gitDirectory);
+  const metadata = await snapshotAutomaticGitMetadata(canonicalGitDirectory);
   const gitDirectoryAfter = await lstat(gitDirectory, { bigint: true });
   if (
     gitDirectoryAfter.isSymbolicLink()
@@ -2032,9 +2077,28 @@ async function assertSafeAutomaticGitRepository(canonicalRoot: string): Promise<
   ) {
     throw new Error("Git-Repository wurde während der Sicherheitsprüfung ausgetauscht.");
   }
+
+  // GIT_COMMON_DIR is pinned to this canonical .git directory in the child
+  // environment. Keep the explicit absence check after the long metadata walk
+  // as the last repository-layout check as well, so the fake/test runner and
+  // the real Git path share the same fail-closed contract.
+  await assertNoGitCommonDirectory(gitDirectory);
+
+  // `config.worktree` is only consulted when `extensions.worktreeConfig` is
+  // enabled in the primary config. Reject both surfaces instead of reading two
+  // mutable files sequentially and leaving a race window between them.
+  try {
+    await lstat(join(gitDirectory, "config.worktree"));
+    throw new Error("Lokale Git-Worktree-Konfiguration ist für automatische Lesevorgänge nicht sicher.");
+  } catch (error) {
+    if (!hasCode(error, "ENOENT")) throw error;
+  }
+  const config = await readStableGitConfig(join(gitDirectory, "config"));
+  if (config !== null) assertSafeAutomaticGitConfig(config.content);
   return {
     root: gitIdentity,
-    metadata: await snapshotAutomaticGitMetadata(canonicalGitDirectory),
+    metadata,
+    config: config?.identity ?? null,
   };
 }
 

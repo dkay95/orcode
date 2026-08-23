@@ -170,6 +170,35 @@ test("explicit key save authenticates and persists even when run spending is una
   }
 });
 
+test("a first valid but unfunded replacement is persisted and activated before the run spend gate", async () => {
+  const candidate = `${KEY_PREFIX}valid-unfunded-replacement-123456`;
+  const service = new OpenRouterService(undefined, undefined, {}, {
+    fetchImpl: async () => new Response(JSON.stringify({
+      data: {
+        label: "valid but unfunded",
+        is_free_tier: false,
+        is_management_key: false,
+        usage: 1,
+        limit: 1,
+        limit_remaining: 0,
+      },
+    }), { status: 200, headers: { "content-type": "application/json" } }),
+  });
+  const credentials = lifecycleCredentials();
+  const { context } = lifecycleContext(service, credentials.store, {
+    readCredentialSecret: async () => candidate,
+  } as Partial<CommandContext>);
+
+  await handleSlashCommand("/key replace", context);
+
+  assert.equal(credentials.current(), candidate);
+  assert.equal(service.requireKey(), candidate);
+  assert.equal(service.keyOrigin, "keychain");
+  assert.equal(service.runtimeState.inferenceValidity, "valid");
+  assert.equal(service.runtimeState.connectivity, "connected");
+  assert.equal(service.runtimeState.credit, "insufficient");
+});
+
 const KEY_PREFIX = `${["sk", "or", "v1"].join("-")}-`;
 
 function lifecycleService(

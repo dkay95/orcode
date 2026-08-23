@@ -123,6 +123,50 @@ test("dashboard startup validation never persists an environment key implicitly"
   assert.equal(openRouter.keyOrigin, "environment");
 });
 
+test("dashboard first-key setup keeps a valid unfunded key active for status and reconnect", async () => {
+  const key = `${STARTUP_KEY_PREFIX}dashboard-valid-unfunded-key-123`;
+  const openRouter = new OpenRouterService(undefined, undefined, {}, {
+    fetchImpl: async () => new Response(JSON.stringify({
+      data: {
+        label: "valid but unfunded",
+        is_free_tier: false,
+        is_management_key: false,
+        usage: 1,
+        limit: 1,
+        limit_remaining: 0,
+      },
+    }), { status: 200, headers: { "content-type": "application/json" } }),
+  });
+  let persisted: string | null = null;
+  const credentials: CredentialStoreLike = {
+    location: "Test-Schlüsselbund",
+    async get() { return persisted; },
+    async has() { return persisted !== null; },
+    async set(_kind, secret) { persisted = secret; },
+    async delete() { persisted = null; return true; },
+  };
+  const messages: string[] = [];
+  const ui = {
+    setStatus: () => undefined,
+    setCancelHandler: () => undefined,
+    addMessage: (_level: string, message: string) => messages.push(message),
+    readSecret: async () => key,
+  };
+
+  const balance = await initializeDashboardKey(
+    ui as never,
+    { openRouter, credentials } as never,
+  );
+
+  assert.equal(balance?.key.limitRemaining, 0);
+  assert.equal(persisted, key);
+  assert.equal(openRouter.requireKey(), key);
+  assert.equal(openRouter.runtimeState.inferenceValidity, "valid");
+  assert.equal(openRouter.runtimeState.connectivity, "connected");
+  assert.equal(openRouter.runtimeState.credit, "insufficient");
+  assert.match(messages.join("\n"), /validiert.*gespeichert/i);
+});
+
 test("a rejected saved key stays persisted until a valid environment fallback is activated", async () => {
   const stored = `${STARTUP_KEY_PREFIX}dashboard-rejected-stored-123`;
   const environment = `${STARTUP_KEY_PREFIX}dashboard-valid-environment-456`;

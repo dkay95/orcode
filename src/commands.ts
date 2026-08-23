@@ -836,7 +836,6 @@ async function readCredentialSecret(
 
 interface CredentialActivationOptions {
   persist?: boolean;
-  requireSpendAvailable?: boolean;
   processOrigin?: Exclude<KeyOrigin, "none" | "keychain">;
   signal?: AbortSignal;
   confirmProcessOnly?: (error: unknown) => Promise<boolean>;
@@ -851,9 +850,6 @@ export async function validateAndActivateInferenceKey(
     candidate,
     options.signal,
   );
-  if (options.requireSpendAvailable !== false) {
-    assertSpendAvailable(balance);
-  }
   let persisted = options.persist !== false;
   if (persisted) {
     try {
@@ -922,7 +918,6 @@ export async function validateAndStoreInferenceKey(
 ): Promise<BalanceReport> {
   const activated = await validateAndActivateInferenceKey(candidate, context, {
     signal,
-    requireSpendAvailable: false,
   });
   if (!activated) throw new Error("API-Key-Aktivierung wurde abgebrochen.");
   return activated.balance;

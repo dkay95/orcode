@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
-import { existsSync, renameSync, symlinkSync } from "node:fs";
+import { existsSync, renameSync, symlinkSync, writeFileSync } from "node:fs";
 import { chmod, mkdir, mkdtemp, readFile, readdir, realpath, rename, rm, stat, symlink, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { delimiter, dirname, isAbsolute, join, sep } from "node:path";
@@ -1102,6 +1102,7 @@ test("Git subject names come from one minimal fixed environment passed unchanged
   const expectedNames = [
     "GIT_ATTR_NOSYSTEM",
     "GIT_CEILING_DIRECTORIES",
+    "GIT_COMMON_DIR",
     "GIT_CONFIG_GLOBAL",
     "GIT_CONFIG_NOSYSTEM",
     "GIT_CONFIG_SYSTEM",
@@ -1148,6 +1149,7 @@ test("Git subject names come from one minimal fixed environment passed unchanged
   assert.equal(invocationEnvironment?.LANG, "C");
   assert.equal(invocationEnvironment?.LC_ALL, "C");
   assert.equal(invocationEnvironment?.GIT_CEILING_DIRECTORIES, await realpath(root));
+  assert.equal(invocationEnvironment?.GIT_COMMON_DIR, join(await realpath(root), ".git"));
   const display = approvalSubjectDisplay(subject!);
   assert.doesNotMatch(display, /hostile-home|hostile-locale|synthetic-value|filtered-value/);
   for (const hostileName of [
@@ -1627,6 +1629,144 @@ test("automatic Git revalidates repository launchers after approval before spawn
   );
   assert.equal(spawned, false, "Git spawned after approval-time launcher injection");
   assert.equal(existsSync(marker), false);
+});
+
+test("automatic Git reads repository config after its final metadata walk", { skip: process.platform === "win32" ? "POSIX timing fixture" : false }, async (t) => {
+  if (!(await gitAvailable())) {
+    t.skip("git ist nicht installiert");
+    return;
+  }
+  const root = await mkdtemp(join(tmpdir(), "routercode-git-final-config-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  await initCommittedGitRepository(root);
+  const metadata = join(root, ".git", "objects", "timing-fixture");
+  await mkdir(metadata);
+  await Promise.all(
+    Array.from({ length: 2_500 }, (_, index) =>
+      writeFile(join(metadata, index.toString(16).padStart(4, "0")), "fixture\n", "utf8")),
+  );
+  const configPath = join(root, ".git", "config");
+  let spawned = false;
+  let timer: NodeJS.Timeout | undefined;
+
+  try {
+    await assert.rejects(
+      runHardenedGitRead(
+        root,
+        { operation: "diff", staged: false },
+        async () => {
+          spawned = true;
+          return { code: 0, stdout: "unsafe diff", stderr: "", truncated: false, timedOut: false, aborted: false };
+        },
+        undefined,
+        {
+          processCallbacks: {
+            onProcessStart: () => {
+              timer = setTimeout(() => {
+                writeFileSync(
+                  configPath,
+                  "[filter \"late\"]\n\tclean = ./repository-helper.sh\n",
+                  "utf8",
+                );
+              }, 20);
+            },
+          },
+        },
+      ),
+      /Git-Filter|Git-Konfiguration|ausgetauscht|nicht sicher/i,
+    );
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+  assert.equal(spawned, false, "Git spawned after config changed during the final metadata walk");
+});
+
+test("automatic Git checks commondir after its final metadata walk", { skip: process.platform === "win32" ? "POSIX timing fixture" : false }, async (t) => {
+  if (!(await gitAvailable())) {
+    t.skip("git ist nicht installiert");
+    return;
+  }
+  const root = await mkdtemp(join(tmpdir(), "routercode-git-final-commondir-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  await initCommittedGitRepository(root);
+  const metadata = join(root, ".git", "objects", "timing-fixture");
+  await mkdir(metadata);
+  await Promise.all(
+    Array.from({ length: 2_500 }, (_, index) =>
+      writeFile(join(metadata, index.toString(16).padStart(4, "0")), "fixture\n", "utf8")),
+  );
+  let spawned = false;
+  let timer: NodeJS.Timeout | undefined;
+
+  try {
+    await assert.rejects(
+      runHardenedGitRead(
+        root,
+        { operation: "status" },
+        async () => {
+          spawned = true;
+          return { code: 0, stdout: "", stderr: "", truncated: false, timedOut: false, aborted: false };
+        },
+        undefined,
+        {
+          processCallbacks: {
+            onProcessStart: () => {
+              timer = setTimeout(() => {
+                writeFileSync(join(root, ".git", "commondir"), "../outside-git\n", "utf8");
+              }, 20);
+            },
+          },
+        },
+      ),
+      /gemeinsame Git-Metadaten|Git-Repository.*ausgetauscht|nicht sicher/i,
+    );
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+  assert.equal(spawned, false, "Git spawned after commondir appeared during the final metadata walk");
+});
+
+test("automatic Git rejects worktree-specific config surfaces before spawn", async (t) => {
+  if (!(await gitAvailable())) {
+    t.skip("git ist nicht installiert");
+    return;
+  }
+  for (const fixture of ["file", "bare-extension", "same-line-extension"] as const) {
+    await t.test(fixture, async () => {
+      const root = await mkdtemp(join(tmpdir(), "routercode-git-worktree-config-"));
+      t.after(() => rm(root, { recursive: true, force: true }));
+      await initCommittedGitRepository(root);
+      if (fixture === "file") {
+        await writeFile(join(root, ".git", "config.worktree"), "[core]\n\tbare = false\n", "utf8");
+      } else if (fixture === "bare-extension") {
+        await writeFile(
+          join(root, ".git", "config"),
+          "[core]\n\trepositoryformatversion = 0\n[extensions]\n\tworktreeConfig\n",
+          "utf8",
+        );
+      } else {
+        await writeFile(
+          join(root, ".git", "config"),
+          "[core]\n\trepositoryformatversion = 0\n[extensions] worktreeConfig = true\n",
+          "utf8",
+        );
+      }
+      let spawned = false;
+
+      await assert.rejects(
+        runHardenedGitRead(
+          root,
+          { operation: "status" },
+          async () => {
+            spawned = true;
+            return { code: 0, stdout: "", stderr: "", truncated: false, timedOut: false, aborted: false };
+          },
+        ),
+        /Git-Worktree-Konfiguration|nicht sicher/i,
+      );
+      assert.equal(spawned, false, `${fixture} worktree config reached Git spawn`);
+    });
+  }
 });
 
 test("automatic Git revalidates bound metadata after the visible process start and before spawning", { skip: process.platform === "win32" ? "POSIX symlink fixture" : false }, async (t) => {
