@@ -618,6 +618,221 @@ export class PrivateStore {
   }
 
   /**
+   * Publishes only the fixed manifest.json inside an exact claimed directory.
+   * The claim may otherwise contain no entries; updates replace only the
+   * previously-bound regular manifest through a protected temporary file.
+   */
+  async writeClaimManifest(
+    claim: PrivateDirectoryClaim,
+    content: string,
+    expectedContent: string | null,
+  ): Promise<void> {
+    if (typeof content !== "string" || Buffer.byteLength(content, "utf8") > 65_536) {
+      throw new Error("PrivateStore-Claim-Manifest ist ungültig oder zu groß.");
+    }
+    if (expectedContent !== null
+      && (typeof expectedContent !== "string"
+        || Buffer.byteLength(expectedContent, "utf8") > 65_536)) {
+      throw new Error("PrivateStore-Claim-Manifest-Erwartung ist ungültig.");
+    }
+    const state = this.#claimState(claim);
+    const manifestPath = join(state.directory.path, "manifest.json");
+    const temporaryPath = join(
+      state.directory.path,
+      `.manifest.${randomUUID()}.private.tmp`,
+    );
+    const tree = [...state.ancestors, state.directory];
+    let previousIdentity: PathIdentity | null = null;
+    let temporaryIdentity: PathIdentity | null = null;
+    let handle: FileHandle | null = null;
+    let published = false;
+    try {
+      await this.assertDirectoryClaim(claim);
+      const entries = await readdir(state.directory.path, { withFileTypes: true });
+      await this.assertDirectoryClaim(claim);
+      if ((expectedContent === null && entries.length !== 0)
+        || (expectedContent !== null && entries.length !== 1)
+        || entries.length > 1
+        || (entries.length === 1 && (
+          entries[0]?.name !== "manifest.json"
+          || !entries[0].isFile()
+          || entries[0].isSymbolicLink()
+        ))) {
+        throw new Error("PrivateStore-Claim enthält unerwartete Manifest-Inhalte.");
+      }
+      if (entries.length === 1) {
+        const before = await lstat(manifestPath, { bigint: true });
+        await this.assertDirectoryClaim(claim);
+        if (before.isSymbolicLink() || !before.isFile()) {
+          throw new Error("PrivateStore-Claim-Manifest ist keine reguläre Datei.");
+        }
+        previousIdentity = pathIdentity(manifestPath, before, "file");
+        const previousHandle = await openIdentityHandle(manifestPath, "file");
+        if (!previousHandle) {
+          throw new Error("PrivateStore-Claim-Manifest konnte nicht gebunden werden.");
+        }
+        try {
+          await this.assertDirectoryClaim(claim);
+          const opened = await assertHandlePathIdentity(
+            previousHandle,
+            manifestPath,
+            "file",
+          );
+          assertSameIdentity(previousIdentity, opened, manifestPath);
+          await this.assertDirectoryClaim(claim);
+          const info = await previousHandle.stat({ bigint: true });
+          if (info.size > 65_536n) {
+            throw new Error("PrivateStore-Claim-Manifest ist zu groß.");
+          }
+          const previous = await previousHandle.readFile("utf8");
+          await this.assertDirectoryClaim(claim);
+          const current = await assertHandlePathIdentity(
+            previousHandle,
+            manifestPath,
+            "file",
+          );
+          assertSameIdentity(previousIdentity, current, manifestPath);
+          if (previous !== expectedContent) {
+            throw new Error("PrivateStore-Claim-Manifest stimmt vor dem Update nicht überein.");
+          }
+        } finally {
+          await previousHandle.close().catch(() => undefined);
+        }
+      }
+      handle = await open(temporaryPath, "wx", PRIVATE_FILE_MODE);
+      await this.assertDirectoryClaim(claim);
+      temporaryIdentity = await assertHandlePathIdentity(handle, temporaryPath, "file");
+      await protectOpenPath(
+        handle,
+        temporaryPath,
+        "file",
+        this.adapter,
+        tree,
+        temporaryIdentity,
+      );
+      await this.assertDirectoryClaim(claim);
+      await handle.writeFile(content, "utf8");
+      await this.assertDirectoryClaim(claim);
+      await handle.sync();
+      await this.assertDirectoryClaim(claim);
+      temporaryIdentity = await assertHandlePathIdentity(handle, temporaryPath, "file");
+      if (previousIdentity) await assertPathIdentity(previousIdentity);
+      await this.assertDirectoryClaim(claim);
+      await rename(temporaryPath, manifestPath);
+      published = true;
+      temporaryIdentity = { ...temporaryIdentity, path: manifestPath };
+      await this.assertDirectoryClaim(claim);
+      await assertPathIdentity(temporaryIdentity);
+    } catch (error) {
+      if (!published) {
+        await unlinkBoundTemporary(temporaryIdentity, tree, handle);
+      }
+      throw error;
+    } finally {
+      await handle?.close().catch(() => undefined);
+    }
+    const readback = await this.readClaimManifest(claim, 65_536);
+    if (readback !== content) {
+      throw new Error("PrivateStore-Claim-Manifest stimmt nach dem Schreiben nicht überein.");
+    }
+  }
+
+  /** Reads the sole fixed regular manifest through the exact claim token. */
+  async readClaimManifest(
+    claim: PrivateDirectoryClaim,
+    maxBytes = 65_536,
+  ): Promise<string> {
+    if (!Number.isSafeInteger(maxBytes) || maxBytes < 1 || maxBytes > 65_536) {
+      throw new Error("PrivateStore-Claim-Manifest-Limit ist ungültig.");
+    }
+    const state = this.#claimState(claim);
+    const manifestPath = join(state.directory.path, "manifest.json");
+    let handle: FileHandle | null = null;
+    try {
+      await this.assertDirectoryClaim(claim);
+      const entries = await readdir(state.directory.path, { withFileTypes: true });
+      await this.assertDirectoryClaim(claim);
+      if (entries.length !== 1
+        || entries[0]?.name !== "manifest.json"
+        || !entries[0].isFile()
+        || entries[0].isSymbolicLink()) {
+        throw new Error("PrivateStore-Claim enthält nicht genau ein reguläres Manifest.");
+      }
+      handle = await openIdentityHandle(manifestPath, "file");
+      if (!handle) throw new Error("PrivateStore-Claim-Manifest konnte nicht gebunden werden.");
+      await this.assertDirectoryClaim(claim);
+      const identity = await assertHandlePathIdentity(handle, manifestPath, "file");
+      await this.assertDirectoryClaim(claim);
+      const info = await handle.stat({ bigint: true });
+      await this.assertDirectoryClaim(claim);
+      if (info.size > BigInt(maxBytes)) {
+        throw new Error("PrivateStore-Claim-Manifest ist zu groß.");
+      }
+      const content = await handle.readFile("utf8");
+      await this.assertDirectoryClaim(claim);
+      const current = await assertHandlePathIdentity(handle, manifestPath, "file");
+      assertSameIdentity(identity, current, manifestPath);
+      return content;
+    } finally {
+      await handle?.close().catch(() => undefined);
+    }
+  }
+
+  /** Removes only the exact expected manifest and leaves the claimed dir empty. */
+  async removeClaimManifest(
+    claim: PrivateDirectoryClaim,
+    expectedContent: string,
+  ): Promise<void> {
+    if (typeof expectedContent !== "string"
+      || Buffer.byteLength(expectedContent, "utf8") > 65_536) {
+      throw new Error("PrivateStore-Claim-Manifest-Erwartung ist ungültig.");
+    }
+    const state = this.#claimState(claim);
+    const manifestPath = join(state.directory.path, "manifest.json");
+    const initial = await this.readClaimManifest(claim, 65_536);
+    if (initial !== expectedContent) {
+      throw new Error("PrivateStore-Claim-Manifest stimmt nicht exakt überein.");
+    }
+    let handle: FileHandle | null = null;
+    try {
+      await this.assertDirectoryClaim(claim);
+      const entries = await readdir(state.directory.path, { withFileTypes: true });
+      await this.assertDirectoryClaim(claim);
+      if (entries.length !== 1
+        || entries[0]?.name !== "manifest.json"
+        || !entries[0].isFile()
+        || entries[0].isSymbolicLink()) {
+        throw new Error("PrivateStore-Claim enthält unerwartete Manifest-Inhalte.");
+      }
+      handle = await openIdentityHandle(manifestPath, "file");
+      if (!handle) throw new Error("PrivateStore-Claim-Manifest konnte nicht gebunden werden.");
+      await this.assertDirectoryClaim(claim);
+      const identity = await assertHandlePathIdentity(handle, manifestPath, "file");
+      await this.assertDirectoryClaim(claim);
+      const readback = await handle.readFile("utf8");
+      await this.assertDirectoryClaim(claim);
+      const current = await assertHandlePathIdentity(handle, manifestPath, "file");
+      assertSameIdentity(identity, current, manifestPath);
+      if (readback !== expectedContent) {
+        throw new Error("PrivateStore-Claim-Manifest änderte sich vor der Freigabe.");
+      }
+      // Node exposes no unlinkat equivalent bound to the directory handle. A
+      // same-user process can race this final checked pathname syscall; every
+      // observable boundary is fenced, but this is not a broader security claim.
+      await unlink(manifestPath);
+      await this.assertDirectoryClaim(claim);
+      await assertMissingPath(manifestPath);
+    } finally {
+      await handle?.close().catch(() => undefined);
+    }
+    const entries = await readdir(state.directory.path, { withFileTypes: true });
+    await this.assertDirectoryClaim(claim);
+    if (entries.length !== 0) {
+      throw new Error("PrivateStore-Claim ist nach Manifest-Freigabe nicht leer.");
+    }
+  }
+
+  /**
    * Releases only the exact claimed inode. The directory must contain either
    * no entries (ownerless crash claim) or exactly the expected owner.json.
    * There is intentionally no recursive or path-only release fallback.

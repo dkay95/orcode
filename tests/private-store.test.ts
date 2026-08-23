@@ -22,11 +22,19 @@ type ExclusiveDirectoryStore = {
 };
 
 type TokenBoundClaimStore = ExclusiveDirectoryStore & {
+  ensureDirectory(path: string): Promise<void>;
   adoptDirectoryClaim(path: string): Promise<{ claim: object; modifiedAtMs: number }>;
   assertDirectoryClaim(claim: object): Promise<void>;
   writeClaimOwner(claim: object, content: string): Promise<void>;
   readClaimOwner(claim: object, maxBytes?: number): Promise<string>;
   releaseDirectoryClaim(claim: object, expectedOwner: string | null): Promise<void>;
+  writeClaimManifest(
+    claim: object,
+    content: string,
+    expectedContent: string | null,
+  ): Promise<void>;
+  readClaimManifest(claim: object, maxBytes?: number): Promise<string>;
+  removeClaimManifest(claim: object, expectedContent: string): Promise<void>;
 };
 
 test("PrivateStore exclusive directory creation returns one opaque claim token and null losers", async () => {
@@ -119,6 +127,52 @@ test("PrivateStore claim release fails closed on owner mismatch or unexpected co
   );
   assert.equal(await readFile(join(lease, "foreign.txt"), "utf8"), "must survive");
   assert.equal(await readFile(join(lease, "owner.json"), "utf8"), owner);
+});
+
+test("PrivateStore transaction manifest lifecycle stays claim-scoped bounded and non-recursive", async () => {
+  const { PosixPrivateStoreAdapter, PrivateStore } = await import("../src/private-store.js");
+  const root = await mkdtemp(join(tmpdir(), "orcode-private-claim-manifest-"));
+  const transaction = join(root, "provider-activation", "70000000-0000-4000-8000-000000000001");
+  const store = new PrivateStore({
+    adapter: new PosixPrivateStoreAdapter(),
+    root,
+  }) as unknown as TokenBoundClaimStore;
+  await store.ensureDirectory(join(root, "provider-activation"));
+  const claim = await store.createDirectoryExclusive(transaction);
+  assert.ok(claim);
+  const prepared = '{"version":1,"phase":"prepared"}\n';
+  const committed = '{"version":1,"phase":"config-committed"}\n';
+
+  await store.writeClaimManifest(claim, prepared, null);
+  assert.equal(await store.readClaimManifest(claim, 64 * 1_024), prepared);
+  await store.writeClaimManifest(claim, committed, prepared);
+  assert.equal(await store.readClaimManifest(claim, 64 * 1_024), committed);
+  await store.removeClaimManifest(claim, committed);
+  assert.deepEqual(await readdir(transaction), []);
+  await store.releaseDirectoryClaim(claim, null);
+  await assert.rejects(stat(transaction), /ENOENT/);
+});
+
+test("PrivateStore bounded manifest read rejects oversized or multiple entries and retains all artifacts", async () => {
+  const { PosixPrivateStoreAdapter, PrivateStore } = await import("../src/private-store.js");
+  const root = await mkdtemp(join(tmpdir(), "orcode-private-claim-manifest-bounds-"));
+  const transaction = join(root, "provider-activation", "70000000-0000-4000-8000-000000000002");
+  const store = new PrivateStore({
+    adapter: new PosixPrivateStoreAdapter(),
+    root,
+  }) as unknown as TokenBoundClaimStore;
+  await store.ensureDirectory(join(root, "provider-activation"));
+  const claim = await store.createDirectoryExclusive(transaction);
+  assert.ok(claim);
+  const oversized = "x".repeat(64 * 1_024 + 1);
+  await writeFile(join(transaction, "manifest.json"), oversized);
+
+  await assert.rejects(store.readClaimManifest(claim, 64 * 1_024), /large|size|groß|manifest/i);
+  assert.equal((await stat(join(transaction, "manifest.json"))).size, oversized.length);
+
+  await writeFile(join(transaction, "foreign.txt"), "foreign survives");
+  await assert.rejects(store.readClaimManifest(claim, 64 * 1_024), /entry|content|manifest|unerwartet/i);
+  assert.equal(await readFile(join(transaction, "foreign.txt"), "utf8"), "foreign survives");
 });
 
 test("PrivateStore exclusive directory creation rejects symlinked ancestors without touching outside", async () => {

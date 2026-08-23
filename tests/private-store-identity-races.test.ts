@@ -91,6 +91,13 @@ type TokenBoundClaimStore = InstanceType<typeof PrivateStore> & {
   writeClaimOwner(claim: object, content: string): Promise<void>;
   readClaimOwner(claim: object, maxBytes?: number): Promise<string>;
   releaseDirectoryClaim(claim: object, expectedOwner: string | null): Promise<void>;
+  writeClaimManifest(
+    claim: object,
+    content: string,
+    expectedContent: string | null,
+  ): Promise<void>;
+  readClaimManifest(claim: object, maxBytes?: number): Promise<string>;
+  removeClaimManifest(claim: object, expectedContent: string): Promise<void>;
 };
 
 after(() => {
@@ -250,6 +257,96 @@ test("PrivateStore token-bound owner write rejects a swapped claim before its fi
   assert.equal(await fs.promises.readFile(join(lease, "must-survive.txt"), "utf8"), "foreign sentinel");
   await assert.rejects(fs.promises.readFile(join(lease, "owner.json")), /ENOENT/);
   assert.deepEqual(await fs.promises.readdir(moved), []);
+});
+
+test("PrivateStore token-bound manifest read rejects a swapped real claim and exposes no replacement bytes", async () => {
+  const root = await fs.promises.mkdtemp(join(tmpdir(), "orcode-private-manifest-read-swap-"));
+  const transaction = join(root, "provider-activation", "70000000-0000-4000-8000-000000000003");
+  const moved = `${transaction}.owned-before-read`;
+  const replacement = `${transaction}.foreign`;
+  const manifestPath = join(transaction, "manifest.json");
+  const expected = '{"version":1,"phase":"prepared"}\n';
+  const foreign = '{"version":1,"secret":"foreign"}\n';
+  const store = new PrivateStore({
+    adapter: new PosixPrivateStoreAdapter(),
+    root,
+  }) as TokenBoundClaimStore;
+  await store.ensureDirectory(join(root, "provider-activation"));
+  const claim = await store.createDirectoryExclusive(transaction);
+  assert.ok(claim);
+  await store.writeClaimManifest(claim, expected, null);
+  await fs.promises.mkdir(replacement);
+  await fs.promises.writeFile(join(replacement, "manifest.json"), foreign);
+  swapAtNextOpen(manifestPath, async () => {
+    await fs.promises.rename(transaction, moved);
+    await fs.promises.rename(replacement, transaction);
+  });
+
+  await assert.rejects(store.readClaimManifest(claim), /swap|identity|claim|manifest|ausgetauscht/i);
+
+  assert.equal(await fs.promises.readFile(join(transaction, "manifest.json"), "utf8"), foreign);
+  assert.equal(await fs.promises.readFile(join(moved, "manifest.json"), "utf8"), expected);
+});
+
+test("PrivateStore token-bound manifest removal rejects a swapped file and retains both artifacts", async () => {
+  const root = await fs.promises.mkdtemp(join(tmpdir(), "orcode-private-manifest-remove-swap-"));
+  const transaction = join(root, "provider-activation", "70000000-0000-4000-8000-000000000004");
+  const manifestPath = join(transaction, "manifest.json");
+  const movedManifest = join(transaction, "manifest-before-remove.json");
+  const expected = '{"version":1,"phase":"prepared"}\n';
+  const replacement = '{"version":1,"phase":"foreign"}\n';
+  const store = new PrivateStore({
+    adapter: new PosixPrivateStoreAdapter(),
+    root,
+  }) as TokenBoundClaimStore;
+  await store.ensureDirectory(join(root, "provider-activation"));
+  const claim = await store.createDirectoryExclusive(transaction);
+  assert.ok(claim);
+  await store.writeClaimManifest(claim, expected, null);
+  swapAtNthLstat(manifestPath, 2, async () => {
+    await fs.promises.rename(manifestPath, movedManifest);
+    await fs.promises.writeFile(manifestPath, replacement);
+  });
+
+  await assert.rejects(
+    store.removeClaimManifest(claim, expected),
+    /swap|identity|claim|manifest|ausgetauscht/i,
+  );
+
+  assert.equal(await fs.promises.readFile(manifestPath, "utf8"), replacement);
+  assert.equal(await fs.promises.readFile(movedManifest, "utf8"), expected);
+  deferredLstatSwap = null;
+});
+
+test("PrivateStore manifest update CAS rejects a final-name swap before publish", async () => {
+  const root = await fs.promises.mkdtemp(join(tmpdir(), "orcode-private-manifest-write-swap-"));
+  const transaction = join(root, "provider-activation", "70000000-0000-4000-8000-000000000005");
+  const manifestPath = join(transaction, "manifest.json");
+  const movedManifest = join(root, "manifest-owned-before-update.json");
+  const expected = '{"version":1,"phase":"prepared"}\n';
+  const replacement = '{"version":1,"phase":"foreign"}\n';
+  const update = '{"version":1,"phase":"credential-staged"}\n';
+  const store = new PrivateStore({
+    adapter: new PosixPrivateStoreAdapter(),
+    root,
+  }) as TokenBoundClaimStore;
+  await store.ensureDirectory(join(root, "provider-activation"));
+  const claim = await store.createDirectoryExclusive(transaction);
+  assert.ok(claim);
+  await store.writeClaimManifest(claim, expected, null);
+  swapAtNthLstat(manifestPath, 2, async () => {
+    await fs.promises.rename(manifestPath, movedManifest);
+    await fs.promises.writeFile(manifestPath, replacement);
+  });
+
+  await assert.rejects(
+    store.writeClaimManifest(claim, update, expected),
+    /swap|identity|claim|manifest|ausgetauscht|stimmt/i,
+  );
+
+  assert.equal(await fs.promises.readFile(manifestPath, "utf8"), replacement);
+  assert.equal(await fs.promises.readFile(movedManifest, "utf8"), expected);
+  deferredLstatSwap = null;
 });
 
 test("PrivateStore token-bound release rejects an owner swapped after readback and retains both artifacts", async () => {

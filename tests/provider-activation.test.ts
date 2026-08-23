@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, readFile, readdir, rename, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, rename, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -7,6 +7,7 @@ import {
   DEFAULT_CONFIG,
   loadConfigDetailed,
   saveConfig,
+  writeFileAtomicSecure,
   type OrcodeConfigWithBudget,
 } from "../src/config.js";
 import { PrivateStore } from "../src/private-store.js";
@@ -42,6 +43,8 @@ const OLD_SECRET = "old-provider-secret-with-enough-bytes";
 const NEW_SECRET = "new-provider-secret-with-enough-bytes";
 const FOREIGN_SECRET = "foreign-provider-secret-with-enough-bytes";
 const CONNECTION_ID = "connection-openrouter-main";
+const TEST_OLD_STATE_SHA256 = "1".repeat(64);
+const TEST_CANDIDATE_STATE_SHA256 = "2".repeat(64);
 const OLD_FINGERPRINT = "acct_or_old_safe_fingerprint";
 const NEW_FINGERPRINT = "acct_or_new_safe_fingerprint";
 const MODEL: BackendModelDescriptor = Object.freeze({
@@ -82,6 +85,8 @@ class FakeRuntimeGuard {
   activeRuns = 0;
   held = false;
   acquisitions = 0;
+  releaseCalls = 0;
+  failRelease = false;
 
   async acquire(): Promise<RuntimeLease> {
     if (this.activeRuns > 0) {
@@ -101,6 +106,8 @@ class FakeRuntimeGuard {
         }
       },
       release: async () => {
+        this.releaseCalls += 1;
+        if (this.failRelease) throw new Error("raw-runtime-release-secret-marker");
         if (!released) {
           released = true;
           this.held = false;
@@ -117,6 +124,10 @@ class FakeRuntimeGuard {
 
   drain(): void {
     this.activeRuns = 0;
+  }
+
+  lose(): void {
+    this.held = false;
   }
 }
 
@@ -204,6 +215,8 @@ class FakeAdapter {
   runtimeSecret = OLD_SECRET;
   runtimeRoute: RouteIdentityV1 | null = oldRoute();
   activateFailure: "before" | "after" | null = null;
+  activateReached: (() => void) | null = null;
+  activatePause: Promise<void> | null = null;
 
   async connect(request: {
     candidate: unknown;
@@ -251,6 +264,8 @@ class FakeAdapter {
     const route = newRoute();
     this.runtimeSecret = secret;
     this.runtimeRoute = route;
+    this.activateReached?.();
+    if (this.activatePause) await this.activatePause;
     if (this.activateFailure === "after") {
       throw new Error("raw-provider-bind-after-secret-marker");
     }
@@ -307,14 +322,14 @@ async function activationFixture(options: ActivationFixtureOptions = {}) {
   ];
   const activationModule = ["../src", "provider-activation.js"].join("/");
   const api = await import(activationModule);
-  const save = async (config: Parameters<typeof saveConfig>[0], configPath: string) => {
+  const writeConfigAtomic = async (configPath: string, content: string) => {
     calls.push("saveConfig");
     if (options.saveMode === "throw-before") throw new Error("raw-config-before-secret-marker");
     if (options.saveMode === "write-corrupt") {
       await writeFile(configPath, "{corrupt-after-save", "utf8");
       return;
     }
-    await saveConfig(config, configPath);
+    await writeFileAtomicSecure(configPath, content);
     if (options.saveMode === "throw-after") throw new Error("raw-config-after-secret-marker");
   };
   const makeCoordinator = (overrides: Record<string, unknown> = {}) =>
@@ -330,7 +345,7 @@ async function activationFixture(options: ActivationFixtureOptions = {}) {
       createUuid: () => uuidQueue.shift() ?? "10000000-0000-4000-8000-000000000099",
       leaseDurationMs: 100,
       waitForLease: async () => new Promise<void>((resolve) => setImmediate(resolve)),
-      saveConfig: save,
+      writeConfigAtomic,
       onBoundary: options.crashAfter
         ? async (boundary: Boundary) => {
           calls.push(`boundary:${boundary}`);
@@ -556,6 +571,63 @@ test("a paused unrelated config writer is preserved by the final fenced reread a
   assert.equal(saved.mainModel, preservedMainModel);
 });
 
+test("raw config CAS preserves every unrelated byte including whitespace unknown fields and 21 fallbacks", async () => {
+  const fixture = await activationFixture();
+  const parsed = JSON.parse(await readFile(fixture.path, "utf8")) as Record<string, unknown>;
+  parsed.fallbackModels = Array.from({ length: 21 }, (_, index) => `preserve/model-${index}`);
+  parsed["futureTopLevelField"] = {
+    keep: "byte exact",
+    nested: [1, true, null, { exact: "spacing survives" }],
+  };
+  const before = `${JSON.stringify(parsed, null, 3)}\n\n`;
+  await writeFile(fixture.path, before, "utf8");
+
+  await fixture.activate();
+
+  const after = await readFile(fixture.path, "utf8");
+  assert.equal(maskProviderSetup(after), maskProviderSetup(before));
+  const saved = JSON.parse(after) as Record<string, unknown>;
+  assert.equal((saved.fallbackModels as unknown[]).length, 21);
+  assert.deepEqual(saved.futureTopLevelField, parsed.futureTopLevelField);
+});
+
+test("same-revision providerSetup mutation before raw CAS is retained and blocks candidate commit", async () => {
+  const fixture = await activationFixture();
+  const coordinator = new fixture.api.ProviderActivationCoordinator({
+    appHome: fixture.appHome,
+    configPath: fixture.path,
+    privateStore: fixture.privateStore,
+    credentials: fixture.credentials,
+    adapter: fixture.adapter,
+    stateStore: fixture.stateStore,
+    runtimeGuard: fixture.runtimeGuard,
+    now: () => 10_000,
+    createUuid: sequentialUuid(),
+    leaseDurationMs: 100,
+    onBoundary: async (boundary: Boundary) => {
+      if (boundary !== "candidate-revalidated") return;
+      const raw = JSON.parse(await readFile(fixture.path, "utf8")) as {
+        providerSetup: ProviderSetupStateV1;
+      };
+      raw.providerSetup.lifecycle = "cancelled";
+      await writeFile(fixture.path, `${JSON.stringify(raw)}\n`, "utf8");
+    },
+  });
+
+  await assert.rejects(
+    coordinator.activate(fixture.request),
+    fixture.api.ProviderActivationRecoveryRequiredError,
+  );
+
+  const retained = JSON.parse(await readFile(fixture.path, "utf8")) as {
+    providerSetup: ProviderSetupStateV1;
+  };
+  assert.equal(retained.providerSetup.lifecycle, "cancelled");
+  assert.equal(retained.providerSetup.revision, fixture.oldState.revision);
+  assert.equal(fixture.credentials.slots.get(NEW_SLOT_ID), NEW_SECRET);
+  assert.equal((await journalDirectories(fixture.appHome)).length, 1);
+});
+
 test("ambiguous corrupt config readback retains journal and both slots as recovery-required", async () => {
   const fixture = await activationFixture({ saveMode: "write-corrupt" });
   await assert.rejects(fixture.activate(), fixture.api.ProviderActivationRecoveryRequiredError);
@@ -608,6 +680,8 @@ test("old v1 cleanup retains a slot referenced by another exact pending journal"
           previousSlot: null,
           candidateConnectionId: CONNECTION_ID,
           candidateRoute: oldRoute(),
+          expectedProviderSetupSha256: TEST_OLD_STATE_SHA256,
+          candidateProviderSetupSha256: TEST_CANDIDATE_STATE_SHA256,
         })}\n`,
       );
     },
@@ -708,6 +782,8 @@ test("failed candidate cleanup retains a v1 slot referenced by another pending j
           previousSlot: OLD_SLOT,
           candidateConnectionId: CONNECTION_ID,
           candidateRoute: newRoute(),
+          expectedProviderSetupSha256: TEST_OLD_STATE_SHA256,
+          candidateProviderSetupSha256: TEST_CANDIDATE_STATE_SHA256,
         })}\n`,
       );
       return "decline";
@@ -772,6 +848,132 @@ test("runtime bind failure after internal mutation retains committed journal and
   assert.equal((await journalDirectories(fixture.appHome)).length, 1);
 });
 
+test("lost runtime guard during awaited persisted bind blocks cleanup and success", async () => {
+  const fixture = await activationFixture();
+  let reached!: () => void;
+  let resume!: () => void;
+  const reachedPromise = new Promise<void>((resolve) => { reached = resolve; });
+  fixture.adapter.activateReached = reached;
+  fixture.adapter.activatePause = new Promise<void>((resolve) => { resume = resolve; });
+
+  const activation = fixture.activate();
+  await reachedPromise;
+  fixture.runtimeGuard.lose();
+  resume();
+
+  await assert.rejects(activation, fixture.api.ProviderActivationRecoveryRequiredError);
+  assert.equal(fixture.credentials.slots.get(OLD_SLOT.id), OLD_SECRET);
+  assert.equal(fixture.credentials.slots.get(NEW_SLOT_ID), NEW_SECRET);
+  assert.equal((await journalDirectories(fixture.appHome)).length, 1);
+});
+
+test("lost runtime guard during awaited process-only bind blocks a success result", async () => {
+  const fixture = await activationFixture();
+  let reached!: () => void;
+  let resume!: () => void;
+  const reachedPromise = new Promise<void>((resolve) => { reached = resolve; });
+  fixture.adapter.activateReached = reached;
+  fixture.adapter.activatePause = new Promise<void>((resolve) => { resume = resolve; });
+
+  const activation = fixture.coordinator().activate({
+    ...fixture.request,
+    persistence: "process-only",
+  });
+  await reachedPromise;
+  fixture.runtimeGuard.lose();
+  resume();
+
+  await assert.rejects(activation, fixture.api.ProviderActivationRecoveryRequiredError);
+  assert.deepEqual(await journalDirectories(fixture.appHome), []);
+  assert.equal(fixture.credentials.calls.includes("reserveSlot"), false);
+});
+
+test("lost runtime guard during awaited recovery bind blocks old-slot and journal cleanup", async () => {
+  const fixture = await activationFixture({ crashAfter: "config-readback" });
+  await assert.rejects(fixture.activate());
+  let reached!: () => void;
+  let resume!: () => void;
+  const reachedPromise = new Promise<void>((resolve) => { reached = resolve; });
+  fixture.adapter.activateReached = reached;
+  fixture.adapter.activatePause = new Promise<void>((resolve) => { resume = resolve; });
+  const recoveryGuard = new FakeRuntimeGuard();
+  const coordinator = new fixture.api.ProviderActivationCoordinator({
+    appHome: fixture.appHome,
+    configPath: fixture.path,
+    privateStore: fixture.privateStore,
+    credentials: fixture.credentials,
+    adapter: fixture.adapter,
+    stateStore: fixture.stateStore,
+    runtimeGuard: recoveryGuard,
+    now: () => 20_000,
+    createUuid: sequentialUuid(),
+    leaseDurationMs: 100,
+  });
+
+  const recovery = coordinator.recover({
+    signal: new AbortController().signal,
+    inspectCommitted: true,
+  });
+  await reachedPromise;
+  recoveryGuard.lose();
+  resume();
+
+  await assert.rejects(recovery, fixture.api.ProviderActivationRecoveryRequiredError);
+  assert.equal(fixture.credentials.slots.get(OLD_SLOT.id), OLD_SECRET);
+  assert.equal(fixture.credentials.slots.get(NEW_SLOT_ID), NEW_SECRET);
+  assert.equal((await journalDirectories(fixture.appHome)).length, 1);
+});
+
+test("runtime release failure after process-only bind is fixed recovery-required not success", async () => {
+  const fixture = await activationFixture();
+  fixture.runtimeGuard.failRelease = true;
+
+  const error = await fixture.coordinator().activate({
+    ...fixture.request,
+    persistence: "process-only",
+  }).catch((reason: unknown) => reason);
+
+  assert.ok(error instanceof fixture.api.ProviderActivationRecoveryRequiredError);
+  assert.doesNotMatch(String(error), /raw-runtime|secret-marker/i);
+  assert.equal(fixture.runtimeGuard.releaseCalls, 1);
+});
+
+test("provider lease release failure after persisted bind is fixed recovery-required not success", async () => {
+  const fixture = await activationFixture();
+  const originalRelease = fixture.privateStore.releaseDirectoryClaim.bind(fixture.privateStore);
+  fixture.privateStore.releaseDirectoryClaim = async (claim, expectedOwner) => {
+    if (expectedOwner !== null) throw new Error("raw-provider-release-secret-marker");
+    return originalRelease(claim, expectedOwner);
+  };
+
+  const error = await fixture.activate().catch((reason: unknown) => reason);
+
+  assert.ok(error instanceof fixture.api.ProviderActivationRecoveryRequiredError);
+  assert.doesNotMatch(String(error), /raw-provider|secret-marker/i);
+  assert.equal(fixture.runtimeGuard.releaseCalls, 1);
+});
+
+test("provider and runtime release failures are both attempted and aggregated redacted", async () => {
+  const fixture = await activationFixture();
+  let providerReleaseCalls = 0;
+  fixture.runtimeGuard.failRelease = true;
+  const originalRelease = fixture.privateStore.releaseDirectoryClaim.bind(fixture.privateStore);
+  fixture.privateStore.releaseDirectoryClaim = async (claim, expectedOwner) => {
+    if (expectedOwner !== null) {
+      providerReleaseCalls += 1;
+      throw new Error("raw-provider-release-secret-marker");
+    }
+    return originalRelease(claim, expectedOwner);
+  };
+
+  const error = await fixture.activate().catch((reason: unknown) => reason);
+
+  assert.ok(error instanceof fixture.api.ProviderActivationRecoveryRequiredError);
+  assert.doesNotMatch(String(error), /raw-provider|raw-runtime|secret-marker/i);
+  assert.equal(providerReleaseCalls, 1);
+  assert.equal(fixture.runtimeGuard.releaseCalls, 1);
+});
+
 test("restart inspection after bind failure authenticates binds and only then cleans old v1", async () => {
   const fixture = await activationFixture();
   fixture.adapter.activateFailure = "before";
@@ -797,8 +999,10 @@ test("strict manifest contains no secret source raw account model response or pa
   assert.deepEqual(Object.keys(parsed).sort(), [
     "backendId",
     "candidateConnectionId",
+    "candidateProviderSetupSha256",
     "candidateRoute",
     "candidateSlot",
+    "expectedProviderSetupSha256",
     "expectedRevision",
     "phase",
     "previousSlot",
@@ -806,6 +1010,24 @@ test("strict manifest contains no secret source raw account model response or pa
     "version",
   ]);
   assert.doesNotMatch(raw, /provider-secret|OPENROUTER_API_KEY|creator_user_id|raw-provider|\/Users\/|\\Users\\/i);
+});
+
+test("strict manifest carries only lowercase complete-state SHA-256 snapshots", async () => {
+  const fixture = await activationFixture({ crashAfter: "journal-written" });
+  await assert.rejects(fixture.activate());
+  const [transactionId] = await journalDirectories(fixture.appHome);
+  assert.ok(transactionId);
+  const parsed = JSON.parse(await readFile(
+    join(fixture.appHome, "provider-activation", transactionId, "manifest.json"),
+    "utf8",
+  )) as Record<string, unknown>;
+
+  assert.match(String(parsed.expectedProviderSetupSha256), /^[0-9a-f]{64}$/);
+  assert.match(String(parsed.candidateProviderSetupSha256), /^[0-9a-f]{64}$/);
+  assert.doesNotMatch(
+    JSON.stringify(parsed),
+    /provider-secret|creator_user_id|raw-account|\/Users\/|\\Users\\/i,
+  );
 });
 
 test("coordinator dependency failures expose only fixed redacted errors", async () => {
@@ -820,7 +1042,7 @@ test("coordinator dependency failures expose only fixed redacted errors", async 
   assert.equal("cause" in (reserveError as object), false);
 
   const journalFixture = await activationFixture();
-  journalFixture.privateStore.writeTextAtomic = async () => {
+  journalFixture.privateStore.writeClaimManifest = async () => {
     throw new Error(rawLeak);
   };
   const journalError = await journalFixture.activate().catch((error: unknown) => error);
@@ -850,6 +1072,34 @@ test("a sole pending journal is recovered before a new activation may reserve or
   assert.deepEqual(await journalDirectories(fixture.appHome), []);
 });
 
+test("a committed verification-pending journal blocks a second activation before every new effect", async () => {
+  const fixture = await activationFixture({ crashAfter: "config-readback" });
+  await assert.rejects(fixture.activate());
+  fixture.restart();
+  const beforeConfig = await readFile(fixture.path, "utf8");
+  const beforeSlots = new Map(fixture.credentials.slots);
+  const beforeJournals = await journalDirectories(fixture.appHome);
+  const beforeReserveCount = fixture.credentials.calls.filter((call) => call === "reserveSlot").length;
+  const beforeRuntimeSecret = fixture.adapter.runtimeSecret;
+
+  await assert.rejects(
+    fixture.coordinator().activate({
+      ...fixture.request,
+      expectedRevision: fixture.oldState.revision + 1,
+    }),
+    fixture.api.ProviderActivationRecoveryRequiredError,
+  );
+
+  assert.equal(await readFile(fixture.path, "utf8"), beforeConfig);
+  assert.deepEqual(fixture.credentials.slots, beforeSlots);
+  assert.deepEqual(await journalDirectories(fixture.appHome), beforeJournals);
+  assert.equal(
+    fixture.credentials.calls.filter((call) => call === "reserveSlot").length,
+    beforeReserveCount,
+  );
+  assert.equal(fixture.adapter.runtimeSecret, beforeRuntimeSecret);
+});
+
 test("malformed journal fails closed with no credential config runtime or artifact cleanup", async () => {
   const fixture = await activationFixture();
   const transactionId = "20000000-0000-4000-8000-000000000001";
@@ -865,6 +1115,113 @@ test("malformed journal fails closed with no credential config runtime or artifa
   assert.deepEqual(fixture.credentials.slots, beforeSlots);
   assert.equal((await journalDirectories(fixture.appHome)).length, 1);
   assert.equal(fixture.adapter.runtimeSecret, OLD_SECRET);
+});
+
+test("journal validation rejects recursive extras and invalid digest fields without cleanup", async () => {
+  const cases = [
+    {
+      name: "candidate route secret extra",
+      includeDigests: true,
+      mutate: (manifest: Record<string, any>) => {
+        manifest.candidateRoute.secret = NEW_SECRET;
+      },
+    },
+    {
+      name: "candidate slot creator extra",
+      includeDigests: true,
+      mutate: (manifest: Record<string, any>) => {
+        manifest.candidateSlot.creator_user_id = "raw-account-id";
+      },
+    },
+    {
+      name: "previous slot extra",
+      includeDigests: true,
+      mutate: (manifest: Record<string, any>) => {
+        manifest.previousSlot.secret = OLD_SECRET;
+      },
+    },
+    {
+      name: "bad old digest",
+      includeDigests: true,
+      mutate: (manifest: Record<string, any>) => {
+        manifest.expectedProviderSetupSha256 = "ABC";
+      },
+    },
+    {
+      name: "bad candidate digest",
+      includeDigests: true,
+      mutate: (manifest: Record<string, any>) => {
+        manifest.candidateProviderSetupSha256 = "not-a-sha256";
+      },
+    },
+  ];
+  for (const [index, entry] of cases.entries()) {
+    const fixture = await activationFixture();
+    const transactionId = `71000000-0000-4000-8000-${String(index + 1).padStart(12, "0")}`;
+    const manifest: Record<string, any> = {
+      version: 1,
+      transactionId,
+      expectedRevision: fixture.oldState.revision,
+      phase: "prepared",
+      backendId: "openrouter",
+      candidateSlot: {
+        version: 1,
+        kind: "inference",
+        id: NEW_SLOT_ID,
+      },
+      previousSlot: OLD_SLOT,
+      candidateConnectionId: CONNECTION_ID,
+      candidateRoute: newRoute(),
+    };
+    if (entry.includeDigests) {
+      manifest.expectedProviderSetupSha256 = "1".repeat(64);
+      manifest.candidateProviderSetupSha256 = "2".repeat(64);
+    }
+    manifest.candidateSlot = structuredClone(manifest.candidateSlot);
+    manifest.previousSlot = structuredClone(manifest.previousSlot);
+    manifest.candidateRoute = structuredClone(manifest.candidateRoute);
+    entry.mutate(manifest);
+    await fixture.privateStore.writeTextAtomic(
+      join(fixture.appHome, "provider-activation", transactionId, "manifest.json"),
+      `${JSON.stringify(manifest)}\n`,
+    );
+    const beforeSlots = new Map(fixture.credentials.slots);
+
+    await assert.rejects(
+      fixture.recover(),
+      fixture.api.ProviderActivationRecoveryRequiredError,
+      entry.name,
+    );
+
+    assert.deepEqual(fixture.credentials.slots, beforeSlots, entry.name);
+    assert.equal((await journalDirectories(fixture.appHome)).length, 1, entry.name);
+  }
+});
+
+test("journal field lengths are bounded before state or credential cleanup", async () => {
+  const fixture = await activationFixture();
+  const transactionId = "71000000-0000-4000-8000-000000000010";
+  await fixture.privateStore.writeTextAtomic(
+    join(fixture.appHome, "provider-activation", transactionId, "manifest.json"),
+    `${JSON.stringify({
+      version: 1,
+      transactionId,
+      expectedRevision: fixture.oldState.revision,
+      phase: "prepared",
+      backendId: "openrouter",
+      candidateSlot: { version: 1, kind: "inference", id: NEW_SLOT_ID },
+      previousSlot: OLD_SLOT,
+      candidateConnectionId: "x".repeat(4_096),
+      candidateRoute: newRoute(),
+      expectedProviderSetupSha256: TEST_OLD_STATE_SHA256,
+      candidateProviderSetupSha256: TEST_CANDIDATE_STATE_SHA256,
+    })}\n`,
+  );
+
+  await assert.rejects(fixture.recover(), fixture.api.ProviderActivationRecoveryRequiredError);
+
+  assert.equal(fixture.credentials.slots.get(OLD_SLOT.id), OLD_SECRET);
+  assert.equal((await journalDirectories(fixture.appHome)).length, 1);
 });
 
 test("recovery old pointer plus exact owned candidate deletes only candidate v1 and journal", async () => {
@@ -897,6 +1254,85 @@ test("recovery same revision with a different old slot is ambiguous and retains 
   assert.equal((await journalDirectories(fixture.appHome)).length, 1);
 });
 
+test("recovery rejects a complete same-revision old providerSetup snapshot mismatch", async () => {
+  const fixture = await activationFixture({ crashAfter: "slot-readback" });
+  await assert.rejects(fixture.activate());
+  const raw = JSON.parse(await readFile(fixture.path, "utf8")) as {
+    providerSetup: ProviderSetupStateV1;
+  };
+  raw.providerSetup.lifecycle = "cancelled";
+  await writeFile(fixture.path, `${JSON.stringify(raw)}\n`, "utf8");
+  const beforeSlots = new Map(fixture.credentials.slots);
+
+  await assert.rejects(
+    fixture.restartAndRecover(false),
+    fixture.api.ProviderActivationRecoveryRequiredError,
+  );
+
+  assert.deepEqual(fixture.credentials.slots, beforeSlots);
+  assert.equal((await journalDirectories(fixture.appHome)).length, 1);
+});
+
+test("recovery rejects a complete committed candidate providerSetup snapshot mismatch", async () => {
+  const fixture = await activationFixture({ crashAfter: "config-readback" });
+  await assert.rejects(fixture.activate());
+  const raw = JSON.parse(await readFile(fixture.path, "utf8")) as {
+    providerSetup: ProviderSetupStateV1;
+  };
+  raw.providerSetup.lifecycle = "cancelled";
+  await writeFile(fixture.path, `${JSON.stringify(raw)}\n`, "utf8");
+  const beforeSlots = new Map(fixture.credentials.slots);
+
+  await assert.rejects(
+    fixture.restartAndRecover(true),
+    fixture.api.ProviderActivationRecoveryRequiredError,
+  );
+
+  assert.deepEqual(fixture.credentials.slots, beforeSlots);
+  assert.equal((await journalDirectories(fixture.appHome)).length, 1);
+});
+
+test("swapped real transaction directory with extra file survives recovery unchanged", async () => {
+  const fixture = await activationFixture({ crashAfter: "journal-written" });
+  await assert.rejects(fixture.activate());
+  const [transactionId] = await journalDirectories(fixture.appHome);
+  assert.ok(transactionId);
+  const transactionPath = join(fixture.appHome, "provider-activation", transactionId);
+  const moved = `${transactionPath}.owned-before-swap`;
+  const manifest = await readFile(join(transactionPath, "manifest.json"), "utf8");
+  await rename(transactionPath, moved);
+  await mkdir(transactionPath);
+  await writeFile(join(transactionPath, "manifest.json"), manifest);
+  await writeFile(join(transactionPath, "foreign.txt"), "foreign survives");
+
+  await assert.rejects(
+    fixture.restartAndRecover(false),
+    fixture.api.ProviderActivationRecoveryRequiredError,
+  );
+
+  assert.equal(await readFile(join(transactionPath, "foreign.txt"), "utf8"), "foreign survives");
+  assert.equal(await readFile(join(moved, "manifest.json"), "utf8"), manifest);
+});
+
+test("symlinked transaction directory is rejected and its target survives recovery", async () => {
+  const fixture = await activationFixture({ crashAfter: "journal-written" });
+  await assert.rejects(fixture.activate());
+  const [transactionId] = await journalDirectories(fixture.appHome);
+  assert.ok(transactionId);
+  const transactionPath = join(fixture.appHome, "provider-activation", transactionId);
+  const moved = `${transactionPath}.owned-before-link`;
+  await rename(transactionPath, moved);
+  await symlink(moved, transactionPath, "dir");
+  const manifest = await readFile(join(moved, "manifest.json"), "utf8");
+
+  await assert.rejects(
+    fixture.restartAndRecover(false),
+    fixture.api.ProviderActivationRecoveryRequiredError,
+  );
+
+  assert.equal(await readFile(join(moved, "manifest.json"), "utf8"), manifest);
+});
+
 test("strict recovery rejects a management candidate slot without deleting it", async () => {
   const fixture = await activationFixture();
   const transactionId = "70000000-0000-4000-8000-000000000002";
@@ -918,6 +1354,8 @@ test("strict recovery rejects a management candidate slot without deleting it", 
       previousSlot: OLD_SLOT,
       candidateConnectionId: CONNECTION_ID,
       candidateRoute: newRoute(),
+      expectedProviderSetupSha256: TEST_OLD_STATE_SHA256,
+      candidateProviderSetupSha256: TEST_CANDIDATE_STATE_SHA256,
     })}\n`,
   );
   const beforeSlots = new Map(fixture.credentials.slots);
@@ -1250,6 +1688,41 @@ function deepEqual(left: unknown, right: unknown): boolean {
   } catch {
     return false;
   }
+}
+
+function maskProviderSetup(raw: string): string {
+  const key = '"providerSetup"';
+  const keyIndex = raw.indexOf(key);
+  assert.notEqual(keyIndex, -1);
+  const colon = raw.indexOf(":", keyIndex + key.length);
+  assert.notEqual(colon, -1);
+  let start = colon + 1;
+  while (/\s/.test(raw[start] ?? "")) start += 1;
+  assert.equal(raw[start], "{");
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+  let end = start;
+  for (; end < raw.length; end += 1) {
+    const char = raw[end]!;
+    if (inString) {
+      if (escaped) escaped = false;
+      else if (char === "\\") escaped = true;
+      else if (char === '"') inString = false;
+      continue;
+    }
+    if (char === '"') inString = true;
+    else if (char === "{") depth += 1;
+    else if (char === "}") {
+      depth -= 1;
+      if (depth === 0) {
+        end += 1;
+        break;
+      }
+    }
+  }
+  assert.equal(depth, 0);
+  return `${raw.slice(0, start)}<providerSetup>${raw.slice(end)}`;
 }
 
 function sequentialUuid(): () => string {

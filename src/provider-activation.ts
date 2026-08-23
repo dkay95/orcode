@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { readFile, readdir } from "node:fs/promises";
 import { join } from "node:path";
 import type {
@@ -11,9 +11,7 @@ import {
   DEFAULT_CONFIG,
   CONFIG_SCHEMA_VERSION,
   saveConfig as saveConfigDefault,
-  validateConfig,
-  type ConfigInput,
-  type OrcodeConfigWithBudget,
+  writeFileAtomicSecure,
 } from "./config.js";
 import {
   normalizeProviderSecret,
@@ -73,6 +71,8 @@ export interface ProviderActivationJournalV1 {
     | null;
   candidateConnectionId: string;
   candidateRoute: RouteIdentityV1;
+  expectedProviderSetupSha256: string;
+  candidateProviderSetupSha256: string;
 }
 
 export interface ProviderActivationResult {
@@ -137,6 +137,8 @@ export interface ProviderActivationCoordinatorOptions {
   leaseDurationMs?: number;
   leaseAttempts?: number;
   waitForLease?: () => Promise<void>;
+  writeConfigAtomic?: (path: string, content: string) => Promise<void>;
+  /** @deprecated Transactional activation uses writeConfigAtomic for byte preservation. */
   saveConfig?: typeof saveConfigDefault;
   onBoundary?: (boundary: ProviderActivationBoundary) => void | Promise<void>;
 }
@@ -155,15 +157,25 @@ interface HeldProviderLease {
 }
 
 interface TransactionJournal {
-  path: string;
-  manifestPath: string;
+  claim: PrivateDirectoryClaim;
+  rawManifest: string;
   manifest: ProviderActivationJournalV1;
 }
 
 type ConfigFacts =
-  | { kind: "valid"; config: OrcodeConfigWithBudget }
-  | { kind: "absent"; config: OrcodeConfigWithBudget }
+  | {
+    kind: "valid" | "absent";
+    prefix: string;
+    suffix: string;
+    state: ProviderSetupStateV1;
+    digest: string;
+  }
   | { kind: "corrupt" | "future" | "unreadable" };
+
+type RecoveryDisposition =
+  | { kind: "complete"; warnings: readonly string[] }
+  | { kind: "verification-pending"; warnings: readonly string[] }
+  | { kind: "recovery-required"; error: ProviderActivationRecoveryRequiredError };
 
 export class ProviderActivationError extends Error {
   constructor(
@@ -199,9 +211,9 @@ export class ProviderActivationBusyError extends ProviderActivationError {
 export class ProviderActivationCoordinator {
   readonly #options: Required<Pick<
     ProviderActivationCoordinatorOptions,
-    "now" | "createUuid" | "leaseDurationMs" | "leaseAttempts" | "waitForLease" | "saveConfig" | "onBoundary"
+    "now" | "createUuid" | "leaseDurationMs" | "leaseAttempts" | "waitForLease" | "writeConfigAtomic" | "onBoundary"
   >> & Omit<ProviderActivationCoordinatorOptions,
-    "now" | "createUuid" | "leaseDurationMs" | "leaseAttempts" | "waitForLease" | "saveConfig" | "onBoundary">;
+    "now" | "createUuid" | "leaseDurationMs" | "leaseAttempts" | "waitForLease" | "saveConfig" | "writeConfigAtomic" | "onBoundary">;
 
   constructor(options: ProviderActivationCoordinatorOptions) {
     if (!Number.isSafeInteger(options.leaseDurationMs ?? DEFAULT_LEASE_DURATION_MS)
@@ -220,7 +232,7 @@ export class ProviderActivationCoordinator {
       leaseAttempts: options.leaseAttempts ?? DEFAULT_LEASE_ATTEMPTS,
       waitForLease: options.waitForLease
         ?? (() => new Promise<void>((resolve) => setImmediate(resolve))),
-      saveConfig: options.saveConfig ?? saveConfigDefault,
+      writeConfigAtomic: options.writeConfigAtomic ?? writeFileAtomicSecure,
       onBoundary: options.onBoundary ?? (() => undefined),
     };
   }
@@ -265,6 +277,7 @@ export class ProviderActivationCoordinator {
           selectedModel,
           request.signal,
         );
+        await assertRuntimeLease(runtimeLease);
         assertActivatedRoute(candidateRoute, activated);
         await this.#boundary("runtime-activated");
         return {
@@ -277,17 +290,22 @@ export class ProviderActivationCoordinator {
 
       providerLease = await this.#acquireProviderLease(request.signal);
       await this.#assertFence(providerLease);
-      await this.#recoverUnderLease({
+      const recovery = await this.#recoverDisposition({
         signal: request.signal,
         inspectCommitted: false,
       }, providerLease, runtimeLease);
+      if (recovery.kind !== "complete") {
+        throw recovery.kind === "recovery-required"
+          ? recovery.error
+          : new ProviderActivationRecoveryRequiredError();
+      }
       await this.#assertFence(providerLease);
       await assertRuntimeLease(runtimeLease);
       const configFacts = await readConfigFacts(this.#options.configPath);
       if (configFacts.kind !== "valid" && configFacts.kind !== "absent") {
         throw new ProviderActivationRecoveryRequiredError("provider-config-unreadable");
       }
-      const current = requireCurrentProviderState(configFacts.config);
+      const current = configFacts.state;
       if (current.revision !== request.expectedRevision) {
         throw new StaleProviderGenerationError();
       }
@@ -315,6 +333,12 @@ export class ProviderActivationCoordinator {
         );
       }
       const previousSlot = previousSlotFromState(current, candidate.connectionId);
+      const nextState = buildNextState(
+        current,
+        candidate,
+        candidateSlot,
+        candidateRoute,
+      );
       const transactionId = createCanonicalUuid(this.#options.createUuid);
       const manifest: ProviderActivationJournalV1 = {
         version: 1,
@@ -326,6 +350,8 @@ export class ProviderActivationCoordinator {
         previousSlot,
         candidateConnectionId: candidate.connectionId,
         candidateRoute,
+        expectedProviderSetupSha256: configFacts.digest,
+        candidateProviderSetupSha256: providerSetupDigest(nextState),
       };
       transaction = await this.#createJournal(manifest, providerLease);
       await this.#boundary("journal-written");
@@ -385,6 +411,7 @@ export class ProviderActivationCoordinator {
           selectedModel,
           request.signal,
         );
+        await assertRuntimeLease(runtimeLease);
         assertActivatedRoute(candidateRoute, activated);
         await this.#boundary("runtime-activated");
         return {
@@ -397,26 +424,19 @@ export class ProviderActivationCoordinator {
 
       manifest.phase = "credential-staged";
       await this.#writeJournal(transaction, manifest, providerLease);
-      const nextState = buildNextState(
-        current,
-        candidate,
-        candidateSlot,
-        candidateRoute,
-      );
       await this.#assertFence(providerLease);
       const beforeSave = await readConfigFacts(this.#options.configPath);
       await this.#assertFence(providerLease);
       if ((beforeSave.kind !== "valid" && beforeSave.kind !== "absent")
-        || requireCurrentProviderState(beforeSave.config).revision !== current.revision) {
-        throw new StaleProviderGenerationError();
+        || beforeSave.digest !== manifest.expectedProviderSetupSha256) {
+        throw new ProviderActivationRecoveryRequiredError(
+          "provider-config-cas-mismatch",
+        );
       }
-      const nextConfig = {
-        ...beforeSave.config,
-        providerSetup: nextState,
-      } satisfies OrcodeConfigWithBudget;
+      const nextRaw = `${beforeSave.prefix}${JSON.stringify(nextState)}${beforeSave.suffix}`;
       let saveError: unknown;
       try {
-        await this.#options.saveConfig(nextConfig, this.#options.configPath);
+        await this.#options.writeConfigAtomic(this.#options.configPath, nextRaw);
       } catch (error) {
         saveError = error;
       }
@@ -426,10 +446,12 @@ export class ProviderActivationCoordinator {
       const afterSave = await readConfigFacts(this.#options.configPath);
       await this.#assertFence(providerLease);
       if ((afterSave.kind === "valid" || afterSave.kind === "absent")
-        && exactCandidateState(afterSave.config.providerSetup, manifest)) {
+        && exactCandidateState(afterSave, manifest)
+        && afterSave.prefix === beforeSave.prefix
+        && afterSave.suffix === beforeSave.suffix) {
         // A post-rename error is non-authoritative; exact readback is the fact.
       } else if ((afterSave.kind === "valid" || afterSave.kind === "absent")
-        && exactOldState(afterSave.config.providerSetup, manifest)) {
+        && exactOldState(afterSave, manifest)) {
         const cleaned = await this.#cleanupFailedCandidate(
           candidateSlot,
           normalized,
@@ -467,6 +489,7 @@ export class ProviderActivationCoordinator {
           selectedModel,
           request.signal,
         );
+        await assertRuntimeLease(runtimeLease);
         assertActivatedRoute(candidateRoute, activated);
       } catch {
         throw new ProviderActivationRecoveryRequiredError("provider-runtime-bind-ambiguous");
@@ -502,11 +525,25 @@ export class ProviderActivationCoordinator {
       if (revalidatedCandidateId) {
         await this.#options.adapter.discardCandidate(revalidatedCandidateId).catch(() => undefined);
       }
-      if (!simulatedCrash && providerLease) {
-        await this.#releaseProviderLease(providerLease).catch(() => undefined);
-      }
       if (!simulatedCrash) {
-        await Promise.resolve(runtimeLease.release()).catch(() => undefined);
+        let releaseFailed = false;
+        if (providerLease) {
+          try {
+            await this.#releaseProviderLease(providerLease);
+          } catch {
+            releaseFailed = true;
+          }
+        }
+        try {
+          await Promise.resolve(runtimeLease.release());
+        } catch {
+          releaseFailed = true;
+        }
+        if (releaseFailed) {
+          throw new ProviderActivationRecoveryRequiredError(
+            "provider-activation-release-failed",
+          );
+        }
       }
       void transaction;
     }
@@ -527,12 +564,50 @@ export class ProviderActivationCoordinator {
     let providerLease: HeldProviderLease | null = null;
     try {
       providerLease = await this.#acquireProviderLease(request.signal);
-      return await this.#recoverUnderLease(request, providerLease, runtimeLease);
+      const disposition = await this.#recoverDisposition(
+        request,
+        providerLease,
+        runtimeLease,
+      );
+      if (disposition.kind === "recovery-required") throw disposition.error;
+      return disposition.warnings;
     } finally {
+      let releaseFailed = false;
       if (providerLease) {
-        await this.#releaseProviderLease(providerLease).catch(() => undefined);
+        try {
+          await this.#releaseProviderLease(providerLease);
+        } catch {
+          releaseFailed = true;
+        }
       }
-      await Promise.resolve(runtimeLease.release()).catch(() => undefined);
+      try {
+        await Promise.resolve(runtimeLease.release());
+      } catch {
+        releaseFailed = true;
+      }
+      if (releaseFailed) {
+        throw new ProviderActivationRecoveryRequiredError(
+          "provider-activation-release-failed",
+        );
+      }
+    }
+  }
+
+  async #recoverDisposition(
+    request: ProviderActivationRecoveryRequest,
+    lease: HeldProviderLease,
+    runtimeLease: ProviderActivationRuntimeLease,
+  ): Promise<RecoveryDisposition> {
+    try {
+      const warnings = await this.#recoverUnderLease(request, lease, runtimeLease);
+      return warnings.length === 0
+        ? { kind: "complete", warnings }
+        : { kind: "verification-pending", warnings };
+    } catch (error) {
+      if (error instanceof ProviderActivationRecoveryRequiredError) {
+        return { kind: "recovery-required", error };
+      }
+      throw error;
     }
   }
 
@@ -555,7 +630,7 @@ export class ProviderActivationCoordinator {
     if (facts.kind !== "valid" && facts.kind !== "absent") {
       throw new ProviderActivationRecoveryRequiredError("provider-config-unreadable");
     }
-    const current = requireCurrentProviderState(facts.config);
+    const current = facts.state;
     let candidateSecret: string | null;
     try {
       candidateSecret = await this.#options.credentials.readSlot(manifest.candidateSlot);
@@ -564,7 +639,7 @@ export class ProviderActivationCoordinator {
     }
     await this.#assertFence(lease);
 
-    if (exactOldState(current, manifest)) {
+    if (exactOldState(facts, manifest)) {
       if (stateReferencesSlot(current, manifest.candidateSlot.id)) {
         throw new ProviderActivationRecoveryRequiredError("provider-recovery-pointer-ambiguous");
       }
@@ -584,7 +659,7 @@ export class ProviderActivationCoordinator {
       return Object.freeze([]);
     }
 
-    if (!exactCandidateState(current, manifest)) {
+    if (!exactCandidateState(facts, manifest)) {
       throw new ProviderActivationRecoveryRequiredError("provider-recovery-pointer-ambiguous");
     }
     if (candidateSecret === null) {
@@ -617,6 +692,7 @@ export class ProviderActivationCoordinator {
     await this.#assertFence(lease);
     try {
       const activated = await this.#activateRuntime(candidate.candidateId, model, request.signal);
+      await assertRuntimeLease(runtimeLease);
       assertActivatedRoute(manifest.candidateRoute, activated);
     } catch {
       throw new ProviderActivationRecoveryRequiredError("provider-runtime-bind-ambiguous");
@@ -856,21 +932,26 @@ export class ProviderActivationCoordinator {
   ): Promise<TransactionJournal> {
     const activationRoot = join(this.#options.appHome, ACTIVATION_DIRECTORY);
     const path = join(activationRoot, manifest.transactionId);
-    const manifestPath = join(path, "manifest.json");
+    let transactionClaim: PrivateDirectoryClaim;
     try {
       await this.#assertFence(lease);
       await this.#options.privateStore.ensureDirectory(activationRoot);
       await this.#assertFence(lease);
-      const transactionClaim = await this.#options.privateStore.createDirectoryExclusive(path);
+      const acquired = await this.#options.privateStore.createDirectoryExclusive(path);
       await this.#assertFence(lease);
-      if (!transactionClaim) {
+      if (!acquired) {
         throw new ProviderActivationRecoveryRequiredError("provider-transaction-collision");
       }
+      transactionClaim = acquired;
     } catch (error) {
       if (error instanceof ProviderActivationError) throw error;
       throw new ProviderActivationRecoveryRequiredError("provider-journal-create-failed");
     }
-    const transaction = { path, manifestPath, manifest: structuredClone(manifest) };
+    const transaction = {
+      claim: transactionClaim!,
+      rawManifest: "",
+      manifest: structuredClone(manifest),
+    };
     await this.#writeJournal(transaction, manifest, lease);
     return transaction;
   }
@@ -888,9 +969,10 @@ export class ProviderActivationCoordinator {
     const serialized = `${JSON.stringify(manifest)}\n`;
     await this.#assertFence(lease);
     try {
-      await this.#options.privateStore.writeTextAtomic(
-        transaction.manifestPath,
+      await this.#options.privateStore.writeClaimManifest(
+        transaction.claim,
         serialized,
+        transaction.rawManifest === "" ? null : transaction.rawManifest,
       );
     } catch {
       // The atomic publish may already have completed; exact readback is authoritative.
@@ -898,7 +980,10 @@ export class ProviderActivationCoordinator {
     await this.#assertFence(lease);
     let readback: string;
     try {
-      readback = await this.#options.privateStore.readText(transaction.manifestPath);
+      readback = await this.#options.privateStore.readClaimManifest(
+        transaction.claim,
+        MANIFEST_FILE_LIMIT,
+      );
     } catch {
       throw new ProviderActivationRecoveryRequiredError("provider-journal-readback-failed");
     }
@@ -907,6 +992,7 @@ export class ProviderActivationCoordinator {
     if (!parsed || JSON.stringify(parsed) !== JSON.stringify(manifest)) {
       throw new ProviderActivationRecoveryRequiredError("provider-journal-readback-failed");
     }
+    transaction.rawManifest = readback;
     transaction.manifest = structuredClone(manifest);
   }
 
@@ -925,10 +1011,15 @@ export class ProviderActivationCoordinator {
         throw new ProviderActivationRecoveryRequiredError("provider-journal-name-invalid");
       }
       const path = join(root, name);
-      const manifestPath = join(path, "manifest.json");
+      let claim: PrivateDirectoryClaim;
       let raw: string;
       try {
-        raw = await this.#options.privateStore.readText(manifestPath);
+        const adopted = await this.#options.privateStore.adoptDirectoryClaim(path);
+        claim = adopted.claim;
+        raw = await this.#options.privateStore.readClaimManifest(
+          claim,
+          MANIFEST_FILE_LIMIT,
+        );
       } catch {
         throw new ProviderActivationRecoveryRequiredError("provider-journal-unreadable");
       }
@@ -939,7 +1030,7 @@ export class ProviderActivationCoordinator {
       if (!manifest) {
         throw new ProviderActivationRecoveryRequiredError("provider-journal-invalid");
       }
-      transactions.push({ path, manifestPath, manifest });
+      transactions.push({ claim: claim!, rawManifest: raw, manifest });
     }
     return transactions;
   }
@@ -955,7 +1046,7 @@ export class ProviderActivationCoordinator {
       const facts = await readConfigFacts(this.#options.configPath);
       await this.#assertFence(lease);
       if ((facts.kind !== "valid" && facts.kind !== "absent")
-        || !exactOldState(facts.config.providerSetup, transaction.manifest)) {
+        || !exactOldState(facts, transaction.manifest)) {
         return false;
       }
       const journals = await this.#readAllJournals();
@@ -993,12 +1084,9 @@ export class ProviderActivationCoordinator {
       const facts = await readConfigFacts(this.#options.configPath);
       await this.#assertFence(lease);
       if ((facts.kind !== "valid" && facts.kind !== "absent")
-        || !exactCandidateState(facts.config.providerSetup, transaction.manifest)
+        || !exactCandidateState(facts, transaction.manifest)
         || stateReferencesSlot(activeState, previous.id)
-        || stateReferencesSlot(
-          requireCurrentProviderState(facts.config),
-          previous.id,
-        )) {
+        || stateReferencesSlot(facts.state, previous.id)) {
         return false;
       }
       const journals = await this.#readAllJournals();
@@ -1025,7 +1113,12 @@ export class ProviderActivationCoordinator {
   ): Promise<void> {
     await this.#assertFence(lease);
     try {
-      await this.#options.privateStore.removeTree(transaction.path);
+      await this.#options.privateStore.removeClaimManifest(
+        transaction.claim,
+        transaction.rawManifest,
+      );
+      await this.#assertFence(lease);
+      await this.#options.privateStore.releaseDirectoryClaim(transaction.claim, null);
     } catch {
       throw new ProviderActivationRecoveryRequiredError("provider-journal-cleanup-failed");
     }
@@ -1171,44 +1264,17 @@ function assertActivatedRoute(
 }
 
 function exactCandidateState(
-  state: unknown,
+  facts: Extract<ConfigFacts, { kind: "valid" | "absent" }>,
   manifest: ProviderActivationJournalV1,
-): state is ProviderSetupStateV1 {
-  const validated = validateProviderSetupState(state);
-  if (isProviderStateIssue(validated)
-    || validated.revision !== manifest.expectedRevision + 1
-    || !exactRoute(validated.defaultRoute, manifest.candidateRoute)) {
-    return false;
-  }
-  const connection = validated.connections.find((entry) =>
-    entry.id === manifest.candidateConnectionId
-  );
-  return connection?.backendId === "openrouter"
-    && connection.enabled
-    && connection.maturity === "stable"
-    && connection.credentialSlot === manifest.candidateSlot.id
-    && connection.accountFingerprint === manifest.candidateRoute.accountFingerprint
-    && connection.accountFingerprintState === "verified"
-    && connection.billingRealm === manifest.candidateRoute.billingRealm;
+): boolean {
+  return facts.digest === manifest.candidateProviderSetupSha256;
 }
 
 function exactOldState(
-  state: unknown,
+  facts: Extract<ConfigFacts, { kind: "valid" | "absent" }>,
   manifest: ProviderActivationJournalV1,
-): state is ProviderSetupStateV1 {
-  const validated = validateProviderSetupState(state);
-  if (isProviderStateIssue(validated)
-    || validated.revision !== manifest.expectedRevision
-    || stateReferencesSlot(validated, manifest.candidateSlot.id)) {
-    return false;
-  }
-  const previousId = manifest.previousSlot?.id ?? null;
-  const previousConnection = validated.connections.find((entry) =>
-    entry.id === manifest.candidateConnectionId
-  );
-  return previousId === null
-    ? previousConnection === undefined
-    : previousConnection?.credentialSlot === previousId;
+): boolean {
+  return facts.digest === manifest.expectedProviderSetupSha256;
 }
 
 function exactRoute(
@@ -1229,26 +1295,18 @@ function stateReferencesSlot(state: ProviderSetupStateV1, slotId: string): boole
   return state.connections.some((connection) => connection.credentialSlot === slotId);
 }
 
-function requireCurrentProviderState(config: OrcodeConfigWithBudget): ProviderSetupStateV1 {
-  const state = validateProviderSetupState(config.providerSetup);
-  if (isProviderStateIssue(state)) {
-    throw new ProviderActivationRecoveryRequiredError("provider-state-invalid");
-  }
-  return state;
-}
-
 async function readConfigFacts(path: string): Promise<ConfigFacts> {
   let raw: string;
+  let kind: "valid" | "absent" = "valid";
   try {
     raw = await readFile(path, "utf8");
   } catch (error) {
     if (hasCode(error, "ENOENT")) {
-      return {
-        kind: "absent",
-        config: structuredClone(DEFAULT_CONFIG),
-      };
+      kind = "absent";
+      raw = `${JSON.stringify(DEFAULT_CONFIG, null, 2)}\n`;
+    } else {
+      return { kind: "unreadable" };
     }
-    return { kind: "unreadable" };
   }
   let parsed: unknown;
   try {
@@ -1257,27 +1315,201 @@ async function readConfigFacts(path: string): Promise<ConfigFacts> {
     return { kind: "corrupt" };
   }
   if (!isRecord(parsed)) return { kind: "corrupt" };
-  if (typeof parsed.schemaVersion === "number"
-    && parsed.schemaVersion > CONFIG_SCHEMA_VERSION) {
+  if (!Number.isInteger(parsed.schemaVersion) || Number(parsed.schemaVersion) < 0) {
+    return { kind: "corrupt" };
+  }
+  if (Number(parsed.schemaVersion) > CONFIG_SCHEMA_VERSION) {
     return { kind: "future" };
   }
   if (!("providerSetup" in parsed)) return { kind: "corrupt" };
-  const providerState = validateProviderSetupState(parsed.providerSetup);
-  if (isProviderStateIssue(providerState)) {
-    return { kind: providerState.kind === "future-version" ? "future" : "corrupt" };
+  const looseState = validateProviderSetupState(parsed.providerSetup);
+  if (isProviderStateIssue(looseState)) {
+    return { kind: looseState.kind === "future-version" ? "future" : "corrupt" };
   }
-  try {
-    return {
-      kind: "valid",
-      config: validateConfig({
-        ...DEFAULT_CONFIG,
-        ...(parsed as unknown as ConfigInput),
-        providerSetup: providerState,
-      }),
-    };
-  } catch {
-    return { kind: "corrupt" };
+  const state = strictProviderSetup(parsed.providerSetup);
+  const span = findTopLevelJsonValue(raw, "providerSetup");
+  if (!state || !span) return { kind: "corrupt" };
+  return {
+    kind,
+    prefix: raw.slice(0, span.start),
+    suffix: raw.slice(span.end),
+    state,
+    digest: providerSetupDigest(state),
+  };
+}
+
+function providerSetupDigest(value: unknown): string {
+  const state = strictProviderSetup(value);
+  if (!state) {
+    throw new ProviderActivationRecoveryRequiredError("provider-state-invalid");
   }
+  return createHash("sha256").update(JSON.stringify(state), "utf8").digest("hex");
+}
+
+function strictProviderSetup(value: unknown): ProviderSetupStateV1 | null {
+  if (!isRecord(value)
+    || !exactKeys(value, [
+      "schemaVersion",
+      "revision",
+      "lifecycle",
+      "connections",
+      "defaultRoute",
+      "cross",
+    ])
+    || !Number.isSafeInteger(value.revision)
+    || Number(value.revision) < 0
+    || !Array.isArray(value.connections)
+    || !value.connections.every((connection) => isRecord(connection)
+      && exactKeys(connection, [
+        "id",
+        "backendId",
+        "enabled",
+        "maturity",
+        "credentialSlot",
+        "accountFingerprint",
+        "accountFingerprintState",
+        "billingRealm",
+        "lastHealth",
+      ])
+      && (connection.lastHealth === null || (isRecord(connection.lastHealth)
+        && exactKeys(connection.lastHealth, [
+          "credential",
+          "connectivity",
+          "spend",
+          "runtime",
+          "observedAt",
+          "generation",
+        ]))))
+    || !strictNullableRouteShape(value.defaultRoute)
+    || !isRecord(value.cross)
+    || !exactKeys(value.cross, ["enabled", "preferredLead", "preferredChallenger"])
+    || !strictNullableRouteShape(value.cross.preferredLead)
+    || !strictNullableRouteShape(value.cross.preferredChallenger)) {
+    return null;
+  }
+  const validated = validateProviderSetupState(value);
+  if (isProviderStateIssue(validated)) return null;
+  return {
+    schemaVersion: 1,
+    revision: validated.revision,
+    lifecycle: validated.lifecycle,
+    connections: validated.connections.map((connection) => ({
+      id: connection.id,
+      backendId: connection.backendId,
+      enabled: connection.enabled,
+      maturity: connection.maturity,
+      credentialSlot: connection.credentialSlot,
+      accountFingerprint: connection.accountFingerprint,
+      accountFingerprintState: connection.accountFingerprintState,
+      billingRealm: connection.billingRealm,
+      lastHealth: connection.lastHealth === null ? null : {
+        credential: connection.lastHealth.credential,
+        connectivity: connection.lastHealth.connectivity,
+        spend: connection.lastHealth.spend,
+        runtime: connection.lastHealth.runtime,
+        observedAt: connection.lastHealth.observedAt,
+        generation: connection.lastHealth.generation,
+      },
+    })),
+    defaultRoute: cloneExactRoute(validated.defaultRoute),
+    cross: {
+      enabled: false,
+      preferredLead: cloneExactRoute(validated.cross.preferredLead),
+      preferredChallenger: cloneExactRoute(validated.cross.preferredChallenger),
+    },
+  };
+}
+
+function strictNullableRouteShape(value: unknown): boolean {
+  return value === null || (isRecord(value) && exactKeys(value, [
+    "version",
+    "backendId",
+    "accountFingerprint",
+    "billingRealm",
+    "requestedModelId",
+    "canonicalModelId",
+    "resolutionState",
+  ]));
+}
+
+function cloneExactRoute(value: RouteIdentityV1 | null): RouteIdentityV1 | null {
+  if (value === null) return null;
+  return {
+    version: 1,
+    backendId: value.backendId,
+    accountFingerprint: value.accountFingerprint,
+    billingRealm: value.billingRealm,
+    requestedModelId: value.requestedModelId,
+    canonicalModelId: value.canonicalModelId,
+    resolutionState: value.resolutionState,
+  };
+}
+
+function findTopLevelJsonValue(
+  raw: string,
+  wantedKey: string,
+): { start: number; end: number } | null {
+  let index = skipJsonWhitespace(raw, 0);
+  if (raw[index] !== "{") return null;
+  index = skipJsonWhitespace(raw, index + 1);
+  let found: { start: number; end: number } | null = null;
+  while (index < raw.length && raw[index] !== "}") {
+    const keyToken = scanJsonString(raw, index);
+    if (!keyToken) return null;
+    let key: unknown;
+    try { key = JSON.parse(raw.slice(index, keyToken)); } catch { return null; }
+    index = skipJsonWhitespace(raw, keyToken);
+    if (raw[index] !== ":") return null;
+    const start = skipJsonWhitespace(raw, index + 1);
+    const end = scanJsonValue(raw, start);
+    if (end === null) return null;
+    if (key === wantedKey) {
+      if (found) return null;
+      found = { start, end };
+    }
+    index = skipJsonWhitespace(raw, end);
+    if (raw[index] === ",") index = skipJsonWhitespace(raw, index + 1);
+    else if (raw[index] !== "}") return null;
+  }
+  return found;
+}
+
+function skipJsonWhitespace(raw: string, start: number): number {
+  let index = start;
+  while (index < raw.length && /\s/.test(raw[index]!)) index += 1;
+  return index;
+}
+
+function scanJsonString(raw: string, start: number): number | null {
+  if (raw[start] !== '"') return null;
+  for (let index = start + 1; index < raw.length; index += 1) {
+    if (raw[index] === "\\") index += 1;
+    else if (raw[index] === '"') return index + 1;
+  }
+  return null;
+}
+
+function scanJsonValue(raw: string, start: number): number | null {
+  if (raw[start] === '"') return scanJsonString(raw, start);
+  if (raw[start] === "{" || raw[start] === "[") {
+    const stack = [raw[start] === "{" ? "}" : "]"];
+    for (let index = start + 1; index < raw.length; index += 1) {
+      if (raw[index] === '"') {
+        const end = scanJsonString(raw, index);
+        if (end === null) return null;
+        index = end - 1;
+      } else if (raw[index] === "{") stack.push("}");
+      else if (raw[index] === "[") stack.push("]");
+      else if (raw[index] === stack.at(-1)) {
+        stack.pop();
+        if (stack.length === 0) return index + 1;
+      }
+    }
+    return null;
+  }
+  let index = start;
+  while (index < raw.length && !/[\s,}\]]/.test(raw[index]!)) index += 1;
+  return index > start ? index : null;
 }
 
 function parseJournal(raw: string, transactionId: string): ProviderActivationJournalV1 | null {
@@ -1290,7 +1522,25 @@ function parseJournal(raw: string, transactionId: string): ProviderActivationJou
   }
   try {
     validateJournal(parsed, transactionId);
-    return structuredClone(parsed as ProviderActivationJournalV1);
+    const value = parsed as unknown as Record<string, unknown>;
+    const candidateSlot = parseCredentialSlot(value.candidateSlot);
+    const previousSlot = parsePreviousSlot(value.previousSlot);
+    const candidateRoute = parseStrictRoute(value.candidateRoute);
+    if (!candidateSlot || candidateSlot.kind !== "inference"
+      || previousSlot === undefined || !candidateRoute) return null;
+    return {
+      version: 1,
+      transactionId,
+      expectedRevision: Number(value.expectedRevision),
+      phase: value.phase as ProviderActivationJournalV1["phase"],
+      backendId: "openrouter",
+      candidateSlot,
+      previousSlot,
+      candidateConnectionId: String(value.candidateConnectionId),
+      candidateRoute,
+      expectedProviderSetupSha256: String(value.expectedProviderSetupSha256),
+      candidateProviderSetupSha256: String(value.candidateProviderSetupSha256),
+    };
   } catch {
     return null;
   }
@@ -1308,6 +1558,8 @@ function validateJournal(value: unknown, transactionId: string): asserts value i
       "previousSlot",
       "candidateConnectionId",
       "candidateRoute",
+      "expectedProviderSetupSha256",
+      "candidateProviderSetupSha256",
     ])
     || value.version !== 1
     || value.transactionId !== transactionId
@@ -1320,13 +1572,15 @@ function validateJournal(value: unknown, transactionId: string): asserts value i
       && value.phase !== "config-committed")
     || value.backendId !== "openrouter"
     || !isInferenceSlot(value.candidateSlot)
-    || !validPreviousSlot(value.previousSlot)
+    || parsePreviousSlot(value.previousSlot) === undefined
     || typeof value.candidateConnectionId !== "string"
     || value.candidateConnectionId.length === 0
-    || validateRouteIdentityV1(value.candidateRoute) === null
-    || (value.candidateRoute as RouteIdentityV1).backendId !== "openrouter"
-    || (value.candidateRoute as RouteIdentityV1).billingRealm !== "openrouter-payg"
-    || (value.candidateRoute as RouteIdentityV1).resolutionState !== "resolved") {
+    || value.candidateConnectionId.length > 256
+    || parseStrictRoute(value.candidateRoute) === null
+    || typeof value.expectedProviderSetupSha256 !== "string"
+    || !/^[0-9a-f]{64}$/.test(value.expectedProviderSetupSha256)
+    || typeof value.candidateProviderSetupSha256 !== "string"
+    || !/^[0-9a-f]{64}$/.test(value.candidateProviderSetupSha256)) {
     throw new Error("invalid-provider-activation-journal");
   }
 }
@@ -1350,18 +1604,55 @@ function parseCredentialSlot(value: unknown): CredentialSlotRef | null {
   };
 }
 
-function validPreviousSlot(value: unknown): boolean {
-  return value === null
-    || isInferenceSlot(value)
-    || (isRecord(value)
+function parsePreviousSlot(
+  value: unknown,
+): ProviderActivationJournalV1["previousSlot"] | undefined {
+  if (value === null) return null;
+  const current = parseCredentialSlot(value);
+  if (current?.kind === "inference") return current;
+  if (isRecord(value)
       && exactKeys(value, ["version", "kind", "id"])
       && value.version === 0
       && value.kind === "inference"
-      && value.id === "legacy:inference");
+      && value.id === "legacy:inference") {
+    return { version: 0, kind: "inference", id: "legacy:inference" };
+  }
+  return undefined;
 }
 
 function isInferenceSlot(value: unknown): boolean {
   return parseCredentialSlot(value)?.kind === "inference";
+}
+
+function parseStrictRoute(value: unknown): RouteIdentityV1 | null {
+  if (!isRecord(value)
+    || !exactKeys(value, [
+      "version",
+      "backendId",
+      "accountFingerprint",
+      "billingRealm",
+      "requestedModelId",
+      "canonicalModelId",
+      "resolutionState",
+    ])) return null;
+  const validated = validateRouteIdentityV1(value);
+  if (!validated
+    || validated.backendId !== "openrouter"
+    || validated.billingRealm !== "openrouter-payg"
+    || validated.resolutionState !== "resolved"
+    || validated.accountFingerprint.length > 512
+    || validated.requestedModelId.length > 512
+    || validated.canonicalModelId === null
+    || validated.canonicalModelId.length > 512) return null;
+  return {
+    version: 1,
+    backendId: "openrouter",
+    accountFingerprint: validated.accountFingerprint,
+    billingRealm: "openrouter-payg",
+    requestedModelId: validated.requestedModelId,
+    canonicalModelId: validated.canonicalModelId,
+    resolutionState: "resolved",
+  };
 }
 
 function parseLeaseOwner(raw: string): LeaseOwnerV1 | null {
@@ -1415,9 +1706,8 @@ async function assertRuntimeLease(lease: ProviderActivationRuntimeLease): Promis
   try {
     await lease.assertHeld();
   } catch {
-    throw new ProviderActivationError(
+    throw new ProviderActivationRecoveryRequiredError(
       "provider-runtime-guard-lost",
-      "Provider runtime guard was lost before activation completed.",
     );
   }
 }
