@@ -407,12 +407,11 @@ export async function promptForValidKey(
   openRouter: OpenRouterService,
   credentials: CredentialStoreLike,
   out: CommandOutput,
-  fallback?: {
+  _fallback?: {
     key: string;
     origin: Exclude<KeyOrigin, "none">;
   },
 ): Promise<BalanceReport | null> {
-  let nextFallback = fallback;
   while (true) {
     if (openRouter.hasKey) {
       const origin = openRouter.keyOrigin;
@@ -436,40 +435,6 @@ export async function promptForValidKey(
           return null;
         }
         const message = openRouter.safeMessage(error).replace(/[.!?]+$/, "");
-        if (nextFallback && nextFallback.key.trim() !== activeKey.trim()) {
-          const candidate = nextFallback;
-          nextFallback = undefined;
-          try {
-            const activated = await validateAndActivateInferenceKey(
-              candidate.key,
-              { credentials, openRouter },
-              {
-                persist: false,
-                processOrigin: candidate.origin === "environment"
-                  ? "environment"
-                  : "interactive",
-              },
-            );
-            if (activated) {
-              out.text(
-                chalk.yellow(
-                  `${originLabel(origin)} wurde abgelehnt. OPENROUTER_API_KEY ist geprüft und für diesen Prozess aktiv; dauerhaft speichern mit /key save.`,
-                ),
-              );
-              return activated.balance;
-            }
-          } catch (fallbackError) {
-            if (!isAuthenticationRejection(fallbackError)) {
-              out.error(
-                `OPENROUTER_API_KEY konnte nicht geprüft werden: ${openRouter.safeMessage(fallbackError)} Der bisherige Key bleibt unverändert geladen; /reconnect versucht es erneut.`,
-              );
-              return null;
-            }
-            out.error(
-              `Auch OPENROUTER_API_KEY wurde abgelehnt: ${openRouter.safeMessage(fallbackError)}`,
-            );
-          }
-        }
         if (!process.stdin.isTTY) {
           throw new Error(
             `${originLabel(origin)} wurde abgelehnt: ${message}. Setze einen gültigen Key.`,

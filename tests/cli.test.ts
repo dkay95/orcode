@@ -1,13 +1,14 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { readFileSync } from "node:fs";
-import { mkdir, mkdtemp } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 import {
   CliUsageError,
+  commandRequiresRunnableRoute,
   createCliPlainSetupSurface,
   createOpenRouterServiceForStartup,
   homeWorkspaceWarning,
@@ -28,6 +29,104 @@ import { CredentialStore } from "../src/credentials.js";
 import type { CredentialStoreLike } from "../src/credentials.js";
 import type { ModelInfo } from "../src/types.js";
 
+type BootstrapRuntimeDouble = {
+  inspectStartup(): Promise<Record<string, unknown>>;
+  resolveLegacyDefaultRoute(): Promise<Record<string, unknown>>;
+  runSetup(transport: "plain" | "fullscreen"): Promise<Record<string, unknown>>;
+  ensureRunnableRoute(): Record<string, unknown>;
+  openRouter: OpenRouterService;
+  credentials: CredentialStore;
+  preparedRoles?: unknown;
+};
+
+function bootstrapRoute(model = "vendor/main"): Record<string, unknown> {
+  return {
+    version: 1,
+    backendId: "openrouter",
+    accountFingerprint: "acct_bootstrap_fixture",
+    billingRealm: "openrouter-payg",
+    requestedModelId: model,
+    canonicalModelId: model,
+    resolutionState: "resolved",
+  };
+}
+
+function bootstrapStorage() {
+  const config = structuredClone(DEFAULT_CONFIG);
+  return {
+    appHome: "/synthetic/.orcode",
+    configPath: "/synthetic/.orcode/config.json",
+    migrationWarning: null,
+    retentionWarnings: [],
+    config,
+    ruleStore: {} as never,
+    session: {
+      appHome: "/synthetic/.orcode",
+      data: { id: "00000000-0000-4000-8000-000000000001", model: null, reasoning: null },
+      setPreferences: () => undefined,
+    } as never,
+  };
+}
+
+function bootstrapRuntime(options: {
+  mode?: "ready" | "ready-with-warning" | "route-choice-required" | "setup-required";
+  route?: Record<string, unknown> | null;
+  setup?: Record<string, unknown>;
+  events?: string[];
+} = {}): BootstrapRuntimeDouble {
+  const events = options.events ?? [];
+  const route = options.route === undefined ? bootstrapRoute() : options.route;
+  const mode = options.mode ?? "ready";
+  return {
+    openRouter: new OpenRouterService(undefined),
+    credentials: {} as CredentialStore,
+    async inspectStartup() {
+      events.push("provider:inspect");
+      return {
+        mode,
+        generation: 1,
+        defaultRoute: route,
+        readyRoutes: route ? [route] : [],
+        warnings: [],
+        crossEnabled: false,
+      };
+    },
+    async resolveLegacyDefaultRoute() {
+      events.push("provider:legacy");
+      return {
+        mode: "ready",
+        generation: 1,
+        defaultRoute: route,
+        readyRoutes: route ? [route] : [],
+        warnings: [],
+        crossEnabled: false,
+      };
+    },
+    async runSetup(transport) {
+      events.push(`provider:setup:${transport}`);
+      return options.setup ?? { kind: "ready" };
+    },
+    ensureRunnableRoute() {
+      events.push("provider:ensure");
+      if (!route) {
+        const error = new Error("Provider setup is required") as Error & { code: string; exitCode: number };
+        error.code = "provider-setup-required";
+        error.exitCode = 1;
+        throw error;
+      }
+      return route;
+    },
+  };
+}
+
+async function invokeRunCli(argv: readonly string[], deps: Record<string, unknown>): Promise<number> {
+  const candidate = (cliModule as typeof cliModule & {
+    runCli?: (args: readonly string[], dependencies: Record<string, unknown>) => Promise<number>;
+  }).runCli;
+  assert.equal(typeof candidate, "function", "runCli must be exported as the injectable bootstrap boundary");
+  return candidate(argv, deps);
+}
+
 test("homeWorkspaceWarning warnt nur bei Workspace === Home-Verzeichnis", () => {
   const home = "/tmp/orcode-home-test";
   assert.match(homeWorkspaceWarning(home, home) ?? "", /Home-Verzeichnis/);
@@ -46,6 +145,319 @@ test("parseArgs accepts -p and known flags", () => {
   assert.equal(options.prompt, "fix the bug");
   assert.equal(options.model, "gpt-5");
   assert.equal(options.json, false);
+});
+
+test("runCli help and version return before every startup and model side effect", async () => {
+  for (const flag of ["--help", "--version"] as const) {
+    const calls: string[] = [];
+    const stdout: string[] = [];
+    const stderr: string[] = [];
+    const exitCode = await invokeRunCli([flag], {
+      initializeStorage: async () => { calls.push("storage"); return bootstrapStorage(); },
+      createProviderRuntime: async () => { calls.push("provider-runtime"); return bootstrapRuntime(); },
+      createAgent: async () => { calls.push("agent"); return {} as never; },
+      runPlain: async () => { calls.push("plain"); },
+      runDashboard: async () => { calls.push("dashboard"); },
+      stdout: { write: (value: string) => { stdout.push(value); return true; } },
+      stderr: { write: (value: string) => { stderr.push(value); return true; } },
+    });
+
+    assert.equal(exitCode, 0);
+    assert.deepEqual(calls, []);
+    assert.equal(stderr.length, 0);
+    assert.match(stdout.join(""), flag === "--help" ? /Usage|Verwendung|Optionen/i : /orcode 0\.4\.1/);
+  }
+});
+
+test("runCli orders storage, activation recovery, bounded inspection, route proof, agent, and plain UI", async () => {
+  const calls: string[] = [];
+  const runtime = bootstrapRuntime({ events: calls });
+  const exitCode = await invokeRunCli(["--plain"], {
+    initializeStorage: async () => { calls.push("storage"); return bootstrapStorage(); },
+    createProviderRuntime: async () => { calls.push("provider:load+recover"); return runtime; },
+    createAgent: async () => { calls.push("agent:create"); return {} as never; },
+    runPlain: async (input: { providerRuntime: unknown; agent: unknown }) => {
+      calls.push("plain");
+      assert.equal(input.providerRuntime, runtime);
+      assert.ok(input.agent);
+    },
+    runDashboard: async () => { calls.push("dashboard"); },
+    stdout: { write: () => true },
+    stderr: { write: () => true },
+  });
+
+  assert.equal(exitCode, 0);
+  assert.deepEqual(calls, [
+    "storage",
+    "provider:load+recover",
+    "provider:inspect",
+    "provider:ensure",
+    "agent:create",
+    "plain",
+  ]);
+});
+
+test("runCli opens route choice for a healthy secondary and never silently replaces the degraded default", async () => {
+  const calls: string[] = [];
+  const runtime = bootstrapRuntime({
+    mode: "route-choice-required",
+    route: null,
+    setup: { kind: "cancelled", mode: "setup-required" },
+    events: calls,
+  });
+  let plainInput: { agent: unknown; providerRuntime: unknown } | null = null;
+  const exitCode = await invokeRunCli(["--plain"], {
+    initializeStorage: async () => bootstrapStorage(),
+    createProviderRuntime: async () => runtime,
+    createAgent: async () => { calls.push("agent:create"); return {} as never; },
+    runPlain: async (input: { agent: unknown; providerRuntime: unknown }) => {
+      plainInput = input;
+      calls.push("plain");
+    },
+    runDashboard: async () => undefined,
+    stdout: { write: () => true },
+    stderr: { write: () => true },
+  });
+
+  assert.equal(exitCode, 0);
+  const capturedPlain = plainInput as unknown as { agent: unknown; providerRuntime: unknown };
+  assert.equal(capturedPlain.agent, null);
+  assert.equal(capturedPlain.providerRuntime, runtime);
+  assert.deepEqual(calls, ["provider:inspect", "provider:setup:plain", "plain"]);
+});
+
+test("plain setup cancellation keeps commands alive and the next model input reopens setup before agent creation", async () => {
+  const calls: string[] = [];
+  let setupCalls = 0;
+  let ready = false;
+  const route = bootstrapRoute();
+  const runtime = bootstrapRuntime({ mode: "setup-required", route: null, events: calls });
+  runtime.runSetup = async () => {
+    setupCalls += 1;
+    calls.push("provider:setup:plain");
+    if (setupCalls === 1) return { kind: "cancelled", mode: "setup-required" };
+    ready = true;
+    return { kind: "ready" };
+  };
+  runtime.ensureRunnableRoute = () => {
+    calls.push("provider:ensure");
+    if (!ready) throw Object.assign(new Error("setup"), { code: "provider-setup-required", exitCode: 1 });
+    return route;
+  };
+
+  const exitCode = await invokeRunCli(["--plain"], {
+    initializeStorage: async () => bootstrapStorage(),
+    createProviderRuntime: async () => runtime,
+    createAgent: async () => { calls.push("agent:create"); return {} as never; },
+    runPlain: async (input: { agent: unknown; ensureAgentForPrompt(): Promise<unknown> }) => {
+      calls.push("command:/help");
+      assert.equal(input.agent, null);
+      assert.ok(await input.ensureAgentForPrompt());
+      calls.push("prompt:queued");
+    },
+    runDashboard: async () => undefined,
+    stdout: { write: () => true },
+    stderr: { write: () => true },
+  });
+
+  assert.equal(exitCode, 0);
+  assert.deepEqual(calls, [
+    "provider:inspect",
+    "provider:setup:plain",
+    "command:/help",
+    "provider:ensure",
+    "provider:setup:plain",
+    "provider:ensure",
+    "agent:create",
+    "prompt:queued",
+  ]);
+});
+
+test("model-dependent slash commands recheck the route while local command variants stay available", () => {
+  assert.equal(commandRequiresRunnableRoute("model", []), true);
+  assert.equal(commandRequiresRunnableRoute("models", ["coder"]), true);
+  assert.equal(commandRequiresRunnableRoute("think", ["high"]), true);
+  assert.equal(commandRequiresRunnableRoute("compress", ["model", "vendor/small"]), true);
+  assert.equal(commandRequiresRunnableRoute("fallback", ["+vendor/backup"]), true);
+  assert.equal(commandRequiresRunnableRoute("panel", ["compare", "these"]), true);
+  assert.equal(commandRequiresRunnableRoute("panel", ["models", "vendor/a,vendor/b"]), true);
+  assert.equal(commandRequiresRunnableRoute("whisper", [], "dashboard"), true);
+
+  assert.equal(commandRequiresRunnableRoute("help", []), false);
+  assert.equal(commandRequiresRunnableRoute("status", []), false);
+  assert.equal(commandRequiresRunnableRoute("compress", ["threshold", "8000"]), false);
+  assert.equal(commandRequiresRunnableRoute("fallback", ["clear"]), false);
+  assert.equal(commandRequiresRunnableRoute("panel", []), false);
+  assert.equal(commandRequiresRunnableRoute("panel", ["show", "1"]), false);
+  assert.equal(commandRequiresRunnableRoute("panel", ["judge", "off"]), false);
+  assert.equal(commandRequiresRunnableRoute("whisper", [], "plain"), false);
+});
+
+test("fullscreen Escape from setup enters the dashboard in setup-required without agent or run artifacts", async () => {
+  const calls: string[] = [];
+  const runtime = bootstrapRuntime({
+    mode: "setup-required",
+    route: null,
+    setup: { kind: "cancelled", mode: "setup-required" },
+    events: calls,
+  });
+  const stdinDescriptor = Object.getOwnPropertyDescriptor(process.stdin, "isTTY");
+  const stdoutDescriptor = Object.getOwnPropertyDescriptor(process.stdout, "isTTY");
+  Object.defineProperty(process.stdin, "isTTY", { configurable: true, value: true });
+  Object.defineProperty(process.stdout, "isTTY", { configurable: true, value: true });
+  try {
+    const exitCode = await invokeRunCli([], {
+      initializeStorage: async () => bootstrapStorage(),
+      createProviderRuntime: async () => runtime,
+      createAgent: async () => { calls.push("agent:create"); return {} as never; },
+      runPlain: async () => { calls.push("plain"); },
+      runDashboard: async (input: { providerRuntime: BootstrapRuntimeDouble; agent: unknown }) => {
+        await input.providerRuntime.runSetup("fullscreen");
+        calls.push("dashboard");
+        assert.equal(input.providerRuntime, runtime);
+        assert.equal(input.agent, null);
+      },
+      stdout: { write: () => true },
+      stderr: { write: () => true },
+    });
+    assert.equal(exitCode, 0);
+  } finally {
+    if (stdinDescriptor) Object.defineProperty(process.stdin, "isTTY", stdinDescriptor);
+    if (stdoutDescriptor) Object.defineProperty(process.stdout, "isTTY", stdoutDescriptor);
+  }
+  assert.deepEqual(calls, ["provider:inspect", "provider:setup:fullscreen", "dashboard"]);
+});
+
+test("-p stays noninteractive on a TTY and renders one safe typed provider failure", async () => {
+  const stderr: string[] = [];
+  const calls: string[] = [];
+  const runtime = bootstrapRuntime({ mode: "setup-required", route: null, events: calls });
+  const original = Object.getOwnPropertyDescriptor(process.stdin, "isTTY");
+  Object.defineProperty(process.stdin, "isTTY", { configurable: true, value: true });
+  try {
+    const exitCode = await invokeRunCli(["-p", "hello"], {
+      initializeStorage: async () => bootstrapStorage(),
+      createProviderRuntime: async () => runtime,
+      createAgent: async () => { throw new Error("agent must stay gated"); },
+      runPlain: async () => { throw new Error("prompt must not be called"); },
+      runDashboard: async () => { throw new Error("dashboard must not be called"); },
+      stdout: { write: () => true },
+      stderr: { write: (value: string) => { stderr.push(value); return true; } },
+    });
+    assert.equal(exitCode, 1);
+  } finally {
+    if (original) Object.defineProperty(process.stdin, "isTTY", original);
+  }
+  assert.equal(stderr.length, 1);
+  assert.deepEqual(calls, ["provider:inspect", "provider:ensure"]);
+  assert.match(stderr[0] ?? "", /provider-setup-required.*\/provider setup/i);
+  assert.doesNotMatch(stderr[0] ?? "", /sk-|credential|account|\/Users\//i);
+});
+
+test("--json emits exactly one safe provider-setup-required record and no prompt", async () => {
+  const stdout: string[] = [];
+  const stderr: string[] = [];
+  const calls: string[] = [];
+  const runtime = bootstrapRuntime({ mode: "setup-required", route: null, events: calls });
+  const exitCode = await invokeRunCli(["--json", "-p", "hello"], {
+    initializeStorage: async () => bootstrapStorage(),
+    createProviderRuntime: async () => runtime,
+    createAgent: async () => { throw new Error("agent must stay gated"); },
+    runPlain: async () => { throw new Error("prompt must not be called"); },
+    runDashboard: async () => { throw new Error("dashboard must not be called"); },
+    stdout: { write: (value: string) => { stdout.push(value); return true; } },
+    stderr: { write: (value: string) => { stderr.push(value); return true; } },
+  });
+
+  assert.equal(exitCode, 1);
+  assert.equal(stdout.length, 1);
+  assert.equal(stderr.length, 0);
+  assert.deepEqual(calls, ["provider:inspect", "provider:ensure"]);
+  assert.deepEqual(JSON.parse(stdout[0] ?? "{}"), {
+    type: "error",
+    code: "provider-setup-required",
+    headline: "setup-required",
+    retryable: true,
+    hint: "/provider setup",
+  });
+});
+
+test("a valid no-saved-key process-only route reaches a noninteractive run without prompting or persistence", async () => {
+  const calls: string[] = [];
+  const runtime = bootstrapRuntime({ events: calls });
+  const storage = bootstrapStorage();
+  const key = `${STARTUP_KEY_PREFIX}${"e".repeat(48)}`;
+  const agent = {
+    async run(prompt: string) {
+      calls.push(`agent:run:${prompt}`);
+      return {
+        text: "ok",
+        suggestions: [],
+        outcome: "completed",
+        costUsd: 0,
+        mainCostUsd: 0,
+        compressorCostUsd: 0,
+        compression: { compressed: false, reason: "disabled", inputCharacters: 0, outputCharacters: 0, costUsd: 0 },
+        selectedModel: "vendor/main",
+        resolvedModel: "vendor/main",
+        notices: [],
+        partial: false,
+        modelSteps: 1,
+      };
+    },
+  };
+  const exitCode = await invokeRunCli(["-p", "hello"], {
+    initializeStorage: async () => storage,
+    createProviderRuntime: async (input: { environment: Record<string, string | undefined> }) => {
+      calls.push(`runtime:env:${input.environment.OPENROUTER_API_KEY === key}`);
+      return runtime;
+    },
+    createAgent: async () => { calls.push("agent:create"); return agent; },
+    runPlain: async () => { throw new Error("interactive prompt must not run"); },
+    runDashboard: async () => { throw new Error("dashboard must not run"); },
+    stdout: { write: () => true },
+    stderr: { write: () => true },
+    environment: { OPENROUTER_API_KEY: key },
+  });
+
+  assert.equal(exitCode, 0);
+  assert.deepEqual(calls, [
+    "runtime:env:true",
+    "provider:inspect",
+    "provider:ensure",
+    "provider:ensure",
+    "agent:create",
+    "provider:ensure",
+    "agent:run:hello",
+  ]);
+});
+
+test("automatic environment setup selects only one exact compatible configured route and never prompts", async () => {
+  const createSurface = (cliModule as typeof cliModule & {
+    createAutomaticEnvironmentSetupSurface?: (model: string) => {
+      chooseHub(entries: Array<{ id: string }>): Promise<string | null>;
+      chooseModel(request: { models: Array<Record<string, unknown>> }): Promise<string | null>;
+      readSecret(request: { backendId: "openrouter"; message: string }): Promise<string | null>;
+      confirm(request: { id: string; message: string; defaultValue: boolean }): Promise<boolean>;
+    };
+  }).createAutomaticEnvironmentSetupSurface;
+  assert.equal(typeof createSurface, "function");
+  const surface = createSurface("vendor/exact");
+  const compatible = {
+    backendId: "openrouter" as const,
+    requestedModelId: "vendor/exact",
+    canonicalModelId: "vendor/exact-canonical",
+    displayName: "Exact",
+    capabilities: { textInput: true, textOutput: true, tools: true, reasoning: true },
+  };
+  const aliasOnly = { ...compatible, requestedModelId: "vendor/alias", canonicalModelId: "vendor/exact" };
+
+  assert.equal(await surface.chooseModel({ backendId: "openrouter", models: [compatible, aliasOnly] }), "vendor/exact-canonical");
+  assert.equal(await surface.chooseModel({ backendId: "openrouter", models: [aliasOnly] }), null);
+  const hubEntry = (id: string) => ({ id, label: id, description: id, disabled: false, current: false, generation: 1 });
+  assert.equal(await surface.chooseHub([hubEntry("cross-prepare"), hubEntry("cross-later")]), "cross-later");
+  assert.equal(await surface.readSecret({ backendId: "openrouter", message: "forbidden" }), null);
+  assert.equal(await surface.confirm({ id: "forbidden", message: "forbidden", defaultValue: true }), false);
 });
 
 test("banner, help, and version derive from the same package metadata", () => {
@@ -278,6 +690,65 @@ test("stored credential read errors remain present-invalid and block valid envir
   }), /gespeichert|Schlüsselbund|ungültig/i);
 });
 
+test("provider runtime keeps an unreadable saved credential authoritative without constructing a secret or env route", () => {
+  const select = (cliModule as typeof cliModule & {
+    providerServiceStartupCredential?: (
+      stored: { kind: "absent" } | { kind: "present"; value: string } | { kind: "invalid" },
+      environment: string | null,
+    ) => { stored: { kind: "absent" } | { kind: "present"; value: string }; environment: string | null };
+  }).providerServiceStartupCredential;
+  assert.equal(typeof select, "function");
+  assert.deepEqual(select({ kind: "invalid" }, `${STARTUP_KEY_PREFIX}${"e".repeat(48)}`), {
+    stored: { kind: "absent" },
+    environment: null,
+  });
+  assert.deepEqual(select({ kind: "present", value: `bad\0${"x".repeat(30)}` }, `${STARTUP_KEY_PREFIX}${"e".repeat(48)}`), {
+    stored: { kind: "absent" },
+    environment: null,
+  });
+});
+
+test("startup durable provider commits preserve every unrelated config byte under exact revision CAS", async () => {
+  const persist = (cliModule as typeof cliModule & {
+    persistProviderSetupState?: (
+      path: string,
+      request: {
+        expectedRevision: number;
+        assertCurrent(): void;
+        build(current: typeof DEFAULT_CONFIG.providerSetup): typeof DEFAULT_CONFIG.providerSetup;
+        adopt(committed: typeof DEFAULT_CONFIG.providerSetup): void;
+      },
+    ) => Promise<typeof DEFAULT_CONFIG.providerSetup>;
+  }).persistProviderSetupState;
+  assert.equal(typeof persist, "function");
+
+  const directory = await mkdtemp(join(tmpdir(), "orcode-provider-state-cas-"));
+  const path = join(directory, "config.json");
+  const before = structuredClone(DEFAULT_CONFIG.providerSetup);
+  const after = { ...before, revision: 1, lifecycle: "cancelled" as const };
+  const beforeBytes = JSON.stringify(before);
+  const raw = `{"schemaVersion":3,"unknown":{"spacing":"  exact  "},"providerSetup":${beforeBytes},"tail":[1, 2, 3]}\n`;
+  await writeFile(path, raw, { encoding: "utf8", mode: 0o600 });
+  let adopted: typeof DEFAULT_CONFIG.providerSetup | null = null;
+
+  const committed = await persist!(path, {
+    expectedRevision: 0,
+    assertCurrent() {},
+    build(current) {
+      assert.deepEqual(current, before);
+      return after;
+    },
+    adopt(value) {
+      adopted = value;
+    },
+  });
+
+  const expectedRaw = raw.replace(beforeBytes, JSON.stringify(after));
+  assert.equal(await readFile(path, "utf8"), expectedRaw);
+  assert.deepEqual(committed, after);
+  assert.deepEqual(adopted, after);
+});
+
 test("startup accepts outer Unicode whitespace for all saved and environment credentials", () => {
   const inference = `${STARTUP_KEY_PREFIX}${"i".repeat(48)}`;
   const management = `${STARTUP_KEY_PREFIX}${"m".repeat(48)}`;
@@ -498,9 +969,10 @@ test("dashboard setup rejects invalid local bytes with zero network and keychain
   assert.match(messages.join("\n"), /ungültig|Steuer|Leerzeichen/i);
 });
 
-test("a rejected saved key stays persisted until a valid environment fallback is activated", async () => {
+test("a rejected saved key remains exclusive and never automatically validates the environment fallback", async () => {
   const stored = `${STARTUP_KEY_PREFIX}dashboard-rejected-stored-123`;
   const environment = `${STARTUP_KEY_PREFIX}dashboard-valid-environment-456`;
+  const authorizations: string[] = [];
   const openRouter = new OpenRouterService(
     stored,
     undefined,
@@ -508,6 +980,7 @@ test("a rejected saved key stays persisted until a valid environment fallback is
     {
       fetchImpl: async (_url, init) => {
         const authorization = (init.headers as Record<string, string>).Authorization;
+        authorizations.push(authorization);
         return authorization === `Bearer ${stored}`
           ? startupKeyResponse(401)
           : startupKeyResponse();
@@ -531,11 +1004,12 @@ test("a rejected saved key stays persisted until a valid environment fallback is
     environment,
   );
 
-  assert.equal(balance?.key.limitRemaining, 99);
-  assert.equal(openRouter.requireKey(), environment);
-  assert.equal(openRouter.keyOrigin, "environment");
+  assert.equal(balance, null);
+  assert.equal(openRouter.requireKey(), stored);
+  assert.equal(openRouter.keyOrigin, "keychain");
   assert.equal(persisted, stored);
   assert.deepEqual(calls, []);
+  assert.deepEqual(authorizations, [`Bearer ${stored}`]);
 });
 
 test("fullscreen key commands use the shared command lifecycle callbacks", () => {

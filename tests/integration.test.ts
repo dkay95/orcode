@@ -195,6 +195,22 @@ test("/status reports the limits it can actually enforce", async () => {
   assert.match(output, /Kompressorlimit/);
 });
 
+test("model-independent slash commands remain available with one setup-required provider runtime and no agent", async () => {
+  const { context } = await harness();
+  const { out, lines } = collectOutput();
+  const providerRuntime = { status: "setup-required" };
+  const setupRequiredContext = {
+    ...context,
+    agent: null,
+    providerRuntime,
+    out,
+  } as unknown as CommandContext & { providerRuntime: unknown };
+
+  assert.equal(await handleSlashCommand("/help", setupRequiredContext), "continue");
+  assert.equal(setupRequiredContext.providerRuntime, providerRuntime);
+  assert.match(lines.join("\n"), /orcode Befehle|\/help/i);
+});
+
 test("/checkpoint marks a point and rewinds to it", async () => {
   const { context } = await harness({ approve: true });
   await handleSlashCommand("/checkpoint new Basis", context);

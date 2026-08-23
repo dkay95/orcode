@@ -160,6 +160,35 @@ test("an unresolvable argv[1] does not throw", () => {
   assert.doesNotThrow(() => isEntrypoint(MODULE_URL, "/nope", resolve));
 });
 
+test("the real --help entrypoint exits before app-home, key, provider, or model startup", async () => {
+  const isolatedHome = await mkdtemp(join(tmpdir(), "orcode-help-bootstrap-"));
+  try {
+    const cliPath = join(PROJECT_ROOT, "src", "cli.ts");
+    const { stdout, stderr } = await execFileAsync(
+      process.execPath,
+      ["--import", "tsx", cliPath, "--help"],
+      {
+        cwd: PROJECT_ROOT,
+        env: {
+          ...process.env,
+          HOME: isolatedHome,
+          USERPROFILE: isolatedHome,
+          OPENROUTER_API_KEY: "synthetic-help-must-not-be-read",
+        },
+      },
+    );
+    assert.match(stdout, /Usage|Verwendung|Optionen/i);
+    assert.equal(stderr, "");
+    await assert.rejects(
+      readFile(join(isolatedHome, ".orcode", "config.json")),
+      (error: unknown) =>
+        typeof error === "object" && error !== null && "code" in error && error.code === "ENOENT",
+    );
+  } finally {
+    await rm(isolatedHome, { recursive: true, force: true });
+  }
+});
+
 test("release metadata packages both CLI names at version 0.4.1", async () => {
   const packageJson = JSON.parse(
     await readFile(join(PROJECT_ROOT, "package.json"), "utf8"),

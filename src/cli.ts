@@ -3,6 +3,7 @@
 import { input, confirm, password, select } from "@inquirer/prompts";
 import chalk from "chalk";
 import { execFile } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { readFileSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
@@ -31,8 +32,6 @@ import { createSshSession, type SshSession } from "./ssh.js";
 import {
   createPlainCommandOutput,
   handleSlashCommand,
-  printBalance,
-  promptForValidKey,
   compressorModelCandidates,
   mainModelCandidates,
   ModelCapabilityError,
@@ -40,7 +39,6 @@ import {
   rankModels,
   resolveCompressorModelCandidate,
   resolveMainModelCandidate,
-  isAuthenticationRejection,
   shouldReplaceCredential,
   validateAndActivateInferenceKey,
   type CommandContext,
@@ -48,19 +46,24 @@ import {
 } from "./commands.js";
 import {
   APP_HOME,
+  assertConfigFileSnapshot,
   consumeConfigWarning,
   configPath,
   isApprovalMode,
   isCompressionMode,
   loadConfig,
   migrateAppHome,
+  readConfigFileSnapshot,
   saveConfig,
+  withConfigWriteLock,
+  writeFileAtomicSecure,
   type OrcodeConfigWithBudget,
 } from "./config.js";
 import {
   CredentialStore,
   normalizeProviderSecret,
   type CredentialKind,
+  type CredentialSlotRef,
   type CredentialStoreLike,
 } from "./credentials.js";
 import { OpenRouterService } from "./openrouter.js";
@@ -121,10 +124,43 @@ import {
   getGitStatus,
   pruneCheckpoints,
 } from "./workspace.js";
-import { errorMessage, formatUsd } from "./utils.js";
+import { errorMessage, formatUsd, isRecord } from "./utils.js";
 import { RunLog } from "./runlog.js";
 import { collectRetentionErrors } from "./storage.js";
-import { createPlainSetupSurface } from "./setup-ui.js";
+import {
+  createPlainSetupSurface,
+  createTuiSetupSurface,
+  runSetupHub,
+  type SetupHubResult,
+  type SetupPreparedRoles,
+  type SetupSurface,
+} from "./setup-ui.js";
+import {
+  BackendRegistry,
+  ProviderSetupRequiredError,
+  sameRoute,
+  type RouteIdentityV1,
+} from "./backends.js";
+import {
+  ANTHROPIC_COMING_SOON_DESCRIPTOR,
+  OPENROUTER_DESCRIPTOR,
+  OpenRouterBackendAdapter,
+} from "./openrouter-backend.js";
+import {
+  ProviderActivationCoordinator,
+  type ProviderActivationRuntimeGuard,
+  type ProviderActivationRuntimeLease,
+} from "./provider-activation.js";
+import {
+  ProviderStateStore,
+  requirePersistableProviderState,
+  validateProviderSetupState,
+  validateRouteIdentityV1,
+  type ProviderSetupStateV1,
+  type ProviderStateCommitRequest,
+} from "./provider-state.js";
+import { SetupOrchestrator, type StartupSetupResult } from "./setup.js";
+import { PrivateStore } from "./private-store.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -369,36 +405,613 @@ export function createCredentialStoreForStartup(
   );
 }
 
-async function main(): Promise<void> {
-  const options = parseArgs(process.argv.slice(2));
-  if (options.version) {
-    process.stdout.write(`orcode ${readPackageVersion()}\n`);
+export interface ProviderRuntimeInput {
+  startup: StartupStorageResult;
+  environment: Readonly<Record<string, string | undefined>>;
+  requestedModel?: string;
+}
+
+export interface ProviderRuntime {
+  readonly openRouter: OpenRouterService;
+  readonly credentials: CredentialStore;
+  readonly preparedRoles: SetupPreparedRoles | null;
+  inspectStartup(): Promise<StartupSetupResult>;
+  resolveLegacyDefaultRoute(): Promise<StartupSetupResult>;
+  runSetup(surface: SetupSurface | "plain" | "fullscreen"): Promise<SetupHubResult>;
+  ensureRunnableRoute(): RouteIdentityV1;
+  runWithReadyRoute<T>(run: (route: RouteIdentityV1) => Promise<T>): Promise<T>;
+}
+
+class SessionProviderRuntimeGuard implements ProviderActivationRuntimeGuard {
+  #activationHeld = false;
+  #activeRuns = 0;
+
+  async acquire(signal: AbortSignal): Promise<ProviderActivationRuntimeLease> {
+    if (signal.aborted) throw signal.reason;
+    if (this.#activationHeld || this.#activeRuns > 0) {
+      throw new Error("Provider runtime is not idle.");
+    }
+    this.#activationHeld = true;
+    let held = true;
+    return {
+      assertHeld: () => {
+        if (!held || !this.#activationHeld || this.#activeRuns > 0) {
+          throw new Error("Provider runtime lease was lost.");
+        }
+      },
+      release: () => {
+        if (!held) return;
+        held = false;
+        this.#activationHeld = false;
+      },
+    };
+  }
+
+  beginRun(): () => void {
+    if (this.#activationHeld) throw new ProviderSetupRequiredError();
+    this.#activeRuns += 1;
+    let active = true;
+    return () => {
+      if (!active) return;
+      active = false;
+      this.#activeRuns -= 1;
+    };
+  }
+}
+
+class DefaultProviderRuntime implements ProviderRuntime {
+  #preparedRoles: SetupPreparedRoles | null = null;
+  #sessionRoute: RouteIdentityV1 | null = null;
+  #sessionRoutePersisted = false;
+
+  constructor(
+    readonly openRouter: OpenRouterService,
+    readonly credentials: CredentialStore,
+    private readonly registry: BackendRegistry,
+    private readonly stateStore: ProviderStateStore,
+    private readonly orchestrator: SetupOrchestrator,
+    private readonly runtimeGuard: SessionProviderRuntimeGuard,
+    private readonly savedSecret: string | null,
+    private readonly environmentSecret: string | null,
+    private readonly requestedModel: string,
+  ) {}
+
+  get preparedRoles(): SetupPreparedRoles | null {
+    return this.#preparedRoles ? structuredClone(this.#preparedRoles) : null;
+  }
+
+  async inspectStartup(): Promise<StartupSetupResult> {
+    const result = await this.orchestrator.inspectStartup();
+    if (
+      (result.mode === "setup-required" || result.mode === "route-choice-required")
+      && this.savedSecret === null
+      && this.environmentSecret
+    ) {
+      const automatic = await this.runSetup(
+        createAutomaticEnvironmentSetupSurface(this.requestedModel),
+      );
+      if (automatic.kind === "ready") {
+        const route = this.ensureRunnableRoute();
+        return {
+          mode: "ready",
+          generation: result.generation,
+          defaultRoute: route,
+          readyRoutes: [route],
+          warnings: [],
+          crossEnabled: false,
+        };
+      }
+    }
+    return result;
+  }
+
+  async resolveLegacyDefaultRoute(): Promise<StartupSetupResult> {
+    return this.orchestrator.resolveLegacyDefaultRoute();
+  }
+
+  async runSetup(surface: SetupSurface | "plain" | "fullscreen"): Promise<SetupHubResult> {
+    if (surface === "fullscreen") {
+      throw new ProviderSetupRequiredError();
+    }
+    const resolvedSurface = surface === "plain"
+      ? createCliPlainSetupSurface()
+      : surface;
+    let activatedRoute: RouteIdentityV1 | null = null;
+    let activatedPersisted = false;
+    const setupOrchestrator = {
+      activateCandidate: async (
+        request: Parameters<SetupOrchestrator["activateCandidate"]>[0],
+      ) => {
+        const result = await this.orchestrator.activateCandidate(request);
+        const route = validateRouteIdentityV1(result.route);
+        if (route?.resolutionState === "resolved" && route.canonicalModelId) {
+          activatedRoute = route;
+          activatedPersisted = result.persisted;
+        }
+        return result;
+      },
+    } as SetupOrchestrator;
+    const result = await runSetupHub({
+      surface: resolvedSurface,
+      orchestrator: setupOrchestrator,
+      registry: this.registry,
+      stateStore: this.stateStore,
+      savedSecret: this.savedSecret,
+      environmentSecret: this.environmentSecret,
+    });
+    if (result.kind === "ready") {
+      this.#preparedRoles = result.preparedRoles
+        ? structuredClone(result.preparedRoles)
+        : null;
+      this.#sessionRoute = activatedRoute
+        ?? result.preparedRoles?.lead
+        ?? this.#sessionRoute;
+      if (activatedRoute) this.#sessionRoutePersisted = activatedPersisted;
+    }
+    return result;
+  }
+
+  ensureRunnableRoute(): RouteIdentityV1 {
+    if (this.#sessionRoute) {
+      if (!this.#sessionRoutePersisted) {
+        return structuredClone(this.#sessionRoute);
+      }
+      const state = this.stateStore.read();
+      const current = state.defaultRoute;
+      const enabled = state.connections.some((connection) =>
+        connection.enabled
+        && connection.backendId === this.#sessionRoute!.backendId
+        && connection.accountFingerprint === this.#sessionRoute!.accountFingerprint
+        && connection.billingRealm === this.#sessionRoute!.billingRealm
+      );
+      if (
+        current
+        && enabled
+        && sameRoute(current, this.#sessionRoute)
+        && current.requestedModelId === this.#sessionRoute.requestedModelId
+        && current.resolutionState === "resolved"
+      ) {
+        return structuredClone(this.#sessionRoute);
+      }
+      this.#sessionRoute = null;
+      this.#sessionRoutePersisted = false;
+    }
+    return this.orchestrator.ensureRunnableRoute();
+  }
+
+  async runWithReadyRoute<T>(run: (route: RouteIdentityV1) => Promise<T>): Promise<T> {
+    const route = this.ensureRunnableRoute();
+    const release = this.runtimeGuard.beginRun();
+    try {
+      return await run(route);
+    } finally {
+      release();
+    }
+  }
+}
+
+function credentialSlotFromState(
+  state: ReturnType<ProviderStateStore["read"]>,
+): "legacy:inference" | CredentialSlotRef {
+  const raw = state.connections.find((connection) =>
+    connection.backendId === "openrouter" && connection.enabled
+  )?.credentialSlot;
+  if (!raw || raw === "legacy:inference") return "legacy:inference";
+  const match = /^v1:(inference):([0-9a-f-]{36})$/.exec(raw);
+  return match
+    ? { version: 1, kind: "inference", id: raw }
+    : "legacy:inference";
+}
+
+async function loadCredentialReferenceForStartup(
+  credentials: CredentialStore,
+  reference: "legacy:inference" | CredentialSlotRef,
+): Promise<StoredCredentialStartupState> {
+  try {
+    const value = reference === "legacy:inference"
+      ? await credentials.get("inference")
+      : await credentials.readSlot(reference);
+    return value === null
+      ? { kind: "absent" }
+      : { kind: "present", value };
+  } catch {
+    return { kind: "invalid" };
+  }
+}
+
+export function providerServiceStartupCredential(
+  stored: StoredCredentialStartupState,
+  environment: string | null,
+): {
+  stored: { kind: "absent" } | { kind: "present"; value: string };
+  environment: string | null;
+} {
+  if (stored.kind === "absent") {
+    return { stored, environment };
+  }
+  if (stored.kind === "present") {
+    try {
+      return {
+        stored: { kind: "present", value: normalizeProviderSecret(stored.value) },
+        environment: null,
+      };
+    } catch {
+      // The unreadable/malformed saved value still shadows the environment;
+      // the adapter reports setup-required without placing those bytes in the
+      // model-facing service.
+    }
+  }
+  return { stored: { kind: "absent" }, environment: null };
+}
+
+export function createAutomaticEnvironmentSetupSurface(
+  requestedModel: string,
+): SetupSurface {
+  return {
+    async chooseHub(entries) {
+      return entries.some((entry) => entry.id === "cross-later")
+        ? "cross-later"
+        : null;
+    },
+    async readSecret() {
+      return null;
+    },
+    async chooseModel(request) {
+      const exact = request.models.filter((model) =>
+        model.backendId === "openrouter"
+        && model.requestedModelId === requestedModel
+        && model.capabilities.textInput
+        && model.capabilities.textOutput
+        && model.capabilities.tools
+      );
+      return exact.length === 1 ? exact[0]!.canonicalModelId : null;
+    },
+    async confirm() {
+      return false;
+    },
+    present() {},
+  };
+}
+
+/**
+ * Commits only the raw top-level `providerSetup` value while holding the
+ * canonical config writer. Setup inspection and legacy resolution therefore
+ * share Task 5's exact-CAS boundary without rewriting unrelated config bytes.
+ */
+export async function persistProviderSetupState(
+  path: string,
+  request: ProviderStateCommitRequest,
+): Promise<ProviderSetupStateV1> {
+  try {
+    return await persistProviderSetupStateOwned(path, request);
+  } catch {
+    throw new Error("Provider state publication failed.");
+  }
+}
+
+async function persistProviderSetupStateOwned(
+  path: string,
+  request: ProviderStateCommitRequest,
+): Promise<ProviderSetupStateV1> {
+  return withConfigWriteLock(path, async (ownership) => {
+    await ownership.assertHeld();
+    const target = await readConfigFileSnapshot(ownership.canonicalPath);
+    await ownership.assertHeld();
+    if (target.kind !== "file") {
+      throw new Error("Provider state publication requires an initialized config.");
+    }
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(target.raw);
+    } catch {
+      throw new Error("Provider state publication requires a valid config.");
+    }
+    if (!isRecord(parsed) || !("providerSetup" in parsed)) {
+      throw new Error("Provider state publication requires a valid config.");
+    }
+    const current = requirePersistableProviderState(
+      validateProviderSetupState(parsed.providerSetup),
+    );
+    if (current.revision !== request.expectedRevision) {
+      throw new Error("Provider state publication revision is stale.");
+    }
+    const span = findStartupTopLevelJsonValue(target.raw, "providerSetup");
+    if (!span) {
+      throw new Error("Provider state publication requires an exact config field.");
+    }
+
+    request.assertCurrent();
+    const built = request.build(current);
+    const candidate = requirePersistableProviderState(
+      validateProviderSetupState(built),
+    );
+    if (
+      candidate.revision !== request.expectedRevision + 1
+      || JSON.stringify(candidate) !== JSON.stringify(built)
+    ) {
+      throw new Error("Provider state publication candidate is invalid.");
+    }
+    const nextRaw = `${target.raw.slice(0, span.start)}${JSON.stringify(candidate)}${target.raw.slice(span.end)}`;
+    request.assertCurrent();
+    await ownership.assertHeld();
+    let writeError: unknown;
+    try {
+      await writeFileAtomicSecure(
+        ownership.canonicalPath,
+        nextRaw,
+        async () => {
+          request.assertCurrent();
+          await ownership.assertHeld();
+          await assertConfigFileSnapshot(ownership.canonicalPath, target);
+          await ownership.assertHeld();
+        },
+      );
+    } catch (error) {
+      writeError = error;
+    }
+    await ownership.assertHeld();
+    const readback = await readConfigFileSnapshot(ownership.canonicalPath);
+    await ownership.assertHeld();
+    if (readback.kind !== "file" || readback.raw !== nextRaw) {
+      if (writeError !== undefined) throw writeError;
+      throw new Error("Provider state publication could not be verified.");
+    }
+    request.assertCurrent();
+    request.adopt(candidate);
+    return structuredClone(candidate);
+  });
+}
+
+function findStartupTopLevelJsonValue(
+  raw: string,
+  wantedKey: string,
+): { start: number; end: number } | null {
+  let index = skipStartupJsonWhitespace(raw, 0);
+  if (raw[index] !== "{") return null;
+  index = skipStartupJsonWhitespace(raw, index + 1);
+  let found: { start: number; end: number } | null = null;
+  while (index < raw.length && raw[index] !== "}") {
+    const keyEnd = scanStartupJsonString(raw, index);
+    if (keyEnd === null) return null;
+    let key: unknown;
+    try {
+      key = JSON.parse(raw.slice(index, keyEnd));
+    } catch {
+      return null;
+    }
+    index = skipStartupJsonWhitespace(raw, keyEnd);
+    if (raw[index] !== ":") return null;
+    const start = skipStartupJsonWhitespace(raw, index + 1);
+    const end = scanStartupJsonValue(raw, start);
+    if (end === null) return null;
+    if (key === wantedKey) {
+      if (found) return null;
+      found = { start, end };
+    }
+    index = skipStartupJsonWhitespace(raw, end);
+    if (raw[index] === ",") {
+      index = skipStartupJsonWhitespace(raw, index + 1);
+    } else if (raw[index] !== "}") {
+      return null;
+    }
+  }
+  return found;
+}
+
+function skipStartupJsonWhitespace(raw: string, start: number): number {
+  let index = start;
+  while (index < raw.length && /\s/.test(raw[index]!)) index += 1;
+  return index;
+}
+
+function scanStartupJsonString(raw: string, start: number): number | null {
+  if (raw[start] !== '"') return null;
+  for (let index = start + 1; index < raw.length; index += 1) {
+    if (raw[index] === "\\") index += 1;
+    else if (raw[index] === '"') return index + 1;
+  }
+  return null;
+}
+
+function scanStartupJsonValue(raw: string, start: number): number | null {
+  if (raw[start] === '"') return scanStartupJsonString(raw, start);
+  if (raw[start] === "{" || raw[start] === "[") {
+    const stack = [raw[start] === "{" ? "}" : "]"];
+    for (let index = start + 1; index < raw.length; index += 1) {
+      if (raw[index] === '"') {
+        const end = scanStartupJsonString(raw, index);
+        if (end === null) return null;
+        index = end - 1;
+      } else if (raw[index] === "{") stack.push("}");
+      else if (raw[index] === "[") stack.push("]");
+      else if (raw[index] === stack.at(-1)) {
+        stack.pop();
+        if (stack.length === 0) return index + 1;
+      }
+    }
+    return null;
+  }
+  let index = start;
+  while (index < raw.length && !/[\s,}\]]/.test(raw[index]!)) index += 1;
+  return index > start ? index : null;
+}
+
+export async function createDefaultProviderRuntime(
+  input: ProviderRuntimeInput,
+): Promise<ProviderRuntime> {
+  const { startup, environment } = input;
+  const credentials = createCredentialStoreForStartup(startup.appHome);
+  const stateStore = new ProviderStateStore(startup.config.providerSetup, {
+    persist: (request) => persistProviderSetupState(startup.configPath, request),
+  });
+  const inferenceReference = credentialSlotFromState(stateStore.read());
+  const storedInference = await loadCredentialReferenceForStartup(
+    credentials,
+    inferenceReference,
+  );
+  const storedManagement = await loadStoredCredentialForStartup(
+    credentials,
+    "management",
+  );
+  const inferenceServiceCredential = providerServiceStartupCredential(
+    storedInference,
+    environment.OPENROUTER_API_KEY ?? null,
+  );
+  const managementServiceCredential = providerServiceStartupCredential(
+    storedManagement,
+    environment.OPENROUTER_MANAGEMENT_KEY ?? null,
+  );
+  const openRouter = createOpenRouterServiceForStartup({
+    storedInferenceKey: inferenceServiceCredential.stored,
+    environmentInferenceKey: inferenceServiceCredential.environment,
+    storedManagementKey: managementServiceCredential.stored,
+    environmentManagementKey: managementServiceCredential.environment,
+  });
+  const connectionId = stateStore.read().connections.find((connection) =>
+    connection.backendId === "openrouter" && connection.enabled
+  )?.id ?? randomUUID();
+  const adapter = new OpenRouterBackendAdapter({
+    service: openRouter,
+    credentials,
+    connectionId,
+    inferenceCredential: inferenceReference,
+    environment,
+  });
+  const registry = new BackendRegistry([
+    { descriptor: OPENROUTER_DESCRIPTOR, adapter },
+    { descriptor: ANTHROPIC_COMING_SOON_DESCRIPTOR },
+  ]);
+  const runtimeGuard = new SessionProviderRuntimeGuard();
+  const activationCoordinator = new ProviderActivationCoordinator({
+    appHome: startup.appHome,
+    configPath: startup.configPath,
+    privateStore: new PrivateStore({ root: startup.appHome }),
+    credentials,
+    adapter,
+    stateStore,
+    runtimeGuard,
+  });
+  await activationCoordinator.recover({
+    signal: new AbortController().signal,
+    inspectCommitted: true,
+  });
+  const orchestrator = new SetupOrchestrator({
+    registry,
+    stateStore,
+    activationCoordinator,
+  });
+  const savedSecret = inferenceServiceCredential.stored.kind === "present"
+    ? inferenceServiceCredential.stored.value
+    : null;
+  return new DefaultProviderRuntime(
+    openRouter,
+    credentials,
+    registry,
+    stateStore,
+    orchestrator,
+    runtimeGuard,
+    savedSecret,
+    storedInference.kind === "absent"
+      ? environment.OPENROUTER_API_KEY ?? null
+      : null,
+    input.requestedModel ?? startup.config.mainModel,
+  );
+}
+
+export interface PlainRunInput extends Omit<RuntimeContext, "agent"> {
+  agent: OrcodeAgent | null;
+  ensureAgentForPrompt(surface?: SetupSurface): Promise<OrcodeAgent>;
+  resumeFlag?: boolean;
+  noResumeFlag?: boolean;
+}
+
+export interface DashboardRunInput extends PlainRunInput {
+  setupRequired: boolean;
+  showChatPickerOnStart?: boolean;
+}
+
+export interface CliBootstrapDeps {
+  initializeStorage: typeof initializeStartupStorage;
+  createProviderRuntime(input: ProviderRuntimeInput): Promise<ProviderRuntime>;
+  createAgent(input: Parameters<typeof OrcodeAgent.create>[0]): Promise<OrcodeAgent>;
+  runPlain(input: PlainRunInput): Promise<void>;
+  runDashboard(input: DashboardRunInput): Promise<void>;
+  stdout: Pick<NodeJS.WriteStream, "write">;
+  stderr: Pick<NodeJS.WriteStream, "write">;
+  environment?: Readonly<Record<string, string | undefined>>;
+}
+
+const defaultCliBootstrapDeps: CliBootstrapDeps = {
+  initializeStorage: initializeStartupStorage,
+  createProviderRuntime: createDefaultProviderRuntime,
+  createAgent: (input) => OrcodeAgent.create(input),
+  runPlain: async (input) => runPlainLoop(input, {
+    resume: input.resumeFlag === true,
+    noResume: input.noResumeFlag === true,
+  }),
+  runDashboard,
+  stdout: process.stdout,
+  stderr: process.stderr,
+  environment: process.env,
+};
+
+export interface NonInteractiveProviderFailure {
+  type: "error";
+  code: "provider-setup-required";
+  headline: "setup-required";
+  retryable: true;
+  hint: "/provider setup";
+}
+
+export function renderNonInteractiveProviderFailure(
+  json: boolean,
+  deps: Pick<CliBootstrapDeps, "stdout" | "stderr">,
+): void {
+  const failure: NonInteractiveProviderFailure = {
+    type: "error",
+    code: "provider-setup-required",
+    headline: "setup-required",
+    retryable: true,
+    hint: "/provider setup",
+  };
+  if (json) {
+    deps.stdout.write(`${JSON.stringify(failure)}\n`);
     return;
   }
+  deps.stderr.write(
+    "provider-setup-required · setup-required · retryable · /provider setup\n",
+  );
+}
+
+export async function runCli(
+  argv: readonly string[],
+  dependencies: CliBootstrapDeps = defaultCliBootstrapDeps,
+): Promise<number> {
+  const options = parseArgs([...argv]);
+  if (options.version) {
+    dependencies.stdout.write(`orcode ${readPackageVersion()}\n`);
+    return 0;
+  }
   if (options.help) {
-    printUsage();
-    return;
+    dependencies.stdout.write(`${renderCliHelp()}\n`);
+    return 0;
   }
 
   const workspace = resolve(options.workspace);
-  const startup = await initializeStartupStorage({
+  const startup = await dependencies.initializeStorage({
     workspace,
     newChat: options.newChat,
     ...(options.chatId ? { chatId: options.chatId } : {}),
   });
   if (startup.migrationWarning) {
-    console.error(chalk.yellow(startup.migrationWarning));
+    dependencies.stderr.write(`${startup.migrationWarning}\n`);
   }
   for (const warning of startup.retentionWarnings) {
-    console.error(chalk.yellow(warning));
+    dependencies.stderr.write(`${warning}\n`);
   }
   const { config, configPath: runtimeConfigPath, ruleStore, session } = startup;
-  // loadConfig never throws any more; a broken file is reported instead of
-  // silently replaced by defaults.
   const configWarning = consumeConfigWarning();
-  if (configWarning) {
-    console.log(chalk.yellow(configWarning));
-  }
+  if (configWarning) dependencies.stderr.write(`${configWarning}\n`);
   if (options.approval) {
     if (!isApprovalMode(options.approval)) {
       throw new CliUsageError(`Ungültiger Approval-Modus: ${options.approval}`);
@@ -411,123 +1024,85 @@ async function main(): Promise<void> {
     }
     config.compressionMode = options.compression;
   }
-
   const homeWarning = homeWorkspaceWarning(workspace);
-  if (homeWarning) {
-    // stderr, damit --json/NDJSON auf stdout ungestört bleibt; gilt für TUI,
-    // Plain- und Prompt-Modus gleichermaßen.
-    console.error(chalk.yellow(homeWarning));
-  }
-  const credentials = createCredentialStoreForStartup(startup.appHome);
-  const storedInferenceKey = await loadStoredCredentialForStartup(
-    credentials,
-    "inference",
-  );
-  const storedManagementKey = await loadStoredCredentialForStartup(
-    credentials,
-    "management",
-  );
-  const environmentInferenceKey = process.env.OPENROUTER_API_KEY ?? null;
-  const environmentManagementKey =
-    process.env.OPENROUTER_MANAGEMENT_KEY ?? null;
-  const openRouter = createOpenRouterServiceForStartup({
-    storedInferenceKey,
-    environmentInferenceKey,
-    storedManagementKey,
-    environmentManagementKey,
+  if (homeWarning) dependencies.stderr.write(`${homeWarning}\n`);
+
+  const providerRuntime = await dependencies.createProviderRuntime({
+    startup,
+    environment: dependencies.environment ?? process.env,
+    requestedModel: options.model ?? config.mainModel,
   });
+  let startupSetup = await providerRuntime.inspectStartup();
+  if (startupSetup.defaultRoute?.resolutionState === "legacy-unverified") {
+    startupSetup = await providerRuntime.resolveLegacyDefaultRoute();
+  }
+
   const approvals = new ApprovalManager(config.approvalMode);
   approvals.setRuleStore(ruleStore, workspace);
   const sshSession = createSshSession();
-  if (!options.model && session.data.model) {
-    config.mainModel = session.data.model;
-  }
-  if (!options.model && session.data.reasoning) {
-    setReasoningSetting(config, session.data.reasoning);
-  }
-  await applyStartupModelPreference(
-    openRouter,
-    options.model,
-    config,
-    session,
-  );
-  const agent = await OrcodeAgent.create({
-    openRouter,
-    approvals,
-    session,
-    config,
-    workspace,
-    sshSession,
-  });
-
   const useTui = Boolean(
-    !options.prompt &&
-    !options.plain &&
-    !options.json &&
-    process.stdin.isTTY &&
-    process.stdout.isTTY,
+    !options.prompt
+    && !options.plain
+    && !options.json
+    && process.stdin.isTTY
+    && process.stdout.isTTY
   );
-  // The dashboard sink is created once `ui` exists (inside `runDashboard`) and
-  // overwrites this placeholder before any command output happens. In --json
-  // mode stdout is reserved for the NDJSON event stream, so every
-  // human-readable status line goes to stderr instead.
+  const nonInteractive = options.prompt !== undefined || options.json;
   const out = options.json ? createStderrCommandOutput() : createPlainCommandOutput();
-  if (!useTui && !options.json) {
-    printBanner(workspace, config.mainModel);
-  }
-  if (useTui) {
-    await runDashboard({
-      workspace,
-      configPath: runtimeConfigPath,
-      config,
-      approvals,
-      openRouter,
-      session,
-      agent,
-      credentials,
-      out,
-      ruleStore,
-      sshSession,
-      showChatPickerOnStart:
-        !options.newChat && !options.continueChat && !options.chatId,
-      initialKeyFallback:
-        storedInferenceKey.kind === "present" && environmentInferenceKey
-          ? environmentInferenceKey
-          : undefined,
-      resumeFlag: options.resume,
-      noResumeFlag: options.noResume,
-    });
-    return;
-  }
+  let agent: OrcodeAgent | null = null;
+  let modelPreferencesApplied = false;
 
-  if (approvals.mode === "allow-all" && process.stdin.isTTY && !options.json) {
-    const keep = await confirm({
-      message: "allow-all ist gespeichert. Für diese Sitzung wirklich ohne Rückfragen arbeiten?",
-      default: false,
-    });
-    if (!keep) {
-      approvals.mode = "ask";
-      console.log("Diese Sitzung verwendet ask; die gespeicherte Einstellung bleibt unverändert.");
+  const ensureAgentForPrompt = async (surface?: SetupSurface): Promise<OrcodeAgent> => {
+    try {
+      providerRuntime.ensureRunnableRoute();
+    } catch (error) {
+      if (!(error instanceof ProviderSetupRequiredError) &&
+        (typeof error !== "object" || error === null || !("code" in error) || error.code !== "provider-setup-required")) {
+        throw error;
+      }
+      const setup = await providerRuntime.runSetup(surface ?? "plain");
+      if (setup.kind !== "ready") throw new ProviderSetupRequiredError();
+      providerRuntime.ensureRunnableRoute();
     }
-  }
-
-  const startupBalance = await promptForValidKey(
-    openRouter,
-    credentials,
-    out,
-    storedInferenceKey.kind === "present" && environmentInferenceKey
-      ? {
-          key: environmentInferenceKey,
-          origin: "environment",
-        }
-      : undefined,
-  );
-
-  if (options.json) {
-    if (!startupBalance) {
-      throw new Error(
-        "OpenRouter ist noch nicht einsatzbereit. Prüfe Verbindung, Key und Guthaben und versuche es erneut.",
+    if (!modelPreferencesApplied) {
+      if (!options.model && session.data.model) config.mainModel = session.data.model;
+      if (!options.model && session.data.reasoning) {
+        setReasoningSetting(config, session.data.reasoning);
+      }
+      await applyStartupModelPreference(
+        providerRuntime.openRouter,
+        options.model,
+        config,
+        session,
       );
+      modelPreferencesApplied = true;
+    }
+    if (!agent) {
+      agent = await dependencies.createAgent({
+        openRouter: providerRuntime.openRouter,
+        approvals,
+        session,
+        config,
+        workspace,
+        sshSession,
+      });
+    }
+    return agent;
+  };
+
+  if (nonInteractive) {
+    try {
+      // Non-interactive starts prove readiness before entering the helper that
+      // is allowed to open an interactive setup surface.
+      providerRuntime.ensureRunnableRoute();
+      agent = await ensureAgentForPrompt();
+    } catch (error) {
+      if (error instanceof ProviderSetupRequiredError ||
+        (typeof error === "object" && error !== null && "code" in error && error.code === "provider-setup-required")) {
+        renderNonInteractiveProviderFailure(options.json, dependencies);
+        return 1;
+      }
+      throw error;
     }
     const prompt = options.prompt ?? (!process.stdin.isTTY ? await readStdinPrompt() : "");
     if (!prompt.trim()) {
@@ -535,56 +1110,73 @@ async function main(): Promise<void> {
         "Kein Prompt: --json braucht -p/--prompt oder eine nicht-interaktive stdin.",
       );
     }
-    await ensureRunnableModelConfiguration(openRouter, config);
-    // Human-readable, so it goes to stderr — stdout is reserved for the
-    // NDJSON event stream in --json mode (see createStderrCommandOutput).
+    await ensureRunnableModelConfiguration(providerRuntime.openRouter, config);
     const effectivePrompt = await applyInterruptedRunNonInteractive(
       session,
       options,
       out,
       prompt,
     );
-    process.exitCode = await runNonInteractive(agent, effectivePrompt, { json: true });
-    return;
-  }
-
-  if (options.prompt) {
-    if (!startupBalance) {
-      throw new Error(
-        "OpenRouter ist noch nicht einsatzbereit. Prüfe Verbindung, Key und Guthaben und versuche es erneut.",
-      );
+    const execute = () => runNonInteractive(agent!, effectivePrompt, { json: options.json });
+    if (typeof providerRuntime.runWithReadyRoute === "function") {
+      return providerRuntime.runWithReadyRoute(() => execute());
     }
-    await printBalance(startupBalance, out);
-    await ensureRunnableModelConfiguration(openRouter, config);
-    const effectivePrompt = await applyInterruptedRunNonInteractive(
-      session,
-      options,
-      out,
-      options.prompt,
-    );
-    process.exitCode = await runNonInteractive(agent, effectivePrompt, { json: false });
-    return;
+    providerRuntime.ensureRunnableRoute();
+    return execute();
   }
 
-  if (startupBalance) {
-    await printBalance(startupBalance, out);
+  let interactiveSetupReady = true;
+  if (startupSetup.mode === "setup-required" || startupSetup.mode === "route-choice-required") {
+    if (!useTui) {
+      interactiveSetupReady = (await providerRuntime.runSetup("plain")).kind === "ready";
+    } else {
+      interactiveSetupReady = false;
+    }
   }
-  await runPlainLoop(
-    {
-      workspace,
-      configPath: runtimeConfigPath,
-      config,
-      approvals,
-      openRouter,
-      session,
-      agent,
-      credentials,
-      out,
-      ruleStore,
-      sshSession,
-    },
-    options,
-  );
+  if (interactiveSetupReady) {
+    try {
+      agent = await ensureAgentForPrompt();
+    } catch (error) {
+      if (!(error instanceof ProviderSetupRequiredError) &&
+        (typeof error !== "object" || error === null || !("code" in error) || error.code !== "provider-setup-required")) {
+        throw error;
+      }
+    }
+  }
+
+  const common = {
+    workspace,
+    configPath: runtimeConfigPath,
+    config,
+    approvals,
+    openRouter: providerRuntime.openRouter,
+    session,
+    agent,
+    credentials: providerRuntime.credentials,
+    out,
+    ruleStore,
+    sshSession,
+    providerRuntime,
+    ensureAgentForPrompt,
+    resumeFlag: options.resume,
+    noResumeFlag: options.noResume,
+  } satisfies PlainRunInput;
+  if (useTui) {
+    await dependencies.runDashboard({
+      ...common,
+      setupRequired: agent === null,
+      showChatPickerOnStart:
+        !options.newChat && !options.continueChat && !options.chatId,
+    });
+    return 0;
+  }
+  if (!options.json) printBanner(workspace, config.mainModel);
+  await dependencies.runPlain(common);
+  return 0;
+}
+
+async function main(): Promise<void> {
+  process.exitCode = await runCli(process.argv.slice(2));
 }
 
 interface RuntimeContext {
@@ -595,6 +1187,7 @@ interface RuntimeContext {
   openRouter: OpenRouterService;
   session: SessionStore;
   agent: OrcodeAgent;
+  providerRuntime: ProviderRuntime;
   credentials: CredentialStore;
   out: CommandOutput;
   ruleStore: RuleStore;
@@ -618,14 +1211,14 @@ interface RuntimeContext {
 }
 
 async function runPlainLoop(
-  context: RuntimeContext,
+  context: PlainRunInput,
   resumeOptions: Pick<CliOptions, "resume" | "noResume">,
 ): Promise<void> {
   console.log(chalk.dim("Schreibe eine Aufgabe oder /help. Ctrl+C beendet.\n"));
   // Set once, if the interrupted-run flow below resolves to "resume": the
   // resume context is prepended to the very next message the user actually
   // sends, then cleared — never sent on its own, never repeated.
-  let pendingSeed = await checkInterruptedRunPlain(context, resumeOptions);
+  let pendingSeed = await checkInterruptedRunPlain(context as RuntimeContext, resumeOptions);
   // `/resume fortsetzen` and `/panel use <n>` (handleSlashCommand, below) seed
   // the same variable through this one hook — no separate insertion path for
   // a command reached mid-session vs. the one offered at startup above.
@@ -651,16 +1244,25 @@ async function runPlainLoop(
     }
     try {
       if (trimmed.startsWith("/")) {
-        const outcome = await handleSlashCommand(trimmed, context);
+        const commandName = resolveCliCommandName(trimmed);
+        if (commandRequiresRunnableRoute(commandName, commandArguments(trimmed))) {
+          const agent = await context.ensureAgentForPrompt();
+          context.agent = agent;
+        }
+        const outcome = await handleSlashCommand(trimmed, context as RuntimeContext);
         if (outcome === "exit") {
           break;
         }
         continue;
       }
+      const agent = await context.ensureAgentForPrompt();
+      context.agent = agent;
       await ensureRunnableModelConfiguration(context.openRouter, context.config);
       const effective = pendingSeed ? `${pendingSeed}\n\n${trimmed}` : trimmed;
       pendingSeed = undefined;
-      const result = await context.agent.run(effective);
+      const result = await context.providerRuntime.runWithReadyRoute(() =>
+        agent.run(effective)
+      );
       printRunFooter(result);
     } catch (error) {
       console.error(chalk.red(context.openRouter.safeMessage(error)));
@@ -669,16 +1271,12 @@ async function runPlainLoop(
         printRunFooter(error.result);
       }
       if (
-        !context.openRouter.hasKey ||
-        shouldReplaceCredential(error, context.openRouter)
+        !(error instanceof ProviderSetupRequiredError)
+        && shouldReplaceCredential(error, context.openRouter)
       ) {
-        const balance = await promptForValidKey(
-          context.openRouter,
-          context.credentials,
-          context.out,
-        );
-        if (balance) {
-          await printBalance(balance, context.out);
+        const setup = await context.providerRuntime.runSetup("plain");
+        if (setup.kind === "ready") {
+          context.agent = await context.ensureAgentForPrompt();
         }
       }
     }
@@ -927,12 +1525,7 @@ class BufferedCommandOutput implements CommandOutput {
 }
 
 async function runDashboard(
-  context: RuntimeContext & {
-    initialKeyFallback?: string;
-    showChatPickerOnStart?: boolean;
-    resumeFlag?: boolean;
-    noResumeFlag?: boolean;
-  },
+  context: DashboardRunInput,
 ): Promise<void> {
   let balance: BalanceInfo | null = null;
   let balanceLabel = "wird geprüft …";
@@ -1004,8 +1597,19 @@ async function runDashboard(
   context.approvals.setPromptHandler((preview) => ui.confirmApproval(preview));
   ui.start();
   try {
+    const setupSurface = createTuiSetupSurface(ui);
+    if (context.setupRequired) {
+      const setup = await context.providerRuntime.runSetup(setupSurface);
+      if (setup.kind === "ready") {
+        try {
+          context.agent = await context.ensureAgentForPrompt(setupSurface);
+        } catch (error) {
+          if (!(error instanceof ProviderSetupRequiredError)) throw error;
+        }
+      }
+    }
     if (context.showChatPickerOnStart) {
-      const switched = await pickDashboardChat(ui, context, true);
+      const switched = await pickDashboardChat(ui, context as RuntimeContext, true);
       if (switched) {
         startingSessionCost = context.session.data.costs.totalUsd;
       } else {
@@ -1015,17 +1619,25 @@ async function runDashboard(
       }
     }
     const startupModel = context.config.mainModel;
-    void Promise.all([
-      inspectWorkspace(context.workspace),
-      loadModelSnapshot(context.openRouter, startupModel),
-    ]).then(([nextProjectStatus, nextModel]) => {
-      projectStatus = nextProjectStatus;
-      if (context.config.mainModel === startupModel) {
-        modelDetails = nextModel.details;
-        currentModelInfo = nextModel.model;
-      }
-      ui.refresh();
-    });
+    if (context.agent) {
+      void Promise.all([
+        inspectWorkspace(context.workspace),
+        loadModelSnapshot(context.openRouter, startupModel),
+      ]).then(([nextProjectStatus, nextModel]) => {
+        projectStatus = nextProjectStatus;
+        if (context.config.mainModel === startupModel) {
+          modelDetails = nextModel.details;
+          currentModelInfo = nextModel.model;
+        }
+        ui.refresh();
+      });
+    } else {
+      void inspectWorkspace(context.workspace).then((nextProjectStatus) => {
+        projectStatus = nextProjectStatus;
+        modelDetails = "Provider-Setup erforderlich";
+        ui.refresh();
+      });
+    }
 
     if (context.approvals.mode === "allow-all") {
       const keep = await ui.confirmAction(
@@ -1042,34 +1654,15 @@ async function runDashboard(
       }
     }
 
-    try {
-      balance = await initializeDashboardKey(
-        ui,
-        context,
-        context.initialKeyFallback,
-      );
-      if (!balance) {
-        balanceLabel = context.openRouter.hasKey ? "nicht geprüft" : "kein Key";
-        ui.addMessage(
-          "system",
-          context.openRouter.hasKey
-            ? "API-Key ist geladen, aber die Startprüfung wurde abgebrochen. Vor einem Modelllauf wird erneut geprüft."
-            : "Kein API-Key aktiv. Verwende /key set, bevor du ein Modell startest.",
-          "OpenRouter",
-        );
-      }
-    } catch (error) {
-      balanceLabel = "nicht verfügbar";
-      ui.addMessage(
-        "error",
-        `OpenRouter-Startprüfung fehlgeschlagen: ${context.openRouter.safeMessage(error)}`,
-      );
-    }
+    balanceLabel = context.agent ? "Provider bereit" : "Setup erforderlich";
 
     // Checked here (after a possible startup chat switch above, so it looks
     // at whichever chat is actually open) rather than before `runDashboard`
     // is even called.
-    const seed = await checkInterruptedRunTui(ui, context);
+    const seed = await checkInterruptedRunTui(ui, context as RuntimeContext & {
+      resumeFlag?: boolean;
+      noResumeFlag?: boolean;
+    });
     if (seed) {
       ui.insertInputText(seed);
     }
@@ -1104,6 +1697,10 @@ async function runDashboard(
             : trimmed.split(/\s+/)[0];
           const commandArgs = commandArguments(trimmed);
           const sessionBefore = context.session;
+
+          if (commandRequiresRunnableRoute(completedCommand, commandArgs, "dashboard")) {
+            context.agent = await context.ensureAgentForPrompt(setupSurface);
+          }
 
           if (completedCommand === "image") {
             const action = commandTail(trimmed);
@@ -1158,13 +1755,13 @@ async function runDashboard(
           }
 
           if (completedCommand === "whisper") {
-            await runVoiceCapture(ui, context);
+            await runVoiceCapture(ui, context as RuntimeContext);
             ui.setStatus("Bereit", false);
             continue;
           }
 
           if (completedCommand === "model" && commandArgs.length === 0) {
-            const selected = await pickDashboardModel(ui, context);
+            const selected = await pickDashboardModel(ui, context as RuntimeContext);
             if (selected) {
               context.session.setPreferences(
                 context.config.mainModel,
@@ -1195,7 +1792,7 @@ async function runDashboard(
             commandArgs.length === 1 &&
             commandArgs[0]?.toLowerCase() === "model"
           ) {
-            const selected = await pickDashboardCompressorModel(ui, context);
+            const selected = await pickDashboardCompressorModel(ui, context as RuntimeContext);
             if (selected) {
               ui.addMessage(
                 "system",
@@ -1317,8 +1914,8 @@ async function runDashboard(
             completedCommand === "chat" &&
             commandArgs.length === 0
           ) {
-            const switched = await pickDashboardChat(ui, context, false);
-            if (switched) {
+            const switched = await pickDashboardChat(ui, context as RuntimeContext, false);
+            if (switched && context.agent) {
               startingSessionCost = context.session.data.costs.totalUsd;
               resolvedModel = "";
               const snapshot = await loadModelSnapshot(
@@ -1339,7 +1936,7 @@ async function runDashboard(
             );
             if (accepted) {
               context.session.clear();
-              context.agent.resetConversationMemory();
+              context.agent?.resetConversationMemory();
               await context.session.save();
               ui.loadTurns([]);
               ui.addMessage("system", "Sitzung zurückgesetzt.", "/clear");
@@ -1378,7 +1975,7 @@ async function runDashboard(
             continue;
           }
 
-          const outcome = await handleSlashCommand(trimmed, context);
+          const outcome = await handleSlashCommand(trimmed, context as RuntimeContext);
           const captured = dashboardOut.flush();
           if (context.session !== sessionBefore) {
             startingSessionCost = context.session.data.costs.totalUsd;
@@ -1406,11 +2003,11 @@ async function runDashboard(
             balance = null;
             balanceLabel = "kein Key";
           }
-          if (
-            context.config.mainModel !== modelBefore ||
-            completedCommand === "model" ||
-            context.session !== sessionBefore
-          ) {
+          if (context.agent && (
+            context.config.mainModel !== modelBefore
+            || completedCommand === "model"
+            || context.session !== sessionBefore
+          )) {
             resolvedModel = "";
             const snapshot = await loadModelSnapshot(
               context.openRouter,
@@ -1436,6 +2033,8 @@ async function runDashboard(
           continue;
         }
 
+        const agent = await context.ensureAgentForPrompt(setupSurface);
+        context.agent = agent;
         const runnableModels = await ensureRunnableModelConfiguration(
           context.openRouter,
           context.config,
@@ -1477,30 +2076,33 @@ async function runDashboard(
           imageSummary ? `${trimmed}\n\n🖼 ${imageSummary}` : trimmed,
         );
         ui.beginAssistant(context.config.mainModel);
-        runController = new AbortController();
+        const controller = new AbortController();
+        runController = controller;
         ui.setCancelHandler(() => {
           runController?.abort(new Error("Der aktuelle Lauf wurde vom Benutzer abgebrochen."));
         });
-        const result = await context.agent.run(
-          trimmed,
-          {
-            onStatus: (status) => ui.setStatus(status),
-            onText: (delta) => ui.appendAssistant(delta),
-            onEvent: (event) => {
-              ui.handleRunEvent(event);
-              // A7: the context-fill header segment is fed from outside —
-              // model-end is the only event carrying a fresh inputTokens
-              // measurement, ModelInfo.contextLength comes from the model
-              // picker's last snapshot.
-              if (event.type === "model-end" && currentModelInfo?.contextLength) {
-                ui.setContextPercent(
-                  (event.inputTokens / currentModelInfo.contextLength) * 100,
-                );
-              }
+        const result = await context.providerRuntime.runWithReadyRoute(() =>
+          agent.run(
+            trimmed,
+            {
+              onStatus: (status) => ui.setStatus(status),
+              onText: (delta) => ui.appendAssistant(delta),
+              onEvent: (event) => {
+                ui.handleRunEvent(event);
+                // A7: the context-fill header segment is fed from outside —
+                // model-end is the only event carrying a fresh inputTokens
+                // measurement, ModelInfo.contextLength comes from the model
+                // picker's last snapshot.
+                if (event.type === "model-end" && currentModelInfo?.contextLength) {
+                  ui.setContextPercent(
+                    (event.inputTokens / currentModelInfo.contextLength) * 100,
+                  );
+                }
+              },
+              signal: controller.signal,
             },
-            signal: runController.signal,
-          },
-          submittedImages,
+            submittedImages,
+          )
         );
         submittedImages = [];
         ui.setCancelHandler();
@@ -1549,17 +2151,7 @@ async function runDashboard(
             `${runResultLabel(partial.outcome)} · ${formatRunCost(partial)}`,
           );
         }
-        if (
-          !cancelled &&
-          (!context.openRouter.hasKey || shouldReplaceCredential(error, context.openRouter))
-        ) {
-          balance = null;
-          balanceLabel = context.openRouter.hasKey ? "Key abgelehnt" : "kein Key";
-          const nextBalance = await promptDashboardInferenceKey(ui, context);
-          if (nextBalance) {
-            balance = nextBalance;
-          }
-        }
+        if (!cancelled) balanceLabel = "Provider-Setup mit /provider setup prüfen";
         ui.setStatus("Bereit", false);
       }
     }
@@ -2021,6 +2613,33 @@ function commandArguments(raw: string): string[] {
   return raw.slice(1).trim().split(/\s+/).slice(1);
 }
 
+export function commandRequiresRunnableRoute(
+  command: string,
+  args: readonly string[],
+  mode: "plain" | "dashboard" = "plain",
+): boolean {
+  if (command === "model" || command === "models" || command === "think") {
+    return true;
+  }
+  if (command === "compress") {
+    return (args[0] ?? "").toLowerCase() === "model";
+  }
+  if (command === "fallback") {
+    return args[0]?.startsWith("+") ?? false;
+  }
+  if (command === "panel") {
+    const subcommand = (args[0] ?? "").toLowerCase();
+    if (!subcommand || subcommand === "show" || subcommand === "use" || subcommand === "judge") {
+      return false;
+    }
+    if (subcommand === "models") {
+      return args.length > 1;
+    }
+    return true;
+  }
+  return mode === "dashboard" && command === "whisper";
+}
+
 function commandTail(raw: string): string {
   return raw.match(/^\/\S+(?:\s+([\s\S]*))?$/)?.[1]?.trim() ?? "";
 }
@@ -2201,13 +2820,12 @@ async function chooseDashboardImage(
 export async function initializeDashboardKey(
   ui: TerminalUi,
   context: RuntimeContext,
-  fallbackKey?: string,
+  _fallbackKey?: string,
 ): Promise<BalanceInfo | null> {
   if (!context.openRouter.hasKey) {
     return promptDashboardInferenceKey(ui, context);
   }
 
-  const activeKey = context.openRouter.requireKey();
   const controller = new AbortController();
   ui.setStatus("Aktiven API-Key und Guthaben prüfen");
   ui.setCancelHandler(() => {
@@ -2233,46 +2851,6 @@ export async function initializeDashboardKey(
     ui.setCancelHandler();
   }
 
-  if (fallbackKey && fallbackKey.trim() !== activeKey.trim()) {
-    const fallbackController = new AbortController();
-    ui.setStatus("OPENROUTER_API_KEY als Ersatz prüfen");
-    ui.setCancelHandler(() => {
-      fallbackController.abort(new Error("Die Ersatz-Key-Prüfung wurde abgebrochen."));
-    });
-    try {
-      const activated = await validateAndActivateInferenceKey(
-        fallbackKey,
-        context,
-        {
-          persist: false,
-          processOrigin: "environment",
-          signal: fallbackController.signal,
-        },
-      );
-      if (activated) {
-        ui.addMessage(
-          "system",
-          "OPENROUTER_API_KEY ist validiert und nur für diesen Prozess aktiv. Dauerhaft speichern mit /key save.",
-          "/key",
-        );
-        return activated.balance;
-      }
-    } catch (error) {
-      if (fallbackController.signal.aborted || isAbortError(error)) {
-        return null;
-      }
-      if (!isAuthenticationRejection(error)) {
-        throw error;
-      }
-      ui.addMessage(
-        "error",
-        `Auch OPENROUTER_API_KEY wurde abgelehnt: ${context.openRouter.safeMessage(error)}`,
-        "OpenRouter",
-      );
-    } finally {
-      ui.setCancelHandler();
-    }
-  }
   return promptDashboardInferenceKey(ui, context);
 }
 
