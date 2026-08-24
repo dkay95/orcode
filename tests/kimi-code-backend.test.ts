@@ -679,6 +679,97 @@ test("entitlement snapshot expiring inside authority publication returns and pub
   }));
 });
 
+test("entitlement snapshot expiring after authority publication settles is removed before inspection returns", async () => {
+  let mode: "catalog" | "entitlement" = "catalog";
+  let now = 100;
+  let publicationCount = 0;
+  let secondPublicationStarted = false;
+  let releasePublication!: () => void;
+  const publicationGate = new Promise<void>((resolve) => {
+    releasePublication = resolve;
+  });
+  const credentialAuthority: ProviderCredentialAuthorityLike = {
+    async withCredential(request, use) {
+      const context = bindingContext(request);
+      return {
+        kind: "available",
+        value: await use(KEY, {
+          ...context,
+          async publishIfCurrent(publish) {
+            publicationCount += 1;
+            publish();
+            if (publicationCount === 2) {
+              secondPublicationStarted = true;
+              await publicationGate;
+            }
+          },
+        }),
+      };
+    },
+  };
+  const adapter = new KimiCodeBackendAdapter({
+    service: new KimiCodeService({
+      now: () => now,
+      fetchImpl: async () => mode === "catalog"
+        ? catalogResponse(["k3", "k3-256k", "kimi-for-coding"])
+        : errorResponse(
+            401,
+            "Your current subscription does not have access to k3. Upgrade to an Moderato plan or above. Upgrade: https://www.kimi.com/membership/pricing?from=server_k3_error",
+          ),
+    }),
+    credentials: {
+      async getOrCreateAccountHmacKey() { return new Uint8Array(HMAC_KEY); },
+    },
+    credentialAuthority,
+    now: () => now,
+  });
+
+  const first = await adapter.inspect(inspectionRequest({
+    generation: 8,
+    deadlineAt: 200,
+  }));
+  assert.equal(first.routeEligible, true);
+
+  mode = "entitlement";
+  now = 150;
+  let secondSettled = false;
+  const secondInspection = adapter.inspect(inspectionRequest({
+    generation: 9,
+    deadlineAt: 400,
+  })).finally(() => {
+    secondSettled = true;
+  });
+  while (!secondPublicationStarted) {
+    await new Promise<void>((resolve) => setImmediate(resolve));
+  }
+  assert.equal(secondSettled, false);
+
+  now = 200;
+  releasePublication();
+  const second = await secondInspection;
+  assert.deepEqual({
+    credential: second.health.credential,
+    runtime: second.health.runtime,
+    accountFingerprint: second.accountFingerprint,
+    explanationCode: second.explanationCode,
+    routeEligible: second.routeEligible,
+    headline: second.headline,
+  }, {
+    credential: "valid",
+    runtime: "policy-unavailable",
+    accountFingerprint: FINGERPRINT,
+    explanationCode: "kimi-code-model-unavailable",
+    routeEligible: false,
+    headline: "policy-unavailable",
+  });
+
+  now = 199;
+  await assert.rejects(adapter.listModels({
+    connectionId: CONNECTION_ID,
+    signal: new AbortController().signal,
+  }));
+});
+
 test("invalid-key inspection rejects only the credential dimension and exposes no body, header, request, or key canary", async () => {
   const privateValues = [
     "private-body-canary",

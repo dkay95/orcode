@@ -313,6 +313,7 @@ export class KimiCodeBackendAdapter implements BackendAdapter {
         explanationForCredentialAccess(selected),
       );
     }
+    const effectiveMetadataDeadlineAt = selected.value.metadata?.deadlineAt ?? null;
     await this.#assertLeaseCurrent(lease, request.deadlineAt, request.signal);
     if (!this.#isInspectionCurrent(request.connectionId, request.generation, attempt.token)) {
       return this.#emptyInspection(
@@ -320,6 +321,27 @@ export class KimiCodeBackendAdapter implements BackendAdapter {
         request.generation,
         "kimi-code-inspection-stale",
       );
+    }
+    throwIfAborted(request.signal);
+    const returnObservedAt = this.#readNow();
+    if (
+      !Number.isFinite(request.deadlineAt)
+      || request.deadlineAt <= returnObservedAt
+    ) {
+      throw new KimiCodeRequestError(offlineFailure());
+    }
+    if (
+      effectiveMetadataDeadlineAt !== null
+      && (
+        !Number.isFinite(effectiveMetadataDeadlineAt)
+        || effectiveMetadataDeadlineAt <= returnObservedAt
+      )
+    ) {
+      this.#activeInspections.delete(request.connectionId);
+      return this.#withoutExpiredReusedMetadata(
+        selected.value,
+        returnObservedAt,
+      ).inspection;
     }
     return selected.value.inspection;
   }
