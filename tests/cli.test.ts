@@ -1797,6 +1797,367 @@ test("provider status treats disabled health as historical and prefers the activ
   assert.equal(processProvider?.isDefault, true);
 });
 
+for (const operation of ["disable", "disconnect"] as const) {
+  test(`provider ${operation} rejects same-revision authoritative identity replacement before mutation`, async () => {
+    const route = {
+      ...bootstrapRoute(`vendor/${operation}`),
+      accountFingerprint: `acct_${operation}_approved_111111`,
+    } as NonNullable<ProviderSetupStateV1["defaultRoute"]>;
+    const approved: ProviderSetupStateV1 = {
+      schemaVersion: 1,
+      revision: 0,
+      lifecycle: "configured",
+      connections: [{
+        id: `${operation}-connection`,
+        backendId: "openrouter",
+        enabled: true,
+        maturity: "stable",
+        credentialSlot: "v1:inference:44444444-4444-4444-8444-444444444444",
+        accountFingerprint: route.accountFingerprint,
+        accountFingerprintState: "verified",
+        billingRealm: "openrouter-payg",
+        lastHealth: null,
+      }],
+      defaultRoute: route,
+      cross: { enabled: false, preferredLead: null, preferredChallenger: null },
+    };
+    const replacementRoute = {
+      ...route,
+      accountFingerprint: `acct_${operation}_replacement_222222`,
+      requestedModelId: `vendor/${operation}-replacement`,
+      canonicalModelId: `vendor/${operation}-replacement`,
+    };
+    const replacement: ProviderSetupStateV1 = {
+      ...structuredClone(approved),
+      connections: [{
+        ...approved.connections[0]!,
+        credentialSlot: "v1:inference:55555555-5555-4555-8555-555555555555",
+        accountFingerprint: replacementRoute.accountFingerprint,
+      }],
+      defaultRoute: replacementRoute,
+    };
+    const root = await mkdtemp(join(tmpdir(), `orcode-provider-${operation}-authority-`));
+    const configPath = join(root, "config.json");
+    const diskConfig = structuredClone(DEFAULT_CONFIG);
+    diskConfig.providerSetup = structuredClone(replacement);
+    await saveConfig(diskConfig, configPath);
+    const stateStore = new ProviderStateStore(approved, {
+      persist: (request) => cliModule.persistProviderSetupState(configPath, request),
+    });
+    const Runtime = (cliModule as unknown as {
+      DefaultProviderRuntime: new (...args: unknown[]) => {
+        execute(intent: Record<string, unknown>, surface: "plain"): Promise<Record<string, unknown>>;
+      };
+    }).DefaultProviderRuntime;
+    const config = structuredClone(DEFAULT_CONFIG);
+    config.providerSetup = structuredClone(approved);
+    const runtime = new Runtime(
+      { forgetKey() { throw new Error("runtime forget forbidden"); } },
+      {},
+      {
+        descriptor() { return { id: "openrouter", displayName: "OpenRouter", maturity: "stable" }; },
+        entries() { return []; },
+      },
+      stateStore,
+      { ensureRunnableRoute: () => route },
+      providerCoordinatorMutationFixture(providerRuntimeGuardFixture()),
+      { beginRun() { return () => undefined; } },
+      { async apply() { throw new Error("credential effect forbidden"); } },
+      "approved-secret",
+      null,
+      route.requestedModelId,
+      config,
+    );
+
+    const prompt = await runtime.execute({ kind: operation, backendId: "openrouter" }, "plain");
+    const result = await runtime.execute({
+      kind: operation,
+      backendId: "openrouter",
+      confirmationToken: prompt.confirmationToken,
+    }, "plain");
+
+    assert.equal(result.kind, "confirmation-required");
+    assert.notEqual(result.confirmationToken, prompt.confirmationToken);
+    const readback = (JSON.parse(await readFile(configPath, "utf8")) as {
+      providerSetup: ProviderSetupStateV1;
+    }).providerSetup;
+    assert.deepEqual(readback, replacement);
+    assert.equal(config.providerSetup.connections[0]?.enabled, true);
+  });
+}
+
+for (const phase of ["prepared", "credential-deleted", "shared-reference"] as const) {
+  test(`logout rejects same-revision authoritative target replacement in ${phase} phase`, async () => {
+    const api = cliModule as typeof cliModule & {
+      DefaultProviderRuntime: new (...args: unknown[]) => {
+        execute(intent: Record<string, unknown>, surface: "plain"): Promise<Record<string, unknown>>;
+      };
+      ProviderCredentialForgetJournal: new (input: {
+        appHome: string;
+        privateStore: PrivateStore;
+      }) => {
+        begin(input: Record<string, unknown>): Promise<unknown>;
+        markDeleted(transaction: unknown): Promise<void>;
+        readPending(): Promise<unknown>;
+      };
+      createProviderCredentialController(input: Record<string, unknown>): {
+        apply(intent: Record<string, unknown>): Promise<Record<string, unknown>>;
+      };
+    };
+    const root = await mkdtemp(join(tmpdir(), `orcode-provider-authoritative-${phase}-`));
+    const targetId = `target-${phase}`;
+    const survivorId = `survivor-${phase}`;
+    const approvedSlot = "v1:inference:66666666-6666-4666-8666-666666666666";
+    const replacementSlot = "v1:inference:77777777-7777-4777-8777-777777777777";
+    const approvedRoute = {
+      ...bootstrapRoute(`vendor/${phase}`),
+      accountFingerprint: `acct_${phase}_approved_333333`,
+    } as NonNullable<ProviderSetupStateV1["defaultRoute"]>;
+    const survivor = {
+      id: survivorId,
+      backendId: "openrouter" as const,
+      enabled: true,
+      maturity: "stable" as const,
+      credentialSlot: approvedSlot,
+      accountFingerprint: approvedRoute.accountFingerprint,
+      accountFingerprintState: "verified" as const,
+      billingRealm: "openrouter-payg" as const,
+      lastHealth: null,
+    };
+    const approved: ProviderSetupStateV1 = {
+      schemaVersion: 1,
+      revision: 0,
+      lifecycle: "configured",
+      connections: [{ ...survivor, id: targetId }, ...(phase === "shared-reference" ? [survivor] : [])],
+      defaultRoute: phase === "credential-deleted" ? null : approvedRoute,
+      cross: { enabled: false, preferredLead: null, preferredChallenger: null },
+    };
+    const replacementRoute = {
+      ...approvedRoute,
+      accountFingerprint: `acct_${phase}_replacement_444444`,
+      requestedModelId: `vendor/${phase}-replacement`,
+      canonicalModelId: `vendor/${phase}-replacement`,
+    };
+    const replacement: ProviderSetupStateV1 = {
+      ...structuredClone(approved),
+      connections: approved.connections.map((connection) =>
+        connection.id === targetId
+          ? {
+              ...connection,
+              credentialSlot: replacementSlot,
+              accountFingerprint: replacementRoute.accountFingerprint,
+            }
+          : connection
+      ),
+      defaultRoute: phase === "credential-deleted"
+        ? null
+        : phase === "shared-reference"
+          ? approvedRoute
+          : replacementRoute,
+    };
+    let durable = structuredClone(replacement);
+    const stateStore = new ProviderStateStore(approved, {
+      persist: async (request) => {
+        request.assertCurrent();
+        const next = request.build(structuredClone(durable));
+        durable = structuredClone(next);
+        request.adopt(next);
+        return structuredClone(next);
+      },
+    });
+    const journal = new api.ProviderCredentialForgetJournal({
+      appHome: root,
+      privateStore: new PrivateStore({ root }),
+    });
+    const transaction = await journal.begin({
+      connectionId: targetId,
+      target: {
+        kind: "versioned",
+        slot: { version: 1, kind: "inference", id: approvedSlot },
+      },
+    });
+    if (phase === "credential-deleted") await journal.markDeleted(transaction);
+    let deletes = 0;
+    const secret = `${STARTUP_KEY_PREFIX}${"a".repeat(48)}`;
+    const openRouter = new OpenRouterService(secret);
+    const coordinator = providerCoordinatorMutationFixture(providerRuntimeGuardFixture());
+    const controller = api.createProviderCredentialController({
+      stateStore,
+      openRouter,
+      credentials: {
+        async deleteSlot() { deletes += 1; return true; },
+      },
+      activationCoordinator: coordinator,
+      forgetJournal: journal,
+    });
+    const config = structuredClone(DEFAULT_CONFIG);
+    config.providerSetup = structuredClone(approved);
+    const runtime = new api.DefaultProviderRuntime(
+      openRouter,
+      {},
+      {
+        descriptor() { return { id: "openrouter", displayName: "OpenRouter", maturity: "stable" }; },
+        entries() { return []; },
+      },
+      stateStore,
+      { ensureRunnableRoute: () => approvedRoute },
+      coordinator,
+      { beginRun() { return () => undefined; } },
+      controller,
+      secret,
+      null,
+      approvedRoute.requestedModelId,
+      config,
+    );
+
+    const prompt = await runtime.execute({ kind: "logout", backendId: "openrouter" }, "plain");
+    const result = await runtime.execute({
+      kind: "logout",
+      backendId: "openrouter",
+      confirmationToken: prompt.confirmationToken,
+    }, "plain");
+
+    assert.equal(result.kind, "confirmation-required");
+    assert.notEqual(result.confirmationToken, prompt.confirmationToken);
+    assert.deepEqual(durable, replacement);
+    assert.equal(deletes, 0);
+    assert.equal(openRouter.hasKey, true);
+    assert.notEqual(await journal.readPending(), null);
+  });
+}
+
+test("targeted logout retains a shared-slot survivor's live credential and runnable route across restart", async () => {
+  const api = cliModule as typeof cliModule & {
+    DefaultProviderRuntime: new (...args: unknown[]) => {
+      execute(intent: Record<string, unknown>, surface: "plain"): Promise<Record<string, unknown>>;
+      adoptCredentialActivation(route: Record<string, unknown>, persisted: boolean, secret: string): void;
+      ensureRunnableRoute(): Record<string, unknown>;
+    };
+    ProviderCredentialForgetJournal: new (input: {
+      appHome: string;
+      privateStore: PrivateStore;
+    }) => unknown;
+    createProviderCredentialController(input: Record<string, unknown>): {
+      apply(intent: Record<string, unknown>): Promise<Record<string, unknown>>;
+    };
+  };
+  const root = await mkdtemp(join(tmpdir(), "orcode-provider-shared-live-"));
+  const slot = "v1:inference:88888888-8888-4888-8888-888888888888";
+  const route = {
+    ...bootstrapRoute("vendor/shared-live"),
+    accountFingerprint: "acct_shared_live_555555",
+  } as NonNullable<ProviderSetupStateV1["defaultRoute"]>;
+  const health = {
+    credential: "valid" as const,
+    connectivity: "connected" as const,
+    spend: "available" as const,
+    runtime: "ready" as const,
+    observedAt: 1,
+    generation: 7,
+  };
+  const connection = {
+    backendId: "openrouter" as const,
+    enabled: true,
+    maturity: "stable" as const,
+    credentialSlot: slot,
+    accountFingerprint: route.accountFingerprint,
+    accountFingerprintState: "verified" as const,
+    billingRealm: "openrouter-payg" as const,
+    lastHealth: health,
+  };
+  const initial: ProviderSetupStateV1 = {
+    schemaVersion: 1,
+    revision: 0,
+    lifecycle: "configured",
+    connections: [
+      { ...connection, id: "shared-selected" },
+      { ...connection, id: "shared-survivor" },
+    ],
+    defaultRoute: route,
+    cross: { enabled: false, preferredLead: null, preferredChallenger: null },
+  };
+  let durable = structuredClone(initial);
+  const stateStore = new ProviderStateStore(initial, {
+    persist: async (request) => {
+      request.assertCurrent();
+      const next = request.build(structuredClone(durable));
+      durable = structuredClone(next);
+      request.adopt(next);
+      return structuredClone(next);
+    },
+  });
+  const slots = new Map([[slot, `${STARTUP_KEY_PREFIX}${"s".repeat(48)}`]]);
+  let deletes = 0;
+  const openRouter = new OpenRouterService(slots.get(slot)!);
+  const coordinator = providerCoordinatorMutationFixture(providerRuntimeGuardFixture());
+  const journal = new api.ProviderCredentialForgetJournal({
+    appHome: root,
+    privateStore: new PrivateStore({ root }),
+  });
+  const controller = api.createProviderCredentialController({
+    stateStore,
+    openRouter,
+    credentials: {
+      async deleteSlot(reference: CredentialSlotRef) {
+        deletes += 1;
+        return slots.delete(reference.id);
+      },
+    },
+    activationCoordinator: coordinator,
+    forgetJournal: journal,
+  });
+  const registry = {
+    descriptor() { return { id: "openrouter", displayName: "OpenRouter", maturity: "stable" }; },
+    entries() {
+      return [{ id: "openrouter", displayName: "OpenRouter", maturity: "stable", connectable: true }];
+    },
+  };
+  const config = structuredClone(DEFAULT_CONFIG);
+  config.providerSetup = structuredClone(initial);
+  const runtime = new api.DefaultProviderRuntime(
+    openRouter,
+    {},
+    registry,
+    stateStore,
+    { ensureRunnableRoute() { throw new Error("session proof was discarded"); } },
+    coordinator,
+    { beginRun() { return () => undefined; } },
+    controller,
+    slots.get(slot),
+    null,
+    route.requestedModelId,
+    config,
+  );
+  runtime.adoptCredentialActivation(route as unknown as Record<string, unknown>, true, slots.get(slot)!);
+
+  const prompt = await runtime.execute({ kind: "logout", backendId: "openrouter" }, "plain");
+  const result = await runtime.execute({
+    kind: "logout",
+    backendId: "openrouter",
+    confirmationToken: prompt.confirmationToken,
+  }, "plain");
+
+  assert.equal(result.kind, "changed");
+  assert.equal(result.defaultCleared, false);
+  assert.equal(deletes, 0);
+  assert.equal(openRouter.hasKey, true);
+  assert.deepEqual(runtime.ensureRunnableRoute(), route);
+  const status = await runtime.execute({ kind: "status" }, "plain");
+  const provider = (status.providers as Array<Record<string, unknown>>)[0];
+  assert.equal(provider?.configuration, "enabled");
+  assert.equal(provider?.headline, "ready");
+  assert.equal(provider?.isDefault, true);
+  assert.equal(provider?.accountFingerprintSuffix, "…555555");
+  assert.deepEqual(durable.connections.map((candidate) => candidate.id), ["shared-survivor"]);
+  assert.equal(durable.connections[0]?.credentialSlot, slot);
+  assert.equal(slots.has(slot), true);
+
+  const restartedStore = new ProviderStateStore(durable);
+  assert.equal(restartedStore.read().defaultRoute?.canonicalModelId, route.canonicalModelId);
+  assert.equal(restartedStore.read().connections[0]?.enabled, true);
+  assert.equal(restartedStore.read().connections[0]?.credentialSlot, slot);
+});
+
 const STARTUP_KEY_PREFIX = `${["sk", "or", "v1"].join("-")}-`;
 
 function providerRuntimeGuardFixture() {

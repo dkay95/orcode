@@ -853,8 +853,17 @@ export class DefaultProviderRuntime implements ProviderRuntime {
     const expected = this.#providerConfirmations.get(token);
     this.#providerConfirmations.delete(token);
     if (!expected) return null;
-    const current = this.#confirmationBinding(operation, state);
-    return JSON.stringify(expected) === JSON.stringify(current) ? expected : null;
+    return this.#confirmationMatches(expected, operation, state) ? expected : null;
+  }
+
+  #confirmationMatches(
+    expected: ProviderConfirmationBinding,
+    operation: ProviderDestructiveOperation,
+    state: ProviderSetupStateV1,
+  ): boolean {
+    return JSON.stringify(expected) === JSON.stringify(
+      this.#confirmationBinding(operation, state),
+    );
   }
 
   async execute(
@@ -1035,68 +1044,82 @@ export class DefaultProviderRuntime implements ProviderRuntime {
       return this.#confirmationRequired(intent.kind, before);
     }
 
-    return this.activationCoordinator.runExclusive(
-      { signal: new AbortController().signal, inspectCommitted: false },
-      async (lease) => {
-        await lease.assertHeld();
-        const current = this.stateStore.read();
-        const authorization = intent.confirmationToken
-          ? this.#consumeConfirmation(intent.confirmationToken, intent.kind, current)
-          : null;
-        if (intent.confirmationToken && !authorization) {
-          return this.#confirmationRequired(intent.kind, current);
-        }
-        const selected = authorization?.connection
-          ? current.connections.find((candidate) =>
-              candidate.id === authorization.connection!.id
-              && candidate.backendId === "openrouter"
-              && candidate.enabled
-            )
-          : current.connections.find((candidate) =>
-              candidate.backendId === "openrouter" && candidate.enabled
-            );
-        const activeProcessRoute = !this.#sessionRoutePersisted
-            && this.#sessionRoute?.backendId === "openrouter"
-          ? this.#sessionRoute
-          : null;
-        if (!selected && !activeProcessRoute) {
-          return { kind: "unchanged", backendId: "openrouter", reason: "bereits deaktiviert" };
-        }
-        const next = selected
-          ? await this.stateStore.commit(current.revision, (authoritative) => ({
-              ...authoritative,
-              lifecycle: "configured",
-              connections: authoritative.connections.map((candidate) =>
-                candidate.id === selected.id ? { ...candidate, enabled: false } : candidate
-              ),
-              defaultRoute: authoritative.defaultRoute
-                && authoritative.defaultRoute.backendId === selected.backendId
-                && authoritative.defaultRoute.accountFingerprint === selected.accountFingerprint
-                && authoritative.defaultRoute.billingRealm === selected.billingRealm
-                ? null
-                : authoritative.defaultRoute,
-              cross: { enabled: false, preferredLead: null, preferredChallenger: null },
-            }))
-          : current;
-        await lease.assertHeld();
-        this.config.providerSetup = requirePersistableProviderState(next);
-        const defaultCleared = current.defaultRoute !== null && next.defaultRoute === null;
-        if (defaultCleared || activeProcessRoute) {
-          this.#processRouteGeneration += 1;
-          this.#sessionRoute = null;
-          this.#sessionRoutePersisted = false;
-          this.#preparedRoles = null;
-        }
-        await lease.assertHeld();
-        return {
-          kind: "changed",
-          operation: intent.kind,
-          backendId: "openrouter",
-          setupRequired: next.defaultRoute === null,
-          defaultCleared,
-        };
-      },
-    );
+    try {
+      return await this.activationCoordinator.runExclusive(
+        { signal: new AbortController().signal, inspectCommitted: false },
+        async (lease) => {
+          await lease.assertHeld();
+          const current = this.stateStore.read();
+          const authorization = intent.confirmationToken
+            ? this.#consumeConfirmation(intent.confirmationToken, intent.kind, current)
+            : null;
+          if (intent.confirmationToken && !authorization) {
+            return this.#confirmationRequired(intent.kind, current);
+          }
+          const mutationAuthority = authorization
+            ?? this.#confirmationBinding(intent.kind, current);
+          const selected = mutationAuthority.connection
+            ? current.connections.find((candidate) =>
+                candidate.id === mutationAuthority.connection!.id
+                && candidate.backendId === "openrouter"
+                && candidate.enabled
+              )
+            : current.connections.find((candidate) =>
+                candidate.backendId === "openrouter" && candidate.enabled
+              );
+          const activeProcessRoute = !this.#sessionRoutePersisted
+              && this.#sessionRoute?.backendId === "openrouter"
+            ? this.#sessionRoute
+            : null;
+          if (!selected && !activeProcessRoute) {
+            return { kind: "unchanged", backendId: "openrouter", reason: "bereits deaktiviert" };
+          }
+          const next = selected
+            ? await this.stateStore.commit(current.revision, (authoritative) => {
+                if (!this.#confirmationMatches(mutationAuthority, intent.kind, authoritative)) {
+                  throw new ProviderConfirmationStaleError(
+                    this.#confirmationRequired(intent.kind, authoritative),
+                  );
+                }
+                return {
+                  ...authoritative,
+                  lifecycle: "configured",
+                  connections: authoritative.connections.map((candidate) =>
+                    candidate.id === selected.id ? { ...candidate, enabled: false } : candidate
+                  ),
+                  defaultRoute: authoritative.defaultRoute
+                    && authoritative.defaultRoute.backendId === selected.backendId
+                    && authoritative.defaultRoute.accountFingerprint === selected.accountFingerprint
+                    && authoritative.defaultRoute.billingRealm === selected.billingRealm
+                    ? null
+                    : authoritative.defaultRoute,
+                  cross: { enabled: false, preferredLead: null, preferredChallenger: null },
+                };
+              })
+            : current;
+          await lease.assertHeld();
+          this.config.providerSetup = requirePersistableProviderState(next);
+          const defaultCleared = current.defaultRoute !== null && next.defaultRoute === null;
+          if (defaultCleared || activeProcessRoute) {
+            this.#processRouteGeneration += 1;
+            this.#sessionRoute = null;
+            this.#sessionRoutePersisted = false;
+            this.#preparedRoles = null;
+          }
+          await lease.assertHeld();
+          return {
+            kind: "changed",
+            operation: intent.kind,
+            backendId: "openrouter",
+            setupRequired: next.defaultRoute === null,
+            defaultCleared,
+          };
+        },
+      );
+    } catch (error) {
+      if (error instanceof ProviderConfirmationStaleError) return error.confirmation;
+      throw error;
+    }
   }
 
   async #logoutProvider(confirmationToken?: string): Promise<ProviderCommandResult> {
@@ -1117,6 +1140,14 @@ export class DefaultProviderRuntime implements ProviderRuntime {
             if (this.#consumeConfirmation(confirmationToken, "logout", current)) return true;
             throw new ProviderConfirmationStaleError(
               this.#confirmationRequired("logout", current),
+            );
+          },
+          onAuthoritativeMismatch: (rawState) => {
+            const authoritative = requirePersistableProviderState(
+              validateProviderSetupState(rawState),
+            );
+            throw new ProviderConfirmationStaleError(
+              this.#confirmationRequired("logout", authoritative),
             );
           },
           onForgotten: () => this.adoptCredentialForget(),
@@ -1452,10 +1483,12 @@ async function settleProviderCredentialForget(input: {
   };
   assertHeld?(): void | Promise<void>;
   onStatePublished?(state: ProviderSetupStateV1): void;
-}): Promise<{ cleanupPending: boolean; removed: boolean }> {
+  onAuthoritativeMismatch?(state: ProviderSetupStateV1): never;
+}): Promise<{ cleanupPending: boolean; removed: boolean; retained: boolean }> {
   await input.assertHeld?.();
   const { connectionId, target } = input.transaction.manifest;
   let state = input.stateStore.read();
+  let expectedAuthoritative = structuredClone(state);
   const connection = connectionId === null
     ? undefined
     : state.connections.find((candidate) => candidate.id === connectionId);
@@ -1465,6 +1498,11 @@ async function settleProviderCredentialForget(input: {
 
   if (targetMatches && (state.defaultRoute !== null || state.cross.enabled)) {
     state = await input.stateStore.commit(state.revision, (current) => {
+      assertProviderForgetAuthoritative(
+        current,
+        expectedAuthoritative,
+        input.onAuthoritativeMismatch,
+      );
       const remaining = current.connections.filter((candidate) => candidate.id !== connectionId);
       const defaultRoute = routeHasCommittedConnection(current.defaultRoute, remaining)
         ? current.defaultRoute
@@ -1485,6 +1523,7 @@ async function settleProviderCredentialForget(input: {
           : { enabled: false, preferredLead: null, preferredChallenger: null },
       };
     });
+    expectedAuthoritative = structuredClone(state);
     input.onStatePublished?.(state);
     await input.assertHeld?.();
   }
@@ -1495,15 +1534,21 @@ async function settleProviderCredentialForget(input: {
   );
   if (referenced) {
     if (targetMatches) {
-      state = await input.stateStore.commit(state.revision, (current) =>
-        stateWithoutForgottenConnection(current, connectionId)
-      );
+      state = await input.stateStore.commit(state.revision, (current) => {
+        assertProviderForgetAuthoritative(
+          current,
+          expectedAuthoritative,
+          input.onAuthoritativeMismatch,
+        );
+        return stateWithoutForgottenConnection(current, connectionId);
+      });
+      expectedAuthoritative = structuredClone(state);
       input.onStatePublished?.(state);
     }
     await input.assertHeld?.();
     await input.journal.complete(input.transaction);
     await input.assertHeld?.();
-    return { cleanupPending: false, removed: false };
+    return { cleanupPending: false, removed: false, retained: true };
   }
 
   let removed = false;
@@ -1514,22 +1559,38 @@ async function settleProviderCredentialForget(input: {
     } else if (input.credentials.delete) {
       removed = await input.credentials.delete("inference");
     } else {
-      return { cleanupPending: true, removed: false };
+      return { cleanupPending: true, removed: false, retained: false };
     }
     await input.assertHeld?.();
     await input.journal.markDeleted(input.transaction);
     await input.assertHeld?.();
   }
   if (targetMatches) {
-    state = await input.stateStore.commit(state.revision, (current) =>
-      stateWithoutForgottenConnection(current, connectionId)
-    );
+    state = await input.stateStore.commit(state.revision, (current) => {
+      assertProviderForgetAuthoritative(
+        current,
+        expectedAuthoritative,
+        input.onAuthoritativeMismatch,
+      );
+      return stateWithoutForgottenConnection(current, connectionId);
+    });
+    expectedAuthoritative = structuredClone(state);
     input.onStatePublished?.(state);
     await input.assertHeld?.();
   }
   await input.journal.complete(input.transaction);
   await input.assertHeld?.();
-  return { cleanupPending: false, removed };
+  return { cleanupPending: false, removed, retained: false };
+}
+
+function assertProviderForgetAuthoritative(
+  authoritative: ProviderSetupStateV1,
+  expected: ProviderSetupStateV1,
+  onMismatch?: (state: ProviderSetupStateV1) => never,
+): void {
+  if (JSON.stringify(authoritative) === JSON.stringify(expected)) return;
+  if (onMismatch) onMismatch(authoritative);
+  throw new Error("Provider credential cleanup requires authoritative recovery.");
 }
 
 function connectionReferencesForgetTarget(
@@ -1745,17 +1806,21 @@ export function createProviderCredentialController(input: {
                 credentials: input.credentials,
                 assertHeld: () => lease.assertHeld(),
                 onStatePublished: input.onInferenceStatePublished,
+                onAuthoritativeMismatch: intent.onAuthoritativeMismatch,
               });
               if (settled.cleanupPending) throw new Error("cleanup-pending");
               await lease.assertHeld();
-              input.openRouter.forgetKey();
-              await lease.assertHeld();
-              if (intent.onForgotten) intent.onForgotten();
-              else input.onInferenceForgotten?.();
+              if (!settled.retained) {
+                input.openRouter.forgetKey();
+                await lease.assertHeld();
+                if (intent.onForgotten) intent.onForgotten();
+                else input.onInferenceForgotten?.();
+              }
               return {
                 kind: "forgotten" as const,
                 credentialKind: "inference" as const,
                 removed: settled.removed,
+                retained: settled.retained,
               };
             },
           );
@@ -1855,7 +1920,8 @@ export async function persistProviderSetupState(
 ): Promise<ProviderSetupStateV1> {
   try {
     return await persistProviderSetupStateOwned(path, request);
-  } catch {
+  } catch (error) {
+    if (error instanceof ProviderConfirmationStaleError) throw error;
     throw new Error("Provider state publication failed.");
   }
 }

@@ -125,6 +125,7 @@ export type ProviderCredentialIntent =
       targetConnectionId?: string;
       targetCredentialSlot?: string;
       authorize?: () => boolean;
+      onAuthoritativeMismatch?: (state: unknown) => never;
       onForgotten?: () => void;
     };
 
@@ -134,6 +135,7 @@ export interface ProviderCredentialIntentPort {
     credentialKind: "inference" | "management";
     persisted?: boolean;
     removed?: boolean;
+    retained?: boolean;
     balance?: BalanceReport;
     credits?: CreditInfo;
   }>;
