@@ -147,6 +147,8 @@ function fixtureAuthority(
         kind: "available",
         value: await use(secret, {
           source: saved === null ? "environment" : "saved",
+          candidatePermit: Object.freeze({ version: 1 as const }),
+          async publishIfCurrent(publish) { publish(); },
           binding: {
             version: 1,
             stateRevision: 0,

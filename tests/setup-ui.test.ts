@@ -203,22 +203,25 @@ test("automatic setup carries one startup signal generation and target through c
   const surface = new ScriptedSurface(["openrouter", "cross-later"], ["sk-or-v1-test-key"], [MODEL.canonicalModelId], [true]);
   const context = fixture(surface);
   const controller = new AbortController();
+  const deadlineAt = Date.now() + 9_000;
 
   const result = await runSetupHub({
     ...context,
     surface,
     signal: controller.signal,
-    deadlineAt: 9_000,
+    deadlineAt,
     generation: 41,
     targetConnectionId: "connection-startup",
   });
 
   assert.deepEqual(result, { kind: "ready" });
-  assert.equal(context.adapter.connectRequest?.signal, controller.signal);
+  const scopedSignal = context.adapter.connectRequest?.signal;
+  assert.ok(scopedSignal);
+  assert.notEqual(scopedSignal, controller.signal);
   assert.equal(context.adapter.connectRequest?.generation, 41);
   assert.equal(context.adapter.connectRequest?.connectionId, "connection-startup");
-  assert.equal(context.adapter.modelRequest?.signal, controller.signal);
-  assert.equal(context.activations[0]?.signal, controller.signal);
+  assert.equal(context.adapter.modelRequest?.signal, scopedSignal);
+  assert.equal(context.activations[0]?.signal, scopedSignal);
   assert.equal(context.activations[0]?.generation, 41);
   assert.equal(context.activations[0]?.targetConnectionId, "connection-startup");
 });
@@ -226,29 +229,143 @@ test("automatic setup carries one startup signal generation and target through c
 test("startup abort revokes a connected candidate even when catalog ignores abort forever", async () => {
   const surface = new ScriptedSurface(["cross-later"]);
   const context = fixture(surface);
+  let catalogReached!: () => void;
+  const reached = new Promise<void>((resolve) => { catalogReached = resolve; });
   context.adapter.listModels = async (request) => {
     context.adapter.modelRequest = request;
     context.adapter.calls.push("models");
+    catalogReached();
     return new Promise<readonly BackendModelDescriptor[]>(() => undefined);
   };
   const controller = new AbortController();
-  void runSetupHub({
+  const deadlineAt = Date.now() + 8_000;
+  const attempt = runSetupHub({
     ...context,
     surface,
     environmentSecret: "sk-or-v1-test-key",
     signal: controller.signal,
-    deadlineAt: 8_000,
+    deadlineAt,
     generation: 42,
   });
-  await Promise.resolve();
-  await Promise.resolve();
+  await reached;
   assert.deepEqual(context.adapter.calls, ["connect", "models"]);
 
   controller.abort(new DOMException("startup timeout", "AbortError"));
-  await Promise.resolve();
-  await Promise.resolve();
+  assert.deepEqual(await attempt, { kind: "cancelled", mode: "setup-required" });
+  await new Promise<void>((resolve) => setImmediate(resolve));
 
   assert.deepEqual(context.adapter.calls, ["connect", "models", "discard"]);
+});
+
+test("startup cancellation settles a pending prompt and fences every late setup effect", async () => {
+  let releaseSecret!: () => void;
+  let secretReached!: () => void;
+  const reached = new Promise<void>((resolve) => { secretReached = resolve; });
+  const secret = new Promise<string>((resolve) => {
+    releaseSecret = () => resolve("sk-or-v1-late-prompt-key");
+  });
+  const surfaceEffects: string[] = [];
+  const surface: SetupSurface = {
+    async chooseHub() {
+      surfaceEffects.push("hub");
+      return "openrouter";
+    },
+    async readSecret() {
+      surfaceEffects.push("secret");
+      secretReached();
+      return secret;
+    },
+    async chooseModel() {
+      surfaceEffects.push("model");
+      return MODEL.canonicalModelId;
+    },
+    async confirm() {
+      surfaceEffects.push("confirm");
+      return true;
+    },
+    present() { surfaceEffects.push("present"); },
+  };
+  const context = fixture(surface);
+  const controller = new AbortController();
+  const attempt = runSetupHub({
+    ...context,
+    surface,
+    signal: controller.signal,
+    deadlineAt: Date.now() + 5_000,
+    generation: 43,
+  });
+  await reached;
+  controller.abort(new DOMException("fixed outer startup cancellation", "AbortError"));
+
+  const settledAfterAbort = await Promise.race([
+    attempt.then(() => "settled" as const),
+    new Promise<"still-pending">((resolve) => {
+      setTimeout(() => resolve("still-pending"), 50);
+    }),
+  ]);
+  releaseSecret();
+  const result = await attempt;
+  await new Promise<void>((resolve) => setImmediate(resolve));
+
+  assert.equal(settledAfterAbort, "settled");
+  assert.deepEqual(result, { kind: "cancelled", mode: "setup-required" });
+  assert.deepEqual(surfaceEffects, ["hub", "secret"]);
+  assert.deepEqual(context.adapter.calls, []);
+  assert.equal(context.activations.length, 0);
+});
+
+test("startup deadline settles a pending prompt and fences every late setup effect", async () => {
+  let releaseSecret!: () => void;
+  let secretReached!: () => void;
+  const reached = new Promise<void>((resolve) => { secretReached = resolve; });
+  const secret = new Promise<string>((resolve) => {
+    releaseSecret = () => resolve("sk-or-v1-late-deadline-key");
+  });
+  const surfaceEffects: string[] = [];
+  const surface: SetupSurface = {
+    async chooseHub() {
+      surfaceEffects.push("hub");
+      return "openrouter";
+    },
+    async readSecret() {
+      surfaceEffects.push("secret");
+      secretReached();
+      return secret;
+    },
+    async chooseModel() {
+      surfaceEffects.push("model");
+      return MODEL.canonicalModelId;
+    },
+    async confirm() {
+      surfaceEffects.push("confirm");
+      return true;
+    },
+    present() { surfaceEffects.push("present"); },
+  };
+  const context = fixture(surface);
+  const attempt = runSetupHub({
+    ...context,
+    surface,
+    deadlineAt: Date.now() + 50,
+    generation: 44,
+  });
+  await reached;
+
+  const settledAtDeadline = await Promise.race([
+    attempt.then(() => "settled" as const),
+    new Promise<"still-pending">((resolve) => {
+      setTimeout(() => resolve("still-pending"), 500);
+    }),
+  ]);
+  releaseSecret();
+  const result = await attempt;
+  await new Promise<void>((resolve) => setImmediate(resolve));
+
+  assert.equal(settledAtDeadline, "settled");
+  assert.deepEqual(result, { kind: "cancelled", mode: "setup-required" });
+  assert.deepEqual(surfaceEffects, ["hub", "secret"]);
+  assert.deepEqual(context.adapter.calls, []);
+  assert.equal(context.activations.length, 0);
 });
 
 test("hub keeps exactly one setup prompt active at a time", async () => {

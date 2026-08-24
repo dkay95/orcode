@@ -55,6 +55,55 @@ export interface ProviderStateCommitRequest {
   adopt(committed: ProviderSetupStateV1): void;
 }
 
+const durableCommitAdopters = new WeakMap<
+  ProviderStateCommitRequest,
+  (committed: ProviderSetupStateV1) => void
+>();
+const durableCommitOutcomes = new WeakMap<object, ProviderSetupStateV1>();
+
+/**
+ * Reports an exact durable candidate that was already adopted before a later
+ * persistence-owner failure rejected. Callers must complete that committed
+ * tuple instead of attempting rollback or runtime cleanup.
+ */
+class ProviderStateCommitAdoptedError extends Error {
+  constructor(committed: ProviderSetupStateV1) {
+    super("Provider state commit completed before persistence ownership settled.");
+    this.name = "ProviderStateCommitAdoptedError";
+    durableCommitOutcomes.set(this, structuredClone(committed));
+  }
+}
+
+export function readProviderStateCommitAdoption(
+  error: unknown,
+): ProviderSetupStateV1 | null {
+  if (
+    error === null
+    || (typeof error !== "object" && typeof error !== "function")
+  ) return null;
+  const committed = durableCommitOutcomes.get(error);
+  return committed ? structuredClone(committed) : null;
+}
+
+/**
+ * Completes adoption only for an exact request issued by ProviderStateStore.
+ * The WeakMap-held capability is unavailable to structurally forged requests;
+ * the ordinary fallback retains the public persistence callback contract but
+ * cannot override a stale fence after durable publication.
+ */
+export function adoptDurablyCommittedProviderState(
+  request: ProviderStateCommitRequest,
+  committed: ProviderSetupStateV1,
+): void {
+  const adoptCommitted = durableCommitAdopters.get(request);
+  if (adoptCommitted) {
+    adoptCommitted(committed);
+    return;
+  }
+  request.assertCurrent();
+  request.adopt(committed);
+}
+
 export interface ProviderStateStoreOptions {
   /**
    * Durable implementations run this request under their exact providerSetup
@@ -332,19 +381,55 @@ export class ProviderStateStore {
       }
     };
 
+    const adoptCommitted = (committed: ProviderSetupStateV1): void => {
+      assertCapabilityOpen();
+      let interrupted = false;
+      try {
+        if (adoptedCandidate) throw new Error("Provider state CAS may adopt exactly once.");
+        if (protocolInvalid || buildCalls !== 1 || !builtCandidate) {
+          throw new Error("Provider state CAS must build exactly once before adoption.");
+        }
+        this.#assertExpectedRevision(expectedRevision);
+        try {
+          assertCurrent();
+        } catch {
+          interrupted = true;
+        }
+        const validated = requirePersistableProviderState(
+          validateProviderSetupState(committed),
+        );
+        if (validated.revision !== expectedRevision + 1) {
+          throw new Error("Provider state CAS returned an invalid committed revision.");
+        }
+        if (JSON.stringify(validated) !== JSON.stringify(builtCandidate)) {
+          throw new Error("Provider state CAS may adopt only its exact built candidate.");
+        }
+        this.#state = structuredClone(validated);
+        adoptedCandidate = structuredClone(validated);
+      } catch (error) {
+        if (!interrupted || !adoptedCandidate) protocolInvalid = true;
+        throw error;
+      }
+      if (interrupted) {
+        throw new ProviderStateCommitAdoptedError(adoptedCandidate);
+      }
+    };
+
     if (!this.#persist) {
       const candidate = buildCandidate(this.read());
       adopt(candidate);
       return this.read();
     }
 
+    const request: ProviderStateCommitRequest = {
+      expectedRevision,
+      build: buildCandidate,
+      assertCurrent: assertCurrentCapability,
+      adopt,
+    };
+    durableCommitAdopters.set(request, adoptCommitted);
     try {
-      const returned = await this.#persist({
-        expectedRevision,
-        build: buildCandidate,
-        assertCurrent: assertCurrentCapability,
-        adopt,
-      });
+      const returned = await this.#persist(request);
       if (
         protocolInvalid
         || buildCalls !== 1
@@ -365,15 +450,19 @@ export class ProviderStateStore {
       }
       return this.read();
     } catch (error) {
-      if (
-        protocolInvalid
-        && adoptedCandidate
+      const exactAdoption = adoptedCandidate
         && JSON.stringify(this.#state) === JSON.stringify(adoptedCandidate)
-      ) {
+        ? adoptedCandidate
+        : null;
+      if (protocolInvalid && exactAdoption) {
         this.#state = structuredClone(stateBeforeCommit);
+      }
+      if (!protocolInvalid && exactAdoption) {
+        throw new ProviderStateCommitAdoptedError(exactAdoption);
       }
       throw error;
     } finally {
+      durableCommitAdopters.delete(request);
       capabilitiesOpen = false;
     }
   }

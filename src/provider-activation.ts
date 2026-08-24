@@ -289,7 +289,7 @@ export class ProviderActivationCoordinator {
           ? recovery.error
           : new ProviderActivationRecoveryRequiredError();
       }
-      await this.#assertMutationAllowed(providerLease, runtimeLease, true);
+      await this.#assertMutationAllowed(providerLease, runtimeLease, true, request.signal);
       const preflight = await readConfigFacts(this.#options.configPath);
       if (preflight.kind !== "valid" && preflight.kind !== "absent") {
         throw new ProviderActivationRecoveryRequiredError("provider-config-unreadable");
@@ -300,7 +300,7 @@ export class ProviderActivationCoordinator {
       ) {
         throw new StaleProviderGenerationError();
       }
-      await this.#assertMutationAllowed(providerLease, runtimeLease, true);
+      await this.#assertMutationAllowed(providerLease, runtimeLease, true, request.signal);
       const normalized = normalizeProviderSecret(request.candidate);
       const candidate = await this.#connectCandidate(
         normalized,
@@ -310,7 +310,8 @@ export class ProviderActivationCoordinator {
       );
       initialCandidateId = candidate.candidateId;
       await this.#boundary("candidate-validated");
-      await this.#assertMutationAllowed(providerLease, runtimeLease, true);
+      await this.#assertMutationAllowed(providerLease, runtimeLease, true, request.signal);
+      assertNoRetainedIdentityCollision(preflight.state, candidate);
       const models = await this.#listModels(candidate.candidateId, request.signal);
       await this.#boundary("models-loaded");
       const selectedModel = selectExplicitModel(
@@ -322,7 +323,7 @@ export class ProviderActivationCoordinator {
       await this.#boundary("model-selected");
 
       if (request.persistence === "process-only") {
-        await this.#assertMutationAllowed(providerLease, runtimeLease, true);
+        await this.#assertMutationAllowed(providerLease, runtimeLease, true, request.signal);
         const activated = await this.#activateRuntime(
           candidate.candidateId,
           selectedModel,
@@ -358,6 +359,7 @@ export class ProviderActivationCoordinator {
         );
       }
       await this.#assertFence(providerLease);
+      assertNoRetainedIdentityCollision(current, candidate);
       let candidateSlot: CredentialSlotRef;
       try {
         candidateSlot = this.#options.credentials.reserveSlot("inference");
@@ -394,12 +396,12 @@ export class ProviderActivationCoordinator {
         expectedProviderSetupSha256: configFacts.digest,
         candidateProviderSetupSha256: providerSetupDigest(nextState),
       };
-      await this.#assertMutationAllowed(providerLease, runtimeLease, true);
+      await this.#assertMutationAllowed(providerLease, runtimeLease, true, request.signal);
       transaction = await this.#createJournal(manifest, providerLease);
       await this.#boundary("journal-written");
 
       try {
-        await this.#assertMutationAllowed(providerLease, runtimeLease, true);
+        await this.#assertMutationAllowed(providerLease, runtimeLease, true, request.signal);
         await this.#options.credentials.writeSlot(candidateSlot, normalized);
         await this.#assertFence(providerLease);
         await this.#boundary("slot-written");
@@ -445,7 +447,7 @@ export class ProviderActivationCoordinator {
             "Provider credential persistence failed without changing the active route.",
           );
         }
-        await this.#assertMutationAllowed(providerLease, runtimeLease, true);
+        await this.#assertMutationAllowed(providerLease, runtimeLease, true, request.signal);
         const activated = await this.#activateRuntime(
           candidate.candidateId,
           selectedModel,
@@ -464,7 +466,7 @@ export class ProviderActivationCoordinator {
       }
 
       manifest.phase = "credential-staged";
-      await this.#assertMutationAllowed(providerLease, runtimeLease, true);
+      await this.#assertMutationAllowed(providerLease, runtimeLease, true, request.signal);
       await this.#writeJournal(transaction, manifest, providerLease);
       await this.#assertFence(providerLease);
       let publication: "candidate" | "old" | "ambiguous";
@@ -490,11 +492,17 @@ export class ProviderActivationCoordinator {
             await assertRuntimeLease(runtimeLease);
             await ownership.assertHeld();
             try {
-              await this.#assertMutationAllowed(providerLease!, runtimeLease, true);
+              await this.#assertMutationAllowed(
+                providerLease!,
+                runtimeLease,
+                true,
+                request.signal,
+              );
               await this.#options.writeConfigAtomic(
                 ownership.canonicalPath,
                 nextRaw,
                 async () => {
+                  throwIfAborted(request.signal);
                   await ownership.assertHeld();
                   await this.#assertFence(providerLease!);
                   await assertRuntimeLease(runtimeLease);
@@ -503,6 +511,7 @@ export class ProviderActivationCoordinator {
                     beforeSave.target,
                   );
                   await ownership.assertHeld();
+                  throwIfAborted(request.signal);
                 },
               );
             } catch {
@@ -569,15 +578,15 @@ export class ProviderActivationCoordinator {
       }
       await this.#boundary("config-readback");
       manifest.phase = "config-committed";
-      await this.#assertMutationAllowed(providerLease, runtimeLease, true);
+      await this.#assertMutationAllowed(providerLease, runtimeLease, true, request.signal);
       await this.#writeJournal(transaction, manifest, providerLease);
-      await this.#assertMutationAllowed(providerLease, runtimeLease, true);
+      await this.#assertMutationAllowed(providerLease, runtimeLease, true, request.signal);
       try {
         this.#options.stateStore.replace(nextState, current.revision);
       } catch {
         throw new ProviderActivationRecoveryRequiredError("provider-state-adoption-failed");
       }
-      await this.#assertMutationAllowed(providerLease, runtimeLease, true);
+      await this.#assertMutationAllowed(providerLease, runtimeLease, true, request.signal);
       let activated: CandidateProviderState;
       try {
         activated = await this.#activateRuntime(
@@ -603,7 +612,7 @@ export class ProviderActivationCoordinator {
       if (!oldCleaned) warnings.push("provider-candidate-cleanup-retained");
       await this.#boundary("old-slot-cleaned");
       if (oldCleaned) {
-        await this.#assertMutationAllowed(providerLease, runtimeLease, true);
+        await this.#assertMutationAllowed(providerLease, runtimeLease, true, request.signal);
         await this.#removeJournal(transaction, providerLease);
         transaction = null;
       }
@@ -726,8 +735,11 @@ export class ProviderActivationCoordinator {
     try {
       providerLease = await this.#acquireProviderLease(request.signal);
       const assertHeld = async () => {
+        throwIfAborted(request.signal);
         await this.#assertFence(providerLease!);
+        throwIfAborted(request.signal);
         await this.#assertNoPendingCredentialForget(providerLease!);
+        throwIfAborted(request.signal);
         await this.#assertFence(providerLease!);
         if ((await this.#readAllJournals()).length !== 0) {
           throw new ProviderActivationRecoveryRequiredError(
@@ -735,10 +747,12 @@ export class ProviderActivationCoordinator {
           );
         }
         await this.#assertFence(providerLease!);
+        throwIfAborted(request.signal);
       };
       const lease: ProviderAuthorityReadLease = { assertHeld };
       await lease.assertHeld();
       const value = await operation(lease);
+      throwIfAborted(request.signal);
       await lease.assertHeld();
       return value;
     } catch (error) {
@@ -796,6 +810,7 @@ export class ProviderActivationCoordinator {
           providerLease!,
           runtimeLease,
           rejectPendingForget,
+          request.signal,
         ),
       };
       await coordinatorLease.assertHeld();
@@ -1147,14 +1162,21 @@ export class ProviderActivationCoordinator {
     lease: HeldProviderLease,
     runtimeLease: ProviderActivationRuntimeLease,
     rejectPendingForget: boolean,
+    signal: AbortSignal,
   ): Promise<void> {
+    throwIfAborted(signal);
     await assertRuntimeLease(runtimeLease);
+    throwIfAborted(signal);
     await this.#assertFence(lease);
+    throwIfAborted(signal);
     if (rejectPendingForget) {
       await this.#assertNoPendingCredentialForget(lease);
+      throwIfAborted(signal);
       await this.#assertFence(lease);
     }
+    throwIfAborted(signal);
     await assertRuntimeLease(runtimeLease);
+    throwIfAborted(signal);
   }
 
   async #assertNoPendingCredentialForget(lease: HeldProviderLease): Promise<void> {
@@ -1477,6 +1499,25 @@ function buildNextState(
     );
   }
   return validated;
+}
+
+function assertNoRetainedIdentityCollision(
+  state: ProviderSetupStateV1,
+  candidate: ProviderCandidate,
+): void {
+  if (!candidate.accountFingerprint) return;
+  const collision = state.connections.some((connection) =>
+    connection.id !== candidate.connectionId
+    && connection.backendId === candidate.backendId
+    && connection.accountFingerprint === candidate.accountFingerprint
+    && connection.billingRealm === candidate.billingRealm
+  );
+  if (collision) {
+    throw new ProviderActivationError(
+      "provider-connection-identity-collision",
+      "Provider connection identity is already retained.",
+    );
+  }
 }
 
 function previousSlotFromState(

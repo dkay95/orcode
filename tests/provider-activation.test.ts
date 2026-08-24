@@ -28,6 +28,7 @@ import type {
   CredentialSlotRef,
   VersionedCredentialStoreLike,
 } from "../src/credentials.js";
+import { ProviderCredentialAuthority } from "../src/provider-authority.js";
 
 const OLD_SLOT: CredentialSlotRef = Object.freeze({
   version: 1,
@@ -2102,6 +2103,201 @@ test("process-only activation reports the exact lost fence when ownership change
   assert.ok(error instanceof fixture.api.ProviderActivationRecoveryRequiredError);
   assert.equal(error.code, "provider-lease-fence-lost");
   assert.equal(fixture.runtimeGuard.releaseCalls, 1);
+});
+
+test("deadline and abort release authority ownership and block late publication", async (t) => {
+  await t.test("hung credential read releases the real coordinator for an immediate retry", async () => {
+    const fixture = await activationFixture();
+    const originalReadSlot = fixture.credentials.readSlot.bind(fixture.credentials);
+    let firstRead = true;
+    let reached!: () => void;
+    const readReached = new Promise<void>((resolve) => { reached = resolve; });
+    fixture.credentials.readSlot = async (slot) => {
+      if (firstRead) {
+        firstRead = false;
+        reached();
+        return new Promise<string | null>(() => undefined);
+      }
+      return originalReadSlot(slot);
+    };
+    const authority = new ProviderCredentialAuthority({
+      stateStore: fixture.stateStore,
+      credentials: fixture.credentials,
+      environment: {},
+      coordinator: () => fixture.coordinator(),
+      now: () => 10_000,
+    });
+    const controller = new AbortController();
+    const reason = new DOMException("fixed authority cancellation", "AbortError");
+    const first = authority.withCredential({
+      connectionId: CONNECTION_ID,
+      credentialKind: "inference",
+      purpose: "startup-inspect",
+      environmentEligibility: "forbidden",
+      deadlineAt: 15_000,
+      signal: controller.signal,
+    }, async () => "must-not-run");
+    await readReached;
+    controller.abort(reason);
+
+    const firstSettlement = await Promise.race([
+      first.then(
+        () => "fulfilled" as const,
+        (error: unknown) => error === reason ? "aborted" as const : "wrong-error" as const,
+      ),
+      new Promise<"still-held">((resolve) => setTimeout(() => resolve("still-held"), 100)),
+    ]);
+    assert.equal(firstSettlement, "aborted");
+
+    const second = await authority.withCredential({
+      connectionId: CONNECTION_ID,
+      credentialKind: "inference",
+      purpose: "startup-inspect",
+      environmentEligibility: "forbidden",
+      deadlineAt: 15_000,
+      signal: new AbortController().signal,
+    }, async (secret) => secret);
+    assert.deepEqual(second, { kind: "available", value: OLD_SECRET });
+  });
+
+  await t.test("absolute deadline releases an abort-ignoring credential read", async () => {
+    const fixture = await activationFixture();
+    const originalReadSlot = fixture.credentials.readSlot.bind(fixture.credentials);
+    let firstRead = true;
+    let reached!: () => void;
+    const readReached = new Promise<void>((resolve) => { reached = resolve; });
+    fixture.credentials.readSlot = async (slot) => {
+      if (firstRead) {
+        firstRead = false;
+        reached();
+        return new Promise<string | null>(() => undefined);
+      }
+      return originalReadSlot(slot);
+    };
+    const authority = new ProviderCredentialAuthority({
+      stateStore: fixture.stateStore,
+      credentials: fixture.credentials,
+      environment: {},
+      coordinator: () => fixture.coordinator(),
+      now: Date.now,
+    });
+    const first = authority.withCredential({
+      connectionId: CONNECTION_ID,
+      credentialKind: "inference",
+      purpose: "startup-inspect",
+      environmentEligibility: "forbidden",
+      deadlineAt: Date.now() + 25,
+      signal: new AbortController().signal,
+    }, async () => "must-not-run");
+    await readReached;
+
+    const firstSettlement = await Promise.race([
+      first.then((result) => result.kind),
+      new Promise<"still-held">((resolve) => setTimeout(() => resolve("still-held"), 100)),
+    ]);
+    assert.equal(firstSettlement, "stale");
+
+    const second = await authority.withCredential({
+      connectionId: CONNECTION_ID,
+      credentialKind: "inference",
+      purpose: "startup-inspect",
+      environmentEligibility: "forbidden",
+      deadlineAt: Date.now() + 1_000,
+      signal: new AbortController().signal,
+    }, async (secret) => secret);
+    assert.deepEqual(second, { kind: "available", value: OLD_SECRET });
+  });
+
+  await t.test("abort immediately before config publication cannot publish config or provider state", async () => {
+    const fixture = await activationFixture();
+    const beforeConfig = await readFile(fixture.path, "utf8");
+    const beforeState = fixture.stateStore.read();
+    const controller = new AbortController();
+    const reason = new DOMException("fixed pre-publication cancellation", "AbortError");
+    const coordinator = new fixture.api.ProviderActivationCoordinator({
+      appHome: fixture.appHome,
+      configPath: fixture.path,
+      privateStore: fixture.privateStore,
+      credentials: fixture.credentials,
+      adapter: fixture.adapter,
+      stateStore: fixture.stateStore,
+      runtimeGuard: fixture.runtimeGuard,
+      now: () => 10_000,
+      createUuid: sequentialUuid(),
+      leaseDurationMs: 100,
+      writeConfigAtomic: async (path: string, content: string, beforePublish?: () => Promise<void>) => {
+        controller.abort(reason);
+        await beforePublish?.();
+        await writeFileAtomicSecure(path, content);
+      },
+    });
+
+    await assert.rejects(coordinator.activate({ ...fixture.request, signal: controller.signal }));
+
+    assert.equal(await readFile(fixture.path, "utf8"), beforeConfig);
+    assert.deepEqual(fixture.stateStore.read(), beforeState);
+    assert.deepEqual(fixture.adapter.runtimeRoute, oldRoute());
+  });
+});
+
+test("targeted replacement rejects duplicate account realm identity in both connection orders", async (t) => {
+  for (const order of ["retained-first", "target-first"] as const) {
+    await t.test(order, async () => {
+      const fixture = await activationFixture();
+      const target = fixture.oldState.connections[0]!;
+      const retained = {
+        ...structuredClone(target),
+        id: "connection-openrouter-retained",
+        credentialSlot: FOREIGN_SLOT.id,
+        accountFingerprint: NEW_FINGERPRINT,
+      };
+      const twoConnectionState: ProviderSetupStateV1 = {
+        ...fixture.oldState,
+        connections: order === "retained-first"
+          ? [retained, target]
+          : [target, retained],
+      };
+      const authoritativeState = fixture.stateStore.replace(
+        twoConnectionState,
+        fixture.oldState.revision,
+      );
+      await writeFile(
+        fixture.path,
+        `${JSON.stringify({
+          ...fixture.initialConfig,
+          providerSetup: authoritativeState,
+        }, null, 2)}\n`,
+        "utf8",
+      );
+      fixture.credentials.calls.length = 0;
+      fixture.adapter.calls.length = 0;
+      const beforeConfig = await readFile(fixture.path, "utf8");
+      const beforeState = fixture.stateStore.read();
+      const beforeSlots = new Map(fixture.credentials.slots);
+      const beforeRuntime = structuredClone(fixture.adapter.runtimeRoute);
+
+      await assert.rejects(
+        fixture.coordinator().activate({
+          ...fixture.request,
+          expectedRevision: authoritativeState.revision,
+          targetConnectionId: CONNECTION_ID,
+        }),
+        (error: unknown) => (
+          typeof error === "object"
+          && error !== null
+          && "code" in error
+          && error.code === "provider-connection-identity-collision"
+        ),
+      );
+
+      assert.equal(await readFile(fixture.path, "utf8"), beforeConfig);
+      assert.deepEqual(fixture.stateStore.read(), beforeState);
+      assert.deepEqual(fixture.credentials.slots, beforeSlots);
+      assert.deepEqual(fixture.adapter.runtimeRoute, beforeRuntime);
+      assert.equal(fixture.credentials.calls.includes("reserveSlot"), false);
+      assert.deepEqual(fixture.adapter.calls, ["connect", "discardCandidate"]);
+    });
+  }
 });
 
 function providerState(

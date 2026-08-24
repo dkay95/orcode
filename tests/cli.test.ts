@@ -43,6 +43,7 @@ import type { CredentialSlotRef, CredentialStoreLike } from "../src/credentials.
 import {
   migrateLegacyOpenRouterState,
   ProviderStateStore,
+  readProviderStateCommitAdoption,
   type ProviderConnectionStateV1,
   type ProviderSetupStateV1,
   type ProviderStateCommitRequest,
@@ -3978,6 +3979,52 @@ test("startup durable provider commits preserve every unrelated config byte unde
   assert.equal(await readFile(path, "utf8"), expectedRaw);
   assert.deepEqual(committed, after);
   assert.deepEqual(adopted, after);
+});
+
+test("post-readback cancellation adopts the exact committed provider state without a half tuple", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "orcode-provider-state-post-readback-"));
+  const path = join(directory, "config.json");
+  const before = new ProviderStateStore(DEFAULT_CONFIG.providerSetup).read();
+  const config = structuredClone(DEFAULT_CONFIG);
+  config.providerSetup = structuredClone(before);
+  await saveConfig(config, path);
+  let postReadbackCancellations = 0;
+  const store = new ProviderStateStore(before, {
+    persist: (request) => cliModule.persistProviderSetupState(path, request),
+  });
+
+  const outcome = await store.commit(
+    before.revision,
+    (current) => ({ ...current, lifecycle: "cancelled" }),
+    () => {
+      const durable = (JSON.parse(readFileSync(path, "utf8")) as {
+        providerSetup: ProviderSetupStateV1;
+      }).providerSetup;
+      if (durable.revision === before.revision + 1) {
+        postReadbackCancellations += 1;
+        const expired = new Error("fixed post-readback provider deadline");
+        expired.name = "TimeoutError";
+        throw expired;
+      }
+    },
+  ).then(
+    (state) => ({ kind: "ready" as const, state }),
+    (error: unknown) => ({
+      kind: "committed" as const,
+      state: readProviderStateCommitAdoption(error),
+    }),
+  );
+
+  const durable = (JSON.parse(await readFile(path, "utf8")) as {
+    providerSetup: ProviderSetupStateV1;
+  }).providerSetup;
+  assert.equal(postReadbackCancellations, 1);
+  assert.equal(outcome.kind, "committed");
+  assert.ok(outcome.state, "an exact committed outcome must survive late cancellation");
+  assert.deepEqual(outcome.state, durable);
+  assert.deepEqual(store.read(), durable);
+  assert.equal(durable.lifecycle, "cancelled");
+  assert.equal(durable.revision, before.revision + 1);
 });
 
 test("versioned inference replace and forget leave one restart-atomic provider tuple", async () => {

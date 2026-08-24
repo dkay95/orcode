@@ -57,6 +57,10 @@ export interface BackendAdapter {
   readonly backendId: BackendId;
   inspect(request: ProviderInspectionRequest): Promise<ProviderInspection>;
   connect(request: { connectionId?: string; candidate: unknown; generation: number; signal: AbortSignal }): Promise<ProviderCandidate>;
+  connectUnderAuthorityLease?(
+    request: { connectionId?: string; candidate: unknown; generation: number; signal: AbortSignal },
+    lease: { assertHeld(): Promise<void> },
+  ): Promise<ProviderCandidate>;
   listModels(request: { connectionId?: string; candidateId?: string; signal: AbortSignal }): Promise<readonly BackendModelDescriptor[]>;
   activate(request: { candidateId: string; model: BackendModelDescriptor; signal: AbortSignal }): Promise<CandidateProviderState>;
   reconnect(request: ProviderInspectionRequest): Promise<ProviderInspection>;

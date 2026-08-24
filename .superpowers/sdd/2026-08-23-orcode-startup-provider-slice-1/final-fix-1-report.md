@@ -227,3 +227,146 @@ Evidence:
 - `.superpowers/sdd/2026-08-23-orcode-startup-provider-slice-1/final-fix-1-report.md`
 
 Exact commit subject: `fix: centralize provider credential authority`.
+
+## Final Fix 1 re-review addendum — manual deadline and durable adoption
+
+This addendum was completed on the frozen, intentionally uncommitted Fix 1
+worktree at `HEAD` `8d17a0c11f12efc5e8d3a9534e94ec2df113fc6d`.
+No existing change was reset or rewritten, and no commit was created.
+
+### Pre-change freeze and formal RED
+
+- `git diff -- src tests` SHA-256:
+  `24a7feba74dca5e82d6a8cdb3992124d6d1be9a1dce7a06a1b9a50ea861d0c24`.
+- `git diff -- src` SHA-256:
+  `72a9d14f6b50a072103df893c36d2e3b519c876ab8c9d3a6cbfe161b8c151fb1`.
+- After adding only the two regression tests, the source-only hash remained
+  exactly `72a9d14f6b50a072103df893c36d2e3b519c876ab8c9d3a6cbfe161b8c151fb1`.
+- The exact focused RED reached 2 tests: 0 passed, 2 failed, 0 skipped:
+  - `manual saved setup authority expiry aborts hub and forbids late activation`
+  - `post-readback cancellation adopts the exact committed provider state without a half tuple`
+- Both failures were the required behavioral failures: the late manual model
+  prompt performed one activation plus two presentations after settlement,
+  and the durable file held the new revision while the in-memory store exposed
+  no exact committed outcome.
+
+### Central correction
+
+- Independent manual setup now owns one abort controller and absolute 8-second
+  deadline. That same signal/deadline is threaded through saved-credential
+  authority, candidate authority, and `runSetupHub`; settlement aborts the
+  owner so an already-detached prompt cannot publish later effects. Startup
+  attempts continue to use their existing caller-owned signal, deadline, and
+  generation.
+- Exact durable config readback now invokes a `ProviderStateStore`-issued
+  WeakMap capability. A structurally forged request receives only the ordinary
+  checked adoption path. The genuine post-readback path rechecks currentness,
+  adopts only the byte-exact built candidate even when that final check reports
+  late cancellation, and returns the existing private typed committed outcome
+  without preserving or exposing the raw cancellation cause.
+- Existing retained-enable handling consumes that typed outcome into the full
+  State/Config/Runtime tuple; the pre-existing retained-enable adopted-outcome,
+  wrong-readback, post-commit-fence, and runtime-bind ordering tests remained
+  green.
+
+### GREEN and final freeze
+
+- Exact two-test GREEN: 2/2 passed, 0 failed, 0 skipped.
+- Direct serial focus (`cli`, provider authority, provider state): 203/203
+  passed, 0 failed, 0 skipped.
+- Serial affected provider focus (authority/state/backends/adapter/activation,
+  setup/UI, CLI/entrypoint, integration, credentials/config, commands/catalog,
+  sessions, privacy, and real provider PTY): 685/685 passed, 0 failed, 0
+  skipped.
+- `npx tsc -p tsconfig.json --noEmit`: PASS.
+- `npx tsc -p tsconfig.tests.json --noEmit`: PASS.
+- `node --import tsx scripts/render-command-docs.ts --check`: PASS.
+- Provider privacy: 3/3 passed, 0 failed, 0 skipped.
+- `git diff --check`: PASS.
+- Approved Spec SHA-256 remained
+  `e15d19821fafbac1f0fc21dd82702d41efa481a12bdcee97df238de2ee85f021`.
+- Approved Plan SHA-256 remained
+  `74914bc2e38c1ac7bb8b57dbfa0abfb1963d4da7acc3fbb6868434039ce22b2c`.
+- Final `git diff -- src tests` SHA-256:
+  `1dcf8527b08685d82e064845cfb014a1cb444d3a8925ab9c381b30a3850baf82`.
+- Final `git diff -- src` SHA-256:
+  `8b4b428ba6a8b921b1568376691050f1a7eba9daceaeaf2d85e43c7f919df391`.
+
+Files changed by this addendum only:
+
+- `src/cli.ts`
+- `src/provider-state.ts`
+- `tests/provider-authority.test.ts`
+- `tests/cli.test.ts`
+- this report
+
+No global/full `npm test` was run, per the re-review constraint.
+
+## Final Fix 1 delta — terminal retained commit and unforgeable outcome
+
+This final delta was completed on the frozen, intentionally uncommitted Fix 1
+worktree at `HEAD` `8d17a0c11f12efc5e8d3a9534e94ec2df113fc6d`.
+No existing change was reset or rewritten, and no commit was created.
+
+### Pre-change freeze and formal RED
+
+- `git diff -- src tests` SHA-256:
+  `1dcf8527b08685d82e064845cfb014a1cb444d3a8925ab9c381b30a3850baf82`.
+- `git diff -- src` SHA-256:
+  `8b4b428ba6a8b921b1568376691050f1a7eba9daceaeaf2d85e43c7f919df391`.
+- After adding only the two regression tests, the source-only hash remained
+  exactly `8b4b428ba6a8b921b1568376691050f1a7eba9daceaeaf2d85e43c7f919df391`.
+- The exact focused RED reached 2 tests: 0 passed, 2 failed, 0 skipped:
+  - `retained enable does not settle or logout before a late genuine durable-adoption outcome`
+  - `committed provider outcome rejects a prototype-shaped object with an own readCommitted override`
+- The failures demonstrated both reported defects: retained enable had already
+  settled at its deadline while the genuine durable adoption was still pending,
+  and a prototype-shaped object with an own virtual reader decoded as committed.
+
+### Central correction
+
+- Retained enable now awaits `ProviderStateStore.commit` to its exact terminal
+  result instead of racing and detaching that persistence operation at the
+  provider deadline. Once durable publication may have begun, the activation
+  lease and caller remain owned until the store proves either an unchanged old
+  tuple or an exact privately branded committed tuple. Cleanup and authority
+  release therefore cannot race a still-capable late adoption. Abortable
+  catalog and other pre-commit provider work retain their existing deadline.
+- Committed provider outcomes are now recorded in a module-private `WeakMap`
+  keyed by the exact error object. The decoder reads that map directly and
+  returns a clone; it no longer trusts `instanceof`, an error name, a prototype,
+  or a dynamically dispatched `readCommitted` method.
+- The two pre-existing stalled/adopted persistence tests were aligned with the
+  terminal contract: they prove no early settlement or ownership release and
+  then verify the exact old or committed tuple after persistence settles.
+
+### GREEN and final freeze
+
+- Exact two-test GREEN: 2/2 passed, 0 failed, 0 skipped.
+- Direct serial provider state + authority focus: 102/102 passed, 0 failed, 0
+  skipped.
+- Required serial provider state/authority/activation/CLI focus: 299/299
+  passed, 0 failed, 0 skipped.
+- `npx tsc -p tsconfig.json --noEmit`: PASS.
+- `npx tsc -p tsconfig.tests.json --noEmit`: PASS.
+- `node --import tsx scripts/render-command-docs.ts --check`: PASS.
+- Provider privacy: 3/3 passed, 0 failed, 0 skipped.
+- `git diff --check`: PASS.
+- Approved Spec SHA-256 remained
+  `e15d19821fafbac1f0fc21dd82702d41efa481a12bdcee97df238de2ee85f021`.
+- Approved Plan SHA-256 remained
+  `74914bc2e38c1ac7bb8b57dbfa0abfb1963d4da7acc3fbb6868434039ce22b2c`.
+- Final `git diff -- src tests` SHA-256:
+  `68d04a34338e04e42d2fc14347e21411e82a8b1430be5a01552861c142918546`.
+- Final `git diff -- src` SHA-256:
+  `7da250c3c882226683f65ce796c7998cf79d10b38db9b67a4a282f7fab41120c`.
+
+Files changed by this delta only:
+
+- `src/cli.ts`
+- `src/provider-state.ts`
+- `tests/provider-authority.test.ts`
+- `tests/provider-state.test.ts`
+- this report
+
+No global/full `npm test` was run, per the final-delta constraint.
