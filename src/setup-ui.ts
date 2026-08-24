@@ -120,11 +120,6 @@ export async function runSetupHub(options: SetupHubOptions): Promise<SetupHubRes
   const attempt = createSetupAttempt(options.signal, options.deadlineAt);
   try {
     return await runSetupHubAttempt({ ...options, signal: attempt.signal });
-  } catch (error) {
-    if (attempt.signal.aborted) {
-      return { kind: "cancelled", mode: "setup-required" };
-    }
-    throw error;
   } finally {
     attempt.close();
   }

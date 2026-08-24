@@ -1904,12 +1904,19 @@ test("candidate deadline discards a late rejected connect without publication", 
   const config = structuredClone(DEFAULT_CONFIG);
   config.mainModel = MODEL;
   config.providerSetup = stateStore.read();
+  const setupOrchestrator = new SetupOrchestrator({
+    registry,
+    stateStore,
+    activationCoordinator: {
+      async activate() { throw new Error("late activation"); },
+    },
+  });
   const runtime = new Runtime(
     {} as never,
     credentials,
     registry,
     stateStore,
-    { async activateCandidate() { throw new Error("late activation"); } },
+    setupOrchestrator,
     coordinator,
     { beginRun() { return () => undefined; } },
     { async apply() { return { kind: "unchanged" }; } },

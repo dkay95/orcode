@@ -534,6 +534,20 @@ test("caller abort settles a pending hub prompt with the exact reason and one ca
   assert.deepEqual(context.adapter.calls, []);
 });
 
+test("setup cancellation cannot report success when cancelled lifecycle persistence rejects", async () => {
+  const surface = new ScriptedSurface([null]);
+  const context = fixture(surface);
+  context.orchestrator.cancelSetup = async () => {
+    throw new Error("fixed cancelled lifecycle persistence failure");
+  };
+
+  await assert.rejects(
+    runSetupHub({ ...context, surface, signal: AbortSignal.abort() }),
+    /fixed cancelled lifecycle persistence failure/,
+  );
+  assert.equal(context.stateStore.read().lifecycle, "never-configured");
+});
+
 test("stale setup cancellation cannot overwrite a newer committed activation", async () => {
   const surface = new ScriptedSurface([]);
   const context = fixture(surface);
