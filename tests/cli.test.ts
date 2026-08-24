@@ -2423,6 +2423,190 @@ test("credential activation and key replacement synchronize the current session 
   assert.equal(fixture.config.mainModel, nextRoute.requestedModelId);
 });
 
+test("prepublication Cross abort cannot publish the activated route into session runtime", async () => {
+  const Runtime = (cliModule as unknown as {
+    DefaultProviderRuntime: new (...args: unknown[]) => {
+      runSetup(
+        surface: SetupSurface,
+        attempt: {
+          generation: number;
+          deadlineAt: number;
+          signal: AbortSignal;
+          remainingMs(): number;
+          assertCurrent(): void;
+        },
+      ): Promise<Record<string, unknown>>;
+      ensureRunnableRoute(): NonNullable<ProviderSetupStateV1["defaultRoute"]>;
+      readonly preparedRoles: unknown;
+    };
+  }).DefaultProviderRuntime;
+  const main: BackendModelDescriptor = {
+    backendId: "openrouter",
+    requestedModelId: "vendor/cross-abort-main",
+    canonicalModelId: "vendor/cross-abort-main",
+    displayName: "Cross abort main",
+    capabilities: { textInput: true, textOutput: true, tools: true, reasoning: true },
+  };
+  const challenger: BackendModelDescriptor = {
+    ...main,
+    requestedModelId: "vendor/cross-abort-challenger",
+    canonicalModelId: "vendor/cross-abort-challenger",
+    displayName: "Cross abort challenger",
+  };
+  const route = {
+    ...bootstrapRoute(main.requestedModelId),
+    accountFingerprint: "acct_cross_abort_111111",
+  } as NonNullable<ProviderSetupStateV1["defaultRoute"]>;
+  const connection: ProviderConnectionStateV1 = {
+    id: "cross-abort-connection",
+    backendId: "openrouter",
+    enabled: true,
+    maturity: "stable",
+    credentialSlot: "v1:inference:15151515-1515-4151-8151-151515151515",
+    accountFingerprint: route.accountFingerprint,
+    accountFingerprintState: "verified",
+    billingRealm: "openrouter-payg",
+    lastHealth: null,
+  };
+  let durable = structuredClone(DEFAULT_CONFIG.providerSetup) as ProviderSetupStateV1;
+  let publicationEntered!: () => void;
+  const reachedPublication = new Promise<void>((resolve) => {
+    publicationEntered = resolve;
+  });
+  let releasePublication!: () => void;
+  const publicationRelease = new Promise<void>((resolve) => {
+    releasePublication = resolve;
+  });
+  const stateStore = new ProviderStateStore(durable, {
+    persist: async (request) => {
+      publicationEntered();
+      await publicationRelease;
+      request.assertCurrent();
+      const next = request.build(durable);
+      request.assertCurrent();
+      durable = structuredClone(next);
+      request.adoptPublished(next);
+      return structuredClone(next);
+    },
+  });
+  const adapter: BackendAdapter = {
+    backendId: "openrouter",
+    async inspect() { throw new Error("unused"); },
+    async reconnect() { throw new Error("unused"); },
+    async logout() {},
+    async discardCandidate() {},
+    async connect() {
+      return {
+        candidateId: "cross-abort-candidate",
+        backendId: "openrouter",
+        connectionId: connection.id,
+        accountFingerprint: route.accountFingerprint,
+        billingRealm: "openrouter-payg",
+        health: {
+          credential: "valid",
+          connectivity: "connected",
+          spend: "available",
+          runtime: "ready",
+          observedAt: 1,
+          generation: 41,
+        },
+      };
+    },
+    async listModels() { return [main, challenger]; },
+    async activate() { throw new Error("unused"); },
+  };
+  const descriptor: BackendDescriptor = {
+    id: "openrouter",
+    displayName: "OpenRouter",
+    maturity: "stable",
+    connectable: true,
+    kind: "raw-model",
+    credentialOwner: "orcode-keychain",
+    billingRealmKind: "api-payg",
+    capabilities: { models: true, tools: true, reasoning: true },
+  };
+  const registry = new BackendRegistry([{ descriptor, adapter }]);
+  const orchestrator = {
+    async cancelSetup() { return {}; },
+    async activateCandidate() {
+      const previous = stateStore.read();
+      const state = stateStore.replace({
+        ...previous,
+        lifecycle: "configured",
+        connections: [connection],
+        defaultRoute: route,
+        cross: { enabled: false, preferredLead: null, preferredChallenger: null },
+      }, previous.revision);
+      durable = structuredClone(state);
+      return { persisted: true, warnings: [], state, route };
+    },
+    ensureRunnableRoute() {
+      throw new Error("no published runtime route");
+    },
+  };
+  let hubCalls = 0;
+  let modelCalls = 0;
+  const notices: string[] = [];
+  const surface: SetupSurface = {
+    async chooseHub() {
+      hubCalls += 1;
+      return hubCalls === 1 ? "openrouter" : "cross-prepare";
+    },
+    async readSecret() { return "sk-or-v1-cross-abort-test"; },
+    async chooseModel() {
+      modelCalls += 1;
+      return modelCalls === 1 ? main.canonicalModelId : challenger.canonicalModelId;
+    },
+    async confirm() { return true; },
+    present(event) {
+      if (event.type === "notice") notices.push(event.message);
+    },
+  };
+  const config = structuredClone(DEFAULT_CONFIG);
+  config.mainModel = "vendor/original-route";
+  const session = SessionStore.create("/synthetic/cross-abort-runtime", "/synthetic/.orcode");
+  const runtime = new Runtime(
+    {},
+    {},
+    registry,
+    stateStore,
+    orchestrator,
+    {},
+    { beginRun() { return () => undefined; } },
+    {},
+    null,
+    null,
+    main.requestedModelId,
+    config,
+    session,
+  );
+  const controller = new AbortController();
+  const pending = runtime.runSetup(surface, {
+    generation: 41,
+    deadlineAt: Date.now() + 5_000,
+    signal: controller.signal,
+    remainingMs: () => 5_000,
+    assertCurrent() {},
+  });
+  await reachedPublication;
+  const activated = structuredClone(durable);
+  const noticesAtPublication = notices.length;
+
+  controller.abort(new DOMException("Cross role publication cancelled", "AbortError"));
+  releasePublication();
+  const result = await pending;
+
+  assert.deepEqual(result, { kind: "ready" });
+  assert.deepEqual(durable, activated);
+  assert.deepEqual(stateStore.read(), activated);
+  assert.equal(session.data.route, undefined);
+  assert.equal(session.data.model, undefined);
+  assert.equal(config.mainModel, "vendor/original-route");
+  assert.equal(runtime.preparedRoles, null);
+  assert.equal(notices.length, noticesAtPublication);
+  assert.throws(() => runtime.ensureRunnableRoute(), /no published runtime route/);
+});
+
 test("late Cross completion after newer activation cannot republish the old route or session owner", async () => {
   const Runtime = (cliModule as unknown as {
     DefaultProviderRuntime: new (...args: unknown[]) => {
@@ -5334,6 +5518,7 @@ test("startup durable provider commits preserve every unrelated config byte unde
         assertCurrent(): void;
         build(current: typeof DEFAULT_CONFIG.providerSetup): typeof DEFAULT_CONFIG.providerSetup;
         adopt(committed: typeof DEFAULT_CONFIG.providerSetup): void;
+        adoptPublished(committed: typeof DEFAULT_CONFIG.providerSetup): void;
       },
     ) => Promise<typeof DEFAULT_CONFIG.providerSetup>;
   }).persistProviderSetupState;
@@ -5347,15 +5532,24 @@ test("startup durable provider commits preserve every unrelated config byte unde
   const raw = `{"schemaVersion":3,"unknown":{"spacing":"  exact  "},"providerSetup":${beforeBytes},"tail":[1, 2, 3]}\n`;
   await writeFile(path, raw, { encoding: "utf8", mode: 0o600 });
   let adopted: typeof DEFAULT_CONFIG.providerSetup | null = null;
+  const publicationEvents: string[] = [];
 
   const committed = await persist!(path, {
     expectedRevision: 0,
-    assertCurrent() {},
+    assertCurrent() {
+      publicationEvents.push("assert-current");
+    },
     build(current) {
+      publicationEvents.push("build");
       assert.deepEqual(current, before);
       return after;
     },
     adopt(value) {
+      publicationEvents.push("adopt-unpublished");
+      adopted = value;
+    },
+    adoptPublished(value) {
+      publicationEvents.push("adopt-published");
       adopted = value;
     },
   });
@@ -5364,6 +5558,13 @@ test("startup durable provider commits preserve every unrelated config byte unde
   assert.equal(await readFile(path, "utf8"), expectedRaw);
   assert.deepEqual(committed, after);
   assert.deepEqual(adopted, after);
+  assert.deepEqual(publicationEvents, [
+    "assert-current",
+    "build",
+    "assert-current",
+    "assert-current",
+    "adopt-published",
+  ]);
 });
 
 test("versioned inference replace and forget leave one restart-atomic provider tuple", async () => {

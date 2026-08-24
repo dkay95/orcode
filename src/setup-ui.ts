@@ -406,6 +406,11 @@ async function completeCrossSetup(
   const activationState = activation.state;
   let staleActivation = false;
   let preparedState: ReturnType<ProviderStateStore["read"]>;
+  const assertCrossCommitCurrent = (): void => {
+    if (crossInputIsCurrent()) return;
+    staleActivation = true;
+    throw new Error("Provider Cross activation was superseded.");
+  };
   try {
     preparedState = await stateStore.commit(activationState.revision, (state) => {
       if (JSON.stringify(state) !== JSON.stringify(activationState)) {
@@ -420,7 +425,7 @@ async function completeCrossSetup(
           preferredChallenger: challengerRoute,
         },
       };
-    });
+    }, assertCrossCommitCurrent);
   } catch (error) {
     if (staleActivation || !activationIsCurrent()) return { kind: "ready" };
     throw error;

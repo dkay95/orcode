@@ -828,6 +828,21 @@ export class DefaultProviderRuntime implements ProviderRuntime {
       : surface;
     const routePublicationGeneration = this.#processRouteGeneration;
     const setupPublicationGeneration = ++this.#setupPublicationGeneration;
+    const setupAttemptIsCurrent = (): boolean => {
+      if (
+        this.#setupPublicationGeneration !== setupPublicationGeneration
+        || this.#processRouteGeneration !== routePublicationGeneration
+        || startupAttempt?.signal.aborted
+      ) return false;
+      if (!startupAttempt) return true;
+      try {
+        if (startupAttempt.remainingMs() <= 0) return false;
+        startupAttempt.assertCurrent();
+        return true;
+      } catch {
+        return false;
+      }
+    };
     let activatedRoute: RouteIdentityV1 | null = null;
     let activatedPersisted = false;
     const setupOrchestrator = {
@@ -862,8 +877,7 @@ export class DefaultProviderRuntime implements ProviderRuntime {
       generation: startupAttempt?.generation,
       targetConnectionId,
       expectedRevision,
-      isCurrent: () => this.#setupPublicationGeneration === setupPublicationGeneration
-        && this.#processRouteGeneration === routePublicationGeneration,
+      isCurrent: setupAttemptIsCurrent,
     });
     const state = this.stateStore.read();
     const persistedSessionRoute = validateRouteIdentityV1(this.session?.data.route);
@@ -900,16 +914,12 @@ export class DefaultProviderRuntime implements ProviderRuntime {
     } else {
       result = await executeHub(null);
     }
-    if (result.kind === "ready") {
+    if (result.kind === "ready" && setupAttemptIsCurrent()) {
       const currentDefaultRoute = validateRouteIdentityV1(this.stateStore.read().defaultRoute);
       const activationCanPublish = activatedRoute !== null
-        && this.#setupPublicationGeneration === setupPublicationGeneration
-        && this.#processRouteGeneration === routePublicationGeneration
         && (!activatedPersisted
           || (currentDefaultRoute !== null && sameExactRoute(currentDefaultRoute, activatedRoute)));
-      const preparedRolesCanPublish = this.#setupPublicationGeneration === setupPublicationGeneration
-        && this.#processRouteGeneration === routePublicationGeneration
-        && (activatedRoute === null || activationCanPublish);
+      const preparedRolesCanPublish = activatedRoute === null || activationCanPublish;
       const nextSessionRoute = activationCanPublish
         ? activatedRoute
         : preparedRolesCanPublish
@@ -2914,10 +2924,10 @@ async function persistProviderSetupStateOwned(
         ownership.canonicalPath,
         nextRaw,
         async () => {
-          request.assertCurrent();
           await ownership.assertHeld();
           await assertConfigFileSnapshot(ownership.canonicalPath, target);
           await ownership.assertHeld();
+          request.assertCurrent();
         },
       );
     } catch (error) {
@@ -2930,8 +2940,7 @@ async function persistProviderSetupStateOwned(
       if (writeError !== undefined) throw writeError;
       throw new Error("Provider state publication could not be verified.");
     }
-    request.assertCurrent();
-    request.adopt(candidate);
+    request.adoptPublished(candidate);
     return structuredClone(candidate);
   });
 }

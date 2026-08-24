@@ -645,6 +645,199 @@ test("caller abort during post-activation Cross settles as Later with no late ef
   assert.deepEqual(surface.calls, ["hub", "secret", "model", "confirm", "hub"]);
 });
 
+function blockingCrossRolePublicationFixture(
+  stage: "before-publication" | "after-publication" = "before-publication",
+) {
+  let durable = createNeverConfiguredProviderState();
+  let publicationEntered!: () => void;
+  const reachedPublication = new Promise<void>((resolve) => {
+    publicationEntered = resolve;
+  });
+  let releasePublication!: () => void;
+  const publicationRelease = new Promise<void>((resolve) => {
+    releasePublication = resolve;
+  });
+  const stateStore = new ProviderStateStore(durable, {
+    persist: async (request) => {
+      if (stage === "before-publication") {
+        publicationEntered();
+        await publicationRelease;
+      }
+      request.assertCurrent();
+      const next = request.build(durable);
+      request.assertCurrent();
+      durable = structuredClone(next);
+      if (stage === "after-publication") {
+        publicationEntered();
+        await publicationRelease;
+      }
+      request.adoptPublished(next);
+      return structuredClone(next);
+    },
+  });
+  const adapter = new Adapter();
+  adapter.models = [MODEL, CHALLENGER];
+  const registry = new BackendRegistry([
+    { descriptor: OPENROUTER, adapter },
+    { descriptor: ANTHROPIC },
+  ]);
+  const activationCoordinator = {
+    async activate(request: ProviderActivationRequest): Promise<ProviderActivationResult> {
+      const route = {
+        version: 1 as const,
+        backendId: "openrouter" as const,
+        accountFingerprint: "acct",
+        billingRealm: "openrouter-payg" as const,
+        requestedModelId: request.selectedCanonicalModelId,
+        canonicalModelId: request.selectedCanonicalModelId,
+        resolutionState: "resolved" as const,
+      };
+      const previous = stateStore.read();
+      const state = stateStore.replace({
+        ...previous,
+        lifecycle: "configured",
+        connections: [{
+          id: "connection",
+          backendId: "openrouter",
+          enabled: true,
+          maturity: "stable",
+          credentialSlot: "v1:inference:90000000-0000-4000-8000-000000000072",
+          accountFingerprint: "acct",
+          accountFingerprintState: "verified",
+          billingRealm: "openrouter-payg",
+          lastHealth: null,
+        }],
+        defaultRoute: route,
+        cross: { enabled: false, preferredLead: null, preferredChallenger: null },
+      }, previous.revision);
+      durable = structuredClone(state);
+      return { persisted: true, warnings: [], state, route };
+    },
+  };
+  const orchestrator = new SetupOrchestrator({ registry, stateStore, activationCoordinator });
+  const surface = new ScriptedSurface(
+    ["openrouter", "cross-prepare"],
+    ["sk-or-v1-test-key"],
+    [MODEL.canonicalModelId, CHALLENGER.canonicalModelId],
+    [true],
+  );
+
+  return {
+    adapter,
+    durable: () => structuredClone(durable),
+    orchestrator,
+    reachedPublication,
+    registry,
+    releasePublication,
+    stateStore,
+    surface,
+  };
+}
+
+test("caller abort after Cross role commit entry leaves no prepublication effects", async () => {
+  const context = blockingCrossRolePublicationFixture();
+  const controller = new AbortController();
+  const pending = runSetupHub({
+    ...context,
+    signal: controller.signal,
+    isCurrent: () => true,
+  });
+  await context.reachedPublication;
+  const activated = context.durable();
+  const eventsAtPublication = context.surface.events.length;
+
+  controller.abort(new DOMException("Cross role publication cancelled", "AbortError"));
+  context.releasePublication();
+  const result = await pending;
+
+  assert.deepEqual(result, { kind: "ready" });
+  assert.deepEqual(context.durable(), activated);
+  assert.deepEqual(context.stateStore.read(), activated);
+  assert.equal(activated.cross.preferredLead, null);
+  assert.equal(activated.cross.preferredChallenger, null);
+  assert.equal(context.surface.events.length, eventsAtPublication);
+  assert.equal("preparedRoles" in result, false);
+});
+
+test("superseded Cross role commit entry leaves no prepublication effects", async () => {
+  const context = blockingCrossRolePublicationFixture();
+  let current = true;
+  const pending = runSetupHub({
+    ...context,
+    isCurrent: () => current,
+  });
+  await context.reachedPublication;
+  const activated = context.durable();
+  const eventsAtPublication = context.surface.events.length;
+
+  current = false;
+  context.releasePublication();
+  const result = await pending;
+
+  assert.deepEqual(result, { kind: "ready" });
+  assert.deepEqual(context.durable(), activated);
+  assert.deepEqual(context.stateStore.read(), activated);
+  assert.equal(activated.cross.preferredLead, null);
+  assert.equal(activated.cross.preferredChallenger, null);
+  assert.equal(context.surface.events.length, eventsAtPublication);
+  assert.equal("preparedRoles" in result, false);
+});
+
+test("caller abort after Cross role publication reconciles the exact committed state", async () => {
+  const context = blockingCrossRolePublicationFixture("after-publication");
+  const controller = new AbortController();
+  const pending = runSetupHub({
+    ...context,
+    signal: controller.signal,
+    isCurrent: () => true,
+  });
+  await context.reachedPublication;
+  const published = context.durable();
+  const eventsAtPublication = context.surface.events.length;
+
+  controller.abort(new DOMException("Cross role publication already committed", "AbortError"));
+  context.releasePublication();
+  const result = await pending;
+
+  assert.deepEqual(result, { kind: "ready" });
+  assert.deepEqual(context.durable(), published);
+  assert.deepEqual(context.stateStore.read(), published);
+  assert.equal(published.revision, 2);
+  assert.equal(published.cross.preferredLead?.canonicalModelId, MODEL.canonicalModelId);
+  assert.equal(
+    published.cross.preferredChallenger?.canonicalModelId,
+    CHALLENGER.canonicalModelId,
+  );
+  assert.equal(context.surface.events.length, eventsAtPublication);
+});
+
+test("supersession after Cross role publication reconciles the exact committed state", async () => {
+  const context = blockingCrossRolePublicationFixture("after-publication");
+  let current = true;
+  const pending = runSetupHub({
+    ...context,
+    isCurrent: () => current,
+  });
+  await context.reachedPublication;
+  const published = context.durable();
+  const eventsAtPublication = context.surface.events.length;
+
+  current = false;
+  context.releasePublication();
+  const result = await pending;
+
+  assert.deepEqual(result, { kind: "ready" });
+  assert.deepEqual(context.durable(), published);
+  assert.deepEqual(context.stateStore.read(), published);
+  assert.equal(published.revision, 2);
+  assert.equal(published.cross.preferredLead?.canonicalModelId, MODEL.canonicalModelId);
+  assert.equal(
+    published.cross.preferredChallenger?.canonicalModelId,
+    CHALLENGER.canonicalModelId,
+  );
+  assert.equal(context.surface.events.length, eventsAtPublication);
+});
+
 test("prepare roles stores distinct resolved models while Cross remains off and starts no collaboration", async () => {
   const surface = new ScriptedSurface(
     ["openrouter", "cross-prepare"],

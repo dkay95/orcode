@@ -53,6 +53,12 @@ export interface ProviderStateCommitRequest {
   build(current: ProviderSetupStateV1): ProviderSetupStateV1;
   assertCurrent(): void;
   adopt(committed: ProviderSetupStateV1): void;
+  /**
+   * Terminal adoption after the persistence owner has verified that the exact
+   * built candidate is already durable. Volatile cancellation/generation
+   * fences no longer reinterpret that publication as a rollback.
+   */
+  adoptPublished(committed: ProviderSetupStateV1): void;
 }
 
 export interface ProviderStateStoreOptions {
@@ -257,6 +263,7 @@ export class ProviderStateStore {
     let buildCalls = 0;
     let builtCandidate: ProviderSetupStateV1 | null = null;
     let adoptedCandidate: ProviderSetupStateV1 | null = null;
+    let publicationCommitted = false;
     let protocolInvalid = false;
     let capabilitiesOpen = true;
 
@@ -268,6 +275,7 @@ export class ProviderStateStore {
 
     const assertCurrentCapability = (): void => {
       assertCapabilityOpen();
+      if (publicationCommitted) return;
       try {
         assertCurrent();
       } catch (error) {
@@ -306,7 +314,10 @@ export class ProviderStateStore {
       }
     };
 
-    const adopt = (committed: ProviderSetupStateV1): void => {
+    const adoptCandidate = (
+      committed: ProviderSetupStateV1,
+      published: boolean,
+    ): void => {
       assertCapabilityOpen();
       try {
         if (adoptedCandidate) throw new Error("Provider state CAS may adopt exactly once.");
@@ -314,7 +325,7 @@ export class ProviderStateStore {
           throw new Error("Provider state CAS must build exactly once before adoption.");
         }
         this.#assertExpectedRevision(expectedRevision);
-        assertCurrent();
+        if (!published) assertCurrent();
         const validated = requirePersistableProviderState(
           validateProviderSetupState(committed),
         );
@@ -326,10 +337,17 @@ export class ProviderStateStore {
         }
         this.#state = structuredClone(validated);
         adoptedCandidate = structuredClone(validated);
+        publicationCommitted = published;
       } catch (error) {
         protocolInvalid = true;
         throw error;
       }
+    };
+    const adopt = (committed: ProviderSetupStateV1): void => {
+      adoptCandidate(committed, false);
+    };
+    const adoptPublished = (committed: ProviderSetupStateV1): void => {
+      adoptCandidate(committed, true);
     };
 
     if (!this.#persist) {
@@ -344,6 +362,7 @@ export class ProviderStateStore {
         build: buildCandidate,
         assertCurrent: assertCurrentCapability,
         adopt,
+        adoptPublished,
       });
       if (
         protocolInvalid
@@ -366,7 +385,8 @@ export class ProviderStateStore {
       return this.read();
     } catch (error) {
       if (
-        protocolInvalid
+        !publicationCommitted
+        && protocolInvalid
         && adoptedCandidate
         && JSON.stringify(this.#state) === JSON.stringify(adoptedCandidate)
       ) {

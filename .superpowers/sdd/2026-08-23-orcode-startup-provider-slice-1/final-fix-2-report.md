@@ -267,3 +267,91 @@ Exact follow-up commit subject: `fix: bind chat handoff to exact session`.
 - No global/full test or `npm run check` was run.
 
 Exact follow-up commit subject: `fix: fence provider Cross and logout completion`.
+
+## Review round 3 — effect-time Cross role publication
+
+### Base and formal tests-only RED
+
+- Exact follow-up base: `ca82b09ad0c89ecff19a8a8eb921242a227da143`.
+- Before production changed, `HEAD:src` had tree hash
+  `80a60a454116565c7596f5010f7e1d7c268d8613`. After adding only the two
+  required tests, the same tree hash and an empty `git diff --name-only -- src`
+  proved that production remained byte-unchanged.
+- The name-filtered formal matrix reached exactly 2 tests: 0 passed and 2
+  failed, with no TypeScript or harness failure:
+  1. `caller abort after Cross role commit entry leaves no prepublication effects`
+     advanced the durable revision from 1 to 2 and stored stale Cross roles.
+  2. `superseded Cross role commit entry leaves no prepublication effects`
+     advanced the durable revision from 1 to 2 and stored stale Cross roles.
+- A focused store test additionally failed 0/1 before the terminal publication
+  capability existed. After the central CAS correction but before the outer
+  runtime fence, the focused runtime test failed 0/1 because the aborted setup
+  still published the activated route into its session.
+
+### Central correction
+
+- The Cross role commit now carries one effect-time assertion combining the
+  caller signal, exact setup and process-route generations, startup authority,
+  and the byte-exact captured activation state. The durable writer executes
+  that assertion as the final statement under the config lock after its final
+  ownership and exact-snapshot checks, immediately before atomic publication.
+- `ProviderStateStore` exposes one terminal `adoptPublished` capability. The
+  persistence owner may use it only for the exact candidate it built and
+  verified durable. A later abort or generation change therefore reconciles
+  the committed revision instead of falsely rolling it back; unpublished
+  adoption retains the existing fallible fence and rollback behavior.
+- `DefaultProviderRuntime.runSetup` applies the same signal/deadline,
+  setup-generation, process-route-generation, and startup-authority fence to
+  the whole route/session/prepared-role publication block. A stale setup cannot
+  adopt a route, change `mainModel`, or clear newer prepared roles. The final
+  authoritative provider-state synchronization remains unconditional so an
+  already committed rename is reflected exactly.
+- Boundary tests cover abort and supersession on both sides of durable
+  publication. Before publication, revision and Cross roles remain unchanged
+  and no notice, session, runtime, or prepared-role effect appears. After
+  publication, the exact revision and roles are adopted without any late UI or
+  route publication.
+
+### Review-round verification
+
+- Required formal RED: 0/2 passed before production changed; the same named
+  matrix is now 2/2 passed.
+- Cross prepublication plus postpublication boundary matrix: 4/4 passed.
+- Provider-state committed-publication reconciliation: 1/1 passed.
+- Runtime prepublication abort publication fence: 1/1 passed.
+- Real config-writer publication ordering and exact-byte preservation: 1/1
+  passed.
+- `tests/setup-ui.test.ts`: 35/35 passed.
+- `tests/provider-state.test.ts`: 24/24 passed.
+- Prior six Fix2 authority/session/Cross/Legacy regressions: 6/6 passed.
+- Serial `tests/cli.test.ts` plus `tests/commands.test.ts`: 170/170 passed.
+- `tests/provider-privacy.test.ts`: 3/3 passed after supplying the isolated
+  fresh-build harness with a temporary dependency symlink; the symlink was
+  removed immediately after the run.
+- `npx tsc -p tsconfig.json --noEmit`: PASS.
+- `npx tsc -p tsconfig.tests.json --noEmit`: PASS.
+- `node --import tsx scripts/render-command-docs.ts --check`: PASS.
+- Approved setup Spec/Plan diff from
+  `8d17a0c11f12efc5e8d3a9534e94ec2df113fc6d`: empty.
+- `git diff --check`: PASS.
+- No global/full test or `npm run check` was run.
+
+### Files
+
+Production:
+
+- `src/cli.ts`
+- `src/provider-state.ts`
+- `src/setup-ui.ts`
+
+Tests:
+
+- `tests/cli.test.ts`
+- `tests/provider-state.test.ts`
+- `tests/setup-ui.test.ts`
+
+Evidence:
+
+- `.superpowers/sdd/2026-08-23-orcode-startup-provider-slice-1/final-fix-2-report.md`
+
+Exact follow-up commit subject: `fix: fence Cross role publication`.

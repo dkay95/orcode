@@ -451,6 +451,34 @@ test("durable provider state commit rejects a suppressed post-adoption fence fai
   assert.deepEqual(store.read(), initial);
 });
 
+test("durable provider state commit reconciles an exact publication after a later fence loss", async () => {
+  const initial = createNeverConfiguredProviderState();
+  let generationCurrent = true;
+  const store = new ProviderStateStore(initial, {
+    persist: async (request) => {
+      const built = request.build(initial);
+      request.assertCurrent();
+      generationCurrent = false;
+      assert.equal(typeof request.adoptPublished, "function");
+      request.adoptPublished!(built);
+      request.assertCurrent();
+      return structuredClone(built);
+    },
+  });
+
+  const committed = await store.commit(
+    initial.revision,
+    (current) => ({ ...current, lifecycle: "cancelled" }),
+    () => {
+      if (!generationCurrent) throw new Error("provider generation is stale");
+    },
+  );
+
+  assert.equal(committed.revision, 1);
+  assert.equal(committed.lifecycle, "cancelled");
+  assert.deepEqual(store.read(), committed);
+});
+
 test("durable provider state capabilities are closed after successful settlement", async () => {
   const initial = createNeverConfiguredProviderState();
   let retained!: ProviderStateCommitRequest;
@@ -471,6 +499,7 @@ test("durable provider state capabilities are closed after successful settlement
   assert.throws(() => retained.assertCurrent(), /closed|settled|capability/i);
   assert.throws(() => retained.build(initial), /closed|settled|capability/i);
   assert.throws(() => retained.adopt(committed), /closed|settled|capability/i);
+  assert.throws(() => retained.adoptPublished(committed), /closed|settled|capability/i);
   assert.deepEqual(store.read(), beforeLateCalls);
 });
 
@@ -496,6 +525,7 @@ test("durable provider state capabilities are closed after failed settlement", a
     () => retained.assertCurrent(),
     () => retained.build(initial),
     () => retained.adopt(forged),
+    () => retained.adoptPublished(forged),
   ]) {
     try {
       callback();
@@ -505,6 +535,6 @@ test("durable provider state capabilities are closed after failed settlement", a
     }
   }
 
-  assert.deepEqual(lateOutcomes, ["rejected", "rejected", "rejected"]);
+  assert.deepEqual(lateOutcomes, ["rejected", "rejected", "rejected", "rejected"]);
   assert.deepEqual(store.read(), initial);
 });
