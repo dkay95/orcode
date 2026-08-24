@@ -342,6 +342,7 @@ async function recoverTaskTenActivationTuple(
   let candidateCounter = 0;
   const candidates = new Map<string, string>();
   const adapter = {
+    backendId: "openrouter" as const,
     async connect(request: {
       candidate: unknown;
       generation: number;
@@ -408,7 +409,7 @@ async function recoverTaskTenActivationTuple(
       configPath,
       privateStore,
       credentials,
-      adapter,
+      adapterResolver: () => adapter,
       stateStore,
       runtimeGuard: {
         async acquire() {
@@ -438,6 +439,7 @@ async function recoverTaskTenActivationTuple(
     });
   const crashing = makeCoordinator(crashAfter);
   await assert.rejects(crashing.activate({
+    backendId: "openrouter",
     expectedRevision: oldState.revision,
     candidate: newSecret,
     expectedRequestedModelId: model.requestedModelId,

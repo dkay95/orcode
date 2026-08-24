@@ -460,6 +460,7 @@ async function activateOpenRouter(
       if (!accepted) return { kind: "cancelled", phase: "persistence" };
     }
     const activationPromise = orchestrator.activateCandidate({
+      backendId: "openrouter",
       expectedRevision: options.expectedRevision ?? stateStore.read().revision,
       candidate: secret,
       expectedRequestedModelId: selectedModel.requestedModelId,

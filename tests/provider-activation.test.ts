@@ -30,6 +30,7 @@ import type {
   VersionedCredentialStoreLike,
 } from "../src/credentials.js";
 import { ProviderCredentialAuthority } from "../src/provider-authority.js";
+import type { ProviderActivationJournalV2 } from "../src/provider-activation.js";
 
 const OLD_SLOT: CredentialSlotRef = Object.freeze({
   version: 1,
@@ -359,7 +360,7 @@ async function activationFixture(options: ActivationFixtureOptions = {}) {
       configPath: path,
       privateStore,
       credentials,
-      adapter,
+      adapterResolver: () => adapter,
       stateStore,
       runtimeGuard,
       now: () => now,
@@ -379,6 +380,7 @@ async function activationFixture(options: ActivationFixtureOptions = {}) {
     });
   let coordinator = makeCoordinator();
   const request = {
+    backendId: "openrouter" as const,
     expectedRevision: oldState.revision,
     candidate: NEW_SECRET,
     expectedRequestedModelId: MODEL.requestedModelId,
@@ -572,7 +574,7 @@ test("cancellation while waiting on a live lease is preserved and writes no dura
     configPath: fixture.path,
     privateStore: fixture.privateStore,
     credentials: fixture.credentials,
-    adapter: fixture.adapter,
+    adapterResolver: () => fixture.adapter,
     stateStore: fixture.stateStore,
     runtimeGuard: fixture.runtimeGuard,
     now: () => 100,
@@ -615,7 +617,7 @@ test("cancellation while waiting on config writer ownership preserves the exact 
     configPath: fixture.path,
     privateStore: fixture.privateStore,
     credentials: fixture.credentials,
-    adapter: fixture.adapter,
+    adapterResolver: () => fixture.adapter,
     stateStore: fixture.stateStore,
     runtimeGuard: fixture.runtimeGuard,
     now: () => 10_000,
@@ -646,7 +648,7 @@ test("the held runtime guard prevents a run from starting through config commit 
     configPath: fixture.path,
     privateStore: fixture.privateStore,
     credentials: fixture.credentials,
-    adapter: fixture.adapter,
+    adapterResolver: () => fixture.adapter,
     stateStore: fixture.stateStore,
     runtimeGuard: fixture.runtimeGuard,
     now: () => 10_000,
@@ -764,7 +766,7 @@ test("a paused unrelated config writer is preserved by the final fenced reread a
     configPath: fixture.path,
     privateStore: fixture.privateStore,
     credentials: fixture.credentials,
-    adapter: fixture.adapter,
+    adapterResolver: () => fixture.adapter,
     stateStore: fixture.stateStore,
     runtimeGuard: fixture.runtimeGuard,
     now: () => 10_000,
@@ -795,7 +797,7 @@ test("provider publication serializes an independent saveConfig writer without l
     configPath: fixture.path,
     privateStore: fixture.privateStore,
     credentials: fixture.credentials,
-    adapter: fixture.adapter,
+    adapterResolver: () => fixture.adapter,
     stateStore: fixture.stateStore,
     runtimeGuard: fixture.runtimeGuard,
     now: () => 10_000,
@@ -877,7 +879,7 @@ test("same-revision providerSetup mutation before raw CAS is retained and blocks
     configPath: fixture.path,
     privateStore: fixture.privateStore,
     credentials: fixture.credentials,
-    adapter: fixture.adapter,
+    adapterResolver: () => fixture.adapter,
     stateStore: fixture.stateStore,
     runtimeGuard: fixture.runtimeGuard,
     now: () => 10_000,
@@ -934,7 +936,7 @@ test("old v1 cleanup retains a slot referenced by another exact pending journal"
     configPath: fixture.path,
     privateStore: fixture.privateStore,
     credentials: fixture.credentials,
-    adapter: fixture.adapter,
+    adapterResolver: () => fixture.adapter,
     stateStore: fixture.stateStore,
     runtimeGuard: fixture.runtimeGuard,
     now: () => 10_000,
@@ -1201,7 +1203,7 @@ test("lost runtime guard during recovery bind happens only after old-slot and jo
     configPath: fixture.path,
     privateStore: fixture.privateStore,
     credentials: fixture.credentials,
-    adapter: fixture.adapter,
+    adapterResolver: () => fixture.adapter,
     stateStore: fixture.stateStore,
     runtimeGuard: recoveryGuard,
     now: () => 20_000,
@@ -1237,7 +1239,7 @@ test("recovery guard loss during awaited candidate connect prevents runtime bind
     configPath: fixture.path,
     privateStore: fixture.privateStore,
     credentials: fixture.credentials,
-    adapter: fixture.adapter,
+    adapterResolver: () => fixture.adapter,
     stateStore: fixture.stateStore,
     runtimeGuard: recoveryGuard,
     now: () => 20_000,
@@ -1276,7 +1278,7 @@ test("recovery guard loss during awaited model listing prevents runtime bind", a
     configPath: fixture.path,
     privateStore: fixture.privateStore,
     credentials: fixture.credentials,
-    adapter: fixture.adapter,
+    adapterResolver: () => fixture.adapter,
     stateStore: fixture.stateStore,
     runtimeGuard: recoveryGuard,
     now: () => 20_000,
@@ -1326,7 +1328,7 @@ test("recovery guard loss during the final provider fence prevents runtime bind"
     configPath: fixture.path,
     privateStore: fixture.privateStore,
     credentials: fixture.credentials,
-    adapter: fixture.adapter,
+    adapterResolver: () => fixture.adapter,
     stateStore: fixture.stateStore,
     runtimeGuard: recoveryGuard,
     now: () => 20_000,
@@ -1477,6 +1479,7 @@ test("strict manifest contains no secret source raw account model response or pa
     "candidateProviderSetupSha256",
     "candidateRoute",
     "candidateSlot",
+    "credentialSlotKind",
     "expectedProviderSetupSha256",
     "expectedRevision",
     "phase",
@@ -1484,7 +1487,38 @@ test("strict manifest contains no secret source raw account model response or pa
     "transactionId",
     "version",
   ]);
+  assert.equal(parsed.version, 2);
+  assert.equal(parsed.credentialSlotKind, "inference");
   assert.doesNotMatch(raw, /provider-secret|OPENROUTER_API_KEY|creator_user_id|raw-provider|\/Users\/|\\Users\\/i);
+});
+
+test("literal legacy OpenRouter journal v1 recovers through the frozen validator", async () => {
+  const fixture = await activationFixture({ crashAfter: "journal-written" });
+  await assert.rejects(fixture.activate());
+  const [transactionId] = await journalDirectories(fixture.appHome);
+  assert.ok(transactionId);
+  const manifestPath = join(fixture.appHome, "provider-activation", transactionId, "manifest.json");
+  const v2 = JSON.parse(await readFile(manifestPath, "utf8")) as ProviderActivationJournalV2;
+  const legacy = {
+    version: 1,
+    transactionId,
+    expectedRevision: v2.expectedRevision,
+    phase: v2.phase,
+    backendId: "openrouter",
+    candidateSlot: { version: 1, kind: "inference", id: v2.candidateSlot.id },
+    previousSlot: v2.previousSlot,
+    candidateConnectionId: v2.candidateConnectionId,
+    candidateRoute: v2.candidateRoute,
+    expectedProviderSetupSha256: v2.expectedProviderSetupSha256,
+    candidateProviderSetupSha256: v2.candidateProviderSetupSha256,
+  };
+  await writeFile(manifestPath, `${JSON.stringify(legacy)}\n`, "utf8");
+
+  await fixture.restartAndRecover(false);
+
+  assert.deepEqual(await journalDirectories(fixture.appHome), []);
+  assert.equal(fixture.credentials.slots.get(OLD_SLOT.id), OLD_SECRET);
+  assert.equal(fixture.credentials.slots.has(v2.candidateSlot.id), false);
 });
 
 test("strict manifest carries only lowercase complete-state SHA-256 snapshots", async () => {
@@ -1995,7 +2029,7 @@ test("a paused expired owner is fenced after a newer activation reclaims the lea
     configPath: fixture.path,
     privateStore: fixture.privateStore,
     credentials: fixture.credentials,
-    adapter: fixture.adapter,
+    adapterResolver: () => fixture.adapter,
     stateStore: fixture.stateStore,
     runtimeGuard: fixture.runtimeGuard,
     now: () => now,
@@ -2019,7 +2053,7 @@ test("a paused expired owner is fenced after a newer activation reclaims the lea
     configPath: fixture.path,
     privateStore: fixture.privateStore,
     credentials: fixture.credentials,
-    adapter: fixture.adapter,
+    adapterResolver: () => fixture.adapter,
     stateStore: fixture.stateStore,
     runtimeGuard: guardB,
     now: () => now,
@@ -2052,7 +2086,7 @@ for (const persistence of ["persisted", "process-only"] as const) {
       configPath: fixture.path,
       privateStore: fixture.privateStore,
       credentials: fixture.credentials,
-      adapter: fixture.adapter,
+      adapterResolver: () => fixture.adapter,
       stateStore: fixture.stateStore,
       runtimeGuard: fixture.runtimeGuard,
       now: () => now,
@@ -2076,7 +2110,7 @@ for (const persistence of ["persisted", "process-only"] as const) {
       configPath: fixture.path,
       privateStore: fixture.privateStore,
       credentials: fixture.credentials,
-      adapter: adapterB,
+      adapterResolver: () => adapterB,
       stateStore: fixture.stateStore,
       runtimeGuard: new FakeRuntimeGuard(),
       now: () => now,
@@ -2135,7 +2169,7 @@ test("process-only activation reports the exact lost fence when ownership change
     configPath: fixture.path,
     privateStore: fixture.privateStore,
     credentials: fixture.credentials,
-    adapter: fixture.adapter,
+    adapterResolver: () => fixture.adapter,
     stateStore: fixture.stateStore,
     runtimeGuard: fixture.runtimeGuard,
     now: () => now,
@@ -2151,12 +2185,13 @@ test("process-only activation reports the exact lost fence when ownership change
   assert.equal(fixture.adapter.runtimeSecret, NEW_SECRET, "the external bind effect already happened");
 
   now = 1_000;
+  const adapterB = new FakeAdapter();
   const coordinatorB = new fixture.api.ProviderActivationCoordinator({
     appHome: fixture.appHome,
     configPath: fixture.path,
     privateStore: fixture.privateStore,
     credentials: fixture.credentials,
-    adapter: new FakeAdapter(),
+    adapterResolver: () => adapterB,
     stateStore: fixture.stateStore,
     runtimeGuard: new FakeRuntimeGuard(),
     now: () => now,
@@ -2198,6 +2233,7 @@ test("deadline and abort release authority ownership and block late publication"
     const controller = new AbortController();
     const reason = new DOMException("fixed authority cancellation", "AbortError");
     const first = authority.withCredential({
+      backendId: "openrouter",
       connectionId: CONNECTION_ID,
       credentialKind: "inference",
       purpose: "startup-inspect",
@@ -2218,6 +2254,7 @@ test("deadline and abort release authority ownership and block late publication"
     assert.equal(firstSettlement, "aborted");
 
     const second = await authority.withCredential({
+      backendId: "openrouter",
       connectionId: CONNECTION_ID,
       credentialKind: "inference",
       purpose: "startup-inspect",
@@ -2250,6 +2287,7 @@ test("deadline and abort release authority ownership and block late publication"
       now: Date.now,
     });
     const first = authority.withCredential({
+      backendId: "openrouter",
       connectionId: CONNECTION_ID,
       credentialKind: "inference",
       purpose: "startup-inspect",
@@ -2266,6 +2304,7 @@ test("deadline and abort release authority ownership and block late publication"
     assert.equal(firstSettlement, "stale");
 
     const second = await authority.withCredential({
+      backendId: "openrouter",
       connectionId: CONNECTION_ID,
       credentialKind: "inference",
       purpose: "startup-inspect",
@@ -2287,7 +2326,7 @@ test("deadline and abort release authority ownership and block late publication"
       configPath: fixture.path,
       privateStore: fixture.privateStore,
       credentials: fixture.credentials,
-      adapter: fixture.adapter,
+      adapterResolver: () => fixture.adapter,
       stateStore: fixture.stateStore,
       runtimeGuard: fixture.runtimeGuard,
       now: () => 10_000,
@@ -2340,7 +2379,7 @@ test("first-run persisted activation cannot replace a config created at the fina
     configPath: path,
     privateStore,
     credentials,
-    adapter,
+    adapterResolver: () => adapter,
     stateStore,
     runtimeGuard,
     now: () => 10_000,
@@ -2372,6 +2411,7 @@ test("first-run persisted activation cannot replace a config created at the fina
 
   await assert.rejects(
     coordinator.activate({
+      backendId: "openrouter",
       expectedRevision: initialState.revision,
       candidate: NEW_SECRET,
       expectedRequestedModelId: MODEL.requestedModelId,
@@ -2416,7 +2456,7 @@ test("real activation writer abort microtask at the last async fence preserves t
     configPath: fixture.path,
     privateStore: fixture.privateStore,
     credentials: fixture.credentials,
-    adapter: fixture.adapter,
+    adapterResolver: () => fixture.adapter,
     stateStore: fixture.stateStore,
     runtimeGuard: fixture.runtimeGuard,
     now: () => 10_000,
@@ -2459,7 +2499,7 @@ test("real activation writer lease expiry microtask cannot rename after the last
     configPath: fixture.path,
     privateStore: fixture.privateStore,
     credentials: fixture.credentials,
-    adapter: fixture.adapter,
+    adapterResolver: () => fixture.adapter,
     stateStore: fixture.stateStore,
     runtimeGuard: fixture.runtimeGuard,
     now: () => now,
@@ -2517,7 +2557,7 @@ test("persisted saved candidate permit validates under existing real config owne
         configPath: fixture.path,
         privateStore: fixture.privateStore,
         credentials: fixture.credentials,
-        adapter: fixture.adapter,
+        adapterResolver: () => fixture.adapter,
         stateStore,
         runtimeGuard: fixture.runtimeGuard,
         candidateAuthority: authority,
@@ -2530,6 +2570,7 @@ test("persisted saved candidate permit validates under existing real config owne
       let permit = authority.environmentCandidatePermit(candidate);
       if (source === "saved") {
         const access = await authority.withCredential({
+          backendId: "openrouter",
           connectionId: CONNECTION_ID,
           credentialKind: "inference",
           purpose: "explicit-repair",
@@ -2591,7 +2632,7 @@ test("saved candidate swap after catalog and model choice has zero activation ef
     configPath: fixture.path,
     privateStore: fixture.privateStore,
     credentials: fixture.credentials,
-    adapter: fixture.adapter,
+    adapterResolver: () => fixture.adapter,
     stateStore: fixture.stateStore,
     runtimeGuard: fixture.runtimeGuard,
     candidateAuthority: authority,
@@ -2606,6 +2647,7 @@ test("saved candidate swap after catalog and model choice has zero activation ef
   let slotsAfterSwap = new Map<string, string>();
 
   const access = await authority.withCredential({
+    backendId: "openrouter",
     connectionId: CONNECTION_ID,
     credentialKind: "inference",
     purpose: "explicit-repair",
@@ -2675,7 +2717,7 @@ test("environment candidate swap after catalog and model choice has zero activat
     configPath: fixture.path,
     privateStore: fixture.privateStore,
     credentials: fixture.credentials,
-    adapter: fixture.adapter,
+    adapterResolver: () => fixture.adapter,
     stateStore: fixture.stateStore,
     runtimeGuard: fixture.runtimeGuard,
     candidateAuthority: authority,
@@ -2961,3 +3003,29 @@ type TokenBoundPrivateStore = PrivateStore & {
   readClaimOwner(claim: object, maxBytes?: number): Promise<string>;
   assertDirectoryClaim(claim: object): Promise<void>;
 };
+
+test("activation journal v2 carries an exact Kimi backend and Kimi credential slot kind", () => {
+  const journal: ProviderActivationJournalV2 = {
+    version: 2,
+    transactionId: "10000000-0000-4000-8000-000000000001",
+    expectedRevision: 4,
+    phase: "prepared",
+    backendId: "kimi-code",
+    credentialSlotKind: "kimi-code",
+    candidateSlot: { version: 1, kind: "kimi-code", id: "v1:kimi-code:10000000-0000-4000-8000-000000000001" },
+    previousSlot: null,
+    candidateConnectionId: "kimi-main",
+    candidateRoute: {
+      version: 1,
+      backendId: "kimi-code",
+      accountFingerprint: "acct_local_kimi",
+      billingRealm: "kimi-code-membership-provider-managed-overage",
+      requestedModelId: "kimi-for-coding",
+      canonicalModelId: "kimi-for-coding",
+      resolutionState: "resolved",
+    },
+    expectedProviderSetupSha256: "1".repeat(64),
+    candidateProviderSetupSha256: "2".repeat(64),
+  };
+  assert.equal(journal.credentialSlotKind, journal.backendId);
+});

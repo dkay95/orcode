@@ -17,7 +17,7 @@ import type {
   ProviderAuthorityReadLease,
   ProviderCredentialAccessResult,
   ProviderCredentialAuthorityLike,
-  ProviderConnectionBindingV1,
+  ProviderConnectionBindingV2,
   ProviderCredentialUseContext,
 } from "./provider-authority.js";
 import {
@@ -79,7 +79,7 @@ interface InspectedSecret {
   balance: BalanceReport;
   inspection: OpenRouterInspection;
   credentialProof?: {
-    binding: ProviderConnectionBindingV1;
+    binding: ProviderConnectionBindingV2;
     source: "saved" | "environment";
     fingerprint: string;
   };
@@ -205,6 +205,7 @@ export class OpenRouterBackendAdapter implements BackendAdapter {
 
   #credentialRequest(request: ProviderInspectionRequest) {
     return {
+      backendId: "openrouter" as const,
       connectionId: request.connectionId,
       credentialKind: "inference" as const,
       purpose: request.purpose ?? "startup-inspect",
@@ -356,6 +357,7 @@ export class OpenRouterBackendAdapter implements BackendAdapter {
       request,
       (use) => this.#credentialAuthority.withCredential(
         {
+          backendId: "openrouter",
           connectionId: request.connectionId,
           credentialKind: "inference",
           purpose: "runtime-bind",
@@ -385,6 +387,7 @@ export class OpenRouterBackendAdapter implements BackendAdapter {
       request,
       (use) => this.#credentialAuthority.withCredentialUnderLease!(
         {
+          backendId: "openrouter",
           connectionId: request.connectionId,
           credentialKind: "inference",
           purpose: "runtime-bind",
@@ -545,6 +548,7 @@ export class OpenRouterBackendAdapter implements BackendAdapter {
     } else if (key.isManagementKey === false) {
       try {
         const managementRequest = {
+          backendId: "openrouter" as const,
           connectionId,
           credentialKind: "management" as const,
           purpose: "startup-inspect" as const,
@@ -727,8 +731,8 @@ export class OpenRouterBackendAdapter implements BackendAdapter {
 }
 
 function sameCredentialBinding(
-  left: ProviderConnectionBindingV1,
-  right: ProviderConnectionBindingV1,
+  left: ProviderConnectionBindingV2,
+  right: ProviderConnectionBindingV2,
 ): boolean {
   return JSON.stringify(left) === JSON.stringify(right);
 }

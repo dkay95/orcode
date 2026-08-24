@@ -299,6 +299,7 @@ async function crashAndRecoverRealActivation(
   let candidateCount = 0;
   const candidates = new Map<string, string>();
   const adapter = {
+    backendId: "openrouter" as const,
     async connect(request: {
       candidate: unknown;
       generation: number;
@@ -358,7 +359,7 @@ async function crashAndRecoverRealActivation(
       configPath,
       privateStore,
       credentials,
-      adapter,
+      adapterResolver: () => adapter,
       stateStore,
       runtimeGuard: {
         async acquire() {
@@ -391,6 +392,7 @@ async function crashAndRecoverRealActivation(
 
   await assert.rejects(
     makeCoordinator("config-readback").activate({
+      backendId: "openrouter",
       expectedRevision: initialState.revision,
       candidate: values.credential,
       expectedRequestedModelId: model.requestedModelId,
@@ -506,7 +508,7 @@ async function realProviderInspectionCorpus(values: PrivacyProbes): Promise<stri
             candidatePermit: Object.freeze({ version: 1 as const }),
             async publishIfCurrent(publish) { publish(); },
             binding: {
-              version: 1,
+              version: 2,
               stateRevision: 4,
               connectionId: request.connectionId,
               backendId: "openrouter",

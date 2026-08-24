@@ -2,6 +2,8 @@ import { createHash, randomUUID } from "node:crypto";
 import { readFile, readdir } from "node:fs/promises";
 import { join } from "node:path";
 import type {
+  BackendAdapter,
+  BackendId,
   BackendModelDescriptor,
   CandidateProviderState,
   ProviderCandidate,
@@ -21,14 +23,16 @@ import {
 } from "./config.js";
 import {
   normalizeProviderSecret,
+  type CredentialSlotKind,
   type CredentialSlotRef,
   type VersionedCredentialStoreLike,
 } from "./credentials.js";
-import type { OpenRouterBackendAdapter } from "./openrouter-backend.js";
 import type {
   ProviderCandidateCredentialPermit,
   ProviderCredentialAuthorityLike,
+  ProviderCredentialPolicy,
 } from "./provider-authority.js";
+import { providerCredentialPolicy } from "./provider-authority.js";
 import {
   PrivateStore,
   type PrivateDirectoryClaim,
@@ -86,6 +90,23 @@ export interface ProviderActivationJournalV1 {
   candidateProviderSetupSha256: string;
 }
 
+export interface ProviderActivationJournalV2 {
+  version: 2;
+  transactionId: string;
+  expectedRevision: number;
+  phase: "prepared" | "credential-staged" | "config-committed";
+  backendId: "openrouter" | "kimi-code";
+  credentialSlotKind: CredentialSlotKind;
+  candidateSlot: CredentialSlotRef;
+  previousSlot: CredentialSlotRef | { version: 0; kind: "inference"; id: "legacy:inference" } | null;
+  candidateConnectionId: string;
+  candidateRoute: RouteIdentityV1;
+  expectedProviderSetupSha256: string;
+  candidateProviderSetupSha256: string;
+}
+
+type ProviderActivationJournal = ProviderActivationJournalV1 | ProviderActivationJournalV2;
+
 export interface ProviderActivationResult {
   persisted: boolean;
   route: RouteIdentityV1;
@@ -104,6 +125,7 @@ export interface ProviderActivationRuntimeGuard {
 }
 
 export interface ProviderActivationRequest {
+  backendId: "openrouter" | "kimi-code";
   expectedRevision: number;
   candidate: string;
   expectedRequestedModelId: string;
@@ -132,6 +154,7 @@ export interface ProviderAuthorityReadLease {
 }
 
 interface ActivationAdapter {
+  readonly backendId: BackendId;
   connect(request: {
     connectionId?: string;
     candidate: unknown;
@@ -155,7 +178,8 @@ export interface ProviderActivationCoordinatorOptions {
   configPath: string;
   privateStore: PrivateStore;
   credentials: VersionedCredentialStoreLike;
-  adapter: OpenRouterBackendAdapter | ActivationAdapter;
+  /** Resolves the exact backend at every operation boundary. */
+  adapterResolver: (backendId: "openrouter" | "kimi-code") => ActivationAdapter | BackendAdapter;
   stateStore: ProviderStateStore;
   runtimeGuard: ProviderActivationRuntimeGuard;
   candidateAuthority?: Pick<
@@ -201,7 +225,7 @@ interface HeldProviderLease {
 interface TransactionJournal {
   claim: PrivateDirectoryClaim;
   rawManifest: string;
-  manifest: ProviderActivationJournalV1;
+  manifest: ProviderActivationJournal;
 }
 
 type ConfigFacts =
@@ -252,6 +276,7 @@ export class ProviderActivationBusyError extends ProviderActivationError {
 }
 
 export class ProviderActivationCoordinator {
+  readonly #adapterResolver: (backendId: "openrouter" | "kimi-code") => ActivationAdapter | BackendAdapter;
   readonly #options: Required<Pick<
     ProviderActivationCoordinatorOptions,
     "now" | "createUuid" | "leaseDurationMs" | "leaseAttempts" | "waitForLease" | "writeConfigAtomic" | "writeConfigAtomicCreate" | "onBoundary"
@@ -279,6 +304,7 @@ export class ProviderActivationCoordinator {
       writeConfigAtomicCreate: options.writeConfigAtomicCreate ?? writeFileAtomicCreateSecure,
       onBoundary: options.onBoundary ?? (() => undefined),
     };
+    this.#adapterResolver = options.adapterResolver;
   }
 
   async activate(request: ProviderActivationRequest): Promise<ProviderActivationResult> {
@@ -326,22 +352,28 @@ export class ProviderActivationCoordinator {
       await this.#assertMutationAllowed(providerLease, runtimeLease, true, request.signal);
       await this.#validateCandidatePermit(request, providerLease, runtimeLease);
       const normalized = normalizeProviderSecret(request.candidate);
+      const policy = requireActivationPolicy(request.backendId);
       const candidate = await this.#connectCandidate(
         normalized,
         request.generation,
         request.signal,
         request.targetConnectionId,
+        request.backendId,
       );
+      if (candidate.backendId !== request.backendId || candidate.billingRealm !== policy.billingRealm) {
+        throw new ProviderActivationError("provider-candidate-backend-mismatch", "Provider candidate backend is invalid.");
+      }
       initialCandidateId = candidate.candidateId;
       await this.#boundary("candidate-validated");
       await this.#assertMutationAllowed(providerLease, runtimeLease, true, request.signal);
       assertNoRetainedIdentityCollision(preflight.state, candidate);
-      const models = await this.#listModels(candidate.candidateId, request.signal);
+      const models = await this.#listModels(candidate.candidateId, request.signal, request.backendId);
       await this.#boundary("models-loaded");
       const selectedModel = selectExplicitModel(
         models,
         request.expectedRequestedModelId,
         request.selectedCanonicalModelId,
+        request.backendId,
       );
       const candidateRoute = routeForCandidate(candidate, selectedModel);
       await this.#boundary("model-selected");
@@ -388,14 +420,14 @@ export class ProviderActivationCoordinator {
       await this.#validateCandidatePermit(request, providerLease, runtimeLease);
       let candidateSlot: CredentialSlotRef;
       try {
-        candidateSlot = this.#options.credentials.reserveSlot("inference");
+        candidateSlot = this.#options.credentials.reserveSlot(policy.savedSlotKinds[0]!);
       } catch {
         throw new ProviderActivationError(
           "provider-credential-reservation-failed",
           "Provider credential reservation failed.",
         );
       }
-      if (!Object.isFrozen(candidateSlot) || !isInferenceSlot(candidateSlot)) {
+      if (!Object.isFrozen(candidateSlot) || candidateSlot.kind !== policy.savedSlotKinds[0]) {
         throw new ProviderActivationError(
           "provider-credential-reservation-invalid",
           "Provider credential reservation is invalid.",
@@ -409,12 +441,13 @@ export class ProviderActivationCoordinator {
         candidateRoute,
       );
       const transactionId = createCanonicalUuid(this.#options.createUuid);
-      const manifest: ProviderActivationJournalV1 = {
-        version: 1,
+      const manifest: ProviderActivationJournalV2 = {
+        version: 2,
         transactionId,
         expectedRevision: current.revision,
         phase: "prepared",
-        backendId: "openrouter",
+        backendId: request.backendId,
+        credentialSlotKind: policy.savedSlotKinds[0]!,
         candidateSlot,
         previousSlot,
         candidateConnectionId: candidate.connectionId,
@@ -444,6 +477,7 @@ export class ProviderActivationCoordinator {
           request.generation,
           request.signal,
           candidate.connectionId,
+          request.backendId,
         );
         revalidatedCandidateId = revalidated.candidateId;
         assertSameCandidate(candidate, revalidated);
@@ -682,10 +716,10 @@ export class ProviderActivationCoordinator {
       throw error;
     } finally {
       if (initialCandidateId) {
-        await this.#options.adapter.discardCandidate(initialCandidateId).catch(() => undefined);
+        await this.#adapterFor(request.backendId).discardCandidate(initialCandidateId).catch(() => undefined);
       }
       if (revalidatedCandidateId) {
-        await this.#options.adapter.discardCandidate(revalidatedCandidateId).catch(() => undefined);
+        await this.#adapterFor(request.backendId).discardCandidate(revalidatedCandidateId).catch(() => undefined);
       }
       if (!simulatedCrash) {
         let releaseFailed = false;
@@ -994,6 +1028,7 @@ export class ProviderActivationCoordinator {
       manifest.expectedRevision + 1,
       request.signal,
       manifest.candidateConnectionId,
+      manifest.backendId,
     );
     try {
       await assertRuntimeLease(runtimeLease);
@@ -1002,10 +1037,10 @@ export class ProviderActivationCoordinator {
         || candidate.billingRealm !== manifest.candidateRoute.billingRealm) {
         throw new ProviderActivationRecoveryRequiredError("provider-candidate-identity-mismatch");
       }
-      const models = await this.#listModels(candidate.candidateId, request.signal);
+      const models = await this.#listModels(candidate.candidateId, request.signal, manifest.backendId);
       await assertRuntimeLease(runtimeLease);
       const model = models.find((entry) =>
-        entry.backendId === "openrouter"
+        entry.backendId === manifest.backendId
         && entry.requestedModelId === manifest.candidateRoute.requestedModelId
         && entry.canonicalModelId === manifest.candidateRoute.canonicalModelId
       );
@@ -1024,7 +1059,7 @@ export class ProviderActivationCoordinator {
         throw new ProviderActivationRecoveryRequiredError("provider-runtime-bind-ambiguous");
       }
     } finally {
-      await this.#options.adapter.discardCandidate(candidate.candidateId).catch(() => undefined);
+      await this.#adapterFor(manifest.backendId).discardCandidate(candidate.candidateId).catch(() => undefined);
     }
     return Object.freeze([]);
   }
@@ -1034,22 +1069,24 @@ export class ProviderActivationCoordinator {
     generation: number,
     signal: AbortSignal,
     connectionId?: string,
+    backendId: "openrouter" | "kimi-code" = "openrouter",
   ): Promise<ProviderCandidate> {
     try {
       const candidate = await abortableDependency(
-        () => this.#options.adapter.connect({
+        () => this.#adapterFor(backendId).connect({
           ...(connectionId ? { connectionId } : {}),
           candidate: secret,
           generation,
           signal,
         }),
         signal,
-        (lateCandidate) => this.#options.adapter
+        (lateCandidate) => this.#adapterFor(backendId)
           .discardCandidate(lateCandidate.candidateId)
           .catch(() => undefined),
       );
-      if (candidate.backendId !== "openrouter"
-        || candidate.billingRealm !== "openrouter-payg"
+      const policy = requireActivationPolicy(backendId);
+      if (candidate.backendId !== backendId
+        || candidate.billingRealm !== policy.billingRealm
         || candidate.health.credential !== "valid"
         || candidate.health.connectivity !== "connected"
         || candidate.health.spend === "limit-reached"
@@ -1069,10 +1106,11 @@ export class ProviderActivationCoordinator {
   async #listModels(
     candidateId: string,
     signal: AbortSignal,
+    backendId: "openrouter" | "kimi-code" = "openrouter",
   ): Promise<readonly BackendModelDescriptor[]> {
     try {
       return await abortableDependency(
-        () => this.#options.adapter.listModels({ candidateId, signal }),
+        () => this.#adapterFor(backendId).listModels({ candidateId, signal }),
         signal,
       );
     } catch (error) {
@@ -1094,7 +1132,7 @@ export class ProviderActivationCoordinator {
       // Runtime activation can publish process state. Once invoked it must
       // settle while Runtime -> Provider ownership remains held; abort may be
       // observed by the adapter but must never detach its publication promise.
-      return await this.#options.adapter.activate({ candidateId, model, signal });
+      return await this.#adapterFor(model.backendId as "openrouter" | "kimi-code").activate({ candidateId, model, signal });
     } catch (error) {
       if (isAbort(error, signal)) throw abortFrom(signal);
       throw new ProviderActivationError(
@@ -1389,6 +1427,16 @@ export class ProviderActivationCoordinator {
     return value;
   }
 
+  #adapterFor(backendId: "openrouter" | "kimi-code"): ActivationAdapter | BackendAdapter {
+    try {
+      const adapter = this.#adapterResolver(backendId);
+      if (!adapter || adapter.backendId !== backendId) throw new Error("adapter-mismatch");
+      return adapter;
+    } catch {
+      throw new ProviderActivationRecoveryRequiredError("provider-adapter-unavailable");
+    }
+  }
+
   async #waitForLease(signal: AbortSignal): Promise<void> {
     try {
       await this.#options.waitForLease();
@@ -1400,7 +1448,7 @@ export class ProviderActivationCoordinator {
   }
 
   async #createJournal(
-    manifest: ProviderActivationJournalV1,
+    manifest: ProviderActivationJournal,
     lease: HeldProviderLease,
   ): Promise<TransactionJournal> {
     const activationRoot = join(this.#options.appHome, ACTIVATION_DIRECTORY);
@@ -1431,7 +1479,7 @@ export class ProviderActivationCoordinator {
 
   async #writeJournal(
     transaction: TransactionJournal,
-    manifest: ProviderActivationJournalV1,
+    manifest: ProviderActivationJournal,
     lease: HeldProviderLease,
   ): Promise<void> {
     try {
@@ -1546,7 +1594,7 @@ export class ProviderActivationCoordinator {
   }
 
   async #cleanupPreviousSlot(
-    previous: ProviderActivationJournalV1["previousSlot"],
+    previous: ProviderActivationJournal["previousSlot"],
     activeState: ProviderSetupStateV2,
     transaction: TransactionJournal,
     lease: HeldProviderLease,
@@ -1599,6 +1647,14 @@ export class ProviderActivationCoordinator {
   }
 }
 
+function requireActivationPolicy(backendId: "openrouter" | "kimi-code"): ProviderCredentialPolicy {
+  const policy = providerCredentialPolicy(backendId);
+  if (!policy || policy.savedSlotKinds.length !== 1) {
+    throw new ProviderActivationError("provider-credential-policy-invalid", "Provider credential policy is invalid.");
+  }
+  return policy;
+}
+
 export async function recoverProviderActivation(
   options: ProviderActivationCoordinatorOptions,
   request: ProviderActivationRecoveryRequest,
@@ -1620,13 +1676,13 @@ function buildNextState(
   }
   const connection = {
     id: candidate.connectionId,
-    backendId: "openrouter" as const,
+    backendId: candidate.backendId,
     enabled: true,
-    maturity: "stable" as const,
+    maturity: candidate.backendId === "openrouter" ? "stable" as const : "preview" as const,
     credentialSlot: candidateSlot.id,
     accountFingerprint: candidate.accountFingerprint,
     accountFingerprintState: "verified" as const,
-    billingRealm: "openrouter-payg" as const,
+    billingRealm: candidate.billingRealm,
     lastHealth: structuredClone(candidate.health),
   };
   const connections = current.connections
@@ -1676,14 +1732,17 @@ function assertNoRetainedIdentityCollision(
 function previousSlotFromState(
   state: ProviderSetupStateV2,
   connectionId: string,
-): ProviderActivationJournalV1["previousSlot"] {
-  const value = state.connections.find((connection) => connection.id === connectionId)
-    ?.credentialSlot;
+): ProviderActivationJournal["previousSlot"] {
+  const existing = state.connections.find((connection) => connection.id === connectionId);
+  const value = existing?.credentialSlot;
   if (!value) return null;
   if (value === "legacy:inference") {
     return { version: 0, kind: "inference", id: "legacy:inference" };
   }
-  const parsed = parseCredentialSlot({ version: 1, kind: "inference", id: value });
+  const policy = existing ? providerCredentialPolicy(existing.backendId) : null;
+  const parsed = policy
+    ? parseCredentialSlot({ version: 1, kind: policy.savedSlotKinds[0]!, id: value })
+    : null;
   return parsed;
 }
 
@@ -1699,9 +1758,9 @@ function routeForCandidate(
   }
   return {
     version: 1,
-    backendId: "openrouter",
+    backendId: candidate.backendId,
     accountFingerprint: candidate.accountFingerprint,
-    billingRealm: "openrouter-payg",
+    billingRealm: candidate.billingRealm,
     requestedModelId: model.requestedModelId,
     canonicalModelId: model.canonicalModelId,
     resolutionState: "resolved",
@@ -1712,9 +1771,10 @@ function selectExplicitModel(
   models: readonly BackendModelDescriptor[],
   requestedModelId: string,
   canonicalModelId: string,
+  backendId: "openrouter" | "kimi-code",
 ): BackendModelDescriptor {
   const selected = models.find((model) =>
-    model.backendId === "openrouter"
+    model.backendId === backendId
     && model.requestedModelId === requestedModelId
     && model.canonicalModelId === canonicalModelId
     && model.capabilities.textInput
@@ -1759,14 +1819,14 @@ function assertActivatedRoute(
 
 function exactCandidateState(
   facts: Extract<ConfigFacts, { kind: "valid" | "absent" }>,
-  manifest: ProviderActivationJournalV1,
+  manifest: ProviderActivationJournal,
 ): boolean {
   return facts.digest === manifest.candidateProviderSetupSha256;
 }
 
 function exactOldState(
   facts: Extract<ConfigFacts, { kind: "valid" | "absent" }>,
-  manifest: ProviderActivationJournalV1,
+  manifest: ProviderActivationJournal,
 ): boolean {
   return facts.digest === manifest.expectedProviderSetupSha256;
 }
@@ -2009,7 +2069,7 @@ function scanJsonValue(raw: string, start: number): number | null {
   return index > start ? index : null;
 }
 
-function parseJournal(raw: string, transactionId: string): ProviderActivationJournalV1 | null {
+function parseJournal(raw: string, transactionId: string): ProviderActivationJournal | null {
   if (Buffer.byteLength(raw, "utf8") > MANIFEST_FILE_LIMIT) return null;
   let parsed: unknown;
   try {
@@ -2018,19 +2078,30 @@ function parseJournal(raw: string, transactionId: string): ProviderActivationJou
     return null;
   }
   try {
-    validateJournal(parsed, transactionId);
+    if (!isRecord(parsed)) return null;
+    if (parsed.version === 1) return parseLegacyOpenRouterJournalV1(parsed, transactionId);
+    if (parsed.version !== 2) return null;
+    validateJournalV2(parsed, transactionId);
     const value = parsed as unknown as Record<string, unknown>;
     const candidateSlot = parseCredentialSlot(value.candidateSlot);
-    const previousSlot = parsePreviousSlot(value.previousSlot);
+    const backendId = value.backendId;
+    if (backendId !== "openrouter" && backendId !== "kimi-code") return null;
+    const policy = providerCredentialPolicy(backendId);
+    if (!policy) return null;
+    const previousSlot = parsePreviousSlot(value.previousSlot, backendId);
     const candidateRoute = parseStrictRoute(value.candidateRoute);
-    if (!candidateSlot || candidateSlot.kind !== "inference"
-      || previousSlot === undefined || !candidateRoute) return null;
+    if (!candidateSlot || candidateSlot.kind !== value.credentialSlotKind
+      || !policy.savedSlotKinds.includes(candidateSlot.kind)
+      || previousSlot === undefined || !candidateRoute
+      || candidateRoute.backendId !== backendId
+      || candidateRoute.billingRealm !== policy.billingRealm) return null;
     return {
-      version: 1,
+      version: 2,
       transactionId,
       expectedRevision: Number(value.expectedRevision),
-      phase: value.phase as ProviderActivationJournalV1["phase"],
-      backendId: "openrouter",
+      phase: value.phase as ProviderActivationJournalV2["phase"],
+      backendId,
+      credentialSlotKind: candidateSlot.kind,
       candidateSlot,
       previousSlot,
       candidateConnectionId: String(value.candidateConnectionId),
@@ -2043,7 +2114,35 @@ function parseJournal(raw: string, transactionId: string): ProviderActivationJou
   }
 }
 
-function validateJournal(value: unknown, transactionId: string): asserts value is ProviderActivationJournalV1 {
+/** Frozen parser: journal-v1 is OpenRouter-only and never reinterprets Kimi. */
+function parseLegacyOpenRouterJournalV1(
+  value: Record<string, unknown>,
+  transactionId: string,
+): ProviderActivationJournalV1 | null {
+  try {
+    validateJournalV1(value, transactionId);
+    const candidateSlot = parseCredentialSlot(value.candidateSlot);
+    const previousSlot = parsePreviousSlot(value.previousSlot, "openrouter");
+    const candidateRoute = parseStrictRoute(value.candidateRoute);
+    if (!candidateSlot || candidateSlot.kind !== "inference" || previousSlot === undefined
+      || !candidateRoute || candidateRoute.backendId !== "openrouter"
+      || candidateRoute.billingRealm !== "openrouter-payg") return null;
+    return {
+      version: 1, transactionId, expectedRevision: Number(value.expectedRevision),
+      phase: value.phase as ProviderActivationJournalV1["phase"], backendId: "openrouter",
+      candidateSlot, previousSlot, candidateConnectionId: String(value.candidateConnectionId),
+      candidateRoute, expectedProviderSetupSha256: String(value.expectedProviderSetupSha256),
+      candidateProviderSetupSha256: String(value.candidateProviderSetupSha256),
+    };
+  } catch { return null; }
+}
+
+function validateJournal(value: ProviderActivationJournal, transactionId: string): void {
+  if (value.version === 1) validateJournalV1(value, transactionId);
+  else validateJournalV2(value, transactionId);
+}
+
+function validateJournalV1(value: unknown, transactionId: string): asserts value is ProviderActivationJournalV1 {
   if (!isRecord(value)
     || !exactKeys(value, [
       "version",
@@ -2069,11 +2168,11 @@ function validateJournal(value: unknown, transactionId: string): asserts value i
       && value.phase !== "config-committed")
     || value.backendId !== "openrouter"
     || !isInferenceSlot(value.candidateSlot)
-    || parsePreviousSlot(value.previousSlot) === undefined
+    || parsePreviousSlot(value.previousSlot, "openrouter") === undefined
     || typeof value.candidateConnectionId !== "string"
     || value.candidateConnectionId.length === 0
     || value.candidateConnectionId.length > 256
-    || parseStrictRoute(value.candidateRoute) === null
+    || parseStrictRoute(value.candidateRoute)?.backendId !== "openrouter"
     || typeof value.expectedProviderSetupSha256 !== "string"
     || !/^[0-9a-f]{64}$/.test(value.expectedProviderSetupSha256)
     || typeof value.candidateProviderSetupSha256 !== "string"
@@ -2082,11 +2181,40 @@ function validateJournal(value: unknown, transactionId: string): asserts value i
   }
 }
 
+function validateJournalV2(value: unknown, transactionId: string): asserts value is ProviderActivationJournalV2 {
+  if (!isRecord(value)
+    || !exactKeys(value, ["version", "transactionId", "expectedRevision", "phase", "backendId", "credentialSlotKind", "candidateSlot", "previousSlot", "candidateConnectionId", "candidateRoute", "expectedProviderSetupSha256", "candidateProviderSetupSha256"])
+    || value.version !== 2 || value.transactionId !== transactionId || !CANONICAL_UUID.test(transactionId)
+    || !Number.isSafeInteger(value.expectedRevision) || Number(value.expectedRevision) < 0 || Number(value.expectedRevision) >= Number.MAX_SAFE_INTEGER
+    || (value.phase !== "prepared" && value.phase !== "credential-staged" && value.phase !== "config-committed")
+    || (value.backendId !== "openrouter" && value.backendId !== "kimi-code")
+    || (value.credentialSlotKind !== "inference" && value.credentialSlotKind !== "kimi-code")
+    || typeof value.candidateConnectionId !== "string" || value.candidateConnectionId.length === 0 || value.candidateConnectionId.length > 256
+    || typeof value.expectedProviderSetupSha256 !== "string" || !/^[0-9a-f]{64}$/.test(value.expectedProviderSetupSha256)
+    || typeof value.candidateProviderSetupSha256 !== "string" || !/^[0-9a-f]{64}$/.test(value.candidateProviderSetupSha256)) {
+    throw new Error("invalid-provider-activation-journal");
+  }
+  const policy = providerCredentialPolicy(value.backendId);
+  const candidateSlot = parseCredentialSlot(value.candidateSlot);
+  const previousSlot = parsePreviousSlot(value.previousSlot, value.backendId);
+  const route = parseStrictRoute(value.candidateRoute);
+  if (!policy
+    || !candidateSlot
+    || candidateSlot.kind !== value.credentialSlotKind
+    || !policy.savedSlotKinds.includes(candidateSlot.kind)
+    || previousSlot === undefined
+    || !route
+    || route.backendId !== value.backendId
+    || route.billingRealm !== policy.billingRealm) {
+    throw new Error("invalid-provider-activation-journal");
+  }
+}
+
 function parseCredentialSlot(value: unknown): CredentialSlotRef | null {
   if (!isRecord(value)
     || !exactKeys(value, ["version", "kind", "id"])
     || value.version !== 1
-    || (value.kind !== "inference" && value.kind !== "management")
+    || (value.kind !== "inference" && value.kind !== "management" && value.kind !== "kimi-code")
     || typeof value.id !== "string") {
     return null;
   }
@@ -2103,15 +2231,17 @@ function parseCredentialSlot(value: unknown): CredentialSlotRef | null {
 
 function parsePreviousSlot(
   value: unknown,
-): ProviderActivationJournalV1["previousSlot"] | undefined {
+  backendId: "openrouter" | "kimi-code",
+): ProviderActivationJournal["previousSlot"] | undefined {
   if (value === null) return null;
   const current = parseCredentialSlot(value);
-  if (current?.kind === "inference") return current;
+  const policy = providerCredentialPolicy(backendId);
+  if (current && policy?.savedSlotKinds.includes(current.kind)) return current;
   if (isRecord(value)
       && exactKeys(value, ["version", "kind", "id"])
       && value.version === 0
       && value.kind === "inference"
-      && value.id === "legacy:inference") {
+      && value.id === "legacy:inference" && backendId === "openrouter") {
     return { version: 0, kind: "inference", id: "legacy:inference" };
   }
   return undefined;
@@ -2134,8 +2264,8 @@ function parseStrictRoute(value: unknown): RouteIdentityV1 | null {
     ])) return null;
   const validated = validateRouteIdentityV1(value);
   if (!validated
-    || validated.backendId !== "openrouter"
-    || validated.billingRealm !== "openrouter-payg"
+    || (validated.backendId !== "openrouter" && validated.backendId !== "kimi-code")
+    || validated.billingRealm !== providerCredentialPolicy(validated.backendId)?.billingRealm
     || validated.resolutionState !== "resolved"
     || validated.accountFingerprint.length > 512
     || validated.requestedModelId.length > 512
@@ -2143,9 +2273,9 @@ function parseStrictRoute(value: unknown): RouteIdentityV1 | null {
     || validated.canonicalModelId.length > 512) return null;
   return {
     version: 1,
-    backendId: "openrouter",
+    backendId: validated.backendId,
     accountFingerprint: validated.accountFingerprint,
-    billingRealm: "openrouter-payg",
+    billingRealm: validated.billingRealm,
     requestedModelId: validated.requestedModelId,
     canonicalModelId: validated.canonicalModelId,
     resolutionState: "resolved",

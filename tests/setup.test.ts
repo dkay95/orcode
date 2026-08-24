@@ -1192,6 +1192,7 @@ test("candidate activation delegates once and emits only privacy-safe normalized
   const secret = "sk-or-v1-private-candidate";
 
   const result = await fixture.orchestrator.activateCandidate({
+    backendId: "openrouter",
     expectedRevision: 0,
     candidate: secret,
     expectedRequestedModelId: "vendor/chosen",
@@ -1238,6 +1239,7 @@ test("concurrent candidate activations are serialized before coordinator commit"
     activationCoordinator,
   });
   const activationRequest = {
+    backendId: "openrouter" as const,
     expectedRevision: 0,
     candidate: "sk-or-v1-private-candidate",
     expectedRequestedModelId: activatedRoute.requestedModelId,
@@ -1290,6 +1292,7 @@ test("new inspection generation waits for an in-flight activation before taking 
   });
 
   const activation = fixture.orchestrator.activateCandidate({
+    backendId: "openrouter",
     expectedRevision: 0,
     candidate: "sk-or-v1-private-candidate",
     expectedRequestedModelId: `vendor/${primary.id}`,
@@ -1589,6 +1592,7 @@ test("back-to-back generations register ownership before an activation wait", as
     activationCoordinator,
   });
   const activation = fixture.orchestrator.activateCandidate({
+    backendId: "openrouter",
     expectedRevision: 0,
     candidate: "candidate-generation-gate",
     expectedRequestedModelId: activatedRoute.requestedModelId,
@@ -1874,6 +1878,7 @@ test("candidate activation event reconstructs only the exact safe route schema",
   });
 
   await fixture.orchestrator.activateCandidate({
+    backendId: "openrouter",
     expectedRevision: 0,
     candidate: "candidate-safe-route-event",
     expectedRequestedModelId: "vendor/chosen",

@@ -150,7 +150,7 @@ function fixtureAuthority(
           candidatePermit: Object.freeze({ version: 1 as const }),
           async publishIfCurrent(publish) { publish(); },
           binding: {
-            version: 1,
+            version: 2,
             stateRevision: 0,
             connectionId: request.connectionId,
             backendId: "openrouter",

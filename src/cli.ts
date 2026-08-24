@@ -975,6 +975,7 @@ export class DefaultProviderRuntime implements ProviderRuntime {
       if (this.authorityOptions && savedBinding.kind === "exact") {
         const access = await this.authorityOptions.credentialAuthority.withCredential(
           {
+            backendId: savedBinding.binding.backendId,
             connectionId: savedBinding.binding.connectionId,
             credentialKind: "inference",
             purpose: "explicit-repair",
@@ -1332,6 +1333,7 @@ export class DefaultProviderRuntime implements ProviderRuntime {
       if (terminalActivation) throw new ProviderSetupRequiredError();
       terminalActivation = (async () => {
         const result = await this.orchestrator.activateCandidate({
+          backendId: "openrouter",
           expectedRevision,
           candidate,
           expectedRequestedModelId: modelId,
@@ -1367,6 +1369,7 @@ export class DefaultProviderRuntime implements ProviderRuntime {
         }
         const access = await this.authorityOptions.credentialAuthority.withCredential(
           {
+            backendId: persistedBinding.binding.backendId,
             connectionId: persistedBinding.binding.connectionId,
             credentialKind: "inference",
             purpose: "explicit-repair",
@@ -2852,6 +2855,7 @@ export function createProviderCredentialController(input: {
           if (terminalActivation.current) throw new ProviderSetupRequiredError();
           terminalActivation.current = (async () => {
             const result = await input.activationCoordinator.activate({
+              backendId: "openrouter",
               expectedRevision,
               candidate,
               expectedRequestedModelId: route.requestedModelId,
@@ -2889,6 +2893,7 @@ export function createProviderCredentialController(input: {
             }
             const access = await input.credentialAuthority.withCredential(
               {
+                backendId: selected.binding.backendId,
                 connectionId: selected.binding.connectionId,
                 credentialKind: "inference",
                 purpose: "explicit-repair",
@@ -3334,7 +3339,7 @@ export async function createDefaultProviderRuntime(
     configPath: startup.configPath,
     privateStore,
     credentials,
-    adapter,
+    adapterResolver: (backendId) => registry.adapter(backendId),
     stateStore,
     runtimeGuard,
     candidateAuthority: credentialAuthority,

@@ -2708,7 +2708,7 @@ test("setup postpublication abort waits for exact activation terminal reconcilia
     configPath,
     privateStore: new PrivateStore({ root }),
     credentials: credentials as never,
-    adapter,
+    adapterResolver: () => adapter,
     stateStore,
     runtimeGuard,
     createUuid: () => `82828282-8282-4282-8282-${String(uuid++).padStart(12, "0")}`,
@@ -2916,7 +2916,7 @@ test("process-only setup postpublication abort reconciles the exact runtime rout
     configPath,
     privateStore: new PrivateStore({ root }),
     credentials: credentials as never,
-    adapter,
+    adapterResolver: () => adapter,
     stateStore,
     runtimeGuard,
     candidateAuthority: credentialAuthority,
@@ -3839,7 +3839,7 @@ test("logout forgets a disabled versioned connection through the restart-safe jo
     configPath: fixture.configPath,
     privateStore: new PrivateStore({ root: fixture.root }),
     credentials: fixture.credentials as never,
-    adapter: fixture.adapter as never,
+    adapterResolver: () => fixture.adapter as never,
     stateStore: restartedStore,
     runtimeGuard: restartedGuard,
   });
@@ -5511,7 +5511,7 @@ async function providerForgetActivationFixture() {
     configPath,
     privateStore,
     credentials: credentials as never,
-    adapter: adapter as never,
+    adapterResolver: () => adapter as never,
     stateStore,
     runtimeGuard,
   });
@@ -5586,7 +5586,7 @@ async function managementMutationLeaseFixture() {
     configPath,
     privateStore,
     credentials: {} as never,
-    adapter: {} as never,
+    adapterResolver: () => ({} as never),
     stateStore,
     runtimeGuard,
     now: () => now,
@@ -7081,13 +7081,14 @@ for (const persistence of ["persisted", "process-only"] as const) {
       configPath: fixture.configPath,
       privateStore: new PrivateStore({ root: fixture.root }),
       credentials: fixture.credentials as never,
-      adapter: fixture.adapter as never,
+      adapterResolver: () => fixture.adapter as never,
       stateStore: independentStore,
       runtimeGuard: providerRuntimeGuardFixture(),
     });
 
     await assert.rejects(
       independentCoordinator.activate({
+        backendId: "openrouter",
         expectedRevision: independentStore.read().revision,
         candidate: fixture.oldSecret,
         expectedRequestedModelId: fixture.route.requestedModelId,

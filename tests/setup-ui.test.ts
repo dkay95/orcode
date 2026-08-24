@@ -231,6 +231,7 @@ test("hub connects OpenRouter in secret, model, and explicit persistence order",
   assert.deepEqual(surface.calls, ["hub", "secret", "model", "confirm", "hub"]);
   assert.deepEqual(context.adapter.calls, ["connect", "models", "discard"]);
   assert.equal(context.activations.length, 1);
+  assert.equal(context.activations[0]?.backendId, "openrouter");
   assert.equal(context.activations[0]?.persistence, "persisted");
   assert.equal(context.activations[0]?.selectedCanonicalModelId, MODEL.canonicalModelId);
 });

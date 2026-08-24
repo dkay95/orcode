@@ -2,6 +2,7 @@ import { createHmac, randomBytes } from "node:crypto";
 import {
   normalizeProviderSecret,
   type CredentialKind,
+  type CredentialSlotKind,
   type CredentialSlotRef,
   type VersionedCredentialStoreLike,
 } from "./credentials.js";
@@ -10,7 +11,7 @@ import type {
   ProviderSetupStateV2,
   ProviderStateStore,
 } from "./provider-state.js";
-import type { RouteIdentityV1 } from "./backends.js";
+import type { BackendId, RouteIdentityV1 } from "./backends.js";
 
 const CANONICAL_UUID =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
@@ -27,9 +28,49 @@ export type EnvironmentEligibility =
   | "automatic-if-no-saved"
   | "explicit-repair";
 
-export type OpenRouterCredentialPointer =
+export type ProviderCredentialPointer =
   | { kind: "legacy"; id: "legacy:inference" }
   | { kind: "versioned"; slot: CredentialSlotRef };
+
+/** @deprecated Use ProviderCredentialPointer for backend-aware code. */
+export type OpenRouterCredentialPointer = ProviderCredentialPointer;
+
+export interface ProviderCredentialPolicy {
+  backendId: "openrouter" | "kimi-code";
+  savedSlotKinds: readonly CredentialSlotKind[];
+  legacyInferenceAllowed: boolean;
+  environmentVariable: "OPENROUTER_API_KEY" | null;
+  billingRealm: "openrouter-payg" | "kimi-code-membership-provider-managed-overage";
+  accountIdentity: "documented-provider-account" | "normalized-secret-hmac";
+  secretFingerprintDomain: "orcode-kimi-code-credential/v1\0" | null;
+}
+
+const PROVIDER_CREDENTIAL_POLICIES = {
+  openrouter: Object.freeze({
+    backendId: "openrouter",
+    savedSlotKinds: Object.freeze(["inference"] as const),
+    legacyInferenceAllowed: true,
+    environmentVariable: "OPENROUTER_API_KEY",
+    billingRealm: "openrouter-payg",
+    accountIdentity: "documented-provider-account",
+    secretFingerprintDomain: null,
+  }),
+  "kimi-code": Object.freeze({
+    backendId: "kimi-code",
+    savedSlotKinds: Object.freeze(["kimi-code"] as const),
+    legacyInferenceAllowed: false,
+    environmentVariable: null,
+    billingRealm: "kimi-code-membership-provider-managed-overage",
+    accountIdentity: "normalized-secret-hmac",
+    secretFingerprintDomain: "orcode-kimi-code-credential/v1\0",
+  }),
+} as const satisfies Readonly<Record<ProviderCredentialPolicy["backendId"], ProviderCredentialPolicy>>;
+
+export function providerCredentialPolicy(
+  backendId: BackendId,
+): ProviderCredentialPolicy | null {
+  return PROVIDER_CREDENTIAL_POLICIES[backendId as ProviderCredentialPolicy["backendId"]] ?? null;
+}
 
 export interface ProviderConnectionBindingV1 {
   version: 1;
@@ -43,8 +84,20 @@ export interface ProviderConnectionBindingV1 {
   isDefault: boolean;
 }
 
+export interface ProviderConnectionBindingV2 {
+  version: 2;
+  stateRevision: number;
+  connectionId: string;
+  backendId: "openrouter" | "kimi-code";
+  enabled: boolean;
+  credentialPointer: ProviderCredentialPointer;
+  accountFingerprint: string;
+  billingRealm: "openrouter-payg" | "kimi-code-membership-provider-managed-overage";
+  isDefault: boolean;
+}
+
 export type ProviderBindingSelection =
-  | { kind: "exact"; binding: ProviderConnectionBindingV1 }
+  | { kind: "exact"; binding: ProviderConnectionBindingV2 }
   | { kind: "none" }
   | { kind: "disabled" }
   | { kind: "ambiguous" }
@@ -69,6 +122,7 @@ export interface ProviderAuthorityCoordinator {
 }
 
 export interface ProviderCredentialRequest {
+  backendId: "openrouter" | "kimi-code";
   connectionId: string;
   credentialKind?: CredentialKind;
   purpose: CredentialAccessPurpose;
@@ -80,7 +134,7 @@ export interface ProviderCredentialRequest {
 
 export interface ProviderCredentialUseContext {
   source: "saved" | "environment";
-  binding: ProviderConnectionBindingV1;
+  binding: ProviderConnectionBindingV2;
   candidatePermit: ProviderCandidateCredentialPermit;
   publishIfCurrent(publish: () => void): Promise<void>;
 }
@@ -155,21 +209,21 @@ export interface ProviderCredentialAuthorityOptions {
   now?: () => number;
 }
 
-type ProviderBindingSelector =
+export type ProviderBindingSelector =
   | { kind: "connection"; connectionId: string }
   | { kind: "route"; route: RouteIdentityV1 }
   | { kind: "default" }
-  | { kind: "backend"; backendId: "openrouter" };
+  | { kind: "backend"; backendId: "openrouter" | "kimi-code" };
 
 interface CredentialPermit {
-  binding: ProviderConnectionBindingV1;
+  binding: ProviderConnectionBindingV2;
   secret: string;
   source: "saved" | "environment";
 }
 
 interface CandidateCredentialProof {
   source: "saved" | "environment";
-  binding: ProviderConnectionBindingV1 | null;
+  binding: ProviderConnectionBindingV2 | null;
   stateRevision: number;
   fingerprint: string;
 }
@@ -225,7 +279,7 @@ export class ProviderCredentialAuthority implements ProviderCredentialAuthorityL
     selector: ProviderBindingSelector,
     options: { allowDisabled?: boolean } = {},
   ): ProviderBindingSelection {
-    return selectOpenRouterBinding(
+    return selectProviderBinding(
       this.#stateStore.read(),
       selector,
       options.allowDisabled ?? false,
@@ -405,7 +459,7 @@ export class ProviderCredentialAuthority implements ProviderCredentialAuthorityL
   ): Promise<CredentialPermit | ProviderCredentialAccessResult<never>> {
     await this.#bounded(request, () => lease.assertHeld());
     const before = await this.#readAuthoritativeState(request);
-    const selected = selectOpenRouterBinding(
+    const selected = selectProviderBinding(
       before,
       { kind: "connection", connectionId: request.connectionId },
       request.allowDisabled ?? false,
@@ -414,12 +468,16 @@ export class ProviderCredentialAuthority implements ProviderCredentialAuthorityL
       return { kind: selected.kind } as ProviderCredentialAccessResult<never>;
     }
     const binding = selected.binding;
+    if (binding.backendId !== request.backendId) return { kind: "stale" };
+    if (request.credentialKind === "management" && binding.backendId !== "openrouter") {
+      return { kind: "invalid-pointer" };
+    }
     let permit = request.credentialKind === "management"
       ? await this.#readManagementPermit(request, binding, before)
       : await this.#readInferencePermit(request, binding, before);
     await this.#bounded(request, () => lease.assertHeld());
     if ("secret" in permit) {
-      const after = selectOpenRouterBinding(
+      const after = selectProviderBinding(
         await this.#readAuthoritativeState(request),
         { kind: "connection", connectionId: request.connectionId },
         request.allowDisabled ?? false,
@@ -552,6 +610,7 @@ export class ProviderCredentialAuthority implements ProviderCredentialAuthorityL
       return;
     }
     const current = await this.#readPermitUnderLease({
+      backendId: expected.binding.backendId,
       connectionId: expected.binding.connectionId,
       credentialKind: "inference",
       purpose: "explicit-repair",
@@ -604,7 +663,7 @@ export class ProviderCredentialAuthority implements ProviderCredentialAuthorityL
       }
       return;
     }
-    const selected = selectOpenRouterBinding(
+    const selected = selectProviderBinding(
       state,
       { kind: "connection", connectionId: expected.binding.connectionId },
       !expected.binding.enabled,
@@ -613,6 +672,7 @@ export class ProviderCredentialAuthority implements ProviderCredentialAuthorityL
       throw new ProviderAuthorityStaleError();
     }
     const current = await this.#readInferencePermit({
+      backendId: expected.binding.backendId,
       connectionId: expected.binding.connectionId,
       credentialKind: "inference",
       purpose: "explicit-repair",
@@ -665,11 +725,19 @@ export class ProviderCredentialAuthority implements ProviderCredentialAuthorityL
 
   async #readInferencePermit(
     request: ProviderCredentialRequest,
-    binding: ProviderConnectionBindingV1,
+    binding: ProviderConnectionBindingV2,
     state: ProviderSetupStateV2,
   ): Promise<CredentialPermit | ProviderCredentialAccessResult<never>> {
     let stored: string | null;
+    const policy = providerCredentialPolicy(binding.backendId);
+    if (!policy || binding.backendId !== request.backendId) return { kind: "invalid-pointer" };
     const pointer = binding.credentialPointer;
+    if (pointer.kind === "legacy" && !policy.legacyInferenceAllowed) {
+      return { kind: "invalid-pointer" };
+    }
+    if (pointer.kind === "versioned" && !policy.savedSlotKinds.includes(pointer.slot.kind)) {
+      return { kind: "invalid-pointer" };
+    }
     try {
       stored = pointer.kind === "legacy"
         ? await this.#bounded(request, () => this.#credentials.get("inference"))
@@ -722,7 +790,7 @@ export class ProviderCredentialAuthority implements ProviderCredentialAuthorityL
 
   async #readManagementPermit(
     request: ProviderCredentialRequest,
-    binding: ProviderConnectionBindingV1,
+    binding: ProviderConnectionBindingV2,
     state: ProviderSetupStateV2,
   ): Promise<CredentialPermit | ProviderCredentialAccessResult<never>> {
     let stored: string | null;
@@ -748,7 +816,7 @@ export class ProviderCredentialAuthority implements ProviderCredentialAuthorityL
   }
 
   #environmentPermit(
-    binding: ProviderConnectionBindingV1,
+    binding: ProviderConnectionBindingV2,
     name: "OPENROUTER_API_KEY" | "OPENROUTER_MANAGEMENT_KEY",
   ): CredentialPermit | ProviderCredentialAccessResult<never> {
     const raw = this.#environment[name];
@@ -766,9 +834,11 @@ export class ProviderCredentialAuthority implements ProviderCredentialAuthorityL
 
   #environmentAllowed(
     request: ProviderCredentialRequest,
-    binding: ProviderConnectionBindingV1,
+    binding: ProviderConnectionBindingV2,
     state: ProviderSetupStateV2,
   ): boolean {
+    const policy = providerCredentialPolicy(binding.backendId);
+    if (!policy || policy.environmentVariable === null || binding.backendId !== request.backendId) return false;
     if (request.environmentEligibility === "forbidden") return false;
     if (request.environmentEligibility === "explicit-repair") return true;
     if (this.#automaticEnvironmentRevoked || !binding.enabled) return false;
@@ -871,7 +941,26 @@ export function parseOpenRouterCredentialPointer(
   };
 }
 
-export function selectOpenRouterBinding(
+export function parseProviderCredentialPointer(
+  backendId: "openrouter" | "kimi-code",
+  value: string,
+): ProviderCredentialPointer | null {
+  const policy = providerCredentialPolicy(backendId);
+  if (!policy) return null;
+  if (value === "legacy:inference") {
+    return policy.legacyInferenceAllowed ? { kind: "legacy", id: value } : null;
+  }
+  const match = /^v1:(inference|management|kimi-code):([0-9a-f-]+)$/u.exec(value);
+  if (!match || !CANONICAL_UUID.test(match[2] ?? "")) return null;
+  const kind = match[1] as CredentialSlotKind;
+  if (!policy.savedSlotKinds.includes(kind)) return null;
+  return {
+    kind: "versioned",
+    slot: Object.freeze({ version: 1, kind, id: value }),
+  };
+}
+
+export function selectProviderBinding(
   state: ProviderSetupStateV2,
   selector: ProviderBindingSelector,
   allowDisabled = false,
@@ -879,7 +968,7 @@ export function selectOpenRouterBinding(
   let matches: ProviderConnectionStateV1[];
   if (selector.kind === "connection") {
     matches = state.connections.filter((connection) =>
-      connection.backendId === "openrouter" && connection.id === selector.connectionId
+      connection.id === selector.connectionId
     );
   } else if (selector.kind === "route") {
     matches = connectionsForRoute(state, selector.route);
@@ -898,19 +987,24 @@ export function selectOpenRouterBinding(
   if (matches.length === 0) return { kind: "none" };
   if (matches.length !== 1) return { kind: "ambiguous" };
   const connection = matches[0]!;
-  const pointer = parseOpenRouterCredentialPointer(connection.credentialSlot);
+  if (connection.backendId !== "openrouter" && connection.backendId !== "kimi-code") {
+    return { kind: "invalid-pointer" };
+  }
+  const policy = providerCredentialPolicy(connection.backendId);
+  if (!policy || connection.billingRealm !== policy.billingRealm) return { kind: "invalid-pointer" };
+  const pointer = parseProviderCredentialPointer(connection.backendId, connection.credentialSlot);
   if (!pointer) return { kind: "invalid-pointer" };
   return {
     kind: "exact",
     binding: {
-      version: 1,
+      version: 2,
       stateRevision: state.revision,
       connectionId: connection.id,
-      backendId: "openrouter",
+      backendId: connection.backendId,
       enabled: connection.enabled,
       credentialPointer: pointer,
       accountFingerprint: connection.accountFingerprint,
-      billingRealm: "openrouter-payg",
+      billingRealm: policy.billingRealm,
       isDefault: Boolean(
         state.defaultRoute
         && connection.backendId === state.defaultRoute.backendId
@@ -921,11 +1015,21 @@ export function selectOpenRouterBinding(
   };
 }
 
+/** Compatibility wrapper for the existing OpenRouter-only call sites. */
+export function selectOpenRouterBinding(
+  state: ProviderSetupStateV2,
+  selector: ProviderBindingSelector,
+  allowDisabled = false,
+): ProviderBindingSelection {
+  const selected = selectProviderBinding(state, selector, allowDisabled);
+  if (selected.kind !== "exact" || selected.binding.backendId === "openrouter") return selected;
+  return { kind: "none" };
+}
+
 function connectionsForRoute(
   state: ProviderSetupStateV2,
   route: RouteIdentityV1,
 ): ProviderConnectionStateV1[] {
-  if (route.backendId !== "openrouter") return [];
   return state.connections.filter((connection) =>
     connection.backendId === route.backendId
     && connection.accountFingerprint === route.accountFingerprint
@@ -934,8 +1038,8 @@ function connectionsForRoute(
 }
 
 function sameBinding(
-  left: ProviderConnectionBindingV1,
-  right: ProviderConnectionBindingV1,
+  left: ProviderConnectionBindingV2,
+  right: ProviderConnectionBindingV2,
 ): boolean {
   return JSON.stringify(left) === JSON.stringify(right);
 }

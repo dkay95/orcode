@@ -36,6 +36,8 @@ import {
   ProviderCredentialAuthority,
   type ProviderAuthorityCoordinator,
   type ProviderConnectionBindingV1,
+  type ProviderConnectionBindingV2,
+  selectProviderBinding,
 } from "../src/provider-authority.js";
 
 const NOW = 1_000_000;
@@ -3736,3 +3738,88 @@ test("pending committed activation journal with never-resolving connect/catalog 
 // This type-only guard keeps the desired adapter contract connected to the
 // production registry rather than testing a standalone fake API.
 void (null as BackendAdapter | null);
+
+const KIMI_SLOT = "v1:kimi-code:018f8d77-2d52-7cc0-8f6a-9fb1f3fc0711";
+const KIMI_FINGERPRINT = "acct_local_kimi";
+const KIMI_REALM = "kimi-code-membership-provider-managed-overage" as const;
+
+function kimiRoute(): RouteIdentityV1 {
+  return {
+    version: 1,
+    backendId: "kimi-code",
+    accountFingerprint: KIMI_FINGERPRINT,
+    billingRealm: KIMI_REALM,
+    requestedModelId: "kimi-for-coding",
+    canonicalModelId: "kimi-for-coding",
+    resolutionState: "resolved",
+  };
+}
+
+function kimiState(slot = KIMI_SLOT): ProviderSetupStateV2 {
+  return {
+    schemaVersion: 2,
+    revision: 4,
+    lifecycle: "configured",
+    connections: [{
+      id: "kimi-main",
+      backendId: "kimi-code",
+      enabled: true,
+      maturity: "preview",
+      credentialSlot: slot,
+      accountFingerprint: KIMI_FINGERPRINT,
+      accountFingerprintState: "verified",
+      billingRealm: KIMI_REALM,
+      lastHealth: null,
+    }],
+    defaultRoute: kimiRoute(),
+    cross: { enabled: false, preferredLead: null, preferredChallenger: null },
+  };
+}
+
+test("Kimi authority binds the literal Kimi slot only inside its callback and never consults OpenRouter environment", async () => {
+  const kimiSecret = "fixture-kimi-membership-key-not-a-real-secret";
+  const credentials = new AuthorityCredentials({}, { [KIMI_SLOT]: kimiSecret });
+  const authority = realAuthority({
+    stateStore: new ProviderStateStore(kimiState()),
+    credentials,
+    environment: { OPENROUTER_API_KEY: SECRET_A },
+  });
+  let binding: ProviderConnectionBindingV2 | null = null;
+  let observedInsideCallback: readonly string[] = [];
+  const result = await authority.withCredential({
+    backendId: "kimi-code",
+    connectionId: "kimi-main",
+    purpose: "runtime-bind",
+    environmentEligibility: "forbidden",
+    deadlineAt: NOW + 5_000,
+    signal: new AbortController().signal,
+  }, async (secret, context) => {
+    assert.equal(secret, kimiSecret);
+    observedInsideCallback = [...credentials.effects];
+    binding = context.binding;
+    return "used";
+  });
+  assert.deepEqual(result, { kind: "available", value: "used" });
+  assert.deepEqual(observedInsideCallback, [`read:${KIMI_SLOT}`]);
+  assert.deepEqual(credentials.effects, [`read:${KIMI_SLOT}`]);
+  assert.deepEqual(binding, {
+    version: 2,
+    stateRevision: 4,
+    connectionId: "kimi-main",
+    backendId: "kimi-code",
+    enabled: true,
+    credentialPointer: { kind: "versioned", slot: { version: 1, kind: "kimi-code", id: KIMI_SLOT } },
+    accountFingerprint: KIMI_FINGERPRINT,
+    billingRealm: KIMI_REALM,
+    isDefault: true,
+  } satisfies ProviderConnectionBindingV2);
+});
+
+test("generic selection rejects a Kimi connection whose slot kind belongs to OpenRouter", () => {
+  const invalid = structuredClone(kimiState("v1:inference:018f8d77-2d52-7cc0-8f6a-9fb1f3fc0711"));
+  const selected = selectProviderBinding(invalid, {
+    kind: "connection",
+    connectionId: "kimi-main",
+  });
+  assert.deepEqual(selected, { kind: "invalid-pointer" });
+});
