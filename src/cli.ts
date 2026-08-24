@@ -165,7 +165,9 @@ import {
   type ProviderActivationRuntimeLease,
 } from "./provider-activation.js";
 import {
+  adoptDurablyCommittedProviderState,
   ProviderStateStore,
+  readProviderStateCommitAdoption,
   requirePersistableProviderState,
   validateProviderSetupState,
   validateRouteIdentityV1,
@@ -1984,8 +1986,10 @@ export class DefaultProviderRuntime implements ProviderRuntime {
           if (authorization.connection && !selected) {
             return this.#confirmationRequired("logout", current);
           }
-          const next = selected
-            ? await this.stateStore.commit(current.revision, (authoritative) => {
+          let next: ProviderSetupStateV1;
+          if (selected) {
+            try {
+              next = await this.stateStore.commit(current.revision, (authoritative) => {
                 if (!this.#confirmationMatches(authorization, "logout", authoritative)) {
                   throw new ProviderConfirmationStaleError(
                     this.#confirmationRequired("logout", authoritative),
@@ -2005,8 +2009,28 @@ export class DefaultProviderRuntime implements ProviderRuntime {
                     : authoritative.defaultRoute,
                   cross: { enabled: false, preferredLead: null, preferredChallenger: null },
                 };
-              })
-            : current;
+              });
+            } catch (error) {
+              const adopted = readProviderStateCommitAdoption(error);
+              if (!adopted) throw error;
+              const result: Extract<ProviderCommandResult, { kind: "changed" }> = {
+                kind: "changed",
+                operation: "logout",
+                backendId: "openrouter",
+                setupRequired: adopted.defaultRoute === null,
+                defaultCleared: current.defaultRoute !== null && adopted.defaultRoute === null,
+              };
+              committedOutcome.value = {
+                proof: LEGACY_LOGOUT_COMMIT_PROOF,
+                state: requirePersistableProviderState(adopted),
+                result,
+                completed: false,
+              };
+              throw error;
+            }
+          } else {
+            next = current;
+          }
           const result: Extract<ProviderCommandResult, { kind: "changed" }> = {
             kind: "changed",
             operation: "logout",
@@ -2929,6 +2953,9 @@ async function persistProviderSetupStateOwned(
           await ownership.assertHeld();
           request.assertCurrent();
         },
+        () => {
+          request.assertCurrent();
+        },
       );
     } catch (error) {
       writeError = error;
@@ -2940,7 +2967,7 @@ async function persistProviderSetupStateOwned(
       if (writeError !== undefined) throw writeError;
       throw new Error("Provider state publication could not be verified.");
     }
-    request.adoptPublished(candidate);
+    adoptDurablyCommittedProviderState(request, candidate);
     return structuredClone(candidate);
   });
 }

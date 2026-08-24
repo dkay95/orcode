@@ -9,7 +9,11 @@ import {
   type ProviderCandidate,
   type ProviderInspection,
 } from "../src/backends.js";
-import { ProviderStateStore, createNeverConfiguredProviderState } from "../src/provider-state.js";
+import {
+  adoptDurablyCommittedProviderState,
+  ProviderStateStore,
+  createNeverConfiguredProviderState,
+} from "../src/provider-state.js";
 import { SetupOrchestrator, type SetupEvent } from "../src/setup.js";
 import {
   createPlainSetupSurface,
@@ -671,7 +675,7 @@ function blockingCrossRolePublicationFixture(
         publicationEntered();
         await publicationRelease;
       }
-      request.adoptPublished(next);
+      adoptDurablyCommittedProviderState(request, next);
       return structuredClone(next);
     },
   });

@@ -355,3 +355,99 @@ Evidence:
 - `.superpowers/sdd/2026-08-23-orcode-startup-provider-slice-1/final-fix-2-report.md`
 
 Exact follow-up commit subject: `fix: fence Cross role publication`.
+
+## Review round 4 — final provider publication boundary
+
+### Base and formal tests-only RED
+
+- Exact follow-up base: `65922ca4507c83ea1c7be79a4ab6cd9ba570192c`.
+- The worktree was clean. Both the initial `src+tests` diff and the initial
+  source-only diff had the empty SHA-256
+  `e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855`;
+  `HEAD:src` had tree hash `86c4c4c453ce4618161198b6be65637f9ea89c6b`.
+- After adding only the four required production-path tests, the source-only
+  diff remained byte-empty and `HEAD:src` retained the same tree hash.
+- The exact name-filtered formal matrix reached 4 tests: 0 passed and 4
+  failed, with no harness failure:
+  1. `real provider writer abort microtask at the last async fence cannot publish stale Cross roles`
+     resolved and published instead of rejecting the queued abort.
+  2. `real provider writer supersession microtask at the last async fence cannot publish stale Cross roles`
+     reached only four assertions and allowed the stale A candidate past the
+     last awaited fence.
+  3. `legacy logout recovers when persistence rejects after adoptPublished`
+     propagated the fixed post-adoption config-lock release failure and left
+     the runtime credential live.
+  4. `committed provider outcome rejects a prototype-shaped object with an own readCommitted override`
+     failed because the private terminal-adoption helpers did not yet exist.
+
+### Central correction
+
+- `writeFileAtomicSecure` now has a distinct synchronous `beforeRename`
+  effect-time hook. It runs only after the awaited snapshot/ownership checks,
+  and there is no await or event-loop yield between that hook and invoking the
+  atomic rename. A non-void result is rejected rather than treating an async
+  callback as a valid final fence.
+- The provider writer threads its existing exact `request.assertCurrent()`
+  capability into that hook. The capability already combines the caller
+  signal, setup/process-route generations, and captured activation state, so a
+  queued abort or newer in-memory state is rejected before stale durable bytes
+  can publish.
+- The public structural `adoptPublished` method was removed. Exact durable
+  adoption is now reachable only through a module-private WeakMap capability
+  bound to the precise `ProviderStateCommitRequest`. Post-publication
+  persistence-owner failures become private error objects whose committed
+  clone is stored in a second WeakMap; decoding never uses `instanceof`, a
+  public method, a name, or prototype dispatch.
+- Legacy logout decodes only that exact committed outcome. It records the
+  existing module-private logout proof, exits the failed first ownership
+  attempt, reacquires the canonical coordinator, verifies the exact adopted
+  state, and only then projects Config/Runtime and forgets the live key once.
+
+### Review-round verification
+
+- Required formal RED: 0/4 passed before production changed; the same exact
+  matrix is now 4/4 passed.
+- `tests/config.test.ts` plus `tests/provider-state.test.ts`: 57/57 passed.
+- `tests/provider-activation.test.ts` plus `tests/setup-ui.test.ts`: 122/122
+  passed.
+- Relevant provider-authority regression matrix: 20/20 passed.
+- Serial `tests/cli.test.ts` plus `tests/commands.test.ts`: 173/173 passed.
+- `tests/provider-privacy.test.ts`: 3/3 passed after supplying the isolated
+  fresh-build harness with the existing dependency tree via a temporary
+  symlink; the symlink and failed-build temp directory were removed.
+- `npx tsc -p tsconfig.json --noEmit`: PASS.
+- `npx tsc -p tsconfig.tests.json --noEmit`: PASS.
+- `node --import tsx scripts/render-command-docs.ts --check`: PASS.
+- Approved setup Spec/Plan diff from
+  `8d17a0c11f12efc5e8d3a9534e94ec2df113fc6d`: empty.
+- `git diff --check`: PASS.
+- Final pre-commit `src+tests` diff SHA-256:
+  `14f6d221a0854ab133528228fb87f81355b1a29c587338f48c38b752b29b6c7b`;
+  source-only diff SHA-256:
+  `176b8e30541ee33b5e62431a9b65a6e168e472c10e36be0d28160655849b6588`.
+- A diagnostic combined provider run reached 161 tests: 160 passed and the
+  unchanged `status reconnect default and confirmation select the same exact provider binding`
+  test failed because its adapter double has no runtime-bind method. The exact
+  single-test failure reproduces unchanged from archived base `65922ca`; none
+  of this round's source or test edits touch that test or its reconnect path.
+- No global/full test or `npm run check` was run.
+
+### Files
+
+Production:
+
+- `src/config.ts`
+- `src/provider-state.ts`
+- `src/cli.ts`
+
+Tests:
+
+- `tests/cli.test.ts`
+- `tests/provider-state.test.ts`
+- `tests/setup-ui.test.ts`
+
+Evidence:
+
+- `.superpowers/sdd/2026-08-23-orcode-startup-provider-slice-1/final-fix-2-report.md`
+
+Exact follow-up commit subject: `fix: close provider publication boundary`.

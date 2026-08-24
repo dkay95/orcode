@@ -4,10 +4,12 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import {
+  adoptDurablyCommittedProviderState,
   createNeverConfiguredProviderState,
   migrateLegacyOpenRouterState,
   projectLegacyModelRoutes,
   ProviderStateStore,
+  readProviderStateCommitAdoption,
   type ProviderConnectionStateV1,
   type ProviderStateCommitRequest,
   validateProviderSetupState,
@@ -459,8 +461,7 @@ test("durable provider state commit reconciles an exact publication after a late
       const built = request.build(initial);
       request.assertCurrent();
       generationCurrent = false;
-      assert.equal(typeof request.adoptPublished, "function");
-      request.adoptPublished!(built);
+      adoptDurablyCommittedProviderState(request, built);
       request.assertCurrent();
       return structuredClone(built);
     },
@@ -477,6 +478,39 @@ test("durable provider state commit reconciles an exact publication after a late
   assert.equal(committed.revision, 1);
   assert.equal(committed.lifecycle, "cancelled");
   assert.deepEqual(store.read(), committed);
+});
+
+test("committed provider outcome rejects a prototype-shaped object with an own readCommitted override", async () => {
+  const initial = createNeverConfiguredProviderState();
+  const store = new ProviderStateStore(initial, {
+    persist: async (request) => {
+      const candidate = request.build(initial);
+      adoptDurablyCommittedProviderState(request, candidate);
+      throw new Error("fixed post-publication persistence failure");
+    },
+  });
+  let genuine: unknown;
+  await store.commit(
+    initial.revision,
+    (current) => ({ ...current, lifecycle: "cancelled" }),
+  ).catch((error: unknown) => {
+    genuine = error;
+  });
+  assert.ok(genuine);
+  assert.ok(readProviderStateCommitAdoption(genuine));
+
+  const forged = Object.create(Object.getPrototypeOf(genuine)) as Record<string, unknown>;
+  Object.defineProperty(forged, "readCommitted", {
+    configurable: true,
+    enumerable: true,
+    value: () => ({
+      ...initial,
+      revision: 1,
+      lifecycle: "cancelled" as const,
+    }),
+  });
+
+  assert.equal(readProviderStateCommitAdoption(forged), null);
 });
 
 test("durable provider state capabilities are closed after successful settlement", async () => {
@@ -499,7 +533,10 @@ test("durable provider state capabilities are closed after successful settlement
   assert.throws(() => retained.assertCurrent(), /closed|settled|capability/i);
   assert.throws(() => retained.build(initial), /closed|settled|capability/i);
   assert.throws(() => retained.adopt(committed), /closed|settled|capability/i);
-  assert.throws(() => retained.adoptPublished(committed), /closed|settled|capability/i);
+  assert.throws(
+    () => adoptDurablyCommittedProviderState(retained, committed),
+    /closed|settled|capability/i,
+  );
   assert.deepEqual(store.read(), beforeLateCalls);
 });
 
@@ -525,7 +562,7 @@ test("durable provider state capabilities are closed after failed settlement", a
     () => retained.assertCurrent(),
     () => retained.build(initial),
     () => retained.adopt(forged),
-    () => retained.adoptPublished(forged),
+    () => adoptDurablyCommittedProviderState(retained, forged),
   ]) {
     try {
       callback();

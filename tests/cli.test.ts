@@ -48,6 +48,7 @@ import { openRouterAccountFingerprint } from "../src/openrouter-backend.js";
 import { CredentialStore } from "../src/credentials.js";
 import type { CredentialSlotRef, CredentialStoreLike } from "../src/credentials.js";
 import {
+  adoptDurablyCommittedProviderState,
   migrateLegacyOpenRouterState,
   ProviderStateStore,
   type ProviderConnectionStateV1,
@@ -2485,7 +2486,7 @@ test("prepublication Cross abort cannot publish the activated route into session
       const next = request.build(durable);
       request.assertCurrent();
       durable = structuredClone(next);
-      request.adoptPublished(next);
+      adoptDurablyCommittedProviderState(request, next);
       return structuredClone(next);
     },
   });
@@ -3833,6 +3834,128 @@ test("disabled legacy logout forgets runtime only after exact durable commit rea
   assert.deepEqual(effects, ["build", "adopt", "readback", "runtime-forget"]);
   assert.equal(stateStore.read().connections[0]?.enabled, false);
   assert.equal(stateStore.read().revision, 1);
+});
+
+test("legacy logout recovers when persistence rejects after adoptPublished", async () => {
+  const api = cliModule as typeof cliModule & {
+    DefaultProviderRuntime: new (...args: unknown[]) => {
+      execute(intent: Record<string, unknown>, surface: "plain"): Promise<Record<string, unknown>>;
+      ensureRunnableRoute(): NonNullable<ProviderSetupStateV1["defaultRoute"]>;
+    };
+    persistProviderSetupState(
+      path: string,
+      request: ProviderStateCommitRequest,
+    ): Promise<ProviderSetupStateV1>;
+  };
+  const route = {
+    ...bootstrapRoute("vendor/legacy-lock-release"),
+    accountFingerprint: "acct_legacy_lock_release_666666",
+  } as NonNullable<ProviderSetupStateV1["defaultRoute"]>;
+  const initial: ProviderSetupStateV1 = {
+    schemaVersion: 1,
+    revision: 0,
+    lifecycle: "configured",
+    connections: [{
+      id: "legacy-lock-release-connection",
+      backendId: "openrouter",
+      enabled: true,
+      maturity: "stable",
+      credentialSlot: "legacy:inference",
+      accountFingerprint: route.accountFingerprint,
+      accountFingerprintState: "verified",
+      billingRealm: "openrouter-payg",
+      lastHealth: null,
+    }],
+    defaultRoute: route,
+    cross: { enabled: false, preferredLead: null, preferredChallenger: null },
+  };
+  const directory = await mkdtemp(join(tmpdir(), "orcode-legacy-lock-release-"));
+  const configPath = join(directory, "config.json");
+  const config = structuredClone(DEFAULT_CONFIG);
+  config.providerSetup = structuredClone(initial);
+  await saveConfig(config, configPath);
+  const stateStore = new ProviderStateStore(initial, {
+    persist: (request) => api.persistProviderSetupState(configPath, request),
+  });
+  const runtimeGuard = providerRuntimeGuardFixture();
+  const coordinatorDelegate = providerCoordinatorMutationFixture(runtimeGuard);
+  let coordinatorAcquisitions = 0;
+  const coordinator = {
+    ...coordinatorDelegate,
+    async runExclusive<T>(
+      request: { signal: AbortSignal },
+      operation: (lease: { assertHeld(): Promise<void> }) => Promise<T>,
+    ): Promise<T> {
+      coordinatorAcquisitions += 1;
+      return coordinatorDelegate.runExclusive(request, operation);
+    },
+  };
+  const secret = `${STARTUP_KEY_PREFIX}${"l".repeat(48)}`;
+  const openRouter = new OpenRouterService(secret);
+  const session = SessionStore.create(
+    "/synthetic/legacy-lock-release",
+    "/synthetic/.orcode",
+  );
+  session.setPreferences(route.requestedModelId, { mode: "auto" }, route);
+  const runtime = new api.DefaultProviderRuntime(
+    openRouter,
+    {},
+    {
+      descriptor() { return { id: "openrouter", displayName: "OpenRouter", maturity: "stable" }; },
+      entries() { return []; },
+    },
+    stateStore,
+    { ensureRunnableRoute: () => route },
+    coordinator,
+    runtimeGuard,
+    { async apply() { throw new Error("legacy logout must not call versioned cleanup"); } },
+    secret,
+    null,
+    route.requestedModelId,
+    config,
+    session,
+  );
+  const prompt = await runtime.execute({ kind: "logout", backendId: "openrouter" }, "plain");
+  const originalRelease = PrivateStore.prototype.releaseDirectoryClaim;
+  let injectedReleaseFailure = false;
+  let result: Record<string, unknown>;
+  PrivateStore.prototype.releaseDirectoryClaim = async function(claim, expectedOwner) {
+    await originalRelease.call(this, claim, expectedOwner);
+    if (!injectedReleaseFailure && expectedOwner !== null) {
+      injectedReleaseFailure = true;
+      throw new Error("fixed config writer release failure after exact adoption");
+    }
+  };
+  try {
+    result = await runtime.execute({
+      kind: "logout",
+      backendId: "openrouter",
+      confirmationToken: prompt.confirmationToken,
+    }, "plain");
+  } finally {
+    PrivateStore.prototype.releaseDirectoryClaim = originalRelease;
+  }
+
+  const durable = (JSON.parse(await readFile(configPath, "utf8")) as {
+    providerSetup: ProviderSetupStateV1;
+  }).providerSetup;
+  assert.equal(injectedReleaseFailure, true);
+  assert.deepEqual(result, {
+    kind: "changed",
+    operation: "logout",
+    backendId: "openrouter",
+    setupRequired: true,
+    defaultCleared: true,
+  });
+  assert.equal(coordinatorAcquisitions, 2);
+  assert.equal(durable.revision, 1);
+  assert.equal(durable.connections[0]?.enabled, false);
+  assert.equal(durable.defaultRoute, null);
+  assert.deepEqual(stateStore.read(), durable);
+  assert.deepEqual(config.providerSetup, durable);
+  assert.deepEqual(session.data.route, route);
+  assert.equal(openRouter.hasKey, false);
+  assert.throws(() => runtime.ensureRunnableRoute(), /setup|required|route/i);
 });
 
 test("legacy logout completes or recovers the exact disabled tuple after first post-commit lease loss", async () => {
@@ -5518,7 +5641,6 @@ test("startup durable provider commits preserve every unrelated config byte unde
         assertCurrent(): void;
         build(current: typeof DEFAULT_CONFIG.providerSetup): typeof DEFAULT_CONFIG.providerSetup;
         adopt(committed: typeof DEFAULT_CONFIG.providerSetup): void;
-        adoptPublished(committed: typeof DEFAULT_CONFIG.providerSetup): void;
       },
     ) => Promise<typeof DEFAULT_CONFIG.providerSetup>;
   }).persistProviderSetupState;
@@ -5548,10 +5670,6 @@ test("startup durable provider commits preserve every unrelated config byte unde
       publicationEvents.push("adopt-unpublished");
       adopted = value;
     },
-    adoptPublished(value) {
-      publicationEvents.push("adopt-published");
-      adopted = value;
-    },
   });
 
   const expectedRaw = raw.replace(beforeBytes, JSON.stringify(after));
@@ -5563,8 +5681,135 @@ test("startup durable provider commits preserve every unrelated config byte unde
     "build",
     "assert-current",
     "assert-current",
-    "adopt-published",
+    "assert-current",
+    "assert-current",
+    "adopt-unpublished",
   ]);
+});
+
+async function realProviderCrossWriterFenceFixture() {
+  const api = cliModule as typeof cliModule & {
+    persistProviderSetupState(
+      path: string,
+      request: ProviderStateCommitRequest,
+    ): Promise<ProviderSetupStateV1>;
+  };
+  const directory = await mkdtemp(join(tmpdir(), "orcode-cross-writer-fence-"));
+  const configPath = join(directory, "config.json");
+  const route = {
+    ...bootstrapRoute("vendor/cross-writer-a"),
+    accountFingerprint: "acct_cross_writer_111111",
+  } as NonNullable<ProviderSetupStateV1["defaultRoute"]>;
+  const challenger = {
+    ...route,
+    requestedModelId: "vendor/cross-writer-challenger",
+    canonicalModelId: "vendor/cross-writer-challenger",
+  };
+  const replacementRoute = {
+    ...route,
+    requestedModelId: "vendor/cross-writer-b",
+    canonicalModelId: "vendor/cross-writer-b",
+  };
+  const activated: ProviderSetupStateV1 = {
+    schemaVersion: 1,
+    revision: 1,
+    lifecycle: "configured",
+    connections: [{
+      id: "cross-writer-connection",
+      backendId: "openrouter",
+      enabled: true,
+      maturity: "stable",
+      credentialSlot: "v1:inference:91919191-9191-4191-8191-919191919191",
+      accountFingerprint: route.accountFingerprint,
+      accountFingerprintState: "verified",
+      billingRealm: "openrouter-payg",
+      lastHealth: null,
+    }],
+    defaultRoute: route,
+    cross: { enabled: false, preferredLead: null, preferredChallenger: null },
+  };
+  const config = structuredClone(DEFAULT_CONFIG);
+  config.providerSetup = structuredClone(activated);
+  await saveConfig(config, configPath);
+  const stateStore = new ProviderStateStore(activated, {
+    persist: (request) => api.persistProviderSetupState(configPath, request),
+  });
+  const commitCross = (assertCurrent: () => void) => stateStore.commit(
+    activated.revision,
+    (current) => ({
+      ...current,
+      cross: {
+        enabled: false,
+        preferredLead: route,
+        preferredChallenger: challenger,
+      },
+    }),
+    assertCurrent,
+  );
+  const readDurable = async (): Promise<ProviderSetupStateV1> => (
+    JSON.parse(await readFile(configPath, "utf8")) as {
+      providerSetup: ProviderSetupStateV1;
+    }
+  ).providerSetup;
+  return {
+    activated,
+    commitCross,
+    readDurable,
+    replacementRoute,
+    stateStore,
+  };
+}
+
+test("real provider writer abort microtask at the last async fence cannot publish stale Cross roles", async () => {
+  const fixture = await realProviderCrossWriterFenceFixture();
+  const controller = new AbortController();
+  const reason = new DOMException("fixed queued provider abort", "AbortError");
+  let assertions = 0;
+
+  await assert.rejects(
+    fixture.commitCross(() => {
+      assertions += 1;
+      if (assertions === 4) queueMicrotask(() => controller.abort(reason));
+      if (controller.signal.aborted) throw reason;
+    }),
+    /Provider state publication failed/,
+  );
+
+  assert.equal(assertions, 5);
+  assert.deepEqual(await fixture.readDurable(), fixture.activated);
+  assert.deepEqual(fixture.stateStore.read(), fixture.activated);
+});
+
+test("real provider writer supersession microtask at the last async fence cannot publish stale Cross roles", async () => {
+  const fixture = await realProviderCrossWriterFenceFixture();
+  const replacement = {
+    ...fixture.activated,
+    defaultRoute: fixture.replacementRoute,
+  };
+  const expectedReplacement = { ...replacement, revision: 2 };
+  let assertions = 0;
+
+  await assert.rejects(
+    fixture.commitCross(() => {
+      assertions += 1;
+      if (assertions === 4) {
+        queueMicrotask(() => {
+          fixture.stateStore.replace(replacement, fixture.activated.revision);
+        });
+      }
+      if (
+        JSON.stringify(fixture.stateStore.read())
+        !== JSON.stringify(fixture.activated)
+      ) {
+        throw new Error("fixed Cross activation superseded");
+      }
+    }),
+    /Provider state publication failed/,
+  );
+
+  assert.equal(assertions, 5);
+  assert.deepEqual(await fixture.readDurable(), fixture.activated);
+  assert.deepEqual(fixture.stateStore.read(), expectedReplacement);
 });
 
 test("versioned inference replace and forget leave one restart-atomic provider tuple", async () => {
