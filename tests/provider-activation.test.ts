@@ -324,6 +324,8 @@ class FakeKimiAdapter {
   readonly candidates = new Map<string, string>();
   readonly calls: string[] = [];
   candidateCounter = 0;
+  currentGeneration = 4;
+  advanceGenerationAfterList = false;
 
   async connect(request: { candidate: unknown; generation: number; signal: AbortSignal }): Promise<ProviderCandidate> {
     this.calls.push("connect");
@@ -335,13 +337,14 @@ class FakeKimiAdapter {
       connectionId: KIMI_CONNECTION_ID,
       accountFingerprint: KIMI_FINGERPRINT,
       billingRealm: KIMI_REALM,
-      health: healthy(request.generation),
+      health: healthy(this.currentGeneration),
     };
   }
 
   async listModels(request: { candidateId?: string; signal: AbortSignal }): Promise<readonly BackendModelDescriptor[]> {
     assert.equal(this.candidates.has(request.candidateId ?? ""), true);
     this.calls.push("listModels");
+    if (this.advanceGenerationAfterList) this.currentGeneration += 1;
     return [KIMI_MODEL];
   }
 
@@ -644,6 +647,10 @@ for (const boundary of boundaries) {
   test(`activation crash after ${boundary} recovers one complete tuple`, async () => {
     const fixture = await activationFixture({ crashAfter: boundary });
     await assert.rejects(fixture.activate(), new RegExp(`simulated-crash:${boundary}`));
+    if (boundary === "config-written") {
+      assert.equal((await journalDirectories(fixture.appHome)).length, 1);
+      assert.equal(fixture.adapter.runtimeSecret, OLD_SECRET);
+    }
     const recovered = await fixture.restartAndRecover();
     const oldTuple = await tupleForState(fixture.initialConfig.providerSetup, fixture.credentials);
     const loaded = await loadConfigDetailed(fixture.path);
@@ -2169,6 +2176,37 @@ test("a live strict owner lease fails boundedly before reserve journal config or
   assert.equal(await store.readClaimOwner(claim), owner);
 });
 
+test("an abort-ignoring live lease wait settles at deadline and releases the runtime guard", async () => {
+  const fixture = await activationFixture({ now: 100 });
+  const store = fixture.privateStore as unknown as TokenBoundPrivateStore;
+  const leasePath = join(fixture.appHome, "provider-setup.lock");
+  const claim = await store.createDirectoryExclusive(leasePath);
+  assert.ok(claim);
+  const owner = '{"version":1,"ownerId":"60000000-0000-4000-8000-000000000003","acquiredAt":100,"expiresAt":200}\n';
+  await store.writeClaimOwner(claim, owner);
+  const configBefore = await readFile(fixture.path, "utf8");
+  const slotsBefore = new Map(fixture.credentials.slots);
+  const activation = fixture.coordinatorWith({
+    waitForLease: async () => new Promise<void>(() => undefined),
+  }).activate({ ...fixture.request, deadlineAt: 120 });
+  void activation.catch(() => undefined);
+  const outcome = await Promise.race([
+    activation.then(
+      () => null,
+      (error: unknown) => error,
+    ),
+    new Promise<null>((resolve) => setTimeout(() => resolve(null), 350)),
+  ]);
+
+  assert.ok(outcome, "provider lease wait must observe the activation deadline");
+  assert.equal((outcome as { code?: unknown }).code, "provider-activation-deadline");
+  assert.equal(fixture.runtimeGuard.releaseCalls, 1);
+  assert.equal(await readFile(fixture.path, "utf8"), configBefore);
+  assert.deepEqual(fixture.credentials.slots, slotsBefore);
+  assert.equal(fixture.credentials.calls.includes("reserveSlot"), false);
+  assert.equal(await store.readClaimOwner(claim), owner);
+});
+
 test("a stale strict owner lease is reclaimed by exact token before activation", async () => {
   const fixture = await activationFixture({ now: 500 });
   const store = fixture.privateStore as unknown as TokenBoundPrivateStore;
@@ -3374,32 +3412,30 @@ test("late slot write retains journal ownership until settlement and cannot orph
   assert.equal((await readTuple(fixture.path, fixture.credentials)).slotId, OLD_SLOT.id);
 });
 
-test("a stalled config-written observer cannot prevent post-durable tuple adoption", async () => {
+test("a stalled pre-readback config-written observer is ignored after deadline and cannot prevent tuple adoption", async () => {
   const fixture = await activationFixture();
-  let releaseObserver!: () => void;
   let observerReached!: () => void;
-  const observer = new Promise<void>((resolve) => { releaseObserver = resolve; });
   const reached = new Promise<void>((resolve) => { observerReached = resolve; });
   const coordinator = fixture.coordinatorWith({
     onBoundary: async (boundary: Boundary) => {
       if (boundary !== "config-written") return;
       observerReached();
-      await observer;
+      await new Promise<void>(() => undefined);
     },
   });
+  const started = Date.now();
   const activation = coordinator.activate({ ...fixture.request, deadlineAt: 10_200 });
+  void activation.catch(() => undefined);
   await reached;
-  await new Promise<void>((resolve) => setTimeout(resolve, 230));
-
+  const result = await activation;
+  assert.ok(Date.now() - started >= 180, "the observer must be detached by the activation deadline");
   const tuple = await readTuple(fixture.path, fixture.credentials);
+  assert.equal(result.persisted, true);
   assert.equal(tuple.secret, NEW_SECRET);
   assert.equal(tuple.state.revision, fixture.oldState.revision + 1);
   assert.equal(fixture.stateStore.read().revision, fixture.oldState.revision + 1);
   assert.equal(fixture.adapter.runtimeSecret, NEW_SECRET);
   assert.equal((await journalDirectories(fixture.appHome)).length, 0);
-
-  releaseObserver();
-  assert.equal((await activation).persisted, true);
 });
 
 test("Kimi persisted activation writes and publishes one exact v2 Kimi tuple through a Kimi resolver", async () => {
@@ -3456,6 +3492,10 @@ for (const boundary of boundaries) {
     const fixture = await kimiActivationFixture({ crashAfter: boundary });
     await assert.rejects(fixture.activate(), new RegExp(`simulated-crash:${boundary}`));
     const journalIds = await journalDirectories(fixture.appHome);
+    if (boundary === "config-written") {
+      assert.equal(journalIds.length, 1);
+      assert.equal(fixture.adapter.calls.includes("activate"), false);
+    }
     if (journalIds.length > 0) {
       assert.equal(journalIds.length, 1);
       const manifest = JSON.parse(await readFile(
@@ -3543,20 +3583,16 @@ test("Kimi v2 journal mutations and resolver mismatches fail closed before crede
   });
 });
 
-test("Kimi generation supersession by aborting at models-loaded publishes nothing", async () => {
+test("Kimi generation supersession after catalog inspection fences revalidation and publishes nothing", async () => {
   const fixture = await kimiActivationFixture();
-  const controller = new AbortController();
   const configBefore = await readFile(fixture.path, "utf8");
   const slotsBefore = new Map(fixture.credentials.slots);
-  const coordinator = fixture.coordinatorWith({
-    onBoundary: async (boundary: Boundary) => {
-      if (boundary === "models-loaded") controller.abort(new Error("superseded-kimi-generation"));
-    },
-  });
+  fixture.adapter.advanceGenerationAfterList = true;
 
-  await assert.rejects(coordinator.activate({ ...fixture.request, signal: controller.signal }));
+  await assert.rejects(fixture.activate(), fixture.api.StaleProviderGenerationError);
+  assert.equal(fixture.adapter.currentGeneration, fixture.request.generation + 1);
   assert.equal(await readFile(fixture.path, "utf8"), configBefore);
   assert.deepEqual(fixture.credentials.slots, slotsBefore);
-  assert.equal(fixture.credentials.calls.includes("reserveSlot"), false);
+  assert.equal(fixture.credentials.calls.includes("reserveSlot"), true);
   assert.equal(fixture.adapter.calls.includes("activate"), false);
 });

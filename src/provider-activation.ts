@@ -529,6 +529,7 @@ export class ProviderActivationCoordinator {
             "provider-candidate-cleanup-ambiguous",
           );
         }
+        if (error instanceof StaleProviderGenerationError) throw error;
         if (decision !== "process-only") {
           throw new ProviderActivationError(
             "provider-credential-persistence-failed",
@@ -560,6 +561,7 @@ export class ProviderActivationCoordinator {
       await this.#writeJournal(transaction, manifest, providerLease);
       await this.#assertFence(providerLease);
       let publication: "candidate" | "old" | "ambiguous";
+      const configCommit = this.#configCommitSignal(request.signal);
       try {
         publication = await withConfigWriteLock(
           this.#options.configPath,
@@ -593,6 +595,11 @@ export class ProviderActivationCoordinator {
               const writeConfigAtomic = beforeSave.kind === "absent"
                 ? this.#options.writeConfigAtomicCreate
                 : this.#options.writeConfigAtomic;
+              // From this point an abort can coincide with an atomic rename.
+              // The writer's pre-publication callback still rejects it before
+              // mutation; after that, readback under retained ownership must
+              // classify the durable outcome instead of abandoning it.
+              configCommit.detach();
               await writeConfigAtomic(
                 ownership.canonicalPath,
                 nextRaw,
@@ -621,7 +628,9 @@ export class ProviderActivationCoordinator {
                   this.#assertActivationAttemptCurrent(request);
                 },
               );
+              await this.#observeCriticalConfigWritten(request.signal);
             } catch (error) {
+              if (isBoundaryFault(error)) throw error;
               writeDisposition = isAtomicFilePostPublicationError(error)
                 ? "post-publication-failed"
                 : "pre-publication-failed";
@@ -634,8 +643,8 @@ export class ProviderActivationCoordinator {
             await assertRuntimeLease(runtimeLease);
             await ownership.assertHeld();
             // Read the durable file while we still own all fences. The
-            // config-written observer runs only after the full tuple is
-            // adopted below, so it cannot strand a published config half-way.
+            // critical config-written observer above has either faulted
+            // immediately or been detached as a non-production observer.
             const afterSave = await readConfigFacts(ownership.canonicalPath);
             await ownership.assertHeld();
             await this.#assertFence(providerLease!);
@@ -654,7 +663,7 @@ export class ProviderActivationCoordinator {
             }
             return "ambiguous";
           },
-          { signal: request.signal },
+          { signal: configCommit.signal },
         );
       } catch (error) {
         if (isBoundaryFault(error)
@@ -665,6 +674,8 @@ export class ProviderActivationCoordinator {
         throw new ProviderActivationRecoveryRequiredError(
           "provider-config-writer-ownership-failed",
         );
+      } finally {
+        configCommit.dispose();
       }
       if (publication === "old") {
         const cleaned = await this.#cleanupFailedCandidate(
@@ -741,9 +752,6 @@ export class ProviderActivationCoordinator {
         await this.#removeJournal(transaction, providerLease);
         transaction = null;
       }
-      // The config-written observer is deliberately last: its direct hook
-      // cannot strand an already durable tuple half-adopted.
-      await this.#awaitActivation(committedRequest, () => this.#boundary("config-written"));
       return {
         persisted: true,
         route: structuredClone(candidateRoute),
@@ -1131,6 +1139,9 @@ export class ProviderActivationCoordinator {
           .catch(() => undefined),
       );
       const policy = requireActivationPolicy(adapter.backendId as "openrouter" | "kimi-code");
+      if (candidate.health.generation !== generation) {
+        throw new StaleProviderGenerationError();
+      }
       if (candidate.backendId !== adapter.backendId
         || candidate.billingRealm !== policy.billingRealm
         || candidate.health.credential !== "valid"
@@ -1141,6 +1152,7 @@ export class ProviderActivationCoordinator {
       }
       return candidate;
     } catch (error) {
+      if (error instanceof StaleProviderGenerationError) throw error;
       if (isAbort(error, signal)) throw abortFrom(signal);
       throw new ProviderActivationError(
         "provider-candidate-validation-failed",
@@ -1199,6 +1211,42 @@ export class ProviderActivationCoordinator {
       }
       throw error;
     }
+  }
+
+  async #observeCriticalConfigWritten(signal: AbortSignal): Promise<void> {
+    try {
+      await abortableDependency(
+        () => this.#boundary("config-written"),
+        signal,
+      );
+    } catch (error) {
+      // An observer may be detached only after cancellation/deadline. A real
+      // immediate boundary fault still escapes to preserve the crash point.
+      if (isAbort(error, signal)) return;
+      throw error;
+    }
+  }
+
+  #configCommitSignal(signal: AbortSignal): {
+    signal: AbortSignal;
+    detach(): void;
+    dispose(): void;
+  } {
+    const controller = new AbortController();
+    let attached = true;
+    const relay = () => controller.abort(signal.reason);
+    signal.addEventListener("abort", relay, { once: true });
+    if (signal.aborted) relay();
+    const detach = () => {
+      if (!attached) return;
+      attached = false;
+      signal.removeEventListener("abort", relay);
+    };
+    return {
+      signal: controller.signal,
+      detach,
+      dispose: detach,
+    };
   }
 
   async #acquireProviderLease(signal: AbortSignal): Promise<HeldProviderLease> {
@@ -1533,7 +1581,10 @@ export class ProviderActivationCoordinator {
 
   async #waitForLease(signal: AbortSignal): Promise<void> {
     try {
-      await this.#options.waitForLease();
+      await abortableDependency(
+        () => this.#options.waitForLease(),
+        signal,
+      );
     } catch (error) {
       if (isAbort(error, signal)) throw abortFrom(signal);
       throw new ProviderActivationRecoveryRequiredError("provider-lease-wait-failed");
