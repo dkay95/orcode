@@ -1138,21 +1138,33 @@ export class ProviderActivationCoordinator {
           .then(() => adapter.discardCandidate(lateCandidate.candidateId))
           .catch(() => undefined),
       );
-      const policy = requireActivationPolicy(adapter.backendId as "openrouter" | "kimi-code");
-      if (candidate.health.generation !== generation) {
-        throw new StaleProviderGenerationError();
+      try {
+        const policy = requireActivationPolicy(adapter.backendId as "openrouter" | "kimi-code");
+        if (candidate.health.generation !== generation) {
+          throw new StaleProviderGenerationError();
+        }
+        if (candidate.backendId !== adapter.backendId
+          || candidate.billingRealm !== policy.billingRealm
+          || candidate.health.credential !== "valid"
+          || candidate.health.connectivity !== "connected"
+          || candidate.health.spend === "limit-reached"
+          || !candidate.accountFingerprint) {
+          throw new Error("candidate-unavailable");
+        }
+        return candidate;
+      } catch (error) {
+        try {
+          await adapter.discardCandidate(candidate.candidateId);
+        } catch {
+          throw new ProviderActivationRecoveryRequiredError(
+            "provider-candidate-cleanup-ambiguous",
+          );
+        }
+        throw error;
       }
-      if (candidate.backendId !== adapter.backendId
-        || candidate.billingRealm !== policy.billingRealm
-        || candidate.health.credential !== "valid"
-        || candidate.health.connectivity !== "connected"
-        || candidate.health.spend === "limit-reached"
-        || !candidate.accountFingerprint) {
-        throw new Error("candidate-unavailable");
-      }
-      return candidate;
     } catch (error) {
       if (error instanceof StaleProviderGenerationError) throw error;
+      if (error instanceof ProviderActivationRecoveryRequiredError) throw error;
       if (isAbort(error, signal)) throw abortFrom(signal);
       throw new ProviderActivationError(
         "provider-candidate-validation-failed",

@@ -3580,6 +3580,7 @@ test("Kimi v2 journal mutations and resolver mismatches fail closed before crede
     assert.equal(await readFile(fixture.path, "utf8"), configBefore);
     assert.deepEqual(fixture.credentials.slots, slotsBefore);
     assert.equal(fixture.credentials.calls.includes("reserveSlot"), false);
+    assert.equal(fixture.adapter.candidates.size, 0);
   });
 });
 
@@ -3595,4 +3596,5 @@ test("Kimi generation supersession after catalog inspection fences revalidation 
   assert.deepEqual(fixture.credentials.slots, slotsBefore);
   assert.equal(fixture.credentials.calls.includes("reserveSlot"), true);
   assert.equal(fixture.adapter.calls.includes("activate"), false);
+  assert.equal(fixture.adapter.candidates.size, 0);
 });
