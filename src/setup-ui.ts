@@ -1,5 +1,6 @@
 import { normalizeProviderSecret } from "./credentials.js";
 import type {
+  BackendAdapter,
   BackendDescriptor,
   BackendId,
   BackendModelDescriptor,
@@ -56,6 +57,13 @@ export interface SetupHubOptions {
   savedSecret?: string | null;
   /** Process-only candidate used automatically only when no saved key exists. */
   environmentSecret?: string | null;
+  /** Existing whole-startup attempt. Omitted for an independent manual setup. */
+  signal?: AbortSignal;
+  deadlineAt?: number;
+  generation?: number;
+  targetConnectionId?: string;
+  /** Durable revision captured with an authority-backed saved credential. */
+  expectedRevision?: number;
 }
 
 /**
@@ -71,6 +79,7 @@ export async function runSetupHub(options: SetupHubOptions): Promise<SetupHubRes
   let environmentOffered = false;
 
   while (true) {
+    if (options.signal?.aborted) return { kind: "cancelled", mode: "setup-required" };
     if (pendingEnvironment) {
       const secret = pendingEnvironment;
       pendingEnvironment = null;
@@ -153,13 +162,41 @@ async function activateOpenRouter(
   options: SetupHubOptions,
 ): Promise<ActivationFlow> {
   const { surface, registry, orchestrator, stateStore } = options;
+  const signal = options.signal ?? new AbortController().signal;
+  let adapter: BackendAdapter | null = null;
   let candidateId: string | null = null;
+  const discardCandidate = async (): Promise<void> => {
+    const ownedCandidateId = candidateId;
+    if (!ownedCandidateId || !adapter) return;
+    candidateId = null;
+    try {
+      await adapter.discardCandidate(ownedCandidateId);
+    } catch {
+      // Candidate cleanup is best-effort and never changes the user-visible
+      // outcome of an already failed or completed setup attempt.
+    }
+  };
+  const onAbort = () => {
+    void discardCandidate();
+  };
+  signal.addEventListener("abort", onAbort, { once: true });
   try {
     const secret = normalizeProviderSecret(rawSecret);
-    const adapter = registry.adapter("openrouter");
-    const controller = new AbortController();
-    const candidate = await adapter.connect({ candidate: secret, generation: 0, signal: controller.signal });
+    const activeAdapter = registry.adapter("openrouter");
+    adapter = activeAdapter;
+    const candidate = await activeAdapter.connect({
+      connectionId: options.targetConnectionId,
+      candidate: secret,
+      generation: options.generation ?? 0,
+      signal,
+    });
     candidateId = candidate.candidateId;
+    if (signal.aborted) {
+      await discardCandidate();
+      throw signal.reason instanceof Error
+        ? signal.reason
+        : new DOMException("The operation was aborted.", "AbortError");
+    }
     if (
       candidate.backendId !== "openrouter"
       || candidate.health.credential !== "valid"
@@ -168,7 +205,7 @@ async function activateOpenRouter(
       surface.present(notice("OpenRouter konnte den Zugangsschlüssel nicht bestätigen."));
       return candidate.health.credential === "rejected" ? { kind: "rejected" } : { kind: "retry" };
     }
-    const models = compatibleMainModels(await adapter.listModels({ candidateId, signal: controller.signal }));
+    const models = compatibleMainModels(await activeAdapter.listModels({ candidateId, signal }));
     if (!models.length) {
       surface.present(notice("OpenRouter stellt keine kompatiblen Main-Modelle bereit."));
       return { kind: "retry" };
@@ -192,12 +229,14 @@ async function activateOpenRouter(
       if (!accepted) return { kind: "cancelled" };
     }
     const activation = await orchestrator.activateCandidate({
-      expectedRevision: stateStore.read().revision,
+      expectedRevision: options.expectedRevision ?? stateStore.read().revision,
       candidate: secret,
       expectedRequestedModelId: selectedModel.requestedModelId,
       selectedCanonicalModelId,
-      signal: controller.signal,
+      signal,
       persistence,
+      targetConnectionId: options.targetConnectionId,
+      startupGeneration: options.generation,
     });
     surface.present(notice("OpenRouter ist eingerichtet."));
     return { kind: "ready", route: activation.route, state: activation.state, models };
@@ -206,14 +245,8 @@ async function activateOpenRouter(
     surface.present(notice("OpenRouter konnte nicht eingerichtet werden. Bitte erneut versuchen."));
     return { kind: "retry" };
   } finally {
-    if (candidateId) {
-      try {
-        await registry.adapter("openrouter").discardCandidate(candidateId);
-      } catch {
-        // Candidate cleanup is best-effort and never changes the user-visible
-        // outcome of an already failed or completed setup attempt.
-      }
-    }
+    signal.removeEventListener("abort", onAbort);
+    await discardCandidate();
   }
 }
 

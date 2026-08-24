@@ -493,9 +493,31 @@ async function realProviderInspectionCorpus(values: PrivacyProbes): Promise<stri
   const adapter = new OpenRouterBackendAdapter({
     service,
     credentials,
-    connectionId: "privacy-openrouter-connection",
-    inferenceCredential: slot,
-    environment: {},
+    credentialAuthority: {
+      async withCredential(request, use) {
+        if (request.credentialKind === "management") return { kind: "absent" as const };
+        const secret = await credentials.readSlot(slot);
+        if (!secret) return { kind: "absent" as const };
+        return {
+          kind: "available" as const,
+          value: await use(secret, {
+            source: "saved",
+            binding: {
+              version: 1,
+              stateRevision: 4,
+              connectionId: request.connectionId,
+              backendId: "openrouter",
+              enabled: true,
+              credentialPointer: { kind: "versioned", slot },
+              accountFingerprint,
+              billingRealm: "openrouter-payg",
+              isDefault: true,
+            },
+          }),
+        };
+      },
+    },
+    createConnectionId: () => "privacy-openrouter-connection",
     now: () => 1_000,
   });
   const route: RouteIdentityV1 = {

@@ -5,6 +5,7 @@ import {
   type ProviderHealth,
   type RouteIdentityV1,
 } from "./backends.js";
+import { parseOpenRouterCredentialPointer } from "./provider-authority.js";
 import { isRecord } from "./utils.js";
 
 export const PROVIDER_SETUP_SCHEMA_VERSION = 1 as const;
@@ -428,7 +429,8 @@ function isProviderConnectionStateV1(value: unknown): value is ProviderConnectio
     && isBackendId(value.backendId)
     && typeof value.enabled === "boolean"
     && (value.maturity === "stable" || value.maturity === "preview")
-    && nonEmptyString(value.credentialSlot)
+    && typeof value.credentialSlot === "string"
+    && parseOpenRouterCredentialPointer(value.credentialSlot) !== null
     && nonEmptyString(value.accountFingerprint)
     && (value.accountFingerprintState === "provisional" || value.accountFingerprintState === "verified")
     && isBillingRealm(value.billingRealm)

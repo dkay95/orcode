@@ -115,12 +115,15 @@ class Adapter implements BackendAdapter {
   readonly rejected = new Set<string>();
   readonly offline = new Set<string>();
   models: readonly BackendModelDescriptor[] = [MODEL];
+  connectRequest: Parameters<BackendAdapter["connect"]>[0] | null = null;
+  modelRequest: Parameters<BackendAdapter["listModels"]>[0] | null = null;
 
   async inspect(): Promise<ProviderInspection> { throw new Error("not used"); }
   async reconnect(): Promise<ProviderInspection> { throw new Error("not used"); }
   async logout(): Promise<void> { this.calls.push("logout"); }
   async discardCandidate(): Promise<void> { this.calls.push("discard"); }
   async connect(request: Parameters<BackendAdapter["connect"]>[0]): Promise<ProviderCandidate> {
+    this.connectRequest = request;
     this.calls.push("connect");
     this.connected.push(String(request.candidate));
     return {
@@ -136,7 +139,8 @@ class Adapter implements BackendAdapter {
         : { credential: "valid", connectivity: "connected", spend: "available", runtime: "ready", observedAt: 1, generation: 1 },
     };
   }
-  async listModels(): Promise<readonly BackendModelDescriptor[]> {
+  async listModels(request: Parameters<BackendAdapter["listModels"]>[0]): Promise<readonly BackendModelDescriptor[]> {
+    this.modelRequest = request;
     this.calls.push("models");
     return this.models;
   }
@@ -163,7 +167,7 @@ function fixture(surface: SetupSurface, options: { processOnlyNullState?: boolea
         ...previous,
         lifecycle: "configured",
         connections: [{
-          id: "connection", backendId: "openrouter", enabled: true, maturity: "stable", credentialSlot: "inference:connection",
+          id: "connection", backendId: "openrouter", enabled: true, maturity: "stable", credentialSlot: "v1:inference:90000000-0000-4000-8000-000000000002",
           accountFingerprint: "acct", accountFingerprintState: "verified", billingRealm: "openrouter-payg", lastHealth: null,
         }],
         defaultRoute: route,
@@ -193,6 +197,58 @@ test("hub connects OpenRouter in secret, model, and explicit persistence order",
   assert.equal(context.activations.length, 1);
   assert.equal(context.activations[0]?.persistence, "persisted");
   assert.equal(context.activations[0]?.selectedCanonicalModelId, MODEL.canonicalModelId);
+});
+
+test("automatic setup carries one startup signal generation and target through candidate catalog and activation", async () => {
+  const surface = new ScriptedSurface(["openrouter", "cross-later"], ["sk-or-v1-test-key"], [MODEL.canonicalModelId], [true]);
+  const context = fixture(surface);
+  const controller = new AbortController();
+
+  const result = await runSetupHub({
+    ...context,
+    surface,
+    signal: controller.signal,
+    deadlineAt: 9_000,
+    generation: 41,
+    targetConnectionId: "connection-startup",
+  });
+
+  assert.deepEqual(result, { kind: "ready" });
+  assert.equal(context.adapter.connectRequest?.signal, controller.signal);
+  assert.equal(context.adapter.connectRequest?.generation, 41);
+  assert.equal(context.adapter.connectRequest?.connectionId, "connection-startup");
+  assert.equal(context.adapter.modelRequest?.signal, controller.signal);
+  assert.equal(context.activations[0]?.signal, controller.signal);
+  assert.equal(context.activations[0]?.generation, 41);
+  assert.equal(context.activations[0]?.targetConnectionId, "connection-startup");
+});
+
+test("startup abort revokes a connected candidate even when catalog ignores abort forever", async () => {
+  const surface = new ScriptedSurface(["cross-later"]);
+  const context = fixture(surface);
+  context.adapter.listModels = async (request) => {
+    context.adapter.modelRequest = request;
+    context.adapter.calls.push("models");
+    return new Promise<readonly BackendModelDescriptor[]>(() => undefined);
+  };
+  const controller = new AbortController();
+  void runSetupHub({
+    ...context,
+    surface,
+    environmentSecret: "sk-or-v1-test-key",
+    signal: controller.signal,
+    deadlineAt: 8_000,
+    generation: 42,
+  });
+  await Promise.resolve();
+  await Promise.resolve();
+  assert.deepEqual(context.adapter.calls, ["connect", "models"]);
+
+  controller.abort(new DOMException("startup timeout", "AbortError"));
+  await Promise.resolve();
+  await Promise.resolve();
+
+  assert.deepEqual(context.adapter.calls, ["connect", "models", "discard"]);
 });
 
 test("hub keeps exactly one setup prompt active at a time", async () => {
@@ -238,7 +294,7 @@ test("a non-connectable provider cannot replace an existing default route", asyn
       backendId: "openrouter",
       enabled: true,
       maturity: "stable",
-      credentialSlot: "inference:connection",
+      credentialSlot: "v1:inference:90000000-0000-4000-8000-000000000002",
       accountFingerprint: "acct",
       accountFingerprintState: "verified",
       billingRealm: "openrouter-payg",
@@ -533,7 +589,7 @@ test("explicit runnable model replacement changes an existing default only throu
       backendId: "openrouter",
       enabled: true,
       maturity: "stable",
-      credentialSlot: "inference:connection",
+      credentialSlot: "v1:inference:90000000-0000-4000-8000-000000000002",
       accountFingerprint: "acct",
       accountFingerprintState: "verified",
       billingRealm: "openrouter-payg",

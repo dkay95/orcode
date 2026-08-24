@@ -515,6 +515,22 @@ test("an active run rejects before lease journal slot or config mutation and exp
   assert.equal(fixture.adapter.runtimeSecret, NEW_SECRET);
 });
 
+test("stale expected revision blocks candidate network before activation", async () => {
+  const fixture = await activationFixture();
+  const current = fixture.stateStore.read();
+  const changed = { ...current, revision: current.revision + 1 };
+  fixture.stateStore.replace(changed, current.revision);
+  const config = await loadConfigDetailed(fixture.path);
+  await saveConfig({ ...config.config, providerSetup: changed }, fixture.path);
+  const before = await fileTree(fixture.appHome);
+
+  await assert.rejects(fixture.activate());
+
+  assert.equal(fixture.adapter.calls.includes("connect"), false);
+  assert.deepEqual(await fileTree(fixture.appHome), before);
+  assert.equal(fixture.credentials.calls.includes("reserveSlot"), false);
+});
+
 test("an active run rejects process-only activation before candidate or durable mutation", async () => {
   const fixture = await activationFixture();
   fixture.runtimeGuard.activeRuns = 1;
@@ -902,6 +918,26 @@ test("committed recovery retains both slots until exact authenticated inspection
   assert.equal((await journalDirectories(crashed.appHome)).length, 0);
 });
 
+test("committed recovery cleans the old slot before binding the runtime", async () => {
+  const fixture = await activationFixture({ crashAfter: "config-readback" });
+  await assert.rejects(fixture.activate(), /simulated-crash:config-readback/);
+  assert.equal(fixture.adapter.runtimeSecret, OLD_SECRET);
+  const originalDeleteSlot = fixture.credentials.deleteSlot.bind(fixture.credentials);
+  let runtimeSecretAtOldSlotCleanup: string | null = null;
+  fixture.credentials.deleteSlot = async (slot) => {
+    if (slot.id === OLD_SLOT.id) {
+      runtimeSecretAtOldSlotCleanup = fixture.adapter.runtimeSecret;
+    }
+    return originalDeleteSlot(slot);
+  };
+
+  await fixture.restartAndRecover(true);
+
+  assert.equal(runtimeSecretAtOldSlotCleanup, OLD_SECRET);
+  assert.equal(fixture.adapter.runtimeSecret, NEW_SECRET);
+  assert.equal((await journalDirectories(fixture.appHome)).length, 0);
+});
+
 test("process-only activation branches before lease journal reservation slot and config writes", async () => {
   const fixture = await activationFixture();
   const beforeConfig = await readFile(fixture.path, "utf8");
@@ -1082,7 +1118,7 @@ test("lost runtime guard during awaited process-only bind blocks a success resul
   assert.equal(fixture.credentials.calls.includes("reserveSlot"), false);
 });
 
-test("lost runtime guard during awaited recovery bind blocks old-slot and journal cleanup", async () => {
+test("lost runtime guard during recovery bind happens only after old-slot and journal cleanup", async () => {
   const fixture = await activationFixture({ crashAfter: "config-readback" });
   await assert.rejects(fixture.activate());
   let reached!: () => void;
@@ -1113,9 +1149,9 @@ test("lost runtime guard during awaited recovery bind blocks old-slot and journa
   resume();
 
   await assert.rejects(recovery, fixture.api.ProviderActivationRecoveryRequiredError);
-  assert.equal(fixture.credentials.slots.get(OLD_SLOT.id), OLD_SECRET);
+  assert.equal(fixture.credentials.slots.has(OLD_SLOT.id), false);
   assert.equal(fixture.credentials.slots.get(NEW_SLOT_ID), NEW_SECRET);
-  assert.equal((await journalDirectories(fixture.appHome)).length, 1);
+  assert.equal((await journalDirectories(fixture.appHome)).length, 0);
 });
 
 test("recovery guard loss during awaited candidate connect prevents runtime bind", async () => {

@@ -12,6 +12,8 @@ import type {
   CredentialSlotRef,
   VersionedCredentialStoreLike,
 } from "../src/credentials.js";
+import { normalizeProviderSecret } from "../src/credentials.js";
+import type { ProviderCredentialAuthorityLike } from "../src/provider-authority.js";
 
 const ACTIVE_KEY = ["active", "fixture", "key", "a".repeat(32)].join("-");
 const INFERENCE_KEY = ["inference", "fixture", "key", "b".repeat(32)].join("-");
@@ -118,6 +120,50 @@ class FakeCredentials implements VersionedCredentialStoreLike {
   }
 }
 
+function fixtureAuthority(
+  credentials: VersionedCredentialStoreLike,
+  environment: Readonly<Record<string, string | undefined>> = {},
+): ProviderCredentialAuthorityLike {
+  return {
+    async withCredential(request, use) {
+      const kind = request.credentialKind ?? "inference";
+      let saved: string | null;
+      try {
+        saved = await credentials.get(kind);
+      } catch {
+        return { kind: "invalid" };
+      }
+      const raw = saved ?? environment[kind === "inference"
+        ? "OPENROUTER_API_KEY"
+        : "OPENROUTER_MANAGEMENT_KEY"];
+      if (!raw) return { kind: "absent" };
+      let secret: string;
+      try {
+        secret = normalizeProviderSecret(raw);
+      } catch {
+        return { kind: "invalid" };
+      }
+      return {
+        kind: "available",
+        value: await use(secret, {
+          source: saved === null ? "environment" : "saved",
+          binding: {
+            version: 1,
+            stateRevision: 0,
+            connectionId: request.connectionId,
+            backendId: "openrouter",
+            enabled: true,
+            credentialPointer: { kind: "legacy", id: "legacy:inference" },
+            accountFingerprint: "fixture-account",
+            billingRealm: "openrouter-payg",
+            isDefault: true,
+          },
+        }),
+      };
+    },
+  };
+}
+
 interface InspectFixtureOptions {
   keyStatus?: number;
   keyExtra?: Record<string, unknown>;
@@ -183,11 +229,12 @@ async function inspectFixture(options: InspectFixtureOptions = {}) {
   const adapter = new OpenRouterBackendAdapter({
     service,
     credentials,
-    connectionId: "connection-local",
-    environment: options.environment ?? {},
+    credentialAuthority: fixtureAuthority(credentials, options.environment),
+    createConnectionId: () => "connection-local",
     now: () => NOW,
   });
   const result = await adapter.inspect({
+    connectionId: "connection-local",
     generation: 7,
     deadlineAt: NOW + 5_000,
     signal: options.signal ?? new AbortController().signal,
@@ -594,10 +641,12 @@ test("caller abort during credits rejects inspection and clears prior model elig
   const adapter = new OpenRouterBackendAdapter({
     service,
     credentials: new FakeCredentials(),
-    connectionId: "connection-local",
+    credentialAuthority: fixtureAuthority(new FakeCredentials()),
+    createConnectionId: () => "connection-local",
     now: () => NOW,
   });
   const ready = await adapter.inspect({
+    connectionId: "connection-local",
     generation: 1,
     deadlineAt: NOW + 5_000,
     signal: new AbortController().signal,
@@ -607,6 +656,7 @@ test("caller abort during credits rejects inspection and clears prior model elig
   abortCredits = true;
   await assert.rejects(
     adapter.inspect({
+      connectionId: "connection-local",
       generation: 2,
       deadlineAt: NOW + 5_000,
       signal: controller.signal,
@@ -614,7 +664,7 @@ test("caller abort during credits rejects inspection and clears prior model elig
     (error: unknown) => error instanceof DOMException && error.name === "AbortError",
   );
   await assert.rejects(
-    adapter.listModels({ signal: new AbortController().signal }),
+    adapter.listModels({ connectionId: "connection-local", signal: new AbortController().signal }),
     /inspection|prüf/i,
   );
   assert.equal(modelRequests, 0);
@@ -669,11 +719,12 @@ test("model catalog is unavailable before exact account inspection", async () =>
   const adapter = new OpenRouterBackendAdapter({
     service,
     credentials: new FakeCredentials(),
-    connectionId: "connection-local",
+    credentialAuthority: fixtureAuthority(new FakeCredentials()),
+    createConnectionId: () => "connection-local",
     now: () => NOW,
   });
   await assert.rejects(
-    adapter.listModels({ signal: new AbortController().signal }),
+    adapter.listModels({ connectionId: "connection-local", signal: new AbortController().signal }),
     /inspect|inspection|prüf/i,
   );
   assert.equal(modelRequests, 0);
@@ -731,20 +782,26 @@ test("setup main-model list follows the shared role predicate and keeps only ope
       throw new Error("unexpected endpoint");
     },
   });
+  const credentials = new FakeCredentials({ inference: INFERENCE_KEY, management: null });
   const adapter = new OpenRouterBackendAdapter({
     service,
-    credentials: new FakeCredentials({ inference: INFERENCE_KEY, management: null }),
-    connectionId: "connection-local",
+    credentials,
+    credentialAuthority: fixtureAuthority(credentials),
+    createConnectionId: () => "connection-local",
     now: () => NOW,
   });
   const inspection = await adapter.inspect({
+    connectionId: "connection-local",
     generation: 1,
     deadlineAt: NOW + 5_000,
     signal: new AbortController().signal,
   });
   assert.equal(inspection.routeEligible, true);
 
-  const listed = await adapter.listModels({ signal: new AbortController().signal });
+  const listed = await adapter.listModels({
+    connectionId: "connection-local",
+    signal: new AbortController().signal,
+  });
   assert.deepEqual(listed.map((entry) => entry.requestedModelId), [
     "vendor/valid",
     "openrouter/auto",
@@ -785,7 +842,8 @@ test("candidate connection is inspection-only until explicit activation", async 
   const adapter = new OpenRouterBackendAdapter({
     service,
     credentials,
-    connectionId: "connection-local",
+    credentialAuthority: fixtureAuthority(credentials),
+    createConnectionId: () => "connection-local",
     createCandidateId: () => "candidate-local",
     now: () => NOW,
   });
@@ -838,10 +896,15 @@ function inspectionRaceFixture() {
   const adapter = new OpenRouterBackendAdapter({
     service,
     credentials: new FakeCredentials({ inference: INFERENCE_KEY, management: null }),
-    connectionId: "connection-local",
+    credentialAuthority: fixtureAuthority(new FakeCredentials({
+      inference: INFERENCE_KEY,
+      management: null,
+    })),
+    createConnectionId: () => "connection-local",
     now: () => NOW,
   });
   const inspect = (generation: number) => adapter.inspect({
+    connectionId: "connection-local",
     generation,
     deadlineAt: NOW + 5_000,
     signal: new AbortController().signal,
@@ -869,7 +932,7 @@ test("stale generation success cannot re-enable models after newest rejection", 
   assert.equal((await stale).health.credential, "valid");
 
   await assert.rejects(
-    fixture.adapter.listModels({ signal: new AbortController().signal }),
+    fixture.adapter.listModels({ connectionId: "connection-local", signal: new AbortController().signal }),
     /inspection|prüf/i,
   );
   assert.equal(fixture.modelRequests(), 0);
@@ -889,7 +952,7 @@ test("stale generation error cannot clear newest successful model eligibility", 
   ));
   assert.equal((await stale).health.credential, "rejected");
 
-  await fixture.adapter.listModels({ signal: new AbortController().signal });
+  await fixture.adapter.listModels({ connectionId: "connection-local", signal: new AbortController().signal });
   assert.equal(fixture.modelRequests(), 1);
 });
 
@@ -902,13 +965,13 @@ test("older completion cannot publish while a newer inspection is still pending"
   fixture.keyRequests[0]!.resolve(keyResponse({ is_management_key: false }));
   assert.equal((await stale).routeEligible, true);
   await assert.rejects(
-    fixture.adapter.listModels({ signal: new AbortController().signal }),
+    fixture.adapter.listModels({ connectionId: "connection-local", signal: new AbortController().signal }),
     /inspection|prüf/i,
   );
   assert.equal(fixture.modelRequests(), 0);
 
   fixture.keyRequests[1]!.resolve(keyResponse({ is_management_key: false }));
   assert.equal((await newest).routeEligible, true);
-  await fixture.adapter.listModels({ signal: new AbortController().signal });
+  await fixture.adapter.listModels({ connectionId: "connection-local", signal: new AbortController().signal });
   assert.equal(fixture.modelRequests(), 1);
 });

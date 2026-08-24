@@ -514,11 +514,14 @@ test("concurrent merge distinguishes redaction projection from a local edit", as
     windowA.data.id,
     appHome,
   );
+  const initialTurnAt = Date.parse(windowA.data.turns[0]!.createdAt);
   windowB.rename("Remote rename");
   windowB.addTurn("assistant", "Remote turn");
+  windowB.data.turns.at(-1)!.createdAt = new Date(initialTurnAt + 1).toISOString();
   await windowB.save();
 
   windowA.addTurn("assistant", "Local turn");
+  windowA.data.turns.at(-1)!.createdAt = new Date(initialTurnAt + 2).toISOString();
   const outcome = await windowA.save();
   assert.equal(outcome.merged, true);
   assert.ok(windowA.data.summary.includes(secret));

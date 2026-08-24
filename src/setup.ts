@@ -65,6 +65,8 @@ export interface StartupInspectionOptions {
   signal?: AbortSignal;
   providerTimeoutMs?: number;
   startupTimeoutMs?: number;
+  deadlineAt?: number;
+  connectionId?: string;
 }
 
 export class ProviderInspectionTimeoutError extends Error {
@@ -159,6 +161,153 @@ const SYSTEM_CLOCK: SetupClock = {
   clearTimeout: (handle) => globalThis.clearTimeout(handle as ReturnType<typeof setTimeout>),
 };
 
+export interface ProviderStartupStepContext {
+  generation: number;
+  deadlineAt: number;
+  signal: AbortSignal;
+  remainingMs(): number;
+  assertCurrent(): void;
+}
+
+export interface ProviderStartupAttemptInput {
+  generation: number;
+  clock?: SetupClock;
+  timeoutMs?: number;
+  deadlineAt?: number;
+  signal?: AbortSignal;
+  recover(context: ProviderStartupStepContext): Promise<void>;
+  inspect(context: ProviderStartupStepContext): Promise<StartupSetupResult>;
+  resolveLegacy?(
+    result: StartupSetupResult,
+    context: ProviderStartupStepContext,
+  ): Promise<StartupSetupResult>;
+  automaticEnvironment?(
+    result: StartupSetupResult,
+    context: ProviderStartupStepContext,
+  ): Promise<StartupSetupResult>;
+  bindRuntime?(
+    result: StartupSetupResult,
+    context: ProviderStartupStepContext,
+  ): Promise<void>;
+}
+
+/** One abortable budget for every startup phase, including recovery. */
+export async function runProviderStartupAttempt(
+  input: ProviderStartupAttemptInput,
+): Promise<StartupSetupResult> {
+  const clock = input.clock ?? SYSTEM_CLOCK;
+  const startedAt = clock.now();
+  assertFiniteNow(startedAt);
+  const timeoutMs = boundedTimeout(
+    input.timeoutMs,
+    DEFAULT_STARTUP_TIMEOUT_MS,
+    MAX_STARTUP_TIMEOUT_MS,
+    "startup",
+  );
+  const deadlineAt = Math.min(input.deadlineAt ?? Number.POSITIVE_INFINITY, startedAt + timeoutMs);
+  const controller = new AbortController();
+  let closed = false;
+  const abortFromCaller = () => {
+    if (!controller.signal.aborted) controller.abort(abortReason(input.signal!));
+  };
+  input.signal?.addEventListener("abort", abortFromCaller, { once: true });
+  if (input.signal?.aborted) abortFromCaller();
+  const timeoutReason = new ProviderInspectionTimeoutError(
+    "startup",
+    null,
+    Math.max(0, deadlineAt - startedAt),
+  );
+  const timer = clock.setTimeout(() => {
+    closed = true;
+    if (!controller.signal.aborted) controller.abort(timeoutReason);
+  }, Math.max(0, deadlineAt - startedAt));
+  const context: ProviderStartupStepContext = {
+    generation: input.generation,
+    deadlineAt,
+    signal: controller.signal,
+    remainingMs: () => Math.max(0, deadlineAt - clock.now()),
+    assertCurrent: () => {
+      if (closed || controller.signal.aborted || clock.now() >= deadlineAt) {
+        throw controller.signal.reason instanceof Error
+          ? controller.signal.reason
+          : timeoutReason;
+      }
+    },
+  };
+  const failed = (): StartupSetupResult => freezeResult({
+    mode: "setup-required",
+    generation: input.generation,
+    defaultRoute: null,
+    readyRoutes: [],
+    warnings: [],
+    crossEnabled: false,
+  });
+  const phase = async <T>(run: () => Promise<T>): Promise<
+    { kind: "value"; value: T } | { kind: "stopped" }
+  > => {
+    if (closed || controller.signal.aborted || context.remainingMs() <= 0) {
+      closed = true;
+      if (!controller.signal.aborted) controller.abort(timeoutReason);
+      return { kind: "stopped" };
+    }
+    return new Promise((resolve) => {
+      let settled = false;
+      const finish = (value: { kind: "value"; value: T } | { kind: "stopped" }) => {
+        if (settled) return;
+        settled = true;
+        controller.signal.removeEventListener("abort", onAbort);
+        resolve(value);
+      };
+      const onAbort = () => finish({ kind: "stopped" });
+      controller.signal.addEventListener("abort", onAbort, { once: true });
+      let operation: Promise<T>;
+      try {
+        operation = run();
+      } catch {
+        finish({ kind: "stopped" });
+        return;
+      }
+      operation.then(
+        (value) => finish(closed || controller.signal.aborted
+          ? { kind: "stopped" }
+          : { kind: "value", value }),
+        () => finish({ kind: "stopped" }),
+      );
+    });
+  };
+
+  try {
+    const recovered = await phase(() => input.recover(context));
+    if (recovered.kind === "stopped") return failed();
+    context.assertCurrent();
+    const inspected = await phase(() => input.inspect(context));
+    if (inspected.kind === "stopped") return failed();
+    context.assertCurrent();
+    let result = inspected.value;
+    if (input.resolveLegacy) {
+      const legacy = await phase(() => input.resolveLegacy!(result, context));
+      if (legacy.kind === "stopped") return failed();
+      context.assertCurrent();
+      result = legacy.value;
+    }
+    if (input.automaticEnvironment) {
+      const automatic = await phase(() => input.automaticEnvironment!(result, context));
+      if (automatic.kind === "stopped") return failed();
+      context.assertCurrent();
+      result = automatic.value;
+    }
+    if (input.bindRuntime && (result.mode === "ready" || result.mode === "ready-with-warning")) {
+      const bound = await phase(() => input.bindRuntime!(result, context));
+      if (bound.kind === "stopped") return failed();
+      context.assertCurrent();
+    }
+    return result;
+  } finally {
+    clock.clearTimeout(timer);
+    input.signal?.removeEventListener("abort", abortFromCaller);
+  }
+}
+
 export class SetupOrchestrator {
   readonly #registry: BackendRegistry;
   readonly #stateStore: ProviderStateStore;
@@ -195,6 +344,11 @@ export class SetupOrchestrator {
       "startup",
     );
     assertFiniteNow(this.#clock.now());
+  }
+
+  /** Generation chosen before whole-startup recovery begins. */
+  nextStartupGeneration(): number {
+    return Math.max(this.#nextGeneration, this.#generation) + 1;
   }
 
   async inspectStartup(options: StartupInspectionOptions = {}): Promise<StartupSetupResult> {
@@ -259,7 +413,7 @@ export class SetupOrchestrator {
   }
 
   async activateCandidate(
-    request: Omit<ProviderActivationRequest, "generation">,
+    request: Omit<ProviderActivationRequest, "generation"> & { startupGeneration?: number },
   ): Promise<ProviderActivationResult> {
     let releaseActivation!: () => void;
     const ownGate = new Promise<void>((resolve) => {
@@ -275,11 +429,26 @@ export class SetupOrchestrator {
       if (this.#currentGeneration) this.#currentGeneration.closed = true;
       this.#supersedeActiveProbes();
       this.#proofs.clear();
-      this.#nextGeneration = Math.max(this.#nextGeneration, this.#generation) + 1;
-      const generation = this.#nextGeneration;
+      const { startupGeneration, ...activationRequest } = request;
+      let generation: number;
+      if (startupGeneration === undefined) {
+        this.#nextGeneration = Math.max(this.#nextGeneration, this.#generation) + 1;
+        generation = this.#nextGeneration;
+      } else {
+        if (
+          !Number.isSafeInteger(startupGeneration)
+          || startupGeneration < 1
+          || startupGeneration < this.#generation
+          || startupGeneration < this.#nextGeneration
+        ) {
+          throw new Error("Provider startup activation generation is stale.");
+        }
+        generation = startupGeneration;
+        this.#nextGeneration = Math.max(this.#nextGeneration, generation);
+      }
       this.#generation = generation;
       const result = await this.#activationCoordinator.activate({
-        ...request,
+        ...activationRequest,
         generation,
       });
       if (generation !== this.#generation) return result;
@@ -310,7 +479,7 @@ export class SetupOrchestrator {
   }
 
   async resolveLegacyDefaultRoute(
-    options: Pick<StartupInspectionOptions, "signal" | "providerTimeoutMs"> = {},
+    options: Pick<StartupInspectionOptions, "signal" | "providerTimeoutMs" | "deadlineAt"> = {},
   ): Promise<StartupSetupResult> {
     const generation = this.#generation;
     const captured = this.#stateStore.read();
@@ -324,13 +493,16 @@ export class SetupOrchestrator {
       return result;
     }
 
-    const connection = captured.connections.find((candidate) =>
+    const matchingConnections = captured.connections.filter((candidate) =>
       candidate.enabled
       && candidate.accountFingerprintState === "verified"
       && candidate.backendId === legacyRoute.backendId
       && candidate.accountFingerprint === legacyRoute.accountFingerprint
       && candidate.billingRealm === legacyRoute.billingRealm
     );
+    const connection = matchingConnections.length === 1
+      ? matchingConnections[0]
+      : undefined;
     const proof = connection ? this.#proofs.get(connection.id) : undefined;
     if (
       !connection
@@ -358,13 +530,16 @@ export class SetupOrchestrator {
 
     const modelsResult = await this.#listModelsBounded(
       adapter,
+      connection.id,
       generation,
-      boundedTimeout(
+      Math.min(boundedTimeout(
         options.providerTimeoutMs,
         this.#providerTimeoutMs,
         MAX_PROVIDER_TIMEOUT_MS,
         "provider",
-      ),
+      ), options.deadlineAt === undefined
+        ? Number.POSITIVE_INFINITY
+        : Math.max(0, options.deadlineAt - this.#clock.now())),
       options.signal,
     );
     if (modelsResult.kind === "cancelled") {
@@ -525,7 +700,7 @@ export class SetupOrchestrator {
     if (options.signal?.aborted) {
       await this.#handleCallerCancellation(captured, generationToken, options.signal);
     }
-    const targets = this.#targets(captured, backendId);
+    const targets = this.#targets(captured, backendId, options.connectionId);
     if (targets.length === 0) {
       if (!this.#ownsGeneration(generationToken)) return this.#staleResult();
       const result = this.#reduce(captured, generation, []);
@@ -536,21 +711,26 @@ export class SetupOrchestrator {
       return result;
     }
 
-    const providerTimeoutMs = boundedTimeout(
+    const configuredProviderTimeoutMs = boundedTimeout(
       options.providerTimeoutMs,
       this.#providerTimeoutMs,
       MAX_PROVIDER_TIMEOUT_MS,
       "provider",
     );
-    const startupTimeoutMs = boundedTimeout(
+    const configuredStartupTimeoutMs = boundedTimeout(
       options.startupTimeoutMs,
       this.#startupTimeoutMs,
       MAX_STARTUP_TIMEOUT_MS,
       "startup",
     );
-    const probePromises = targets.map((target) =>
-      this.#runProbe(target, method, generationToken, providerTimeoutMs)
-    );
+    const now = this.#clock.now();
+    assertFiniteNow(now);
+    const externalRemaining = options.deadlineAt === undefined
+      ? Number.POSITIVE_INFINITY
+      : Math.max(0, options.deadlineAt - now);
+    const startupTimeoutMs = Math.min(configuredStartupTimeoutMs, externalRemaining);
+    const providerTimeoutMs = Math.min(configuredProviderTimeoutMs, startupTimeoutMs);
+    const deadlineAt = now + startupTimeoutMs;
     const cancelOutstanding = () => {
       const reason = abortReason(options.signal!);
       for (const token of this.#activeProbes) {
@@ -568,6 +748,11 @@ export class SetupOrchestrator {
         ));
       }
     }, startupTimeoutMs);
+    // Register the whole-attempt timer before equal-deadline provider timers so
+    // the primary timeout identity remains "startup" at the shared bound.
+    const probePromises = targets.map((target) =>
+      this.#runProbe(target, method, generationToken, providerTimeoutMs, deadlineAt)
+    );
 
     let outcomes: ProbeOutcome[];
     try {
@@ -647,10 +832,18 @@ export class SetupOrchestrator {
     return result;
   }
 
-  #targets(state: ProviderSetupStateV1, backendId?: BackendId): ProbeTarget[] {
+  #targets(
+    state: ProviderSetupStateV1,
+    backendId?: BackendId,
+    connectionId?: string,
+  ): ProbeTarget[] {
     const targets: ProbeTarget[] = [];
     for (const current of state.connections) {
-      if (!current.enabled || (backendId && current.backendId !== backendId)) continue;
+      if (
+        !current.enabled
+        || (backendId && current.backendId !== backendId)
+        || (connectionId && current.id !== connectionId)
+      ) continue;
       try {
         const descriptor = this.#registry.descriptor(current.backendId);
         if (!descriptor.connectable || descriptor.maturity === "coming-soon") continue;
@@ -671,6 +864,7 @@ export class SetupOrchestrator {
     method: "inspect" | "reconnect",
     generationToken: GenerationToken,
     timeoutMs: number,
+    deadlineAt: number,
   ): Promise<ProbeOutcome> {
     const generation = generationToken.generation;
     if (!this.#ownsGeneration(generationToken)) {
@@ -772,8 +966,9 @@ export class SetupOrchestrator {
       controller.signal.addEventListener("abort", onAbort, { once: true });
 
       const request = {
+        connectionId: target.connection.id,
         generation,
-        deadlineAt: startedAt + timeoutMs,
+        deadlineAt,
         signal: controller.signal,
       };
       const operation = Promise.resolve().then(() => target.adapter[method](request));
@@ -1016,14 +1211,15 @@ export class SetupOrchestrator {
     state: ProviderSetupStateV1,
     generation: number,
   ): boolean {
-    const connection = state.connections.find((candidate) =>
+    const connections = state.connections.filter((candidate) =>
       candidate.enabled
       && candidate.accountFingerprintState === "verified"
       && candidate.backendId === route.backendId
       && candidate.accountFingerprint === route.accountFingerprint
       && candidate.billingRealm === route.billingRealm
     );
-    if (!connection) return false;
+    if (connections.length !== 1) return false;
+    const connection = connections[0]!;
     const proof = this.#proofs.get(connection.id);
     return proof?.generation === generation
       && proof.stateRevision === state.revision
@@ -1156,6 +1352,7 @@ export class SetupOrchestrator {
 
   #listModelsBounded(
     adapter: BackendAdapter,
+    connectionId: string,
     generation: number,
     timeoutMs: number,
     callerSignal?: AbortSignal,
@@ -1165,7 +1362,7 @@ export class SetupOrchestrator {
     const token: AttemptToken = {
       generation,
       backendId: adapter.backendId,
-      connectionId: "legacy-model-resolution",
+      connectionId,
       controller,
       closed: false,
       superseded: false,
@@ -1203,7 +1400,10 @@ export class SetupOrchestrator {
         return;
       }
       const operation = Promise.resolve().then(() =>
-        adapter.listModels({ signal: controller.signal })
+        adapter.listModels({
+          connectionId: token.connectionId,
+          signal: controller.signal,
+        })
       );
       operation.then(
         (models) => {

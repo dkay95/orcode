@@ -822,7 +822,7 @@ async function runChildHarness(scenario) {
           backendId: "openrouter",
           enabled: true,
           maturity: "stable",
-          credentialSlot: "provider-slot:v1:inference:10000000-0000-4000-8000-000000000010",
+          credentialSlot: "v1:inference:10000000-0000-4000-8000-000000000010",
           accountFingerprint: route.accountFingerprint,
           accountFingerprintState: "verified",
           billingRealm: "openrouter-payg",

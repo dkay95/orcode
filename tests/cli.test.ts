@@ -2496,7 +2496,7 @@ for (const phase of ["prepared", "credential-deleted", "shared-reference"] as co
   });
 }
 
-test("targeted logout retains a shared-slot survivor's live credential and runnable route across restart", async () => {
+test("duplicate shared-slot logout fails closed without choosing the first connection", async () => {
   const api = cliModule as typeof cliModule & {
     DefaultProviderRuntime: new (...args: unknown[]) => {
       execute(intent: Record<string, unknown>, surface: "plain"): Promise<Record<string, unknown>>;
@@ -2607,25 +2607,26 @@ test("targeted logout retains a shared-slot survivor's live credential and runna
     confirmationToken: prompt.confirmationToken,
   }, "plain");
 
-  assert.equal(result.kind, "changed");
-  assert.equal(result.defaultCleared, false);
+  assert.equal(result.kind, "confirmation-required");
+  assert.notEqual(result.confirmationToken, prompt.confirmationToken);
   assert.equal(deletes, 0);
   assert.equal(openRouter.hasKey, true);
-  assert.deepEqual(runtime.ensureRunnableRoute(), route);
+  assert.throws(() => runtime.ensureRunnableRoute(), /session proof was discarded/);
   const status = await runtime.execute({ kind: "status" }, "plain");
   const provider = (status.providers as Array<Record<string, unknown>>)[0];
-  assert.equal(provider?.configuration, "enabled");
-  assert.equal(provider?.headline, "ready");
-  assert.equal(provider?.isDefault, true);
-  assert.equal(provider?.accountFingerprintSuffix, "…555555");
-  assert.deepEqual(durable.connections.map((candidate) => candidate.id), ["shared-survivor"]);
-  assert.equal(durable.connections[0]?.credentialSlot, slot);
+  assert.equal(provider?.configuration, "disabled");
+  assert.equal(provider?.headline, null);
+  assert.equal(provider?.isDefault, false);
+  assert.equal(provider?.accountFingerprintSuffix, null);
+  assert.deepEqual(durable, initial);
   assert.equal(slots.has(slot), true);
 
   const restartedStore = new ProviderStateStore(durable);
   assert.equal(restartedStore.read().defaultRoute?.canonicalModelId, route.canonicalModelId);
-  assert.equal(restartedStore.read().connections[0]?.enabled, true);
-  assert.equal(restartedStore.read().connections[0]?.credentialSlot, slot);
+  assert.deepEqual(restartedStore.read().connections.map((candidate) => candidate.id), [
+    "shared-selected",
+    "shared-survivor",
+  ]);
 });
 
 test("disabled targeted logout validates authoritative identity before delete or journal phase transition", async () => {
@@ -4043,9 +4044,16 @@ test("versioned inference replace and forget leave one restart-atomic provider t
     appHome: forgetRoot,
     privateStore: new PrivateStore({ root: forgetRoot }),
   });
-  const activate = async (request: { expectedRevision: number; candidate: string }) => {
+  const activate = async (request: {
+    expectedRevision: number;
+    candidate: string;
+    targetConnectionId?: string;
+    generation: number;
+  }) => {
     assert.equal(request.expectedRevision, 0);
     assert.equal(request.candidate, newKey);
+    assert.equal(request.targetConnectionId, connectionId);
+    assert.equal(request.generation, 0);
     const next: ProviderSetupStateV1 = {
       ...structuredClone(initial),
       revision: 1,

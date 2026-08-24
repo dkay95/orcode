@@ -173,7 +173,19 @@ import {
   type ProviderSetupStateV1,
   type ProviderStateCommitRequest,
 } from "./provider-state.js";
-import { SetupOrchestrator, type StartupSetupResult } from "./setup.js";
+import {
+  SetupOrchestrator,
+  runProviderStartupAttempt,
+  type ProviderStartupStepContext,
+  type StartupSetupResult,
+} from "./setup.js";
+import {
+  ProviderCredentialAuthority,
+  ProviderAuthoritySnapshot,
+  parseOpenRouterCredentialPointer,
+  selectOpenRouterBinding,
+  type ProviderCredentialAuthorityLike,
+} from "./provider-authority.js";
 import { PrivateStore, type PrivateDirectoryClaim } from "./private-store.js";
 
 const execFileAsync = promisify(execFile);
@@ -556,6 +568,7 @@ export class DefaultProviderRuntime implements ProviderRuntime {
   #sessionRoutePersisted = false;
   #processRouteGeneration = 0;
   readonly #providerConfirmations = new Map<string, ProviderConfirmationBinding>();
+  #startupAttemptGeneration = 0;
 
   constructor(
     readonly openRouter: OpenRouterService,
@@ -566,11 +579,16 @@ export class DefaultProviderRuntime implements ProviderRuntime {
     private readonly activationCoordinator: ProviderActivationCoordinator,
     private readonly runtimeGuard: SessionProviderRuntimeGuard,
     readonly providerCredentials: ProviderCredentialIntentPort,
-    private savedSecret: string | null,
+    _legacySavedSecret: string | null,
     private environmentSecret: string | null,
     private readonly requestedModel: string,
     private readonly config: OrcodeConfigWithBudget,
     private readonly session?: SessionStore,
+    private readonly authorityOptions?: {
+      credentialAuthority: ProviderCredentialAuthority;
+      adapter: OpenRouterBackendAdapter;
+      recover(context: ProviderStartupStepContext): Promise<void>;
+    },
   ) {}
 
   get preparedRoles(): SetupPreparedRoles | null {
@@ -586,7 +604,6 @@ export class DefaultProviderRuntime implements ProviderRuntime {
     this.#sessionRoute = structuredClone(route);
     this.#sessionRoutePersisted = persisted;
     this.#preparedRoles = null;
-    this.savedSecret = persisted ? secret : null;
     this.environmentSecret = persisted ? null : secret;
     if (persisted) {
       this.#synchronizeAuthoritativeProviderState();
@@ -598,23 +615,55 @@ export class DefaultProviderRuntime implements ProviderRuntime {
     this.#sessionRoute = null;
     this.#sessionRoutePersisted = false;
     this.#preparedRoles = null;
-    this.savedSecret = null;
     this.environmentSecret = null;
     this.#synchronizeAuthoritativeProviderState();
   }
 
   async inspectStartup(): Promise<StartupSetupResult> {
-    const result = await this.orchestrator.inspectStartup();
-    this.#synchronizeAuthoritativeProviderState();
-    if (
-      (result.mode === "setup-required" || result.mode === "route-choice-required")
-      && this.savedSecret === null
-      && this.environmentSecret
-    ) {
-      const automatic = await this.runSetup(
-        createAutomaticEnvironmentSetupSurface(this.requestedModel),
-      );
-      if (automatic.kind === "ready") {
+    const generation = typeof this.orchestrator.nextStartupGeneration === "function"
+      ? this.orchestrator.nextStartupGeneration()
+      : ++this.#startupAttemptGeneration;
+    return runProviderStartupAttempt({
+      generation,
+      recover: (context) => this.authorityOptions?.recover(context) ?? Promise.resolve(),
+      inspect: async (context) => {
+        const result = await this.orchestrator.inspectStartup({
+          signal: context.signal,
+          deadlineAt: context.deadlineAt,
+        });
+        context.assertCurrent();
+        if (result.generation !== context.generation) {
+          throw new Error("Provider startup generation was superseded.");
+        }
+        this.#synchronizeAuthoritativeProviderState();
+        return result;
+      },
+      resolveLegacy: async (result, context) => {
+        if (result.defaultRoute?.resolutionState !== "legacy-unverified") return result;
+        const resolved = await this.orchestrator.resolveLegacyDefaultRoute({
+          signal: context.signal,
+          deadlineAt: context.deadlineAt,
+          providerTimeoutMs: context.remainingMs(),
+        });
+        context.assertCurrent();
+        if (resolved.generation !== context.generation) {
+          throw new Error("Provider startup generation was superseded.");
+        }
+        this.#synchronizeAuthoritativeProviderState();
+        return resolved;
+      },
+      automaticEnvironment: async (result, context) => {
+        if (
+          result.mode !== "setup-required"
+          && result.mode !== "route-choice-required"
+        ) return result;
+        if (!this.environmentSecret) return result;
+        const automatic = await this.runSetup(
+          createAutomaticEnvironmentSetupSurface(this.requestedModel),
+          context,
+        );
+        context.assertCurrent();
+        if (automatic.kind !== "ready") return result;
         const route = this.ensureRunnableRoute();
         return {
           mode: "ready",
@@ -624,9 +673,29 @@ export class DefaultProviderRuntime implements ProviderRuntime {
           warnings: [],
           crossEnabled: false,
         };
-      }
-    }
-    return result;
+      },
+      bindRuntime: async (result, context) => {
+        if (!this.authorityOptions || !result.defaultRoute) return;
+        if (
+          this.#sessionRoute
+          && !this.#sessionRoutePersisted
+          && sameRoute(this.#sessionRoute, result.defaultRoute)
+        ) {
+          return;
+        }
+        const selected = selectOpenRouterBinding(
+          this.stateStore.read(),
+          { kind: "route", route: result.defaultRoute },
+        );
+        if (selected.kind !== "exact") throw new ProviderSetupRequiredError();
+        await this.authorityOptions.adapter.bindRuntime({
+          connectionId: selected.binding.connectionId,
+          generation: result.generation,
+          deadlineAt: context.deadlineAt,
+          signal: context.signal,
+        });
+      },
+    });
   }
 
   async resolveLegacyDefaultRoute(): Promise<StartupSetupResult> {
@@ -635,7 +704,10 @@ export class DefaultProviderRuntime implements ProviderRuntime {
     return result;
   }
 
-  async runSetup(surface: SetupSurface | "plain" | "fullscreen"): Promise<SetupHubResult> {
+  async runSetup(
+    surface: SetupSurface | "plain" | "fullscreen",
+    startupAttempt?: ProviderStartupStepContext,
+  ): Promise<SetupHubResult> {
     if (surface === "fullscreen") {
       throw new ProviderSetupRequiredError();
     }
@@ -657,14 +729,53 @@ export class DefaultProviderRuntime implements ProviderRuntime {
         return result;
       },
     } as SetupOrchestrator;
-    const result = await runSetupHub({
+    const executeHub = (
+      savedSecret: string | null,
+      targetConnectionId?: string,
+      expectedRevision?: number,
+    ) => runSetupHub({
       surface: resolvedSurface,
       orchestrator: setupOrchestrator,
       registry: this.registry,
       stateStore: this.stateStore,
-      savedSecret: this.savedSecret,
+      savedSecret,
       environmentSecret: this.environmentSecret,
+      signal: startupAttempt?.signal,
+      deadlineAt: startupAttempt?.deadlineAt,
+      generation: startupAttempt?.generation,
+      targetConnectionId,
+      expectedRevision,
     });
+    const state = this.stateStore.read();
+    const savedBinding = this.#sessionRoute
+      ? selectOpenRouterBinding(state, { kind: "route", route: this.#sessionRoute })
+      : state.defaultRoute
+        ? selectOpenRouterBinding(state, { kind: "default" })
+        : selectOpenRouterBinding(state, { kind: "backend", backendId: "openrouter" });
+    let result: SetupHubResult;
+    if (this.authorityOptions && savedBinding.kind === "exact") {
+      const signal = startupAttempt?.signal ?? new AbortController().signal;
+      const access = await this.authorityOptions.credentialAuthority.withCredential(
+        {
+          connectionId: savedBinding.binding.connectionId,
+          credentialKind: "inference",
+          purpose: "explicit-repair",
+          environmentEligibility: "forbidden",
+          deadlineAt: startupAttempt?.deadlineAt ?? Date.now() + 8_000,
+          signal,
+        },
+        (secret, context) => executeHub(
+          secret,
+          context.binding.connectionId,
+          context.binding.stateRevision,
+        ),
+      );
+      result = access.kind === "available"
+        ? access.value
+        : await executeHub(null);
+    } else {
+      result = await executeHub(null);
+    }
     if (result.kind === "ready") {
       this.#preparedRoles = result.preparedRoles
         ? structuredClone(result.preparedRoles)
@@ -701,15 +812,13 @@ export class DefaultProviderRuntime implements ProviderRuntime {
       }
       const state = this.stateStore.read();
       const current = state.defaultRoute;
-      const enabled = state.connections.some((connection) =>
-        connection.enabled
-        && connection.backendId === this.#sessionRoute!.backendId
-        && connection.accountFingerprint === this.#sessionRoute!.accountFingerprint
-        && connection.billingRealm === this.#sessionRoute!.billingRealm
+      const selected = selectOpenRouterBinding(
+        state,
+        { kind: "route", route: this.#sessionRoute },
       );
       if (
         current
-        && enabled
+        && selected.kind === "exact"
         && sameRoute(current, this.#sessionRoute)
         && current.requestedModelId === this.#sessionRoute.requestedModelId
         && current.resolutionState === "resolved"
@@ -754,36 +863,83 @@ export class DefaultProviderRuntime implements ProviderRuntime {
     }
 
     const state = this.stateStore.read();
+    const persistedBinding = selectOpenRouterBinding(
+      state,
+      { kind: "route", route: current },
+    );
     const currentIsPersisted = Boolean(
-      this.savedSecret
+      persistedBinding.kind === "exact"
       && state.defaultRoute
       && sameRoute(state.defaultRoute, current)
       && state.defaultRoute.requestedModelId === current.requestedModelId
     );
-    const candidate = this.openRouter.requireKey();
-    const result = await this.orchestrator.activateCandidate({
-      expectedRevision: state.revision,
-      candidate,
-      expectedRequestedModelId: modelId,
-      selectedCanonicalModelId,
-      signal: new AbortController().signal,
-      persistence: this.#sessionRoute
-        ? (this.#sessionRoutePersisted ? "persisted" : "process-only")
-        : (currentIsPersisted ? "persisted" : "process-only"),
-    });
-    const route = validateRouteIdentityV1(result.route);
-    if (
-      !route
-      || route.resolutionState !== "resolved"
-      || route.requestedModelId !== modelId
-      || route.canonicalModelId !== selectedCanonicalModelId
-      || route.backendId !== current.backendId
-      || route.accountFingerprint !== current.accountFingerprint
-      || route.billingRealm !== current.billingRealm
-    ) {
-      throw new ProviderSetupRequiredError();
+    const persistence = this.#sessionRoute
+      ? (this.#sessionRoutePersisted ? "persisted" : "process-only")
+      : (currentIsPersisted ? "persisted" : "process-only");
+    const controller = new AbortController();
+    const activateExactCandidate = async (
+      candidate: string,
+      expectedRevision: number,
+      targetConnectionId?: string,
+    ): Promise<void> => {
+      const result = await this.orchestrator.activateCandidate({
+        expectedRevision,
+        candidate,
+        expectedRequestedModelId: modelId,
+        selectedCanonicalModelId,
+        signal: controller.signal,
+        persistence,
+        ...(targetConnectionId ? { targetConnectionId } : {}),
+      });
+      const route = validateRouteIdentityV1(result.route);
+      if (
+        !route
+        || route.resolutionState !== "resolved"
+        || route.requestedModelId !== modelId
+        || route.canonicalModelId !== selectedCanonicalModelId
+        || route.backendId !== current.backendId
+        || route.accountFingerprint !== current.accountFingerprint
+        || route.billingRealm !== current.billingRealm
+      ) {
+        throw new ProviderSetupRequiredError();
+      }
+      this.adoptCredentialActivation(route, result.persisted, candidate);
+    };
+
+    if (persistence === "persisted") {
+      if (persistedBinding.kind !== "exact" || !this.authorityOptions) {
+        throw new ProviderSetupRequiredError();
+      }
+      const access = await this.authorityOptions.credentialAuthority.withCredential(
+        {
+          connectionId: persistedBinding.binding.connectionId,
+          credentialKind: "inference",
+          purpose: "explicit-repair",
+          environmentEligibility: "forbidden",
+          deadlineAt: Date.now() + 8_000,
+          signal: controller.signal,
+        },
+        async (candidate, context) => {
+          if (
+            context.binding.stateRevision !== state.revision
+            || context.binding.connectionId !== persistedBinding.binding.connectionId
+            || context.binding.accountFingerprint !== current.accountFingerprint
+            || context.binding.billingRealm !== current.billingRealm
+          ) {
+            throw new ProviderSetupRequiredError();
+          }
+          await activateExactCandidate(
+            candidate,
+            context.binding.stateRevision,
+            context.binding.connectionId,
+          );
+        },
+      );
+      if (access.kind !== "available") throw new ProviderSetupRequiredError();
+      return;
     }
-    this.adoptCredentialActivation(route, result.persisted, candidate);
+
+    await activateExactCandidate(this.openRouter.requireKey(), state.revision);
   }
 
   async runWithReadyRoute<T>(
@@ -808,26 +964,33 @@ export class DefaultProviderRuntime implements ProviderRuntime {
   }
 
   #selectedOpenRouterConnection(state: ProviderSetupStateV1) {
-    const matchesRoute = (route: RouteIdentityV1 | null) => route
-      ? state.connections.find((candidate) =>
-          candidate.backendId === "openrouter"
-          && candidate.accountFingerprint === route.accountFingerprint
-          && candidate.billingRealm === route.billingRealm
-        )
+    const selected = this.#sessionRoute
+      ? selectOpenRouterBinding(state, { kind: "route", route: this.#sessionRoute })
+      : state.defaultRoute
+        ? selectOpenRouterBinding(state, { kind: "default" })
+        : selectOpenRouterBinding(state, { kind: "backend", backendId: "openrouter" });
+    return selected.kind === "exact"
+      ? state.connections.find((connection) => connection.id === selected.binding.connectionId)
       : undefined;
-    return matchesRoute(this.#sessionRoute)
-      ?? matchesRoute(state.defaultRoute)
-      ?? state.connections.find((candidate) =>
-        candidate.backendId === "openrouter" && candidate.enabled
-      )
-      ?? state.connections.find((candidate) => candidate.backendId === "openrouter");
   }
 
   #confirmationBinding(
     operation: ProviderDestructiveOperation,
     state: ProviderSetupStateV1,
   ): ProviderConfirmationBinding {
-    const connection = this.#selectedOpenRouterConnection(state);
+    let connection = this.#selectedOpenRouterConnection(state);
+    if (!connection && operation === "logout") {
+      const retained = selectOpenRouterBinding(
+        state,
+        { kind: "backend", backendId: "openrouter" },
+        true,
+      );
+      if (retained.kind === "exact") {
+        connection = state.connections.find((candidate) =>
+          candidate.id === retained.binding.connectionId
+        );
+      }
+    }
     return {
       operation,
       providerRevision: state.revision,
@@ -892,6 +1055,130 @@ export class DefaultProviderRuntime implements ProviderRuntime {
     );
   }
 
+  async #enableRetainedOpenRouter(): Promise<boolean | null> {
+    if (!this.authorityOptions) return null;
+    const retained = selectOpenRouterBinding(
+      this.stateStore.read(),
+      { kind: "backend", backendId: "openrouter" },
+      true,
+    );
+    if (retained.kind !== "exact" || retained.binding.enabled) return null;
+
+    const controller = new AbortController();
+    const connectionId = retained.binding.connectionId;
+    return this.activationCoordinator.runExclusive(
+      { signal: controller.signal, inspectCommitted: false },
+      async (lease) => {
+        await lease.assertHeld();
+        const current = this.stateStore.read();
+        const selected = selectOpenRouterBinding(
+          current,
+          { kind: "connection", connectionId },
+          true,
+        );
+        if (
+          selected.kind !== "exact"
+          || selected.binding.enabled
+          || selected.binding.accountFingerprint !== retained.binding.accountFingerprint
+          || selected.binding.billingRealm !== retained.binding.billingRealm
+          || selected.binding.credentialPointer.kind !== retained.binding.credentialPointer.kind
+          || (selected.binding.credentialPointer.kind === "legacy"
+            ? retained.binding.credentialPointer.kind !== "legacy"
+            : retained.binding.credentialPointer.kind !== "versioned"
+              || selected.binding.credentialPointer.slot.id !== retained.binding.credentialPointer.slot.id)
+        ) return false;
+
+        const connection = current.connections.find((item) => item.id === connectionId);
+        if (!connection) return false;
+        const generation = Math.max(
+          current.revision,
+          connection.lastHealth?.generation ?? 0,
+        ) + 1;
+        const deadlineAt = Date.now() + 5_000;
+        const inspection = await this.authorityOptions!.adapter.inspectUnderAuthorityLease({
+          connectionId,
+          generation,
+          deadlineAt,
+          signal: controller.signal,
+          purpose: "explicit-enable",
+          environmentEligibility: "forbidden",
+          allowDisabled: true,
+        }, lease);
+        await lease.assertHeld();
+        if (
+          !inspection.routeEligible
+          || inspection.accountFingerprint !== connection.accountFingerprint
+          || inspection.billingRealm !== connection.billingRealm
+        ) return false;
+
+        const models = await this.authorityOptions!.adapter.listModels({
+          connectionId,
+          signal: controller.signal,
+        });
+        await lease.assertHeld();
+        const exact = models.filter((model) =>
+          model.backendId === "openrouter"
+          && model.requestedModelId === this.requestedModel
+          && model.capabilities.textInput
+          && model.capabilities.textOutput
+        );
+        const canonical = new Set(exact.map((model) => model.canonicalModelId));
+        if (exact.length === 0 || canonical.size !== 1) return false;
+        const model = exact[0]!;
+        const route: RouteIdentityV1 = {
+          version: 1,
+          backendId: "openrouter",
+          accountFingerprint: connection.accountFingerprint,
+          billingRealm: "openrouter-payg",
+          requestedModelId: model.requestedModelId,
+          canonicalModelId: model.canonicalModelId,
+          resolutionState: "resolved",
+        };
+        const committed = await this.stateStore.commit(current.revision, (authoritative) => {
+          const authoritativeSelection = selectOpenRouterBinding(
+            authoritative,
+            { kind: "connection", connectionId },
+            true,
+          );
+          const authoritativeConnection = authoritative.connections.find((item) => item.id === connectionId);
+          if (
+            authoritativeSelection.kind !== "exact"
+            || authoritativeSelection.binding.enabled
+            || !authoritativeConnection
+            || authoritativeConnection.credentialSlot !== connection.credentialSlot
+            || authoritativeConnection.accountFingerprint !== connection.accountFingerprint
+            || authoritativeConnection.billingRealm !== connection.billingRealm
+          ) {
+            throw new Error("Provider enable binding changed before commit.");
+          }
+          return {
+            ...authoritative,
+            lifecycle: "configured",
+            connections: authoritative.connections.map((item) => item.id === connectionId
+              ? { ...item, enabled: true, lastHealth: structuredClone(inspection.health) }
+              : item),
+            defaultRoute: route,
+            cross: { enabled: false, preferredLead: null, preferredChallenger: null },
+          };
+        });
+        await lease.assertHeld();
+        await this.authorityOptions!.adapter.bindRuntimeUnderAuthorityLease({
+          connectionId,
+          generation,
+          deadlineAt,
+          signal: controller.signal,
+        }, lease);
+        await lease.assertHeld();
+        this.config.providerSetup = requirePersistableProviderState(committed);
+        this.#processRouteGeneration += 1;
+        this.#sessionRoute = structuredClone(route);
+        this.#sessionRoutePersisted = true;
+        this.#preparedRoles = null;
+        return true;
+      },
+    );
+  }
+
   async execute(
     intent: ProviderCommandIntent,
     surface: SetupSurface | "plain" | "fullscreen",
@@ -904,6 +1191,17 @@ export class DefaultProviderRuntime implements ProviderRuntime {
           backendId: "anthropic",
           displayName: descriptor.displayName,
           explanation: "Coming soon · Claude-Modelle sind heute über OpenRouter verfügbar.",
+        };
+      }
+    }
+
+    if (intent.kind === "enable") {
+      const retained = await this.#enableRetainedOpenRouter();
+      if (retained !== null) {
+        return {
+          kind: "setup",
+          backendId: "openrouter",
+          outcome: retained ? "ready" : "cancelled",
         };
       }
     }
@@ -938,17 +1236,51 @@ export class DefaultProviderRuntime implements ProviderRuntime {
     }
 
     if (intent.kind === "reconnect") {
-      const result = await this.activationCoordinator.runExclusive(
-        { signal: new AbortController().signal, inspectCommitted: false },
-        async (lease) => {
-          await lease.assertHeld();
-          const inspected = await this.orchestrator.reconnect("openrouter");
-          await lease.assertHeld();
-          return inspected;
-        },
-      );
+      const selected = this.#selectedOpenRouterConnection(this.stateStore.read());
+      if (!selected) {
+        return {
+          kind: "reconnected",
+          backendId: "openrouter",
+          headline: "setup-required",
+          generation: 0,
+        };
+      }
+      const controller = new AbortController();
+      const runtimeLease = await this.runtimeGuard.acquire(controller.signal);
+      let result: StartupSetupResult;
+      let primaryFailed = false;
+      try {
+        await runtimeLease.assertHeld();
+        result = await this.orchestrator.reconnect("openrouter", {
+          connectionId: selected.id,
+          signal: controller.signal,
+        });
+        await runtimeLease.assertHeld();
+        const adapter = this.registry.adapter("openrouter");
+        if (
+          adapter.bindRuntime
+          && (result.mode === "ready" || result.mode === "ready-with-warning")
+        ) {
+          await adapter.bindRuntime({
+            connectionId: selected.id,
+            generation: result.generation,
+            deadlineAt: Date.now() + 5_000,
+            signal: controller.signal,
+          });
+          await runtimeLease.assertHeld();
+        }
+      } catch (error) {
+        primaryFailed = true;
+        throw error;
+      } finally {
+        try {
+          await Promise.resolve(runtimeLease.release());
+        } catch (error) {
+          if (!primaryFailed) throw error;
+        }
+      }
       const connection = this.stateStore.read().connections.find((candidate) =>
-        candidate.backendId === "openrouter" && candidate.enabled
+        candidate.id === selected.id && candidate.backendId === "openrouter"
       );
       return {
         kind: "reconnected",
@@ -997,9 +1329,7 @@ export class DefaultProviderRuntime implements ProviderRuntime {
         : null;
       const connection = processRoute
         ? undefined
-        : state.connections.find((candidate) =>
-            candidate.backendId === "openrouter" && candidate.enabled
-          );
+        : this.#selectedOpenRouterConnection(state);
       const health = connection?.lastHealth ?? null;
       return {
         backendId: "openrouter",
@@ -1048,9 +1378,7 @@ export class DefaultProviderRuntime implements ProviderRuntime {
     },
   ): Promise<ProviderCommandResult> {
     const before = this.stateStore.read();
-    const connection = before.connections.find((candidate) =>
-      candidate.backendId === "openrouter" && candidate.enabled
-    );
+    const connection = this.#selectedOpenRouterConnection(before);
     const processRoute = !this.#sessionRoutePersisted
         && this.#sessionRoute?.backendId === "openrouter"
       ? this.#sessionRoute
@@ -1089,10 +1417,11 @@ export class DefaultProviderRuntime implements ProviderRuntime {
                 candidate.id === mutationAuthority.connection!.id
                 && candidate.backendId === "openrouter"
                 && candidate.enabled
+                && candidate.credentialSlot === mutationAuthority.connection!.credentialSlot
+                && candidate.accountFingerprint === mutationAuthority.connection!.accountFingerprint
+                && candidate.billingRealm === mutationAuthority.connection!.billingRealm
               )
-            : current.connections.find((candidate) =>
-                candidate.backendId === "openrouter" && candidate.enabled
-              );
+            : undefined;
           const activeProcessRoute = !this.#sessionRoutePersisted
               && this.#sessionRoute?.backendId === "openrouter"
             ? this.#sessionRoute
@@ -1132,6 +1461,10 @@ export class DefaultProviderRuntime implements ProviderRuntime {
             this.#sessionRoutePersisted = false;
             this.#preparedRoles = null;
           }
+          if (activeProcessRoute) {
+            this.environmentSecret = null;
+            this.authorityOptions?.credentialAuthority.revokeAutomaticEnvironment();
+          }
           await lease.assertHeld();
           return {
             kind: "changed",
@@ -1151,6 +1484,16 @@ export class DefaultProviderRuntime implements ProviderRuntime {
   async #logoutProvider(confirmationToken?: string): Promise<ProviderCommandResult> {
     if (!confirmationToken) return this.#confirmationRequired("logout");
     const expected = this.#providerConfirmations.get(confirmationToken);
+    if (
+      expected?.operation === "logout"
+      && expected.connection === null
+      && this.stateStore.read().connections.some((connection) =>
+        connection.backendId === "openrouter"
+      )
+    ) {
+      this.#providerConfirmations.delete(confirmationToken);
+      return this.#confirmationRequired("logout");
+    }
     if (
       expected?.operation === "logout"
       && expected.connection?.credentialSlot.startsWith("v1:inference:")
@@ -1242,7 +1585,6 @@ export class DefaultProviderRuntime implements ProviderRuntime {
         this.#sessionRoute = null;
         this.#sessionRoutePersisted = false;
         this.#preparedRoles = null;
-        this.savedSecret = null;
         this.environmentSecret = null;
         await lease.assertHeld();
         return {
@@ -1263,11 +1605,10 @@ function credentialSlotFromState(
   const raw = state.connections.find((connection) =>
     connection.backendId === "openrouter" && connection.enabled
   )?.credentialSlot;
-  if (!raw || raw === "legacy:inference") return "legacy:inference";
-  const match = /^v1:(inference):([0-9a-f-]{36})$/.exec(raw);
-  return match
-    ? { version: 1, kind: "inference", id: raw }
-    : "legacy:inference";
+  if (!raw) return "legacy:inference";
+  const parsed = parseOpenRouterCredentialPointer(raw);
+  if (!parsed) throw new ProviderSetupRequiredError();
+  return parsed.kind === "legacy" ? parsed.id : parsed.slot;
 }
 
 async function loadCredentialReferenceForStartup(
@@ -1690,13 +2031,13 @@ export async function recoverProviderCredentialBinding(input: {
 }> {
   const recovery = await input.recover();
   const reference = credentialSlotFromState(input.stateStore.read());
+  if (recovery?.cleanupPending) {
+    return { reference, stored: { kind: "absent" }, environment: null };
+  }
   const selected = providerServiceStartupCredential(
     await input.readCredential(reference),
     input.environmentCredential,
   );
-  if (recovery?.cleanupPending) {
-    return { reference, stored: { kind: "absent" }, environment: null };
-  }
   return { reference, ...selected };
 }
 
@@ -1752,6 +2093,7 @@ async function readAuthoritativeProviderState(
 export function createProviderCredentialController(input: {
   stateStore: ProviderStateStore;
   openRouter: OpenRouterService;
+  credentialAuthority?: ProviderCredentialAuthorityLike;
   credentials: {
     location?: string;
     set?(kind: CredentialKind, secret: string): Promise<void>;
@@ -1781,30 +2123,92 @@ export function createProviderCredentialController(input: {
   return {
     async apply(intent) {
       if (intent.credentialKind === "inference" && intent.kind !== "forget") {
-        const candidate = intent.kind === "save"
-          ? input.openRouter.requireKey()
-          : intent.candidate;
         const state = input.stateStore.read();
         const route = inferenceRoute();
-        const result = await input.activationCoordinator.activate({
-          expectedRevision: state.revision,
-          candidate,
-          expectedRequestedModelId: route.requestedModelId,
-          selectedCanonicalModelId: route.canonicalModelId!,
-          generation: state.connections.find((connection) => connection.enabled)?.lastHealth?.generation ?? 0,
-          signal: new AbortController().signal,
-          persistence: "persisted",
-          onPersistenceFailure: intent.kind === "replace" && intent.allowProcessOnly
-            ? async () => (await intent.allowProcessOnly!("inference", "Der sichere Credential-Speicher ist nicht verfügbar."))
-              ? "process-only"
-              : "decline"
-            : undefined,
-        });
-        input.onInferenceReady?.(result.route, result.persisted, candidate);
+        const selected = selectOpenRouterBinding(state, { kind: "route", route });
+        if (selected.kind === "ambiguous" || selected.kind === "invalid-pointer") {
+          throw new ProviderSetupRequiredError();
+        }
+        const targetConnection = selected.kind === "exact"
+          ? state.connections.find((connection) => connection.id === selected.binding.connectionId)
+          : undefined;
+        const signal = new AbortController().signal;
+        const activateCandidate = async (
+          candidate: string,
+          expectedRevision: number,
+          targetConnectionId?: string,
+        ) => {
+          const result = await input.activationCoordinator.activate({
+            expectedRevision,
+            candidate,
+            expectedRequestedModelId: route.requestedModelId,
+            selectedCanonicalModelId: route.canonicalModelId!,
+            generation: targetConnection?.lastHealth?.generation ?? 0,
+            signal,
+            persistence: "persisted",
+            ...(targetConnectionId ? { targetConnectionId } : {}),
+            onPersistenceFailure: intent.kind === "replace" && intent.allowProcessOnly
+              ? async () => (await intent.allowProcessOnly!("inference", "Der sichere Credential-Speicher ist nicht verfügbar."))
+                ? "process-only"
+                : "decline"
+              : undefined,
+          });
+          input.onInferenceReady?.(result.route, result.persisted, candidate);
+          return { persisted: result.persisted };
+        };
+        let activation: { persisted: boolean };
+        if (intent.kind === "save" && selected.kind === "exact") {
+          if (!input.credentialAuthority) {
+            await input.activationCoordinator.runExclusive(
+              { signal, inspectCommitted: false },
+              async (lease) => {
+                await lease.assertHeld();
+                throw new ProviderSetupRequiredError();
+              },
+            );
+            throw new ProviderSetupRequiredError();
+          }
+          const access = await input.credentialAuthority.withCredential(
+            {
+              connectionId: selected.binding.connectionId,
+              credentialKind: "inference",
+              purpose: "explicit-repair",
+              environmentEligibility: "forbidden",
+              deadlineAt: Date.now() + 8_000,
+              signal,
+            },
+            (candidate, context) => {
+              if (
+                context.binding.stateRevision !== state.revision
+                || context.binding.connectionId !== selected.binding.connectionId
+                || context.binding.accountFingerprint !== selected.binding.accountFingerprint
+                || context.binding.billingRealm !== selected.binding.billingRealm
+              ) {
+                throw new ProviderSetupRequiredError();
+              }
+              return activateCandidate(
+                candidate,
+                context.binding.stateRevision,
+                context.binding.connectionId,
+              );
+            },
+          );
+          if (access.kind !== "available") throw new ProviderSetupRequiredError();
+          activation = access.value;
+        } else {
+          const candidate = intent.kind === "save"
+            ? input.openRouter.requireKey()
+            : intent.candidate;
+          activation = await activateCandidate(
+            candidate,
+            state.revision,
+            targetConnection?.id,
+          );
+        }
         return {
           kind: "ready",
           credentialKind: "inference",
-          persisted: result.persisted,
+          persisted: activation.persisted,
         };
       }
 
@@ -1990,6 +2394,7 @@ export async function persistProviderSetupState(
     if (
       error instanceof ProviderConfirmationStaleError
       || error instanceof ProviderAuthoritativeSnapshotRead
+      || error instanceof ProviderAuthoritySnapshot
     ) throw error;
     throw new Error("Provider state publication failed.");
   }
@@ -2157,78 +2562,34 @@ export async function createDefaultProviderRuntime(
     privateStore,
   });
 
-  // Recovery must own the authoritative provider pointer before the active
-  // service derives its credential. This adapter is recovery-only: committed
-  // candidates carry their own secret and no environment key is consulted.
-  const recoveryService = createOpenRouterServiceForStartup({
+  // Construction is deliberately credential-free. Recovery and every read
+  // run inside the one bounded startup attempt below.
+  const openRouter = createOpenRouterServiceForStartup({
     storedInferenceKey: { kind: "absent" },
     environmentInferenceKey: null,
     storedManagementKey: { kind: "absent" },
     environmentManagementKey: null,
   });
-  const recoveryReference = credentialSlotFromState(stateStore.read());
-  const recoveryAdapter = new OpenRouterBackendAdapter({
-    service: recoveryService,
-    credentials,
-    connectionId: stateStore.read().connections.find((connection) =>
-      connection.backendId === "openrouter" && connection.enabled
-    )?.id ?? randomUUID(),
-    inferenceCredential: recoveryReference,
-    environment,
-  });
-  const recoveryCoordinator = new ProviderActivationCoordinator({
-    appHome: startup.appHome,
-    configPath: startup.configPath,
-    privateStore,
-    credentials,
-    adapter: recoveryAdapter,
+  let activationCoordinator: ProviderActivationCoordinator | null = null;
+  const credentialAuthority = new ProviderCredentialAuthority({
     stateStore,
-    runtimeGuard,
+    credentials,
+    environment,
+    coordinator: () => {
+      if (!activationCoordinator) throw new ProviderSetupRequiredError();
+      return activationCoordinator;
+    },
   });
-  const recoverySignal = new AbortController().signal;
-  const recoveredInference = (await recoveryCoordinator.recoverAndRun(
-    { signal: recoverySignal, inspectCommitted: true },
-    (lease) => recoverProviderCredentialBinding({
-      stateStore,
-      recover: () => recoverProviderCredentialForget({
-        journal: forgetJournal,
-        stateStore,
-        credentials,
-        assertHeld: () => lease.assertHeld(),
-        onStatePublished: (state) => {
-          startup.config.providerSetup = requirePersistableProviderState(state);
-        },
-      }),
-      readCredential: (reference) => loadCredentialReferenceForStartup(credentials, reference),
-      environmentCredential: environment.OPENROUTER_API_KEY ?? null,
-    }),
-  )).value;
-  const storedManagement = await loadStoredCredentialForStartup(credentials, "management");
-  const managementServiceCredential = providerServiceStartupCredential(
-    storedManagement,
-    environment.OPENROUTER_MANAGEMENT_KEY ?? null,
-  );
-  const openRouter = createOpenRouterServiceForStartup({
-    storedInferenceKey: recoveredInference.stored,
-    environmentInferenceKey: recoveredInference.environment,
-    storedManagementKey: managementServiceCredential.stored,
-    environmentManagementKey: managementServiceCredential.environment,
-  });
-  const connectionId = stateStore.read().connections.find((connection) =>
-    connection.backendId === "openrouter" && connection.enabled
-  )?.id ?? randomUUID();
   const adapter = new OpenRouterBackendAdapter({
     service: openRouter,
     credentials,
-    connectionId,
-    inferenceCredential: recoveredInference.reference,
-    environment,
+    credentialAuthority,
   });
   const registry = new BackendRegistry([
     { descriptor: OPENROUTER_DESCRIPTOR, adapter },
     { descriptor: ANTHROPIC_COMING_SOON_DESCRIPTOR },
   ]);
-  const activationCoordinator = new ProviderActivationCoordinator({
+  activationCoordinator = new ProviderActivationCoordinator({
     appHome: startup.appHome,
     configPath: startup.configPath,
     privateStore,
@@ -2246,6 +2607,7 @@ export async function createDefaultProviderRuntime(
   const providerCredentials = createProviderCredentialController({
     stateStore,
     openRouter,
+    credentialAuthority,
     credentials,
     activationCoordinator,
     forgetJournal,
@@ -2261,8 +2623,9 @@ export async function createDefaultProviderRuntime(
     },
     onInferenceForgotten: () => runtimeOwner?.adoptCredentialForget(),
   });
-  const savedSecret = recoveredInference.stored.kind === "present"
-    ? recoveredInference.stored.value
+  const automaticEnvironment = stateStore.read().lifecycle === "never-configured"
+      && stateStore.read().connections.length === 0
+    ? environment.OPENROUTER_API_KEY ?? null
     : null;
   runtimeOwner = new DefaultProviderRuntime(
     openRouter,
@@ -2273,11 +2636,31 @@ export async function createDefaultProviderRuntime(
     activationCoordinator,
     runtimeGuard,
     providerCredentials,
-    savedSecret,
-    recoveredInference.environment,
+    null,
+    automaticEnvironment,
     input.requestedModel ?? startup.config.mainModel,
     startup.config,
     startup.session,
+    {
+      credentialAuthority,
+      adapter,
+      recover: async (context) => {
+        await activationCoordinator!.recoverAndRun(
+          { signal: context.signal, inspectCommitted: true },
+          async (lease) => {
+            await recoverProviderCredentialForget({
+              journal: forgetJournal,
+              stateStore,
+              credentials,
+              assertHeld: () => lease.assertHeld(),
+              onStatePublished: (state) => {
+                startup.config.providerSetup = requirePersistableProviderState(state);
+              },
+            });
+          },
+        );
+      },
+    },
   );
   return runtimeOwner;
 }

@@ -55,13 +55,24 @@ export interface BackendDescriptor {
 
 export interface BackendAdapter {
   readonly backendId: BackendId;
-  inspect(request: { generation: number; deadlineAt: number; signal: AbortSignal }): Promise<ProviderInspection>;
-  connect(request: { candidate: unknown; generation: number; signal: AbortSignal }): Promise<ProviderCandidate>;
-  listModels(request: { candidateId?: string; signal: AbortSignal }): Promise<readonly BackendModelDescriptor[]>;
+  inspect(request: ProviderInspectionRequest): Promise<ProviderInspection>;
+  connect(request: { connectionId?: string; candidate: unknown; generation: number; signal: AbortSignal }): Promise<ProviderCandidate>;
+  listModels(request: { connectionId?: string; candidateId?: string; signal: AbortSignal }): Promise<readonly BackendModelDescriptor[]>;
   activate(request: { candidateId: string; model: BackendModelDescriptor; signal: AbortSignal }): Promise<CandidateProviderState>;
-  reconnect(request: { generation: number; deadlineAt: number; signal: AbortSignal }): Promise<ProviderInspection>;
+  reconnect(request: ProviderInspectionRequest): Promise<ProviderInspection>;
+  bindRuntime?(request: { connectionId: string; generation: number; deadlineAt: number; signal: AbortSignal }): Promise<void>;
   logout(request: { signal: AbortSignal }): Promise<void>;
   discardCandidate(candidateId: string): Promise<void>;
+}
+
+export interface ProviderInspectionRequest {
+  connectionId: string;
+  generation: number;
+  deadlineAt: number;
+  signal: AbortSignal;
+  purpose?: "startup-inspect" | "reconnect" | "runtime-bind" | "explicit-enable" | "explicit-repair";
+  environmentEligibility?: "forbidden" | "automatic-if-no-saved" | "explicit-repair";
+  allowDisabled?: boolean;
 }
 
 export interface BackendModelDescriptor {

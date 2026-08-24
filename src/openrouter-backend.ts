@@ -7,13 +7,17 @@ import {
   type CandidateProviderState,
   type ProviderCandidate,
   type ProviderHealth,
+  type ProviderInspectionRequest,
 } from "./backends.js";
 import {
   normalizeProviderSecret,
-  type CredentialKind,
-  type CredentialSlotRef,
   type VersionedCredentialStoreLike,
 } from "./credentials.js";
+import type {
+  ProviderAuthorityReadLease,
+  ProviderCredentialAccessResult,
+  ProviderCredentialAuthorityLike,
+} from "./provider-authority.js";
 import {
   OpenRouterHttpError,
   OpenRouterService,
@@ -60,34 +64,28 @@ export interface OpenRouterInspection {
   qualifiers: readonly string[];
 }
 
-type LegacyCredentialRef = "legacy:inference" | "legacy:management";
-type CredentialRef = CredentialSlotRef | LegacyCredentialRef;
-
 export interface OpenRouterBackendAdapterOptions {
   service: OpenRouterService;
   credentials: VersionedCredentialStoreLike;
-  connectionId: string;
-  inferenceCredential?: CredentialRef;
-  managementCredential?: CredentialRef;
-  environment?: Readonly<Record<string, string | undefined>>;
+  credentialAuthority: ProviderCredentialAuthorityLike;
   now?: () => number;
   createCandidateId?: () => string;
+  createConnectionId?: () => string;
 }
 
 interface InspectedSecret {
-  secret: string;
   balance: BalanceReport;
   inspection: OpenRouterInspection;
 }
 
 interface CandidateEntry extends InspectedSecret {
   candidateId: string;
+  secret: string;
 }
 
-type SelectedCredential =
-  | { kind: "available"; secret: string }
-  | { kind: "absent" }
-  | { kind: "invalid" };
+type InspectionCredentialAccess = (
+  use: (secret: string) => Promise<InspectedSecret>,
+) => Promise<ProviderCredentialAccessResult<InspectedSecret>>;
 
 export function openRouterAccountFingerprint(
   hmacKey: Uint8Array,
@@ -107,60 +105,105 @@ export class OpenRouterBackendAdapter implements BackendAdapter {
   readonly backendId = "openrouter" as const;
   readonly #service: OpenRouterService;
   readonly #credentials: VersionedCredentialStoreLike;
-  readonly #connectionId: string;
-  readonly #inferenceCredential: CredentialRef;
-  readonly #managementCredential: CredentialRef;
-  readonly #environment: Readonly<Record<string, string | undefined>>;
+  readonly #credentialAuthority: ProviderCredentialAuthorityLike;
   readonly #now: () => number;
   readonly #createCandidateId: () => string;
+  readonly #createConnectionId: () => string;
   readonly #candidates = new Map<string, CandidateEntry>();
-  #activeInspection: InspectedSecret | null = null;
-  #inspectionSequence = 0;
+  readonly #activeInspections = new Map<string, InspectedSecret>();
+  readonly #inspectionSequence = new Map<string, number>();
 
   constructor(options: OpenRouterBackendAdapterOptions) {
     this.#service = options.service;
     this.#credentials = options.credentials;
-    this.#connectionId = options.connectionId;
-    this.#inferenceCredential = options.inferenceCredential ?? "legacy:inference";
-    this.#managementCredential = options.managementCredential ?? "legacy:management";
-    this.#environment = options.environment ?? process.env;
+    this.#credentialAuthority = options.credentialAuthority;
     this.#now = options.now ?? Date.now;
     this.#createCandidateId = options.createCandidateId ?? randomUUID;
+    this.#createConnectionId = options.createConnectionId ?? randomUUID;
   }
 
-  async inspect(request: {
-    generation: number;
-    deadlineAt: number;
-    signal: AbortSignal;
-  }): Promise<OpenRouterInspection> {
-    void request.deadlineAt;
-    const inspectionSequence = ++this.#inspectionSequence;
-    this.#activeInspection = null;
-    const selected = await this.#selectCredential(
-      "inference",
-      this.#inferenceCredential,
-      "OPENROUTER_API_KEY",
+  async inspect(request: ProviderInspectionRequest): Promise<OpenRouterInspection> {
+    return this.#inspectWithCredentialAccess(
+      request,
+      (use) => this.#credentialAuthority.withCredential(
+        this.#credentialRequest(request),
+        use,
+      ),
+    );
+  }
+
+  async inspectUnderAuthorityLease(
+    request: ProviderInspectionRequest,
+    lease: ProviderAuthorityReadLease,
+  ): Promise<OpenRouterInspection> {
+    if (!this.#credentialAuthority.withCredentialUnderLease) {
+      return this.#emptyInspection(
+        request.connectionId,
+        request.generation,
+        "openrouter-credential-unavailable",
+      );
+    }
+    return this.#inspectWithCredentialAccess(
+      request,
+      (use) => this.#credentialAuthority.withCredentialUnderLease!(
+        this.#credentialRequest(request),
+        lease,
+        use,
+      ),
+      lease,
+    );
+  }
+
+  async #inspectWithCredentialAccess(
+    request: ProviderInspectionRequest,
+    access: InspectionCredentialAccess,
+    authorityLease?: ProviderAuthorityReadLease,
+  ): Promise<OpenRouterInspection> {
+    const inspectionSequence = (this.#inspectionSequence.get(request.connectionId) ?? 0) + 1;
+    this.#inspectionSequence.set(request.connectionId, inspectionSequence);
+    this.#activeInspections.delete(request.connectionId);
+    const selected = await access(
+      (secret) => this.#inspectSecret(
+        secret,
+        request.connectionId,
+        request.generation,
+        request.deadlineAt,
+        request.signal,
+        authorityLease,
+      ),
     );
     if (selected.kind !== "available") {
       return this.#emptyInspection(
+        request.connectionId,
         request.generation,
-        selected.kind === "invalid"
-          ? "openrouter-credential-unavailable"
-          : "openrouter-credential-missing",
+        explanationForCredentialAccess(selected),
       );
     }
-    const inspected = await this.#inspectSecret(
-      selected.secret,
-      request.generation,
-      request.signal,
-    );
-    if (inspectionSequence === this.#inspectionSequence) {
-      this.#activeInspection = inspected.inspection.routeEligible ? inspected : null;
+    const inspected = selected.value;
+    if (inspectionSequence === this.#inspectionSequence.get(request.connectionId)) {
+      if (inspected.inspection.routeEligible) {
+        this.#activeInspections.set(request.connectionId, inspected);
+      } else {
+        this.#activeInspections.delete(request.connectionId);
+      }
     }
     return inspected.inspection;
   }
 
+  #credentialRequest(request: ProviderInspectionRequest) {
+    return {
+      connectionId: request.connectionId,
+      credentialKind: "inference" as const,
+      purpose: request.purpose ?? "startup-inspect",
+      environmentEligibility: request.environmentEligibility ?? "automatic-if-no-saved",
+      allowDisabled: request.allowDisabled ?? false,
+      deadlineAt: request.deadlineAt,
+      signal: request.signal,
+    };
+  }
+
   async connect(request: {
+    connectionId?: string;
     candidate: unknown;
     generation: number;
     signal: AbortSignal;
@@ -171,17 +214,20 @@ export class OpenRouterBackendAdapter implements BackendAdapter {
     const secret = normalizeProviderSecret(request.candidate);
     const inspected = await this.#inspectSecret(
       secret,
+      request.connectionId ?? this.#createConnectionId(),
       request.generation,
+      Number.MAX_SAFE_INTEGER,
       request.signal,
     );
+    throwIfAborted(request.signal);
     const candidateId = this.#createCandidateId();
     if (inspected.inspection.routeEligible) {
-      this.#candidates.set(candidateId, { ...inspected, candidateId });
+      this.#candidates.set(candidateId, { ...inspected, candidateId, secret });
     }
     return {
       candidateId,
       backendId: "openrouter",
-      connectionId: this.#connectionId,
+      connectionId: inspected.inspection.connectionId,
       accountFingerprint: inspected.inspection.accountFingerprint,
       billingRealm: "openrouter-payg",
       health: inspected.inspection.health,
@@ -189,12 +235,15 @@ export class OpenRouterBackendAdapter implements BackendAdapter {
   }
 
   async listModels(request: {
+    connectionId?: string;
     candidateId?: string;
     signal: AbortSignal;
   }): Promise<readonly BackendModelDescriptor[]> {
     const inspected = request.candidateId
       ? this.#candidates.get(request.candidateId) ?? null
-      : this.#activeInspection;
+      : request.connectionId
+        ? this.#activeInspections.get(request.connectionId) ?? null
+        : null;
     if (!inspected?.inspection.routeEligible) {
       throw new Error("OpenRouter account inspection must succeed before model listing.");
     }
@@ -236,11 +285,11 @@ export class OpenRouterBackendAdapter implements BackendAdapter {
       throw new Error("OpenRouter model selection is invalid.");
     }
     this.#service.activateValidatedKey(candidate.secret, "interactive", candidate.balance);
-    this.#activeInspection = candidate;
+    this.#activeInspections.set(candidate.inspection.connectionId, candidate);
     return {
       candidateId: request.candidateId,
       backendId: "openrouter",
-      connectionId: this.#connectionId,
+      connectionId: candidate.inspection.connectionId,
       accountFingerprint: candidate.inspection.accountFingerprint,
       billingRealm: "openrouter-payg",
       route: {
@@ -255,17 +304,99 @@ export class OpenRouterBackendAdapter implements BackendAdapter {
     };
   }
 
-  reconnect(request: {
+  reconnect(request: ProviderInspectionRequest): Promise<OpenRouterInspection> {
+    return this.inspect({ ...request, purpose: request.purpose ?? "reconnect" });
+  }
+
+  async bindRuntime(request: {
+    connectionId: string;
     generation: number;
     deadlineAt: number;
     signal: AbortSignal;
-  }): Promise<OpenRouterInspection> {
-    return this.inspect(request);
+  }): Promise<void> {
+    return this.#bindWithCredentialAccess(
+      request,
+      (use) => this.#credentialAuthority.withCredential(
+        {
+          connectionId: request.connectionId,
+          credentialKind: "inference",
+          purpose: "runtime-bind",
+          environmentEligibility: "automatic-if-no-saved",
+          deadlineAt: request.deadlineAt,
+          signal: request.signal,
+        },
+        use,
+      ),
+    );
+  }
+
+  async bindRuntimeUnderAuthorityLease(
+    request: {
+      connectionId: string;
+      generation: number;
+      deadlineAt: number;
+      signal: AbortSignal;
+      allowDisabled?: boolean;
+    },
+    lease: ProviderAuthorityReadLease,
+  ): Promise<void> {
+    if (!this.#credentialAuthority.withCredentialUnderLease) {
+      throw new Error("OpenRouter runtime credential binding is unavailable.");
+    }
+    return this.#bindWithCredentialAccess(
+      request,
+      (use) => this.#credentialAuthority.withCredentialUnderLease!(
+        {
+          connectionId: request.connectionId,
+          credentialKind: "inference",
+          purpose: "runtime-bind",
+          environmentEligibility: "forbidden",
+          allowDisabled: request.allowDisabled,
+          deadlineAt: request.deadlineAt,
+          signal: request.signal,
+        },
+        lease,
+        use,
+      ),
+    );
+  }
+
+  async #bindWithCredentialAccess(
+    request: {
+      connectionId: string;
+      generation: number;
+      deadlineAt: number;
+      signal: AbortSignal;
+    },
+    access: (
+      use: (secret: string, context: { source: "saved" | "environment" }) => Promise<void>,
+    ) => Promise<ProviderCredentialAccessResult<void>>,
+  ): Promise<void> {
+    const inspected = this.#activeInspections.get(request.connectionId);
+    if (
+      !inspected
+      || !inspected.inspection.routeEligible
+      || inspected.inspection.health.generation !== request.generation
+    ) {
+      throw new Error("OpenRouter account inspection must be current before runtime binding.");
+    }
+    const selected = await access(
+      async (secret, context) => {
+        this.#service.activateValidatedKey(
+          secret,
+          context.source === "saved" ? "keychain" : "environment",
+          inspected.balance,
+        );
+      },
+    );
+    if (selected.kind !== "available") {
+      throw new Error("OpenRouter runtime credential binding is unavailable.");
+    }
   }
 
   async logout(request: { signal: AbortSignal }): Promise<void> {
     throwIfAborted(request.signal);
-    this.#activeInspection = null;
+    this.#activeInspections.clear();
     this.#service.forgetKey();
     this.#service.forgetManagementKey();
   }
@@ -276,17 +407,19 @@ export class OpenRouterBackendAdapter implements BackendAdapter {
 
   async #inspectSecret(
     secret: string,
+    connectionId: string,
     generation: number,
+    deadlineAt: number,
     signal: AbortSignal,
+    authorityLease?: ProviderAuthorityReadLease,
   ): Promise<InspectedSecret> {
     let key: KeyInfo;
     try {
       key = await this.#service.inspectKey(secret, signal);
     } catch (error) {
       return {
-        secret,
         balance: { key: {} },
-        inspection: this.#inspectionFromKeyFailure(error, generation),
+        inspection: this.#inspectionFromKeyFailure(error, connectionId, generation),
       };
     }
 
@@ -304,24 +437,39 @@ export class OpenRouterBackendAdapter implements BackendAdapter {
         creditsFailed = true;
       }
     } else if (key.isManagementKey === false) {
-      const management = await this.#selectCredential(
-        "management",
-        this.#managementCredential,
-        "OPENROUTER_MANAGEMENT_KEY",
-      );
-      if (management.kind === "available") {
-        creditsAttempted = true;
-        try {
-          credits = await this.#service.getCredits(
-            management.secret,
-            signal,
-            "candidate",
-          );
-        } catch {
-          throwIfAborted(signal);
+      try {
+        const managementRequest = {
+          connectionId,
+          credentialKind: "management" as const,
+          purpose: "startup-inspect" as const,
+          environmentEligibility: "automatic-if-no-saved" as const,
+          deadlineAt,
+          signal,
+        };
+        const useManagement = (managementSecret: string) => this.#service.getCredits(
+          managementSecret,
+          signal,
+          "candidate",
+        );
+        const management = authorityLease && this.#credentialAuthority.withCredentialUnderLease
+          ? await this.#credentialAuthority.withCredentialUnderLease(
+              managementRequest,
+              authorityLease,
+              useManagement,
+            )
+          : await this.#credentialAuthority.withCredential(
+              managementRequest,
+              useManagement,
+            );
+        if (management.kind === "available") {
+          creditsAttempted = true;
+          credits = management.value;
+        } else if (management.kind === "invalid") {
           creditsFailed = true;
         }
-      } else if (management.kind === "invalid") {
+      } catch {
+        throwIfAborted(signal);
+        creditsAttempted = true;
         creditsFailed = true;
       }
     }
@@ -365,7 +513,7 @@ export class OpenRouterBackendAdapter implements BackendAdapter {
       : Object.freeze([] as string[]);
     const inspection: OpenRouterInspection = {
       backendId: "openrouter",
-      connectionId: this.#connectionId,
+      connectionId,
       health,
       headline,
       accountFingerprint,
@@ -376,7 +524,6 @@ export class OpenRouterBackendAdapter implements BackendAdapter {
       qualifiers,
     };
     return {
-      secret,
       balance: {
         key,
         ...(credits ? { credits } : {}),
@@ -388,7 +535,11 @@ export class OpenRouterBackendAdapter implements BackendAdapter {
     };
   }
 
-  #inspectionFromKeyFailure(error: unknown, generation: number): OpenRouterInspection {
+  #inspectionFromKeyFailure(
+    error: unknown,
+    connectionId: string,
+    generation: number,
+  ): OpenRouterInspection {
     const status = error instanceof OpenRouterHttpError ? error.status : undefined;
     const failure = describeOpenRouterFailure(error);
     const credential = status === 401 ? "rejected" as const : "unknown" as const;
@@ -407,7 +558,7 @@ export class OpenRouterBackendAdapter implements BackendAdapter {
     };
     return {
       backendId: "openrouter",
-      connectionId: this.#connectionId,
+      connectionId,
       health,
       headline: deriveProviderHeadline(health),
       accountFingerprint: null,
@@ -427,7 +578,11 @@ export class OpenRouterBackendAdapter implements BackendAdapter {
     };
   }
 
-  #emptyInspection(generation: number, explanationCode: string): OpenRouterInspection {
+  #emptyInspection(
+    connectionId: string,
+    generation: number,
+    explanationCode: string,
+  ): OpenRouterInspection {
     const health: ProviderHealth = {
       credential: "unknown",
       connectivity: "unknown",
@@ -438,7 +593,7 @@ export class OpenRouterBackendAdapter implements BackendAdapter {
     };
     return {
       backendId: "openrouter",
-      connectionId: this.#connectionId,
+      connectionId,
       health,
       headline: "unknown",
       accountFingerprint: null,
@@ -450,39 +605,18 @@ export class OpenRouterBackendAdapter implements BackendAdapter {
     };
   }
 
-  async #selectCredential(
-    kind: CredentialKind,
-    credential: CredentialRef,
-    environmentName: "OPENROUTER_API_KEY" | "OPENROUTER_MANAGEMENT_KEY",
-  ): Promise<SelectedCredential> {
-    let saved: string | null;
-    try {
-      saved = typeof credential === "string"
-        ? await this.#credentials.get(kind)
-        : await this.#credentials.readSlot(credential);
-    } catch {
-      return { kind: "invalid" };
-    }
-    if (saved !== null) {
-      try {
-        return { kind: "available", secret: normalizeProviderSecret(saved) };
-      } catch {
-        return { kind: "invalid" };
-      }
-    }
-    const processValue = this.#environment[environmentName];
-    if (processValue === undefined || processValue.length === 0) {
-      return { kind: "absent" };
-    }
-    try {
-      return {
-        kind: "available",
-        secret: normalizeProviderSecret(processValue),
-      };
-    } catch {
-      return { kind: "invalid" };
-    }
+}
+
+function explanationForCredentialAccess(
+  result: Exclude<ProviderCredentialAccessResult<unknown>, { kind: "available" }>,
+): string {
+  if (result.kind === "forget-pending") return "openrouter-credential-forget-pending";
+  if (result.kind === "invalid-pointer") return "openrouter-credential-invalid-pointer";
+  if (result.kind === "stale") return "openrouter-credential-stale";
+  if (result.kind === "absent" || result.kind === "disabled" || result.kind === "none") {
+    return "openrouter-credential-missing";
   }
+  return "openrouter-credential-unavailable";
 }
 
 function credentialFromExpiry(

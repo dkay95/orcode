@@ -104,6 +104,7 @@ export interface ProviderActivationRequest {
   generation: number;
   signal: AbortSignal;
   persistence: "persisted" | "process-only";
+  targetConnectionId?: string;
   onPersistenceFailure?: () => Promise<"process-only" | "decline">;
 }
 
@@ -116,8 +117,13 @@ export interface ProviderCoordinatorLease {
   assertHeld(): Promise<void>;
 }
 
+export interface ProviderAuthorityReadLease {
+  assertHeld(): Promise<void>;
+}
+
 interface ActivationAdapter {
   connect(request: {
+    connectionId?: string;
     candidate: unknown;
     generation: number;
     signal: AbortSignal;
@@ -284,11 +290,23 @@ export class ProviderActivationCoordinator {
           : new ProviderActivationRecoveryRequiredError();
       }
       await this.#assertMutationAllowed(providerLease, runtimeLease, true);
+      const preflight = await readConfigFacts(this.#options.configPath);
+      if (preflight.kind !== "valid" && preflight.kind !== "absent") {
+        throw new ProviderActivationRecoveryRequiredError("provider-config-unreadable");
+      }
+      if (
+        preflight.state.revision !== request.expectedRevision
+        || this.#options.stateStore.read().revision !== request.expectedRevision
+      ) {
+        throw new StaleProviderGenerationError();
+      }
+      await this.#assertMutationAllowed(providerLease, runtimeLease, true);
       const normalized = normalizeProviderSecret(request.candidate);
       const candidate = await this.#connectCandidate(
         normalized,
         request.generation,
         request.signal,
+        request.targetConnectionId,
       );
       initialCandidateId = candidate.candidateId;
       await this.#boundary("candidate-validated");
@@ -397,6 +415,7 @@ export class ProviderActivationCoordinator {
           readback,
           request.generation,
           request.signal,
+          candidate.connectionId,
         );
         revalidatedCandidateId = revalidated.candidateId;
         assertSameCandidate(candidate, revalidated);
@@ -692,6 +711,54 @@ export class ProviderActivationCoordinator {
     return this.#recoverAndRun(request, false, operation);
   }
 
+  /**
+   * Provider-only read fence. It deliberately does not acquire the runtime
+   * guard, so parallel read inspections cannot invert runtime -> provider
+   * mutation ordering.
+   */
+  async readAuthority<T>(
+    request: { signal: AbortSignal },
+    operation: (lease: ProviderAuthorityReadLease) => Promise<T>,
+  ): Promise<T> {
+    throwIfAborted(request.signal);
+    let providerLease: HeldProviderLease | null = null;
+    let primaryFailed = false;
+    try {
+      providerLease = await this.#acquireProviderLease(request.signal);
+      const assertHeld = async () => {
+        await this.#assertFence(providerLease!);
+        await this.#assertNoPendingCredentialForget(providerLease!);
+        await this.#assertFence(providerLease!);
+        if ((await this.#readAllJournals()).length !== 0) {
+          throw new ProviderActivationRecoveryRequiredError(
+            "provider-activation-journal-pending",
+          );
+        }
+        await this.#assertFence(providerLease!);
+      };
+      const lease: ProviderAuthorityReadLease = { assertHeld };
+      await lease.assertHeld();
+      const value = await operation(lease);
+      await lease.assertHeld();
+      return value;
+    } catch (error) {
+      primaryFailed = true;
+      throw error;
+    } finally {
+      if (providerLease) {
+        try {
+          await this.#releaseProviderLease(providerLease);
+        } catch {
+          if (!primaryFailed) {
+            throw new ProviderActivationRecoveryRequiredError(
+              "provider-authority-release-failed",
+            );
+          }
+        }
+      }
+    }
+  }
+
   async #recoverAndRun<T>(
     request: ProviderActivationRecoveryRequest,
     rejectPendingForget: boolean,
@@ -836,39 +903,6 @@ export class ProviderActivationCoordinator {
       return Object.freeze(["provider-activation-verification-pending"]);
     }
 
-    await assertRuntimeLease(runtimeLease);
-    const candidate = await this.#connectCandidate(
-      candidateSecret,
-      manifest.expectedRevision + 1,
-      request.signal,
-    );
-    await assertRuntimeLease(runtimeLease);
-    if (candidate.connectionId !== manifest.candidateConnectionId
-      || candidate.accountFingerprint !== manifest.candidateRoute.accountFingerprint
-      || candidate.billingRealm !== manifest.candidateRoute.billingRealm) {
-      throw new ProviderActivationRecoveryRequiredError("provider-candidate-identity-mismatch");
-    }
-    const models = await this.#listModels(candidate.candidateId, request.signal);
-    await assertRuntimeLease(runtimeLease);
-    const model = models.find((entry) =>
-      entry.backendId === "openrouter"
-      && entry.requestedModelId === manifest.candidateRoute.requestedModelId
-      && entry.canonicalModelId === manifest.candidateRoute.canonicalModelId
-    );
-    if (!model) {
-      throw new ProviderActivationRecoveryRequiredError("provider-candidate-model-mismatch");
-    }
-    await this.#assertFence(lease);
-    await assertRuntimeLease(runtimeLease);
-    try {
-      const activated = await this.#activateRuntime(candidate.candidateId, model, request.signal);
-      await assertRuntimeLease(runtimeLease);
-      assertActivatedRoute(manifest.candidateRoute, activated);
-    } catch {
-      throw new ProviderActivationRecoveryRequiredError("provider-runtime-bind-ambiguous");
-    } finally {
-      await this.#options.adapter.discardCandidate(candidate.candidateId).catch(() => undefined);
-    }
     await this.#assertFence(lease);
     if (this.#options.stateStore.read().revision === manifest.expectedRevision) {
       try {
@@ -884,7 +918,45 @@ export class ProviderActivationCoordinator {
       lease,
     );
     if (!oldCleaned) return Object.freeze(["provider-candidate-cleanup-retained"]);
-    await this.#removeJournal(transaction, lease);
+
+    await assertRuntimeLease(runtimeLease);
+    const candidate = await this.#connectCandidate(
+      candidateSecret,
+      manifest.expectedRevision + 1,
+      request.signal,
+      manifest.candidateConnectionId,
+    );
+    try {
+      await assertRuntimeLease(runtimeLease);
+      if (candidate.connectionId !== manifest.candidateConnectionId
+        || candidate.accountFingerprint !== manifest.candidateRoute.accountFingerprint
+        || candidate.billingRealm !== manifest.candidateRoute.billingRealm) {
+        throw new ProviderActivationRecoveryRequiredError("provider-candidate-identity-mismatch");
+      }
+      const models = await this.#listModels(candidate.candidateId, request.signal);
+      await assertRuntimeLease(runtimeLease);
+      const model = models.find((entry) =>
+        entry.backendId === "openrouter"
+        && entry.requestedModelId === manifest.candidateRoute.requestedModelId
+        && entry.canonicalModelId === manifest.candidateRoute.canonicalModelId
+      );
+      if (!model) {
+        throw new ProviderActivationRecoveryRequiredError("provider-candidate-model-mismatch");
+      }
+      await this.#assertFence(lease);
+      await assertRuntimeLease(runtimeLease);
+      await this.#removeJournal(transaction, lease);
+      await assertRuntimeLease(runtimeLease);
+      try {
+        const activated = await this.#activateRuntime(candidate.candidateId, model, request.signal);
+        await assertRuntimeLease(runtimeLease);
+        assertActivatedRoute(manifest.candidateRoute, activated);
+      } catch {
+        throw new ProviderActivationRecoveryRequiredError("provider-runtime-bind-ambiguous");
+      }
+    } finally {
+      await this.#options.adapter.discardCandidate(candidate.candidateId).catch(() => undefined);
+    }
     return Object.freeze([]);
   }
 
@@ -892,13 +964,21 @@ export class ProviderActivationCoordinator {
     secret: string,
     generation: number,
     signal: AbortSignal,
+    connectionId?: string,
   ): Promise<ProviderCandidate> {
     try {
-      const candidate = await this.#options.adapter.connect({
-        candidate: secret,
-        generation,
+      const candidate = await abortableDependency(
+        () => this.#options.adapter.connect({
+          ...(connectionId ? { connectionId } : {}),
+          candidate: secret,
+          generation,
+          signal,
+        }),
         signal,
-      });
+        (lateCandidate) => this.#options.adapter
+          .discardCandidate(lateCandidate.candidateId)
+          .catch(() => undefined),
+      );
       if (candidate.backendId !== "openrouter"
         || candidate.billingRealm !== "openrouter-payg"
         || candidate.health.credential !== "valid"
@@ -922,7 +1002,10 @@ export class ProviderActivationCoordinator {
     signal: AbortSignal,
   ): Promise<readonly BackendModelDescriptor[]> {
     try {
-      return await this.#options.adapter.listModels({ candidateId, signal });
+      return await abortableDependency(
+        () => this.#options.adapter.listModels({ candidateId, signal }),
+        signal,
+      );
     } catch (error) {
       if (isAbort(error, signal)) throw abortFrom(signal);
       throw new ProviderActivationError(
@@ -938,7 +1021,10 @@ export class ProviderActivationCoordinator {
     signal: AbortSignal,
   ): Promise<CandidateProviderState> {
     try {
-      return await this.#options.adapter.activate({ candidateId, model, signal });
+      return await abortableDependency(
+        () => this.#options.adapter.activate({ candidateId, model, signal }),
+        signal,
+      );
     } catch (error) {
       if (isAbort(error, signal)) throw abortFrom(signal);
       throw new ProviderActivationError(
@@ -1937,6 +2023,38 @@ function abortFrom(signal: AbortSignal): Error {
   return signal.reason instanceof Error
     ? signal.reason
     : new DOMException("The operation was aborted.", "AbortError");
+}
+
+function abortableDependency<T>(
+  operation: () => Promise<T>,
+  signal: AbortSignal,
+  onLateResolve?: (value: T) => void | Promise<void>,
+): Promise<T> {
+  if (signal.aborted) return Promise.reject(abortFrom(signal));
+  return new Promise<T>((resolve, reject) => {
+    let settled = false;
+    const finish = (callback: () => void) => {
+      if (settled) return;
+      settled = true;
+      signal.removeEventListener("abort", onAbort);
+      callback();
+    };
+    const onAbort = () => finish(() => reject(abortFrom(signal)));
+    signal.addEventListener("abort", onAbort, { once: true });
+    Promise.resolve().then(operation).then(
+      (value) => {
+        if (settled) {
+          if (onLateResolve) void Promise.resolve(onLateResolve(value)).catch(() => undefined);
+          return;
+        }
+        finish(() => resolve(value));
+      },
+      (error) => {
+        if (settled) return;
+        finish(() => reject(error));
+      },
+    );
+  });
 }
 
 function isAbort(error: unknown, signal: AbortSignal): boolean {

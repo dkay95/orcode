@@ -192,7 +192,7 @@ function connection(
     backendId: "openrouter",
     enabled: true,
     maturity: "stable",
-    credentialSlot: `inference:${id}`,
+    credentialSlot: "v1:inference:90000000-0000-4000-8000-000000000001",
     accountFingerprint,
     accountFingerprintState: "verified",
     billingRealm: "openrouter-payg",
