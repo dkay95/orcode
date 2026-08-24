@@ -20,6 +20,30 @@ const SANITIZED_ERROR = {
     type: "invalid_request_error",
   },
 };
+const PINNED_TOOL = {
+  description: "Read a city's temperature",
+  name: "read_temperature",
+  parameters: {
+    $schema: "http://json-schema.org/draft-07/schema#",
+    type: "object",
+    properties: { city: { type: "string" } },
+    required: ["city"],
+    additionalProperties: false,
+  },
+  strict: null,
+  type: "function",
+} as const;
+
+function pinnedRequest(input: unknown): Record<string, unknown> {
+  return {
+    input,
+    model: MODEL,
+    service_tier: "auto",
+    store: false,
+    stream: true,
+    tools: [PINNED_TOOL],
+  };
+}
 
 function sseResponse(events: readonly object[]): Response {
   const body = events.map((event) => `data: ${JSON.stringify(event)}\n\n`).join("") + "data: [DONE]\n\n";
@@ -234,7 +258,7 @@ test("the bridge propagates request aborts to the injected upstream fetch", asyn
   const pending = fetcher(new Request(`${SDK_SERVER_URL}/responses`, {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ model: MODEL, input: "hello", stream: true }),
+    body: JSON.stringify(pinnedRequest("hello")),
     signal: controller.signal,
   }));
 
@@ -258,7 +282,7 @@ test("unexpected paths and unsupported request bodies fail with one sanitized er
     new Request(`${SDK_SERVER_URL}/chat/completions`, {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ model: MODEL, input: "hello", stream: true }),
+      body: JSON.stringify(pinnedRequest("hello")),
     }),
     new Request(`${SDK_SERVER_URL}/responses`, {
       method: "POST",
@@ -268,7 +292,7 @@ test("unexpected paths and unsupported request bodies fail with one sanitized er
     new Request(`${SDK_SERVER_URL}/responses`, {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ model: MODEL, input: [{ type: "unknown" }], stream: true }),
+      body: JSON.stringify(pinnedRequest([{ type: "unknown" }])),
     }),
   ];
 
@@ -278,6 +302,124 @@ test("unexpected paths and unsupported request bodies fail with one sanitized er
     assert.deepEqual(await response.json(), SANITIZED_ERROR);
   }
   assert.equal(upstreamCalls, 0);
+});
+
+test("the strict pinned parser rejects unknown fields and cross-role content parts before upstream fetch", async () => {
+  const reasoning = {
+    content: [{ text: "Need weather data.", type: "reasoning_text" }],
+    id: "reasoning_1",
+    status: "completed",
+    summary: [{ text: "Need weather data.", type: "summary_text" }],
+    type: "reasoning",
+  };
+  const assistant = {
+    content: [{ text: "hello", type: "output_text" }],
+    id: "message_1",
+    role: "assistant",
+    status: "completed",
+    type: "message",
+  };
+  const functionCall = {
+    arguments: "{\"city\":\"Berlin\"}",
+    call_id: "call_1",
+    id: "function_1",
+    name: "read_temperature",
+    status: "completed",
+    type: "function_call",
+  };
+  const functionOutput = {
+    call_id: "call_1",
+    id: "output_1",
+    output: "{\"temperatureC\":18}",
+    type: "function_call_output",
+  };
+  const invalidBodies: readonly { readonly name: string; readonly body: Record<string, unknown> }[] = [
+    { name: "unknown root key", body: { ...pinnedRequest("hello"), unexpected: true } },
+    { name: "unknown user item key", body: pinnedRequest([{ role: "user", content: "hello", unexpected: true }]) },
+    { name: "unknown system item key", body: pinnedRequest([{ role: "system", content: "hello", unexpected: true }]) },
+    { name: "unknown developer item key", body: pinnedRequest([{ role: "developer", content: "hello", unexpected: true }]) },
+    { name: "unknown assistant item key", body: pinnedRequest([{ ...assistant, unexpected: true }]) },
+    { name: "unknown reasoning item key", body: pinnedRequest([{ ...reasoning, unexpected: true }]) },
+    { name: "unknown function-call item key", body: pinnedRequest([{ ...functionCall, unexpected: true }]) },
+    { name: "unknown function-output item key", body: pinnedRequest([{ ...functionOutput, unexpected: true }]) },
+    { name: "unknown tool key", body: { ...pinnedRequest("hello"), tools: [{ ...PINNED_TOOL, unexpected: true }] } },
+    {
+      name: "unknown user content key",
+      body: pinnedRequest([{ role: "user", content: [{ type: "input_text", text: "hello", unexpected: true }] }]),
+    },
+    {
+      name: "unknown system content key",
+      body: pinnedRequest([{ role: "system", content: [{ type: "input_text", text: "hello", unexpected: true }] }]),
+    },
+    {
+      name: "unknown developer content key",
+      body: pinnedRequest([{ role: "developer", content: [{ type: "input_text", text: "hello", unexpected: true }] }]),
+    },
+    {
+      name: "unknown assistant content key",
+      body: pinnedRequest([{ ...assistant, content: [{ type: "output_text", text: "hello", unexpected: true }] }]),
+    },
+    {
+      name: "unknown reasoning-content key",
+      body: pinnedRequest([{ ...reasoning, content: [{ type: "reasoning_text", text: "hello", unexpected: true }] }]),
+    },
+    {
+      name: "unknown reasoning-summary key",
+      body: pinnedRequest([{ ...reasoning, summary: [{ type: "summary_text", text: "hello", unexpected: true }] }]),
+    },
+    { name: "user output_text", body: pinnedRequest([{ role: "user", content: [{ type: "output_text", text: "hello" }] }]) },
+    { name: "system output_text", body: pinnedRequest([{ role: "system", content: [{ type: "output_text", text: "hello" }] }]) },
+    { name: "developer output_text", body: pinnedRequest([{ role: "developer", content: [{ type: "output_text", text: "hello" }] }]) },
+    {
+      name: "assistant input_text",
+      body: pinnedRequest([{ ...assistant, content: [{ type: "input_text", text: "hello" }] }]),
+    },
+    {
+      name: "user reasoning_text",
+      body: pinnedRequest([{ role: "user", content: [{ type: "reasoning_text", text: "hello" }] }]),
+    },
+    {
+      name: "assistant reasoning_text",
+      body: pinnedRequest([{ ...assistant, content: [{ type: "reasoning_text", text: "hello" }] }]),
+    },
+    {
+      name: "reasoning input_text",
+      body: pinnedRequest([{ ...reasoning, content: [{ type: "input_text", text: "hello" }] }]),
+    },
+    {
+      name: "reasoning summary output_text",
+      body: pinnedRequest([{ ...reasoning, summary: [{ type: "output_text", text: "hello" }] }]),
+    },
+  ];
+
+  for (const invalid of invalidBodies) {
+    let upstreamCalls = 0;
+    const fetcher = createKimiResponsesFetcher({
+      fetch: async () => {
+        upstreamCalls += 1;
+        return sseResponse([
+          chatChunk("chatcmpl-invalid", { role: "assistant", content: "must not run" }, "stop", {
+            prompt_tokens: 1,
+            completion_tokens: 1,
+            total_tokens: 2,
+            prompt_tokens_details: { cached_tokens: 0 },
+            completion_tokens_details: { reasoning_tokens: 0 },
+          }),
+        ]);
+      },
+      url: KIMI_CHAT_COMPLETIONS_URL,
+      now: () => FIXED_NOW_MS,
+    });
+    const response = await fetcher(new Request(`${SDK_SERVER_URL}/responses`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(invalid.body),
+    }));
+
+    assert.equal(response.status, 400, invalid.name);
+    assert.deepEqual(await response.json(), SANITIZED_ERROR, invalid.name);
+    assert.equal(upstreamCalls, 0, invalid.name);
+  }
 });
 
 test("the factory accepts only the reviewed Kimi Code Chat Completions URL", () => {

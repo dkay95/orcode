@@ -18,9 +18,9 @@ interface JsonObject {
 interface ResponsesTool {
   readonly type: "function";
   readonly name: string;
-  readonly description: string | null;
+  readonly description: string;
   readonly parameters: JsonObject;
-  readonly strict: boolean | null;
+  readonly strict: null;
 }
 
 interface ChatToolCall {
@@ -66,6 +66,11 @@ function isObject(value: unknown): value is JsonObject {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+function hasExactKeys(value: JsonObject, expected: readonly string[]): boolean {
+  const keys = Object.keys(value);
+  return keys.length === expected.length && expected.every((key) => Object.hasOwn(value, key));
+}
+
 function sanitizedErrorResponse(): Response {
   return Response.json({
     error: {
@@ -75,13 +80,30 @@ function sanitizedErrorResponse(): Response {
   }, { status: 400 });
 }
 
-function stringContent(value: unknown): string | null {
+function inputContent(value: unknown): string | null {
   if (typeof value === "string") return value;
   if (!Array.isArray(value)) return null;
   let text = "";
   for (const part of value) {
-    if (!isObject(part)) return null;
-    if ((part.type !== "input_text" && part.type !== "output_text") || typeof part.text !== "string") {
+    if (!isObject(part)
+      || !hasExactKeys(part, ["text", "type"])
+      || part.type !== "input_text"
+      || typeof part.text !== "string") {
+      return null;
+    }
+    text += part.text;
+  }
+  return text;
+}
+
+function outputContent(value: unknown): string | null {
+  if (!Array.isArray(value)) return null;
+  let text = "";
+  for (const part of value) {
+    if (!isObject(part)
+      || !hasExactKeys(part, ["text", "type"])
+      || part.type !== "output_text"
+      || typeof part.text !== "string") {
       return null;
     }
     text += part.text;
@@ -90,42 +112,46 @@ function stringContent(value: unknown): string | null {
 }
 
 function reasoningContent(item: JsonObject): string | null {
-  if (Array.isArray(item.content)) {
-    let text = "";
-    for (const part of item.content) {
-      if (!isObject(part) || part.type !== "reasoning_text" || typeof part.text !== "string") return null;
-      text += part.text;
-    }
-    if (text.length > 0) return text;
+  if (!Array.isArray(item.content) || !Array.isArray(item.summary)) return null;
+  let contentText = "";
+  for (const part of item.content) {
+    if (!isObject(part)
+      || !hasExactKeys(part, ["text", "type"])
+      || part.type !== "reasoning_text"
+      || typeof part.text !== "string") return null;
+    contentText += part.text;
   }
-  if (!Array.isArray(item.summary)) return null;
-  let text = "";
+  let summaryText = "";
   for (const part of item.summary) {
-    if (!isObject(part) || part.type !== "summary_text" || typeof part.text !== "string") return null;
-    text += part.text;
+    if (!isObject(part)
+      || !hasExactKeys(part, ["text", "type"])
+      || part.type !== "summary_text"
+      || typeof part.text !== "string") return null;
+    summaryText += part.text;
   }
-  return text.length > 0 ? text : null;
+  if (contentText.length > 0) return contentText;
+  return summaryText.length > 0 ? summaryText : null;
 }
 
 function parseTools(value: unknown): readonly ResponsesTool[] | null {
-  if (value === undefined) return [];
   if (!Array.isArray(value)) return null;
   const tools: ResponsesTool[] = [];
   for (const raw of value) {
     if (!isObject(raw)
+      || !hasExactKeys(raw, ["description", "name", "parameters", "strict", "type"])
       || raw.type !== "function"
       || typeof raw.name !== "string"
       || !isObject(raw.parameters)
-      || !(raw.description === null || raw.description === undefined || typeof raw.description === "string")
-      || !(raw.strict === null || raw.strict === undefined || typeof raw.strict === "boolean")) {
+      || typeof raw.description !== "string"
+      || raw.strict !== null) {
       return null;
     }
     tools.push({
       type: "function",
       name: raw.name,
-      description: typeof raw.description === "string" ? raw.description : null,
+      description: raw.description,
       parameters: raw.parameters,
-      strict: typeof raw.strict === "boolean" ? raw.strict : null,
+      strict: null,
     });
   }
   return tools;
@@ -160,13 +186,21 @@ function parseInput(value: unknown): readonly ChatMessage[] | null {
   for (const raw of value) {
     if (!isObject(raw)) return null;
     if (raw.type === "reasoning") {
+      if (!hasExactKeys(raw, ["content", "id", "status", "summary", "type"])
+        || typeof raw.id !== "string"
+        || raw.status !== "completed") return null;
       const content = reasoningContent(raw);
       if (content === null) return null;
       assistantReasoning += content;
       continue;
     }
     if (raw.type === "function_call") {
-      if (typeof raw.call_id !== "string" || typeof raw.name !== "string" || typeof raw.arguments !== "string") {
+      if (!hasExactKeys(raw, ["arguments", "call_id", "id", "name", "status", "type"])
+        || typeof raw.call_id !== "string"
+        || typeof raw.id !== "string"
+        || typeof raw.name !== "string"
+        || typeof raw.arguments !== "string"
+        || raw.status !== "completed") {
         return null;
       }
       assistantToolCalls.push({
@@ -177,21 +211,28 @@ function parseInput(value: unknown): readonly ChatMessage[] | null {
       continue;
     }
     if (raw.type === "function_call_output") {
-      if (typeof raw.call_id !== "string" || typeof raw.output !== "string") return null;
+      if (!hasExactKeys(raw, ["call_id", "id", "output", "type"])
+        || typeof raw.call_id !== "string"
+        || typeof raw.id !== "string"
+        || typeof raw.output !== "string") return null;
       flushAssistant();
       messages.push({ role: "tool", tool_call_id: raw.call_id, content: raw.output });
       continue;
     }
     if (raw.type === "message") {
-      if (raw.role !== "assistant") return null;
-      const content = stringContent(raw.content);
+      if (!hasExactKeys(raw, ["content", "id", "role", "status", "type"])
+        || raw.role !== "assistant"
+        || typeof raw.id !== "string"
+        || raw.status !== "completed") return null;
+      const content = outputContent(raw.content);
       if (content === null) return null;
       flushAssistant();
       messages.push({ role: "assistant", content });
       continue;
     }
     if (raw.type === undefined && (raw.role === "user" || raw.role === "system" || raw.role === "developer")) {
-      const content = stringContent(raw.content);
+      if (!hasExactKeys(raw, ["content", "role"])) return null;
+      const content = inputContent(raw.content);
       if (content === null) return null;
       flushAssistant();
       messages.push({ role: raw.role, content });
@@ -204,7 +245,13 @@ function parseInput(value: unknown): readonly ChatMessage[] | null {
 }
 
 function parseResponsesRequest(value: unknown): ParsedResponsesRequest | null {
-  if (!isObject(value) || typeof value.model !== "string" || value.model.length === 0 || value.stream !== true) {
+  if (!isObject(value)
+    || !hasExactKeys(value, ["input", "model", "service_tier", "store", "stream", "tools"])
+    || typeof value.model !== "string"
+    || value.model.length === 0
+    || value.service_tier !== "auto"
+    || value.store !== false
+    || value.stream !== true) {
     return null;
   }
   const messages = parseInput(value.input);
@@ -217,9 +264,8 @@ function toChatTool(tool: ResponsesTool): object {
   const functionDefinition: Record<string, unknown> = {
     name: tool.name,
     parameters: tool.parameters,
+    description: tool.description,
   };
-  if (tool.description !== null) functionDefinition.description = tool.description;
-  if (tool.strict !== null) functionDefinition.strict = tool.strict;
   return { type: "function", function: functionDefinition };
 }
 
