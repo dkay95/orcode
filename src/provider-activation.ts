@@ -11,9 +11,11 @@ import {
   DEFAULT_CONFIG,
   CONFIG_SCHEMA_VERSION,
   assertConfigFileSnapshot,
+  isAtomicFilePostPublicationError,
   readConfigFileSnapshot,
   saveConfig as saveConfigDefault,
   withConfigWriteLock,
+  writeFileAtomicCreateSecure,
   writeFileAtomicSecure,
   type ConfigFileSnapshot,
 } from "./config.js";
@@ -172,6 +174,12 @@ export interface ProviderActivationCoordinatorOptions {
     beforePublish?: () => Promise<void>,
     beforeRename?: () => void,
   ) => Promise<void>;
+  writeConfigAtomicCreate?: (
+    path: string,
+    content: string,
+    beforePublish?: () => Promise<void>,
+    beforeLink?: () => void,
+  ) => Promise<void>;
   /** @deprecated Transactional activation uses writeConfigAtomic for byte preservation. */
   saveConfig?: typeof saveConfigDefault;
   onBoundary?: (boundary: ProviderActivationBoundary) => void | Promise<void>;
@@ -246,9 +254,9 @@ export class ProviderActivationBusyError extends ProviderActivationError {
 export class ProviderActivationCoordinator {
   readonly #options: Required<Pick<
     ProviderActivationCoordinatorOptions,
-    "now" | "createUuid" | "leaseDurationMs" | "leaseAttempts" | "waitForLease" | "writeConfigAtomic" | "onBoundary"
+    "now" | "createUuid" | "leaseDurationMs" | "leaseAttempts" | "waitForLease" | "writeConfigAtomic" | "writeConfigAtomicCreate" | "onBoundary"
   >> & Omit<ProviderActivationCoordinatorOptions,
-    "now" | "createUuid" | "leaseDurationMs" | "leaseAttempts" | "waitForLease" | "saveConfig" | "writeConfigAtomic" | "onBoundary">;
+    "now" | "createUuid" | "leaseDurationMs" | "leaseAttempts" | "waitForLease" | "saveConfig" | "writeConfigAtomic" | "writeConfigAtomicCreate" | "onBoundary">;
 
   constructor(options: ProviderActivationCoordinatorOptions) {
     if (!Number.isSafeInteger(options.leaseDurationMs ?? DEFAULT_LEASE_DURATION_MS)
@@ -268,6 +276,7 @@ export class ProviderActivationCoordinator {
       waitForLease: options.waitForLease
         ?? (() => new Promise<void>((resolve) => setImmediate(resolve))),
       writeConfigAtomic: options.writeConfigAtomic ?? writeFileAtomicSecure,
+      writeConfigAtomicCreate: options.writeConfigAtomicCreate ?? writeFileAtomicCreateSecure,
       onBoundary: options.onBoundary ?? (() => undefined),
     };
   }
@@ -509,6 +518,8 @@ export class ProviderActivationCoordinator {
             const nextRaw = `${beforeSave.prefix}${JSON.stringify(nextState)}${beforeSave.suffix}`;
             await assertRuntimeLease(runtimeLease);
             await ownership.assertHeld();
+            let writeDisposition: "succeeded" | "pre-publication-failed" | "post-publication-failed"
+              = "succeeded";
             try {
               await this.#assertMutationAllowed(
                 providerLease!,
@@ -516,7 +527,10 @@ export class ProviderActivationCoordinator {
                 true,
                 request.signal,
               );
-              await this.#options.writeConfigAtomic(
+              const writeConfigAtomic = beforeSave.kind === "absent"
+                ? this.#options.writeConfigAtomicCreate
+                : this.#options.writeConfigAtomic;
+              await writeConfigAtomic(
                 ownership.canonicalPath,
                 nextRaw,
                 async () => {
@@ -544,9 +558,12 @@ export class ProviderActivationCoordinator {
                   this.#assertActivationAttemptCurrent(request);
                 },
               );
-            } catch {
-              // The exact readback below, not a write outcome, classifies a
-              // possible post-rename failure while ownership is still held.
+            } catch (error) {
+              writeDisposition = isAtomicFilePostPublicationError(error)
+                ? "post-publication-failed"
+                : "pre-publication-failed";
+              // The non-forgeable phase proof and exact readback are both
+              // required while config/provider/runtime ownership is held.
             }
             await assertRuntimeLease(runtimeLease);
             await ownership.assertHeld();
@@ -563,11 +580,13 @@ export class ProviderActivationCoordinator {
             await ownership.assertHeld();
             if ((afterSave.kind === "valid" || afterSave.kind === "absent")
               && exactCandidateState(afterSave, manifest)
+              && writeDisposition !== "pre-publication-failed"
               && afterSave.prefix === beforeSave.prefix
               && afterSave.suffix === beforeSave.suffix) {
               return "candidate";
             }
             if ((afterSave.kind === "valid" || afterSave.kind === "absent")
+              && writeDisposition === "pre-publication-failed"
               && exactOldState(afterSave, manifest)) {
               return "old";
             }

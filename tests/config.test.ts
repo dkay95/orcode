@@ -12,6 +12,7 @@ import {
   isApprovalMode,
   isBudgetAction,
   isCompressionMode,
+  isAtomicFilePostPublicationError,
   loadConfig,
   loadConfigDetailed,
   readConfigFileSnapshot,
@@ -22,6 +23,8 @@ import {
   validateFallbackModels,
   validateProvider,
   validateVerify,
+  writeFileAtomicCreateSecure,
+  writeFileAtomicSecure,
 } from "../src/config.js";
 
 async function configPath(prefix: string): Promise<string> {
@@ -229,6 +232,69 @@ test("saveConfig writes atomically, leaves no temp file and keeps 0600", async (
   if (process.platform !== "win32") {
     assert.equal(info.mode & 0o777, 0o600);
   }
+});
+
+test("atomic file writers preserve pre-publication error identity and expose no forgeable post-publication proof", async () => {
+  const createPath = await configPath("atomic-create-pre-error");
+  const createReason = new DOMException("fixed create fence abort", "AbortError");
+  await assert.rejects(
+    writeFileAtomicCreateSecure(createPath, "candidate", undefined, () => {
+      throw createReason;
+    }),
+    (error: unknown) => error === createReason,
+  );
+  await assert.rejects(readFile(createPath, "utf8"), { code: "ENOENT" });
+
+  const replacePath = await configPath("atomic-replace-pre-error");
+  await writeFile(replacePath, "old", { encoding: "utf8", mode: 0o600 });
+  const replaceReason = new Error("fixed replace fence rejection");
+  await assert.rejects(
+    writeFileAtomicSecure(replacePath, "candidate", undefined, () => {
+      throw replaceReason;
+    }),
+    (error: unknown) => error === replaceReason,
+  );
+  assert.equal(await readFile(replacePath, "utf8"), "old");
+
+  assert.equal(isAtomicFilePostPublicationError({
+    name: "AtomicFilePostPublicationError",
+    message: "forged",
+    operation: "replace",
+    publicationError: null,
+  }), false);
+
+  const createPostPath = await configPath("atomic-create-post-error");
+  const createPostReason = new Error("fixed create post-publication failure");
+  const createPostError = await writeFileAtomicCreateSecure(
+    createPostPath,
+    "created",
+    undefined,
+    undefined,
+    () => { throw createPostReason; },
+  ).catch((error: unknown) => error);
+  assert.equal(isAtomicFilePostPublicationError(createPostError), true);
+  if (!isAtomicFilePostPublicationError(createPostError)) assert.fail("missing create post-publication proof");
+  assert.equal(createPostError.operation, "create");
+  assert.equal(createPostError.publicationError, createPostReason);
+  assert.equal(await readFile(createPostPath, "utf8"), "created");
+  assert.deepEqual(await readdir(dirname(createPostPath)), ["config.json"]);
+
+  const replacePostPath = await configPath("atomic-replace-post-error");
+  await writeFile(replacePostPath, "old", { encoding: "utf8", mode: 0o600 });
+  const replacePostReason = new Error("fixed replace post-publication failure");
+  const replacePostError = await writeFileAtomicSecure(
+    replacePostPath,
+    "replaced",
+    undefined,
+    undefined,
+    () => { throw replacePostReason; },
+  ).catch((error: unknown) => error);
+  assert.equal(isAtomicFilePostPublicationError(replacePostError), true);
+  if (!isAtomicFilePostPublicationError(replacePostError)) assert.fail("missing replace post-publication proof");
+  assert.equal(replacePostError.operation, "replace");
+  assert.equal(replacePostError.publicationError, replacePostReason);
+  assert.equal(await readFile(replacePostPath, "utf8"), "replaced");
+  assert.deepEqual(await readdir(dirname(replacePostPath)), ["config.json"]);
 });
 
 test("saveConfig keeps a copy of a config it could not parse", async () => {

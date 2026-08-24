@@ -6071,7 +6071,7 @@ test("first-run cancellation initializes an absent config with the exact committ
   assert.deepEqual(disk, expected);
 });
 
-test("first-run absent provider commit cannot replace a config created at the final publication fence", async () => {
+test("first-run absent provider commit cannot adopt a byte-identical config created at the final publication fence", async () => {
   const persist = (cliModule as typeof cliModule & {
     persistProviderSetupState?: (
       path: string,
@@ -6082,10 +6082,16 @@ test("first-run absent provider commit cannot replace a config created at the fi
 
   const directory = await mkdtemp(join(tmpdir(), "orcode-provider-first-race-"));
   const path = join(directory, "config.json");
+  const referencePath = join(directory, "reference.json");
   const initial = structuredClone(DEFAULT_CONFIG.providerSetup) as ProviderSetupStateV1;
   const candidate = { ...initial, revision: 1, lifecycle: "cancelled" as const };
-  const foreign = { ...structuredClone(DEFAULT_CONFIG), mainModel: "foreign/owner" };
-  const foreignRaw = `${JSON.stringify(foreign, null, 2)}\n`;
+  await persist!(referencePath, {
+    expectedRevision: initial.revision,
+    assertCurrent() {},
+    build: () => candidate,
+    adopt() {},
+  });
+  const foreignRaw = await readFile(referencePath, "utf8");
   let assertions = 0;
   let adopted = false;
 
@@ -6118,7 +6124,7 @@ test("first-run absent provider commit cannot replace a config created at the fi
   assert.equal(adopted, false);
 });
 
-test("first-run absent provider commit preserves a config created by a final-fence abort", async () => {
+test("first-run absent provider commit cannot adopt a byte-identical config created by a final-fence abort", async () => {
   const persist = (cliModule as typeof cliModule & {
     persistProviderSetupState?: (
       path: string,
@@ -6129,10 +6135,16 @@ test("first-run absent provider commit preserves a config created by a final-fen
 
   const directory = await mkdtemp(join(tmpdir(), "orcode-provider-first-abort-"));
   const path = join(directory, "config.json");
+  const referencePath = join(directory, "reference.json");
   const initial = structuredClone(DEFAULT_CONFIG.providerSetup) as ProviderSetupStateV1;
   const candidate = { ...initial, revision: 1, lifecycle: "cancelled" as const };
-  const foreign = { ...structuredClone(DEFAULT_CONFIG), mainModel: "foreign/abort-owner" };
-  const foreignRaw = `${JSON.stringify(foreign, null, 2)}\n`;
+  await persist!(referencePath, {
+    expectedRevision: initial.revision,
+    assertCurrent() {},
+    build: () => candidate,
+    adopt() {},
+  });
+  const foreignRaw = await readFile(referencePath, "utf8");
   const reason = new DOMException("fixed first-run publication abort", "AbortError");
   let assertions = 0;
   let adopted = false;
@@ -6148,6 +6160,60 @@ test("first-run absent provider commit preserves a config created by a final-fen
             mode: 0o600,
             flag: "wx",
           });
+          throw reason;
+        }
+      },
+      build(current) {
+        assert.deepEqual(current, initial);
+        return candidate;
+      },
+      adopt() {
+        adopted = true;
+      },
+    }),
+    /Provider state publication failed/,
+  );
+
+  assert.equal(assertions, 4);
+  assert.equal(await readFile(path, "utf8"), foreignRaw);
+  assert.equal(adopted, false);
+});
+
+test("existing provider commit cannot adopt byte-identical foreign bytes after a rejected rename fence", async () => {
+  const persist = (cliModule as typeof cliModule & {
+    persistProviderSetupState?: (
+      path: string,
+      request: ProviderStateCommitRequest,
+    ) => Promise<ProviderSetupStateV1>;
+  }).persistProviderSetupState;
+  assert.equal(typeof persist, "function");
+
+  const directory = await mkdtemp(join(tmpdir(), "orcode-provider-existing-race-"));
+  const path = join(directory, "config.json");
+  const referencePath = join(directory, "reference.json");
+  const initial = structuredClone(DEFAULT_CONFIG.providerSetup) as ProviderSetupStateV1;
+  const candidate = { ...initial, revision: 1, lifecycle: "cancelled" as const };
+  const initialRaw = `${JSON.stringify(DEFAULT_CONFIG, null, 2)}\n`;
+  await writeFile(path, initialRaw, { encoding: "utf8", mode: 0o600 });
+  await writeFile(referencePath, initialRaw, { encoding: "utf8", mode: 0o600 });
+  await persist!(referencePath, {
+    expectedRevision: initial.revision,
+    assertCurrent() {},
+    build: () => candidate,
+    adopt() {},
+  });
+  const foreignRaw = await readFile(referencePath, "utf8");
+  const reason = new Error("fixed byte-identical foreign replace");
+  let assertions = 0;
+  let adopted = false;
+
+  await assert.rejects(
+    persist!(path, {
+      expectedRevision: initial.revision,
+      assertCurrent() {
+        assertions += 1;
+        if (assertions === 4) {
+          writeFileSync(path, foreignRaw, { encoding: "utf8" });
           throw reason;
         }
       },

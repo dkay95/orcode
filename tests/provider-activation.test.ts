@@ -8,6 +8,7 @@ import {
   loadConfigDetailed,
   saveConfig,
   withConfigWriteLock,
+  writeFileAtomicCreateSecure,
   writeFileAtomicSecure,
   type OrcodeConfigWithBudget,
 } from "../src/config.js";
@@ -300,7 +301,7 @@ class FakeAdapter {
 interface ActivationFixtureOptions {
   crashAfter?: Boundary;
   oldSlot?: CredentialSlotRef | "legacy:inference" | null;
-  saveMode?: "normal" | "throw-before" | "throw-after" | "write-corrupt";
+  saveMode?: "normal" | "throw-before" | "throw-after" | "throw-branded-after" | "write-corrupt";
   now?: number;
 }
 
@@ -341,7 +342,15 @@ async function activationFixture(options: ActivationFixtureOptions = {}) {
       await writeFile(configPath, "{corrupt-after-save", "utf8");
       return;
     }
-    await writeFileAtomicSecure(configPath, content);
+    await writeFileAtomicSecure(
+      configPath,
+      content,
+      undefined,
+      undefined,
+      options.saveMode === "throw-branded-after"
+        ? () => { throw new Error("raw-config-branded-after-secret-marker"); }
+        : undefined,
+    );
     if (options.saveMode === "throw-after") throw new Error("raw-config-after-secret-marker");
   };
   const makeCoordinator = (overrides: Record<string, unknown> = {}) =>
@@ -419,6 +428,7 @@ async function activationFixture(options: ActivationFixtureOptions = {}) {
       inspectCommitted,
     }),
     coordinator: () => coordinator,
+    coordinatorWith: (overrides: Record<string, unknown>) => makeCoordinator(overrides),
   };
 }
 
@@ -663,12 +673,69 @@ test("a config write that fails before publish keeps the old pointer and cleans 
   assert.equal(fixture.credentials.slots.get(FOREIGN_SLOT.id), FOREIGN_SECRET);
 });
 
-test("a post-rename config throw is classified by exact readback and continues with the new candidate", async () => {
+test("an unbranded post-return config throw cannot authorize candidate adoption from exact readback", async () => {
   const fixture = await activationFixture({ saveMode: "throw-after" });
+  await assert.rejects(
+    fixture.activate(),
+    (error: unknown) => (
+      typeof error === "object"
+      && error !== null
+      && "code" in error
+      && error.code === "provider-config-commit-ambiguous"
+    ),
+  );
+  const durable = JSON.parse(await readFile(fixture.path, "utf8")) as {
+    providerSetup: ProviderSetupStateV1;
+  };
+  assert.equal(durable.providerSetup.revision, fixture.oldState.revision + 1);
+  assert.equal(durable.providerSetup.connections[0]?.credentialSlot, NEW_SLOT_ID);
+  assert.deepEqual(fixture.stateStore.read(), fixture.oldState);
+  assert.deepEqual(fixture.adapter.runtimeRoute, oldRoute());
+  assert.equal(fixture.credentials.slots.get(NEW_SLOT_ID), NEW_SECRET);
+  assert.equal((await journalDirectories(fixture.appHome)).length, 1);
+});
+
+test("a branded post-publication failure with exact candidate readback authorizes one complete adoption", async () => {
+  const fixture = await activationFixture({ saveMode: "throw-branded-after" });
   const result = await fixture.activate();
   assert.equal(result.persisted, true);
   const tuple = await readTuple(fixture.path, fixture.credentials);
   assert.equal(tuple.secret, NEW_SECRET);
+  assert.deepEqual(fixture.stateStore.read(), result.state);
+  assert.deepEqual(fixture.adapter.runtimeRoute, newRoute());
+  assert.deepEqual(await journalDirectories(fixture.appHome), []);
+});
+
+test("a successful writer with exact old readback is recovery-required and retains candidate artifacts", async () => {
+  const fixture = await activationFixture();
+  const beforeConfig = await readFile(fixture.path, "utf8");
+  const coordinator = fixture.coordinatorWith({
+    writeConfigAtomic: async (
+      _path: string,
+      _content: string,
+      beforePublish?: () => Promise<void>,
+      beforeRename?: () => void,
+    ) => {
+      await beforePublish?.();
+      beforeRename?.();
+    },
+  });
+
+  await assert.rejects(
+    coordinator.activate(fixture.request),
+    (error: unknown) => (
+      typeof error === "object"
+      && error !== null
+      && "code" in error
+      && error.code === "provider-config-commit-ambiguous"
+    ),
+  );
+
+  assert.equal(await readFile(fixture.path, "utf8"), beforeConfig);
+  assert.deepEqual(fixture.stateStore.read(), fixture.oldState);
+  assert.deepEqual(fixture.adapter.runtimeRoute, oldRoute());
+  assert.equal(fixture.credentials.slots.get(NEW_SLOT_ID), NEW_SECRET);
+  assert.equal((await journalDirectories(fixture.appHome)).length, 1);
 });
 
 test("provider publication rejects a symlinked config target without consuming outside bytes", async () => {
@@ -2239,6 +2306,101 @@ test("deadline and abort release authority ownership and block late publication"
     assert.deepEqual(fixture.stateStore.read(), beforeState);
     assert.deepEqual(fixture.adapter.runtimeRoute, oldRoute());
   });
+});
+
+test("first-run persisted activation cannot replace a config created at the final publication fence", async () => {
+  const activationModule = await import("../src/provider-activation.js");
+  const appHome = await mkdtemp(join(tmpdir(), "orcode-provider-first-activation-race-"));
+  const path = join(appHome, "config.json");
+  const credentials = new FakeCredentials(null);
+  const adapter = new FakeAdapter();
+  const runtimeGuard = new FakeRuntimeGuard();
+  const initialState = structuredClone(DEFAULT_CONFIG.providerSetup) as ProviderSetupStateV1;
+  const stateStore = new ProviderStateStore(initialState);
+  const privateStore = new PrivateStore({ root: appHome });
+  const beforeRuntime = structuredClone(adapter.runtimeRoute);
+  let foreignRaw: string | null = null;
+  let foreignIdentity: { dev: bigint; ino: bigint } | null = null;
+  const createForeignAfterSnapshot = async (
+    content: string,
+    beforePublish?: () => Promise<void>,
+  ) => {
+    await beforePublish?.();
+    foreignRaw = content;
+    await writeFile(path, content, {
+      encoding: "utf8",
+      mode: 0o600,
+      flag: "wx",
+    });
+    const created = await lstat(path, { bigint: true });
+    foreignIdentity = { dev: created.dev, ino: created.ino };
+  };
+  const coordinator = new activationModule.ProviderActivationCoordinator({
+    appHome,
+    configPath: path,
+    privateStore,
+    credentials,
+    adapter,
+    stateStore,
+    runtimeGuard,
+    now: () => 10_000,
+    createUuid: sequentialUuid(),
+    leaseDurationMs: 100,
+    writeConfigAtomic: (
+      configPath: string,
+      content: string,
+      beforePublish?: () => Promise<void>,
+      beforeRename?: () => void,
+    ) => writeFileAtomicSecure(
+      configPath,
+      content,
+      () => createForeignAfterSnapshot(content, beforePublish),
+      beforeRename,
+    ),
+    writeConfigAtomicCreate: (
+      configPath: string,
+      content: string,
+      beforePublish?: () => Promise<void>,
+      beforeLink?: () => void,
+    ) => writeFileAtomicCreateSecure(
+      configPath,
+      content,
+      () => createForeignAfterSnapshot(content, beforePublish),
+      beforeLink,
+    ),
+  });
+
+  await assert.rejects(
+    coordinator.activate({
+      expectedRevision: initialState.revision,
+      candidate: NEW_SECRET,
+      expectedRequestedModelId: MODEL.requestedModelId,
+      selectedCanonicalModelId: MODEL.canonicalModelId,
+      generation: 1,
+      signal: new AbortController().signal,
+      deadlineAt: Number.MAX_SAFE_INTEGER,
+      persistence: "persisted",
+    }),
+    (error: unknown) => (
+      typeof error === "object"
+      && error !== null
+      && "code" in error
+      && error.code === "provider-config-commit-ambiguous"
+    ),
+  );
+
+  assert.ok(foreignRaw);
+  const expectedForeignIdentity = foreignIdentity as { dev: bigint; ino: bigint } | null;
+  assert.ok(expectedForeignIdentity);
+  assert.equal(await readFile(path, "utf8"), foreignRaw);
+  const retained = await lstat(path, { bigint: true });
+  assert.equal(retained.dev, expectedForeignIdentity.dev);
+  assert.equal(retained.ino, expectedForeignIdentity.ino);
+  assert.deepEqual(stateStore.read(), initialState);
+  assert.deepEqual(adapter.runtimeRoute, beforeRuntime);
+  assert.equal(adapter.calls.includes("activate"), false);
+  assert.equal(credentials.slots.get(NEW_SLOT_ID), NEW_SECRET);
+  assert.equal((await journalDirectories(appHome)).length, 1);
 });
 
 test("real activation writer abort microtask at the last async fence preserves the old tuple", async () => {

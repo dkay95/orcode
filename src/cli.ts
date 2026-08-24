@@ -57,6 +57,7 @@ import {
   assertConfigFileSnapshot,
   consumeConfigWarning,
   configPath,
+  isAtomicFilePostPublicationError,
   isApprovalMode,
   isCompressionMode,
   loadConfig,
@@ -3197,6 +3198,7 @@ async function persistProviderSetupStateOwned(
         },
       );
     } catch (error) {
+      if (!isAtomicFilePostPublicationError(error)) throw error;
       writeError = error;
     }
     await ownership.assertHeld();

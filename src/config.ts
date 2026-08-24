@@ -66,6 +66,41 @@ export function configPath(appHome: string = APP_HOME): string {
 export const SECURE_DIRECTORY_MODE = 0o700;
 export const SECURE_FILE_MODE = 0o600;
 
+export interface AtomicFilePostPublicationError extends Error {
+  readonly operation: "create" | "replace";
+  readonly publicationError: unknown;
+}
+
+class AtomicFilePostPublicationFailure extends Error implements AtomicFilePostPublicationError {
+  constructor(
+    readonly operation: "create" | "replace",
+    readonly publicationError: unknown,
+  ) {
+    super("Atomic file publication completed before cleanup failed.");
+    this.name = "AtomicFilePostPublicationError";
+  }
+}
+
+const atomicFilePostPublicationErrors = new WeakSet<object>();
+
+/** A non-forgeable phase proof; exact readback is still required before adoption. */
+export function isAtomicFilePostPublicationError(
+  error: unknown,
+): error is AtomicFilePostPublicationError {
+  return typeof error === "object"
+    && error !== null
+    && atomicFilePostPublicationErrors.has(error);
+}
+
+function atomicFilePostPublicationError(
+  operation: "create" | "replace",
+  publicationError: unknown,
+): AtomicFilePostPublicationError {
+  const error = new AtomicFilePostPublicationFailure(operation, publicationError);
+  atomicFilePostPublicationErrors.add(error);
+  return Object.freeze(error);
+}
+
 export const BUDGET_ACTIONS = ["warn", "block"] as const;
 export type BudgetAction = (typeof BUDGET_ACTIONS)[number];
 
@@ -338,6 +373,7 @@ export async function saveConfig(
         await ownership.assertHeld();
       });
     } catch (error) {
+      if (!isAtomicFilePostPublicationError(error)) throw error;
       writeError = error;
     }
     await ownership.assertHeld();
@@ -379,16 +415,19 @@ const securedDirectories = new Set<string>();
 /**
  * Atomic write with an unpredictable temp name and `wx`, so a hostile or stale
  * temp file can never be reused and a crash cannot leave a half written target
- * (N2).
+ * (N2). Ordinary rejection proves rename did not complete; only the
+ * non-forgeable post-publication brand permits an exact-readback reconciliation.
  */
 export async function writeFileAtomicSecure(
   path: string,
   content: string,
   beforePublish?: () => Promise<void>,
   beforeRename?: () => void,
+  afterPublish?: () => void,
 ): Promise<void> {
   await ensureSecureDirectory(dirname(path));
   const temporary = `${path}.${randomUUID()}.tmp`;
+  let published = false;
   try {
     await writeFile(temporary, content, {
       encoding: "utf8",
@@ -401,16 +440,22 @@ export async function writeFileAtomicSecure(
       throw new Error("Atomic write beforeRename fence must be synchronous.");
     }
     await rename(temporary, path);
+    published = true;
+    const postPublishResult: unknown = afterPublish?.();
+    if (postPublishResult !== undefined) {
+      throw new Error("Atomic write afterPublish hook must be synchronous.");
+    }
   } catch (error) {
     await unlink(temporary).catch(() => {});
+    if (published) {
+      throw atomicFilePostPublicationError("replace", error);
+    }
     throw error;
   }
   try {
     await chmod(path, SECURE_FILE_MODE);
   } catch (error) {
-    if (!hasCode(error, "ENOENT")) {
-      throw error;
-    }
+    throw atomicFilePostPublicationError("replace", error);
   }
 }
 
@@ -418,16 +463,20 @@ export async function writeFileAtomicSecure(
  * Atomically publishes one newly created secure file without ever replacing an
  * existing target. The hard-link publish is the create-only CAS: if another
  * writer creates `path` after the last snapshot fence, `link` fails with
- * `EEXIST` and leaves those foreign bytes untouched.
+ * `EEXIST` and leaves those foreign bytes untouched. Ordinary rejection proves
+ * link did not complete; only the non-forgeable post-publication brand permits
+ * an exact-readback reconciliation.
  */
 export async function writeFileAtomicCreateSecure(
   path: string,
   content: string,
   beforePublish?: () => Promise<void>,
   beforeLink?: () => void,
+  afterPublish?: () => void,
 ): Promise<void> {
   await ensureSecureDirectory(dirname(path));
   const temporary = `${path}.${randomUUID()}.tmp`;
+  let published = false;
   try {
     await writeFile(temporary, content, {
       encoding: "utf8",
@@ -440,17 +489,23 @@ export async function writeFileAtomicCreateSecure(
       throw new Error("Atomic create beforeLink fence must be synchronous.");
     }
     await link(temporary, path);
+    published = true;
+    const postPublishResult: unknown = afterPublish?.();
+    if (postPublishResult !== undefined) {
+      throw new Error("Atomic create afterPublish hook must be synchronous.");
+    }
     await unlink(temporary);
   } catch (error) {
     await unlink(temporary).catch(() => {});
+    if (published) {
+      throw atomicFilePostPublicationError("create", error);
+    }
     throw error;
   }
   try {
     await chmod(path, SECURE_FILE_MODE);
   } catch (error) {
-    if (!hasCode(error, "ENOENT")) {
-      throw error;
-    }
+    throw atomicFilePostPublicationError("create", error);
   }
 }
 
