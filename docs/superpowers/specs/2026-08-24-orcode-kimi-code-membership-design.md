@@ -1,7 +1,7 @@
 # Orcode Kimi Code Membership Provider Design
 
 Date: 2026-08-24  
-Status: Proposed for user review  
+Status: Approved by user on 2026-08-24
 Depends on: `2026-08-23-orcode-startup-provider-setup-design.md` and final
 approval of the provider-authority stabilization
 
@@ -23,6 +23,27 @@ The first release supports the official third-party integration contract:
 
 Kimi Open Platform pay-as-you-go and native Kimi OAuth are separate future
 integrations. Neither is silently substituted for Kimi Code membership.
+
+### 1.1 Global single-owner boundary
+
+The user requires every Orcode provider and model—not only Kimi—to be
+single-owner. A subscription, API key, account route, provider session, or
+runtime proof belongs exclusively to the local Orcode owner. It may never be
+used by another person, tenant, team member, anonymous client, public endpoint,
+shared daemon, or resale service.
+
+Provider credentials remain inside the private store of the owner's operating
+system account. Local sockets and process APIs are owner-only. A future remote
+feature may permit the same owner to use an explicitly enrolled personal
+device, but only with strong owner authentication and device revocation. A
+relay, remote host, browser client, or transport service never receives or
+becomes the owner of provider credentials. Multi-user use requires a separate
+design and separate provider credentials; it cannot be enabled by configuration
+alone.
+
+This global owner-only rule does not by itself prohibit owner-initiated
+non-interactive use of providers whose terms allow it. Kimi Code has the
+additional provider-specific personal-interactive restriction in section 3.
 
 ## 2. User outcome
 
@@ -297,11 +318,16 @@ The implementation is test-first and must prove at least:
     through OpenRouter or a different Kimi account.
 11. Kimi use is rejected before credential/network in scheduled, relay,
     multi-user, and unattended batch modes.
-12. Cross remains off after every setup, migration, repair, restart, command,
+12. Every provider credential and runtime route is owner-only: foreign local
+    users, anonymous/local-network clients, unenrolled remote devices, shared
+    services, and multi-tenant callers are rejected before credential read or
+    provider network. An explicitly enrolled personal device still cannot
+    receive the provider credential itself.
+13. Cross remains off after every setup, migration, repair, restart, command,
     model change, and recovery path.
-13. POSIX PTY and Windows-gated contracts cover paste/cancel/setup copy without
+14. POSIX PTY and Windows-gated contracts cover paste/cancel/setup copy without
     retaining secret bytes or leaking error diagnostics.
-14. Existing OpenRouter, Anthropic Coming-soon, CLI, migration, session, config,
+15. Existing OpenRouter, Anthropic Coming-soon, CLI, migration, session, config,
     and release suites remain green.
 
 The frozen final tree must pass focused provider/Kimi tests, both TypeScript
@@ -314,6 +340,8 @@ metadata, and one captured repository-full test run before integration.
 - Reading or managing the official Kimi CLI/VS Code credential store.
 - Kimi Open Platform pay-as-you-go.
 - Enterprise, resale, multi-user, remote relay, or unattended automation use.
+- Sharing any Orcode-owned provider credential or runtime proof with another
+  user; future same-owner device access remains credentialless at the client.
 - Automatic environment-key fallback.
 - Dynamic trust of undocumented model IDs, capabilities, account identifiers,
   billing claims, or quota values.
