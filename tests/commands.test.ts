@@ -512,11 +512,14 @@ test("provider setup, connect, status, models, and reconnect dispatch one typed 
     { kind: "reconnect", backendId: "openrouter", sameSurface: true },
   ]);
   const rendered = output.join("\n");
-  assert.match(rendered, /OpenRouter.*enabled.*ready.*openrouter-payg.*…c0ffee.*Standard/s);
+  assert.match(rendered, /OpenRouter.*enabled.*ready.*openrouter-payg.*Standard/s);
   assert.match(rendered, /credential=valid.*connectivity=connected.*spend=unknown.*runtime=not-applicable/s);
   assert.match(rendered, /Anthropic.*Coming soon/s);
   assert.match(rendered, /Cross: aus/);
   assert.match(rendered, /vendor\/model/);
+  // Privacy contract: the fingerprint suffix supplied by the port must never
+  // reach the rendered status output.
+  assert.doesNotMatch(rendered, /…c0ffee/);
   assert.doesNotMatch(rendered, /creator|credentialSlot|account-id|\/Users\//i);
 });
 
@@ -626,6 +629,168 @@ test("unknown and partial provider subcommands use the exact new usage without m
     );
   }
   assert.deepEqual(calls, []);
+});
+
+test("every kimi provider account command dispatches one exact kimi-code intent", async () => {
+  const intents: Array<Record<string, unknown>> = [];
+  const output: string[] = [];
+  const context = {
+    config: structuredClone(DEFAULT_CONFIG),
+    providerCommands: {
+      async execute(intent: Record<string, unknown>) {
+        intents.push(intent);
+        if (intent.kind === "status") {
+          return { kind: "status", providers: [], crossEnabled: false };
+        }
+        return {
+          kind: "unchanged",
+          backendId: "kimi-code",
+          reason: "pure-domain-double",
+        };
+      },
+    },
+    out: {
+      text: (value: string) => output.push(value),
+      error: (value: string) => output.push(value),
+    },
+  } as unknown as CommandContext;
+
+  for (const action of ["connect", "enable", "disable", "reconnect", "models", "logout"]) {
+    await handleSlashCommand(`/provider ${action} kimi-code`, context);
+  }
+  await handleSlashCommand("/provider status", context);
+
+  assert.deepEqual(intents, [
+    { kind: "connect", backendId: "kimi-code" },
+    { kind: "enable", backendId: "kimi-code" },
+    { kind: "disable", backendId: "kimi-code" },
+    { kind: "reconnect", backendId: "kimi-code" },
+    { kind: "models", backendId: "kimi-code" },
+    { kind: "logout", backendId: "kimi-code" },
+    { kind: "status" },
+  ]);
+});
+
+test("provider status renders kimi as preview on its own realm without private data", async () => {
+  const output: string[] = [];
+  const context = {
+    config: structuredClone(DEFAULT_CONFIG),
+    providerCommands: {
+      async execute() {
+        return {
+          kind: "status",
+          providers: [{
+            backendId: "openrouter",
+            displayName: "OpenRouter",
+            availability: "connectable",
+            configuration: "enabled",
+            maturity: "stable",
+            billingRealm: "openrouter-payg",
+            accountFingerprintSuffix: "…c0ffee",
+            headline: "ready",
+            health: {
+              credential: "valid",
+              connectivity: "connected",
+              spend: "unknown",
+              runtime: "not-applicable",
+            },
+            isDefault: false,
+          }, {
+            backendId: "kimi-code",
+            displayName: "Kimi Code",
+            availability: "connectable",
+            configuration: "enabled",
+            maturity: "preview",
+            billingRealm: "kimi-code-membership-provider-managed-overage",
+            accountFingerprintSuffix: "…feedface",
+            headline: "ready",
+            health: {
+              credential: "valid",
+              connectivity: "connected",
+              spend: "unknown",
+              runtime: "not-applicable",
+            },
+            isDefault: true,
+          }],
+          crossEnabled: false,
+        };
+      },
+    },
+    out: {
+      text: (value: string) => output.push(value),
+      error: (value: string) => output.push(value),
+    },
+  } as unknown as CommandContext;
+
+  await handleSlashCommand("/provider status", context);
+  const rendered = output.join("\n");
+  const kimiLine = output.find((line) => line.includes("Kimi Code"));
+
+  assert.ok(kimiLine, "status must render the kimi provider entry");
+  assert.match(kimiLine, /Kimi Code.*Preview.*enabled.*ready.*kimi-code-membership-provider-managed-overage.*Standard/s);
+  assert.match(kimiLine, /credential=valid.*connectivity=connected.*spend=unknown.*runtime=not-applicable/s);
+  assert.equal(kimiLine.toLowerCase().includes("openrouter"), false);
+  assert.match(rendered, /OpenRouter.*enabled.*ready.*openrouter-payg/s);
+  assert.doesNotMatch(rendered, /feedface|c0ffee|…|acct_|@|quota/i);
+  assert.doesNotMatch(rendered, /\d/);
+});
+
+test("kimi provider models render the kimi catalog and a kimi-specific empty message", async () => {
+  const output: string[] = [];
+  let empty = false;
+  const context = {
+    config: structuredClone(DEFAULT_CONFIG),
+    providerCommands: {
+      async execute() {
+        return {
+          kind: "models",
+          backendId: "kimi-code",
+          models: empty ? [] : [
+            { requestedModelId: "k3", canonicalModelId: "k3", displayName: "Kimi K3" },
+            { requestedModelId: "kimi-for-coding", canonicalModelId: "kimi-for-coding", displayName: "Kimi K2.7 Code" },
+          ],
+        };
+      },
+    },
+    out: {
+      text: (value: string) => output.push(value),
+      error: (value: string) => output.push(value),
+    },
+  } as unknown as CommandContext;
+
+  await handleSlashCommand("/provider models kimi-code", context);
+  assert.match(output.join("\n"), /Kimi K3 · k3 · k3/);
+  assert.match(output.join("\n"), /Kimi K2\.7 Code · kimi-for-coding · kimi-for-coding/);
+
+  output.length = 0;
+  empty = true;
+  await handleSlashCommand("/provider models kimi-code", context);
+  assert.deepEqual(output, ["Keine nutzbaren Kimi-Code-Modelle verfügbar."]);
+});
+
+test("a kimi reconnect result is never relabeled as openrouter", async () => {
+  const output: string[] = [];
+  const context = {
+    config: structuredClone(DEFAULT_CONFIG),
+    providerCommands: {
+      async execute() {
+        return {
+          kind: "reconnected",
+          backendId: "kimi-code",
+          headline: "ready",
+          generation: 3,
+        };
+      },
+    },
+    out: {
+      text: (value: string) => output.push(value),
+      error: (value: string) => output.push(value),
+    },
+  } as unknown as CommandContext;
+
+  await handleSlashCommand("/provider reconnect kimi-code", context);
+
+  assert.deepEqual(output, ["Kimi Code · ready · Generation 3"]);
 });
 
 test("a valid environment key remains process-only during startup validation", async () => {

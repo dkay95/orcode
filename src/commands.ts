@@ -172,7 +172,10 @@ export interface ProviderRouteIntentPort {
   ): Promise<void>;
 }
 
-export type ProviderCommandBackendId = "openrouter" | "anthropic";
+export type ProviderCommandBackendId = "openrouter" | "kimi-code" | "anthropic";
+
+/** Backends the pure command domain can address with account mutations today. */
+export type ProviderCommandConnectableBackendId = "openrouter" | "kimi-code";
 
 export type ProviderCommandIntent =
   | { kind: "setup" }
@@ -188,8 +191,8 @@ export interface ProviderCommandStatusEntry {
   displayName: string;
   availability: "connectable" | "coming-soon";
   configuration: "enabled" | "disabled";
-  maturity: "stable" | "coming-soon";
-  billingRealm: "openrouter-payg" | "none";
+  maturity: "stable" | "preview" | "coming-soon";
+  billingRealm: "openrouter-payg" | "kimi-code-membership-provider-managed-overage" | "none";
   accountFingerprintSuffix: string | null;
   headline: string | null;
   health: {
@@ -212,29 +215,34 @@ export type ProviderCommandResult =
   | { kind: "status"; providers: readonly ProviderCommandStatusEntry[]; crossEnabled: false }
   | {
       kind: "models";
-      backendId: "openrouter";
+      backendId: ProviderCommandConnectableBackendId;
       models: readonly {
         requestedModelId: string;
         canonicalModelId: string;
         displayName: string;
       }[];
     }
-  | { kind: "reconnected"; backendId: "openrouter"; headline: string; generation: number }
+  | {
+      kind: "reconnected";
+      backendId: ProviderCommandConnectableBackendId;
+      headline: string;
+      generation: number;
+    }
   | {
       kind: "confirmation-required";
       operation: "disable" | "disconnect" | "logout";
-      backendId: "openrouter";
+      backendId: ProviderCommandConnectableBackendId;
       message: string;
       confirmationToken: string;
     }
   | {
       kind: "changed";
       operation: "disable" | "disconnect" | "logout";
-      backendId: "openrouter";
+      backendId: ProviderCommandConnectableBackendId;
       setupRequired: boolean;
       defaultCleared: boolean;
     }
-  | { kind: "unchanged"; backendId: "openrouter"; reason: string };
+  | { kind: "unchanged"; backendId: ProviderCommandConnectableBackendId; reason: string };
 
 export interface ProviderCommandIntentPort {
   execute(
@@ -2593,7 +2601,7 @@ async function providerAccountCommand(
   } else {
     if (args.length !== 1) throw new Error(PROVIDER_COMMAND_USAGE);
     const backendId = args[0]?.toLowerCase();
-    if (backendId !== "openrouter" && backendId !== "anthropic") {
+    if (backendId !== "openrouter" && backendId !== "kimi-code" && backendId !== "anthropic") {
       throw new Error(PROVIDER_COMMAND_USAGE);
     }
     intent = { kind: action, backendId };
@@ -2638,10 +2646,17 @@ function renderProviderCommandResult(
       const details = provider.health
         ? ` · credential=${provider.health.credential} · connectivity=${provider.health.connectivity} · spend=${provider.health.spend} · runtime=${provider.health.runtime}`
         : "";
+      const availability = provider.availability === "coming-soon"
+        ? "Coming soon"
+        : provider.maturity === "preview"
+          ? `Preview · ${provider.configuration}`
+          : provider.configuration;
+      // Privacy contract: rendered status must never include account
+      // fingerprints or fingerprint suffixes, key fragments, account IDs,
+      // emails, raw quota, or fabricated numeric zeros.
       out.text(
-        `${provider.displayName} · ${provider.availability === "coming-soon" ? "Coming soon" : provider.configuration}`
+        `${provider.displayName} · ${availability}`
         + ` · ${provider.headline ?? "nicht geprüft"} · ${provider.billingRealm}`
-        + `${provider.accountFingerprintSuffix ? ` · ${provider.accountFingerprintSuffix}` : ""}`
         + `${provider.isDefault ? " · Standard" : ""}${details}`,
       );
     }
@@ -2653,11 +2668,14 @@ function renderProviderCommandResult(
       ? result.models.map((model) =>
           `${model.displayName} · ${model.requestedModelId} · ${model.canonicalModelId}`
         ).join("\n")
-      : "Keine nutzbaren OpenRouter-Modelle verfügbar.");
+      : result.backendId === "kimi-code"
+        ? "Keine nutzbaren Kimi-Code-Modelle verfügbar."
+        : "Keine nutzbaren OpenRouter-Modelle verfügbar.");
     return;
   }
   if (result.kind === "reconnected") {
-    out.text(`OpenRouter · ${result.headline} · Generation ${result.generation}`);
+    const displayName = result.backendId === "kimi-code" ? "Kimi Code" : "OpenRouter";
+    out.text(`${displayName} · ${result.headline} · Generation ${result.generation}`);
     return;
   }
   if (result.kind === "changed") {

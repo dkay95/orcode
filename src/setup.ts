@@ -23,8 +23,17 @@ import {
   type ProviderSetupStateV2,
   type ProviderStateStore,
 } from "./provider-state.js";
+import { KIMI_CODE_MODELS } from "./kimi-code.js";
 
 export { ProviderSetupRequiredError };
+
+const KIMI_CODE_CATALOG_MODEL_IDS: ReadonlySet<string> = new Set(
+  KIMI_CODE_MODELS.map((model) => model.id),
+);
+
+function isKimiCatalogModelId(value: unknown): value is string {
+  return typeof value === "string" && KIMI_CODE_CATALOG_MODEL_IDS.has(value);
+}
 
 const DEFAULT_PROVIDER_TIMEOUT_MS = 5_000;
 const MAX_PROVIDER_TIMEOUT_MS = 15_000;
@@ -1747,7 +1756,7 @@ function normalizeModelList(value: unknown): readonly BackendModelDescriptor[] |
       return null;
     }
     if (
-      !includes(["openrouter", "codex", "anthropic"] as const, backendId)
+      !includes(["openrouter", "kimi-code", "codex", "anthropic"] as const, backendId)
       || typeof requestedModelId !== "string"
       || requestedModelId.length === 0
       || typeof canonicalModelId !== "string"
@@ -1756,6 +1765,10 @@ function normalizeModelList(value: unknown): readonly BackendModelDescriptor[] |
       || typeof textOutput !== "boolean"
       || typeof tools !== "boolean"
       || typeof reasoning !== "boolean"
+    ) continue;
+    if (
+      backendId === "kimi-code"
+      && (!isKimiCatalogModelId(requestedModelId) || !isKimiCatalogModelId(canonicalModelId))
     ) continue;
     normalized.push({
       backendId,
@@ -1795,11 +1808,12 @@ function safeRouteIdentity(value: unknown): RouteIdentityV1 | null {
   }
   if (
     version !== 1
-    || !includes(["openrouter", "codex", "anthropic"] as const, backendId)
+    || !includes(["openrouter", "kimi-code", "codex", "anthropic"] as const, backendId)
     || typeof accountFingerprint !== "string"
     || accountFingerprint.length === 0
     || !includes([
       "openrouter-payg",
+      "kimi-code-membership-provider-managed-overage",
       "chatgpt-subscription-provider-managed-overage",
       "chatgpt-account-provider-managed-limits",
       "none",
@@ -1811,6 +1825,16 @@ function safeRouteIdentity(value: unknown): RouteIdentityV1 | null {
       ? typeof canonicalModelId !== "string" || canonicalModelId.length === 0
       : canonicalModelId !== null)
   ) return null;
+  if (backendId === "kimi-code") {
+    if (
+      billingRealm !== "kimi-code-membership-provider-managed-overage"
+      || resolutionState !== "resolved"
+      || !isKimiCatalogModelId(requestedModelId)
+      || !isKimiCatalogModelId(canonicalModelId)
+    ) return null;
+  } else if (billingRealm === "kimi-code-membership-provider-managed-overage") {
+    return null;
+  }
   const safeCanonicalModelId = resolutionState === "resolved"
     ? canonicalModelId as string
     : null;

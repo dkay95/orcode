@@ -324,6 +324,7 @@ async function setupFixture(options: {
   activationCoordinator?: ActivationDouble;
   providerTimeoutMs?: number;
   startupTimeoutMs?: number;
+  registry?: BackendRegistry;
   onEvent?: (event: Record<string, unknown>) => void;
 } = {}) {
   const api = await import("../src/setup.js");
@@ -333,7 +334,7 @@ async function setupFixture(options: {
   const clock = options.clock ?? new FakeClock();
   const activationCoordinator = options.activationCoordinator ?? forbiddenActivation();
   const events: Array<Record<string, unknown>> = [];
-  const registry = new BackendRegistry([
+  const registry = options.registry ?? new BackendRegistry([
     { descriptor: OPENROUTER_DESCRIPTOR, adapter },
     { descriptor: ANTHROPIC_DESCRIPTOR },
   ]);
@@ -1981,4 +1982,337 @@ test("a reentrant newer generation stops the remaining old authoritative events"
     [],
   );
   assert.equal(fixture.clock.activeTimers(), 0);
+});
+
+// ---------------------------------------------------------------------------
+// Task 6A — safe Kimi route and model decoding
+// ---------------------------------------------------------------------------
+
+const KIMI_DESCRIPTOR: BackendDescriptor = {
+  id: "kimi-code",
+  displayName: "Kimi Code",
+  maturity: "preview",
+  connectable: true,
+  kind: "raw-model",
+  credentialOwner: "orcode-keychain",
+  billingRealmKind: "provider-managed",
+  capabilities: { models: true, tools: true, reasoning: true },
+};
+
+class FakeKimiAdapter implements BackendAdapter {
+  readonly backendId = "kimi-code" as const;
+  readonly calls: string[] = [];
+  inspectionScripts: InspectionScript[] = [];
+  models: readonly BackendModelDescriptor[] = [];
+
+  inspect(request: InspectionRequest): Promise<ProviderInspection> {
+    this.calls.push("kimi-code.inspect");
+    const script = this.inspectionScripts.shift();
+    if (!script) return Promise.reject(new Error("missing deterministic kimi inspection script"));
+    return Promise.resolve().then(() => script(request));
+  }
+
+  async connect(): Promise<ProviderCandidate> {
+    throw new Error("connect must not be called by startup inspection");
+  }
+
+  async listModels(): Promise<readonly BackendModelDescriptor[]> {
+    this.calls.push("kimi-code.listModels");
+    return structuredClone(this.models);
+  }
+
+  async activate(): Promise<CandidateProviderState> {
+    throw new Error("activate must not be called by startup inspection");
+  }
+
+  reconnect(request: InspectionRequest): Promise<ProviderInspection> {
+    return this.inspect(request);
+  }
+
+  async logout(): Promise<void> {
+    this.calls.push("kimi-code.logout");
+  }
+
+  async discardCandidate(): Promise<void> {
+    this.calls.push("kimi-code.discardCandidate");
+  }
+}
+
+function kimiRegistry(adapter: FakeKimiAdapter): BackendRegistry {
+  return new BackendRegistry([
+    { descriptor: KIMI_DESCRIPTOR, adapter },
+    { descriptor: ANTHROPIC_DESCRIPTOR },
+  ]);
+}
+
+function kimiConnection(
+  overrides: Partial<ProviderConnectionStateV1> = {},
+): ProviderConnectionStateV1 {
+  return {
+    id: "kimi-connection",
+    backendId: "kimi-code",
+    enabled: true,
+    maturity: "preview",
+    credentialSlot: "v1:kimi-code:018f8d77-2d52-7cc0-8f6a-9fb1f3fc0711",
+    accountFingerprint: "acct_kimi_primary",
+    accountFingerprintState: "verified",
+    billingRealm: "kimi-code-membership-provider-managed-overage",
+    lastHealth: null,
+    ...overrides,
+  };
+}
+
+function kimiRoute(overrides: Partial<RouteIdentityV1> = {}): RouteIdentityV1 {
+  return {
+    version: 1,
+    backendId: "kimi-code",
+    accountFingerprint: "acct_kimi_primary",
+    billingRealm: "kimi-code-membership-provider-managed-overage",
+    requestedModelId: "k3",
+    canonicalModelId: "k3",
+    resolutionState: "resolved",
+    ...overrides,
+  };
+}
+
+function kimiState(options: {
+  defaultRoute?: RouteIdentityV1 | null;
+} = {}): ProviderSetupStateV2 {
+  return {
+    schemaVersion: 2,
+    revision: 0,
+    lifecycle: "configured",
+    connections: [kimiConnection()],
+    defaultRoute: options.defaultRoute === undefined ? kimiRoute() : options.defaultRoute,
+    cross: { enabled: false, preferredLead: null, preferredChallenger: null },
+  };
+}
+
+function kimiInspected(
+  owner: ProviderConnectionStateV1,
+  request: InspectionRequest,
+): ProviderInspection {
+  const observedHealth = health(request.generation);
+  const headline = deriveProviderHeadline(observedHealth);
+  return {
+    backendId: "kimi-code",
+    connectionId: owner.id,
+    health: observedHealth,
+    headline,
+    accountFingerprint: owner.accountFingerprint,
+    billingRealm: "kimi-code-membership-provider-managed-overage",
+    routeEligible: headline === "ready",
+    retryable: true,
+    explanationCode: `fixture-${headline}`,
+  };
+}
+
+function kimiModel(
+  requestedModelId: string,
+  canonicalModelId = requestedModelId,
+): BackendModelDescriptor {
+  return {
+    backendId: "kimi-code",
+    requestedModelId,
+    canonicalModelId,
+    displayName: requestedModelId,
+    capabilities: { textInput: true, textOutput: true, tools: true, reasoning: true },
+  };
+}
+
+function kimiActivation(
+  route: RouteIdentityV1,
+  state: ProviderSetupStateV2 | null,
+): ActivationDouble {
+  const calls: ProviderActivationRequest[] = [];
+  return {
+    calls,
+    async activate(request) {
+      calls.push(request);
+      return { persisted: true, route, state, warnings: [] };
+    },
+  };
+}
+
+test("kimi candidate activation preserves the exact kimi route and billing realm", async () => {
+  const safeRoute = kimiRoute();
+  const secret = "secret-extra-kimi-route-field";
+  const coordinatorRoute = { ...safeRoute, secret } as RouteIdentityV1;
+  const activatedState = kimiState({ defaultRoute: safeRoute });
+  activatedState.revision = 1;
+  const fixture = await setupFixture({
+    state: kimiState(),
+    registry: kimiRegistry(new FakeKimiAdapter()),
+    activationCoordinator: kimiActivation(coordinatorRoute, activatedState),
+  });
+
+  await fixture.orchestrator.activateCandidate({
+    backendId: "kimi-code",
+    expectedRevision: 0,
+    candidate: "candidate-kimi-route-event",
+    expectedRequestedModelId: "k3",
+    selectedCanonicalModelId: "k3",
+    signal: new AbortController().signal,
+    deadlineAt: Number.MAX_SAFE_INTEGER,
+    persistence: "persisted",
+  });
+  const activationEvent = fixture.events.find((event) => event.type === "candidate-activation");
+
+  assert.ok(activationEvent, "kimi activation must emit the safe-route event");
+  assert.deepEqual(activationEvent.route, safeRoute);
+  assert.equal(activationEvent.backendId, "kimi-code");
+  assert.equal(activationEvent.connectionId, "kimi-connection");
+  const serialized = JSON.stringify(activationEvent);
+  assert.equal(serialized.includes(secret), false);
+  assert.equal(serialized.includes("openrouter"), false);
+});
+
+test("every catalog-gated kimi model id survives the safe-route projection", async () => {
+  for (const modelId of ["k3", "k3-256k", "kimi-for-coding", "kimi-for-coding-highspeed"]) {
+    const safeRoute = kimiRoute({ requestedModelId: modelId, canonicalModelId: modelId });
+    const fixture = await setupFixture({
+      state: kimiState({ defaultRoute: null }),
+      registry: kimiRegistry(new FakeKimiAdapter()),
+      activationCoordinator: kimiActivation(safeRoute, null),
+    });
+
+    await fixture.orchestrator.activateCandidate({
+      backendId: "kimi-code",
+      expectedRevision: 0,
+      candidate: `candidate-${modelId}`,
+      expectedRequestedModelId: modelId,
+      selectedCanonicalModelId: modelId,
+      signal: new AbortController().signal,
+      deadlineAt: Number.MAX_SAFE_INTEGER,
+      persistence: "persisted",
+    });
+    const activationEvent = fixture.events.find((event) => event.type === "candidate-activation");
+
+    assert.ok(activationEvent, `kimi model ${modelId} must project a safe route`);
+    assert.deepEqual(activationEvent.route, safeRoute);
+  }
+});
+
+test("unsafe, mismatched, or openrouter-fallback kimi routes never emit a safe-route event", async () => {
+  const cases: Array<{ name: string; route: RouteIdentityV1 }> = [
+    {
+      name: "kimi backend on the openrouter billing realm",
+      route: kimiRoute({ billingRealm: "openrouter-payg" }),
+    },
+    {
+      name: "openrouter backend on the kimi billing realm",
+      route: kimiRoute({ backendId: "openrouter" }),
+    },
+    {
+      name: "unknown kimi model",
+      route: kimiRoute({ requestedModelId: "k9", canonicalModelId: "k9" }),
+    },
+    {
+      name: "non-catalog canonical model",
+      route: kimiRoute({ canonicalModelId: "vendor/alien" }),
+    },
+    {
+      name: "ambiguous legacy-unverified kimi route",
+      route: kimiRoute({ canonicalModelId: null, resolutionState: "legacy-unverified" }),
+    },
+  ];
+  for (const entry of cases) {
+    const fixture = await setupFixture({
+      state: kimiState(),
+      registry: kimiRegistry(new FakeKimiAdapter()),
+      activationCoordinator: kimiActivation(entry.route, null),
+    });
+
+    await fixture.orchestrator.activateCandidate({
+      backendId: "kimi-code",
+      expectedRevision: 0,
+      candidate: "candidate-unsafe-kimi-route",
+      expectedRequestedModelId: "k3",
+      selectedCanonicalModelId: "k3",
+      signal: new AbortController().signal,
+      deadlineAt: Number.MAX_SAFE_INTEGER,
+      persistence: "persisted",
+    });
+
+    assert.equal(
+      fixture.events.some((event) => event.type === "candidate-activation"),
+      false,
+      `${entry.name} must not emit a candidate-activation event`,
+    );
+  }
+});
+
+test("kimi model normalization keeps only catalog-gated kimi models and preserves the kimi route", async () => {
+  const legacyRoute = kimiRoute({ canonicalModelId: null, resolutionState: "legacy-unverified" });
+  const adapter = new FakeKimiAdapter();
+  const owner = kimiConnection();
+  adapter.inspectionScripts = [(request) => kimiInspected(owner, request)];
+  adapter.models = [
+    kimiModel("k9"),
+    kimiModel("k3", "vendor/alien"),
+    kimiModel("k3"),
+  ];
+  const fixture = await setupFixture({
+    state: kimiState({ defaultRoute: legacyRoute }),
+    registry: kimiRegistry(adapter),
+  });
+  await fixture.orchestrator.inspectStartup();
+
+  const result = await fixture.orchestrator.resolveLegacyDefaultRoute();
+  const resolved = fixture.stateStore.read().defaultRoute;
+
+  assert.equal(result.mode, "ready");
+  assert.deepEqual(resolved, kimiRoute());
+  assert.equal(resolved?.backendId, "kimi-code");
+  assert.equal(resolved?.billingRealm, "kimi-code-membership-provider-managed-overage");
+  assert.equal(fixture.clock.activeTimers(), 0);
+});
+
+test("an unknown kimi model never resolves and never falls back to openrouter", async () => {
+  const legacyRoute = kimiRoute({
+    requestedModelId: "k9",
+    canonicalModelId: null,
+    resolutionState: "legacy-unverified",
+  });
+  const adapter = new FakeKimiAdapter();
+  const owner = kimiConnection();
+  adapter.inspectionScripts = [(request) => kimiInspected(owner, request)];
+  adapter.models = [kimiModel("k9"), kimiModel("k3")];
+  const fixture = await setupFixture({
+    state: kimiState({ defaultRoute: legacyRoute }),
+    registry: kimiRegistry(adapter),
+  });
+  await fixture.orchestrator.inspectStartup();
+
+  await fixture.orchestrator.resolveLegacyDefaultRoute();
+  const stored = fixture.stateStore.read().defaultRoute;
+
+  assert.deepEqual(stored, legacyRoute);
+  assert.equal(stored?.resolutionState, "legacy-unverified");
+  assert.equal(stored?.backendId, "kimi-code");
+});
+
+test("openrouter model normalization and rejection behavior stays byte-compatible", async () => {
+  const state = migrateLegacyOpenRouterState(
+    { mainModel: "vendor/legacy-requested" },
+    { connectionId: "legacy-byte-compat" },
+  );
+  const adapter = new FakeAdapter();
+  adapter.inspectionScripts = [(request) => inspected(state.connections[0]!, request, {
+    accountFingerprint: "acct_verified_byte_compat",
+  })];
+  adapter.models = [
+    kimiModel("k3"),
+    model("vendor/legacy-requested", "vendor/canonical-safe"),
+  ];
+  const fixture = await setupFixture({ state, adapter });
+  await fixture.orchestrator.inspectStartup();
+
+  const result = await fixture.orchestrator.resolveLegacyDefaultRoute();
+  const resolved = fixture.stateStore.read().defaultRoute;
+
+  assert.equal(result.mode, "ready");
+  assert.equal(resolved?.backendId, "openrouter");
+  assert.equal(resolved?.canonicalModelId, "vendor/canonical-safe");
+  assert.equal(resolved?.billingRealm, "openrouter-payg");
 });
