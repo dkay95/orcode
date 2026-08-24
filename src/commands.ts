@@ -144,6 +144,76 @@ export interface ProviderRouteIntentPort {
   ): Promise<void>;
 }
 
+export type ProviderCommandBackendId = "openrouter" | "anthropic";
+
+export type ProviderCommandIntent =
+  | { kind: "setup" }
+  | { kind: "status" }
+  | {
+      kind: "connect" | "enable" | "disable" | "disconnect" | "reconnect" | "models" | "logout";
+      backendId: ProviderCommandBackendId;
+      confirmed?: true;
+    };
+
+export interface ProviderCommandStatusEntry {
+  backendId: ProviderCommandBackendId;
+  displayName: string;
+  availability: "connectable" | "coming-soon";
+  configuration: "enabled" | "disabled";
+  maturity: "stable" | "coming-soon";
+  billingRealm: "openrouter-payg" | "none";
+  accountFingerprintSuffix: string | null;
+  headline: string | null;
+  health: {
+    credential: string;
+    connectivity: string;
+    spend: string;
+    runtime: string;
+  } | null;
+  isDefault: boolean;
+}
+
+export type ProviderCommandResult =
+  | {
+      kind: "provider-coming-soon";
+      backendId: "anthropic";
+      displayName: string;
+      explanation: string;
+    }
+  | { kind: "setup"; backendId: "openrouter"; outcome: "ready" | "cancelled" }
+  | { kind: "status"; providers: readonly ProviderCommandStatusEntry[]; crossEnabled: false }
+  | {
+      kind: "models";
+      backendId: "openrouter";
+      models: readonly {
+        requestedModelId: string;
+        canonicalModelId: string;
+        displayName: string;
+      }[];
+    }
+  | { kind: "reconnected"; backendId: "openrouter"; headline: string; generation: number }
+  | {
+      kind: "confirmation-required";
+      operation: "disable" | "disconnect" | "logout";
+      backendId: "openrouter";
+      message: string;
+    }
+  | {
+      kind: "changed";
+      operation: "disable" | "disconnect" | "logout";
+      backendId: "openrouter";
+      setupRequired: boolean;
+      defaultCleared: boolean;
+    }
+  | { kind: "unchanged"; backendId: "openrouter"; reason: string };
+
+export interface ProviderCommandIntentPort {
+  execute(
+    intent: ProviderCommandIntent,
+    surface: SetupSurface | "plain" | "fullscreen",
+  ): Promise<ProviderCommandResult>;
+}
+
 export interface CommandLocalRuntime {
   guard: WorkspaceGuard;
   journal: ChangeJournal;
@@ -161,6 +231,8 @@ export interface CommandContext<Agent extends OrcodeAgent | null = OrcodeAgent> 
   providerCredentials?: ProviderCredentialIntentPort;
   /** Shared provider runtime seam for route-changing model/session commands. */
   providerRoutes?: ProviderRouteIntentPort;
+  /** One shared provider-command controller owned by the provider runtime. */
+  providerCommands?: ProviderCommandIntentPort;
   providerRouteSurface?: SetupSurface | "plain" | "fullscreen";
   workspace: string;
   credentials: CredentialStoreLike;
@@ -242,6 +314,12 @@ export interface CommandContext<Agent extends OrcodeAgent | null = OrcodeAgent> 
   /** One confirmation per explicit credential-forget attempt. */
   confirmCredentialForget?: (
     kind: "inference" | "management",
+    details: string,
+  ) => Promise<boolean>;
+  /** Provider account/config confirmation; deliberately independent of YOLO/tool approvals. */
+  confirmProviderMutation?: (
+    operation: "disable" | "disconnect" | "logout",
+    backendId: ProviderCommandBackendId,
     details: string,
   ) => Promise<boolean>;
   /** Required before a validated key may stay process-only after Keychain failure. */
@@ -2323,13 +2401,132 @@ async function providerCommand(args: string[], context: CommandContext): Promise
     });
   } else if (action === "clear" || action === "reset") {
     context.config.provider = validateProvider({});
+  } else if (isProviderAccountAction(action)) {
+    await providerAccountCommand(action, args.slice(1), context);
+    return;
   } else {
-    throw new Error(
-      "Verwendung: /provider [sort <off|price|throughput|latency>|allow|deny|only <a> <b>…|ignore <a> <b>…|fallback <on|off>|clear]",
-    );
+    throw new Error(PROVIDER_COMMAND_USAGE);
   }
   await saveContextConfig(context);
   printProviderStatus(context);
+}
+
+const PROVIDER_COMMAND_USAGE =
+  "Verwendung: /provider [setup|connect|enable|disable|disconnect|reconnect|status|models|logout|sort|allow|deny|only|ignore|fallback|clear]";
+
+const PROVIDER_ACCOUNT_ACTIONS = [
+  "setup",
+  "connect",
+  "enable",
+  "disable",
+  "disconnect",
+  "reconnect",
+  "status",
+  "models",
+  "logout",
+] as const;
+
+type ProviderAccountAction = (typeof PROVIDER_ACCOUNT_ACTIONS)[number];
+
+function isProviderAccountAction(value: string): value is ProviderAccountAction {
+  return includesValue(PROVIDER_ACCOUNT_ACTIONS, value);
+}
+
+async function providerAccountCommand(
+  action: ProviderAccountAction,
+  args: string[],
+  context: CommandContext,
+): Promise<void> {
+  const providerCommands = context.providerCommands;
+  if (!providerCommands) throw new Error("Provider-Steuerung ist nicht verfügbar.");
+  const surface = context.providerRouteSurface ?? "plain";
+  let intent: ProviderCommandIntent;
+  if (action === "setup" || action === "status") {
+    if (args.length !== 0) throw new Error(PROVIDER_COMMAND_USAGE);
+    intent = { kind: action };
+  } else {
+    if (args.length !== 1) throw new Error(PROVIDER_COMMAND_USAGE);
+    const backendId = args[0]?.toLowerCase();
+    if (backendId !== "openrouter" && backendId !== "anthropic") {
+      throw new Error(PROVIDER_COMMAND_USAGE);
+    }
+    intent = { kind: action, backendId };
+  }
+
+  let result = await providerCommands.execute(intent, surface);
+  if (result.kind === "confirmation-required") {
+    const accepted = context.confirmProviderMutation
+      ? await context.confirmProviderMutation(
+          result.operation,
+          result.backendId,
+          result.message,
+        )
+      : await confirm({ message: result.message, default: false });
+    if (!accepted) {
+      context.out.text("Provider-Änderung abgebrochen. Die Unterhaltung bleibt geöffnet.");
+      return;
+    }
+    result = await providerCommands.execute({
+      kind: result.operation,
+      backendId: result.backendId,
+      confirmed: true,
+    }, surface);
+  }
+  renderProviderCommandResult(result, context.out);
+}
+
+function renderProviderCommandResult(
+  result: ProviderCommandResult,
+  out: CommandOutput,
+): void {
+  if (result.kind === "provider-coming-soon") {
+    out.text(`${result.displayName} · ${result.explanation}`);
+    return;
+  }
+  if (result.kind === "setup") {
+    out.text(`Provider-Setup: ${result.outcome}`);
+    return;
+  }
+  if (result.kind === "status") {
+    for (const provider of result.providers) {
+      const details = provider.health
+        ? ` · credential=${provider.health.credential} · connectivity=${provider.health.connectivity} · spend=${provider.health.spend} · runtime=${provider.health.runtime}`
+        : "";
+      out.text(
+        `${provider.displayName} · ${provider.availability === "coming-soon" ? "Coming soon" : provider.configuration}`
+        + ` · ${provider.headline ?? "nicht geprüft"} · ${provider.billingRealm}`
+        + `${provider.accountFingerprintSuffix ? ` · ${provider.accountFingerprintSuffix}` : ""}`
+        + `${provider.isDefault ? " · Standard" : ""}${details}`,
+      );
+    }
+    out.text(`Cross: ${result.crossEnabled ? "an" : "aus"}`);
+    return;
+  }
+  if (result.kind === "models") {
+    out.text(result.models.length
+      ? result.models.map((model) =>
+          `${model.displayName} · ${model.requestedModelId} · ${model.canonicalModelId}`
+        ).join("\n")
+      : "Keine nutzbaren OpenRouter-Modelle verfügbar.");
+    return;
+  }
+  if (result.kind === "reconnected") {
+    out.text(`OpenRouter · ${result.headline} · Generation ${result.generation}`);
+    return;
+  }
+  if (result.kind === "changed") {
+    out.text(
+      `${result.backendId} ${result.operation}: geändert`
+      + `${result.defaultCleared ? " · Standardroute entfernt" : ""}`
+      + `${result.setupRequired ? " · Provider-Setup erforderlich" : ""}`,
+    );
+    return;
+  }
+  if (result.kind === "unchanged") {
+    out.text(`${result.backendId}: unverändert · ${result.reason}`);
+    return;
+  }
+  throw new Error("Provider confirmation did not settle.");
 }
 
 function printProviderStatus(context: CommandContext): void {

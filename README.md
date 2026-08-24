@@ -177,6 +177,12 @@ Slash commands, generated from the same catalog orcode's `/help` and
 in-app command palette use (`src/command-catalog.ts`), so this list cannot
 drift from what the app actually offers:
 
+OpenRouter is the Stable, runnable provider in Slice 1. Anthropic / Claude
+subscription is shown truthfully as Coming soon and cannot be connected yet;
+Claude models remain available through OpenRouter. Cross is optional and
+on-demand, and provider setup, repair, disable, logout, and reconnect all keep
+Cross off until an explicit later `/collab` or `/cross` action.
+
 <!-- orcode:command-docs:start -->
 | Command | Aliases | Usage | Description |
 | --- | --- | --- | --- |
@@ -201,7 +207,7 @@ drift from what the app actually offers:
 | `/budget` |  | `/budget [day <USD>\|total <USD>\|on-exceed warn\|block]` | Workspace-Budget anzeigen oder Tages-/Gesamtlimit setzen |
 | `/verify` |  | `/verify [on\|off\|now\|suggest\|clear\|rounds <n>\|<befehl>]` | Verifikationskommandos nach Änderungen konfigurieren (A4) |
 | `/web` |  | `/web [on\|off\|auto]` | Websuche-Plugin für den Hauptlauf steuern (A2) |
-| `/provider` |  | `/provider [sort <modus>\|allow\|deny\|only …\|ignore …\|clear]` | OpenRouter-Anbieterpolitik setzen (A3) |
+| `/provider` |  | `/provider [setup\|connect\|enable\|disable\|disconnect\|reconnect\|status\|models\|logout\|sort\|allow\|deny\|only\|ignore\|fallback\|clear]` | OpenRouter Stable verwalten; Anthropic / Claude-Abo Coming soon |
 | `/fallback` | `/fallbacks` | `/fallback [+<modell>\|-<modell>\|clear]` | Fallback-Modellkette hinter dem Main-Modell pflegen (A3) |
 | `/history` |  | `/history [Anzahl]` | Letzte Gesprächsrunden anzeigen |
 | `/checkpoint` | `/checkpoints` | `/checkpoint [list\|new [Name]\|restore <ID\|Name>]` | Stand im Chat markieren oder auf eine Marke zurücksetzen |

@@ -1151,6 +1151,237 @@ test("dashboard pre-dispatch uses exact catalog aliases and preserves unknown to
   assert.equal(resolveCliCommandName("/UNKNOWN"), "unknown");
 });
 
+test("provider account commands stay model-independent and use the catalog's sole provider handler", () => {
+  for (const action of ["setup", "connect", "enable", "disable", "disconnect", "reconnect", "status", "models", "logout"]) {
+    assert.equal(resolveCliCommandName(`/provider ${action} openrouter`), "provider");
+    assert.equal(commandRequiresRunnableRoute("provider", [action, "openrouter"], "dashboard"), false);
+  }
+  assert.equal(resolveCliCommandName("/pro openrouter"), "pro");
+});
+
+test("the real provider runtime command port fences active runs and keeps Coming-soon effect-free", async () => {
+  const Runtime = (cliModule as unknown as {
+    DefaultProviderRuntime?: new (...args: unknown[]) => {
+      execute(intent: Record<string, unknown>, surface: "plain"): Promise<Record<string, unknown>>;
+      runWithReadyRoute<T>(run: (route: Record<string, unknown>) => Promise<T>): Promise<T>;
+      ensureRunnableRoute(): Record<string, unknown>;
+      adoptCredentialActivation(route: Record<string, unknown>, persisted: boolean, secret: string): void;
+    };
+  }).DefaultProviderRuntime;
+  assert.equal(typeof Runtime, "function", "the shared runtime command boundary must be directly testable");
+
+  let forbiddenEffects = 0;
+  const comingSoonRuntime = new Runtime!(
+    {},
+    {},
+    {
+      descriptor(id: string) {
+        assert.equal(id, "anthropic");
+        return { id, displayName: "Anthropic / Claude-Abo", maturity: "coming-soon" };
+      },
+    },
+    new Proxy({}, { get() { forbiddenEffects += 1; throw new Error("state read forbidden"); } }),
+    new Proxy({}, { get() { forbiddenEffects += 1; throw new Error("orchestrator forbidden"); } }),
+    new Proxy({}, { get() { forbiddenEffects += 1; throw new Error("coordinator forbidden"); } }),
+    new Proxy({}, { get() { forbiddenEffects += 1; throw new Error("run guard forbidden"); } }),
+    new Proxy({}, { get() { forbiddenEffects += 1; throw new Error("credential port forbidden"); } }),
+    null,
+    null,
+    "openrouter/auto",
+    structuredClone(DEFAULT_CONFIG),
+  );
+  const comingSoon = await comingSoonRuntime.execute(
+    { kind: "connect", backendId: "anthropic" },
+    "plain",
+  );
+  assert.equal(comingSoon.kind, "provider-coming-soon");
+  assert.equal(forbiddenEffects, 0);
+
+  const route = {
+    version: 1,
+    backendId: "openrouter",
+    accountFingerprint: "acct_local_fixture_123456",
+    billingRealm: "openrouter-payg",
+    requestedModelId: "vendor/model",
+    canonicalModelId: "vendor/model",
+    resolutionState: "resolved",
+  } as const;
+  const slot = "v1:inference:11111111-1111-4111-8111-111111111111";
+  const stateStore = new ProviderStateStore({
+    schemaVersion: 1,
+    revision: 0,
+    lifecycle: "configured",
+    connections: [{
+      id: "connection-1",
+      backendId: "openrouter",
+      enabled: true,
+      maturity: "stable",
+      credentialSlot: slot,
+      accountFingerprint: route.accountFingerprint,
+      accountFingerprintState: "verified",
+      billingRealm: "openrouter-payg",
+      lastHealth: {
+        credential: "valid",
+        connectivity: "connected",
+        spend: "available",
+        runtime: "not-applicable",
+        observedAt: 1,
+        generation: 1,
+      },
+    }],
+    defaultRoute: route,
+    cross: { enabled: false, preferredLead: null, preferredChallenger: null },
+  });
+  let activeRuns = 0;
+  const runtimeGuard = {
+    beginRun() {
+      activeRuns += 1;
+      return () => { activeRuns -= 1; };
+    },
+  };
+  const activationCoordinator = {
+    async runExclusive(_request: unknown, operation: (lease: { assertHeld(): Promise<void> }) => Promise<unknown>) {
+      if (activeRuns > 0) throw Object.assign(new Error("busy"), { code: "provider-runtime-not-idle" });
+      return operation({
+        async assertHeld() {
+          if (activeRuns > 0) throw new Error("lost provider fence");
+        },
+      });
+    },
+  };
+  let releaseRun!: () => void;
+  const config = structuredClone(DEFAULT_CONFIG);
+  const runtime = new Runtime!(
+    {},
+    {},
+    {
+      descriptor() { return { id: "openrouter", displayName: "OpenRouter", maturity: "stable" }; },
+      entries() {
+        return [{
+          id: "openrouter",
+          displayName: "OpenRouter",
+          maturity: "stable",
+          connectable: true,
+        }];
+      },
+    },
+    stateStore,
+    { ensureRunnableRoute: () => route },
+    activationCoordinator,
+    runtimeGuard,
+    { async apply() { throw new Error("disable must not delete credentials"); } },
+    "secret-in-memory",
+    null,
+    route.requestedModelId,
+    config,
+  );
+  const active = runtime.runWithReadyRoute(async () => new Promise<void>((resolve) => {
+    releaseRun = resolve;
+  }));
+  await assert.rejects(
+    runtime.execute({ kind: "disable", backendId: "openrouter", confirmed: true }, "plain"),
+    (error: unknown) => Boolean(error && typeof error === "object" && "code" in error
+      && error.code === "provider-runtime-not-idle"),
+  );
+  assert.equal(stateStore.read().connections[0]?.enabled, true);
+  assert.equal(stateStore.read().defaultRoute?.canonicalModelId, route.canonicalModelId);
+
+  releaseRun();
+  await active;
+  const disabled = await runtime.execute(
+    { kind: "disable", backendId: "openrouter", confirmed: true },
+    "plain",
+  );
+  assert.equal(disabled.kind, "changed");
+  assert.equal(stateStore.read().connections[0]?.enabled, false);
+  assert.equal(stateStore.read().connections[0]?.credentialSlot, slot);
+  assert.equal(stateStore.read().defaultRoute, null);
+  assert.equal(stateStore.read().cross.enabled, false);
+
+  const processState = new ProviderStateStore(structuredClone(DEFAULT_CONFIG.providerSetup));
+  const processRuntime = new Runtime!(
+    {},
+    {},
+    {
+      descriptor() { return { id: "openrouter", displayName: "OpenRouter", maturity: "stable" }; },
+      entries() {
+        return [{
+          id: "openrouter",
+          displayName: "OpenRouter",
+          maturity: "stable",
+          connectable: true,
+        }];
+      },
+    },
+    processState,
+    { ensureRunnableRoute() { throw Object.assign(new Error("setup"), { code: "provider-setup-required" }); } },
+    activationCoordinator,
+    runtimeGuard,
+    { async apply() { throw new Error("process-only disable must not delete credentials"); } },
+    null,
+    "process-secret",
+    route.requestedModelId,
+    structuredClone(DEFAULT_CONFIG),
+  );
+  processRuntime.adoptCredentialActivation(route, false, "process-secret");
+  const processStatus = await processRuntime.execute({ kind: "status" }, "plain");
+  assert.equal(processStatus.kind, "status");
+  const processProvider = (processStatus.providers as Array<Record<string, unknown>>)[0];
+  assert.equal(processProvider?.configuration, "enabled");
+  assert.equal(processProvider?.headline, "ready");
+  assert.equal(processProvider?.isDefault, true);
+  assert.equal(processProvider?.accountFingerprintSuffix, "…123456");
+  assert.notEqual(processProvider?.accountFingerprintSuffix, route.accountFingerprint);
+  const processDisabled = await processRuntime.execute(
+    { kind: "disable", backendId: "openrouter", confirmed: true },
+    "plain",
+  );
+  assert.equal(processDisabled.kind, "changed");
+  assert.throws(
+    () => processRuntime.ensureRunnableRoute(),
+    (error: unknown) => Boolean(error && typeof error === "object" && "code" in error
+      && error.code === "provider-setup-required"),
+  );
+
+  let legacyCredentialEffects = 0;
+  const legacyState = new ProviderStateStore({
+    ...stateStore.read(),
+    revision: 0,
+    connections: [{
+      ...stateStore.read().connections[0]!,
+      enabled: true,
+      credentialSlot: "legacy:inference",
+    }],
+    defaultRoute: route,
+  });
+  const legacyRuntime = new Runtime!(
+    { forgetKey() {} },
+    {},
+    {
+      descriptor() { return { id: "openrouter", displayName: "OpenRouter", maturity: "stable" }; },
+      entries() { return []; },
+    },
+    legacyState,
+    { ensureRunnableRoute: () => route },
+    activationCoordinator,
+    runtimeGuard,
+    { async apply() { legacyCredentialEffects += 1; throw new Error("legacy slot deletion forbidden"); } },
+    "legacy-secret",
+    null,
+    route.requestedModelId,
+    structuredClone(DEFAULT_CONFIG),
+  );
+  const legacyLogout = await legacyRuntime.execute(
+    { kind: "logout", backendId: "openrouter", confirmed: true },
+    "plain",
+  );
+  assert.equal(legacyLogout.kind, "changed");
+  assert.equal(legacyCredentialEffects, 0);
+  assert.equal(legacyState.read().connections[0]?.credentialSlot, "legacy:inference");
+  assert.equal(legacyState.read().connections[0]?.enabled, false);
+  assert.equal(legacyState.read().defaultRoute, null);
+});
+
 const STARTUP_KEY_PREFIX = `${["sk", "or", "v1"].join("-")}-`;
 
 function providerRuntimeGuardFixture() {

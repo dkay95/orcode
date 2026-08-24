@@ -45,6 +45,10 @@ import {
   type CommandLocalRuntime,
   type CommandOutput,
   type ProviderCredentialIntentPort,
+  type ProviderCommandIntent,
+  type ProviderCommandIntentPort,
+  type ProviderCommandResult,
+  type ProviderCommandStatusEntry,
   type ProviderRouteIntentPort,
 } from "./commands.js";
 import {
@@ -143,6 +147,7 @@ import {
 import {
   BackendRegistry,
   ProviderSetupRequiredError,
+  deriveProviderHeadline,
   sameRoute,
   type RouteIdentityV1,
 } from "./backends.js";
@@ -418,7 +423,7 @@ export interface ProviderRuntimeInput {
   requestedModel?: string;
 }
 
-export interface ProviderRuntime extends ProviderRouteIntentPort {
+export interface ProviderRuntime extends ProviderRouteIntentPort, ProviderCommandIntentPort {
   readonly openRouter: OpenRouterService;
   readonly credentials: CredentialStore;
   readonly preparedRoles: SetupPreparedRoles | null;
@@ -508,7 +513,7 @@ class SessionProviderRuntimeGuard implements ProviderActivationRuntimeGuard {
   }
 }
 
-class DefaultProviderRuntime implements ProviderRuntime {
+export class DefaultProviderRuntime implements ProviderRuntime {
   #preparedRoles: SetupPreparedRoles | null = null;
   #sessionRoute: RouteIdentityV1 | null = null;
   #sessionRoutePersisted = false;
@@ -519,6 +524,7 @@ class DefaultProviderRuntime implements ProviderRuntime {
     private readonly registry: BackendRegistry,
     private readonly stateStore: ProviderStateStore,
     private readonly orchestrator: SetupOrchestrator,
+    private readonly activationCoordinator: ProviderActivationCoordinator,
     private readonly runtimeGuard: SessionProviderRuntimeGuard,
     readonly providerCredentials: ProviderCredentialIntentPort,
     private savedSecret: string | null,
@@ -735,6 +741,312 @@ class DefaultProviderRuntime implements ProviderRuntime {
       runSetup: (requestedSurface) => this.runSetup(requestedSurface),
       surface,
     });
+  }
+
+  async execute(
+    intent: ProviderCommandIntent,
+    surface: SetupSurface | "plain" | "fullscreen",
+  ): Promise<ProviderCommandResult> {
+    if (intent.kind !== "setup" && intent.kind !== "status") {
+      const descriptor = this.registry.descriptor(intent.backendId);
+      if (descriptor.maturity === "coming-soon") {
+        return {
+          kind: "provider-coming-soon",
+          backendId: "anthropic",
+          displayName: descriptor.displayName,
+          explanation: "Coming soon · Claude-Modelle sind heute über OpenRouter verfügbar.",
+        };
+      }
+    }
+
+    if (intent.kind === "setup" || intent.kind === "connect" || intent.kind === "enable") {
+      const result = await this.runSetup(surface);
+      return {
+        kind: "setup",
+        backendId: "openrouter",
+        outcome: result.kind === "ready" ? "ready" : "cancelled",
+      };
+    }
+
+    if (intent.kind === "status") {
+      return this.#providerStatus();
+    }
+
+    if (intent.kind === "models") {
+      const models = await this.runModelCatalog(
+        async () => mainModelCandidates(await this.openRouter.listModels()),
+        surface,
+      );
+      return {
+        kind: "models",
+        backendId: "openrouter",
+        models: models.map((model) => ({
+          requestedModelId: model.id,
+          canonicalModelId: model.canonicalSlug ?? model.id,
+          displayName: model.name,
+        })),
+      };
+    }
+
+    if (intent.kind === "reconnect") {
+      const result = await this.activationCoordinator.runExclusive(
+        { signal: new AbortController().signal, inspectCommitted: false },
+        async (lease) => {
+          await lease.assertHeld();
+          const inspected = await this.orchestrator.reconnect("openrouter");
+          await lease.assertHeld();
+          return inspected;
+        },
+      );
+      const connection = this.stateStore.read().connections.find((candidate) =>
+        candidate.backendId === "openrouter" && candidate.enabled
+      );
+      return {
+        kind: "reconnected",
+        backendId: "openrouter",
+        headline: connection?.lastHealth
+          ? deriveProviderHeadline(connection.lastHealth)
+          : result.mode,
+        generation: result.generation,
+      };
+    }
+
+    if (intent.kind === "logout") {
+      if (!intent.confirmed) {
+        return {
+          kind: "confirmation-required",
+          operation: "logout",
+          backendId: "openrouter",
+          message: "OpenRouter-Zugang wirklich abmelden und nur seinen aktuellen versionierten Schlüssel entfernen?",
+        };
+      }
+      const connection = this.stateStore.read().connections.find((candidate) =>
+        candidate.backendId === "openrouter" && candidate.enabled
+      );
+      if (connection?.credentialSlot.startsWith("v1:inference:")) {
+        await this.providerCredentials.apply({ kind: "forget", credentialKind: "inference" });
+      } else {
+        await this.#logoutWithoutVersionedCredential(connection?.id ?? null);
+      }
+      return {
+        kind: "changed",
+        operation: "logout",
+        backendId: "openrouter",
+        setupRequired: true,
+        defaultCleared: true,
+      };
+    }
+
+    if (intent.kind !== "disable" && intent.kind !== "disconnect") {
+      throw new Error("Unsupported provider command intent.");
+    }
+    return this.#disableProvider({
+      kind: intent.kind,
+      backendId: "openrouter",
+      ...(intent.confirmed ? { confirmed: true as const } : {}),
+    });
+  }
+
+  #providerStatus(): ProviderCommandResult {
+    const state = this.stateStore.read();
+    const providers: ProviderCommandStatusEntry[] = this.registry.entries().map((descriptor) => {
+      if (descriptor.id === "anthropic") {
+        return {
+          backendId: "anthropic",
+          displayName: descriptor.displayName,
+          availability: "coming-soon",
+          configuration: "disabled",
+          maturity: "coming-soon",
+          billingRealm: "none",
+          accountFingerprintSuffix: null,
+          headline: null,
+          health: null,
+          isDefault: false,
+        };
+      }
+      const connection = state.connections.find((candidate) =>
+        candidate.backendId === "openrouter" && candidate.enabled
+      ) ?? state.connections.find((candidate) => candidate.backendId === "openrouter");
+      const processRoute = !connection && this.#sessionRoute?.backendId === "openrouter"
+        ? this.#sessionRoute
+        : null;
+      const health = connection?.lastHealth ?? null;
+      return {
+        backendId: "openrouter",
+        displayName: descriptor.displayName,
+        availability: "connectable",
+        configuration: connection?.enabled || processRoute ? "enabled" : "disabled",
+        maturity: "stable",
+        billingRealm: "openrouter-payg",
+        accountFingerprintSuffix: connection?.accountFingerprint || processRoute?.accountFingerprint
+          ? `…${(connection?.accountFingerprint ?? processRoute!.accountFingerprint).slice(-6)}`
+          : null,
+        headline: health ? deriveProviderHeadline(health) : processRoute ? "ready" : null,
+        health: health
+          ? {
+              credential: health.credential,
+              connectivity: health.connectivity,
+              spend: health.spend,
+              runtime: health.runtime,
+            }
+          : processRoute
+            ? {
+                credential: "valid",
+                connectivity: "connected",
+                spend: "unknown",
+                runtime: "not-applicable",
+              }
+            : null,
+        isDefault: Boolean(
+          processRoute
+          || (connection
+            && state.defaultRoute
+            && connection.backendId === state.defaultRoute.backendId
+            && connection.accountFingerprint === state.defaultRoute.accountFingerprint
+            && connection.billingRealm === state.defaultRoute.billingRealm)
+        ),
+      };
+    });
+    return { kind: "status", providers, crossEnabled: false };
+  }
+
+  async #disableProvider(
+    intent: {
+      kind: "disable" | "disconnect";
+      backendId: "openrouter";
+      confirmed?: true;
+    },
+  ): Promise<ProviderCommandResult> {
+    const before = this.stateStore.read();
+    const connection = before.connections.find((candidate) =>
+      candidate.backendId === "openrouter" && candidate.enabled
+    );
+    if (!connection) {
+      if (this.#sessionRoute?.backendId === "openrouter") {
+        if (!intent.confirmed) {
+          return {
+            kind: "confirmation-required",
+            operation: intent.kind,
+            backendId: "openrouter",
+            message: "Letzten nutzbaren OpenRouter-Zugang deaktivieren? Modellläufe stoppen, die Unterhaltung bleibt geöffnet.",
+          };
+        }
+        await this.activationCoordinator.runExclusive(
+          { signal: new AbortController().signal, inspectCommitted: false },
+          async (lease) => {
+            await lease.assertHeld();
+            this.#sessionRoute = null;
+            this.#sessionRoutePersisted = false;
+            this.#preparedRoles = null;
+            await lease.assertHeld();
+          },
+        );
+        return {
+          kind: "changed",
+          operation: intent.kind,
+          backendId: "openrouter",
+          setupRequired: true,
+          defaultCleared: false,
+        };
+      }
+      return { kind: "unchanged", backendId: "openrouter", reason: "bereits deaktiviert" };
+    }
+    const affectsDefault = Boolean(
+      before.defaultRoute
+      && before.defaultRoute.backendId === connection.backendId
+      && before.defaultRoute.accountFingerprint === connection.accountFingerprint
+      && before.defaultRoute.billingRealm === connection.billingRealm
+    );
+    const isFinalEnabled = before.connections.filter((candidate) => candidate.enabled).length === 1;
+    if ((affectsDefault || isFinalEnabled) && !intent.confirmed) {
+      return {
+        kind: "confirmation-required",
+        operation: intent.kind,
+        backendId: "openrouter",
+        message: "Letzten nutzbaren OpenRouter-Zugang deaktivieren? Modellläufe stoppen, die Unterhaltung bleibt geöffnet.",
+      };
+    }
+
+    const committed = await this.activationCoordinator.runExclusive(
+      { signal: new AbortController().signal, inspectCommitted: false },
+      async (lease) => {
+        await lease.assertHeld();
+        const current = this.stateStore.read();
+        const selected = current.connections.find((candidate) => candidate.id === connection.id);
+        if (!selected?.enabled) return current;
+        const next = await this.stateStore.commit(current.revision, (authoritative) => ({
+          ...authoritative,
+          lifecycle: "configured",
+          connections: authoritative.connections.map((candidate) =>
+            candidate.id === connection.id ? { ...candidate, enabled: false } : candidate
+          ),
+          defaultRoute: authoritative.defaultRoute
+            && authoritative.defaultRoute.backendId === selected.backendId
+            && authoritative.defaultRoute.accountFingerprint === selected.accountFingerprint
+            && authoritative.defaultRoute.billingRealm === selected.billingRealm
+            ? null
+            : authoritative.defaultRoute,
+          cross: { enabled: false, preferredLead: null, preferredChallenger: null },
+        }));
+        await lease.assertHeld();
+        this.config.providerSetup = requirePersistableProviderState(next);
+        await lease.assertHeld();
+        return next;
+      },
+    );
+    const defaultCleared = before.defaultRoute !== null && committed.defaultRoute === null;
+    if (defaultCleared) {
+      this.#sessionRoute = null;
+      this.#sessionRoutePersisted = false;
+      this.#preparedRoles = null;
+    }
+    return {
+      kind: "changed",
+      operation: intent.kind,
+      backendId: "openrouter",
+      setupRequired: committed.defaultRoute === null,
+      defaultCleared,
+    };
+  }
+
+  async #logoutWithoutVersionedCredential(connectionId: string | null): Promise<void> {
+    await this.activationCoordinator.runExclusive(
+      { signal: new AbortController().signal, inspectCommitted: false },
+      async (lease) => {
+        await lease.assertHeld();
+        const current = this.stateStore.read();
+        const selected = connectionId === null
+          ? undefined
+          : current.connections.find((candidate) => candidate.id === connectionId);
+        const next = selected?.enabled
+          ? await this.stateStore.commit(current.revision, (authoritative) => ({
+              ...authoritative,
+              lifecycle: "configured",
+              connections: authoritative.connections.map((candidate) =>
+                candidate.id === connectionId ? { ...candidate, enabled: false } : candidate
+              ),
+              defaultRoute: authoritative.defaultRoute
+                && authoritative.defaultRoute.backendId === selected.backendId
+                && authoritative.defaultRoute.accountFingerprint === selected.accountFingerprint
+                && authoritative.defaultRoute.billingRealm === selected.billingRealm
+                ? null
+                : authoritative.defaultRoute,
+              cross: { enabled: false, preferredLead: null, preferredChallenger: null },
+            }))
+          : current;
+        await lease.assertHeld();
+        this.config.providerSetup = requirePersistableProviderState(next);
+        await lease.assertHeld();
+        this.openRouter.forgetKey();
+        await lease.assertHeld();
+        return next;
+      },
+    );
+    this.#sessionRoute = null;
+    this.#sessionRoutePersisted = false;
+    this.#preparedRoles = null;
+    this.savedSecret = null;
+    this.environmentSecret = null;
   }
 }
 
@@ -1656,6 +1968,7 @@ export async function createDefaultProviderRuntime(
     registry,
     stateStore,
     orchestrator,
+    activationCoordinator,
     runtimeGuard,
     providerCredentials,
     savedSecret,
@@ -1921,6 +2234,7 @@ export async function runCli(
     agent,
     credentials: providerRuntime.credentials,
     providerCredentials: providerRuntime.providerCredentials,
+    providerCommands: providerRuntime,
     providerRoutes: providerRuntime,
     providerRouteSurface: "plain",
     localRuntime,
@@ -1960,6 +2274,7 @@ interface RuntimeContext {
   agent: OrcodeAgent | null;
   localRuntime: CommandLocalRuntime;
   providerCredentials: ProviderCredentialIntentPort;
+  providerCommands: ProviderCommandIntentPort;
   providerRoutes: ProviderRouteIntentPort;
   providerRouteSurface: SetupSurface | "plain" | "fullscreen";
   providerRuntime: ProviderRuntime;
@@ -1979,6 +2294,7 @@ interface RuntimeContext {
   /** Fullscreen destructive-chat confirmation; plain mode leaves this unset for Inquirer. */
   confirmChatDeletion?: (title: string, details: string) => Promise<boolean>;
   confirmCredentialForget?: CommandContext["confirmCredentialForget"];
+  confirmProviderMutation?: CommandContext["confirmProviderMutation"];
   confirmProcessOnlyCredential?: CommandContext["confirmProcessOnlyCredential"];
   readCredentialSecret?: CommandContext["readCredentialSecret"];
   /** Direct slash-command process events (currently `/diff`) for the active dashboard. */
@@ -2358,6 +2674,11 @@ async function runDashboard(
   context.confirmCredentialForget = async (kind, details) =>
     (await ui.confirmAction(
       kind === "inference" ? "API-Key wirklich entfernen?" : "Management-Key wirklich entfernen?",
+      details,
+    )).accepted;
+  context.confirmProviderMutation = async (operation, backendId, details) =>
+    (await ui.confirmAction(
+      `${backendId} ${operation} bestätigen?`,
       details,
     )).accepted;
   context.confirmProcessOnlyCredential = async (kind, reason) =>

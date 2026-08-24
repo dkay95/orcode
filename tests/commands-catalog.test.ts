@@ -4,6 +4,7 @@ import { readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
 import {
+  COMMAND_CATALOG,
   commandTokenIsExact,
   rankSlashCommands,
 } from "../src/command-catalog.js";
@@ -88,6 +89,19 @@ test("completion exposes every documented top-level command", () => {
   assert.ok(names.has("panel"));
   assert.ok(names.has("resume"));
   assert.ok(names.has("ssh"));
+});
+
+test("provider catalog, completion, help, and generated docs expose the one flat dispatcher", () => {
+  const provider = rankSlashCommands("/provider")[0];
+  const providerDefinition = COMMAND_CATALOG.find((entry) => entry.name === "provider");
+  assert.equal(provider?.name, "provider");
+  assert.equal(providerDefinition?.handlerId, "provider");
+  assert.match(provider?.usage ?? "", /setup/);
+  assert.match(provider?.usage ?? "", /connect/);
+  assert.match(provider?.usage ?? "", /disconnect/);
+  assert.match(provider?.usage ?? "", /logout/);
+  assert.match(provider?.description ?? "", /OpenRouter.*Stable/i);
+  assert.match(provider?.description ?? "", /Anthropic.*Coming soon/i);
 });
 
 test("slash catalog exposes voice input under /whisper and /voice", () => {

@@ -642,6 +642,33 @@ test("/provider sort, deny/allow, only, fallback policy, and clear round-trip th
   void lines;
 });
 
+test("provider commands and legacy key intents share runtime ports without direct command-layer provider effects", async () => {
+  const { context } = await harness();
+  const providerIntents: Array<Record<string, unknown>> = [];
+  const credentialIntents: Array<Record<string, unknown>> = [];
+  (context as CommandContext & {
+    providerCommands: { execute(intent: Record<string, unknown>): Promise<Record<string, unknown>> };
+    providerCredentials: { apply(intent: Record<string, unknown>): Promise<Record<string, unknown>> };
+  }).providerCommands = {
+    async execute(intent) {
+      providerIntents.push(intent);
+      return { kind: "reconnected", backendId: "openrouter", headline: "ready", generation: 4 };
+    },
+  };
+  context.providerCredentials = {
+    async apply(intent) {
+      credentialIntents.push(intent as unknown as Record<string, unknown>);
+      return { kind: "ready", credentialKind: "inference", persisted: true };
+    },
+  };
+
+  await handleSlashCommand("/provider reconnect openrouter", context);
+  await handleSlashCommand("/key save", context);
+
+  assert.deepEqual(providerIntents, [{ kind: "reconnect", backendId: "openrouter" }]);
+  assert.deepEqual(credentialIntents, [{ kind: "save", credentialKind: "inference" }]);
+});
+
 test("/fallback adds, removes, and clears the fallback chain", async () => {
   const { context } = await harness();
   const compatibleModels = ["test/compatible-one", "test/compatible-two"].map((id) => ({

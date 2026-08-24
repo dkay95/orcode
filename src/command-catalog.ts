@@ -164,8 +164,8 @@ export const COMMAND_CATALOG = [
   {
     name: "provider",
     handlerId: "provider",
-    usage: "/provider [sort <modus>|allow|deny|only …|ignore …|clear]",
-    description: "OpenRouter-Anbieterpolitik setzen (A3)",
+    usage: "/provider [setup|connect|enable|disable|disconnect|reconnect|status|models|logout|sort|allow|deny|only|ignore|fallback|clear]",
+    description: "OpenRouter Stable verwalten; Anthropic / Claude-Abo Coming soon",
     acceptsArguments: true,
   },
   {

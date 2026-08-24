@@ -394,6 +394,235 @@ test("slash help renders every shared catalog usage and catalog aliases dispatch
   assert.equal(await handleSlashCommand("/q", context), "exit");
 });
 
+test("bare and legacy provider routing policy remain byte exact", async () => {
+  const root = await mkdtemp(join(tmpdir(), "orcode-provider-compat-"));
+  const config = structuredClone(DEFAULT_CONFIG);
+  const output: string[] = [];
+  const context = {
+    config,
+    configPath: join(root, "config.json"),
+    out: {
+      text: (value: string) => output.push(value),
+      error: (value: string) => output.push(value),
+    },
+  } as unknown as CommandContext;
+
+  await handleSlashCommand("/provider", context);
+  assert.equal(
+    output.pop(),
+    "Sortierung: Standard (Preis/Verfügbarkeit) · Datenweitergabe: deny · Provider-Fallbacks: an",
+  );
+
+  const commands = [
+    "/provider sort price",
+    "/provider deny",
+    "/provider only anthropic openai",
+    "/provider ignore meta",
+    "/provider fallbacks off",
+    "/provider sort none",
+    "/provider reset",
+  ];
+  for (const command of commands) await handleSlashCommand(command, context);
+
+  assert.deepEqual(context.config.provider, { dataCollection: "deny" });
+  assert.equal(
+    output.at(-1),
+    "Sortierung: Standard (Preis/Verfügbarkeit) · Datenweitergabe: deny · Provider-Fallbacks: an",
+  );
+  const saved = JSON.parse(await readFile(context.configPath!, "utf8")) as {
+    provider: Record<string, unknown>;
+  };
+  assert.deepEqual(saved.provider, { dataCollection: "deny" });
+});
+
+test("provider setup, connect, status, models, and reconnect dispatch one typed intent port", async () => {
+  const output: string[] = [];
+  const intents: Array<Record<string, unknown>> = [];
+  const surface = { present() {} };
+  const context = {
+    config: structuredClone(DEFAULT_CONFIG),
+    providerRouteSurface: surface,
+    providerCommands: {
+      async execute(intent: Record<string, unknown>, receivedSurface: unknown) {
+        intents.push({ ...intent, sameSurface: receivedSurface === surface });
+        if (intent.kind === "status") {
+          return {
+            kind: "status",
+            providers: [{
+              backendId: "openrouter",
+              displayName: "OpenRouter",
+              availability: "connectable",
+              configuration: "enabled",
+              maturity: "stable",
+              billingRealm: "openrouter-payg",
+              accountFingerprintSuffix: "…c0ffee",
+              headline: "ready",
+              health: {
+                credential: "valid",
+                connectivity: "connected",
+                spend: "unknown",
+                runtime: "not-applicable",
+              },
+              isDefault: true,
+            }, {
+              backendId: "anthropic",
+              displayName: "Anthropic / Claude-Abo",
+              availability: "coming-soon",
+              configuration: "disabled",
+              maturity: "coming-soon",
+              billingRealm: "none",
+              accountFingerprintSuffix: null,
+              headline: null,
+              health: null,
+              isDefault: false,
+            }],
+            crossEnabled: false,
+          };
+        }
+        if (intent.kind === "models") {
+          return {
+            kind: "models",
+            backendId: "openrouter",
+            models: [{ requestedModelId: "vendor/model", canonicalModelId: "vendor/model", displayName: "Model" }],
+          };
+        }
+        if (intent.kind === "reconnect") {
+          return { kind: "reconnected", backendId: "openrouter", headline: "ready", generation: 9 };
+        }
+        return { kind: "setup", backendId: "openrouter", outcome: "ready" };
+      },
+    },
+    out: {
+      text: (value: string) => output.push(value),
+      error: (value: string) => output.push(value),
+    },
+  } as unknown as CommandContext;
+
+  await handleSlashCommand("/provider setup", context);
+  await handleSlashCommand("/provider connect openrouter", context);
+  await handleSlashCommand("/provider status", context);
+  await handleSlashCommand("/provider models openrouter", context);
+  await handleSlashCommand("/provider reconnect openrouter", context);
+
+  assert.deepEqual(intents, [
+    { kind: "setup", sameSurface: true },
+    { kind: "connect", backendId: "openrouter", sameSurface: true },
+    { kind: "status", sameSurface: true },
+    { kind: "models", backendId: "openrouter", sameSurface: true },
+    { kind: "reconnect", backendId: "openrouter", sameSurface: true },
+  ]);
+  const rendered = output.join("\n");
+  assert.match(rendered, /OpenRouter.*enabled.*ready.*openrouter-payg.*…c0ffee.*Standard/s);
+  assert.match(rendered, /credential=valid.*connectivity=connected.*spend=unknown.*runtime=not-applicable/s);
+  assert.match(rendered, /Anthropic.*Coming soon/s);
+  assert.match(rendered, /Cross: aus/);
+  assert.match(rendered, /vendor\/model/);
+  assert.doesNotMatch(rendered, /creator|credentialSlot|account-id|\/Users\//i);
+});
+
+test("every Anthropic provider command returns one typed coming-soon result with no legacy side effects", async () => {
+  const calls: Array<Record<string, unknown>> = [];
+  const output: string[] = [];
+  const forbidden = () => {
+    throw new Error("forbidden provider side effect");
+  };
+  const context = {
+    config: structuredClone(DEFAULT_CONFIG),
+    providerCommands: {
+      async execute(intent: Record<string, unknown>) {
+        calls.push(intent);
+        return {
+          kind: "provider-coming-soon",
+          backendId: "anthropic",
+          displayName: "Anthropic / Claude-Abo",
+          explanation: "Coming soon · Claude-Modelle sind heute über OpenRouter verfügbar.",
+        };
+      },
+    },
+    credentials: { get: forbidden, set: forbidden, delete: forbidden, has: forbidden },
+    openRouter: new Proxy({}, { get: forbidden }),
+    approvals: new Proxy({}, { get: forbidden }),
+    out: {
+      text: (value: string) => output.push(value),
+      error: (value: string) => output.push(value),
+    },
+  } as unknown as CommandContext;
+
+  for (const action of ["connect", "enable", "reconnect", "logout", "models", "disconnect", "disable"]) {
+    await handleSlashCommand(`/provider ${action} anthropic`, context);
+  }
+
+  assert.deepEqual(calls.map((intent) => intent.kind), [
+    "connect", "enable", "reconnect", "logout", "models", "disconnect", "disable",
+  ]);
+  assert.equal(output.length, 7);
+  assert.ok(output.every((line) => /Coming soon/.test(line)));
+});
+
+test("provider disable and logout confirmations are exact, never YOLO-bypassed, and cancellation stays in chat", async () => {
+  const intents: Array<Record<string, unknown>> = [];
+  const confirmations: Array<{ operation: string; backendId: string; message: string }> = [];
+  let accept = false;
+  const context = {
+    config: structuredClone(DEFAULT_CONFIG),
+    approvals: { mode: "allow-all" },
+    providerCommands: {
+      async execute(intent: Record<string, unknown>) {
+        intents.push(intent);
+        if (intent.confirmed !== true) {
+          return {
+            kind: "confirmation-required",
+            operation: intent.kind,
+            backendId: intent.backendId,
+            message: `Bestätige ${String(intent.kind)}.`,
+          };
+        }
+        return {
+          kind: "changed",
+          operation: intent.kind,
+          backendId: intent.backendId,
+          setupRequired: true,
+          defaultCleared: true,
+        };
+      },
+    },
+    confirmProviderMutation: async (operation: string, backendId: string, message: string) => {
+      confirmations.push({ operation, backendId, message });
+      return accept;
+    },
+    out: { text: () => undefined, error: () => undefined },
+  } as unknown as CommandContext;
+
+  assert.equal(await handleSlashCommand("/provider disable openrouter", context), "continue");
+  assert.equal(confirmations.length, 1);
+  assert.deepEqual(intents, [{ kind: "disable", backendId: "openrouter" }]);
+
+  accept = true;
+  assert.equal(await handleSlashCommand("/provider logout openrouter", context), "continue");
+  assert.equal(confirmations.length, 2);
+  assert.deepEqual(intents.slice(1), [
+    { kind: "logout", backendId: "openrouter" },
+    { kind: "logout", backendId: "openrouter", confirmed: true },
+  ]);
+});
+
+test("unknown and partial provider subcommands use the exact new usage without mutation", async () => {
+  const calls: unknown[] = [];
+  const context = {
+    config: structuredClone(DEFAULT_CONFIG),
+    providerCommands: { execute: async (intent: unknown) => { calls.push(intent); } },
+    out: { text: () => undefined, error: () => undefined },
+  } as unknown as CommandContext;
+
+  const expected = "Verwendung: /provider [setup|connect|enable|disable|disconnect|reconnect|status|models|logout|sort|allow|deny|only|ignore|fallback|clear]";
+  for (const command of ["/provider con openrouter", "/provider STATUSS", "/provider setup-now"]) {
+    await assert.rejects(handleSlashCommand(command, context), (error: unknown) =>
+      error instanceof Error && error.message === expected
+    );
+  }
+  assert.deepEqual(calls, []);
+});
+
 test("a valid environment key remains process-only during startup validation", async () => {
   const key = `${KEY_PREFIX}environment-process-only-123`;
   const service = lifecycleService(key, "environment");
