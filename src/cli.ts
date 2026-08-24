@@ -1004,8 +1004,7 @@ export class DefaultProviderRuntime implements ProviderRuntime {
         const activationCanPublish = activatedRoute !== null
           && (!activatedPersisted
             || (currentDefaultRoute !== null && sameExactRoute(currentDefaultRoute, activatedRoute)));
-        const reconcileCommittedActivation = activatedPersisted
-          && activationCanPublish
+        const reconcileCommittedActivation = activationCanPublish
           && activationSettledAfterInterruption
           && setupPublicationOwnerIsCurrent();
         if (attemptIsCurrent || reconcileCommittedActivation) {

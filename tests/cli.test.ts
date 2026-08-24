@@ -44,6 +44,7 @@ import { createPanelCall, OpenRouterHttpError, OpenRouterService } from "../src/
 import { askPanel } from "../src/panel.js";
 import * as panelModule from "../src/panel.js";
 import { ProviderActivationCoordinator } from "../src/provider-activation.js";
+import { ProviderCredentialAuthority } from "../src/provider-authority.js";
 import { openRouterAccountFingerprint } from "../src/openrouter-backend.js";
 import { CredentialStore } from "../src/credentials.js";
 import type { CredentialSlotRef, CredentialStoreLike } from "../src/credentials.js";
@@ -2803,6 +2804,217 @@ test("setup postpublication abort waits for exact activation terminal reconcilia
   assert.equal(config.mainModel, model.requestedModelId);
   assert.equal(active?.credentialSlot === undefined ? null : slots.get(active.credentialSlot), secret);
   assert.equal(presentations.length - presentationsAtAbort, 0);
+});
+
+test("process-only setup postpublication abort reconciles the exact runtime route without cancellation", async () => {
+  const root = await mkdtemp(join(tmpdir(), "orcode-setup-process-postpublication-"));
+  const configPath = join(root, "config.json");
+  const initial = structuredClone(DEFAULT_CONFIG.providerSetup) as ProviderSetupStateV1;
+  const config = structuredClone(DEFAULT_CONFIG);
+  config.providerSetup = structuredClone(initial);
+  await saveConfig(config, configPath);
+  const stateStore = new ProviderStateStore(initial);
+  const secret = `${STARTUP_KEY_PREFIX}${"y".repeat(48)}`;
+  const accountFingerprint = "acct_setup_process_postpublication_222222";
+  const model: BackendModelDescriptor = {
+    backendId: "openrouter",
+    requestedModelId: "vendor/setup-process-postpublication",
+    canonicalModelId: "vendor/setup-process-postpublication",
+    displayName: "Setup process postpublication",
+    capabilities: { textInput: true, textOutput: true, tools: true, reasoning: true },
+  };
+  const route = {
+    version: 1 as const,
+    backendId: "openrouter" as const,
+    accountFingerprint,
+    billingRealm: "openrouter-payg" as const,
+    requestedModelId: model.requestedModelId,
+    canonicalModelId: model.canonicalModelId,
+    resolutionState: "resolved" as const,
+  };
+  const slots = new Map<string, string>();
+  const credentials = {
+    reserveSlot(kind: "inference" | "management") {
+      return Object.freeze({
+        version: 1 as const,
+        kind,
+        id: `v1:${kind}:83838383-8383-4383-8383-838383838383`,
+      });
+    },
+    async writeSlot(slot: CredentialSlotRef, value: string) { slots.set(slot.id, value); },
+    async readSlot(slot: CredentialSlotRef) { return slots.get(slot.id) ?? null; },
+    async deleteSlot(slot: CredentialSlotRef) { return slots.delete(slot.id); },
+  };
+  let runtimeRoute: typeof route | null = null;
+  const adapter: BackendAdapter = {
+    backendId: "openrouter",
+    async inspect() { throw new Error("unused"); },
+    async reconnect() { throw new Error("unused"); },
+    async logout() {},
+    async connect(request) {
+      assert.equal(request.candidate, secret);
+      return {
+        candidateId: "candidate-setup-process-postpublication",
+        backendId: "openrouter",
+        connectionId: "connection-setup-process-postpublication",
+        accountFingerprint,
+        billingRealm: "openrouter-payg",
+        health: {
+          credential: "valid",
+          connectivity: "connected",
+          spend: "available",
+          runtime: "ready",
+          observedAt: 1,
+          generation: request.generation,
+        },
+      };
+    },
+    async listModels() { return [model]; },
+    async activate(request) {
+      runtimeRoute = structuredClone(route);
+      return {
+        candidateId: request.candidateId,
+        backendId: "openrouter",
+        connectionId: "connection-setup-process-postpublication",
+        accountFingerprint,
+        billingRealm: "openrouter-payg",
+        route: structuredClone(route),
+      };
+    },
+    async discardCandidate() {},
+  };
+  const descriptor: BackendDescriptor = {
+    id: "openrouter",
+    displayName: "OpenRouter",
+    maturity: "stable",
+    connectable: true,
+    kind: "raw-model",
+    credentialOwner: "orcode-keychain",
+    billingRealmKind: "api-payg",
+    capabilities: { models: true, tools: true, reasoning: true },
+  };
+  const registry = new BackendRegistry([{ descriptor, adapter }]);
+  const runtimeGuard = providerRuntimeGuardFixture();
+  let reachedRuntimeActivation!: () => void;
+  const runtimeActivationReached = new Promise<void>((resolve) => {
+    reachedRuntimeActivation = resolve;
+  });
+  let releaseRuntimeActivation!: () => void;
+  const runtimeActivationRelease = new Promise<void>((resolve) => {
+    releaseRuntimeActivation = resolve;
+  });
+  let coordinator!: ProviderActivationCoordinator;
+  const credentialAuthority = new ProviderCredentialAuthority({
+    stateStore,
+    credentials: credentials as never,
+    environment: { OPENROUTER_API_KEY: secret },
+    coordinator: () => coordinator,
+  });
+  let uuid = 1;
+  coordinator = new ProviderActivationCoordinator({
+    appHome: root,
+    configPath,
+    privateStore: new PrivateStore({ root }),
+    credentials: credentials as never,
+    adapter,
+    stateStore,
+    runtimeGuard,
+    candidateAuthority: credentialAuthority,
+    createUuid: () => `84848484-8484-4484-8484-${String(uuid++).padStart(12, "0")}`,
+    onBoundary: async (boundary) => {
+      if (boundary !== "runtime-activated") return;
+      reachedRuntimeActivation();
+      await runtimeActivationRelease;
+    },
+  });
+  const orchestrator = new SetupOrchestrator({
+    registry,
+    stateStore,
+    activationCoordinator: coordinator,
+  });
+  let cancelCalls = 0;
+  const originalCancel = orchestrator.cancelSetup.bind(orchestrator);
+  orchestrator.cancelSetup = async (request) => {
+    cancelCalls += 1;
+    return originalCancel(request);
+  };
+  const Runtime = (cliModule as unknown as {
+    DefaultProviderRuntime: new (...args: unknown[]) => {
+      runSetup(surface: SetupSurface, attempt: Record<string, unknown>): Promise<Record<string, unknown>>;
+      currentSessionRoute(): typeof route;
+    };
+  }).DefaultProviderRuntime;
+  const session = SessionStore.create(
+    "/synthetic/setup-process-postpublication",
+    "/synthetic/.orcode",
+  );
+  const runtime = new Runtime(
+    new OpenRouterService(undefined),
+    credentials,
+    registry,
+    stateStore,
+    orchestrator,
+    coordinator,
+    runtimeGuard,
+    { async apply() { throw new Error("unused"); } },
+    null,
+    secret,
+    model.requestedModelId,
+    config,
+    session,
+    {
+      credentialAuthority,
+      adapter: adapter as never,
+      async recover() {},
+    },
+  );
+  const surface: SetupSurface = {
+    async chooseHub() { return "cross-later"; },
+    async readSecret() { throw new Error("environment setup must not prompt for a secret"); },
+    async chooseModel() { return model.canonicalModelId; },
+    async confirm() { throw new Error("process-only setup must not ask for persistence"); },
+    present() {},
+  };
+  const controller = new AbortController();
+  const reason = new DOMException("fixed process-only setup postpublication abort", "AbortError");
+  const pending = runtime.runSetup(surface, {
+    generation: 51,
+    deadlineAt: Date.now() + 5_000,
+    signal: controller.signal,
+    remainingMs: () => 5_000,
+    assertCurrent() {
+      if (controller.signal.aborted) throw reason;
+    },
+  });
+  await runtimeActivationReached;
+
+  controller.abort(reason);
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  const stillPending = Symbol("still-pending");
+  const early = await Promise.race([
+    pending,
+    new Promise<typeof stillPending>((resolve) => setImmediate(() => resolve(stillPending))),
+  ]);
+  const cancelCallsBeforeRelease = cancelCalls;
+  releaseRuntimeActivation();
+  const result = await pending;
+  const disk = (JSON.parse(await readFile(configPath, "utf8")) as {
+    providerSetup: ProviderSetupStateV1;
+  }).providerSetup;
+
+  assert.equal(early, stillPending);
+  assert.equal(cancelCallsBeforeRelease, 0);
+  assert.deepEqual(result, { kind: "ready" });
+  assert.equal(cancelCalls, 0);
+  assert.deepEqual(disk, initial);
+  assert.deepEqual(stateStore.read(), initial);
+  assert.deepEqual(config.providerSetup, initial);
+  assert.deepEqual(runtimeRoute, route);
+  assert.deepEqual(session.data.route, route);
+  assert.equal(session.data.model, model.requestedModelId);
+  assert.equal(config.mainModel, model.requestedModelId);
+  assert.deepEqual(runtime.currentSessionRoute(), route);
+  assert.equal(slots.size, 0);
 });
 
 test("late Cross completion after newer activation cannot republish the old route or session owner", async () => {
