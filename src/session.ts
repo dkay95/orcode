@@ -120,6 +120,8 @@ export class SessionStore {
   #data: PersistedSessionData;
   /** Last state known to be on disk; the base of the three-way merge. */
   #base: PersistedSessionData;
+  /** A legacy route derived at read time but not yet owned by the chat file. */
+  #pendingLegacyRouteProjection = false;
   readonly appHome: string;
   readonly path: string;
 
@@ -168,14 +170,23 @@ export class SessionStore {
     assertChatId(id);
     const path = chatPath(appHome, workspace, id);
     try {
+      const raw = JSON.parse(await readFile(path, "utf8"));
       const parsed = normalizeSession(
-        JSON.parse(await readFile(path, "utf8")),
+        raw,
         workspace,
         id,
         providerConnection,
       );
       if (parsed) {
-        return new SessionStore(appHome, path, parsed);
+        const store = new SessionStore(appHome, path, parsed);
+        if (
+          validateRouteIdentityV1(raw?.route) === null
+          && parsed.route?.resolutionState === "legacy-unverified"
+        ) {
+          store.#pendingLegacyRouteProjection = true;
+          delete store.#base.route;
+        }
+        return store;
       }
     } catch (error) {
       if (hasCode(error, "ENOENT")) {
@@ -274,11 +285,27 @@ export class SessionStore {
     this.#data.model = model.trim();
     if (route) {
       this.#data.route = structuredClone(route);
+      this.#pendingLegacyRouteProjection = false;
     } else if (this.#data.route?.requestedModelId !== this.#data.model) {
       delete this.#data.route;
+      this.#pendingLegacyRouteProjection = false;
     }
     this.#data.reasoning = structuredClone(reasoning);
     this.#data.updatedAt = new Date().toISOString();
+  }
+
+  /** Rebinds only a route that was projected lazily and is still unpersisted. */
+  rebindPendingLegacyRoute(providerConnection?: ProviderConnectionStateV1): void {
+    if (!this.#pendingLegacyRouteProjection) return;
+    if (
+      this.#data.model
+      && isActiveMigratedOpenRouterConnection(providerConnection)
+    ) {
+      this.#data.route = mapLegacyOpenRouterModel(this.#data.model, providerConnection);
+      return;
+    }
+    delete this.#data.route;
+    this.#pendingLegacyRouteProjection = false;
   }
 
   async fork(title = `${this.#data.title} (Fork)`): Promise<SessionStore> {
@@ -502,8 +529,28 @@ export class SessionStore {
 
       if (foreign.kind === "data") {
         if (
+          this.#pendingLegacyRouteProjection
+          && foreign.data.route !== undefined
+          && this.#hasOnlyPendingLegacyRouteProjection()
+        ) {
+          // A real route published by another window is authoritative over a
+          // read-time projection and requires no duplicate write.
+          this.#data = structuredClone(foreign.data);
+          this.#base = structuredClone(foreign.data);
+          this.#pendingLegacyRouteProjection = false;
+          return {
+            merged: false,
+            conflictBackupPath: null,
+            revision: foreign.revision,
+          };
+        }
+        if (this.#pendingLegacyRouteProjection && foreign.data.route !== undefined) {
+          this.#data.route = structuredClone(foreign.data.route);
+          this.#pendingLegacyRouteProjection = false;
+        }
+        if (
           sameValue(this.#data, this.#base)
-          && !hasPendingLegacyRouteProjection(this.#base, foreign.data)
+          && !this.#pendingLegacyRouteProjection
         ) {
           // A stale but locally unchanged window has nothing to contribute.
           // Adopt the locked readback exactly instead of merging it into a new
@@ -543,10 +590,18 @@ export class SessionStore {
         `${JSON.stringify(persisted, null, 2)}\n`,
       );
       this.#base = structuredClone(this.#data);
+      this.#pendingLegacyRouteProjection = false;
       return { merged, conflictBackupPath, revision: this.#data.revision };
     } finally {
       await release();
     }
+  }
+
+  #hasOnlyPendingLegacyRouteProjection(): boolean {
+    if (!this.#pendingLegacyRouteProjection) return false;
+    const withoutProjection = structuredClone(this.#data);
+    delete withoutProjection.route;
+    return sameValue(withoutProjection, this.#base);
   }
 }
 
@@ -1456,21 +1511,6 @@ function sameValue(left: unknown, right: unknown): boolean {
 
 function sameRedactedProjection(left: unknown, right: unknown): boolean {
   return JSON.stringify(redactValue(left)) === JSON.stringify(redactValue(right));
-}
-
-function hasPendingLegacyRouteProjection(
-  projected: PersistedSessionData,
-  persisted: PersistedSessionData,
-): boolean {
-  if (
-    projected.route?.resolutionState !== "legacy-unverified"
-    || persisted.route !== undefined
-  ) {
-    return false;
-  }
-  const withoutProjection = structuredClone(projected);
-  delete withoutProjection.route;
-  return sameRedactedProjection(withoutProjection, persisted);
 }
 
 function turnKey(turn: ChatTurn): string {

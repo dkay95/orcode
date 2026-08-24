@@ -923,9 +923,14 @@ test("later /chat open keeps using the verified migrated OpenRouter connection f
   };
   context.config.providerSetup = {
     schemaVersion: 1,
-    revision: 2,
-    lifecycle: "configured",
-    connections: [connection],
+    revision: 0,
+    lifecycle: "migrated",
+    connections: [{
+      ...connection,
+      accountFingerprint: "acct_legacy_task-ten-migrated-chat-connection",
+      accountFingerprintState: "provisional",
+      lastHealth: null,
+    }],
     defaultRoute: null,
     cross: { enabled: false, preferredLead: null, preferredChallenger: null },
   };
@@ -938,8 +943,14 @@ test("later /chat open keeps using the verified migrated OpenRouter connection f
   await historical.save();
   const transitions: string[] = [];
   (context as CommandContext & {
-    providerRoutes: { transitionModel(modelId: string): Promise<void> };
+    providerRoutes: {
+      migratedSessionConnection(): ProviderConnectionStateV1;
+      transitionModel(modelId: string): Promise<void>;
+    };
   }).providerRoutes = {
+    migratedSessionConnection() {
+      return structuredClone(connection);
+    },
     async transitionModel(modelId) {
       transitions.push(modelId);
     },

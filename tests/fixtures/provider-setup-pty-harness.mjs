@@ -2,7 +2,7 @@
 
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
-import { mkdtemp, readFile, readdir, rm, stat } from "node:fs/promises";
+import { mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { dirname, join, relative, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -45,7 +45,7 @@ export function syntheticInvalidProviderCredentials() {
   });
 }
 
-export async function buildFreshProviderSetupModules(projectRoot) {
+export async function buildFreshProviderSetupModules(projectRoot, options = {}) {
   const buildRoot = await mkdtemp(join(projectRoot, ".orcode-provider-proof-"));
   const outputRoot = join(buildRoot, "dist");
   const tsc = join(projectRoot, "node_modules", "typescript", "bin", "tsc");
@@ -70,6 +70,30 @@ export async function buildFreshProviderSetupModules(projectRoot) {
   );
   if (build.failed) {
     throw new Error("The isolated provider proof build failed.");
+  }
+  if (options.pasteEndSubmits === true) {
+    const tuiPath = join(outputRoot, "tui.js");
+    const original = await readFile(tuiPath, "utf8");
+    const expected = [
+      'if (key.name === "paste-end") {',
+      "            if (this.#pasting)",
+      "                this.#finishPaste();",
+      "            return;",
+      "        }",
+    ].join("\n");
+    const replacement = [
+      'if (key.name === "paste-end") {',
+      "            if (this.#pasting) {",
+      "                this.#finishPaste();",
+      "                this.#resolveSecret(this.#inputChars.join(\"\"));",
+      "            }",
+      "            return;",
+      "        }",
+    ].join("\n");
+    if (original.split(expected).length !== 2) {
+      throw new Error("The provider paste-end mutant no longer matches the isolated build.");
+    }
+    await writeFile(tuiPath, original.replace(expected, replacement));
   }
   return {
     buildRoot,
@@ -142,13 +166,21 @@ def wait_for(marker):
             raise RuntimeError("early-exit")
         read_once(0.05)
 
-def wait_for_growth(previous_size):
-    while len(captured) <= previous_size:
+def wait_for_after(marker, previous_size):
+    while marker not in captured[previous_size:]:
         if time.monotonic() >= deadline:
-            raise TimeoutError("render-timeout")
+            raise TimeoutError("marker-after-timeout")
         if process.poll() is not None and not read_once(0.0):
             raise RuntimeError("early-exit")
         read_once(0.05)
+
+def marker_json_after(marker, previous_size):
+    wait_for_after(marker, previous_size)
+    start = captured.find(marker, previous_size) + len(marker)
+    end = captured.find(b"\n", start)
+    if end < 0:
+        raise RuntimeError("partial-marker")
+    return json.loads(bytes(captured[start:end]).rstrip(b"\r").decode("ascii"))
 
 def write_all(data):
     offset = 0
@@ -165,10 +197,17 @@ def complete_valid_secret(check_before_enter):
     wait_for(stage("secret", 1))
     before = len(captured)
     paste(b"\xc2\xa0" + clean + b"\r\n\xe3\x80\x80")
-    wait_for_growth(before)
+    ack = marker_json_after(b"ORCODE_PROVIDER_POST_FINISH_ACK:", before)
+    if (
+        ack["modelAttempt"] != 0
+        or ack["confirmAttempt"] != 0
+        or any(value != 0 for value in ack["counters"].values())
+    ):
+        raise RuntimeError("premature-submit")
     if check_before_enter:
+        checkpoint_start = len(captured)
         os.kill(process.pid, signal.SIGUSR1)
-        wait_for(b"ORCODE_PROVIDER_CHECKPOINT:")
+        wait_for_after(b"ORCODE_PROVIDER_CHECKPOINT:", checkpoint_start)
     write_all(b"\r")
 
 def finish_valid_flow(cross_key=b"\r"):
@@ -286,9 +325,11 @@ try:
         "timedOut": False,
     }
     sys.stdout.write(json.dumps(result, separators=(",", ":")))
-except Exception:
+except Exception as error:
     failure = {
-        "controllerError": "provider-pty-controller-failed",
+        "controllerError": "provider-pty-premature-submit"
+            if str(error) == "premature-submit"
+            else "provider-pty-controller-failed",
         "outputBase64": base64.b64encode(bytes(captured)).decode("ascii"),
     }
     sys.stdout.write(json.dumps(failure, separators=(",", ":")))
@@ -311,8 +352,10 @@ finally:
 `;
 
 export async function runProviderSetupPtyScenario(options) {
-  if (process.platform === "win32") {
-    throw new Error("The real POSIX provider PTY proof does not cover ConPTY.");
+  if ((options.platform ?? process.platform) === "win32") {
+    const error = new Error("The real provider transcript proof requires a POSIX PTY.");
+    error.code = "provider-pty-posix-unsupported";
+    throw error;
   }
   const request = {
     columns: options.columns ?? DEFAULT_COLUMNS,
@@ -402,7 +445,9 @@ export async function runProviderSetupPtyScenario(options) {
       : Buffer.alloc(0);
     throw await safePtyFailure(
       failureBytes,
-      "provider-pty-controller-failed",
+      controller.controllerError === "provider-pty-premature-submit"
+        ? "provider-pty-premature-submit"
+        : "provider-pty-controller-failed",
       options.projectRoot,
       options.moduleRoot,
       {
@@ -420,11 +465,13 @@ export async function runProviderSetupPtyScenario(options) {
   const ready = lastJsonMarker(output, "ORCODE_PROVIDER_READY:");
   const result = lastJsonMarker(output, "ORCODE_PROVIDER_RESULT:");
   const checkpoints = jsonMarkers(output, "ORCODE_PROVIDER_CHECKPOINT:");
+  const postFinishAcks = jsonMarkers(output, "ORCODE_PROVIDER_POST_FINISH_ACK:");
   return {
     checkpoints,
     homeAudit,
     output,
     outputBase64: controller.outputBase64,
+    postFinishAcks,
     ready,
     result,
   };
@@ -585,8 +632,12 @@ function containsPrivateHome(value) {
     new RegExp(`(?:^|[^A-Za-z0-9_])(?:file:\\/\\/)?\\/${usersDirectory}\\/[^/\\s]+(?:\\/|\\b)`, "i"),
     new RegExp(`(?:^|[^A-Za-z0-9_])(?:file:\\/\\/)?\\/${homeDirectory}\\/[^/\\s]+(?:\\/|\\b)`, "i"),
     new RegExp(`(?:^|[^A-Za-z0-9_])(?:file:\\/\\/)?\\/${rootDirectory}(?:\\/|\\b)`, "i"),
-    new RegExp(`(?:^|[^A-Za-z0-9_])(?:file:\\/\\/\\/)?[A-Za-z]:[\\\\/]${usersDirectory}[\\\\/][^\\\\/\\s]+(?:[\\\\/]|\\b)`, "i"),
+    new RegExp(`(?:^|[^A-Za-z0-9_])(?:file:\\/\\/\\/)?[A-Za-z]:[\\\\/]+${usersDirectory}[\\\\/]+[^\\\\/\\s]+(?:[\\\\/]+|\\b)`, "i"),
   ].some((pattern) => pattern.test(value));
+}
+
+export function containsPrivateHomeForProof(value) {
+  return containsPrivateHome(value);
 }
 
 async function safePtyFailure(
@@ -817,6 +868,23 @@ async function runChildHarness(scenario) {
   const emitStage = (stage, attempt) => {
     process.stdout.write(`\nORCODE_PROVIDER_STAGE:${JSON.stringify({ stage, attempt })}\n`);
   };
+  const setStatus = ui.setStatus.bind(ui);
+  let secretPasteStatusCount = 0;
+  ui.setStatus = (status, busy) => {
+    setStatus(status, busy);
+    if (secretAttempt === 0 || busy !== false) return;
+    secretPasteStatusCount += 1;
+    if (secretPasteStatusCount % 2 !== 0) return;
+    const attempt = secretAttempt;
+    setImmediate(() => {
+      process.stdout.write(`\nORCODE_PROVIDER_POST_FINISH_ACK:${JSON.stringify({
+        attempt,
+        modelAttempt,
+        confirmAttempt,
+        counters: { ...counters },
+      })}\n`);
+    });
+  };
   const baseSurface = setupUi.createTuiSetupSurface(ui);
   const surface = {
     async chooseHub(entries) {
@@ -831,6 +899,7 @@ async function runChildHarness(scenario) {
       return pending;
     },
     readSecret(request) {
+      secretPasteStatusCount = 0;
       const pending = baseSurface.readSecret(request);
       emitStage("secret", ++secretAttempt);
       return pending;

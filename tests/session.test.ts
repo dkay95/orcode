@@ -1053,6 +1053,129 @@ test("two historical chats derive one migrated route lazily and persist only on 
   assert.equal(await readFile(secondPath, "utf8"), secondOriginal);
 });
 
+test("concurrent foreign save preserves both lazy historical route and foreign turn", async () => {
+  const { workspace, appHome } = await workspaceRoot("provider-route-concurrent-turn");
+  const directory = join(appHome, "chats", workspaceStorageHash(workspace));
+  await mkdir(directory, { recursive: true });
+  const id = "lazy-route-concurrent-turn";
+  const timestamp = "2026-08-24T08:00:00.000Z";
+  const path = join(directory, `${id}.json`);
+  await writeFile(path, `${JSON.stringify({
+    version: 2,
+    id,
+    title: "Lazy route concurrency",
+    workspace,
+    summary: "",
+    turns: [{ role: "user", content: "historical turn", createdAt: timestamp }],
+    costs: { mainUsd: 0, compressorUsd: 0, voiceUsd: 0, totalUsd: 0 },
+    model: "synthetic/lazy-concurrent",
+    revision: 4,
+    checkpoints: [],
+    toolCalls: [],
+    dailySpendUsd: {},
+    createdAt: timestamp,
+    updatedAt: timestamp,
+  }, null, 2)}\n`);
+  const connection: ProviderConnectionStateV1 = {
+    id: "legacy-concurrent-connection",
+    backendId: "openrouter",
+    enabled: true,
+    maturity: "stable",
+    credentialSlot: "legacy:inference",
+    accountFingerprint: "acct_legacy_concurrent_projection",
+    accountFingerprintState: "provisional",
+    billingRealm: "openrouter-payg",
+    lastHealth: null,
+  };
+  const expectedRoute = {
+    version: 1 as const,
+    backendId: "openrouter" as const,
+    accountFingerprint: connection.accountFingerprint,
+    billingRealm: "openrouter-payg" as const,
+    requestedModelId: "synthetic/lazy-concurrent",
+    canonicalModelId: null,
+    resolutionState: "legacy-unverified" as const,
+  };
+
+  const lazyWindow = await SessionStore.openById(workspace, id, appHome, connection);
+  const foreignWindow = await SessionStore.openById(workspace, id, appHome);
+  assert.deepEqual(lazyWindow.data.route, expectedRoute);
+  assert.equal(foreignWindow.data.route, undefined);
+  foreignWindow.addTurn("assistant", "foreign turn");
+  const foreignOutcome = await foreignWindow.save();
+
+  const lazyOutcome = await lazyWindow.save();
+  const persisted = await SessionStore.openById(workspace, id, appHome);
+  assert.equal(lazyOutcome.merged, true);
+  assert.equal(lazyOutcome.revision, foreignOutcome.revision + 1);
+  assert.deepEqual(persisted.data.route, expectedRoute);
+  assert.deepEqual(
+    new Set(persisted.data.turns.map((turn) => turn.content)),
+    new Set(["historical turn", "foreign turn"]),
+  );
+});
+
+test("foreign persisted route is authoritative over a pending lazy projection without revision churn", async () => {
+  const { workspace, appHome } = await workspaceRoot("provider-route-foreign-authority");
+  const directory = join(appHome, "chats", workspaceStorageHash(workspace));
+  await mkdir(directory, { recursive: true });
+  const id = "lazy-route-foreign-authority";
+  const timestamp = "2026-08-24T08:30:00.000Z";
+  const path = join(directory, `${id}.json`);
+  await writeFile(path, `${JSON.stringify({
+    version: 2,
+    id,
+    title: "Foreign route authority",
+    workspace,
+    summary: "",
+    turns: [],
+    costs: { mainUsd: 0, compressorUsd: 0, voiceUsd: 0, totalUsd: 0 },
+    model: "synthetic/lazy-authority",
+    revision: 2,
+    checkpoints: [],
+    toolCalls: [],
+    dailySpendUsd: {},
+    createdAt: timestamp,
+    updatedAt: timestamp,
+  }, null, 2)}\n`);
+  const connection: ProviderConnectionStateV1 = {
+    id: "legacy-authority-connection",
+    backendId: "openrouter",
+    enabled: true,
+    maturity: "stable",
+    credentialSlot: "legacy:inference",
+    accountFingerprint: "acct_legacy_pending_authority",
+    accountFingerprintState: "provisional",
+    billingRealm: "openrouter-payg",
+    lastHealth: null,
+  };
+  const authoritativeRoute = {
+    version: 1 as const,
+    backendId: "openrouter" as const,
+    accountFingerprint: "acct_or_foreign_verified_authority",
+    billingRealm: "openrouter-payg" as const,
+    requestedModelId: "synthetic/lazy-authority",
+    canonicalModelId: "synthetic/lazy-authority",
+    resolutionState: "resolved" as const,
+  };
+
+  const lazyWindow = await SessionStore.openById(workspace, id, appHome, connection);
+  const foreignWindow = await SessionStore.openById(workspace, id, appHome);
+  foreignWindow.setPreferences(
+    "synthetic/lazy-authority",
+    { mode: "effort", effort: "medium" },
+    authoritativeRoute,
+  );
+  const foreignOutcome = await foreignWindow.save();
+  const foreignBytes = await readFile(path, "utf8");
+
+  const lazyOutcome = await lazyWindow.save();
+  assert.equal(lazyOutcome.merged, false);
+  assert.equal(lazyOutcome.revision, foreignOutcome.revision);
+  assert.equal(await readFile(path, "utf8"), foreignBytes);
+  assert.deepEqual(lazyWindow.data.route, authoritativeRoute);
+});
+
 test("summaries are redacted before they are persisted", async () => {
   const { workspace, appHome } = await workspaceRoot("summary");
   const store = SessionStore.create(workspace, appHome, "Zusammenfassung");

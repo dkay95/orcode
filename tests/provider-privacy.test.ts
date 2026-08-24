@@ -59,12 +59,14 @@ interface ProviderPtyBuild {
 interface ProviderPtyHarnessModule {
   buildFreshProviderSetupModules(projectRoot: string): Promise<ProviderPtyBuild>;
   runProviderSetupPtyScenario(options: {
+    platform?: string;
     projectRoot: string;
     moduleRoot: string;
     scenario: string;
   }): Promise<{ outputBase64: string }>;
   syntheticProviderCredential(): string;
   syntheticProviderCredentialFragments(): readonly string[];
+  containsPrivateHomeForProof(value: string): boolean;
 }
 
 interface PrivacyProbes {
@@ -111,6 +113,7 @@ function privateHomeForms(): string[] {
   const linuxUser = ["", "home", "private-person", "project"].join(slash);
   const rootUser = ["", "root", "project"].join(slash);
   const windowsUser = ["C:", "Users", "private-person", "project"].join("\\");
+  const windowsFileUrl = `file:///${windowsUser}`;
   return [
     unixUser,
     linuxUser,
@@ -119,6 +122,9 @@ function privateHomeForms(): string[] {
     windowsUser.replaceAll("\\", slash),
     `file://${unixUser}`,
     `file:///${windowsUser.replaceAll("\\", slash)}`,
+    JSON.stringify(windowsUser),
+    JSON.stringify({ home: windowsUser }),
+    JSON.stringify(windowsFileUrl),
   ];
 }
 
@@ -130,9 +136,25 @@ function containsPrivateHome(value: string): boolean {
     new RegExp(`(?:^|[^A-Za-z0-9_])(?:file:\\/\\/)?\\/${usersDirectory}\\/[^/\\s]+(?:\\/|\\b)`, "i"),
     new RegExp(`(?:^|[^A-Za-z0-9_])(?:file:\\/\\/)?\\/${homeDirectory}\\/[^/\\s]+(?:\\/|\\b)`, "i"),
     new RegExp(`(?:^|[^A-Za-z0-9_])(?:file:\\/\\/)?\\/${rootDirectory}(?:\\/|\\b)`, "i"),
-    new RegExp(`(?:^|[^A-Za-z0-9_])(?:file:\\/\\/\\/)?[A-Za-z]:[\\\\/]${usersDirectory}[\\\\/][^\\\\/\\s]+(?:[\\\\/]|\\b)`, "i"),
+    new RegExp(`(?:^|[^A-Za-z0-9_])(?:file:\\/\\/\\/)?[A-Za-z]:[\\\\/]+${usersDirectory}[\\\\/]+[^\\\\/\\s]+(?:[\\\\/]+|\\b)`, "i"),
   ].some((pattern) => pattern.test(value));
 }
+
+test("serialized Windows private homes fail provider privacy scanning", async () => {
+  const harness = await import(HARNESS_MODULE) as ProviderPtyHarnessModule;
+  const credential = harness.syntheticProviderCredential();
+  const values = probes(credential);
+  const dirtySerialized = privateHomeForms().slice(-3);
+  assert.equal(dirtySerialized.length, 3);
+  for (const dirty of dirtySerialized) {
+    assert.equal(containsPrivateHome(dirty), true);
+    assert.equal(harness.containsPrivateHomeForProof(dirty), true);
+    assert.throws(
+      () => assertProviderPrivate(dirty, values),
+      /provider-privacy-private-home-detected/,
+    );
+  }
+});
 
 function assertProviderPrivate(value: string, values: PrivacyProbes): void {
   if (scanForSecrets(value).length > 0) {
@@ -628,16 +650,22 @@ test("provider privacy scanner recursively covers committed fixtures PTY output 
   assertProviderPrivate(setupEvents, values);
   await writeFile(join(generatedHome, "setup-events.json"), `${setupEvents}\n`);
 
-  const build = await harness.buildFreshProviderSetupModules(PROJECT_ROOT);
-  t.after(() => build.cleanup());
-  const pty = await harness.runProviderSetupPtyScenario({
-    projectRoot: PROJECT_ROOT,
-    moduleRoot: build.moduleRoot,
-    scenario: "success",
+  await t.test("real POSIX transcript corpus", {
+    skip: process.platform === "win32"
+      ? "The privacy corpus stays active; only its real POSIX PTY transcript is skipped."
+      : false,
+  }, async (subtest) => {
+    const build = await harness.buildFreshProviderSetupModules(PROJECT_ROOT);
+    subtest.after(() => build.cleanup());
+    const pty = await harness.runProviderSetupPtyScenario({
+      projectRoot: PROJECT_ROOT,
+      moduleRoot: build.moduleRoot,
+      scenario: "success",
+    });
+    const decodedPty = Buffer.from(pty.outputBase64, "base64").toString("utf8");
+    assertProviderPrivate(decodedPty, values);
+    await writeFile(join(generatedHome, "provider-pty-transcript.txt"), decodedPty);
   });
-  const decodedPty = Buffer.from(pty.outputBase64, "base64").toString("utf8");
-  assertProviderPrivate(decodedPty, values);
-  await writeFile(join(generatedHome, "provider-pty-transcript.txt"), decodedPty);
 
   const afterRecovery = await sortedRegularFiles(generatedHome);
   for (const artifact of afterRecovery) {

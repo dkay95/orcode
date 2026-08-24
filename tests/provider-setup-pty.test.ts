@@ -28,6 +28,12 @@ interface ProviderPtyRun {
     rows: number;
   };
   checkpoints: Array<Record<string, number>>;
+  postFinishAcks: Array<{
+    attempt: number;
+    modelAttempt: number;
+    confirmAttempt: number;
+    counters: Record<string, number>;
+  }>;
   result: {
     chatAccepted: boolean;
     counters: Record<string, number>;
@@ -42,26 +48,39 @@ interface ProviderPtyRun {
 }
 
 interface ProviderPtyHarnessModule {
-  buildFreshProviderSetupModules(projectRoot: string): Promise<ProviderPtyBuild>;
+  buildFreshProviderSetupModules(
+    projectRoot: string,
+    options?: { pasteEndSubmits?: boolean },
+  ): Promise<ProviderPtyBuild>;
   runProviderSetupPtyScenario(options: {
     controllerTimeoutMs?: number;
+    platform?: string;
     projectRoot: string;
+    pythonExecutable?: string;
     moduleRoot: string;
     scenario: string;
   }): Promise<ProviderPtyRun>;
   syntheticProviderCredential(): string;
   syntheticProviderCredentialFragments(): readonly string[];
   syntheticInvalidProviderCredentials(): Readonly<Record<string, string>>;
+  containsPrivateHomeForProof(value: string): boolean;
 }
 
 const PROJECT_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const HARNESS_MODULE = "./fixtures/provider-setup-pty-harness.mjs";
 let harness: ProviderPtyHarnessModule;
-let build: ProviderPtyBuild;
+let build: ProviderPtyBuild | undefined;
+const POSIX_PTY_ONLY = {
+  skip: process.platform === "win32"
+    ? "The real provider transcript proof requires a POSIX PTY; Windows ConPTY is not claimed."
+    : false,
+} as const;
 
 before(async () => {
   harness = await import(HARNESS_MODULE) as ProviderPtyHarnessModule;
-  build = await harness.buildFreshProviderSetupModules(PROJECT_ROOT);
+  if (process.platform !== "win32") {
+    build = await harness.buildFreshProviderSetupModules(PROJECT_ROOT);
+  }
 });
 
 after(async () => {
@@ -69,6 +88,7 @@ after(async () => {
 });
 
 async function run(scenario: string): Promise<ProviderPtyRun> {
+  if (!build) throw new Error("The POSIX provider proof build is unavailable.");
   return harness.runProviderSetupPtyScenario({
     projectRoot: PROJECT_ROOT,
     moduleRoot: build.moduleRoot,
@@ -86,10 +106,7 @@ function assertTranscriptPrivate(runResult: ProviderPtyRun): void {
     assert.equal(raw.includes(Buffer.from(fragment)), false);
   }
   assert.deepEqual(scanForSecrets(runResult.output), []);
-  assert.doesNotMatch(
-    runResult.output,
-    /(?:file:\/\/)?(?:\/Users\/[^/\s]+|\/home\/[^/\s]+|\/root(?:\/|\b)|[A-Za-z]:[\\/]Users[\\/][^\\/\s]+)/,
-  );
+  assert.equal(containsPrivateHomeInTranscript(runResult.output), false);
   assert.deepEqual(runResult.homeAudit, {
     auditFailed: false,
     fileCount: 0,
@@ -97,6 +114,23 @@ function assertTranscriptPrivate(runResult: ProviderPtyRun): void {
     sha256: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
     totalBytes: 0,
   });
+}
+
+function containsPrivateHomeInTranscript(value: string): boolean {
+  return /(?:file:\/\/)?(?:\/Users\/[^/\s]+|\/home\/[^/\s]+|\/root(?:\/|\b)|[A-Za-z]:[\\/]+Users[\\/]+[^\\/\s]+)/.test(value);
+}
+
+function serializedWindowsPrivateHomes(): string[] {
+  const separator = "\\";
+  const windowsHome = ["C:", ["Us", "ers"].join(""), "private-person", "project"]
+    .join(separator);
+  const windowsFileUrl = `file:///${windowsHome}`;
+  return [
+    windowsHome,
+    JSON.stringify(windowsHome),
+    JSON.stringify({ home: windowsHome }),
+    JSON.stringify(windowsFileUrl),
+  ];
 }
 
 function assertNoRejectedEffects(runResult: ProviderPtyRun): void {
@@ -118,7 +152,31 @@ function assertNoRejectedEffects(runResult: ProviderPtyRun): void {
   assertTranscriptPrivate(runResult);
 }
 
-test("real POSIX provider setup masks Unicode-wrapped CRLF paste and submits only after later Enter", async () => {
+test("Windows CI skips only the POSIX transcript proof while privacy and unsupported-platform contracts pass", async () => {
+  const error = await harness.runProviderSetupPtyScenario({
+    platform: "win32",
+    projectRoot: PROJECT_ROOT,
+    moduleRoot: "unused-on-unsupported-platform",
+    pythonExecutable: "must-not-be-invoked",
+    scenario: "success",
+  }).then(
+    () => null,
+    (reason: unknown) => reason,
+  );
+  assert.ok(error instanceof Error);
+  assert.equal((error as Error & { code?: unknown }).code, "provider-pty-posix-unsupported");
+  assert.match(error.message, /requires a POSIX PTY/);
+  assert.doesNotMatch(error.message, /ConPTY/i);
+});
+
+test("serialized Windows private homes fail transcript and isolated-home scanning", async () => {
+  for (const dirty of serializedWindowsPrivateHomes()) {
+    assert.equal(containsPrivateHomeInTranscript(dirty), true);
+    assert.equal(harness.containsPrivateHomeForProof(dirty), true);
+  }
+});
+
+test("real POSIX provider setup masks Unicode-wrapped CRLF paste and submits only after later Enter", POSIX_PTY_ONLY, async () => {
   const result = await run("success");
 
   assert.deepEqual(result.ready, {
@@ -135,6 +193,21 @@ test("real POSIX provider setup masks Unicode-wrapped CRLF paste and submits onl
     credentialStore: 0,
     state: 0,
   }]);
+  assert.deepEqual(result.postFinishAcks, [{
+    attempt: 1,
+    modelAttempt: 0,
+    confirmAttempt: 0,
+    counters: {
+      activation: 0,
+      adapter: 0,
+      config: 0,
+      credentialStore: 0,
+      discard: 0,
+      modelCatalog: 0,
+      network: 0,
+      state: 0,
+    },
+  }]);
   assert.equal(result.result.failure, false);
   assert.equal(result.result.observedCandidateCount, 1);
   assert.equal(result.result.observedCleanOnly, true);
@@ -150,7 +223,7 @@ test("real POSIX provider setup masks Unicode-wrapped CRLF paste and submits onl
   assertTranscriptPrivate(result);
 });
 
-test("real POSIX provider setup rejects NUL ANSI and embedded controls before every provider or store effect", async (t) => {
+test("real POSIX provider setup rejects NUL ANSI and embedded controls before every provider or store effect", POSIX_PTY_ONLY, async (t) => {
   for (const scenario of ["reject-nul", "reject-ansi", "reject-control"] as const) {
     await t.test(scenario, async () => {
       const result = await run(scenario);
@@ -166,7 +239,7 @@ test("real POSIX provider setup rejects NUL ANSI and embedded controls before ev
   }
 });
 
-test("real POSIX rejected secret clears before one clean retry", async () => {
+test("real POSIX rejected secret clears before one clean retry", POSIX_PTY_ONLY, async () => {
   const result = await run("retry-clean");
 
   assert.equal(result.result.failure, false);
@@ -187,7 +260,7 @@ test("real POSIX rejected secret clears before one clean retry", async () => {
   assertTranscriptPrivate(result);
 });
 
-test("real POSIX Escape before secret or model activation keeps setup-required chat live", async (t) => {
+test("real POSIX Escape before secret or model activation keeps setup-required chat live", POSIX_PTY_ONLY, async (t) => {
   for (const scenario of ["escape-secret", "escape-model"] as const) {
     await t.test(scenario, async () => {
       const result = await run(scenario);
@@ -206,7 +279,7 @@ test("real POSIX Escape before secret or model activation keeps setup-required c
   }
 });
 
-test("real POSIX Escape after activation is Later keeps the route ready and Cross off", async () => {
+test("real POSIX Escape after activation is Later keeps the route ready and Cross off", POSIX_PTY_ONLY, async () => {
   const result = await run("escape-cross");
 
   assert.equal(result.result.failure, false);
@@ -220,7 +293,7 @@ test("real POSIX Escape after activation is Later keeps the route ready and Cros
   assertTranscriptPrivate(result);
 });
 
-test("bounded POSIX provider proof failures expose only safe counts and a one-way transcript digest", async () => {
+test("bounded POSIX provider proof failures expose only safe counts and a one-way transcript digest", POSIX_PTY_ONLY, async () => {
   const error = await run("unknown-proof-scenario").then(
     () => null,
     (reason: unknown) => reason,
@@ -262,7 +335,8 @@ test("bounded POSIX provider proof failures expose only safe counts and a one-wa
   })), []);
 });
 
-test("forced outer POSIX controller timeout leaves no harness process group and exposes only safe cleanup facts", async () => {
+test("forced outer POSIX controller timeout leaves no harness process group and exposes only safe cleanup facts", POSIX_PTY_ONLY, async () => {
+  if (!build) throw new Error("The POSIX provider proof build is unavailable.");
   const error = await harness.runProviderSetupPtyScenario({
     controllerTimeoutMs: 1_500,
     projectRoot: PROJECT_ROOT,
@@ -314,4 +388,32 @@ test("forced outer POSIX controller timeout leaves no harness process group and 
     homeTotalBytes: safe.homeTotalBytes,
     processGroupAliveAfterCleanup: safe.processGroupAliveAfterCleanup,
   })), []);
+});
+
+test("real provider PTY proof rejects an end-triggered secret submission mutant before explicit Enter", POSIX_PTY_ONLY, async (t) => {
+  const mutant = await harness.buildFreshProviderSetupModules(PROJECT_ROOT, {
+    pasteEndSubmits: true,
+  });
+  t.after(() => mutant.cleanup());
+  const error = await harness.runProviderSetupPtyScenario({
+    projectRoot: PROJECT_ROOT,
+    moduleRoot: mutant.moduleRoot,
+    scenario: "success",
+  }).then(
+    () => null,
+    (reason: unknown) => reason,
+  );
+  assert.ok(error instanceof Error);
+  const safe = error as Error & {
+    code?: unknown;
+    outputBase64?: unknown;
+    privacyFindings?: unknown;
+    stderr?: unknown;
+    stdout?: unknown;
+  };
+  assert.equal(safe.code, "provider-pty-premature-submit");
+  assert.equal(safe.privacyFindings, 0);
+  assert.equal("outputBase64" in safe, false);
+  assert.equal("stdout" in safe, false);
+  assert.equal("stderr" in safe, false);
 });

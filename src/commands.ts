@@ -109,6 +109,7 @@ import {
 import { suggestVerifyCommands } from "./verify.js";
 import { errorMessage, hasCode, isRecord, truncate } from "./utils.js";
 import { ProcessEventRedactor } from "./redaction.js";
+import type { ProviderConnectionStateV1 } from "./provider-state.js";
 
 /** Sink for command output — replaces the direct `console.log`/`console.error` calls. */
 export interface CommandOutput {
@@ -148,6 +149,8 @@ export interface ProviderCredentialIntentPort {
 }
 
 export interface ProviderRouteIntentPort {
+  /** Authoritative runtime projection; an explicit undefined must not fall back to startup state. */
+  migratedSessionConnection?(): ProviderConnectionStateV1 | undefined;
   runModelCatalog?<T>(
     run: () => Promise<T>,
     surface?: SetupSurface | "plain" | "fullscreen",
@@ -1693,9 +1696,7 @@ async function chatCommand(
   context: CommandContext,
 ): Promise<void> {
   const action = (args[0] ?? "").toLowerCase();
-  const migratedConnection = context.config === undefined
-    ? undefined
-    : migratedOpenRouterSessionConnection(context.config.providerSetup);
+  const migratedConnection = authoritativeMigratedSessionConnection(context);
   if (!action) {
     const chats = await SessionStore.list(
       context.workspace,
@@ -1945,6 +1946,18 @@ async function chatCommand(
   throw new Error(
     "Verwendung: /chat [list|new [Titel]|open <ID|Titel>|search <Begriff>|rename <Titel>|fork [Titel]|delete <ID|Titel>|current]",
   );
+}
+
+function authoritativeMigratedSessionConnection(
+  context: CommandContext,
+): ProviderConnectionStateV1 | undefined {
+  const runtimeProjection = context.providerRoutes?.migratedSessionConnection;
+  if (runtimeProjection) {
+    return runtimeProjection.call(context.providerRoutes);
+  }
+  return context.config === undefined
+    ? undefined
+    : migratedOpenRouterSessionConnection(context.config.providerSetup);
 }
 
 async function replaceDeletedSession(

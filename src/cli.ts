@@ -435,6 +435,7 @@ export interface ProviderRuntime extends ProviderRouteIntentPort, ProviderComman
   readonly openRouter: OpenRouterService;
   readonly credentials: CredentialStore;
   readonly preparedRoles: SetupPreparedRoles | null;
+  migratedSessionConnection(): ProviderConnectionStateV1 | undefined;
   inspectStartup(): Promise<StartupSetupResult>;
   resolveLegacyDefaultRoute(): Promise<StartupSetupResult>;
   runSetup(surface: SetupSurface | "plain" | "fullscreen"): Promise<SetupHubResult>;
@@ -569,6 +570,7 @@ export class DefaultProviderRuntime implements ProviderRuntime {
     private environmentSecret: string | null,
     private readonly requestedModel: string,
     private readonly config: OrcodeConfigWithBudget,
+    private readonly session?: SessionStore,
   ) {}
 
   get preparedRoles(): SetupPreparedRoles | null {
@@ -587,7 +589,7 @@ export class DefaultProviderRuntime implements ProviderRuntime {
     this.savedSecret = persisted ? secret : null;
     this.environmentSecret = persisted ? null : secret;
     if (persisted) {
-      this.config.providerSetup = requirePersistableProviderState(this.stateStore.read());
+      this.#synchronizeAuthoritativeProviderState();
     }
   }
 
@@ -598,11 +600,12 @@ export class DefaultProviderRuntime implements ProviderRuntime {
     this.#preparedRoles = null;
     this.savedSecret = null;
     this.environmentSecret = null;
-    this.config.providerSetup = requirePersistableProviderState(this.stateStore.read());
+    this.#synchronizeAuthoritativeProviderState();
   }
 
   async inspectStartup(): Promise<StartupSetupResult> {
     const result = await this.orchestrator.inspectStartup();
+    this.#synchronizeAuthoritativeProviderState();
     if (
       (result.mode === "setup-required" || result.mode === "route-choice-required")
       && this.savedSecret === null
@@ -627,7 +630,9 @@ export class DefaultProviderRuntime implements ProviderRuntime {
   }
 
   async resolveLegacyDefaultRoute(): Promise<StartupSetupResult> {
-    return this.orchestrator.resolveLegacyDefaultRoute();
+    const result = await this.orchestrator.resolveLegacyDefaultRoute();
+    this.#synchronizeAuthoritativeProviderState();
+    return result;
   }
 
   async runSetup(surface: SetupSurface | "plain" | "fullscreen"): Promise<SetupHubResult> {
@@ -673,7 +678,20 @@ export class DefaultProviderRuntime implements ProviderRuntime {
       this.#sessionRoute = nextSessionRoute;
       if (activatedRoute) this.#sessionRoutePersisted = activatedPersisted;
     }
+    this.#synchronizeAuthoritativeProviderState();
     return result;
+  }
+
+  migratedSessionConnection(): ProviderConnectionStateV1 | undefined {
+    return migratedOpenRouterSessionConnection(this.stateStore.read());
+  }
+
+  #synchronizeAuthoritativeProviderState(): void {
+    const state = requirePersistableProviderState(this.stateStore.read());
+    this.config.providerSetup = state;
+    this.session?.rebindPendingLegacyRoute(
+      migratedOpenRouterSessionConnection(state),
+    );
   }
 
   ensureRunnableRoute(): RouteIdentityV1 {
@@ -2259,6 +2277,7 @@ export async function createDefaultProviderRuntime(
     recoveredInference.environment,
     input.requestedModel ?? startup.config.mainModel,
     startup.config,
+    startup.session,
   );
   return runtimeOwner;
 }
@@ -3592,9 +3611,7 @@ export async function pickDashboardChat(
   preferNew: boolean,
 ): Promise<boolean> {
   await saveDashboardSessionPreferences(context, ui);
-  const migratedConnection = migratedOpenRouterSessionConnection(
-    context.config.providerSetup,
-  );
+  const migratedConnection = context.providerRuntime.migratedSessionConnection();
   const chats = await SessionStore.list(
     context.workspace,
     context.session.appHome,

@@ -9,6 +9,7 @@ import { fileURLToPath } from "node:url";
 import {
   CliUsageError,
   commandRequiresRunnableRoute,
+  createDefaultProviderRuntime,
   createCliPlainSetupSurface,
   createOpenRouterServiceForStartup,
   executeProviderModelAction,
@@ -36,10 +37,13 @@ import { createPanelCall, OpenRouterHttpError, OpenRouterService } from "../src/
 import { askPanel } from "../src/panel.js";
 import * as panelModule from "../src/panel.js";
 import { ProviderActivationCoordinator } from "../src/provider-activation.js";
+import { openRouterAccountFingerprint } from "../src/openrouter-backend.js";
 import { CredentialStore } from "../src/credentials.js";
 import type { CredentialSlotRef, CredentialStoreLike } from "../src/credentials.js";
 import {
+  migrateLegacyOpenRouterState,
   ProviderStateStore,
+  type ProviderConnectionStateV1,
   type ProviderSetupStateV1,
   type ProviderStateCommitRequest,
 } from "../src/provider-state.js";
@@ -328,6 +332,194 @@ test("runCli future and corrupt provider startup stops before runtime setup netw
   }
 });
 
+test("startup verification rebinds current and later historical sessions before any save", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "orcode-startup-identity-rebind-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const appHome = join(root, ".orcode");
+  const workspace = join(root, "workspace");
+  const configPath = join(appHome, "config.json");
+  const modelId = "synthetic/startup-identity-model";
+  const connectionId = "startup-identity-legacy-connection";
+  const initialProviderState = migrateLegacyOpenRouterState(
+    { ...structuredClone(DEFAULT_CONFIG), mainModel: modelId },
+    { connectionId },
+  );
+  const config = structuredClone(DEFAULT_CONFIG);
+  config.mainModel = modelId;
+  config.providerSetup = initialProviderState;
+  await saveConfig(config, configPath);
+
+  const currentSeed = SessionStore.create(workspace, appHome, "Current identity chat");
+  currentSeed.setPreferences(modelId, { mode: "auto" });
+  await currentSeed.save();
+  const laterSeed = SessionStore.create(workspace, appHome, "Later identity chat");
+  laterSeed.setPreferences(modelId, { mode: "auto" });
+  await laterSeed.save();
+  const currentBytes = await readFile(currentSeed.path, "utf8");
+  const laterBytes = await readFile(laterSeed.path, "utf8");
+  const current = await SessionStore.openById(
+    workspace,
+    currentSeed.data.id,
+    appHome,
+    initialProviderState.connections[0],
+  );
+  assert.equal(
+    current.data.route?.accountFingerprint,
+    `acct_legacy_${connectionId}`,
+  );
+
+  const secret = `${["sk", "or", "v1"].join("-")}-${"i".repeat(48)}`;
+  const creatorId = ["startup", "identity", "creator", "opaque"].join("-");
+  const hmacKey = new Uint8Array(32).fill(21);
+  const verifiedFingerprint = openRouterAccountFingerprint(hmacKey, creatorId);
+  const originalFetch = globalThis.fetch;
+  const credentialOriginals = {
+    get: CredentialStore.prototype.get,
+    set: CredentialStore.prototype.set,
+    delete: CredentialStore.prototype.delete,
+    has: CredentialStore.prototype.has,
+    reserveSlot: CredentialStore.prototype.reserveSlot,
+    writeSlot: CredentialStore.prototype.writeSlot,
+    readSlot: CredentialStore.prototype.readSlot,
+    deleteSlot: CredentialStore.prototype.deleteSlot,
+    getOrCreateAccountHmacKey: CredentialStore.prototype.getOrCreateAccountHmacKey,
+  };
+  const credentialEffects: string[] = [];
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+    CredentialStore.prototype.get = credentialOriginals.get;
+    CredentialStore.prototype.set = credentialOriginals.set;
+    CredentialStore.prototype.delete = credentialOriginals.delete;
+    CredentialStore.prototype.has = credentialOriginals.has;
+    CredentialStore.prototype.reserveSlot = credentialOriginals.reserveSlot;
+    CredentialStore.prototype.writeSlot = credentialOriginals.writeSlot;
+    CredentialStore.prototype.readSlot = credentialOriginals.readSlot;
+    CredentialStore.prototype.deleteSlot = credentialOriginals.deleteSlot;
+    CredentialStore.prototype.getOrCreateAccountHmacKey = credentialOriginals.getOrCreateAccountHmacKey;
+  });
+  CredentialStore.prototype.get = async function(kind) {
+    credentialEffects.push(`get:${kind}`);
+    return kind === "inference" ? secret : null;
+  };
+  CredentialStore.prototype.set = async function(kind) {
+    credentialEffects.push(`unexpected-set:${kind}`);
+    throw new Error("credential write is outside startup verification");
+  };
+  CredentialStore.prototype.delete = async function(kind) {
+    credentialEffects.push(`unexpected-delete:${kind}`);
+    throw new Error("credential delete is outside startup verification");
+  };
+  CredentialStore.prototype.has = async function(kind) {
+    credentialEffects.push(`has:${kind}`);
+    return kind === "inference";
+  };
+  CredentialStore.prototype.reserveSlot = function(kind) {
+    credentialEffects.push(`unexpected-reserve:${kind}`);
+    throw new Error("credential reserve is outside startup verification");
+  };
+  CredentialStore.prototype.writeSlot = async function(slot) {
+    credentialEffects.push(`unexpected-write-slot:${slot.kind}`);
+    throw new Error("credential slot write is outside startup verification");
+  };
+  CredentialStore.prototype.readSlot = async function(slot) {
+    credentialEffects.push(`read-slot:${slot.kind}`);
+    return null;
+  };
+  CredentialStore.prototype.deleteSlot = async function(slot) {
+    credentialEffects.push(`unexpected-delete-slot:${slot.kind}`);
+    throw new Error("credential slot delete is outside startup verification");
+  };
+  CredentialStore.prototype.getOrCreateAccountHmacKey = async function() {
+    credentialEffects.push("hmac");
+    return new Uint8Array(hmacKey);
+  };
+  globalThis.fetch = (async (input: RequestInfo | URL) => {
+    const url = input instanceof Request ? input.url : String(input);
+    if (url.endsWith("/key")) {
+      return new Response(JSON.stringify({
+        data: {
+          label: "identity fixture",
+          creator_user_id: creatorId,
+          is_free_tier: false,
+          is_management_key: false,
+          limit: null,
+          limit_remaining: null,
+          usage: 0,
+          usage_daily: 0,
+          usage_weekly: 0,
+          usage_monthly: 0,
+          expires_at: null,
+        },
+      }), { status: 200, headers: { "content-type": "application/json" } });
+    }
+    if (url.endsWith("/models")) {
+      return new Response(JSON.stringify({
+        data: [{
+          id: modelId,
+          canonical_slug: modelId,
+          name: "Startup identity model",
+          context_length: 16_384,
+          pricing: { prompt: "0", completion: "0" },
+          supported_parameters: ["tools"],
+          architecture: { input_modalities: ["text"], output_modalities: ["text"] },
+        }],
+      }), { status: 200, headers: { "content-type": "application/json" } });
+    }
+    throw new Error("unexpected startup identity endpoint");
+  }) as typeof globalThis.fetch;
+
+  const startup = {
+    appHome,
+    configPath,
+    migrationWarning: null,
+    retentionWarnings: [],
+    config,
+    ruleStore: {} as never,
+    session: current,
+  };
+  const runtime = await createDefaultProviderRuntime({
+    startup,
+    environment: {},
+    requestedModel: modelId,
+  });
+  const inspected = await runtime.inspectStartup();
+  assert.equal(inspected.defaultRoute?.accountFingerprint, verifiedFingerprint);
+  assert.equal(
+    (startup.config.providerSetup as ProviderSetupStateV1).connections[0]?.accountFingerprint,
+    verifiedFingerprint,
+  );
+  assert.equal(startup.session.data.route?.accountFingerprint, verifiedFingerprint);
+  assert.equal(await readFile(currentSeed.path, "utf8"), currentBytes);
+
+  const resolved = await runtime.resolveLegacyDefaultRoute();
+  assert.equal(resolved.defaultRoute?.resolutionState, "resolved");
+  assert.deepEqual(
+    (startup.config.providerSetup as ProviderSetupStateV1).defaultRoute,
+    resolved.defaultRoute,
+  );
+  assert.equal(startup.session.data.route?.accountFingerprint, verifiedFingerprint);
+  assert.equal(await readFile(currentSeed.path, "utf8"), currentBytes);
+  const routeAuthority = runtime as typeof runtime & {
+    migratedSessionConnection?(): ProviderConnectionStateV1 | undefined;
+  };
+  assert.equal(typeof routeAuthority.migratedSessionConnection, "function");
+  const authoritativeConnection = routeAuthority.migratedSessionConnection?.();
+  assert.equal(authoritativeConnection?.accountFingerprint, verifiedFingerprint);
+  assert.equal(authoritativeConnection?.accountFingerprintState, "verified");
+  const later = await SessionStore.openById(
+    workspace,
+    laterSeed.data.id,
+    appHome,
+    authoritativeConnection,
+  );
+  assert.equal(later.data.route?.accountFingerprint, verifiedFingerprint);
+  assert.equal(await readFile(laterSeed.path, "utf8"), laterBytes);
+  assert.equal(
+    credentialEffects.some((effect) => effect.startsWith("unexpected-")),
+    false,
+  );
+});
+
 test("dashboard picker opens a second historical chat through the migrated connection and persists its route", async (t) => {
   const root = await mkdtemp(join(tmpdir(), "orcode-dashboard-migrated-chat-"));
   t.after(() => rm(root, { recursive: true, force: true }));
@@ -343,27 +535,38 @@ test("dashboard picker opens a second historical chat through the migrated conne
   assert.equal(historical.data.route, undefined);
 
   const config = structuredClone(DEFAULT_CONFIG);
+  const authoritativeConnection: ProviderConnectionStateV1 = {
+    id: "dashboard-migrated-openrouter",
+    backendId: "openrouter",
+    enabled: true,
+    maturity: "stable",
+    credentialSlot: "legacy:inference",
+    accountFingerprint: "acct_or_dashboard_migrated_verified",
+    accountFingerprintState: "verified",
+    billingRealm: "openrouter-payg",
+    lastHealth: {
+      credential: "valid",
+      connectivity: "connected",
+      spend: "unknown",
+      runtime: "not-applicable",
+      observedAt: 10,
+      generation: 4,
+    },
+  };
   config.providerSetup = {
     schemaVersion: 1,
-    revision: 4,
-    lifecycle: "configured",
+    revision: 0,
+    lifecycle: "migrated",
     connections: [{
       id: "dashboard-migrated-openrouter",
       backendId: "openrouter",
       enabled: true,
       maturity: "stable",
       credentialSlot: "legacy:inference",
-      accountFingerprint: "acct_or_dashboard_migrated_verified",
-      accountFingerprintState: "verified",
+      accountFingerprint: "acct_legacy_dashboard-migrated-openrouter",
+      accountFingerprintState: "provisional",
       billingRealm: "openrouter-payg",
-      lastHealth: {
-        credential: "valid",
-        connectivity: "connected",
-        spend: "unknown",
-        runtime: "not-applicable",
-        observedAt: 10,
-        generation: 4,
-      },
+      lastHealth: null,
     }],
     defaultRoute: null,
     cross: { enabled: false, preferredLead: null, preferredChallenger: null },
@@ -387,6 +590,9 @@ test("dashboard picker opens a second historical chat through the migrated conne
       },
     },
     providerRuntime: {
+      migratedSessionConnection() {
+        return structuredClone(authoritativeConnection);
+      },
       async transitionModel(modelId: string) {
         transitioned.push(modelId);
       },
