@@ -8,7 +8,9 @@ modes, and separates the cost of your main model from an optional, cheaper
 compressor model that condenses long conversation context before it reaches
 the main model. It is aimed at developers who want a scriptable, terminal-
 first coding agent and want to choose (and pay for) exactly which model does
-the work.
+the work. A Kimi Code membership key can additionally be connected as a
+**Preview** provider; see [Kimi Code (Preview)](#kimi-code-preview) for
+exactly what that does and does not cover yet.
 
 ## Requirements
 
@@ -19,6 +21,10 @@ the work.
   [openrouter.ai/keys](https://openrouter.ai/keys). orcode needs at
   least an inference key; an optional separate management key unlocks the
   `/balance` full-account view (see [Privacy and data flow](#privacy-and-data-flow)).
+- **Optionally, a Kimi Code membership API key** for the Preview Kimi Code
+  provider. This is a key you create yourself in the Kimi Code Console for
+  third-party tools; it is not a Kimi login. See
+  [Kimi Code (Preview)](#kimi-code-preview).
 
 Shell execution is platform-native; Windows does not require an additional
 POSIX shell:
@@ -177,11 +183,13 @@ Slash commands, generated from the same catalog orcode's `/help` and
 in-app command palette use (`src/command-catalog.ts`), so this list cannot
 drift from what the app actually offers:
 
-OpenRouter is the Stable, runnable provider in Slice 1. Anthropic / Claude
-subscription is shown truthfully as Coming soon and cannot be connected yet;
-Claude models remain available through OpenRouter. Cross is optional and
-on-demand, and provider setup, repair, disable, logout, and reconnect all keep
-Cross off until an explicit later `/collab` or `/cross` action.
+OpenRouter is the Stable, runnable provider in Slice 1.
+Kimi Code Abo is a Preview provider connected with a membership key; see
+[Kimi Code (Preview)](#kimi-code-preview) for its boundaries. Anthropic /
+Claude subscription is shown truthfully as Coming soon and cannot be connected
+yet; Claude models remain available through OpenRouter. Cross is optional and
+on-demand, and provider setup, repair, disable, logout, and reconnect for every
+provider keep Cross off until an explicit later `/collab` or `/cross` action.
 
 <!-- orcode:command-docs:start -->
 | Command | Aliases | Usage | Description |
@@ -247,7 +255,129 @@ Command-line flags: `-C`/`--cwd <path>` (workspace), `-p`/`--prompt <text>`
 `-a`/`--approval <mode>`, `--compress <mode>`, `--new`, `--continue`,
 `--chat <id>`, `--plain` (non-fullscreen output, for terminals without
 full-screen support or for debugging), `--json`, `-h`/`--help`,
-`-v`/`--version`.
+`-v`/`--version`. `--json` and unattended runs are not available on a Kimi
+Code route; see [Kimi Code (Preview)](#kimi-code-preview).
+
+## Kimi Code (Preview)
+
+orcode can connect a Kimi Code membership as a second provider next to
+OpenRouter. This provider is **Preview**: its behavior is verified with
+recorded fixtures and repository tests only. Automated tests never use a live
+Kimi credential, and the following live results have **not** been recorded
+yet:
+
+- an authenticated live model catalog (`GET /models` with a real membership
+  key),
+- streamed text from a live Kimi model,
+- streamed reasoning from a live Kimi model,
+- one complete live tool loop (model → tool call → tool result → model).
+
+Until all four exist as sanitized evidence, the provider stays Preview, and
+everything below describes the reviewed integration contract that the code
+implements against fixtures — not a promise about your account.
+
+### Setup with a membership key
+
+orcode is a third-party tool for Kimi Code and uses only the documented
+third-party integration path: a Kimi Code API key that you create yourself in
+the Kimi Code Console and paste into orcode's hidden-input prompt
+(`/provider connect kimi-code`). The only endpoint orcode talks to for Kimi
+is `https://api.kimi.com/coding/v1`.
+
+Setup validates the key with a single metadata call to the model catalog; it
+never sends a chat completion just to test a key. The key is then stored in
+your OS's native credential store, the same one OpenRouter keys use, and is
+never written to `config.json`, chats, run logs, exports, or reports. Provider
+state keeps only a local keyed fingerprint of the key that is never displayed.
+Because Kimi's third-party API does not expose a fixed account ID, replacing
+the key is conservatively treated as a possible account/billing change and
+asks for explicit confirmation. `/key` continues to manage only the OpenRouter
+key.
+
+Exactly four model IDs are supported. orcode intersects the catalog your key
+returns with this fixed list, ignores unknown IDs, and hides listed IDs that
+your membership does not return:
+
+| Model ID | Display name |
+| --- | --- |
+| `k3` | Kimi K3 |
+| `k3-256k` | Kimi K3 256K |
+| `kimi-for-coding` | Kimi K2.7 Code |
+| `kimi-for-coding-highspeed` | Kimi K2.7 Code HighSpeed |
+
+Which of these your membership tier can use, and how much, is decided by Kimi,
+not by orcode. Limits are provider-managed, and Kimi may bill optional Extra
+Usage on top of the membership. orcode therefore never presents a request as
+costing nothing, never displays remaining quota, and shows Kimi costs as
+`providerverwaltet / unbekannt` instead of a number; check usage in your Kimi
+Code account. A model or tier your membership does not include is reported as
+unavailable without discarding the key, and a catalog outage leaves the key
+saved and the provider offline/unknown.
+
+By contract, one Kimi connection with one model is enough for ordinary chat,
+and OpenRouter is not required for it. That end-to-end path is exactly what
+the live results listed above would record; it has not been recorded yet.
+
+### Owner-only, local, interactive use
+
+Kimi Code membership is for personal interactive use, and orcode enforces
+that boundary: a Kimi route works only in a local, user-initiated interactive
+orcode session under the OS account that holds the key. The following are
+unavailable for Kimi and are rejected before any credential read or network
+access:
+
+- `--json` output and piped or otherwise unattended batch runs,
+- scheduled or background execution,
+- relay, remote, shared-service, shared-daemon, and multi-user setups,
+- use by collaborators or through a shared subscription,
+- resale and SaaS proxying.
+
+Multi-user or automated Kimi use would need a separate design and separate
+provider credentials; it cannot be enabled by configuration.
+
+### What orcode deliberately does not do
+
+- **No Kimi OAuth or device-code login.** That path belongs to the official
+  Kimi CLI and VS Code extension; orcode does not copy their client identity,
+  tokens, device codes, or User-Agent. Where the setup explanation shows
+  `Mit Kimi anmelden · Coming soon`, that row is presentation only: it starts
+  no process, opens no browser, and touches no file, credential, or network.
+- **No Kimi CLI credential reuse.** orcode never reads the official client's
+  credential store and never runs `kimi login`.
+- **No browser cookies.**
+- **No environment-variable fallback.** Unlike `OPENROUTER_API_KEY`, there is
+  no Kimi environment variable; the saved membership key is the only source.
+- **No Kimi Open Platform fallback.** A Moonshot / Kimi Open Platform
+  pay-as-you-go key or base URL is never tried in place of the membership
+  endpoint.
+
+### Commands and lifecycle
+
+All Kimi actions go through `/provider` and act on the exact selected Kimi
+connection:
+
+| Command | Effect |
+| --- | --- |
+| `/provider connect kimi-code` | Ask for a membership key with hidden input, validate it against the catalog, store it, and bind the route. |
+| `/provider enable kimi-code` | Re-enable a disabled connection, reading only the exact retained key. |
+| `/provider disable kimi-code` | Keep the key, but make the next startup perform zero Kimi credential reads and zero network calls. |
+| `/provider reconnect kimi-code` | Re-run the catalog inspection on the saved key and rebind the route. |
+| `/provider status` | Show safe state only: readiness, `Preview`, billing realm, health, and `Cross: aus`/`an` — never the key, a fragment, an account ID, an email address, or a quota figure. |
+| `/provider models kimi-code` | List the supported models your membership currently returns. |
+| `/provider logout kimi-code` | After an explicit confirmation, clear every route bound to that connection and delete the stored key. |
+
+`/provider disconnect` is not offered for Kimi. Cross stays **off** after every
+one of these actions and after setup, model change, repair, recovery, and
+restart; only an explicit later `/collab` or `/cross` action can start it.
+
+### Unsupported features on Kimi routes
+
+Image attachments (`/image`), voice input (`/whisper`), `/panel`, and `/web`
+have no Kimi runtime contract yet. On a Kimi route they are unavailable, and
+orcode does not fall back to OpenRouter for them. The compressor uses the
+exact same Kimi connection and model or is disabled; a Kimi-only session never
+reads an OpenRouter key. `/models` still lists OpenRouter models — use
+`/provider models kimi-code` for Kimi.
 
 ## Privacy and data flow
 
@@ -261,6 +391,12 @@ full-screen support or for debugging), `--json`, `-h`/`--help`,
   the compressor model is chosen independently. If you enable `/web`,
   search queries go through OpenRouter's web-search plugin as well. Nothing
   is sent anywhere else by orcode itself.
+- **With a Kimi Code route,** the same categories of data go to
+  `api.kimi.com` (Kimi) instead of OpenRouter, for the main model and — if
+  enabled — for the compressor, which uses the same Kimi connection. Every
+  request carries orcode's own product/version identity. Kimi error
+  responses are reduced to fixed orcode messages; response bodies, headers,
+  and request IDs are neither shown nor logged.
 - **What stays local:** orcode's own state — chat transcripts,
   compressed handoffs, timestamps, costs, checkpoints, tool-call records,
   and the append-only run log — lives under `~/.orcode/` on your
@@ -279,9 +415,9 @@ full-screen support or for debugging), `--json`, `-h`/`--help`,
   subsystem.** It is stored in your OS's native credential store via
   `@napi-rs/keyring`, is not passed to a child process as a command-line
   argument, and shell tools receive an environment with credential-like
-  variables removed. If the same value is deliberately included in file or
-  conversation content, the exact recovery-artifact exception above still
-  applies.
+  variables removed. The same applies to a saved Kimi Code membership key.
+  If the same value is deliberately included in file or conversation
+  content, the exact recovery-artifact exception above still applies.
 - **The optional management key** is used only for the account-wide
   `GET /credits` call behind `/balance`; it is never sent to a model or to
   a child process. Without it, orcode still validates your inference

@@ -9,6 +9,42 @@ breaking changes.
 
 ## [Unreleased]
 
+### Added
+
+- Kimi Code membership provider (**Preview**). `/provider connect kimi-code`
+  takes a user-created Kimi Code membership API key with hidden input,
+  validates it with one catalog call against `https://api.kimi.com/coding/v1`,
+  stores it in the OS credential store, and keeps only a never-displayed keyed
+  account fingerprint in provider state. Exactly four model IDs are supported
+  and gated by the returned catalog: `k3`, `k3-256k`, `kimi-for-coding`, and
+  `kimi-for-coding-highspeed`. `enable`, `disable`, `reconnect`, `status`,
+  `models`, and `logout` complete the lifecycle; `status` shows safe state only.
+- Kimi limits are provider-managed and paid Extra Usage may apply; orcode shows
+  Kimi costs as provider-managed/unknown, displays no quota, and never presents
+  a request as costing nothing.
+
+### Security
+
+- Kimi Code is restricted to owner-only local interactive use. JSON, piped or
+  unattended batch, scheduled, relay, collaborator, shared-service, multi-user,
+  resale, and SaaS use are rejected before any credential read or network
+  access.
+- No Kimi OAuth/device-code login, Kimi CLI credential reuse, browser cookies,
+  environment-variable key fallback, or Kimi Open Platform fallback exists;
+  `Mit Kimi anmelden` remains Coming soon and has no effect. Kimi error
+  responses are reduced to fixed messages without bodies, headers, request IDs,
+  or key fragments.
+
+### Known limitations
+
+- Image, voice, `/panel`, and `/web` are unavailable on Kimi routes and do not
+  fall back to OpenRouter; the compressor uses the same Kimi connection or is
+  disabled. Cross stays off through every Kimi setup, command, and recovery
+  path.
+- Kimi remains Preview and fixture-verified: the authenticated live catalog,
+  streamed text, streamed reasoning, and one-tool-loop smokes are not yet
+  recorded.
+
 ## [0.4.1] - 2026-08-23
 
 ### Added
