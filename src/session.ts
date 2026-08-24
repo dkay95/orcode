@@ -305,7 +305,9 @@ export class SessionStore {
       }
       this.#data.route = persistable;
       this.#pendingLegacyRouteProjection = false;
-    } else if (this.#data.route?.requestedModelId !== trimmedModel) {
+    } else if (this.#data.route === undefined || !routeOwnsModel(this.#data.route, trimmedModel)) {
+      // A route-less update keeps the exact current route as long as it owns
+      // the model (requested or canonical id); it never synthesizes one.
       delete this.#data.route;
       this.#pendingLegacyRouteProjection = false;
     }
@@ -1118,14 +1120,30 @@ function normalizeSession(
   };
 }
 
+/** The closed own-key set of `RouteIdentityV1`; nothing else may enter a chat file. */
+const ROUTE_IDENTITY_V1_KEYS: ReadonlySet<string> = new Set<keyof RouteIdentityV1>([
+  "version",
+  "backendId",
+  "accountFingerprint",
+  "billingRealm",
+  "requestedModelId",
+  "canonicalModelId",
+  "resolutionState",
+]);
+
 /**
- * A route the chat file may own. Beyond the shared shape check, only the
- * migrated OpenRouter connection ever produces a `legacy-unverified` route;
- * any other backend must be fully resolved or it is not a runnable identity.
+ * A route the chat file may own. Beyond the shared shape check, the route must
+ * carry exactly the known own keys (an extra future or credential-like field is
+ * never persisted, reopened, or echoed), and only the migrated OpenRouter
+ * connection ever produces a `legacy-unverified` route; any other backend must
+ * be fully resolved or it is not a runnable identity.
  */
 function persistableSessionRoute(value: unknown): RouteIdentityV1 | null {
   const route = validateRouteIdentityV1(value);
   if (route === null) {
+    return null;
+  }
+  if (Object.keys(route).some((key) => !ROUTE_IDENTITY_V1_KEYS.has(key))) {
     return null;
   }
   if (route.backendId !== "openrouter" && route.resolutionState !== "resolved") {

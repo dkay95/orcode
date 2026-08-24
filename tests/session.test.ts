@@ -2139,3 +2139,153 @@ test("privacy canaries never enter the serialized kimi session route or session 
   );
   assert.ok((await readFile(path, "utf8")).includes("canary-header-value-7f3a"), "fixture stays untouched");
 });
+
+// ---------------------------------------------------------------------------
+// Task 7A review fix — canonical-model preference updates and closed route keys
+// ---------------------------------------------------------------------------
+
+const ROUTE_IDENTITY_V1_OWN_KEYS = Object.freeze([
+  "version",
+  "backendId",
+  "accountFingerprint",
+  "billingRealm",
+  "requestedModelId",
+  "canonicalModelId",
+  "resolutionState",
+] as const);
+
+test("route-less setPreferences keeps the exact kimi route when the model is its canonical id", async () => {
+  const { workspace, appHome } = await workspaceRoot("kimi-route-canonical-prefs");
+  const canonicalRoute: RouteIdentityV1 = {
+    ...KIMI_SESSION_ROUTE,
+    requestedModelId: "k3",
+    canonicalModelId: "kimi-k3-0905",
+  };
+  const routeBytes = JSON.stringify(canonicalRoute);
+  const store = SessionStore.create(workspace, appHome, "Kimi canonical prefs");
+  store.setPreferences("k3", { mode: "auto" }, canonicalRoute);
+  store.addTurn("user", "historical kimi turn");
+  await store.save();
+
+  // `/think` style update: reasoning changes, the model is addressed by its
+  // canonical id, no route is supplied.
+  store.setPreferences("kimi-k3-0905", { mode: "effort", effort: "high" });
+  assert.equal(JSON.stringify(store.data.route), routeBytes);
+  assert.equal(store.data.model, "kimi-k3-0905");
+  await store.save();
+
+  const persisted = JSON.parse(await readFile(store.path, "utf8")) as PersistedSessionData;
+  assert.equal(JSON.stringify(persisted.route), routeBytes);
+  assert.equal(persisted.model, "kimi-k3-0905");
+  assert.deepEqual(persisted.reasoning, { mode: "effort", effort: "high" });
+  const afterUpdate = await readFile(store.path, "utf8");
+
+  const reopened = await SessionStore.openById(
+    workspace,
+    store.data.id,
+    appHome,
+    LEGACY_OPENROUTER_DEFAULT_CONNECTION,
+  );
+  assert.equal(JSON.stringify(reopened.data.route), routeBytes);
+  assert.equal(reopened.data.route?.backendId, "kimi-code");
+  assert.equal(reopened.data.model, "kimi-k3-0905");
+  reopened.rebindPendingLegacyRoute(LEGACY_OPENROUTER_DEFAULT_CONNECTION);
+  assert.equal(JSON.stringify(reopened.data.route), routeBytes);
+
+  const listed = await SessionStore.list(workspace, appHome, LEGACY_OPENROUTER_DEFAULT_CONNECTION);
+  assert.equal(JSON.stringify(listed.find((chat) => chat.id === store.data.id)?.route), routeBytes);
+
+  const outcome = await reopened.save();
+  assert.equal(outcome.merged, false);
+  assert.equal(await readFile(store.path, "utf8"), afterUpdate, "reopen and save do not churn the route");
+
+  // A model the route does not own still drops the route and synthesizes nothing.
+  reopened.setPreferences("k3-256k", { mode: "auto" });
+  assert.equal(reopened.data.route, undefined);
+  assert.equal(reopened.data.model, "k3-256k");
+});
+
+const EXTRA_FIELD_KIMI_ROUTES: ReadonlyArray<{ name: string; key: string; value: unknown }> = [
+  { name: "future connection id", key: "connectionId", value: "conn_future_kimi_7f3a" },
+  { name: "future resolution alias", key: "resolution", value: "resolved-7f3a" },
+  { name: "future capability map", key: "capabilities", value: { tools: true, reasoning: false } },
+  { name: "future undefined-valued note", key: "note", value: null },
+  { name: "credential-like api key", key: "apiKey", value: KIMI_CANARIES.rawKey },
+  { name: "credential-like auth header", key: "authorization", value: KIMI_CANARIES.header },
+  { name: "credential-like error body", key: "lastError", value: KIMI_CANARIES.body },
+  { name: "credential-like credential path", key: "credentialPath", value: KIMI_CANARIES.path },
+];
+
+function extraFieldRoute(key: string, value: unknown): Record<string, unknown> {
+  return { ...KIMI_SESSION_ROUTE, [key]: value };
+}
+
+function assertNoExtraFieldTrace(text: string, key: string, value: unknown, name: string): void {
+  assertNoCanary(text);
+  assert.ok(!text.includes(`"${key}"`), `${name}: extra key leaked into: ${text.slice(0, 80)}`);
+  if (typeof value === "string") {
+    assert.ok(!text.includes(value), `${name}: extra value leaked into: ${text.slice(0, 80)}`);
+  } else if (value !== null) {
+    assert.ok(!text.includes(JSON.stringify(value)), `${name}: extra value leaked into: ${text.slice(0, 80)}`);
+  }
+}
+
+test("setPreferences rejects routes carrying extra own fields and persists exactly the closed key set", async () => {
+  const { workspace, appHome } = await workspaceRoot("kimi-route-extra-fields-prefs");
+  for (const { name, key, value } of EXTRA_FIELD_KIMI_ROUTES) {
+    const store = SessionStore.create(workspace, appHome, `Extra ${name}`);
+    store.setPreferences("k3", { mode: "auto" }, KIMI_SESSION_ROUTE);
+    const before = structuredClone(store.data);
+    assert.throws(
+      () => store.setPreferences(
+        "k3",
+        { mode: "effort", effort: "low" },
+        extraFieldRoute(key, value) as unknown as RouteIdentityV1,
+      ),
+      (error: unknown) => {
+        assert.ok(error instanceof Error, name);
+        assert.equal(error.message, "Chat-Route ist unvollständig oder unbekannt.", name);
+        assertNoExtraFieldTrace(error.message, key, value, name);
+        return true;
+      },
+      name,
+    );
+    assert.deepEqual(store.data, before, name);
+    await store.save();
+    const raw = await readFile(store.path, "utf8");
+    assertNoExtraFieldTrace(raw, key, value, name);
+    const persisted = JSON.parse(raw) as PersistedSessionData;
+    assert.deepEqual(persisted.route, KIMI_SESSION_ROUTE, name);
+    assert.deepEqual(Object.keys(persisted.route ?? {}), [...ROUTE_IDENTITY_V1_OWN_KEYS], name);
+    assert.deepEqual(persisted.reasoning, { mode: "auto" }, name);
+  }
+});
+
+test("reopen, list, and search fail closed on persisted routes carrying extra own fields", async () => {
+  const { workspace, appHome } = await workspaceRoot("kimi-route-extra-fields-reopen");
+  for (const [index, { name, key, value }] of EXTRA_FIELD_KIMI_ROUTES.entries()) {
+    const id = `kimi-extra-${index}`;
+    const path = await writeKimiChatFile(appHome, workspace, id, {
+      route: extraFieldRoute(key, value),
+    });
+    const original = await readFile(path, "utf8");
+
+    for (const connection of [LEGACY_OPENROUTER_DEFAULT_CONNECTION, undefined]) {
+      await assert.rejects(
+        SessionStore.openById(workspace, id, appHome, connection),
+        (error: unknown) => {
+          assert.ok(error instanceof Error, name);
+          assert.match(error.message, /Chat-Datei ist ungültig/, name);
+          assertNoExtraFieldTrace(error.message, key, value, name);
+          return true;
+        },
+        name,
+      );
+      const listed = await SessionStore.list(workspace, appHome, connection);
+      assert.equal(listed.some((chat) => chat.id === id), false, name);
+      const hits = await SessionStore.search(workspace, "historical kimi turn", appHome, connection);
+      assert.equal(hits.some((hit) => hit.chat.id === id), false, name);
+    }
+    assert.equal(await readFile(path, "utf8"), original, name);
+  }
+});
