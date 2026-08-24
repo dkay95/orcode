@@ -165,7 +165,7 @@ export const COMMAND_CATALOG = [
     name: "provider",
     handlerId: "provider",
     usage: "/provider [setup|connect|enable|disable|disconnect|reconnect|status|models|logout|sort|allow|deny|only|ignore|fallback|clear]",
-    description: "OpenRouter Stable verwalten; Anthropic / Claude-Abo Coming soon",
+    description: "OpenRouter Stable verwalten; Kimi Code Abo Preview (Membership-Key); Anthropic / Claude-Abo Coming soon",
     acceptsArguments: true,
   },
   {

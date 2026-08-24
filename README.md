@@ -207,7 +207,7 @@ Cross off until an explicit later `/collab` or `/cross` action.
 | `/budget` |  | `/budget [day <USD>\|total <USD>\|on-exceed warn\|block]` | Workspace-Budget anzeigen oder Tages-/Gesamtlimit setzen |
 | `/verify` |  | `/verify [on\|off\|now\|suggest\|clear\|rounds <n>\|<befehl>]` | Verifikationskommandos nach Änderungen konfigurieren (A4) |
 | `/web` |  | `/web [on\|off\|auto]` | Websuche-Plugin für den Hauptlauf steuern (A2) |
-| `/provider` |  | `/provider [setup\|connect\|enable\|disable\|disconnect\|reconnect\|status\|models\|logout\|sort\|allow\|deny\|only\|ignore\|fallback\|clear]` | OpenRouter Stable verwalten; Anthropic / Claude-Abo Coming soon |
+| `/provider` |  | `/provider [setup\|connect\|enable\|disable\|disconnect\|reconnect\|status\|models\|logout\|sort\|allow\|deny\|only\|ignore\|fallback\|clear]` | OpenRouter Stable verwalten; Kimi Code Abo Preview (Membership-Key); Anthropic / Claude-Abo Coming soon |
 | `/fallback` | `/fallbacks` | `/fallback [+<modell>\|-<modell>\|clear]` | Fallback-Modellkette hinter dem Main-Modell pflegen (A3) |
 | `/history` |  | `/history [Anzahl]` | Letzte Gesprächsrunden anzeigen |
 | `/checkpoint` | `/checkpoints` | `/checkpoint [list\|new [Name]\|restore <ID\|Name>]` | Stand im Chat markieren oder auf eine Marke zurücksetzen |
