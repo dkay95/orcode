@@ -29,7 +29,7 @@ import {
   validateProviderSetupState,
   type ProviderConnectionStateV1,
   type ProviderStateCommitRequest,
-  type ProviderSetupStateV1,
+  type ProviderSetupStateV2,
 } from "../src/provider-state.js";
 import { SetupOrchestrator, type SetupClock, type StartupSetupResult } from "../src/setup.js";
 import {
@@ -287,9 +287,9 @@ function route(fingerprint: string): RouteIdentityV1 {
 function stateWithConnections(
   connections: ProviderConnectionStateV1[],
   defaultRoute: RouteIdentityV1 | null,
-): ProviderSetupStateV1 {
+): ProviderSetupStateV2 {
   return {
-    schemaVersion: 1,
+    schemaVersion: 2,
     revision: 4,
     lifecycle: "configured",
     connections,
@@ -411,7 +411,7 @@ test("unknown versioned credential pointer fails closed without legacy or enviro
     read: () => structuredClone(state),
     async commit(
       _revision: number,
-      build: (current: ProviderSetupStateV1) => ProviderSetupStateV1,
+      build: (current: ProviderSetupStateV2) => ProviderSetupStateV2,
     ) {
       return build(structuredClone(state));
     },
@@ -2660,7 +2660,7 @@ type RuntimeUnderTest = {
 };
 
 function runtimeFixture(
-  initial: ProviderSetupStateV1,
+  initial: ProviderSetupStateV2,
   authorityOptions?: unknown,
   beforeExclusive?: () => void | Promise<void>,
 ): {
@@ -2752,7 +2752,7 @@ function runtimeFixture(
   };
 }
 
-function commandState(): ProviderSetupStateV1 {
+function commandState(): ProviderSetupStateV2 {
   const left = connection({ id: "connection-a", slot: SLOT_A, fingerprint: FINGERPRINT_A });
   const right = connection({ id: "connection-b", slot: SLOT_B, fingerprint: FINGERPRINT_B });
   left.lastHealth = {
@@ -2958,7 +2958,7 @@ test("explicit enable reuses the retained slot without replacement allocation", 
 function retainedEnableFixture(
   assertHeld: () => void | Promise<void> = () => undefined,
   afterOperation: () => void | Promise<void> = () => undefined,
-  persist?: (request: ProviderStateCommitRequest) => Promise<ProviderSetupStateV1>,
+  persist?: (request: ProviderStateCommitRequest) => Promise<ProviderSetupStateV2>,
 ) {
   const credentials = new AuthorityCredentials({}, { [SLOT_A]: SECRET_A });
   const initialState = stateWithConnections([
@@ -3245,7 +3245,7 @@ test("retained enable completes an exact adopted tuple when persistence hangs af
 
 test("retained enable does not settle or logout before a late genuine durable-adoption outcome", async () => {
   let fixture!: ReturnType<typeof retainedEnableFixture>;
-  let durable: ProviderSetupStateV1 | null = null;
+  let durable: ProviderSetupStateV2 | null = null;
   let publicationReached!: () => void;
   let releaseAdoption!: () => void;
   let adoptionFinished!: () => void;
@@ -3297,7 +3297,7 @@ test("retained enable does not settle or logout before a late genuine durable-ad
   await finished;
   const final = await attempt;
   const committed = fixture.stateStore.read();
-  const durableReadback = durable as ProviderSetupStateV1 | null;
+  const durableReadback = durable as ProviderSetupStateV2 | null;
 
   assert.deepEqual(final, {
     kind: "setup",
@@ -3369,7 +3369,7 @@ test("retained enable reports ready after an outer post-commit authority failure
 
 test("retained enable adopts a durable commit that rejects after exact adoption", async () => {
   let fixture!: ReturnType<typeof retainedEnableFixture>;
-  let durable: ProviderSetupStateV1 | null = null;
+  let durable: ProviderSetupStateV2 | null = null;
   fixture = retainedEnableFixture(
     () => undefined,
     () => undefined,
@@ -3387,7 +3387,7 @@ test("retained enable adopts a durable commit that rejects after exact adoption"
     "plain",
   );
   const committed = fixture.stateStore.read();
-  const durableCommit = durable as ProviderSetupStateV1 | null;
+  const durableCommit = durable as ProviderSetupStateV2 | null;
 
   assert.deepEqual(result, {
     kind: "setup",
@@ -3403,7 +3403,7 @@ test("retained enable adopts a durable commit that rejects after exact adoption"
 
 test("retained enable adopts an exact commit when persistence resolves a wrong readback", async () => {
   let fixture!: ReturnType<typeof retainedEnableFixture>;
-  let durable: ProviderSetupStateV1 | null = null;
+  let durable: ProviderSetupStateV2 | null = null;
   fixture = retainedEnableFixture(
     () => undefined,
     () => undefined,
@@ -3421,7 +3421,7 @@ test("retained enable adopts an exact commit when persistence resolves a wrong r
     "plain",
   );
   const committed = fixture.stateStore.read();
-  const durableCommit = durable as ProviderSetupStateV1 | null;
+  const durableCommit = durable as ProviderSetupStateV2 | null;
 
   assert.deepEqual(result, {
     kind: "setup",

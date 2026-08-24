@@ -40,7 +40,7 @@ import {
 import { PrivateStore } from "../src/private-store.js";
 import {
   ProviderStateStore,
-  type ProviderSetupStateV1,
+  type ProviderSetupStateV2,
 } from "../src/provider-state.js";
 import { scanForSecrets } from "../src/redaction.js";
 import { SetupOrchestrator, type SetupEvent } from "../src/setup.js";
@@ -249,8 +249,8 @@ async function crashAndRecoverRealActivation(
       reasoning: true,
     },
   };
-  const initialState: ProviderSetupStateV1 = {
-    schemaVersion: 1,
+  const initialState: ProviderSetupStateV2 = {
+    schemaVersion: 2,
     revision: 3,
     lifecycle: "never-configured",
     connections: [],
@@ -533,7 +533,7 @@ async function realProviderInspectionCorpus(values: PrivacyProbes): Promise<stri
     resolutionState: "resolved",
   };
   const stateStore = new ProviderStateStore({
-    schemaVersion: 1,
+    schemaVersion: 2,
     revision: 4,
     lifecycle: "configured",
     connections: [{

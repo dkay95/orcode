@@ -383,6 +383,7 @@ export class CredentialStore implements VersionedCredentialStoreLike {
   }
 
   async get(kind: CredentialKind): Promise<string | null> {
+    assertLegacyCredentialKind(kind);
     let value: string | undefined | null;
     try {
       value = await this.entry(kind).getPassword();
@@ -395,6 +396,7 @@ export class CredentialStore implements VersionedCredentialStoreLike {
   }
 
   async set(kind: CredentialKind, secret: string): Promise<void> {
+    assertLegacyCredentialKind(kind);
     const normalized = normalizeProviderSecret(secret);
     const entry = this.entry(kind);
     let previous: string | null;
@@ -470,6 +472,7 @@ export class CredentialStore implements VersionedCredentialStoreLike {
   }
 
   async delete(kind: CredentialKind): Promise<boolean> {
+    assertLegacyCredentialKind(kind);
     let existing: string | null = null;
     try {
       existing = await this.get(kind);
@@ -489,6 +492,7 @@ export class CredentialStore implements VersionedCredentialStoreLike {
   }
 
   async has(kind: CredentialKind): Promise<boolean> {
+    assertLegacyCredentialKind(kind);
     return Boolean(await this.get(kind));
   }
 
@@ -535,6 +539,12 @@ function parseSlotRef(slot: CredentialSlotRef): ParsedSlot {
 
 function isCredentialSlotKind(value: unknown): value is CredentialSlotKind {
   return value === "inference" || value === "management" || value === "kimi-code";
+}
+
+function assertLegacyCredentialKind(value: unknown): asserts value is CredentialKind {
+  if (value !== "inference" && value !== "management") {
+    throw new Error("Der Credential-Typ ist ungültig.");
+  }
 }
 
 function decodeAccountHmacKey(value: string): Uint8Array {

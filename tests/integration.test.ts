@@ -33,7 +33,7 @@ import { PrivateStore } from "../src/private-store.js";
 import {
   ProviderStateStore,
   type ProviderConnectionStateV1,
-  type ProviderSetupStateV1,
+  type ProviderSetupStateV2,
 } from "../src/provider-state.js";
 import { createRunId, RunLog } from "../src/runlog.js";
 import { RuleStore, rulesPath, shellApprovalSubject } from "../src/rules.js";
@@ -145,10 +145,10 @@ function collectOutput(): { out: CommandOutput; lines: string[] } {
 
 interface TaskTenActivationTuple {
   revision: number;
-  lifecycle: ProviderSetupStateV1["lifecycle"];
+  lifecycle: ProviderSetupStateV2["lifecycle"];
   connections: ProviderConnectionStateV1[];
   route: RouteIdentityV1 | null;
-  cross: ProviderSetupStateV1["cross"];
+  cross: ProviderSetupStateV2["cross"];
   slots: Array<{
     id: string;
     secret: "old" | "new" | "foreign" | "other";
@@ -279,8 +279,8 @@ async function recoverTaskTenActivationTuple(
       reasoning: true,
     },
   };
-  const oldState: ProviderSetupStateV1 = {
-    schemaVersion: 1,
+  const oldState: ProviderSetupStateV2 = {
+    schemaVersion: 2,
     revision: 3,
     lifecycle: "configured",
     connections: [{
@@ -455,7 +455,7 @@ async function recoverTaskTenActivationTuple(
 
   const loaded = await loadConfigDetailed(configPath);
   assert.equal("kind" in loaded.config.providerSetup, false);
-  const state = loaded.config.providerSetup as ProviderSetupStateV1;
+  const state = loaded.config.providerSetup as ProviderSetupStateV2;
   let journals: string[];
   try {
     journals = (await readdir(join(appHome, "provider-activation"))).sort();
@@ -874,7 +874,7 @@ test("/chat list with a migrated connection stays read-only and does not persist
     },
   };
   context.config.providerSetup = {
-    schemaVersion: 1,
+    schemaVersion: 2,
     revision: 2,
     lifecycle: "configured",
     connections: [connection],
@@ -923,7 +923,7 @@ test("later /chat open keeps using the verified migrated OpenRouter connection f
     },
   };
   context.config.providerSetup = {
-    schemaVersion: 1,
+    schemaVersion: 2,
     revision: 0,
     lifecycle: "migrated",
     connections: [{

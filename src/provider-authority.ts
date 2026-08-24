@@ -7,7 +7,7 @@ import {
 } from "./credentials.js";
 import type {
   ProviderConnectionStateV1,
-  ProviderSetupStateV1,
+  ProviderSetupStateV2,
   ProviderStateStore,
 } from "./provider-state.js";
 import type { RouteIdentityV1 } from "./backends.js";
@@ -102,7 +102,7 @@ export interface ProviderCandidateAuthorityRequest extends ProviderCandidatePref
 export interface ProviderCandidateSnapshotAuthorityRequest
   extends ProviderCandidateAuthorityRequest {
   candidate: string;
-  authoritativeState: ProviderSetupStateV1;
+  authoritativeState: ProviderSetupStateV2;
 }
 
 export type ProviderCandidatePreflightResult =
@@ -666,7 +666,7 @@ export class ProviderCredentialAuthority implements ProviderCredentialAuthorityL
   async #readInferencePermit(
     request: ProviderCredentialRequest,
     binding: ProviderConnectionBindingV1,
-    state: ProviderSetupStateV1,
+    state: ProviderSetupStateV2,
   ): Promise<CredentialPermit | ProviderCredentialAccessResult<never>> {
     let stored: string | null;
     const pointer = binding.credentialPointer;
@@ -698,7 +698,7 @@ export class ProviderCredentialAuthority implements ProviderCredentialAuthorityL
 
   async #readAuthoritativeState(
     request: ProviderCandidatePreflightRequest,
-  ): Promise<ProviderSetupStateV1> {
+  ): Promise<ProviderSetupStateV2> {
     const expectedRevision = this.#stateStore.read().revision;
     try {
       await this.#bounded(
@@ -723,7 +723,7 @@ export class ProviderCredentialAuthority implements ProviderCredentialAuthorityL
   async #readManagementPermit(
     request: ProviderCredentialRequest,
     binding: ProviderConnectionBindingV1,
-    state: ProviderSetupStateV1,
+    state: ProviderSetupStateV2,
   ): Promise<CredentialPermit | ProviderCredentialAccessResult<never>> {
     let stored: string | null;
     try {
@@ -767,7 +767,7 @@ export class ProviderCredentialAuthority implements ProviderCredentialAuthorityL
   #environmentAllowed(
     request: ProviderCredentialRequest,
     binding: ProviderConnectionBindingV1,
-    state: ProviderSetupStateV1,
+    state: ProviderSetupStateV2,
   ): boolean {
     if (request.environmentEligibility === "forbidden") return false;
     if (request.environmentEligibility === "explicit-repair") return true;
@@ -851,7 +851,7 @@ class ProviderAuthorityStaleError extends Error {
 }
 
 export class ProviderAuthoritySnapshot extends Error {
-  constructor(readonly state: ProviderSetupStateV1) {
+  constructor(readonly state: ProviderSetupStateV2) {
     super("Provider authority snapshot captured.");
     this.name = "ProviderAuthoritySnapshot";
   }
@@ -872,7 +872,7 @@ export function parseOpenRouterCredentialPointer(
 }
 
 export function selectOpenRouterBinding(
-  state: ProviderSetupStateV1,
+  state: ProviderSetupStateV2,
   selector: ProviderBindingSelector,
   allowDisabled = false,
 ): ProviderBindingSelection {
@@ -922,7 +922,7 @@ export function selectOpenRouterBinding(
 }
 
 function connectionsForRoute(
-  state: ProviderSetupStateV1,
+  state: ProviderSetupStateV2,
   route: RouteIdentityV1,
 ): ProviderConnectionStateV1[] {
   if (route.backendId !== "openrouter") return [];

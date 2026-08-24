@@ -20,7 +20,7 @@ import type {
 import {
   readProviderStateCommitAdoption,
   type ProviderConnectionStateV1,
-  type ProviderSetupStateV1,
+  type ProviderSetupStateV2,
   type ProviderStateStore,
 } from "./provider-state.js";
 
@@ -147,7 +147,7 @@ interface InspectionProof {
 }
 
 interface ApplyResult {
-  state: ProviderSetupStateV1;
+  state: ProviderSetupStateV2;
   changed: boolean;
 }
 
@@ -427,7 +427,7 @@ export class SetupOrchestrator {
         return this.#latestResult
           ?? this.#setupRequiredResult(current, token.generation);
       }
-      let state: ProviderSetupStateV1;
+      let state: ProviderSetupStateV2;
       try {
         state = await this.#commitCancelled(captured, token.generation);
       } catch (error) {
@@ -654,7 +654,7 @@ export class SetupOrchestrator {
     }
     const canonicalModelId = exact[0]!.canonicalModelId;
 
-    let committed: ProviderSetupStateV1;
+    let committed: ProviderSetupStateV2;
     try {
       committed = await this.#stateStore.commit(
         captured.revision,
@@ -906,7 +906,7 @@ export class SetupOrchestrator {
   }
 
   #targets(
-    state: ProviderSetupStateV1,
+    state: ProviderSetupStateV2,
     backendId?: BackendId,
     connectionId?: string,
   ): ProbeTarget[] {
@@ -1122,7 +1122,7 @@ export class SetupOrchestrator {
 
   #publishInspectionEvents(
     outcomes: readonly ProbeOutcome[],
-    state: ProviderSetupStateV1,
+    state: ProviderSetupStateV2,
     generationToken: GenerationToken,
   ): boolean {
     const generation = generationToken.generation;
@@ -1190,7 +1190,7 @@ export class SetupOrchestrator {
 
   #recordProofs(
     outcomes: readonly ProbeOutcome[],
-    state: ProviderSetupStateV1,
+    state: ProviderSetupStateV2,
     generation: number,
   ): void {
     for (const outcome of outcomes) {
@@ -1222,7 +1222,7 @@ export class SetupOrchestrator {
   }
 
   #reduce(
-    state: ProviderSetupStateV1,
+    state: ProviderSetupStateV2,
     generation: number,
     outcomes: readonly ProbeOutcome[],
   ): StartupSetupResult {
@@ -1281,7 +1281,7 @@ export class SetupOrchestrator {
 
   #routeHasProof(
     route: RouteIdentityV1,
-    state: ProviderSetupStateV1,
+    state: ProviderSetupStateV2,
     generation: number,
   ): boolean {
     const connections = state.connections.filter((candidate) =>
@@ -1318,7 +1318,7 @@ export class SetupOrchestrator {
   }
 
   #publishRouteChoice(
-    state: ProviderSetupStateV1,
+    state: ProviderSetupStateV2,
     generation: number,
     route: RouteIdentityV1,
   ): StartupSetupResult {
@@ -1341,7 +1341,7 @@ export class SetupOrchestrator {
   }
 
   #setupRequiredResult(
-    state: ProviderSetupStateV1,
+    state: ProviderSetupStateV2,
     generation: number,
   ): StartupSetupResult {
     return freezeResult({
@@ -1355,7 +1355,7 @@ export class SetupOrchestrator {
   }
 
   async #handleCallerCancellation(
-    captured: ProviderSetupStateV1,
+    captured: ProviderSetupStateV2,
     generationToken: GenerationToken,
     signal: AbortSignal,
   ): Promise<never> {
@@ -1372,7 +1372,7 @@ export class SetupOrchestrator {
   }
 
   async #handleLegacyCallerCancellation(
-    captured: ProviderSetupStateV1,
+    captured: ProviderSetupStateV2,
     generation: number,
     signal: AbortSignal,
   ): Promise<never> {
@@ -1388,9 +1388,9 @@ export class SetupOrchestrator {
   }
 
   async #commitCancelled(
-    captured: ProviderSetupStateV1,
+    captured: ProviderSetupStateV2,
     generation: number,
-  ): Promise<ProviderSetupStateV1> {
+  ): Promise<ProviderSetupStateV2> {
     try {
       return await this.#stateStore.commit(
         captured.revision,
@@ -1519,7 +1519,7 @@ export class SetupOrchestrator {
 }
 
 function applyOutcomes(
-  state: ProviderSetupStateV1,
+  state: ProviderSetupStateV2,
   outcomes: readonly ProbeOutcome[],
 ): ApplyResult {
   const next = structuredClone(state);

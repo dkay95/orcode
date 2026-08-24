@@ -21,7 +21,7 @@ import {
   migrateLegacyOpenRouterState,
   ProviderStateStore,
   type ProviderConnectionStateV1,
-  type ProviderSetupStateV1,
+  type ProviderSetupStateV2,
 } from "../src/provider-state.js";
 
 interface ClockTask {
@@ -222,10 +222,10 @@ function configuredState(options: {
   defaultRoute?: RouteIdentityV1 | null;
   preferredLead?: RouteIdentityV1 | null;
   preferredChallenger?: RouteIdentityV1 | null;
-} = {}): ProviderSetupStateV1 {
+} = {}): ProviderSetupStateV2 {
   const primary = options.connections?.[0] ?? connection();
   return {
-    schemaVersion: 1,
+    schemaVersion: 2,
     revision: 0,
     lifecycle: "configured",
     connections: options.connections ?? [primary],
@@ -317,7 +317,7 @@ function forbiddenActivation(): ActivationDouble {
 }
 
 async function setupFixture(options: {
-  state?: ProviderSetupStateV1;
+  state?: ProviderSetupStateV2;
   stateStore?: ProviderStateStore;
   adapter?: FakeAdapter;
   clock?: FakeClock;
@@ -1675,7 +1675,7 @@ test("a superseded generation cannot publish after durable adoption returns", as
 test("runnable route proof is revoked by current provider state revision or disable", async (t) => {
   const cases: Array<{
     name: string;
-    mutate(state: ProviderSetupStateV1): void;
+    mutate(state: ProviderSetupStateV2): void;
   }> = [
     {
       name: "unrelated revision",

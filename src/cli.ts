@@ -176,7 +176,7 @@ import {
   validateProviderSetupState,
   validateRouteIdentityV1,
   type ProviderConnectionStateV1,
-  type ProviderSetupStateV1,
+  type ProviderSetupStateV2,
   type ProviderStateCommitRequest,
 } from "./provider-state.js";
 import {
@@ -596,7 +596,7 @@ const LEGACY_LOGOUT_COMMIT_PROOF = Symbol("legacy-logout-commit-proof");
 
 interface LegacyLogoutCommittedOutcome {
   readonly proof: typeof LEGACY_LOGOUT_COMMIT_PROOF;
-  readonly state: ProviderSetupStateV1;
+  readonly state: ProviderSetupStateV2;
   readonly result: Extract<ProviderCommandResult, { kind: "changed" }>;
   completed: boolean;
 }
@@ -1427,7 +1427,7 @@ export class DefaultProviderRuntime implements ProviderRuntime {
     });
   }
 
-  #desiredSessionRoute(state: ProviderSetupStateV1): RouteIdentityV1 | null {
+  #desiredSessionRoute(state: ProviderSetupStateV2): RouteIdentityV1 | null {
     if (this.#sessionRoute?.resolutionState === "resolved") {
       return structuredClone(this.#sessionRoute);
     }
@@ -1441,7 +1441,7 @@ export class DefaultProviderRuntime implements ProviderRuntime {
       : null;
   }
 
-  #selectedOpenRouterConnection(state: ProviderSetupStateV1) {
+  #selectedOpenRouterConnection(state: ProviderSetupStateV2) {
     const desiredRoute = this.#desiredSessionRoute(state);
     const selected = desiredRoute
       ? selectOpenRouterBinding(state, { kind: "route", route: desiredRoute })
@@ -1455,7 +1455,7 @@ export class DefaultProviderRuntime implements ProviderRuntime {
 
   #confirmationBinding(
     operation: ProviderDestructiveOperation,
-    state: ProviderSetupStateV1,
+    state: ProviderSetupStateV2,
   ): ProviderConfirmationBinding {
     let connection = this.#selectedOpenRouterConnection(state);
     if (!connection && operation === "logout") {
@@ -1516,7 +1516,7 @@ export class DefaultProviderRuntime implements ProviderRuntime {
   #consumeConfirmation(
     token: string,
     operation: ProviderDestructiveOperation,
-    state: ProviderSetupStateV1,
+    state: ProviderSetupStateV2,
   ): ProviderConfirmationBinding | null {
     const expected = this.#providerConfirmations.get(token);
     this.#providerConfirmations.delete(token);
@@ -1527,7 +1527,7 @@ export class DefaultProviderRuntime implements ProviderRuntime {
   #confirmationMatches(
     expected: ProviderConfirmationBinding,
     operation: ProviderDestructiveOperation,
-    state: ProviderSetupStateV1,
+    state: ProviderSetupStateV2,
   ): boolean {
     return JSON.stringify(expected) === JSON.stringify(
       this.#confirmationBinding(operation, state),
@@ -1562,7 +1562,7 @@ export class DefaultProviderRuntime implements ProviderRuntime {
     };
     const connectionId = retained.binding.connectionId;
     let committedTuple: {
-      state: ProviderSetupStateV1;
+      state: ProviderSetupStateV2;
       route: RouteIdentityV1;
     } | null = null;
     let committedAdopted = false;
@@ -1657,7 +1657,7 @@ export class DefaultProviderRuntime implements ProviderRuntime {
               allowDisabled: true,
             }, lease);
             await lease.assertHeld();
-            const expectedCommittedState: ProviderSetupStateV1 = {
+            const expectedCommittedState: ProviderSetupStateV2 = {
               ...current,
               revision: current.revision + 1,
               lifecycle: "configured",
@@ -1667,7 +1667,7 @@ export class DefaultProviderRuntime implements ProviderRuntime {
               defaultRoute: route,
               cross: { enabled: false, preferredLead: null, preferredChallenger: null },
             };
-            let committed: ProviderSetupStateV1;
+            let committed: ProviderSetupStateV2;
             try {
               committed = await this.stateStore.commit(
                 current.revision,
@@ -2196,7 +2196,7 @@ export class DefaultProviderRuntime implements ProviderRuntime {
           if (authorization.connection && !selected) {
             return this.#confirmationRequired("logout", current);
           }
-          let next: ProviderSetupStateV1;
+          let next: ProviderSetupStateV2;
           if (selected) {
             try {
               next = await this.stateStore.commit(current.revision, (authoritative) => {
@@ -2530,7 +2530,7 @@ export async function recoverProviderCredentialForget(input: {
     deleteSlot(slot: CredentialSlotRef): Promise<boolean>;
   };
   assertHeld?(): void | Promise<void>;
-  onStatePublished?(state: ProviderSetupStateV1): void;
+  onStatePublished?(state: ProviderSetupStateV2): void;
 }): Promise<{ cleanupPending: boolean }> {
   try {
     await input.assertHeld?.();
@@ -2556,9 +2556,9 @@ async function settleProviderCredentialForget(input: {
     deleteSlot(slot: CredentialSlotRef): Promise<boolean>;
   };
   assertHeld?(): void | Promise<void>;
-  onStatePublished?(state: ProviderSetupStateV1): void;
-  onAuthoritativeMismatch?(state: ProviderSetupStateV1): never;
-  initialAuthoritativeState?: ProviderSetupStateV1;
+  onStatePublished?(state: ProviderSetupStateV2): void;
+  onAuthoritativeMismatch?(state: ProviderSetupStateV2): never;
+  initialAuthoritativeState?: ProviderSetupStateV2;
 }): Promise<{ cleanupPending: boolean; removed: boolean; retained: boolean }> {
   await input.assertHeld?.();
   const { connectionId, target } = input.transaction.manifest;
@@ -2661,9 +2661,9 @@ async function settleProviderCredentialForget(input: {
 }
 
 function assertProviderForgetAuthoritative(
-  authoritative: ProviderSetupStateV1,
-  expected: ProviderSetupStateV1,
-  onMismatch?: (state: ProviderSetupStateV1) => never,
+  authoritative: ProviderSetupStateV2,
+  expected: ProviderSetupStateV2,
+  onMismatch?: (state: ProviderSetupStateV2) => never,
 ): void {
   if (JSON.stringify(authoritative) === JSON.stringify(expected)) return;
   if (onMismatch) onMismatch(authoritative);
@@ -2671,7 +2671,7 @@ function assertProviderForgetAuthoritative(
 }
 
 function connectionReferencesForgetTarget(
-  connection: ProviderSetupStateV1["connections"][number],
+  connection: ProviderSetupStateV2["connections"][number],
   target: ProviderCredentialForgetTarget,
 ): boolean {
   return target.kind === "versioned"
@@ -2680,7 +2680,7 @@ function connectionReferencesForgetTarget(
 }
 
 function committedConnectionReferencesForgetTarget(
-  connection: ProviderSetupStateV1["connections"][number],
+  connection: ProviderSetupStateV2["connections"][number],
   target: ProviderCredentialForgetTarget,
 ): boolean {
   return target.kind === "versioned"
@@ -2691,7 +2691,7 @@ function committedConnectionReferencesForgetTarget(
 
 function routeHasCommittedConnection(
   route: RouteIdentityV1 | null,
-  connections: ProviderSetupStateV1["connections"],
+  connections: ProviderSetupStateV2["connections"],
 ): boolean {
   if (!route) return false;
   return connections.some((connection) =>
@@ -2703,9 +2703,9 @@ function routeHasCommittedConnection(
 }
 
 function stateWithoutForgottenConnection(
-  state: ProviderSetupStateV1,
+  state: ProviderSetupStateV2,
   connectionId: string | null,
-): ProviderSetupStateV1 {
+): ProviderSetupStateV2 {
   const connections = state.connections.filter((candidate) => candidate.id !== connectionId);
   const defaultRoute = routeHasCommittedConnection(state.defaultRoute, connections)
     ? state.defaultRoute
@@ -2774,7 +2774,7 @@ export function providerServiceStartupCredential(
 }
 
 class ProviderAuthoritativeSnapshotRead extends Error {
-  constructor(readonly state: ProviderSetupStateV1) {
+  constructor(readonly state: ProviderSetupStateV2) {
     super("Provider authoritative snapshot read completed.");
     this.name = "ProviderAuthoritativeSnapshotRead";
   }
@@ -2782,7 +2782,7 @@ class ProviderAuthoritativeSnapshotRead extends Error {
 
 async function readAuthoritativeProviderState(
   stateStore: ProviderStateStore,
-): Promise<ProviderSetupStateV1> {
+): Promise<ProviderSetupStateV2> {
   const expectedRevision = stateStore.read().revision;
   try {
     await stateStore.commit(expectedRevision, (authoritative) => {
@@ -2816,7 +2816,7 @@ export function createProviderCredentialController(input: {
     "begin" | "markDeleted" | "complete"
   >;
   getInferenceRoute?(): RouteIdentityV1;
-  onInferenceStatePublished?(state: ProviderSetupStateV1): void;
+  onInferenceStatePublished?(state: ProviderSetupStateV2): void;
   onInferenceReady?(route: RouteIdentityV1, persisted: boolean, candidate: string): void;
   onInferenceForgotten?(): void;
 }): ProviderCredentialIntentPort {
@@ -3121,7 +3121,7 @@ export function createAutomaticEnvironmentSetupSurface(
 export async function persistProviderSetupState(
   path: string,
   request: ProviderStateCommitRequest,
-): Promise<ProviderSetupStateV1> {
+): Promise<ProviderSetupStateV2> {
   try {
     return await persistProviderSetupStateOwned(path, request);
   } catch (error) {
@@ -3137,7 +3137,7 @@ export async function persistProviderSetupState(
 async function persistProviderSetupStateOwned(
   path: string,
   request: ProviderStateCommitRequest,
-): Promise<ProviderSetupStateV1> {
+): Promise<ProviderSetupStateV2> {
   return withConfigWriteLock(path, async (ownership) => {
     await ownership.assertHeld();
     const target = await readConfigFileSnapshot(ownership.canonicalPath);

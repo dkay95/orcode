@@ -112,6 +112,20 @@ test("schema-1 provider setup migrates byte-stably to V2 without adding Kimi", (
   }
 });
 
+test("schema-1 input cannot satisfy the V2 type boundary", () => {
+  const legacy: ProviderSetupStateV1 = {
+    schemaVersion: 1,
+    revision: 0,
+    lifecycle: "never-configured",
+    connections: [],
+    defaultRoute: null,
+    cross: { enabled: false, preferredLead: null, preferredChallenger: null },
+  };
+  // @ts-expect-error schema 1 must remain a distinct migration-only input.
+  const current: ProviderSetupStateV2 = legacy;
+  void current;
+});
+
 test("V2 Kimi and OpenRouter connections accept only their own slots and realms", () => {
   const kimiRoute = {
     version: 1,
@@ -258,7 +272,7 @@ test("future and corrupt provider state remain distinct and cannot be saved over
   const root = await mkdtemp(join(tmpdir(), "orcode-provider-state-refusal-"));
   const path = join(root, "config.json");
   const future = validateProviderSetupState({ schemaVersion: 99 });
-  const corrupt = validateProviderSetupState({ schemaVersion: 1, connections: "wrong" });
+  const corrupt = validateProviderSetupState({ schemaVersion: 2, connections: "wrong" });
   assert.deepEqual(future, { kind: "future-version", version: 99 });
   assert.deepEqual(corrupt, { kind: "corrupt" });
   await assert.rejects(saveConfig({ ...DEFAULT_CONFIG, providerSetup: future }, path), /future-version/);
@@ -620,7 +634,7 @@ test("durable provider state commit reports exact adoption after a resolved wron
 
 test("committed provider state readback rejects a structurally forged outcome", async () => {
   const providerState = await import("../src/provider-state.js") as unknown as {
-    readProviderStateCommitAdoption?: (error: unknown) => ProviderSetupStateV1 | null;
+    readProviderStateCommitAdoption?: (error: unknown) => ProviderSetupStateV2 | null;
   };
   const forged = Object.assign(new Error("fixed forged committed outcome"), {
     name: "ProviderStateCommitAdoptedError",

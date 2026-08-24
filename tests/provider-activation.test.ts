@@ -15,7 +15,7 @@ import {
 import { PrivateStore } from "../src/private-store.js";
 import {
   ProviderStateStore,
-  type ProviderSetupStateV1,
+  type ProviderSetupStateV2,
 } from "../src/provider-state.js";
 import type {
   BackendModelDescriptor,
@@ -494,7 +494,7 @@ for (const boundary of boundaries) {
     const recovered = await fixture.restartAndRecover();
     const oldTuple = await tupleForState(fixture.initialConfig.providerSetup, fixture.credentials);
     const loaded = await loadConfigDetailed(fixture.path);
-    const newTuple = await tupleForState(loaded.config.providerSetup as ProviderSetupStateV1, fixture.credentials);
+    const newTuple = await tupleForState(loaded.config.providerSetup as ProviderSetupStateV2, fixture.credentials);
     assert.ok(
       deepEqual(recovered, oldTuple) || recovered.secret === NEW_SECRET,
       `mixed tuple after ${boundary}: ${JSON.stringify(recovered)}`,
@@ -685,7 +685,7 @@ test("an unbranded post-return config throw cannot authorize candidate adoption 
     ),
   );
   const durable = JSON.parse(await readFile(fixture.path, "utf8")) as {
-    providerSetup: ProviderSetupStateV1;
+    providerSetup: ProviderSetupStateV2;
   };
   assert.equal(durable.providerSetup.revision, fixture.oldState.revision + 1);
   assert.equal(durable.providerSetup.connections[0]?.credentialSlot, NEW_SLOT_ID);
@@ -823,7 +823,7 @@ test("provider publication serializes an independent saveConfig writer without l
 
   const saved = JSON.parse(await readFile(fixture.path, "utf8")) as {
     mainModel: string;
-    providerSetup: ProviderSetupStateV1;
+    providerSetup: ProviderSetupStateV2;
   };
   assert.equal(settledWhileProviderOwned, false);
   assert.equal(saved.mainModel, "preserve/independent-config-writer");
@@ -842,7 +842,7 @@ test("a stale ordinary config writer after activation preserves the committed pr
 
   const saved = JSON.parse(await readFile(fixture.path, "utf8")) as {
     mainModel: string;
-    providerSetup: ProviderSetupStateV1;
+    providerSetup: ProviderSetupStateV2;
   };
   assert.equal(saved.mainModel, "preserve/stale-writer-after-activation");
   assert.equal(saved.providerSetup.revision, fixture.oldState.revision + 1);
@@ -886,7 +886,7 @@ test("same-revision providerSetup mutation before raw CAS is retained and blocks
     onBoundary: async (boundary: Boundary) => {
       if (boundary !== "candidate-revalidated") return;
       const raw = JSON.parse(await readFile(fixture.path, "utf8")) as {
-        providerSetup: ProviderSetupStateV1;
+        providerSetup: ProviderSetupStateV2;
       };
       raw.providerSetup.lifecycle = "cancelled";
       await writeFile(fixture.path, `${JSON.stringify(raw)}\n`, "utf8");
@@ -899,7 +899,7 @@ test("same-revision providerSetup mutation before raw CAS is retained and blocks
   );
 
   const retained = JSON.parse(await readFile(fixture.path, "utf8")) as {
-    providerSetup: ProviderSetupStateV1;
+    providerSetup: ProviderSetupStateV2;
   };
   assert.equal(retained.providerSetup.lifecycle, "cancelled");
   assert.equal(retained.providerSetup.revision, fixture.oldState.revision);
@@ -1116,7 +1116,7 @@ test("future provider config causes zero journal slot config runtime or cleanup 
 test("revision overflow fails before reserve journal config or runtime effects", async () => {
   const fixture = await activationFixture();
   const raw = JSON.parse(await readFile(fixture.path, "utf8")) as {
-    providerSetup: ProviderSetupStateV1;
+    providerSetup: ProviderSetupStateV2;
   };
   raw.providerSetup.revision = Number.MAX_SAFE_INTEGER;
   await writeFile(fixture.path, `${JSON.stringify(raw)}\n`, "utf8");
@@ -1714,7 +1714,7 @@ test("recovery same revision with a different old slot is ambiguous and retains 
   const fixture = await activationFixture({ crashAfter: "slot-readback" });
   await assert.rejects(fixture.activate());
   const raw = JSON.parse(await readFile(fixture.path, "utf8")) as {
-    providerSetup: ProviderSetupStateV1;
+    providerSetup: ProviderSetupStateV2;
   };
   raw.providerSetup.connections[0]!.credentialSlot = FOREIGN_SLOT.id;
   await writeFile(fixture.path, `${JSON.stringify(raw)}\n`, "utf8");
@@ -1733,7 +1733,7 @@ test("recovery rejects a complete same-revision old providerSetup snapshot misma
   const fixture = await activationFixture({ crashAfter: "slot-readback" });
   await assert.rejects(fixture.activate());
   const raw = JSON.parse(await readFile(fixture.path, "utf8")) as {
-    providerSetup: ProviderSetupStateV1;
+    providerSetup: ProviderSetupStateV2;
   };
   raw.providerSetup.lifecycle = "cancelled";
   await writeFile(fixture.path, `${JSON.stringify(raw)}\n`, "utf8");
@@ -1752,7 +1752,7 @@ test("recovery rejects a complete committed candidate providerSetup snapshot mis
   const fixture = await activationFixture({ crashAfter: "config-readback" });
   await assert.rejects(fixture.activate());
   const raw = JSON.parse(await readFile(fixture.path, "utf8")) as {
-    providerSetup: ProviderSetupStateV1;
+    providerSetup: ProviderSetupStateV2;
   };
   raw.providerSetup.lifecycle = "cancelled";
   await writeFile(fixture.path, `${JSON.stringify(raw)}\n`, "utf8");
@@ -1864,7 +1864,7 @@ test("recovery compares exact connection slot fingerprint and route not same-acc
   const fixture = await activationFixture({ crashAfter: "config-readback" });
   await assert.rejects(fixture.activate());
   const raw = JSON.parse(await readFile(fixture.path, "utf8")) as {
-    providerSetup: ProviderSetupStateV1;
+    providerSetup: ProviderSetupStateV2;
   };
   raw.providerSetup.connections[0]!.credentialSlot = FOREIGN_SLOT.id;
   await writeFile(fixture.path, `${JSON.stringify(raw)}\n`, "utf8");
@@ -1880,7 +1880,7 @@ test("recovery advanced revision retains journal candidate active and foreign sl
   const fixture = await activationFixture({ crashAfter: "slot-readback" });
   await assert.rejects(fixture.activate());
   const raw = JSON.parse(await readFile(fixture.path, "utf8")) as {
-    providerSetup: ProviderSetupStateV1;
+    providerSetup: ProviderSetupStateV2;
   };
   raw.providerSetup.revision = fixture.oldState.revision + 2;
   await writeFile(fixture.path, `${JSON.stringify(raw)}\n`, "utf8");
@@ -2315,7 +2315,7 @@ test("first-run persisted activation cannot replace a config created at the fina
   const credentials = new FakeCredentials(null);
   const adapter = new FakeAdapter();
   const runtimeGuard = new FakeRuntimeGuard();
-  const initialState = structuredClone(DEFAULT_CONFIG.providerSetup) as ProviderSetupStateV1;
+  const initialState = structuredClone(DEFAULT_CONFIG.providerSetup) as ProviderSetupStateV2;
   const stateStore = new ProviderStateStore(initialState);
   const privateStore = new PrivateStore({ root: appHome });
   const beforeRuntime = structuredClone(adapter.runtimeRoute);
@@ -2553,7 +2553,7 @@ test("persisted saved candidate permit validates under existing real config owne
       });
       const memory = stateStore.read();
       const disk = (JSON.parse(await readFile(fixture.path, "utf8")) as {
-        providerSetup: ProviderSetupStateV1;
+        providerSetup: ProviderSetupStateV2;
       }).providerSetup;
       const tuple = await tupleForState(memory, fixture.credentials);
 
@@ -2741,7 +2741,7 @@ test("targeted replacement rejects duplicate account realm identity in both conn
         credentialSlot: FOREIGN_SLOT.id,
         accountFingerprint: NEW_FINGERPRINT,
       };
-      const twoConnectionState: ProviderSetupStateV1 = {
+      const twoConnectionState: ProviderSetupStateV2 = {
         ...fixture.oldState,
         connections: order === "retained-first"
           ? [retained, target]
@@ -2792,10 +2792,10 @@ test("targeted replacement rejects duplicate account realm identity in both conn
 
 function providerState(
   oldSlot: CredentialSlotRef | "legacy:inference" | null,
-): ProviderSetupStateV1 {
+): ProviderSetupStateV2 {
   if (oldSlot === null) {
     return {
-      schemaVersion: 1,
+      schemaVersion: 2,
       revision: 3,
       lifecycle: "never-configured",
       connections: [],
@@ -2805,7 +2805,7 @@ function providerState(
   }
   const credentialSlot = typeof oldSlot === "string" ? oldSlot : oldSlot.id;
   return {
-    schemaVersion: 1,
+    schemaVersion: 2,
     revision: 3,
     lifecycle: oldSlot === "legacy:inference" ? "migrated" : "configured",
     connections: [{
@@ -2870,10 +2870,10 @@ function healthy(generation: number): ProviderHealth {
 
 async function readTuple(path: string, credentials: FakeCredentials) {
   const loaded = await loadConfigDetailed(path);
-  return tupleForState(loaded.config.providerSetup as ProviderSetupStateV1, credentials);
+  return tupleForState(loaded.config.providerSetup as ProviderSetupStateV2, credentials);
 }
 
-async function tupleForState(state: ProviderSetupStateV1, credentials: FakeCredentials) {
+async function tupleForState(state: ProviderSetupStateV2, credentials: FakeCredentials) {
   const connection = state.connections.find((entry) => entry.enabled) ?? null;
   const slotId = connection?.credentialSlot ?? null;
   const secret = slotId === "legacy:inference"

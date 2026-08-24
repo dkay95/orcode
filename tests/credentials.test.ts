@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { CredentialStore, parseCredentialSlotRef } from "../src/credentials.js";
+import type { CredentialKind } from "../src/credentials.js";
 import * as credentialsModule from "../src/credentials.js";
 import { PosixPrivateStoreAdapter, PrivateStore } from "../src/private-store.js";
 
@@ -178,6 +179,22 @@ test("Kimi slots use the versioned provider-slot account namespace", async () =>
     "factory:de.routercode.openrouter/provider-slot:v1:kimi-code:018f8d77-2d52-7cc0-8f6a-9fb1f3fc0711",
   ]);
   void store;
+});
+
+test("legacy credential methods reject Kimi before keychain factory access", async () => {
+  const { store, calls } = fakeStore();
+  const kimiAsLegacyKind = "kimi-code" as unknown as CredentialKind;
+  const operations = [
+    () => store.get(kimiAsLegacyKind),
+    () => store.set(kimiAsLegacyKind, `${TEST_KEY_PREFIX}${"k".repeat(40)}`),
+    () => store.delete(kimiAsLegacyKind),
+    () => store.has(kimiAsLegacyKind),
+  ];
+
+  for (const operation of operations) {
+    await assert.rejects(operation, /Credential|ungültig/i);
+  }
+  assert.deepEqual(calls, []);
 });
 
 test("versioned slots are unique, exact, isolated from legacy slots, and reserve without keychain calls", async () => {

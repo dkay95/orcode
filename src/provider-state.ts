@@ -33,7 +33,8 @@ export interface ProviderConnectionStateV1 {
 
 export type ProviderConnectionStateV2 = ProviderConnectionStateV1;
 
-interface ProviderSetupStateSchemaV1 {
+/** @deprecated Migration-only input shape. Current provider state is always V2. */
+export interface ProviderSetupStateV1 {
   schemaVersion: 1;
   revision: number;
   lifecycle: "never-configured" | "cancelled" | "migrated" | "configured";
@@ -47,8 +48,7 @@ interface ProviderSetupStateSchemaV1 {
 }
 
 export interface ProviderSetupStateV2 {
-  /** V1 is accepted only as a deprecated source-compatible input and migrated on validation. */
-  schemaVersion: 1 | 2;
+  schemaVersion: 2;
   revision: number;
   lifecycle: "never-configured" | "cancelled" | "migrated" | "configured";
   connections: ProviderConnectionStateV2[];
@@ -59,9 +59,6 @@ export interface ProviderSetupStateV2 {
     preferredChallenger: RouteIdentityV1 | null;
   };
 }
-
-/** @deprecated Use ProviderSetupStateV2. V1-shaped values are upgraded on validation. */
-export type ProviderSetupStateV1 = ProviderSetupStateV2;
 
 export type ProviderStateIssue =
   | { kind: "corrupt" }
@@ -284,8 +281,8 @@ export function validateProviderSetupState(value: unknown): ProviderSetupState {
   return validateProviderSetupStateV2(value);
 }
 
-function validateProviderSetupStateV1(value: unknown): ProviderSetupStateSchemaV1 | ProviderStateIssue {
-  return validateProviderSetupStateStructure(value, 1) as ProviderSetupStateSchemaV1 | ProviderStateIssue;
+function validateProviderSetupStateV1(value: unknown): ProviderSetupStateV1 | ProviderStateIssue {
+  return validateProviderSetupStateStructure(value, 1) as ProviderSetupStateV1 | ProviderStateIssue;
 }
 
 function validateProviderSetupStateV2(value: unknown): ProviderSetupStateV2 | ProviderStateIssue {
@@ -295,7 +292,7 @@ function validateProviderSetupStateV2(value: unknown): ProviderSetupStateV2 | Pr
 function validateProviderSetupStateStructure(
   value: unknown,
   schemaVersion: 1 | 2,
-): ProviderSetupStateSchemaV1 | ProviderSetupStateV2 | ProviderStateIssue {
+): ProviderSetupStateV1 | ProviderSetupStateV2 | ProviderStateIssue {
   if (!isRecord(value) || value.schemaVersion !== schemaVersion) return { kind: "corrupt" };
   if (
     !Number.isSafeInteger(value.revision)
@@ -321,10 +318,12 @@ function validateProviderSetupStateStructure(
   if (!routes.every((route) => routeMatchesConnection(route, connections))) {
     return { kind: "corrupt" };
   }
-  return structuredClone(value) as unknown as ProviderSetupStateSchemaV1 | ProviderSetupStateV2;
+  return structuredClone(value) as unknown as ProviderSetupStateV1 | ProviderSetupStateV2;
 }
 
-export function isProviderStateIssue(value: ProviderSetupState): value is ProviderStateIssue {
+export function isProviderStateIssue(
+  value: ProviderSetupState | ProviderSetupStateV1,
+): value is ProviderStateIssue {
   return "kind" in value;
 }
 
@@ -334,9 +333,7 @@ export function requirePersistableProviderState(
   if (isProviderStateIssue(value)) {
     throw new Error(`Provider setup state is ${value.kind} and cannot be saved.`);
   }
-  return value.schemaVersion === 1
-    ? migrateProviderSetupV1ToV2(value)
-    : value;
+  return value;
 }
 
 /**

@@ -54,7 +54,7 @@ import {
   ProviderStateStore,
   readProviderStateCommitAdoption,
   type ProviderConnectionStateV1,
-  type ProviderSetupStateV1,
+  type ProviderSetupStateV2,
   type ProviderStateCommitRequest,
 } from "../src/provider-state.js";
 import { PrivateStore } from "../src/private-store.js";
@@ -274,7 +274,7 @@ test("runCli future and corrupt provider startup stops before runtime setup netw
       {
         name: "corrupt",
         error: "Error: Config-Migration abgelehnt: Die Konfiguration ist beschädigt oder nicht eindeutig lesbar.",
-        providerSetup: { schemaVersion: 1, connections: "invalid" },
+        providerSetup: { schemaVersion: 2, connections: "invalid" },
       },
     ] as const) {
       await t.test(fixture.name, async (subtest) => {
@@ -496,7 +496,7 @@ test("startup verification rebinds current and later historical sessions before 
   const inspected = await runtime.inspectStartup();
   assert.equal(inspected.defaultRoute?.accountFingerprint, verifiedFingerprint);
   assert.equal(
-    (startup.config.providerSetup as ProviderSetupStateV1).connections[0]?.accountFingerprint,
+    (startup.config.providerSetup as ProviderSetupStateV2).connections[0]?.accountFingerprint,
     verifiedFingerprint,
   );
   assert.equal(startup.session.data.route?.accountFingerprint, verifiedFingerprint);
@@ -505,7 +505,7 @@ test("startup verification rebinds current and later historical sessions before 
   const resolved = await runtime.resolveLegacyDefaultRoute();
   assert.equal(resolved.defaultRoute?.resolutionState, "resolved");
   assert.deepEqual(
-    (startup.config.providerSetup as ProviderSetupStateV1).defaultRoute,
+    (startup.config.providerSetup as ProviderSetupStateV2).defaultRoute,
     resolved.defaultRoute,
   );
   assert.equal(startup.session.data.route?.accountFingerprint, verifiedFingerprint);
@@ -565,7 +565,7 @@ test("dashboard picker opens a second historical chat through the migrated conne
     },
   };
   config.providerSetup = {
-    schemaVersion: 1,
+    schemaVersion: 2,
     revision: 0,
     lifecycle: "migrated",
     connections: [{
@@ -669,11 +669,11 @@ test("dashboard proves a foreign historical route before current chat, config, o
   const currentRoute = {
     ...bootstrapRoute("vendor/current"),
     accountFingerprint: "acct_current_dashboard_111111",
-  } as unknown as NonNullable<ProviderSetupStateV1["defaultRoute"]>;
+  } as unknown as NonNullable<ProviderSetupStateV2["defaultRoute"]>;
   const foreignRoute = {
     ...bootstrapRoute("vendor/foreign"),
     accountFingerprint: "acct_foreign_dashboard_222222",
-  } as unknown as NonNullable<ProviderSetupStateV1["defaultRoute"]>;
+  } as unknown as NonNullable<ProviderSetupStateV2["defaultRoute"]>;
   const current = SessionStore.create(workspace, appHome, "Current exact chat");
   current.setPreferences(currentRoute.requestedModelId, { mode: "auto" }, currentRoute);
   current.addTurn("user", "current exact turn");
@@ -745,14 +745,14 @@ test("failed post-bind previous-session save cannot leave a runnable foreign bin
   const routeA = {
     ...bootstrapRoute("vendor/post-bind-a"),
     accountFingerprint: "acct_post_bind_a_111111",
-  } as unknown as NonNullable<ProviderSetupStateV1["defaultRoute"]>;
+  } as unknown as NonNullable<ProviderSetupStateV2["defaultRoute"]>;
   const routeB = {
     ...bootstrapRoute("vendor/post-bind-b"),
     accountFingerprint: "acct_post_bind_b_222222",
-  } as unknown as NonNullable<ProviderSetupStateV1["defaultRoute"]>;
+  } as unknown as NonNullable<ProviderSetupStateV2["defaultRoute"]>;
   const connection = (
     id: string,
-    route: NonNullable<ProviderSetupStateV1["defaultRoute"]>,
+    route: NonNullable<ProviderSetupStateV2["defaultRoute"]>,
     slot: string,
   ): ProviderConnectionStateV1 => ({
     id,
@@ -765,8 +765,8 @@ test("failed post-bind previous-session save cannot leave a runnable foreign bin
     billingRealm: "openrouter-payg",
     lastHealth: null,
   });
-  const initial: ProviderSetupStateV1 = {
-    schemaVersion: 1,
+  const initial: ProviderSetupStateV2 = {
+    schemaVersion: 2,
     revision: 0,
     lifecycle: "configured",
     connections: [
@@ -949,7 +949,7 @@ test("runCli synchronizes the exact startup route into the current session befor
   const route = {
     ...bootstrapRoute("vendor/startup-exact"),
     accountFingerprint: "acct_startup_exact_333333",
-  } as unknown as NonNullable<ProviderSetupStateV1["defaultRoute"]>;
+  } as unknown as NonNullable<ProviderSetupStateV2["defaultRoute"]>;
   const storage = bootstrapStorage();
   const preferences: unknown[][] = [];
   (storage as unknown as {
@@ -988,11 +988,11 @@ test("late agent creation after /chat open uses selected exact session", async (
   const routeA = {
     ...bootstrapRoute("vendor/startup-chat-a"),
     accountFingerprint: "acct_late_agent_a_111111",
-  } as unknown as NonNullable<ProviderSetupStateV1["defaultRoute"]>;
+  } as unknown as NonNullable<ProviderSetupStateV2["defaultRoute"]>;
   const routeB = {
     ...bootstrapRoute("vendor/selected-chat-b"),
     accountFingerprint: "acct_late_agent_b_222222",
-  } as unknown as NonNullable<ProviderSetupStateV1["defaultRoute"]>;
+  } as unknown as NonNullable<ProviderSetupStateV2["defaultRoute"]>;
   const sessionA = SessionStore.create(workspace, appHome, "Startup chat A");
   sessionA.setPreferences(routeA.requestedModelId, { mode: "auto" }, routeA);
   sessionA.addTurn("user", "A remains here");
@@ -2107,7 +2107,7 @@ test("the real provider runtime command port fences active runs and keeps Coming
   } as const;
   const slot = "v1:inference:11111111-1111-4111-8111-111111111111";
   const stateStore = new ProviderStateStore({
-    schemaVersion: 1,
+    schemaVersion: 2,
     revision: 0,
     lifecycle: "configured",
     connections: [{
@@ -2310,8 +2310,8 @@ test("the real provider runtime command port fences active runs and keeps Coming
 });
 
 function providerCommandReviewFixture(options: {
-  state?: ProviderSetupStateV1;
-  route?: NonNullable<ProviderSetupStateV1["defaultRoute"]>;
+  state?: ProviderSetupStateV2;
+  route?: NonNullable<ProviderSetupStateV2["defaultRoute"]>;
   session?: SessionStore;
 } = {}) {
   const Runtime = (cliModule as unknown as {
@@ -2324,10 +2324,10 @@ function providerCommandReviewFixture(options: {
   const route = options.route ?? {
     ...bootstrapRoute("vendor/review"),
     accountFingerprint: "acct_review_fixture_111111",
-  } as NonNullable<ProviderSetupStateV1["defaultRoute"]>;
+  } as NonNullable<ProviderSetupStateV2["defaultRoute"]>;
   const slot = "v1:inference:11111111-1111-4111-8111-111111111119";
   const initial = options.state ?? {
-    schemaVersion: 1,
+    schemaVersion: 2,
     revision: 0,
     lifecycle: "configured",
     connections: [{
@@ -2343,7 +2343,7 @@ function providerCommandReviewFixture(options: {
     }],
     defaultRoute: route,
     cross: { enabled: false, preferredLead: null, preferredChallenger: null },
-  } satisfies ProviderSetupStateV1;
+  } satisfies ProviderSetupStateV2;
   let stateEffects = 0;
   let credentialEffects = 0;
   let runtimeEffects = 0;
@@ -2408,12 +2408,12 @@ test("credential activation and key replacement synchronize the current session 
   const oldRoute = {
     ...bootstrapRoute("vendor/old-account"),
     accountFingerprint: "acct_old_session_111111",
-  } as NonNullable<ProviderSetupStateV1["defaultRoute"]>;
+  } as NonNullable<ProviderSetupStateV2["defaultRoute"]>;
   session.setPreferences(oldRoute.requestedModelId, { mode: "auto" }, oldRoute);
   const nextRoute = {
     ...bootstrapRoute("vendor/new-account"),
     accountFingerprint: "acct_new_session_222222",
-  } as NonNullable<ProviderSetupStateV1["defaultRoute"]>;
+  } as NonNullable<ProviderSetupStateV2["defaultRoute"]>;
   const fixture = providerCommandReviewFixture({ route: nextRoute, session });
 
   fixture.runtime.adoptCredentialActivation(
@@ -2440,7 +2440,7 @@ test("prepublication Cross abort cannot publish the activated route into session
           assertCurrent(): void;
         },
       ): Promise<Record<string, unknown>>;
-      ensureRunnableRoute(): NonNullable<ProviderSetupStateV1["defaultRoute"]>;
+      ensureRunnableRoute(): NonNullable<ProviderSetupStateV2["defaultRoute"]>;
       readonly preparedRoles: unknown;
     };
   }).DefaultProviderRuntime;
@@ -2460,7 +2460,7 @@ test("prepublication Cross abort cannot publish the activated route into session
   const route = {
     ...bootstrapRoute(main.requestedModelId),
     accountFingerprint: "acct_cross_abort_111111",
-  } as NonNullable<ProviderSetupStateV1["defaultRoute"]>;
+  } as NonNullable<ProviderSetupStateV2["defaultRoute"]>;
   const connection: ProviderConnectionStateV1 = {
     id: "cross-abort-connection",
     backendId: "openrouter",
@@ -2472,7 +2472,7 @@ test("prepublication Cross abort cannot publish the activated route into session
     billingRealm: "openrouter-payg",
     lastHealth: null,
   };
-  let durable = structuredClone(DEFAULT_CONFIG.providerSetup) as ProviderSetupStateV1;
+  let durable = structuredClone(DEFAULT_CONFIG.providerSetup) as ProviderSetupStateV2;
   let publicationEntered!: () => void;
   const reachedPublication = new Promise<void>((resolve) => {
     publicationEntered = resolve;
@@ -2614,7 +2614,7 @@ test("prepublication Cross abort cannot publish the activated route into session
 test("setup postpublication abort waits for exact activation terminal reconciliation without cancellation", async () => {
   const root = await mkdtemp(join(tmpdir(), "orcode-setup-postpublication-"));
   const configPath = join(root, "config.json");
-  const initial = structuredClone(DEFAULT_CONFIG.providerSetup) as ProviderSetupStateV1;
+  const initial = structuredClone(DEFAULT_CONFIG.providerSetup) as ProviderSetupStateV2;
   const config = structuredClone(DEFAULT_CONFIG);
   config.providerSetup = structuredClone(initial);
   await saveConfig(config, configPath);
@@ -2787,7 +2787,7 @@ test("setup postpublication abort waits for exact activation terminal reconcilia
   releaseReadback();
   const result = await pending;
   const disk = (JSON.parse(await readFile(configPath, "utf8")) as {
-    providerSetup: ProviderSetupStateV1;
+    providerSetup: ProviderSetupStateV2;
   }).providerSetup;
   const memory = stateStore.read();
   const active = memory.connections.find((connection) => connection.enabled);
@@ -2809,7 +2809,7 @@ test("setup postpublication abort waits for exact activation terminal reconcilia
 test("process-only setup postpublication abort reconciles the exact runtime route without cancellation", async () => {
   const root = await mkdtemp(join(tmpdir(), "orcode-setup-process-postpublication-"));
   const configPath = join(root, "config.json");
-  const initial = structuredClone(DEFAULT_CONFIG.providerSetup) as ProviderSetupStateV1;
+  const initial = structuredClone(DEFAULT_CONFIG.providerSetup) as ProviderSetupStateV2;
   const config = structuredClone(DEFAULT_CONFIG);
   config.providerSetup = structuredClone(initial);
   await saveConfig(config, configPath);
@@ -2999,7 +2999,7 @@ test("process-only setup postpublication abort reconciles the exact runtime rout
   releaseRuntimeActivation();
   const result = await pending;
   const disk = (JSON.parse(await readFile(configPath, "utf8")) as {
-    providerSetup: ProviderSetupStateV1;
+    providerSetup: ProviderSetupStateV2;
   }).providerSetup;
 
   assert.equal(early, stillPending);
@@ -3021,9 +3021,9 @@ test("late Cross completion after newer activation cannot republish the old rout
   const Runtime = (cliModule as unknown as {
     DefaultProviderRuntime: new (...args: unknown[]) => {
       runSetup(surface: SetupSurface): Promise<Record<string, unknown>>;
-      ensureRunnableRoute(): NonNullable<ProviderSetupStateV1["defaultRoute"]>;
+      ensureRunnableRoute(): NonNullable<ProviderSetupStateV2["defaultRoute"]>;
       adoptCredentialActivation(
-        route: NonNullable<ProviderSetupStateV1["defaultRoute"]>,
+        route: NonNullable<ProviderSetupStateV2["defaultRoute"]>,
         persisted: boolean,
         secret: string,
       ): void;
@@ -3055,11 +3055,11 @@ test("late Cross completion after newer activation cannot republish the old rout
   const routeA = {
     ...bootstrapRoute(main.requestedModelId),
     accountFingerprint: "acct_cross_old_111111",
-  } as NonNullable<ProviderSetupStateV1["defaultRoute"]>;
+  } as NonNullable<ProviderSetupStateV2["defaultRoute"]>;
   const routeB = {
     ...bootstrapRoute("vendor/cross-b"),
     accountFingerprint: "acct_cross_new_222222",
-  } as NonNullable<ProviderSetupStateV1["defaultRoute"]>;
+  } as NonNullable<ProviderSetupStateV2["defaultRoute"]>;
   const connection = (
     id: string,
     accountFingerprint: string,
@@ -3128,7 +3128,7 @@ test("late Cross completion after newer activation cannot republish the old rout
       runtimeAccount = routeA.accountFingerprint;
       return { persisted: true, warnings: [], state, route: routeA };
     },
-    ensureRunnableRoute(route: NonNullable<ProviderSetupStateV1["defaultRoute"]>) {
+    ensureRunnableRoute(route: NonNullable<ProviderSetupStateV2["defaultRoute"]>) {
       return structuredClone(route);
     },
   };
@@ -3201,9 +3201,9 @@ test("reconnect synchronizes the current session to the exact rebound route", as
   const route = {
     ...bootstrapRoute("vendor/reconnect-exact"),
     accountFingerprint: "acct_reconnect_exact_333333",
-  } as NonNullable<ProviderSetupStateV1["defaultRoute"]>;
-  const state: ProviderSetupStateV1 = {
-    schemaVersion: 1,
+  } as NonNullable<ProviderSetupStateV2["defaultRoute"]>;
+  const state: ProviderSetupStateV2 = {
+    schemaVersion: 2,
     revision: 0,
     lifecycle: "configured",
     connections: [{
@@ -3294,14 +3294,14 @@ test("reconnect repairs persisted foreign route when runtime projection is empty
   const routeA = {
     ...bootstrapRoute("vendor/reconnect-default-a"),
     accountFingerprint: "acct_reconnect_default_a_111111",
-  } as unknown as NonNullable<ProviderSetupStateV1["defaultRoute"]>;
+  } as unknown as NonNullable<ProviderSetupStateV2["defaultRoute"]>;
   const routeB = {
     ...bootstrapRoute("vendor/reconnect-persisted-b"),
     accountFingerprint: "acct_reconnect_persisted_b_222222",
-  } as unknown as NonNullable<ProviderSetupStateV1["defaultRoute"]>;
+  } as unknown as NonNullable<ProviderSetupStateV2["defaultRoute"]>;
   const connection = (
     id: string,
-    route: NonNullable<ProviderSetupStateV1["defaultRoute"]>,
+    route: NonNullable<ProviderSetupStateV2["defaultRoute"]>,
     slot: string,
   ): ProviderConnectionStateV1 => ({
     id,
@@ -3314,8 +3314,8 @@ test("reconnect repairs persisted foreign route when runtime projection is empty
     billingRealm: "openrouter-payg",
     lastHealth: null,
   });
-  const initial: ProviderSetupStateV1 = {
-    schemaVersion: 1,
+  const initial: ProviderSetupStateV2 = {
+    schemaVersion: 2,
     revision: 0,
     lifecycle: "configured",
     connections: [
@@ -3419,14 +3419,14 @@ test("historical route selection proves catalogs and binds the exact foreign con
   const currentRoute = {
     ...bootstrapRoute("vendor/current-exact"),
     accountFingerprint: "acct_selection_current_111111",
-  } as unknown as NonNullable<ProviderSetupStateV1["defaultRoute"]>;
+  } as unknown as NonNullable<ProviderSetupStateV2["defaultRoute"]>;
   const foreignRoute = {
     ...bootstrapRoute("vendor/foreign-exact"),
     accountFingerprint: "acct_selection_foreign_222222",
-  } as unknown as NonNullable<ProviderSetupStateV1["defaultRoute"]>;
+  } as unknown as NonNullable<ProviderSetupStateV2["defaultRoute"]>;
   const connection = (
     id: string,
-    route: NonNullable<ProviderSetupStateV1["defaultRoute"]>,
+    route: NonNullable<ProviderSetupStateV2["defaultRoute"]>,
     slot: string,
   ) => ({
     id,
@@ -3439,8 +3439,8 @@ test("historical route selection proves catalogs and binds the exact foreign con
     billingRealm: "openrouter-payg" as const,
     lastHealth: null,
   });
-  const initial: ProviderSetupStateV1 = {
-    schemaVersion: 1,
+  const initial: ProviderSetupStateV2 = {
+    schemaVersion: 2,
     revision: 0,
     lifecycle: "configured",
     connections: [
@@ -3555,13 +3555,13 @@ test("failed startup proof for a foreign current session cannot fall back to the
   const currentRoute = {
     ...bootstrapRoute("vendor/startup-current"),
     accountFingerprint: "acct_startup_current_555555",
-  } as unknown as NonNullable<ProviderSetupStateV1["defaultRoute"]>;
+  } as unknown as NonNullable<ProviderSetupStateV2["defaultRoute"]>;
   const foreignRoute = {
     ...bootstrapRoute("vendor/startup-foreign"),
     accountFingerprint: "acct_startup_foreign_666666",
-  } as unknown as NonNullable<ProviderSetupStateV1["defaultRoute"]>;
-  const initial: ProviderSetupStateV1 = {
-    schemaVersion: 1,
+  } as unknown as NonNullable<ProviderSetupStateV2["defaultRoute"]>;
+  const initial: ProviderSetupStateV2 = {
+    schemaVersion: 2,
     revision: 0,
     lifecycle: "configured",
     connections: [
@@ -3738,7 +3738,7 @@ test("provider confirmation tokens bind every destructive intent to the exact fe
   });
 
   const processFixture = providerCommandReviewFixture({
-    state: structuredClone(DEFAULT_CONFIG.providerSetup) as ProviderSetupStateV1,
+    state: structuredClone(DEFAULT_CONFIG.providerSetup) as ProviderSetupStateV2,
   });
   processFixture.runtime.adoptCredentialActivation(
     processFixture.route as unknown as Record<string, unknown>,
@@ -3828,7 +3828,7 @@ test("logout forgets a disabled versioned connection through the restart-safe jo
 
   fixture.allowOldSlotDelete();
   const durable = (JSON.parse(await readFile(fixture.configPath, "utf8")) as {
-    providerSetup: ProviderSetupStateV1;
+    providerSetup: ProviderSetupStateV2;
   }).providerSetup;
   const restartedStore = new ProviderStateStore(durable, {
     persist: (request) => fixture.api.persistProviderSetupState(fixture.configPath, request),
@@ -3889,9 +3889,9 @@ test("provider status treats disabled health as historical and prefers the activ
   const route = {
     ...bootstrapRoute("vendor/status"),
     accountFingerprint: "acct_status_old_111111",
-  } as NonNullable<ProviderSetupStateV1["defaultRoute"]>;
-  const staleState: ProviderSetupStateV1 = {
-    schemaVersion: 1,
+  } as NonNullable<ProviderSetupStateV2["defaultRoute"]>;
+  const staleState: ProviderSetupStateV2 = {
+    schemaVersion: 2,
     revision: 3,
     lifecycle: "configured",
     connections: [{
@@ -3951,9 +3951,9 @@ for (const operation of ["disable", "disconnect"] as const) {
     const route = {
       ...bootstrapRoute(`vendor/${operation}`),
       accountFingerprint: `acct_${operation}_approved_111111`,
-    } as NonNullable<ProviderSetupStateV1["defaultRoute"]>;
-    const approved: ProviderSetupStateV1 = {
-      schemaVersion: 1,
+    } as NonNullable<ProviderSetupStateV2["defaultRoute"]>;
+    const approved: ProviderSetupStateV2 = {
+      schemaVersion: 2,
       revision: 0,
       lifecycle: "configured",
       connections: [{
@@ -3976,7 +3976,7 @@ for (const operation of ["disable", "disconnect"] as const) {
       requestedModelId: `vendor/${operation}-replacement`,
       canonicalModelId: `vendor/${operation}-replacement`,
     };
-    const replacement: ProviderSetupStateV1 = {
+    const replacement: ProviderSetupStateV2 = {
       ...structuredClone(approved),
       connections: [{
         ...approved.connections[0]!,
@@ -4028,7 +4028,7 @@ for (const operation of ["disable", "disconnect"] as const) {
     assert.equal(result.kind, "confirmation-required");
     assert.notEqual(result.confirmationToken, prompt.confirmationToken);
     const readback = (JSON.parse(await readFile(configPath, "utf8")) as {
-      providerSetup: ProviderSetupStateV1;
+      providerSetup: ProviderSetupStateV2;
     }).providerSetup;
     assert.deepEqual(readback, replacement);
     assert.equal(config.providerSetup.connections[0]?.enabled, true);
@@ -4044,9 +4044,9 @@ test("legacy logout rechecks the retained confirmation inside authoritative comm
   const approvedRoute = {
     ...bootstrapRoute("vendor/legacy-approved"),
     accountFingerprint: "acct_legacy_approved_111111",
-  } as NonNullable<ProviderSetupStateV1["defaultRoute"]>;
-  const approved: ProviderSetupStateV1 = {
-    schemaVersion: 1,
+  } as NonNullable<ProviderSetupStateV2["defaultRoute"]>;
+  const approved: ProviderSetupStateV2 = {
+    schemaVersion: 2,
     revision: 0,
     lifecycle: "configured",
     connections: [{
@@ -4063,7 +4063,7 @@ test("legacy logout rechecks the retained confirmation inside authoritative comm
     defaultRoute: approvedRoute,
     cross: { enabled: false, preferredLead: null, preferredChallenger: null },
   };
-  const replacements: Array<{ name: string; state: ProviderSetupStateV1 }> = [
+  const replacements: Array<{ name: string; state: ProviderSetupStateV2 }> = [
     {
       name: "fingerprint",
       state: {
@@ -4182,8 +4182,8 @@ test("disabled legacy logout forgets runtime only after exact durable commit rea
       execute(intent: Record<string, unknown>, surface: "plain"): Promise<Record<string, unknown>>;
     };
   }).DefaultProviderRuntime;
-  const initial: ProviderSetupStateV1 = {
-    schemaVersion: 1,
+  const initial: ProviderSetupStateV2 = {
+    schemaVersion: 2,
     revision: 0,
     lifecycle: "configured",
     connections: [{
@@ -4249,19 +4249,19 @@ test("legacy logout recovers when persistence rejects after adoptPublished", asy
   const api = cliModule as typeof cliModule & {
     DefaultProviderRuntime: new (...args: unknown[]) => {
       execute(intent: Record<string, unknown>, surface: "plain"): Promise<Record<string, unknown>>;
-      ensureRunnableRoute(): NonNullable<ProviderSetupStateV1["defaultRoute"]>;
+      ensureRunnableRoute(): NonNullable<ProviderSetupStateV2["defaultRoute"]>;
     };
     persistProviderSetupState(
       path: string,
       request: ProviderStateCommitRequest,
-    ): Promise<ProviderSetupStateV1>;
+    ): Promise<ProviderSetupStateV2>;
   };
   const route = {
     ...bootstrapRoute("vendor/legacy-lock-release"),
     accountFingerprint: "acct_legacy_lock_release_666666",
-  } as NonNullable<ProviderSetupStateV1["defaultRoute"]>;
-  const initial: ProviderSetupStateV1 = {
-    schemaVersion: 1,
+  } as NonNullable<ProviderSetupStateV2["defaultRoute"]>;
+  const initial: ProviderSetupStateV2 = {
+    schemaVersion: 2,
     revision: 0,
     lifecycle: "configured",
     connections: [{
@@ -4346,7 +4346,7 @@ test("legacy logout recovers when persistence rejects after adoptPublished", asy
   }
 
   const durable = (JSON.parse(await readFile(configPath, "utf8")) as {
-    providerSetup: ProviderSetupStateV1;
+    providerSetup: ProviderSetupStateV2;
   }).providerSetup;
   assert.equal(injectedReleaseFailure, true);
   assert.deepEqual(result, {
@@ -4376,9 +4376,9 @@ test("legacy logout completes or recovers the exact disabled tuple after first p
   const route = {
     ...bootstrapRoute("vendor/legacy-post-commit"),
     accountFingerprint: "acct_legacy_post_commit_555555",
-  } as NonNullable<ProviderSetupStateV1["defaultRoute"]>;
-  const initial: ProviderSetupStateV1 = {
-    schemaVersion: 1,
+  } as NonNullable<ProviderSetupStateV2["defaultRoute"]>;
+  const initial: ProviderSetupStateV2 = {
+    schemaVersion: 2,
     revision: 0,
     lifecycle: "configured",
     connections: [{
@@ -4484,7 +4484,7 @@ for (const phase of ["prepared", "credential-deleted", "shared-reference"] as co
     const approvedRoute = {
       ...bootstrapRoute(`vendor/${phase}`),
       accountFingerprint: `acct_${phase}_approved_333333`,
-    } as NonNullable<ProviderSetupStateV1["defaultRoute"]>;
+    } as NonNullable<ProviderSetupStateV2["defaultRoute"]>;
     const survivor = {
       id: survivorId,
       backendId: "openrouter" as const,
@@ -4496,8 +4496,8 @@ for (const phase of ["prepared", "credential-deleted", "shared-reference"] as co
       billingRealm: "openrouter-payg" as const,
       lastHealth: null,
     };
-    const approved: ProviderSetupStateV1 = {
-      schemaVersion: 1,
+    const approved: ProviderSetupStateV2 = {
+      schemaVersion: 2,
       revision: 0,
       lifecycle: "configured",
       connections: [{ ...survivor, id: targetId }, ...(phase === "shared-reference" ? [survivor] : [])],
@@ -4510,7 +4510,7 @@ for (const phase of ["prepared", "credential-deleted", "shared-reference"] as co
       requestedModelId: `vendor/${phase}-replacement`,
       canonicalModelId: `vendor/${phase}-replacement`,
     };
-    const replacement: ProviderSetupStateV1 = {
+    const replacement: ProviderSetupStateV2 = {
       ...structuredClone(approved),
       connections: approved.connections.map((connection) =>
         connection.id === targetId
@@ -4618,7 +4618,7 @@ test("duplicate shared-slot logout fails closed without choosing the first conne
   const route = {
     ...bootstrapRoute("vendor/shared-live"),
     accountFingerprint: "acct_shared_live_555555",
-  } as NonNullable<ProviderSetupStateV1["defaultRoute"]>;
+  } as NonNullable<ProviderSetupStateV2["defaultRoute"]>;
   const health = {
     credential: "valid" as const,
     connectivity: "connected" as const,
@@ -4637,8 +4637,8 @@ test("duplicate shared-slot logout fails closed without choosing the first conne
     billingRealm: "openrouter-payg" as const,
     lastHealth: health,
   };
-  const initial: ProviderSetupStateV1 = {
-    schemaVersion: 1,
+  const initial: ProviderSetupStateV2 = {
+    schemaVersion: 2,
     revision: 0,
     lifecycle: "configured",
     connections: [
@@ -4753,8 +4753,8 @@ test("disabled targeted logout validates authoritative identity before delete or
   const connectionId = "disabled-predelete-target";
   const approvedSlot = "v1:inference:99999999-9999-4999-8999-999999999999";
   const replacementSlot = "v1:inference:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
-  const approved: ProviderSetupStateV1 = {
-    schemaVersion: 1,
+  const approved: ProviderSetupStateV2 = {
+    schemaVersion: 2,
     revision: 0,
     lifecycle: "configured",
     connections: [{
@@ -4771,7 +4771,7 @@ test("disabled targeted logout validates authoritative identity before delete or
     defaultRoute: null,
     cross: { enabled: false, preferredLead: null, preferredChallenger: null },
   };
-  const replacement: ProviderSetupStateV1 = {
+  const replacement: ProviderSetupStateV2 = {
     ...structuredClone(approved),
     connections: [{
       ...approved.connections[0]!,
@@ -4872,12 +4872,12 @@ test("global key forget refuses shared provider references without partial mutat
   const legacyRoute = {
     ...bootstrapRoute("vendor/legacy-shared"),
     accountFingerprint: "acct_legacy_shared_444444",
-  } as NonNullable<ProviderSetupStateV1["defaultRoute"]>;
+  } as NonNullable<ProviderSetupStateV2["defaultRoute"]>;
   const versionedRoute = {
     ...bootstrapRoute("vendor/versioned-shared"),
     accountFingerprint: "acct_versioned_shared_333333",
-  } as NonNullable<ProviderSetupStateV1["defaultRoute"]>;
-  const fixtures: Array<{ name: string; connections: ProviderSetupStateV1["connections"]; route: NonNullable<ProviderSetupStateV1["defaultRoute"]> }> = [
+  } as NonNullable<ProviderSetupStateV2["defaultRoute"]>;
+  const fixtures: Array<{ name: string; connections: ProviderSetupStateV2["connections"]; route: NonNullable<ProviderSetupStateV2["defaultRoute"]> }> = [
     {
       name: "shared v1 references",
       route: versionedRoute,
@@ -4937,8 +4937,8 @@ test("global key forget refuses shared provider references without partial mutat
   for (const fixture of fixtures) {
     await t.test(fixture.name, async () => {
       const root = await mkdtemp(join(tmpdir(), "orcode-global-key-forget-shared-"));
-      const initial: ProviderSetupStateV1 = {
-        schemaVersion: 1,
+      const initial: ProviderSetupStateV2 = {
+        schemaVersion: 2,
         revision: 0,
         lifecycle: "configured",
         connections: structuredClone(fixture.connections),
@@ -5047,20 +5047,20 @@ test("global key forget refuses authoritative shared Legacy references when in-m
     persistProviderSetupState(
       path: string,
       request: ProviderStateCommitRequest,
-    ): Promise<ProviderSetupStateV1>;
+    ): Promise<ProviderSetupStateV2>;
   };
   const root = await mkdtemp(join(tmpdir(), "orcode-global-key-forget-authoritative-shared-"));
   const configPath = join(root, "config.json");
-  const stale: ProviderSetupStateV1 = {
-    schemaVersion: 1,
+  const stale: ProviderSetupStateV2 = {
+    schemaVersion: 2,
     revision: 0,
     lifecycle: "never-configured",
     connections: [],
     defaultRoute: null,
     cross: { enabled: false, preferredLead: null, preferredChallenger: null },
   };
-  const authoritative: ProviderSetupStateV1 = {
-    schemaVersion: 1,
+  const authoritative: ProviderSetupStateV2 = {
+    schemaVersion: 2,
     revision: 0,
     lifecycle: "configured",
     connections: ["durable-legacy-one", "durable-legacy-two"].map((id, index) => ({
@@ -5159,7 +5159,7 @@ test("global key forget refuses authoritative shared Legacy references when in-m
   assert.deepEqual(stateStore.read(), stale);
   assert.equal(await readFile(configPath, "utf8"), beforeBytes);
   const restarted = new ProviderStateStore(
-    (JSON.parse(beforeBytes) as { providerSetup: ProviderSetupStateV1 }).providerSetup,
+    (JSON.parse(beforeBytes) as { providerSetup: ProviderSetupStateV2 }).providerSetup,
   );
   assert.deepEqual(restarted.read(), authoritative);
   assert.deepEqual(await realJournal.readPending(), null);
@@ -5189,12 +5189,12 @@ test("global key forget removes the sole authoritative disabled v1 connection wh
     persistProviderSetupState(
       path: string,
       request: ProviderStateCommitRequest,
-    ): Promise<ProviderSetupStateV1>;
+    ): Promise<ProviderSetupStateV2>;
   };
   const root = await mkdtemp(join(tmpdir(), "orcode-global-key-forget-authoritative-disabled-"));
   const configPath = join(root, "config.json");
-  const stale: ProviderSetupStateV1 = {
-    schemaVersion: 1,
+  const stale: ProviderSetupStateV2 = {
+    schemaVersion: 2,
     revision: 0,
     lifecycle: "never-configured",
     connections: [],
@@ -5202,8 +5202,8 @@ test("global key forget removes the sole authoritative disabled v1 connection wh
     cross: { enabled: false, preferredLead: null, preferredChallenger: null },
   };
   const slot = "v1:inference:cccccccc-cccc-4ccc-8ccc-cccccccccccc";
-  const authoritative: ProviderSetupStateV1 = {
-    schemaVersion: 1,
+  const authoritative: ProviderSetupStateV2 = {
+    schemaVersion: 2,
     revision: 0,
     lifecycle: "configured",
     connections: [{
@@ -5264,7 +5264,7 @@ test("global key forget removes the sole authoritative disabled v1 connection wh
       return slots.delete(reference.id);
     },
   };
-  const published: ProviderSetupStateV1[] = [];
+  const published: ProviderSetupStateV2[] = [];
   let forgotten = 0;
   const controller = api.createProviderCredentialController({
     stateStore,
@@ -5272,7 +5272,7 @@ test("global key forget removes the sole authoritative disabled v1 connection wh
     credentials,
     activationCoordinator: providerCoordinatorMutationFixture(providerRuntimeGuardFixture()),
     forgetJournal: journal,
-    onInferenceStatePublished(state: ProviderSetupStateV1) {
+    onInferenceStatePublished(state: ProviderSetupStateV2) {
       published.push(structuredClone(state));
     },
     onInferenceForgotten() { forgotten += 1; },
@@ -5300,7 +5300,7 @@ test("global key forget removes the sole authoritative disabled v1 connection wh
   assert.deepEqual(published.map((state) => state.revision), [1, 2]);
   assert.equal(published.every((state) => state.defaultRoute === null), true);
   const durable = (JSON.parse(await readFile(configPath, "utf8")) as {
-    providerSetup: ProviderSetupStateV1;
+    providerSetup: ProviderSetupStateV2;
   }).providerSetup;
   assert.deepEqual(stateStore.read(), durable);
   assert.equal(durable.revision, 2);
@@ -5390,7 +5390,7 @@ async function providerForgetActivationFixture() {
     persistProviderSetupState(
       path: string,
       request: ProviderStateCommitRequest,
-    ): Promise<ProviderSetupStateV1>;
+    ): Promise<ProviderSetupStateV2>;
   };
   const root = await mkdtemp(join(tmpdir(), "orcode-provider-forget-serialization-"));
   const configPath = join(root, "config.json");
@@ -5399,9 +5399,9 @@ async function providerForgetActivationFixture() {
   const route = {
     ...bootstrapRoute("vendor/main"),
     accountFingerprint: "acct_forget_serialization",
-  } as NonNullable<ProviderSetupStateV1["defaultRoute"]>;
-  const initial: ProviderSetupStateV1 = {
-    schemaVersion: 1,
+  } as NonNullable<ProviderSetupStateV2["defaultRoute"]>;
+  const initial: ProviderSetupStateV2 = {
+    schemaVersion: 2,
     revision: 0,
     lifecycle: "configured",
     connections: [{
@@ -5563,8 +5563,8 @@ async function managementMutationLeaseFixture() {
   };
   const root = await mkdtemp(join(tmpdir(), "orcode-management-effect-fence-"));
   const configPath = join(root, "config.json");
-  const state: ProviderSetupStateV1 = {
-    schemaVersion: 1,
+  const state: ProviderSetupStateV2 = {
+    schemaVersion: 2,
     revision: 0,
     lifecycle: "never-configured",
     connections: [],
@@ -5633,7 +5633,7 @@ test("management validation loss fences keychain set and runtime activation befo
   const mutations: string[] = [];
   const controller = fixture.api.createProviderCredentialController({
     stateStore: new ProviderStateStore({
-      schemaVersion: 1,
+      schemaVersion: 2,
       revision: 0,
       lifecycle: "never-configured",
       connections: [],
@@ -5688,7 +5688,7 @@ test("management forget loss fences keychain and runtime deletion before either 
   const mutations: string[] = [];
   const controller = fixture.api.createProviderCredentialController({
     stateStore: new ProviderStateStore({
-      schemaVersion: 1,
+      schemaVersion: 2,
       revision: 0,
       lifecycle: "never-configured",
       connections: [],
@@ -5723,7 +5723,7 @@ test("management process-only approval loss fences runtime activation after fail
   let setAttempts = 0;
   const controller = fixture.api.createProviderCredentialController({
     stateStore: new ProviderStateStore({
-      schemaVersion: 1,
+      schemaVersion: 2,
       revision: 0,
       lifecycle: "never-configured",
       connections: [],
@@ -5992,8 +5992,8 @@ test("restart recovery derives inspection credentials only from the recovered ve
 
   const oldSlot = "v1:inference:00000000-0000-4000-8000-000000000011";
   const newSlot = "v1:inference:00000000-0000-4000-8000-000000000022";
-  const state = (revision: number, slot: string, account: string): ProviderSetupStateV1 => ({
-    schemaVersion: 1,
+  const state = (revision: number, slot: string, account: string): ProviderSetupStateV2 => ({
+    schemaVersion: 2,
     revision,
     lifecycle: "configured",
     connections: [{
@@ -6046,13 +6046,13 @@ test("first-run cancellation initializes an absent config with the exact committ
     persistProviderSetupState?: (
       path: string,
       request: ProviderStateCommitRequest,
-    ) => Promise<ProviderSetupStateV1>;
+    ) => Promise<ProviderSetupStateV2>;
   }).persistProviderSetupState;
   assert.equal(typeof persist, "function");
 
   const directory = await mkdtemp(join(tmpdir(), "orcode-provider-first-cancel-"));
   const path = join(directory, "config.json");
-  const initial = structuredClone(DEFAULT_CONFIG.providerSetup) as ProviderSetupStateV1;
+  const initial = structuredClone(DEFAULT_CONFIG.providerSetup) as ProviderSetupStateV2;
   const stateStore = new ProviderStateStore(initial, {
     persist: (request) => persist!(path, request),
   });
@@ -6076,14 +6076,14 @@ test("first-run absent provider commit cannot adopt a byte-identical config crea
     persistProviderSetupState?: (
       path: string,
       request: ProviderStateCommitRequest,
-    ) => Promise<ProviderSetupStateV1>;
+    ) => Promise<ProviderSetupStateV2>;
   }).persistProviderSetupState;
   assert.equal(typeof persist, "function");
 
   const directory = await mkdtemp(join(tmpdir(), "orcode-provider-first-race-"));
   const path = join(directory, "config.json");
   const referencePath = join(directory, "reference.json");
-  const initial = structuredClone(DEFAULT_CONFIG.providerSetup) as ProviderSetupStateV1;
+  const initial = structuredClone(DEFAULT_CONFIG.providerSetup) as ProviderSetupStateV2;
   const candidate = { ...initial, revision: 1, lifecycle: "cancelled" as const };
   await persist!(referencePath, {
     expectedRevision: initial.revision,
@@ -6129,14 +6129,14 @@ test("first-run absent provider commit cannot adopt a byte-identical config crea
     persistProviderSetupState?: (
       path: string,
       request: ProviderStateCommitRequest,
-    ) => Promise<ProviderSetupStateV1>;
+    ) => Promise<ProviderSetupStateV2>;
   }).persistProviderSetupState;
   assert.equal(typeof persist, "function");
 
   const directory = await mkdtemp(join(tmpdir(), "orcode-provider-first-abort-"));
   const path = join(directory, "config.json");
   const referencePath = join(directory, "reference.json");
-  const initial = structuredClone(DEFAULT_CONFIG.providerSetup) as ProviderSetupStateV1;
+  const initial = structuredClone(DEFAULT_CONFIG.providerSetup) as ProviderSetupStateV2;
   const candidate = { ...initial, revision: 1, lifecycle: "cancelled" as const };
   await persist!(referencePath, {
     expectedRevision: initial.revision,
@@ -6184,14 +6184,14 @@ test("existing provider commit cannot adopt byte-identical foreign bytes after a
     persistProviderSetupState?: (
       path: string,
       request: ProviderStateCommitRequest,
-    ) => Promise<ProviderSetupStateV1>;
+    ) => Promise<ProviderSetupStateV2>;
   }).persistProviderSetupState;
   assert.equal(typeof persist, "function");
 
   const directory = await mkdtemp(join(tmpdir(), "orcode-provider-existing-race-"));
   const path = join(directory, "config.json");
   const referencePath = join(directory, "reference.json");
-  const initial = structuredClone(DEFAULT_CONFIG.providerSetup) as ProviderSetupStateV1;
+  const initial = structuredClone(DEFAULT_CONFIG.providerSetup) as ProviderSetupStateV2;
   const candidate = { ...initial, revision: 1, lifecycle: "cancelled" as const };
   const initialRaw = `${JSON.stringify(DEFAULT_CONFIG, null, 2)}\n`;
   await writeFile(path, initialRaw, { encoding: "utf8", mode: 0o600 });
@@ -6293,14 +6293,14 @@ async function realProviderCrossWriterFenceFixture() {
     persistProviderSetupState(
       path: string,
       request: ProviderStateCommitRequest,
-    ): Promise<ProviderSetupStateV1>;
+    ): Promise<ProviderSetupStateV2>;
   };
   const directory = await mkdtemp(join(tmpdir(), "orcode-cross-writer-fence-"));
   const configPath = join(directory, "config.json");
   const route = {
     ...bootstrapRoute("vendor/cross-writer-a"),
     accountFingerprint: "acct_cross_writer_111111",
-  } as NonNullable<ProviderSetupStateV1["defaultRoute"]>;
+  } as NonNullable<ProviderSetupStateV2["defaultRoute"]>;
   const challenger = {
     ...route,
     requestedModelId: "vendor/cross-writer-challenger",
@@ -6311,8 +6311,8 @@ async function realProviderCrossWriterFenceFixture() {
     requestedModelId: "vendor/cross-writer-b",
     canonicalModelId: "vendor/cross-writer-b",
   };
-  const activated: ProviderSetupStateV1 = {
-    schemaVersion: 1,
+  const activated: ProviderSetupStateV2 = {
+    schemaVersion: 2,
     revision: 1,
     lifecycle: "configured",
     connections: [{
@@ -6347,9 +6347,9 @@ async function realProviderCrossWriterFenceFixture() {
     }),
     assertCurrent,
   );
-  const readDurable = async (): Promise<ProviderSetupStateV1> => (
+  const readDurable = async (): Promise<ProviderSetupStateV2> => (
     JSON.parse(await readFile(configPath, "utf8")) as {
-      providerSetup: ProviderSetupStateV1;
+      providerSetup: ProviderSetupStateV2;
     }
   ).providerSetup;
   return {
@@ -6430,7 +6430,7 @@ test("post-readback cancellation adopts the exact committed provider state witho
     (current) => ({ ...current, lifecycle: "cancelled" }),
     () => {
       const durable = (JSON.parse(readFileSync(path, "utf8")) as {
-        providerSetup: ProviderSetupStateV1;
+        providerSetup: ProviderSetupStateV2;
       }).providerSetup;
       if (durable.revision === before.revision + 1) {
         postReadbackCancellations += 1;
@@ -6448,7 +6448,7 @@ test("post-readback cancellation adopts the exact committed provider state witho
   );
 
   const durable = (JSON.parse(await readFile(path, "utf8")) as {
-    providerSetup: ProviderSetupStateV1;
+    providerSetup: ProviderSetupStateV2;
   }).providerSetup;
   assert.equal(postReadbackCancellations, 1);
   assert.equal(outcome.kind, "committed");
@@ -6477,9 +6477,9 @@ test("versioned inference replace and forget leave one restart-atomic provider t
   const oldSlot = "v1:inference:00000000-0000-4000-8000-000000000031";
   const newSlot = "v1:inference:00000000-0000-4000-8000-000000000032";
   const connectionId = "00000000-0000-4000-8000-000000000039";
-  const route = bootstrapRoute("vendor/main") as unknown as ProviderSetupStateV1["defaultRoute"];
-  const initial: ProviderSetupStateV1 = {
-    schemaVersion: 1,
+  const route = bootstrapRoute("vendor/main") as unknown as ProviderSetupStateV2["defaultRoute"];
+  const initial: ProviderSetupStateV2 = {
+    schemaVersion: 2,
     revision: 0,
     lifecycle: "configured",
     connections: [{
@@ -6533,7 +6533,7 @@ test("versioned inference replace and forget leave one restart-atomic provider t
     assert.equal(request.candidate, newKey);
     assert.equal(request.targetConnectionId, connectionId);
     assert.equal(request.generation, 0);
-    const next: ProviderSetupStateV1 = {
+    const next: ProviderSetupStateV2 = {
       ...structuredClone(initial),
       revision: 1,
       connections: [{ ...initial.connections[0]!, credentialSlot: newSlot }],
@@ -6599,9 +6599,9 @@ test("saving a process-only environment route persists that exact route and vers
   const environmentKey = `${STARTUP_KEY_PREFIX}${"p".repeat(48)}`;
   const slotId = "v1:inference:00000000-0000-4000-8000-000000000041";
   const connectionId = "00000000-0000-4000-8000-000000000049";
-  const route = bootstrapRoute("vendor/process-only") as unknown as NonNullable<ProviderSetupStateV1["defaultRoute"]>;
-  const initial: ProviderSetupStateV1 = {
-    schemaVersion: 1,
+  const route = bootstrapRoute("vendor/process-only") as unknown as NonNullable<ProviderSetupStateV2["defaultRoute"]>;
+  const initial: ProviderSetupStateV2 = {
+    schemaVersion: 2,
     revision: 0,
     lifecycle: "never-configured",
     connections: [],
@@ -6637,8 +6637,8 @@ test("saving a process-only environment route persists that exact route and vers
         assert.equal(request.persistence, "persisted");
         assert.equal(request.expectedRequestedModelId, route.requestedModelId);
         assert.equal(request.selectedCanonicalModelId, route.canonicalModelId);
-        const next: ProviderSetupStateV1 = {
-          schemaVersion: 1,
+        const next: ProviderSetupStateV2 = {
+          schemaVersion: 2,
           revision: 1,
           lifecycle: "configured",
           connections: [{
@@ -6698,9 +6698,9 @@ test("forget retry retains the exact versioned pointer across a crash before slo
   assert.equal(typeof createController, "function");
   const key = `${STARTUP_KEY_PREFIX}${"f".repeat(48)}`;
   const slotId = "v1:inference:00000000-0000-4000-8000-000000000051";
-  const route = bootstrapRoute("vendor/main") as unknown as NonNullable<ProviderSetupStateV1["defaultRoute"]>;
-  const initial: ProviderSetupStateV1 = {
-    schemaVersion: 1,
+  const route = bootstrapRoute("vendor/main") as unknown as NonNullable<ProviderSetupStateV2["defaultRoute"]>;
+  const initial: ProviderSetupStateV2 = {
+    schemaVersion: 2,
     revision: 0,
     lifecycle: "configured",
     connections: [{
@@ -6799,16 +6799,16 @@ test("failed pre-delete forget journals the exact target and synchronizes the fi
     persistProviderSetupState?: (
       path: string,
       request: ProviderStateCommitRequest,
-    ) => Promise<ProviderSetupStateV1>;
+    ) => Promise<ProviderSetupStateV2>;
   };
   assert.equal(typeof api.ProviderCredentialForgetJournal, "function");
   assert.equal(typeof api.createProviderCredentialController, "function");
   const root = await mkdtemp(join(tmpdir(), "orcode-forget-journal-pre-delete-"));
   const configPath = join(root, "config.json");
   const slotId = "v1:inference:00000000-0000-4000-8000-000000000061";
-  const route = bootstrapRoute("vendor/main") as unknown as NonNullable<ProviderSetupStateV1["defaultRoute"]>;
-  const initial: ProviderSetupStateV1 = {
-    schemaVersion: 1,
+  const route = bootstrapRoute("vendor/main") as unknown as NonNullable<ProviderSetupStateV2["defaultRoute"]>;
+  const initial: ProviderSetupStateV2 = {
+    schemaVersion: 2,
     revision: 0,
     lifecycle: "configured",
     connections: [{
@@ -6854,7 +6854,7 @@ test("failed pre-delete forget journals the exact target and synchronizes the fi
     runtimeGuard,
     activationCoordinator: providerCoordinatorMutationFixture(runtimeGuard),
     forgetJournal: journal,
-    onInferenceStatePublished(state: ProviderSetupStateV1) {
+    onInferenceStatePublished(state: ProviderSetupStateV2) {
       config.providerSetup = structuredClone(state);
     },
   });
@@ -6869,13 +6869,13 @@ test("failed pre-delete forget journals the exact target and synchronizes the fi
   );
   assert.deepEqual(config.providerSetup, durable);
   assert.equal(
-    (JSON.parse(await readFile(configPath, "utf8")) as { providerSetup: ProviderSetupStateV1 })
+    (JSON.parse(await readFile(configPath, "utf8")) as { providerSetup: ProviderSetupStateV2 })
       .providerSetup.defaultRoute,
     null,
   );
   await saveConfig(config, configPath);
 
-  const saved = JSON.parse(await readFile(configPath, "utf8")) as { providerSetup: ProviderSetupStateV1 };
+  const saved = JSON.parse(await readFile(configPath, "utf8")) as { providerSetup: ProviderSetupStateV2 };
   assert.equal(saved.providerSetup.defaultRoute, null);
   assert.equal(saved.providerSetup.connections[0]?.credentialSlot, slotId);
   assert.deepEqual(saved.providerSetup, durable);
@@ -6913,9 +6913,9 @@ test("post-delete forget recovery trusts the durable phase, completes once, and 
   assert.equal(typeof api.recoverProviderCredentialForget, "function");
   const root = await mkdtemp(join(tmpdir(), "orcode-forget-journal-post-delete-"));
   const slotId = "v1:inference:00000000-0000-4000-8000-000000000071";
-  const route = bootstrapRoute("vendor/main") as unknown as NonNullable<ProviderSetupStateV1["defaultRoute"]>;
-  const initial: ProviderSetupStateV1 = {
-    schemaVersion: 1,
+  const route = bootstrapRoute("vendor/main") as unknown as NonNullable<ProviderSetupStateV2["defaultRoute"]>;
+  const initial: ProviderSetupStateV2 = {
+    schemaVersion: 2,
     revision: 0,
     lifecycle: "configured",
     connections: [{
@@ -7134,9 +7134,9 @@ test("forget recovery cleans an old slot after the same connection committed a n
   const route = {
     ...bootstrapRoute("vendor/new"),
     accountFingerprint: "acct_same_connection_new_slot",
-  } as NonNullable<ProviderSetupStateV1["defaultRoute"]>;
-  const state: ProviderSetupStateV1 = {
-    schemaVersion: 1,
+  } as NonNullable<ProviderSetupStateV2["defaultRoute"]>;
+  const state: ProviderSetupStateV2 = {
+    schemaVersion: 2,
     revision: 4,
     lifecycle: "configured",
     connections: [{
@@ -7206,9 +7206,9 @@ test("forget recovery retains a slot referenced by another committed connection 
   const survivingRoute = {
     ...bootstrapRoute("vendor/surviving"),
     accountFingerprint: "acct_shared_slot_surviving",
-  } as NonNullable<ProviderSetupStateV1["defaultRoute"]>;
-  const state: ProviderSetupStateV1 = {
-    schemaVersion: 1,
+  } as NonNullable<ProviderSetupStateV2["defaultRoute"]>;
+  const state: ProviderSetupStateV2 = {
+    schemaVersion: 2,
     revision: 7,
     lifecycle: "configured",
     connections: [

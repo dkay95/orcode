@@ -38,7 +38,7 @@ import {
   isProviderStateIssue,
   validateProviderSetupState,
   validateRouteIdentityV1,
-  type ProviderSetupStateV1,
+  type ProviderSetupStateV2,
 } from "./provider-state.js";
 import { isRecord } from "./utils.js";
 
@@ -89,7 +89,7 @@ export interface ProviderActivationJournalV1 {
 export interface ProviderActivationResult {
   persisted: boolean;
   route: RouteIdentityV1;
-  state: ProviderSetupStateV1 | null;
+  state: ProviderSetupStateV2 | null;
   warnings: readonly string[];
 }
 
@@ -209,7 +209,7 @@ type ConfigFacts =
     kind: "valid" | "absent";
     prefix: string;
     suffix: string;
-    state: ProviderSetupStateV1;
+    state: ProviderSetupStateV2;
     digest: string;
     target: ConfigFileSnapshot;
   }
@@ -1270,7 +1270,7 @@ export class ProviderActivationCoordinator {
 
   async #validateCandidatePermitAgainstSnapshot(
     request: ProviderActivationRequest,
-    authoritativeState: ProviderSetupStateV1,
+    authoritativeState: ProviderSetupStateV2,
     lease: HeldProviderLease,
     runtimeLease: ProviderActivationRuntimeLease,
   ): Promise<void> {
@@ -1547,7 +1547,7 @@ export class ProviderActivationCoordinator {
 
   async #cleanupPreviousSlot(
     previous: ProviderActivationJournalV1["previousSlot"],
-    activeState: ProviderSetupStateV1,
+    activeState: ProviderSetupStateV2,
     transaction: TransactionJournal,
     lease: HeldProviderLease,
   ): Promise<boolean> {
@@ -1607,11 +1607,11 @@ export async function recoverProviderActivation(
 }
 
 function buildNextState(
-  current: ProviderSetupStateV1,
+  current: ProviderSetupStateV2,
   candidate: ProviderCandidate,
   candidateSlot: CredentialSlotRef,
   route: RouteIdentityV1,
-): ProviderSetupStateV1 {
+): ProviderSetupStateV2 {
   if (!candidate.accountFingerprint) {
     throw new ProviderActivationError(
       "provider-candidate-identity-missing",
@@ -1632,7 +1632,7 @@ function buildNextState(
   const connections = current.connections
     .filter((entry) => entry.id !== candidate.connectionId)
     .concat(connection);
-  const next: ProviderSetupStateV1 = {
+  const next: ProviderSetupStateV2 = {
     ...structuredClone(current),
     revision: current.revision + 1,
     lifecycle: "configured",
@@ -1655,7 +1655,7 @@ function buildNextState(
 }
 
 function assertNoRetainedIdentityCollision(
-  state: ProviderSetupStateV1,
+  state: ProviderSetupStateV2,
   candidate: ProviderCandidate,
 ): void {
   if (!candidate.accountFingerprint) return;
@@ -1674,7 +1674,7 @@ function assertNoRetainedIdentityCollision(
 }
 
 function previousSlotFromState(
-  state: ProviderSetupStateV1,
+  state: ProviderSetupStateV2,
   connectionId: string,
 ): ProviderActivationJournalV1["previousSlot"] {
   const value = state.connections.find((connection) => connection.id === connectionId)
@@ -1785,7 +1785,7 @@ function exactRoute(
     && left.resolutionState === right.resolutionState;
 }
 
-function stateReferencesSlot(state: ProviderSetupStateV1, slotId: string): boolean {
+function stateReferencesSlot(state: ProviderSetupStateV2, slotId: string): boolean {
   return state.connections.some((connection) => connection.credentialSlot === slotId);
 }
 
@@ -1843,7 +1843,7 @@ function providerSetupDigest(value: unknown): string {
   return createHash("sha256").update(JSON.stringify(state), "utf8").digest("hex");
 }
 
-function strictProviderSetup(value: unknown): ProviderSetupStateV1 | null {
+function strictProviderSetup(value: unknown): ProviderSetupStateV2 | null {
   if (!isRecord(value)
     || !exactKeys(value, [
       "schemaVersion",
@@ -1887,7 +1887,7 @@ function strictProviderSetup(value: unknown): ProviderSetupStateV1 | null {
   const validated = validateProviderSetupState(value);
   if (isProviderStateIssue(validated)) return null;
   return {
-    schemaVersion: 1,
+    schemaVersion: 2,
     revision: validated.revision,
     lifecycle: validated.lifecycle,
     connections: validated.connections.map((connection) => ({
