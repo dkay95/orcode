@@ -2233,6 +2233,7 @@ function runtimeFixture(
   runtime: RuntimeUnderTest;
   stateStore: ProviderStateStore;
   reconnectRequests: unknown[][];
+  runtimeBindings: Array<{ connectionId?: string }>;
   coordinatorExclusiveCalls(): number;
 } {
   const Runtime = (cliModule as unknown as {
@@ -2240,6 +2241,7 @@ function runtimeFixture(
   }).DefaultProviderRuntime;
   const stateStore = new ProviderStateStore(initial);
   const reconnectRequests: unknown[][] = [];
+  const runtimeBindings: Array<{ connectionId?: string }> = [];
   let coordinatorExclusiveCalls = 0;
   const orchestrator = {
     async inspectStartup() {
@@ -2266,7 +2268,11 @@ function runtimeFixture(
   };
   const registry = {
     adapter() {
-      return {};
+      return {
+        async bindRuntime(request: { connectionId?: string }) {
+          runtimeBindings.push(request);
+        },
+      };
     },
     descriptor() {
       return { id: "openrouter", displayName: "OpenRouter", maturity: "stable" };
@@ -2307,6 +2313,7 @@ function runtimeFixture(
     runtime,
     stateStore,
     reconnectRequests,
+    runtimeBindings,
     coordinatorExclusiveCalls: () => coordinatorExclusiveCalls,
   };
 }
@@ -2343,6 +2350,8 @@ test("status reconnect default and confirmation select the same exact provider b
     (fixture.reconnectRequests[0]?.[1] as { connectionId?: string } | undefined)?.connectionId,
     "connection-b",
   );
+  assert.equal(fixture.runtimeBindings.length, 1);
+  assert.equal(fixture.runtimeBindings[0]?.connectionId, "connection-b");
   assert.equal(fixture.coordinatorExclusiveCalls(), 0, "reconnect must not hold a provider mutation lease around authority reads");
 
   const prompt = await fixture.runtime.execute(
