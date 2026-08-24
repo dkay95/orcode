@@ -158,12 +158,12 @@ export interface ProviderRouteIntentPort {
   ): Promise<T>;
   /** Exact route currently bound to the model-facing runtime. */
   currentSessionRoute?(): RouteIdentityV1;
-  /** Proves and binds an already persisted resolved session route. */
+  /** Proves and stages an already persisted resolved session route. */
   selectSessionRoute?(
     route: RouteIdentityV1,
     surface?: SetupSurface | "plain" | "fullscreen",
   ): Promise<RouteIdentityV1>;
-  /** Transfers current-session ownership only after route selection succeeds. */
+  /** Commits the staged route together with current-session ownership. */
   adoptSession?(session: SessionStore): void;
   transitionModel(
     modelId: string,
@@ -256,6 +256,8 @@ export interface CommandContext<Agent extends OrcodeAgent | null = OrcodeAgent> 
   openRouter: OpenRouterService;
   session: SessionStore;
   agent: Agent;
+  /** Atomically transfers provider, session, agent, and local-runtime ownership. */
+  commitSessionHandoff?(session: SessionStore): void;
   localRuntime?: CommandLocalRuntime;
   providerCredentials?: ProviderCredentialIntentPort;
   /** Shared provider runtime seam for route-changing model/session commands. */
@@ -377,6 +379,19 @@ function commandLocalRuntime(
 function updateCommandSession(context: NullableCommandContext, next: SessionStore): void {
   context.agent?.setSession(next);
   context.localRuntime?.setSession(next);
+}
+
+function commitCommandSessionHandoff(
+  context: NullableCommandContext,
+  next: SessionStore,
+): void {
+  if (context.commitSessionHandoff) {
+    context.commitSessionHandoff(next);
+    return;
+  }
+  context.providerRoutes?.adoptSession?.(next);
+  context.session = next;
+  updateCommandSession(context, next);
 }
 
 function resetCommandConversation(context: NullableCommandContext): void {
@@ -1977,10 +1992,8 @@ async function replaceDeletedSession(
   const route = readableCommandSessionRoute(context, false);
   if (route) {
     context.config.mainModel = route.requestedModelId;
-    context.providerRoutes?.adoptSession?.(next);
   }
-  context.session = next;
-  updateCommandSession(context, next);
+  commitCommandSessionHandoff(context, next);
   next.setPreferences(
     context.config.mainModel,
     getReasoningSetting(context.config),
@@ -2014,6 +2027,7 @@ async function replaceSession(
   if (context.session.data.id !== next.data.id) {
     await saveSessionPreferences(context, previousRoute);
   }
+  commitCommandSessionHandoff(context, next);
   if (selectedRoute) context.config.mainModel = selectedRoute.requestedModelId;
   if (!selectedRoute && next.data.model) {
     context.config.mainModel = next.data.model;
@@ -2021,11 +2035,8 @@ async function replaceSession(
   if (next.data.reasoning) {
     setReasoningSetting(context.config, next.data.reasoning);
   }
-  // Swapping the chat keeps the cached model resolution, the compressor price
-  // cache and the change journal; rebuilding the agent threw all of that away.
-  if (selectedRoute) context.providerRoutes?.adoptSession?.(next);
-  context.session = next;
-  updateCommandSession(context, next);
+  // The one handoff above keeps provider/runtime/session ownership exact while
+  // reusing the cached model resolution, compressor price cache, and journal.
   next.setPreferences(
     context.config.mainModel,
     getReasoningSetting(context.config),

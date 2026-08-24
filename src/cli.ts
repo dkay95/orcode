@@ -513,6 +513,16 @@ function sameExactRoute(left: RouteIdentityV1, right: RouteIdentityV1): boolean 
     && left.resolutionState === right.resolutionState;
 }
 
+function isProviderSetupRequired(error: unknown): boolean {
+  return error instanceof ProviderSetupRequiredError
+    || Boolean(
+      error
+      && typeof error === "object"
+      && "code" in error
+      && error.code === "provider-setup-required",
+    );
+}
+
 class SessionProviderRuntimeGuard implements ProviderActivationRuntimeGuard {
   #activationHeld = false;
   #activeRuns = 0;
@@ -582,6 +592,12 @@ export class DefaultProviderRuntime implements ProviderRuntime {
   #preparedRoles: SetupPreparedRoles | null = null;
   #sessionRoute: RouteIdentityV1 | null = null;
   #sessionRoutePersisted = false;
+  #pendingSessionBinding: {
+    route: RouteIdentityV1;
+    connectionId: string;
+    generation: number;
+    ready: boolean;
+  } | null = null;
   #processRouteGeneration = 0;
   readonly #providerConfirmations = new Map<string, ProviderConfirmationBinding>();
   #startupAttemptGeneration = 0;
@@ -626,8 +642,10 @@ export class DefaultProviderRuntime implements ProviderRuntime {
     ) {
       throw new ProviderSetupRequiredError();
     }
+    const hadPendingRoute = this.#pendingSessionBinding !== null;
     if (
       forceGeneration
+      || hadPendingRoute
       || !this.#sessionRoute
       || !sameExactRoute(this.#sessionRoute, validated)
       || this.#sessionRoutePersisted !== persisted
@@ -636,6 +654,7 @@ export class DefaultProviderRuntime implements ProviderRuntime {
     }
     this.#sessionRoute = structuredClone(validated);
     this.#sessionRoutePersisted = persisted;
+    this.#pendingSessionBinding = null;
     this.#preparedRoles = null;
     if (synchronizeConfig) this.config.mainModel = validated.requestedModelId;
     if (synchronizeSession && this.session) {
@@ -663,6 +682,7 @@ export class DefaultProviderRuntime implements ProviderRuntime {
     this.#processRouteGeneration += 1;
     this.#sessionRoute = null;
     this.#sessionRoutePersisted = false;
+    this.#pendingSessionBinding = null;
     this.#preparedRoles = null;
     this.environmentSecret = null;
     this.#synchronizeAuthoritativeProviderState();
@@ -903,7 +923,52 @@ export class DefaultProviderRuntime implements ProviderRuntime {
   }
 
   adoptSession(session: SessionStore): void {
-    const route = this.ensureRunnableRoute();
+    const requestedRoute = validateRouteIdentityV1(session.data.route);
+    const pending = this.#pendingSessionBinding;
+    if (pending) {
+      if (
+        !pending.ready
+        || pending.generation !== this.#processRouteGeneration
+        || requestedRoute?.resolutionState !== "resolved"
+        || !requestedRoute.canonicalModelId
+        || !sameExactRoute(requestedRoute, pending.route)
+      ) {
+        throw new ProviderSetupRequiredError();
+      }
+      const selected = selectOpenRouterBinding(
+        this.stateStore.read(),
+        { kind: "route", route: pending.route },
+      );
+      if (
+        selected.kind !== "exact"
+        || selected.binding.connectionId !== pending.connectionId
+      ) {
+        throw new ProviderSetupRequiredError();
+      }
+      this.session = session;
+      this.#synchronizeAuthoritativeProviderState();
+      this.#adoptExactSessionRoute(requestedRoute, true);
+      return;
+    }
+
+    let route: RouteIdentityV1;
+    try {
+      route = this.ensureRunnableRoute();
+    } catch (error) {
+      if (!isProviderSetupRequired(error) || requestedRoute?.resolutionState === "resolved") {
+        throw error;
+      }
+      // A new/unresolved chat may own a setup-required runtime. It cannot run
+      // model bytes until setup publishes an exact route for this owner.
+      this.session = session;
+      return;
+    }
+    if (
+      requestedRoute?.resolutionState === "resolved"
+      && !sameExactRoute(requestedRoute, route)
+    ) {
+      throw new ProviderSetupRequiredError();
+    }
     this.session = session;
     session.setPreferences(
       route.requestedModelId,
@@ -975,6 +1040,14 @@ export class DefaultProviderRuntime implements ProviderRuntime {
       if (exact.length !== 1 || !adapter.bindRuntime) {
         throw new ProviderSetupRequiredError();
       }
+      this.#processRouteGeneration += 1;
+      const pendingGeneration = this.#processRouteGeneration;
+      this.#pendingSessionBinding = {
+        route: structuredClone(proved),
+        connectionId: current.binding.connectionId,
+        generation: pendingGeneration,
+        ready: false,
+      };
       await adapter.bindRuntime({
         connectionId: current.binding.connectionId,
         generation: result.generation,
@@ -986,14 +1059,20 @@ export class DefaultProviderRuntime implements ProviderRuntime {
         this.stateStore.read(),
         { kind: "route", route: proved },
       );
+      const pending = this.#pendingSessionBinding;
       if (
-        rebound.kind !== "exact"
+        this.#processRouteGeneration !== pendingGeneration
+        || !pending
+        || pending.generation !== pendingGeneration
+        || pending.connectionId !== current.binding.connectionId
+        || !sameExactRoute(pending.route, proved)
+        || pending.ready
+        || rebound.kind !== "exact"
         || rebound.binding.connectionId !== current.binding.connectionId
       ) {
         throw new ProviderSetupRequiredError();
       }
-      this.#synchronizeAuthoritativeProviderState();
-      this.#adoptExactSessionRoute(proved, true, false, false, false);
+      pending.ready = true;
       return structuredClone(proved);
     } catch (error) {
       primaryFailed = true;
@@ -1009,6 +1088,7 @@ export class DefaultProviderRuntime implements ProviderRuntime {
   }
 
   ensureRunnableRoute(): RouteIdentityV1 {
+    if (this.#pendingSessionBinding) throw new ProviderSetupRequiredError();
     const requiredSessionRoute = validateRouteIdentityV1(this.session?.data.route);
     if (
       requiredSessionRoute?.resolutionState === "resolved"
@@ -1017,6 +1097,12 @@ export class DefaultProviderRuntime implements ProviderRuntime {
       throw new ProviderSetupRequiredError();
     }
     if (this.#sessionRoute) {
+      if (
+        requiredSessionRoute?.resolutionState === "resolved"
+        && !sameExactRoute(requiredSessionRoute, this.#sessionRoute)
+      ) {
+        throw new ProviderSetupRequiredError();
+      }
       if (!this.#sessionRoutePersisted) {
         return structuredClone(this.#sessionRoute);
       }
@@ -1165,6 +1251,7 @@ export class DefaultProviderRuntime implements ProviderRuntime {
         this.#processRouteGeneration += 1;
         this.#sessionRoute = null;
         this.#sessionRoutePersisted = false;
+        this.#pendingSessionBinding = null;
         this.#preparedRoles = null;
         await this.orchestrator.reconnect("openrouter");
       },
@@ -1173,12 +1260,22 @@ export class DefaultProviderRuntime implements ProviderRuntime {
     });
   }
 
-  #selectedOpenRouterConnection(state: ProviderSetupStateV1) {
+  #desiredSessionRoute(state: ProviderSetupStateV1): RouteIdentityV1 | null {
+    if (this.#sessionRoute?.resolutionState === "resolved") {
+      return structuredClone(this.#sessionRoute);
+    }
     const persistedSessionRoute = validateRouteIdentityV1(this.session?.data.route);
-    const desiredRoute = this.#sessionRoute
-      ?? (persistedSessionRoute?.resolutionState === "resolved"
-        ? persistedSessionRoute
-        : null);
+    if (persistedSessionRoute?.resolutionState === "resolved") {
+      return structuredClone(persistedSessionRoute);
+    }
+    const defaultRoute = validateRouteIdentityV1(state.defaultRoute);
+    return defaultRoute?.resolutionState === "resolved"
+      ? structuredClone(defaultRoute)
+      : null;
+  }
+
+  #selectedOpenRouterConnection(state: ProviderSetupStateV1) {
+    const desiredRoute = this.#desiredSessionRoute(state);
     const selected = desiredRoute
       ? selectOpenRouterBinding(state, { kind: "route", route: desiredRoute })
       : state.defaultRoute
@@ -1459,19 +1556,10 @@ export class DefaultProviderRuntime implements ProviderRuntime {
         };
       }
       const controller = new AbortController();
-      const reconnectRoute = this.#sessionRoute
-        && this.#sessionRoute.backendId === selected.backendId
-        && this.#sessionRoute.accountFingerprint === selected.accountFingerprint
-        && this.#sessionRoute.billingRealm === selected.billingRealm
-        ? structuredClone(this.#sessionRoute)
-        : reconnectState.defaultRoute
-          && reconnectState.defaultRoute.backendId === selected.backendId
-          && reconnectState.defaultRoute.accountFingerprint === selected.accountFingerprint
-          && reconnectState.defaultRoute.billingRealm === selected.billingRealm
-          ? structuredClone(reconnectState.defaultRoute)
-          : null;
+      const reconnectRoute = this.#desiredSessionRoute(reconnectState);
       const runtimeLease = await this.runtimeGuard.acquire(controller.signal);
       let result: StartupSetupResult;
+      let routeReady = false;
       let primaryFailed = false;
       try {
         await runtimeLease.assertHeld();
@@ -1484,16 +1572,42 @@ export class DefaultProviderRuntime implements ProviderRuntime {
         let provedRoute: RouteIdentityV1 | null = null;
         if (reconnectRoute?.resolutionState === "resolved") {
           try {
-            provedRoute = this.orchestrator.ensureRunnableRoute(reconnectRoute);
+            const candidate = this.orchestrator.ensureRunnableRoute(reconnectRoute);
+            if (sameExactRoute(candidate, reconnectRoute)) provedRoute = candidate;
           } catch (error) {
-            if (
-              !(error instanceof ProviderSetupRequiredError)
-              && !(typeof error === "object" && error !== null && "code" in error
-                && error.code === "provider-setup-required")
-            ) {
-              throw error;
-            }
+            if (!isProviderSetupRequired(error)) throw error;
           }
+        }
+        const rebound = provedRoute
+          ? selectOpenRouterBinding(
+              this.stateStore.read(),
+              { kind: "route", route: provedRoute },
+            )
+          : null;
+        if (
+          provedRoute
+          && rebound?.kind === "exact"
+          && rebound.binding.connectionId === selected.id
+        ) {
+          const defaultRoute = validateRouteIdentityV1(reconnectState.defaultRoute);
+          if (!defaultRoute || !sameExactRoute(defaultRoute, provedRoute)) {
+            const catalogRoute = provedRoute;
+            const models = await adapter.listModels({
+              connectionId: selected.id,
+              signal: controller.signal,
+            });
+            await runtimeLease.assertHeld();
+            const exact = models.filter((model) =>
+              model.backendId === catalogRoute.backendId
+              && model.requestedModelId === catalogRoute.requestedModelId
+              && model.canonicalModelId === catalogRoute.canonicalModelId
+              && model.capabilities.textInput
+              && model.capabilities.textOutput
+            );
+            if (exact.length !== 1) provedRoute = null;
+          }
+        } else {
+          provedRoute = null;
         }
         if (adapter.bindRuntime && provedRoute) {
           await adapter.bindRuntime({
@@ -1503,17 +1617,27 @@ export class DefaultProviderRuntime implements ProviderRuntime {
             signal: controller.signal,
           });
           await runtimeLease.assertHeld();
+          const bound = selectOpenRouterBinding(
+            this.stateStore.read(),
+            { kind: "route", route: provedRoute },
+          );
+          if (bound.kind !== "exact" || bound.binding.connectionId !== selected.id) {
+            throw new ProviderSetupRequiredError();
+          }
           this.#synchronizeAuthoritativeProviderState();
           this.#adoptExactSessionRoute(provedRoute, true);
-        } else if (
-          reconnectRoute
-          && this.#sessionRoute
-          && sameExactRoute(this.#sessionRoute, reconnectRoute)
-        ) {
-          this.#processRouteGeneration += 1;
-          this.#sessionRoute = null;
-          this.#sessionRoutePersisted = false;
-          this.#preparedRoles = null;
+          routeReady = true;
+        } else {
+          if (
+            reconnectRoute
+            && this.#sessionRoute
+            && sameExactRoute(this.#sessionRoute, reconnectRoute)
+          ) {
+            this.#processRouteGeneration += 1;
+            this.#sessionRoute = null;
+            this.#sessionRoutePersisted = false;
+            this.#preparedRoles = null;
+          }
           this.#synchronizeAuthoritativeProviderState();
         }
       } catch (error) {
@@ -1532,7 +1656,9 @@ export class DefaultProviderRuntime implements ProviderRuntime {
       return {
         kind: "reconnected",
         backendId: "openrouter",
-        headline: connection?.lastHealth
+        headline: !routeReady
+          ? "setup-required"
+          : connection?.lastHealth
           ? deriveProviderHeadline(connection.lastHealth)
           : result.mode,
         generation: result.generation,
@@ -3031,6 +3157,7 @@ export async function runCli(
     dependencies.stderr.write(`${warning}\n`);
   }
   const { config, configPath: runtimeConfigPath, ruleStore, session } = startup;
+  let currentSession = session;
   const configWarning = consumeConfigWarning();
   if (configWarning) dependencies.stderr.write(`${configWarning}\n`);
   if (options.approval) {
@@ -3101,16 +3228,16 @@ export async function runCli(
         throw new ProviderSetupRequiredError();
       }
     }
-    if (!options.model && session.data.reasoning) {
-      setReasoningSetting(config, session.data.reasoning);
+    if (!options.model && currentSession.data.reasoning) {
+      setReasoningSetting(config, currentSession.data.reasoning);
     }
     config.mainModel = route.requestedModelId;
-    session.setPreferences(config.mainModel, getReasoningSetting(config), route);
+    currentSession.setPreferences(config.mainModel, getReasoningSetting(config), route);
     if (!agent) {
       agent = await dependencies.createAgent({
         openRouter: providerRuntime.openRouter,
         approvals,
-        session,
+        session: currentSession,
         config,
         workspace,
         sshSession,
@@ -3140,7 +3267,7 @@ export async function runCli(
       );
     }
     const effectivePrompt = await applyInterruptedRunNonInteractive(
-      session,
+      currentSession,
       options,
       out,
       prompt,
@@ -3177,7 +3304,10 @@ export async function runCli(
 
   const localRuntime: CommandLocalRuntime = {
     guard: await WorkspaceGuard.create(workspace),
-    journal: new ChangeJournal({ appHome: session.appHome, chatId: session.data.id }),
+    journal: new ChangeJournal({
+      appHome: currentSession.appHome,
+      chatId: currentSession.data.id,
+    }),
     setSession(next) {
       this.journal = new ChangeJournal({ appHome: next.appHome, chatId: next.data.id });
     },
@@ -3190,7 +3320,7 @@ export async function runCli(
     config,
     approvals,
     openRouter: providerRuntime.openRouter,
-    session,
+    session: currentSession,
     agent,
     credentials: providerRuntime.credentials,
     providerCredentials: providerRuntime.providerCredentials,
@@ -3202,6 +3332,13 @@ export async function runCli(
     ruleStore,
     sshSession,
     providerRuntime,
+    commitSessionHandoff(next: SessionStore) {
+      providerRuntime.adoptSession(next);
+      currentSession = next;
+      this.session = next;
+      this.agent?.setSession(next);
+      this.localRuntime.setSession(next);
+    },
     ensureAgentForPrompt,
     resumeFlag: options.resume,
     noResumeFlag: options.noResume,
@@ -3232,6 +3369,7 @@ interface RuntimeContext {
   openRouter: OpenRouterService;
   session: SessionStore;
   agent: OrcodeAgent | null;
+  commitSessionHandoff?(session: SessionStore): void;
   localRuntime: CommandLocalRuntime;
   providerCredentials: ProviderCredentialIntentPort;
   providerCommands: ProviderCommandIntentPort;
@@ -4261,6 +4399,21 @@ function approvalChoiceLabel(mode: ApprovalMode): string {
   }
 }
 
+/** Commits every mutable chat owner after the previous chat is durable. */
+function commitDashboardSessionHandoff(
+  context: RuntimeContext,
+  next: SessionStore,
+): void {
+  if (context.commitSessionHandoff) {
+    context.commitSessionHandoff(next);
+    return;
+  }
+  context.providerRuntime.adoptSession?.(next);
+  context.session = next;
+  context.agent?.setSession(next);
+  context.localRuntime.setSession(next);
+}
+
 /** @internal Exported so the dashboard chat-switch boundary can be regression tested. */
 export async function pickDashboardChat(
   ui: TerminalUi,
@@ -4342,6 +4495,7 @@ export async function pickDashboardChat(
   }
 
   await saveDashboardSessionPreferences(context, ui, previousRoute ?? undefined);
+  commitDashboardSessionHandoff(context, next);
   if (selectedRoute) context.config.mainModel = selectedRoute.requestedModelId;
   if (next.data.reasoning) {
     setReasoningSetting(context.config, next.data.reasoning);
@@ -4351,13 +4505,6 @@ export async function pickDashboardChat(
     getReasoningSetting(context.config),
     selectedRoute ?? undefined,
   );
-  if (selectedRoute) context.providerRuntime.adoptSession?.(next);
-
-  context.session = next;
-  // Reuse the agent: rebuilding it dropped the cached model resolution, the
-  // compressor price cache and the undo journal on every chat switch.
-  context.agent?.setSession(next);
-  context.localRuntime.setSession(next);
   await saveDashboardSessionPreferences(context, ui, selectedRoute ?? undefined);
   await saveConfig(context.config, context.configPath);
   ui.loadTurns(next.recentTurns(VISIBLE_TURNS));

@@ -726,6 +726,186 @@ test("dashboard proves a foreign historical route before current chat, config, o
   assert.equal(await readFile(current.path, "utf8"), currentBytes);
 });
 
+test("failed post-bind previous-session save cannot leave a runnable foreign binding", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "orcode-post-bind-save-failure-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const workspace = join(root, "workspace");
+  const appHome = join(root, ".orcode");
+  const routeA = {
+    ...bootstrapRoute("vendor/post-bind-a"),
+    accountFingerprint: "acct_post_bind_a_111111",
+  } as unknown as NonNullable<ProviderSetupStateV1["defaultRoute"]>;
+  const routeB = {
+    ...bootstrapRoute("vendor/post-bind-b"),
+    accountFingerprint: "acct_post_bind_b_222222",
+  } as unknown as NonNullable<ProviderSetupStateV1["defaultRoute"]>;
+  const connection = (
+    id: string,
+    route: NonNullable<ProviderSetupStateV1["defaultRoute"]>,
+    slot: string,
+  ): ProviderConnectionStateV1 => ({
+    id,
+    backendId: "openrouter",
+    enabled: true,
+    maturity: "stable",
+    credentialSlot: slot,
+    accountFingerprint: route.accountFingerprint,
+    accountFingerprintState: "verified",
+    billingRealm: "openrouter-payg",
+    lastHealth: null,
+  });
+  const initial: ProviderSetupStateV1 = {
+    schemaVersion: 1,
+    revision: 0,
+    lifecycle: "configured",
+    connections: [
+      connection("post-bind-a", routeA, "legacy:inference"),
+      connection(
+        "post-bind-b",
+        routeB,
+        "v1:inference:67676767-6767-4767-8767-676767676767",
+      ),
+    ],
+    defaultRoute: routeA,
+    cross: { enabled: false, preferredLead: null, preferredChallenger: null },
+  };
+  const current = SessionStore.create(workspace, appHome, "Post-bind current A");
+  current.setPreferences(routeA.requestedModelId, { mode: "auto" }, routeA);
+  current.addTurn("user", "current A turn");
+  await current.save();
+  const historical = SessionStore.create(workspace, appHome, "Post-bind foreign B");
+  historical.setPreferences(routeB.requestedModelId, { mode: "auto" }, routeB);
+  historical.addTurn("user", "foreign B turn");
+  await historical.save();
+  const Runtime = (cliModule as unknown as {
+    DefaultProviderRuntime: new (...args: unknown[]) => {
+      adoptCredentialActivation(route: Record<string, unknown>, persisted: boolean, secret: string): void;
+      runWithReadyRoute<T>(run: (route: Record<string, unknown>) => Promise<T>, surface: "fullscreen"): Promise<T>;
+      adoptSession(session: SessionStore): void;
+      migratedSessionConnection(): undefined;
+      currentSessionRoute(): Record<string, unknown>;
+      selectSessionRoute(route: Record<string, unknown>, surface: "fullscreen"): Promise<Record<string, unknown>>;
+      transitionModel(): Promise<void>;
+    };
+  }).DefaultProviderRuntime;
+  const stateStore = new ProviderStateStore(initial);
+  const config = structuredClone(DEFAULT_CONFIG);
+  config.mainModel = routeA.requestedModelId;
+  config.providerSetup = structuredClone(initial);
+  const events: string[] = [];
+  const runtime = new Runtime(
+    {},
+    {},
+    {
+      descriptor() { return { id: "openrouter", displayName: "OpenRouter", maturity: "stable" }; },
+      entries() { return []; },
+      adapter() {
+        return {
+          async listModels(request: { connectionId?: string }) {
+            events.push(`models:${request.connectionId}`);
+            return [{
+              backendId: "openrouter",
+              requestedModelId: routeB.requestedModelId,
+              canonicalModelId: routeB.canonicalModelId,
+              displayName: "Post-bind foreign B",
+              capabilities: { textInput: true, textOutput: true, tools: true, reasoning: true },
+            }];
+          },
+          async bindRuntime(request: { connectionId: string }) {
+            events.push(`bind:${request.connectionId}`);
+          },
+        };
+      },
+    },
+    stateStore,
+    {
+      async reconnect(_backendId: string, options: { connectionId?: string }) {
+        events.push(`reconnect:${options.connectionId}`);
+        return {
+          mode: "route-choice-required",
+          generation: 71,
+          defaultRoute: routeA,
+          readyRoutes: [routeA, routeB],
+          warnings: [],
+          crossEnabled: false,
+        };
+      },
+      ensureRunnableRoute(route: Record<string, unknown>) {
+        events.push(`prove:${String(route.accountFingerprint)}`);
+        return route;
+      },
+    },
+    {},
+    {
+      async acquire() { return { assertHeld() {}, release() {} }; },
+      beginRun() { return () => undefined; },
+    },
+    {},
+    "saved-secret",
+    null,
+    routeA.requestedModelId,
+    config,
+    current,
+  );
+  runtime.adoptCredentialActivation(routeA as unknown as Record<string, unknown>, true, "saved-secret");
+  const saveFailure = new Error("fixed previous-session save failure");
+  current.save = async () => { throw saveFailure; };
+  const agentSessions: string[] = [];
+  const localSessions: string[] = [];
+  const context = {
+    workspace,
+    configPath: join(appHome, "config.json"),
+    config,
+    session: current,
+    agent: { setSession(next: SessionStore) { agentSessions.push(next.data.id); } },
+    localRuntime: { setSession(next: SessionStore) { localSessions.push(next.data.id); } },
+    providerRuntime: runtime,
+    providerRouteSurface: "fullscreen",
+  };
+  const ui = {
+    async pickChoice() { return { value: historical.data.id, label: historical.data.title }; },
+    addMessage() {},
+    loadTurns() { throw new Error("failed handoff must not load foreign turns"); },
+    setStatus() { throw new Error("failed handoff must not publish foreign status"); },
+  };
+
+  await assert.rejects(
+    pickDashboardChat(ui as never, context as never, false),
+    (error: unknown) => error === saveFailure,
+  );
+
+  let dispatchedRoute: Record<string, unknown> | null = null;
+  let foreignModelBytes = 0;
+  const runError = await runtime.runWithReadyRoute(async (route) => {
+    dispatchedRoute = structuredClone(route);
+    if (route.accountFingerprint === routeB.accountFingerprint) foreignModelBytes += 1;
+  }, "fullscreen").then(
+    () => null,
+    (error: unknown) => error,
+  );
+  assert.equal(foreignModelBytes, 0);
+  if (runError === null) {
+    assert.deepEqual(dispatchedRoute, routeA);
+  } else {
+    assert.ok(
+      runError instanceof Error
+      && (runError as Error & { code?: unknown }).code === "provider-setup-required",
+    );
+    assert.equal(dispatchedRoute, null);
+  }
+  assert.equal(context.session, current);
+  assert.equal(config.mainModel, routeA.requestedModelId);
+  assert.deepEqual(current.data.route, routeA);
+  assert.deepEqual(agentSessions, []);
+  assert.deepEqual(localSessions, []);
+  assert.deepEqual(events, [
+    "reconnect:post-bind-b",
+    `prove:${routeB.accountFingerprint}`,
+    "models:post-bind-b",
+    "bind:post-bind-b",
+  ]);
+});
+
 test("runCli orders storage, activation recovery, bounded inspection, route proof, agent, and plain UI", async () => {
   const calls: string[] = [];
   const runtime = bootstrapRuntime({ events: calls });
@@ -786,6 +966,134 @@ test("runCli synchronizes the exact startup route into the current session befor
   assert.equal(exitCode, 0);
   assert.deepEqual(sessionRouteAtAgentCreation, route);
   assert.deepEqual(preferences.at(-1), [route.requestedModelId, { mode: "auto" }, route]);
+});
+
+test("late agent creation after /chat open uses selected exact session", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "orcode-late-agent-session-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const workspace = join(root, "workspace");
+  const appHome = join(root, ".orcode");
+  await mkdir(workspace, { recursive: true });
+  const routeA = {
+    ...bootstrapRoute("vendor/startup-chat-a"),
+    accountFingerprint: "acct_late_agent_a_111111",
+  } as unknown as NonNullable<ProviderSetupStateV1["defaultRoute"]>;
+  const routeB = {
+    ...bootstrapRoute("vendor/selected-chat-b"),
+    accountFingerprint: "acct_late_agent_b_222222",
+  } as unknown as NonNullable<ProviderSetupStateV1["defaultRoute"]>;
+  const sessionA = SessionStore.create(workspace, appHome, "Startup chat A");
+  sessionA.setPreferences(routeA.requestedModelId, { mode: "auto" }, routeA);
+  sessionA.addTurn("user", "A remains here");
+  await sessionA.save();
+  const sessionB = SessionStore.create(workspace, appHome, "Selected chat B");
+  sessionB.setPreferences(routeB.requestedModelId, { mode: "auto" }, routeB);
+  await sessionB.save();
+  const config = structuredClone(DEFAULT_CONFIG);
+  config.mainModel = routeA.requestedModelId;
+  let setupCalls = 0;
+  let selectedRoute: typeof routeB | null = null;
+  let selectedOwner: SessionStore = sessionA;
+  let ready = false;
+  const runtime = {
+    openRouter: new OpenRouterService(undefined),
+    credentials: {} as CredentialStore,
+    preparedRoles: null,
+    providerCredentials: { async apply() { return { kind: "unchanged", credentialKind: "inference" }; } },
+    migratedSessionConnection() { return undefined; },
+    async inspectStartup() {
+      return {
+        mode: "setup-required",
+        generation: 1,
+        defaultRoute: null,
+        readyRoutes: [],
+        warnings: [],
+        crossEnabled: false,
+      };
+    },
+    async resolveLegacyDefaultRoute() { throw new Error("legacy resolution must not run"); },
+    async runSetup() {
+      setupCalls += 1;
+      if (setupCalls === 1) return { kind: "cancelled", mode: "setup-required" };
+      ready = true;
+      return { kind: "ready" };
+    },
+    ensureRunnableRoute() {
+      if (!ready || !selectedRoute) {
+        throw Object.assign(new Error("setup required"), { code: "provider-setup-required" });
+      }
+      return structuredClone(selectedRoute);
+    },
+    currentSessionRoute() {
+      return this.ensureRunnableRoute();
+    },
+    async selectSessionRoute(route: typeof routeB) {
+      selectedRoute = structuredClone(route);
+      return structuredClone(route);
+    },
+    adoptSession(next: SessionStore) {
+      selectedOwner = next;
+    },
+    async transitionModel() {},
+    async execute() { throw new Error("provider command must not run"); },
+    async runWithReadyRoute<T>(run: (route: typeof routeB) => Promise<T>) {
+      return run(this.ensureRunnableRoute());
+    },
+  };
+  const createdFor: string[] = [];
+  const promptOwners: Array<{ sessionId: string; prompt: string }> = [];
+  let agentSession: SessionStore | null = null;
+
+  const exitCode = await invokeRunCli(["--plain", "--cwd", workspace], {
+    initializeStorage: async () => ({
+      appHome,
+      configPath: join(appHome, "config.json"),
+      migrationWarning: null,
+      retentionWarnings: [],
+      config,
+      ruleStore: {} as never,
+      session: sessionA,
+    }),
+    createProviderRuntime: async () => runtime,
+    createAgent: async (input: { session: SessionStore }) => {
+      createdFor.push(input.session.data.id);
+      agentSession = input.session;
+      return {
+        setSession(next: SessionStore) { agentSession = next; },
+        async run(prompt: string) {
+          promptOwners.push({ sessionId: agentSession!.data.id, prompt });
+          agentSession!.addTurn("user", prompt);
+          return {};
+        },
+      } as never;
+    },
+    runPlain: async (input: Record<string, unknown>) => {
+      const context = input as unknown as Omit<CommandContext<null>, "agent"> & {
+        agent: { run(prompt: string): Promise<unknown> } | null;
+        ensureAgentForPrompt(): Promise<{ run(prompt: string): Promise<unknown> }>;
+      };
+      await handleSlashCommand(`/chat open ${sessionB.data.id}`, context as never);
+      context.agent = await context.ensureAgentForPrompt();
+      await context.agent.run("first prompt for B");
+    },
+    runDashboard: async () => undefined,
+    stdout: { write: () => true },
+    stderr: { write: () => true },
+  });
+
+  assert.equal(exitCode, 0);
+  assert.equal(setupCalls, 2);
+  assert.equal(selectedOwner.data.id, sessionB.data.id);
+  assert.deepEqual(createdFor, [sessionB.data.id]);
+  assert.equal(sessionA.data.model, routeA.requestedModelId);
+  assert.deepEqual(sessionA.data.route, routeA);
+  assert.deepEqual(sessionA.data.turns.map((turn) => turn.content), ["A remains here"]);
+  assert.equal(sessionB.data.model, routeB.requestedModelId);
+  assert.deepEqual(sessionB.data.route, routeB);
+  assert.deepEqual(promptOwners, [{
+    sessionId: sessionB.data.id,
+    prompt: "first prompt for B",
+  }]);
 });
 
 test("runCli opens route choice for a healthy secondary and never silently replaces the degraded default", async () => {
@@ -2143,7 +2451,7 @@ test("reconnect synchronizes the current session to the exact rebound route", as
     requestedModelId: "vendor/stale-session",
     canonicalModelId: "vendor/stale-session",
   };
-  session.setPreferences(staleRoute.requestedModelId, { mode: "auto" }, staleRoute);
+  session.setPreferences(staleRoute.requestedModelId, { mode: "auto" });
   const bindingCalls: unknown[] = [];
   const config = structuredClone(DEFAULT_CONFIG);
   config.providerSetup = structuredClone(state);
@@ -2198,6 +2506,130 @@ test("reconnect synchronizes the current session to the exact rebound route", as
   assert.equal(session.data.model, route.requestedModelId);
   assert.deepEqual(session.data.route, route);
   assert.equal(config.mainModel, route.requestedModelId);
+});
+
+test("reconnect repairs persisted foreign route when runtime projection is empty", async () => {
+  const Runtime = (cliModule as unknown as {
+    DefaultProviderRuntime: new (...args: unknown[]) => {
+      execute(intent: Record<string, unknown>, surface: "plain"): Promise<Record<string, unknown>>;
+      ensureRunnableRoute(): Record<string, unknown>;
+    };
+  }).DefaultProviderRuntime;
+  const routeA = {
+    ...bootstrapRoute("vendor/reconnect-default-a"),
+    accountFingerprint: "acct_reconnect_default_a_111111",
+  } as unknown as NonNullable<ProviderSetupStateV1["defaultRoute"]>;
+  const routeB = {
+    ...bootstrapRoute("vendor/reconnect-persisted-b"),
+    accountFingerprint: "acct_reconnect_persisted_b_222222",
+  } as unknown as NonNullable<ProviderSetupStateV1["defaultRoute"]>;
+  const connection = (
+    id: string,
+    route: NonNullable<ProviderSetupStateV1["defaultRoute"]>,
+    slot: string,
+  ): ProviderConnectionStateV1 => ({
+    id,
+    backendId: "openrouter",
+    enabled: true,
+    maturity: "stable",
+    credentialSlot: slot,
+    accountFingerprint: route.accountFingerprint,
+    accountFingerprintState: "verified",
+    billingRealm: "openrouter-payg",
+    lastHealth: null,
+  });
+  const initial: ProviderSetupStateV1 = {
+    schemaVersion: 1,
+    revision: 0,
+    lifecycle: "configured",
+    connections: [
+      connection("reconnect-default-a", routeA, "legacy:inference"),
+      connection(
+        "reconnect-persisted-b",
+        routeB,
+        "v1:inference:78787878-7878-4787-8787-787878787878",
+      ),
+    ],
+    defaultRoute: routeA,
+    cross: { enabled: false, preferredLead: null, preferredChallenger: null },
+  };
+  const stateStore = new ProviderStateStore(initial);
+  const session = SessionStore.create("/synthetic/reconnect-persisted-foreign", "/synthetic/.orcode");
+  session.setPreferences(routeB.requestedModelId, { mode: "auto" }, routeB);
+  const config = structuredClone(DEFAULT_CONFIG);
+  config.mainModel = routeA.requestedModelId;
+  config.providerSetup = structuredClone(initial);
+  const events: string[] = [];
+  const runtime = new Runtime(
+    {},
+    {},
+    {
+      descriptor() { return { id: "openrouter", displayName: "OpenRouter", maturity: "stable" }; },
+      entries() { return []; },
+      adapter() {
+        return {
+          async listModels(request: { connectionId?: string }) {
+            events.push(`models:${request.connectionId}`);
+            return [{
+              backendId: "openrouter",
+              requestedModelId: routeB.requestedModelId,
+              canonicalModelId: routeB.canonicalModelId,
+              displayName: "Reconnect persisted B",
+              capabilities: { textInput: true, textOutput: true, tools: true, reasoning: true },
+            }];
+          },
+          async bindRuntime(request: { connectionId: string }) {
+            events.push(`bind:${request.connectionId}`);
+          },
+        };
+      },
+    },
+    stateStore,
+    {
+      async reconnect(_backendId: string, options: { connectionId?: string }) {
+        events.push(`reconnect:${options.connectionId}`);
+        return {
+          mode: "route-choice-required",
+          generation: 81,
+          defaultRoute: routeA,
+          readyRoutes: [routeA, routeB],
+          warnings: [],
+          crossEnabled: false,
+        };
+      },
+      ensureRunnableRoute(route: Record<string, unknown>) {
+        events.push(`prove:${String(route.accountFingerprint)}`);
+        return route;
+      },
+    },
+    {},
+    {
+      async acquire() { return { assertHeld() {}, release() {} }; },
+      beginRun() { return () => undefined; },
+    },
+    {},
+    "saved-secret",
+    null,
+    routeA.requestedModelId,
+    config,
+    session,
+  );
+
+  const result = await runtime.execute(
+    { kind: "reconnect", backendId: "openrouter" },
+    "plain",
+  );
+
+  assert.equal(result.kind, "reconnected");
+  assert.deepEqual(events, [
+    "reconnect:reconnect-persisted-b",
+    `prove:${routeB.accountFingerprint}`,
+    "models:reconnect-persisted-b",
+    "bind:reconnect-persisted-b",
+  ]);
+  assert.deepEqual(runtime.ensureRunnableRoute(), routeB);
+  assert.deepEqual(session.data.route, routeB);
+  assert.equal(config.mainModel, routeB.requestedModelId);
 });
 
 test("historical route selection proves catalogs and binds the exact foreign connection before session adoption", async () => {
@@ -2317,10 +2749,17 @@ test("historical route selection proves catalogs and binds the exact foreign con
   );
 
   assert.deepEqual(selected, foreignRoute);
-  assert.deepEqual(runtime.ensureRunnableRoute(), foreignRoute);
+  assert.throws(
+    () => runtime.ensureRunnableRoute(),
+    (error: unknown) => Boolean(
+      error && typeof error === "object" && "code" in error
+      && error.code === "provider-setup-required"
+    ),
+  );
   assert.deepEqual(originalSession.data.route, currentRoute);
   assert.equal(config.mainModel, currentRoute.requestedModelId);
   runtime.adoptSession(targetSession);
+  assert.deepEqual(runtime.ensureRunnableRoute(), foreignRoute);
   assert.deepEqual(targetSession.data.route, foreignRoute);
   assert.deepEqual(events, [
     "reconnect:selection-foreign",

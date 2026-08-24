@@ -149,3 +149,62 @@ Evidence:
 - `.superpowers/sdd/2026-08-23-orcode-startup-provider-slice-1/final-fix-2-report.md`
 
 Exact commit subject: `fix: bind provider setup and sessions exactly`.
+
+## Review round 1 — exact chat handoff
+
+### Base and formal RED
+
+- Exact follow-up base: `a7407feb7d73938acf243b7d9c45c1223f6d0697`.
+- Before production changed, `git diff --name-only a7407feb7d73938acf243b7d9c45c1223f6d0697 -- src`
+  was empty.
+- One name-filtered `tests/cli.test.ts` run reached exactly 3 tests: 0 passed,
+  3 failed, with no compile or harness failure:
+  1. `late agent creation after /chat open uses selected exact session` —
+     `createAgent.session.id` was startup chat A instead of selected chat B.
+  2. `failed post-bind previous-session save cannot leave a runnable foreign binding` —
+     one foreign-model callback ran after the old-chat save rejected.
+  3. `reconnect repairs persisted foreign route when runtime projection is empty` —
+     only reconnect B ran; exact proof, B catalog, and B runtime bind were absent.
+
+### Central correction
+
+- `runCli` now owns one mutable current session. Command and dashboard chat
+  switches call one handoff which commits provider/session/agent/local-runtime
+  ownership together; late agent creation and prompt preferences consume that
+  owner instead of the startup closure.
+- Foreign historical selection proves the exact route and catalog under the
+  runtime lease, physically binds it, then leaves it pending. No model action
+  can use a pending route. Only `adoptSession()` for the exact selected chat
+  publishes it; a failed previous-chat save therefore leaves the process
+  setup-required with zero foreign model bytes.
+- Pending publication is generation checked and is superseded by later
+  credential activation/forget. A resolved session/runtime mismatch is an
+  explicit setup-required gate.
+- Reconnect uses one desired-route order: current runtime projection, then the
+  persisted current-session route, then the durable default. A persisted
+  foreign route must pass exact connection proof and an exact one-model catalog
+  match before bind/adoption; it never falls back to the default account.
+
+The first post-production run reached the three intended paths (2/3 passed)
+and exposed only a test-fixture identity mistake: `SessionStore.openById()`
+returns the selected B instance rather than mutating the earlier construction
+handle. The assertion was tightened to record the actual prompt-owning session
+ID; it still proves `createAgent.session.id === B`, A is unchanged, and the
+first prompt belongs only to B.
+
+### Review-round verification
+
+- Named review matrix: 3/3 passed.
+- `tests/cli.test.ts`: 117/117 passed.
+- `tests/commands.test.ts`: 50/50 passed.
+- Focused combined setup/setup-UI/CLI/commands/session/integration run:
+  329/329 passed, including 30/30 integration tests.
+- `tests/provider-privacy.test.ts`: 3/3 passed with the temporary isolated
+  worktree dependency symlink removed afterward.
+- `tsc -p tsconfig.json --noEmit`: PASS.
+- `tsc -p tsconfig.tests.json --noEmit`: PASS.
+- `node --import tsx scripts/render-command-docs.ts --check`: PASS.
+- Approved setup Spec/Plan diff from the follow-up base: empty.
+- `git diff --check`: PASS.
+
+Exact follow-up commit subject: `fix: bind chat handoff to exact session`.
