@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -11,13 +11,39 @@ import {
   type CommandContext,
   type CommandOutput,
 } from "../src/commands.js";
-import { DEFAULT_CONFIG } from "../src/config.js";
-import type { CredentialStoreLike } from "../src/credentials.js";
+import {
+  DEFAULT_CONFIG,
+  loadConfigDetailed,
+  saveConfig,
+  type OrcodeConfigWithBudget,
+} from "../src/config.js";
+import type {
+  CredentialKind,
+  CredentialSlotRef,
+  CredentialStoreLike,
+  VersionedCredentialStoreLike,
+} from "../src/credentials.js";
 import { executeProviderModelAction } from "../src/cli.js";
 import { OpenRouterHttpError, OpenRouterService } from "../src/openrouter.js";
+import {
+  ProviderActivationCoordinator,
+  type ProviderActivationBoundary,
+} from "../src/provider-activation.js";
+import { PrivateStore } from "../src/private-store.js";
+import {
+  ProviderStateStore,
+  type ProviderConnectionStateV1,
+  type ProviderSetupStateV1,
+} from "../src/provider-state.js";
 import { createRunId, RunLog } from "../src/runlog.js";
 import { RuleStore, rulesPath, shellApprovalSubject } from "../src/rules.js";
 import { SessionStore } from "../src/session.js";
+import type {
+  BackendModelDescriptor,
+  CandidateProviderState,
+  ProviderCandidate,
+  RouteIdentityV1,
+} from "../src/backends.js";
 import type { ToolCallPreview } from "../src/types.js";
 import { ChangeJournal, WorkspaceGuard } from "../src/workspace.js";
 
@@ -115,6 +141,349 @@ function collectOutput(): { out: CommandOutput; lines: string[] } {
       },
     },
   };
+}
+
+interface TaskTenActivationTuple {
+  revision: number;
+  lifecycle: ProviderSetupStateV1["lifecycle"];
+  connections: ProviderConnectionStateV1[];
+  route: RouteIdentityV1 | null;
+  cross: ProviderSetupStateV1["cross"];
+  slots: Array<{
+    id: string;
+    secret: "old" | "new" | "foreign" | "other";
+  }>;
+  journals: string[];
+}
+
+const TASK_TEN_OLD_SLOT_ID = "v1:inference:10000000-0000-4000-8000-000000000001";
+const TASK_TEN_NEW_SLOT_ID = "v1:inference:10000000-0000-4000-8000-000000000002";
+const TASK_TEN_FOREIGN_SLOT_ID = "v1:inference:10000000-0000-4000-8000-000000000099";
+const TASK_TEN_CONNECTION_ID = "task-ten-exact-activation-connection";
+const TASK_TEN_OLD_FINGERPRINT = "acct_or_task_ten_old";
+const TASK_TEN_NEW_FINGERPRINT = "acct_or_task_ten_new";
+
+function expectedTaskTenActivationTuple(kind: "old" | "new"): TaskTenActivationTuple {
+  const route: RouteIdentityV1 = kind === "old"
+    ? {
+      version: 1,
+      backendId: "openrouter",
+      accountFingerprint: TASK_TEN_OLD_FINGERPRINT,
+      billingRealm: "openrouter-payg",
+      requestedModelId: "synthetic/task-ten-old-model",
+      canonicalModelId: "synthetic/task-ten-old-model",
+      resolutionState: "resolved",
+    }
+    : {
+      version: 1,
+      backendId: "openrouter",
+      accountFingerprint: TASK_TEN_NEW_FINGERPRINT,
+      billingRealm: "openrouter-payg",
+      requestedModelId: "synthetic/task-ten-new-requested",
+      canonicalModelId: "synthetic/task-ten-new-canonical",
+      resolutionState: "resolved",
+    };
+  return {
+    revision: kind === "old" ? 3 : 4,
+    lifecycle: "configured",
+    connections: [{
+      id: TASK_TEN_CONNECTION_ID,
+      backendId: "openrouter",
+      enabled: true,
+      maturity: "stable",
+      credentialSlot: kind === "old" ? TASK_TEN_OLD_SLOT_ID : TASK_TEN_NEW_SLOT_ID,
+      accountFingerprint: kind === "old"
+        ? TASK_TEN_OLD_FINGERPRINT
+        : TASK_TEN_NEW_FINGERPRINT,
+      accountFingerprintState: "verified",
+      billingRealm: "openrouter-payg",
+      lastHealth: kind === "old"
+        ? null
+        : {
+          credential: "valid",
+          connectivity: "connected",
+          spend: "unknown",
+          runtime: "not-applicable",
+          observedAt: 10,
+          generation: 4,
+        },
+    }],
+    route,
+    cross: { enabled: false, preferredLead: null, preferredChallenger: null },
+    slots: kind === "old"
+      ? [
+        { id: TASK_TEN_OLD_SLOT_ID, secret: "old" },
+        { id: TASK_TEN_FOREIGN_SLOT_ID, secret: "foreign" },
+      ]
+      : [
+        { id: TASK_TEN_NEW_SLOT_ID, secret: "new" },
+        { id: TASK_TEN_FOREIGN_SLOT_ID, secret: "foreign" },
+      ],
+    journals: [],
+  };
+}
+
+async function recoverTaskTenActivationTuple(
+  crashAfter: Extract<ProviderActivationBoundary, "slot-readback" | "config-readback">,
+): Promise<TaskTenActivationTuple> {
+  const appHome = await mkdtemp(join(tmpdir(), "orcode-task-ten-activation-"));
+  const configPath = join(appHome, "config.json");
+  const oldSecret = ["task", "ten", "old", "credential", "safe", "bytes"].join("-");
+  const newSecret = ["task", "ten", "new", "credential", "safe", "bytes"].join("-");
+  const foreignSecret = ["task", "ten", "foreign", "credential", "safe", "bytes"].join("-");
+  const connectionId = TASK_TEN_CONNECTION_ID;
+  const oldFingerprint = TASK_TEN_OLD_FINGERPRINT;
+  const newFingerprint = TASK_TEN_NEW_FINGERPRINT;
+  const oldSlot: CredentialSlotRef = Object.freeze({
+    version: 1,
+    kind: "inference",
+    id: TASK_TEN_OLD_SLOT_ID,
+  });
+  const newSlot: CredentialSlotRef = Object.freeze({
+    version: 1,
+    kind: "inference",
+    id: TASK_TEN_NEW_SLOT_ID,
+  });
+  const foreignSlot: CredentialSlotRef = Object.freeze({
+    version: 1,
+    kind: "inference",
+    id: TASK_TEN_FOREIGN_SLOT_ID,
+  });
+  const oldRoute: RouteIdentityV1 = {
+    version: 1,
+    backendId: "openrouter",
+    accountFingerprint: oldFingerprint,
+    billingRealm: "openrouter-payg",
+    requestedModelId: "synthetic/task-ten-old-model",
+    canonicalModelId: "synthetic/task-ten-old-model",
+    resolutionState: "resolved",
+  };
+  const newRoute: RouteIdentityV1 = {
+    version: 1,
+    backendId: "openrouter",
+    accountFingerprint: newFingerprint,
+    billingRealm: "openrouter-payg",
+    requestedModelId: "synthetic/task-ten-new-requested",
+    canonicalModelId: "synthetic/task-ten-new-canonical",
+    resolutionState: "resolved",
+  };
+  const model: BackendModelDescriptor = {
+    backendId: "openrouter",
+    requestedModelId: newRoute.requestedModelId,
+    canonicalModelId: newRoute.canonicalModelId!,
+    displayName: "Task Ten New Model",
+    capabilities: {
+      textInput: true,
+      textOutput: true,
+      tools: true,
+      reasoning: true,
+    },
+  };
+  const oldState: ProviderSetupStateV1 = {
+    schemaVersion: 1,
+    revision: 3,
+    lifecycle: "configured",
+    connections: [{
+      id: connectionId,
+      backendId: "openrouter",
+      enabled: true,
+      maturity: "stable",
+      credentialSlot: oldSlot.id,
+      accountFingerprint: oldFingerprint,
+      accountFingerprintState: "verified",
+      billingRealm: "openrouter-payg",
+      lastHealth: null,
+    }],
+    defaultRoute: oldRoute,
+    cross: { enabled: false, preferredLead: null, preferredChallenger: null },
+  };
+  await saveConfig({
+    ...structuredClone(DEFAULT_CONFIG),
+    providerSetup: oldState,
+  } satisfies OrcodeConfigWithBudget, configPath);
+
+  const slots = new Map([
+    [oldSlot.id, oldSecret],
+    [foreignSlot.id, foreignSecret],
+  ]);
+  let reserved = false;
+  const credentials: VersionedCredentialStoreLike = {
+    location: "task-ten-in-memory-store",
+    reserveSlot(kind: CredentialKind) {
+      assert.equal(kind, "inference");
+      assert.equal(reserved, false);
+      reserved = true;
+      return newSlot;
+    },
+    async writeSlot(slot, secret) {
+      assert.equal(slot, newSlot);
+      slots.set(slot.id, secret);
+    },
+    async readSlot(slot) {
+      return slots.get(slot.id) ?? null;
+    },
+    async deleteSlot(slot) {
+      return slots.delete(slot.id);
+    },
+    async get() {
+      return null;
+    },
+    async set() {},
+    async delete() {
+      return false;
+    },
+    async has() {
+      return false;
+    },
+    async getOrCreateAccountHmacKey() {
+      return new Uint8Array(32).fill(10);
+    },
+  };
+  let candidateCounter = 0;
+  const candidates = new Map<string, string>();
+  const adapter = {
+    async connect(request: {
+      candidate: unknown;
+      generation: number;
+      signal: AbortSignal;
+    }): Promise<ProviderCandidate> {
+      assert.equal(request.signal.aborted, false);
+      assert.equal(typeof request.candidate, "string");
+      const candidateId = `task-ten-candidate-${++candidateCounter}`;
+      candidates.set(candidateId, request.candidate as string);
+      return {
+        candidateId,
+        backendId: "openrouter",
+        connectionId,
+        accountFingerprint: request.candidate === newSecret
+          ? newFingerprint
+          : oldFingerprint,
+        billingRealm: "openrouter-payg",
+        health: {
+          credential: "valid",
+          connectivity: "connected",
+          spend: "unknown",
+          runtime: "not-applicable",
+          observedAt: 10,
+          generation: request.generation,
+        },
+      };
+    },
+    async listModels(request: {
+      candidateId?: string;
+      signal: AbortSignal;
+    }): Promise<readonly BackendModelDescriptor[]> {
+      assert.equal(request.signal.aborted, false);
+      assert.equal(candidates.has(request.candidateId ?? ""), true);
+      return [model];
+    },
+    async activate(request: {
+      candidateId: string;
+      model: BackendModelDescriptor;
+      signal: AbortSignal;
+    }): Promise<CandidateProviderState> {
+      assert.equal(request.signal.aborted, false);
+      assert.equal(candidates.get(request.candidateId), newSecret);
+      assert.equal(request.model.canonicalModelId, model.canonicalModelId);
+      return {
+        candidateId: request.candidateId,
+        backendId: "openrouter",
+        connectionId,
+        accountFingerprint: newFingerprint,
+        billingRealm: "openrouter-payg",
+        route: newRoute,
+      };
+    },
+    async discardCandidate(candidateId: string) {
+      candidates.delete(candidateId);
+    },
+  };
+  const stateStore = new ProviderStateStore(oldState);
+  const privateStore = new PrivateStore({ root: appHome });
+  let now = 1_000;
+  let uuidCounter = 10;
+  const makeCoordinator = (boundary?: ProviderActivationBoundary) =>
+    new ProviderActivationCoordinator({
+      appHome,
+      configPath,
+      privateStore,
+      credentials,
+      adapter,
+      stateStore,
+      runtimeGuard: {
+        async acquire() {
+          let held = true;
+          return {
+            assertHeld() {
+              if (!held) throw new Error("task-ten-runtime-lease-lost");
+            },
+            async release() {
+              held = false;
+            },
+          };
+        },
+      },
+      now: () => now,
+      createUuid: () => {
+        uuidCounter += 1;
+        return `10000000-0000-4000-8000-${String(uuidCounter).padStart(12, "0")}`;
+      },
+      leaseDurationMs: 100,
+      waitForLease: async () => new Promise<void>((resolve) => setImmediate(resolve)),
+      onBoundary: boundary
+        ? async (reached) => {
+          if (reached === boundary) throw new Error("task-ten-simulated-crash");
+        }
+        : async () => undefined,
+    });
+  const crashing = makeCoordinator(crashAfter);
+  await assert.rejects(crashing.activate({
+    expectedRevision: oldState.revision,
+    candidate: newSecret,
+    expectedRequestedModelId: model.requestedModelId,
+    selectedCanonicalModelId: model.canonicalModelId,
+    generation: 4,
+    signal: new AbortController().signal,
+    persistence: "persisted",
+  }));
+  now = 5_000;
+  await makeCoordinator().recover({
+    signal: new AbortController().signal,
+    inspectCommitted: true,
+  });
+
+  const loaded = await loadConfigDetailed(configPath);
+  assert.equal("kind" in loaded.config.providerSetup, false);
+  const state = loaded.config.providerSetup as ProviderSetupStateV1;
+  let journals: string[];
+  try {
+    journals = (await readdir(join(appHome, "provider-activation"))).sort();
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    journals = [];
+  }
+  const tuple: TaskTenActivationTuple = {
+    revision: state.revision,
+    lifecycle: state.lifecycle,
+    connections: structuredClone(state.connections),
+    route: state.defaultRoute ? structuredClone(state.defaultRoute) : null,
+    cross: structuredClone(state.cross),
+    slots: [...slots.entries()]
+      .map(([id, value]) => ({
+        id,
+        secret: value === oldSecret
+          ? "old" as const
+          : value === newSecret
+            ? "new" as const
+            : value === foreignSecret
+              ? "foreign" as const
+              : "other" as const,
+      }))
+      .sort((left, right) => left.id.localeCompare(right.id)),
+    journals,
+  };
+  await rm(appHome, { recursive: true, force: true });
+  return tuple;
 }
 
 test("/export writes plain files without a fight", async () => {
@@ -481,6 +850,134 @@ test("/chat operations keep using the app home selected by startup migration", a
 
   assert.equal(context.session.appHome, migratedAppHome);
   assert.equal(context.session.data.title, "Nach Migration");
+});
+
+test("/chat list with a migrated connection stays read-only and does not persist a projected route", async () => {
+  const { context } = await harness();
+  const connection: ProviderConnectionStateV1 = {
+    id: "task-ten-list-migrated-connection",
+    backendId: "openrouter",
+    enabled: true,
+    maturity: "stable",
+    credentialSlot: "legacy:inference",
+    accountFingerprint: "acct_or_task_ten_list_verified",
+    accountFingerprintState: "verified",
+    billingRealm: "openrouter-payg",
+    lastHealth: {
+      credential: "valid",
+      connectivity: "connected",
+      spend: "unknown",
+      runtime: "not-applicable",
+      observedAt: 10,
+      generation: 2,
+    },
+  };
+  context.config.providerSetup = {
+    schemaVersion: 1,
+    revision: 2,
+    lifecycle: "configured",
+    connections: [connection],
+    defaultRoute: null,
+    cross: { enabled: false, preferredLead: null, preferredChallenger: null },
+  };
+  const historical = SessionStore.create(
+    context.workspace,
+    context.session.appHome,
+    "Read-only historical chat",
+  );
+  historical.setPreferences("synthetic/list-historical-model", { mode: "auto" });
+  await historical.save();
+  const bytesBefore = await readFile(historical.path, "utf8");
+
+  await handleSlashCommand("/chat list", context);
+
+  assert.equal(await readFile(historical.path, "utf8"), bytesBefore);
+  const persisted = await SessionStore.openById(
+    context.workspace,
+    historical.data.id,
+    context.session.appHome,
+  );
+  assert.equal(persisted.data.route, undefined);
+  assert.equal(context.config.providerSetup.cross.enabled, false);
+});
+
+test("later /chat open keeps using the verified migrated OpenRouter connection for historical routes", async () => {
+  const { context } = await harness();
+  const connection: ProviderConnectionStateV1 = {
+    id: "task-ten-migrated-chat-connection",
+    backendId: "openrouter",
+    enabled: true,
+    maturity: "stable",
+    credentialSlot: "legacy:inference",
+    accountFingerprint: "acct_or_task_ten_migrated_verified",
+    accountFingerprintState: "verified",
+    billingRealm: "openrouter-payg",
+    lastHealth: {
+      credential: "valid",
+      connectivity: "connected",
+      spend: "unknown",
+      runtime: "not-applicable",
+      observedAt: 10,
+      generation: 2,
+    },
+  };
+  context.config.providerSetup = {
+    schemaVersion: 1,
+    revision: 2,
+    lifecycle: "configured",
+    connections: [connection],
+    defaultRoute: null,
+    cross: { enabled: false, preferredLead: null, preferredChallenger: null },
+  };
+  const historical = SessionStore.create(
+    context.workspace,
+    context.session.appHome,
+    "Historischer migrierter Chat",
+  );
+  historical.setPreferences("synthetic/historical-chat-model", { mode: "auto" });
+  await historical.save();
+  const transitions: string[] = [];
+  (context as CommandContext & {
+    providerRoutes: { transitionModel(modelId: string): Promise<void> };
+  }).providerRoutes = {
+    async transitionModel(modelId) {
+      transitions.push(modelId);
+    },
+  };
+
+  await handleSlashCommand("/chat open Historischer migrierter Chat", context);
+
+  assert.deepEqual(transitions, ["synthetic/historical-chat-model"]);
+  assert.equal(context.session.data.id, historical.data.id);
+  assert.deepEqual(context.session.data.route, {
+    version: 1,
+    backendId: "openrouter",
+    accountFingerprint: connection.accountFingerprint,
+    billingRealm: "openrouter-payg",
+    requestedModelId: "synthetic/historical-chat-model",
+    canonicalModelId: null,
+    resolutionState: "legacy-unverified",
+  });
+  const persisted = await SessionStore.openById(
+    context.workspace,
+    historical.data.id,
+    context.session.appHome,
+  );
+  assert.deepEqual(persisted.data.route, context.session.data.route);
+  assert.equal(context.config.providerSetup.cross.enabled, false);
+});
+
+test("activation restart yields only an exact old or exact new credential-route tuple", async (t) => {
+  const oldTuple = expectedTaskTenActivationTuple("old");
+  const newTuple = expectedTaskTenActivationTuple("new");
+  await t.test("pre-config-publish journal recovers the exact old tuple", async () => {
+    const tuple = await recoverTaskTenActivationTuple("slot-readback");
+    assert.deepEqual(tuple, oldTuple);
+  });
+  await t.test("post-config-publish journal recovers the exact new tuple", async () => {
+    const tuple = await recoverTaskTenActivationTuple("config-readback");
+    assert.deepEqual(tuple, newTuple);
+  });
 });
 
 test("/config reports and mutations use the config path selected by startup migration", async () => {

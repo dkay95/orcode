@@ -87,7 +87,12 @@ import {
   summarizeRun,
   undoInterruptedRun,
 } from "./resume.js";
-import { rankChatMatches, SessionStore, workspaceSpend } from "./session.js";
+import {
+  migratedOpenRouterSessionConnection,
+  rankChatMatches,
+  SessionStore,
+  workspaceSpend,
+} from "./session.js";
 import {
   getGitDiff,
   runProcess,
@@ -1688,8 +1693,15 @@ async function chatCommand(
   context: CommandContext,
 ): Promise<void> {
   const action = (args[0] ?? "").toLowerCase();
+  const migratedConnection = context.config === undefined
+    ? undefined
+    : migratedOpenRouterSessionConnection(context.config.providerSetup);
   if (!action) {
-    const chats = await SessionStore.list(context.workspace, context.session.appHome);
+    const chats = await SessionStore.list(
+      context.workspace,
+      context.session.appHome,
+      migratedConnection,
+    );
     const choices = [
       {
         name: "＋ Neuer Chat",
@@ -1719,7 +1731,12 @@ async function chatCommand(
     } else if (selected !== context.session.data.id) {
       await replaceSession(
         context,
-        await SessionStore.openById(context.workspace, selected, context.session.appHome),
+        await SessionStore.openById(
+          context.workspace,
+          selected,
+          context.session.appHome,
+          migratedConnection,
+        ),
       );
     }
     printCurrentChat(context.session, context.out);
@@ -1727,7 +1744,11 @@ async function chatCommand(
   }
 
   if (action === "list") {
-    const chats = await SessionStore.list(context.workspace, context.session.appHome);
+    const chats = await SessionStore.list(
+      context.workspace,
+      context.session.appHome,
+      migratedConnection,
+    );
     if (!chats.length) {
       context.out.text("Noch keine gespeicherten Chats in diesem Workspace.");
       return;
@@ -1781,7 +1802,11 @@ async function chatCommand(
     if (!query) {
       throw new Error("Verwendung: /chat open <ID oder Titel>");
     }
-    const chats = await SessionStore.list(context.workspace, context.session.appHome);
+    const chats = await SessionStore.list(
+      context.workspace,
+      context.session.appHome,
+      migratedConnection,
+    );
     const matches = rankChatMatches(chats, query);
     if (!matches.length) {
       throw new Error(`Kein Chat gefunden: ${query}`);
@@ -1791,7 +1816,12 @@ async function chatCommand(
     if (!contested) {
       await replaceSession(
         context,
-        await SessionStore.openById(context.workspace, best.chat.id, context.session.appHome),
+        await SessionStore.openById(
+          context.workspace,
+          best.chat.id,
+          context.session.appHome,
+          migratedConnection,
+        ),
       );
       printCurrentChat(context.session, context.out);
       return;
@@ -1813,7 +1843,12 @@ async function chatCommand(
     if (selected !== context.session.data.id) {
       await replaceSession(
         context,
-        await SessionStore.openById(context.workspace, selected, context.session.appHome),
+        await SessionStore.openById(
+          context.workspace,
+          selected,
+          context.session.appHome,
+          migratedConnection,
+        ),
       );
     }
     printCurrentChat(context.session, context.out);
@@ -1825,7 +1860,12 @@ async function chatCommand(
     if (!query) {
       throw new Error("Verwendung: /chat search <Suchbegriff>");
     }
-    const hits = await SessionStore.search(context.workspace, query, context.session.appHome);
+    const hits = await SessionStore.search(
+      context.workspace,
+      query,
+      context.session.appHome,
+      migratedConnection,
+    );
     if (!hits.length) {
       context.out.text(`Keine Chats gefunden für: ${query}`);
       return;
@@ -1852,7 +1892,11 @@ async function chatCommand(
     if (!query) {
       throw new Error("Verwendung: /chat delete <ID oder Titel>");
     }
-    const chats = await SessionStore.list(context.workspace, context.session.appHome);
+    const chats = await SessionStore.list(
+      context.workspace,
+      context.session.appHome,
+      migratedConnection,
+    );
     const matches = rankChatMatches(chats, query);
     if (!matches.length) {
       throw new Error(`Kein Chat gefunden: ${query}`);

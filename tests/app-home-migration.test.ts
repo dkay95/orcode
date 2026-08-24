@@ -28,7 +28,12 @@ import { initializeStartupStorage } from "../src/cli.js";
 import { migrateAppHome, withConfigWriteLock } from "../src/config.js";
 import { CredentialStore } from "../src/credentials.js";
 import { PrivateStore } from "../src/private-store.js";
+import {
+  projectLegacyModelRoutes,
+  type ProviderConnectionStateV1,
+} from "../src/provider-state.js";
 import { approvalSubjectFingerprint } from "../src/rules.js";
+import { SessionStore } from "../src/session.js";
 import {
   migrationManifestPath,
   parseCheckpointEntries,
@@ -1707,5 +1712,393 @@ test("committed v0 app-home fixture migrates through real startup without extern
     CredentialStore.prototype.set = originalSet;
     CredentialStore.prototype.delete = originalDelete;
     CredentialStore.prototype.has = originalHas;
+  }
+});
+
+test("historical startup preserves every model role and creates one local migrated OpenRouter connection without provider or credential access", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "orcode-historical-provider-roles-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const legacyHome = join(root, ".routercode");
+  const appHome = join(root, ".orcode");
+  await cp(HISTORICAL_FIXTURE_ROOT, legacyHome, { recursive: true });
+  const configPath = join(legacyHome, "config.json");
+  const legacyConfig = JSON.parse(await readFile(configPath, "utf8")) as Record<string, unknown>;
+  Object.assign(legacyConfig, {
+    mainModel: "synthetic/main-v0",
+    fallbackModels: ["synthetic/fallback-a-v0", "synthetic/fallback-b-v0"],
+    compressorModel: "synthetic/compressor-v0",
+    transcriptionModel: "synthetic/transcription-v0",
+    panelModels: ["synthetic/panel-a-v0", "synthetic/panel-b-v0", "synthetic/panel-c-v0"],
+    reasoningByModel: {
+      "synthetic/main-v0": { mode: "effort", effort: "high" },
+      "synthetic/fallback-a-v0": { mode: "effort", effort: "low" },
+      "synthetic/panel-b-v0": { mode: "auto" },
+    },
+  });
+  await writeFile(configPath, `${JSON.stringify(legacyConfig, null, 2)}\n`);
+  const firstChatPath = join(
+    legacyHome,
+    "chats",
+    HISTORICAL_FIXTURE_HASH,
+    `${HISTORICAL_FIXTURE_CHAT_ID}.json`,
+  );
+  const secondChatId = "legacy-fixture-chat-second";
+  const secondChat = JSON.parse(await readFile(firstChatPath, "utf8")) as Record<string, unknown>;
+  Object.assign(secondChat, {
+    id: secondChatId,
+    title: "Historischer zweiter Provider-Chat",
+    model: "synthetic/session-second-v0",
+    createdAt: "2024-08-21T09:59:00.000Z",
+    updatedAt: "2024-08-21T10:01:00.000Z",
+  });
+  await writeFile(
+    join(legacyHome, "chats", HISTORICAL_FIXTURE_HASH, `${secondChatId}.json`),
+    `${JSON.stringify(secondChat, null, 2)}\n`,
+  );
+
+  let credentialCalls = 0;
+  let networkCalls = 0;
+  let capturedConnection: ProviderConnectionStateV1 | undefined;
+  const originalFetch = globalThis.fetch;
+  const originalGet = CredentialStore.prototype.get;
+  const originalSet = CredentialStore.prototype.set;
+  const originalDelete = CredentialStore.prototype.delete;
+  const originalHas = CredentialStore.prototype.has;
+  globalThis.fetch = (async () => {
+    networkCalls += 1;
+    throw new Error("provider-role migration must remain offline");
+  }) as typeof fetch;
+  CredentialStore.prototype.get = async function() {
+    credentialCalls += 1;
+    return null;
+  };
+  CredentialStore.prototype.set = async function() {
+    credentialCalls += 1;
+  };
+  CredentialStore.prototype.delete = async function() {
+    credentialCalls += 1;
+    return false;
+  };
+  CredentialStore.prototype.has = async function() {
+    credentialCalls += 1;
+    return false;
+  };
+
+  try {
+    const startup = await initializeStartupStorage(
+      { workspace: HISTORICAL_FIXTURE_WORKSPACE, newChat: false },
+      {
+        migrateAppHome: () => migrateAppHome(appHome, legacyHome, {
+          randomUUID: () => "task-ten-migrated-connection",
+        } as never),
+        pruneRunLogs: async () => undefined,
+        pruneCheckpoints: async () => undefined,
+        pruneBrowserTempArtifacts: async () => undefined,
+        openSession: (async (...args: unknown[]) => {
+          const [workspace, selectedHome, , providerConnection] = args as [
+            string,
+            string,
+            { newChat: boolean },
+            ProviderConnectionStateV1 | undefined,
+          ];
+          capturedConnection = providerConnection;
+          return SessionStore.open(workspace, selectedHome, providerConnection);
+        }) as never,
+      },
+    );
+    assert.ok(capturedConnection);
+    if ("kind" in startup.config.providerSetup) assert.fail("provider state must be current");
+    assert.equal(startup.config.providerSetup.connections.length, 1);
+    assert.equal(startup.config.providerSetup.connections[0]?.credentialSlot, "legacy:inference");
+    assert.equal(startup.config.providerSetup.connections[0]?.id, "task-ten-migrated-connection");
+    assert.equal(startup.config.mainModel, "synthetic/main-v0");
+    assert.deepEqual(startup.config.fallbackModels, [
+      "synthetic/fallback-a-v0",
+      "synthetic/fallback-b-v0",
+    ]);
+    assert.equal(startup.config.compressorModel, "synthetic/compressor-v0");
+    assert.equal(startup.config.transcriptionModel, "synthetic/transcription-v0");
+    assert.deepEqual(startup.config.panelModels, [
+      "synthetic/panel-a-v0",
+      "synthetic/panel-b-v0",
+      "synthetic/panel-c-v0",
+    ]);
+    assert.deepEqual(Object.keys(startup.config.reasoningByModel).sort(), [
+      "synthetic/fallback-a-v0",
+      "synthetic/main-v0",
+      "synthetic/panel-b-v0",
+    ]);
+    const projection = projectLegacyModelRoutes({
+      mainModel: startup.config.mainModel,
+      fallbackModels: startup.config.fallbackModels,
+      compressorModel: startup.config.compressorModel,
+      transcriptionModel: startup.config.transcriptionModel,
+      panelModels: startup.config.panelModels,
+      reasoningByModel: startup.config.reasoningByModel,
+    }, capturedConnection);
+    assert.deepEqual(
+      [
+        projection.default.requestedModelId,
+        ...projection.fallbacks.map((route) => route.requestedModelId),
+        projection.compressor.requestedModelId,
+        projection.transcription.requestedModelId,
+        ...projection.panel.map((route) => route.requestedModelId),
+        ...Object.keys(projection.reasoning).sort(),
+      ],
+      [
+        "synthetic/main-v0",
+        "synthetic/fallback-a-v0",
+        "synthetic/fallback-b-v0",
+        "synthetic/compressor-v0",
+        "synthetic/transcription-v0",
+        "synthetic/panel-a-v0",
+        "synthetic/panel-b-v0",
+        "synthetic/panel-c-v0",
+        "synthetic/fallback-a-v0",
+        "synthetic/main-v0",
+        "synthetic/panel-b-v0",
+      ],
+    );
+    assert.equal(startup.session.data.route?.requestedModelId, "synthetic/session-second-v0");
+    assert.equal(startup.session.data.route?.resolutionState, "legacy-unverified");
+    assert.equal(networkCalls, 0);
+    assert.equal(credentialCalls, 0);
+  } finally {
+    globalThis.fetch = originalFetch;
+    CredentialStore.prototype.get = originalGet;
+    CredentialStore.prototype.set = originalSet;
+    CredentialStore.prototype.delete = originalDelete;
+    CredentialStore.prototype.has = originalHas;
+  }
+});
+
+test("historical chats persist migrated routes independently and second open-save is stable", async (t) => {
+  const appHome = await mkdtemp(join(tmpdir(), "orcode-historical-route-stability-"));
+  t.after(() => rm(appHome, { recursive: true, force: true }));
+  const workspace = "/fixture/task-ten-route-workspace";
+  const workspaceHash = createHash("sha256").update(workspace).digest("hex").slice(0, 16);
+  const chatDirectory = join(appHome, "chats", workspaceHash);
+  await mkdir(chatDirectory, { recursive: true });
+  const firstId = "historical-route-chat-a";
+  const secondId = "historical-route-chat-b";
+  const sessionFixture = (id: string, model: string, updatedAt: string) => ({
+    version: 2,
+    id,
+    title: id,
+    workspace,
+    summary: "",
+    turns: [],
+    costs: { mainUsd: 0, compressorUsd: 0, voiceUsd: 0, totalUsd: 0 },
+    model,
+    reasoning: { mode: "auto" },
+    revision: 3,
+    checkpoints: [],
+    toolCalls: [],
+    dailySpendUsd: {},
+    createdAt: "2024-08-20T10:00:00.000Z",
+    updatedAt,
+  });
+  const firstPath = join(chatDirectory, `${firstId}.json`);
+  const secondPath = join(chatDirectory, `${secondId}.json`);
+  await writeFile(firstPath, `${JSON.stringify(sessionFixture(
+    firstId,
+    "synthetic/session-route-a",
+    "2024-08-20T10:01:00.000Z",
+  ), null, 2)}\n`);
+  await writeFile(secondPath, `${JSON.stringify(sessionFixture(
+    secondId,
+    "synthetic/session-route-b",
+    "2024-08-21T10:01:00.000Z",
+  ), null, 2)}\n`);
+  const provisional: ProviderConnectionStateV1 = {
+    id: "task-ten-legacy-connection",
+    backendId: "openrouter",
+    enabled: true,
+    maturity: "stable",
+    credentialSlot: "legacy:inference",
+    accountFingerprint: "acct_legacy_task-ten-legacy-connection",
+    accountFingerprintState: "provisional",
+    billingRealm: "openrouter-payg",
+    lastHealth: null,
+  };
+
+  const originalSecond = await readFile(secondPath, "utf8");
+  const first = await SessionStore.openById(workspace, firstId, appHome, provisional);
+  assert.equal(first.data.route?.requestedModelId, "synthetic/session-route-a");
+  await first.save();
+  assert.equal(await readFile(secondPath, "utf8"), originalSecond);
+  const firstPersisted = await readFile(firstPath, "utf8");
+  const firstAgain = await SessionStore.openById(workspace, firstId, appHome, provisional);
+  const firstNoop = await firstAgain.save();
+  assert.equal(await readFile(firstPath, "utf8"), firstPersisted);
+  assert.equal(firstNoop.revision, firstAgain.data.revision);
+
+  const verified: ProviderConnectionStateV1 = {
+    ...provisional,
+    accountFingerprint: "acct_or_task_ten_verified",
+    accountFingerprintState: "verified",
+    lastHealth: {
+      credential: "valid",
+      connectivity: "connected",
+      spend: "unknown",
+      runtime: "not-applicable",
+      observedAt: 20,
+      generation: 2,
+    },
+  };
+  const second = await SessionStore.openById(workspace, secondId, appHome, verified);
+  assert.equal(second.data.route?.requestedModelId, "synthetic/session-route-b");
+  assert.equal(second.data.route?.accountFingerprint, verified.accountFingerprint);
+  await second.save();
+  assert.equal(await readFile(firstPath, "utf8"), firstPersisted);
+  const secondPersisted = await readFile(secondPath, "utf8");
+  const secondAgain = await SessionStore.openById(workspace, secondId, appHome, verified);
+  await secondAgain.save();
+  assert.equal(await readFile(secondPath, "utf8"), secondPersisted);
+  const beforeSecondStartup = await snapshotFileTree(appHome);
+  const startup = await SessionStore.open(workspace, appHome, verified);
+  await startup.save();
+  assert.deepEqual(await snapshotFileTree(appHome), beforeSecondStartup);
+});
+
+test("verified migrated connection lazily derives a historical route before persistence", async (t) => {
+  const appHome = await mkdtemp(join(tmpdir(), "orcode-verified-historical-route-"));
+  t.after(() => rm(appHome, { recursive: true, force: true }));
+  const workspace = "/fixture/task-ten-verified-route-workspace";
+  const workspaceHash = createHash("sha256").update(workspace).digest("hex").slice(0, 16);
+  const chatDirectory = join(appHome, "chats", workspaceHash);
+  await mkdir(chatDirectory, { recursive: true });
+  const chatId = "verified-historical-route-chat";
+  await writeFile(join(chatDirectory, `${chatId}.json`), `${JSON.stringify({
+    version: 2,
+    id: chatId,
+    title: "Verified historical route",
+    workspace,
+    summary: "",
+    turns: [],
+    costs: { mainUsd: 0, compressorUsd: 0, voiceUsd: 0, totalUsd: 0 },
+    model: "synthetic/verified-historical-model",
+    reasoning: { mode: "auto" },
+    revision: 1,
+    checkpoints: [],
+    toolCalls: [],
+    dailySpendUsd: {},
+    createdAt: "2024-08-20T10:00:00.000Z",
+    updatedAt: "2024-08-20T10:01:00.000Z",
+  }, null, 2)}\n`);
+  const connection: ProviderConnectionStateV1 = {
+    id: "task-ten-verified-legacy-connection",
+    backendId: "openrouter",
+    enabled: true,
+    maturity: "stable",
+    credentialSlot: "legacy:inference",
+    accountFingerprint: "acct_or_task_ten_verified_historical",
+    accountFingerprintState: "verified",
+    billingRealm: "openrouter-payg",
+    lastHealth: {
+      credential: "valid",
+      connectivity: "connected",
+      spend: "unknown",
+      runtime: "not-applicable",
+      observedAt: 50,
+      generation: 5,
+    },
+  };
+
+  const session = await SessionStore.openById(workspace, chatId, appHome, connection);
+
+  assert.deepEqual(session.data.route, {
+    version: 1,
+    backendId: "openrouter",
+    accountFingerprint: connection.accountFingerprint,
+    billingRealm: "openrouter-payg",
+    requestedModelId: "synthetic/verified-historical-model",
+    canonicalModelId: null,
+    resolutionState: "legacy-unverified",
+  });
+});
+
+test("future and corrupt provider homes remain byte-identical and stop before setup credential deletion or network", async (t) => {
+  for (const fixture of [
+    { name: "future", providerSetup: { schemaVersion: 99, opaque: "safe-future-provider-state" } },
+    { name: "corrupt", providerSetup: { schemaVersion: 1, connections: "invalid" } },
+  ] as const) {
+    await t.test(fixture.name, async () => {
+      const root = await mkdtemp(join(tmpdir(), `orcode-provider-${fixture.name}-`));
+      t.after(() => rm(root, { recursive: true, force: true }));
+      const appHome = join(root, ".orcode");
+      const legacyHome = join(root, ".routercode");
+      await mkdir(appHome, { recursive: true });
+      await writeFile(join(appHome, "config.json"), `${JSON.stringify({
+        schemaVersion: 1,
+        mainModel: "synthetic/safe-model",
+        providerSetup: fixture.providerSetup,
+      })}\n`);
+      await writeFile(join(appHome, "sentinel.txt"), "safe-sentinel\n");
+      const before = await snapshotFileTree(appHome);
+      let credentialCalls = 0;
+      let networkCalls = 0;
+      let setupCalls = 0;
+      let sessionCalls = 0;
+      const originalFetch = globalThis.fetch;
+      const originalGet = CredentialStore.prototype.get;
+      const originalSet = CredentialStore.prototype.set;
+      const originalDelete = CredentialStore.prototype.delete;
+      const originalHas = CredentialStore.prototype.has;
+      globalThis.fetch = (async () => {
+        networkCalls += 1;
+        throw new Error("network forbidden");
+      }) as typeof fetch;
+      CredentialStore.prototype.get = async function() {
+        credentialCalls += 1;
+        return null;
+      };
+      CredentialStore.prototype.set = async function() {
+        credentialCalls += 1;
+      };
+      CredentialStore.prototype.delete = async function() {
+        credentialCalls += 1;
+        return false;
+      };
+      CredentialStore.prototype.has = async function() {
+        credentialCalls += 1;
+        return false;
+      };
+      try {
+        const error = await initializeStartupStorage(
+          { workspace: HISTORICAL_FIXTURE_WORKSPACE, newChat: false },
+          {
+            migrateAppHome: () => migrateAppHome(appHome, legacyHome),
+            pruneRunLogs: async () => undefined,
+            pruneCheckpoints: async () => undefined,
+            pruneBrowserTempArtifacts: async () => undefined,
+            loadRules: (async () => {
+              setupCalls += 1;
+              throw new Error("post-migration setup forbidden");
+            }) as never,
+            openSession: (async () => {
+              sessionCalls += 1;
+              throw new Error("post-migration session forbidden");
+            }) as never,
+          },
+        ).then(
+          () => null,
+          (reason: unknown) => reason,
+        );
+        assert.ok(error instanceof Error);
+        assert.doesNotMatch(String(error), /credential|network forbidden|post-migration|creator_user_id/i);
+        assert.deepEqual(await snapshotFileTree(appHome), before);
+        assert.equal(credentialCalls, 0);
+        assert.equal(networkCalls, 0);
+        assert.equal(setupCalls, 0);
+        assert.equal(sessionCalls, 0);
+      } finally {
+        globalThis.fetch = originalFetch;
+        CredentialStore.prototype.get = originalGet;
+        CredentialStore.prototype.set = originalSet;
+        CredentialStore.prototype.delete = originalDelete;
+        CredentialStore.prototype.has = originalHas;
+      }
+    });
   }
 });

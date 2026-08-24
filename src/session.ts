@@ -35,9 +35,11 @@ import {
 import { formatUsd, hasCode, isRecord } from "./utils.js";
 import type { RouteIdentityV1 } from "./backends.js";
 import {
+  isProviderStateIssue,
   mapLegacyOpenRouterModel,
   validateRouteIdentityV1,
   type ProviderConnectionStateV1,
+  type ProviderSetupState,
 } from "./provider-state.js";
 
 const MAX_TURNS = 80;
@@ -95,6 +97,23 @@ export interface SaveOutcome {
 
 export interface SessionRunSnapshot {
   data: PersistedSessionData;
+}
+
+/**
+ * Returns the one still-legacy OpenRouter connection that may project model
+ * preferences from historical chats. Once activation moves the connection to
+ * a versioned slot, old chats must no longer infer a route from it.
+ */
+export function migratedOpenRouterSessionConnection(
+  providerSetup: ProviderSetupState,
+): ProviderConnectionStateV1 | undefined {
+  if (isProviderStateIssue(providerSetup)) {
+    return undefined;
+  }
+  const matches = providerSetup.connections.filter(
+    isActiveMigratedOpenRouterConnection,
+  );
+  return matches.length === 1 ? matches[0] : undefined;
 }
 
 export class SessionStore {
@@ -482,6 +501,21 @@ export class SessionStore {
       let conflictBackupPath: string | null = null;
 
       if (foreign.kind === "data") {
+        if (
+          sameValue(this.#data, this.#base)
+          && !hasPendingLegacyRouteProjection(this.#base, foreign.data)
+        ) {
+          // A stale but locally unchanged window has nothing to contribute.
+          // Adopt the locked readback exactly instead of merging it into a new
+          // revision and churning an otherwise stable file.
+          this.#data = structuredClone(foreign.data);
+          this.#base = structuredClone(foreign.data);
+          return {
+            merged: false,
+            conflictBackupPath: null,
+            revision: foreign.revision,
+          };
+        }
         if (fingerprint(foreign.data) !== fingerprint(this.#base)) {
           this.#data = mergeSessions(this.#base, this.#data, foreign.data);
           merged = true;
@@ -922,8 +956,7 @@ function isActiveMigratedOpenRouterConnection(
 ): value is ProviderConnectionStateV1 {
   return value?.backendId === "openrouter"
     && value.enabled
-    && value.credentialSlot === "legacy:inference"
-    && value.accountFingerprintState === "provisional";
+    && value.credentialSlot === "legacy:inference";
 }
 
 function normalizeTurns(value: unknown): ChatTurn[] {
@@ -1423,6 +1456,21 @@ function sameValue(left: unknown, right: unknown): boolean {
 
 function sameRedactedProjection(left: unknown, right: unknown): boolean {
   return JSON.stringify(redactValue(left)) === JSON.stringify(redactValue(right));
+}
+
+function hasPendingLegacyRouteProjection(
+  projected: PersistedSessionData,
+  persisted: PersistedSessionData,
+): boolean {
+  if (
+    projected.route?.resolutionState !== "legacy-unverified"
+    || persisted.route !== undefined
+  ) {
+    return false;
+  }
+  const withoutProjection = structuredClone(projected);
+  delete withoutProjection.route;
+  return sameRedactedProjection(withoutProjection, persisted);
 }
 
 function turnKey(turn: ChatTurn): string {

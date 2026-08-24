@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { readFileSync } from "node:fs";
-import { mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -14,7 +14,9 @@ import {
   executeProviderModelAction,
   homeWorkspaceWarning,
   initializeDashboardKey,
+  initializeStartupStorage,
   parseArgs,
+  pickDashboardChat,
   readPackageVersion,
   renderCliBanner,
   renderCliHelp,
@@ -29,7 +31,7 @@ import {
   shouldReplaceCredential,
   type CommandContext,
 } from "../src/commands.js";
-import { DEFAULT_CONFIG, saveConfig } from "../src/config.js";
+import { DEFAULT_CONFIG, migrateAppHome, saveConfig } from "../src/config.js";
 import { createPanelCall, OpenRouterHttpError, OpenRouterService } from "../src/openrouter.js";
 import { askPanel } from "../src/panel.js";
 import * as panelModule from "../src/panel.js";
@@ -42,6 +44,7 @@ import {
   type ProviderStateCommitRequest,
 } from "../src/provider-state.js";
 import { PrivateStore } from "../src/private-store.js";
+import { SessionStore } from "../src/session.js";
 import type { ModelInfo } from "../src/types.js";
 
 type BootstrapRuntimeDouble = {
@@ -182,6 +185,263 @@ test("runCli help and version return before every startup and model side effect"
     assert.equal(stderr.length, 0);
     assert.match(stdout.join(""), flag === "--help" ? /Usage|Verwendung|Optionen/i : /orcode 0\.4\.1/);
   }
+});
+
+test("runCli future and corrupt provider startup stops before runtime setup network or every credential seam", async (t) => {
+  const originalFetch = globalThis.fetch;
+  const originals = {
+    get: CredentialStore.prototype.get,
+    set: CredentialStore.prototype.set,
+    delete: CredentialStore.prototype.delete,
+    has: CredentialStore.prototype.has,
+    reserveSlot: CredentialStore.prototype.reserveSlot,
+    writeSlot: CredentialStore.prototype.writeSlot,
+    readSlot: CredentialStore.prototype.readSlot,
+    deleteSlot: CredentialStore.prototype.deleteSlot,
+    getOrCreateAccountHmacKey: CredentialStore.prototype.getOrCreateAccountHmacKey,
+  };
+  const credentialCalls: string[] = [];
+  let networkCalls = 0;
+  const fakeLegacyIds = {
+    inference: "task-ten-fake-inference-store-id",
+    management: "task-ten-fake-management-store-id",
+  } as const;
+  globalThis.fetch = (async () => {
+    networkCalls += 1;
+    throw new Error("task-ten-network-tripwire");
+  }) as typeof fetch;
+  CredentialStore.prototype.get = async function(kind) {
+    credentialCalls.push(`get:${fakeLegacyIds[kind]}`);
+    return null;
+  };
+  CredentialStore.prototype.set = async function(kind) {
+    credentialCalls.push(`set:${fakeLegacyIds[kind]}`);
+  };
+  CredentialStore.prototype.delete = async function(kind) {
+    credentialCalls.push(`delete:${fakeLegacyIds[kind]}`);
+    return false;
+  };
+  CredentialStore.prototype.has = async function(kind) {
+    credentialCalls.push(`has:${fakeLegacyIds[kind]}`);
+    return false;
+  };
+  CredentialStore.prototype.reserveSlot = function(kind) {
+    credentialCalls.push(`reserve:${kind}`);
+    return Object.freeze({
+      version: 1,
+      kind,
+      id: `v1:${kind}:10000000-0000-4000-8000-000000000010`,
+    });
+  };
+  CredentialStore.prototype.writeSlot = async function(slot) {
+    credentialCalls.push(`write:${slot.id}`);
+  };
+  CredentialStore.prototype.readSlot = async function(slot) {
+    credentialCalls.push(`read:${slot.id}`);
+    return null;
+  };
+  CredentialStore.prototype.deleteSlot = async function(slot) {
+    credentialCalls.push(`delete-slot:${slot.id}`);
+    return false;
+  };
+  CredentialStore.prototype.getOrCreateAccountHmacKey = async function() {
+    credentialCalls.push("hmac");
+    return new Uint8Array(32).fill(10);
+  };
+
+  try {
+    for (const fixture of [
+      {
+        name: "future",
+        error: "Error: Config-Migration abgelehnt: providerSetup oder schemaVersion hat die zukünftige Version 99.",
+        providerSetup: { schemaVersion: 99, opaque: "task-ten-private-future-marker" },
+      },
+      {
+        name: "corrupt",
+        error: "Error: Config-Migration abgelehnt: Die Konfiguration ist beschädigt oder nicht eindeutig lesbar.",
+        providerSetup: { schemaVersion: 1, connections: "invalid" },
+      },
+    ] as const) {
+      await t.test(fixture.name, async (subtest) => {
+        const root = await mkdtemp(join(tmpdir(), `orcode-cli-provider-${fixture.name}-`));
+        subtest.after(() => rm(root, { recursive: true, force: true }));
+        const appHome = join(root, ".orcode");
+        const legacyHome = join(root, ".routercode");
+        const path = join(appHome, "config.json");
+        await mkdir(appHome, { recursive: true });
+        await writeFile(path, `${JSON.stringify({
+          schemaVersion: 1,
+          mainModel: "synthetic/task-ten-safe-model",
+          providerSetup: fixture.providerSetup,
+        })}\n`);
+        const bootstrapCalls: string[] = [];
+        const error = await invokeRunCli(["--plain"], {
+          initializeStorage: () => initializeStartupStorage(
+            { workspace: root, newChat: false },
+            {
+              migrateAppHome: () => migrateAppHome(appHome, legacyHome),
+              pruneRunLogs: async () => undefined,
+              pruneCheckpoints: async () => undefined,
+              pruneBrowserTempArtifacts: async () => undefined,
+            },
+          ),
+          createProviderRuntime: async () => {
+            bootstrapCalls.push("provider-runtime");
+            throw new Error("task-ten-provider-runtime-tripwire");
+          },
+          createAgent: async () => {
+            bootstrapCalls.push("agent");
+            throw new Error("task-ten-agent-tripwire");
+          },
+          runPlain: async () => {
+            bootstrapCalls.push("plain");
+          },
+          runDashboard: async () => {
+            bootstrapCalls.push("dashboard");
+          },
+          stdout: { write: () => true },
+          stderr: { write: () => true },
+          environment: {},
+        }).then(
+          () => null,
+          (reason: unknown) => reason,
+        );
+        assert.ok(error instanceof Error);
+        assert.equal(String(error), fixture.error);
+        assert.doesNotMatch(String(error), /task-ten-private-future-marker|tripwire/i);
+        assert.deepEqual(bootstrapCalls, []);
+        assert.deepEqual(credentialCalls, []);
+        assert.equal(networkCalls, 0);
+      });
+    }
+  } finally {
+    globalThis.fetch = originalFetch;
+    CredentialStore.prototype.get = originals.get;
+    CredentialStore.prototype.set = originals.set;
+    CredentialStore.prototype.delete = originals.delete;
+    CredentialStore.prototype.has = originals.has;
+    CredentialStore.prototype.reserveSlot = originals.reserveSlot;
+    CredentialStore.prototype.writeSlot = originals.writeSlot;
+    CredentialStore.prototype.readSlot = originals.readSlot;
+    CredentialStore.prototype.deleteSlot = originals.deleteSlot;
+    CredentialStore.prototype.getOrCreateAccountHmacKey = originals.getOrCreateAccountHmacKey;
+  }
+});
+
+test("dashboard picker opens a second historical chat through the migrated connection and persists its route", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "orcode-dashboard-migrated-chat-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const workspace = join(root, "workspace");
+  const appHome = join(root, ".orcode");
+  const current = SessionStore.create(workspace, appHome, "Current chat");
+  current.addTurn("user", "current turn");
+  await current.save();
+  const historical = SessionStore.create(workspace, appHome, "Second historical chat");
+  historical.setPreferences("synthetic/dashboard-historical-model", { mode: "auto" });
+  historical.addTurn("user", "historical turn");
+  await historical.save();
+  assert.equal(historical.data.route, undefined);
+
+  const config = structuredClone(DEFAULT_CONFIG);
+  config.providerSetup = {
+    schemaVersion: 1,
+    revision: 4,
+    lifecycle: "configured",
+    connections: [{
+      id: "dashboard-migrated-openrouter",
+      backendId: "openrouter",
+      enabled: true,
+      maturity: "stable",
+      credentialSlot: "legacy:inference",
+      accountFingerprint: "acct_or_dashboard_migrated_verified",
+      accountFingerprintState: "verified",
+      billingRealm: "openrouter-payg",
+      lastHealth: {
+        credential: "valid",
+        connectivity: "connected",
+        spend: "unknown",
+        runtime: "not-applicable",
+        observedAt: 10,
+        generation: 4,
+      },
+    }],
+    defaultRoute: null,
+    cross: { enabled: false, preferredLead: null, preferredChallenger: null },
+  };
+  const transitioned: string[] = [];
+  const agentSessions: string[] = [];
+  const localSessions: string[] = [];
+  const runtimeContext = {
+    workspace,
+    configPath: join(appHome, "config.json"),
+    config,
+    session: current,
+    agent: {
+      setSession(next: SessionStore) {
+        agentSessions.push(next.data.id);
+      },
+    },
+    localRuntime: {
+      setSession(next: SessionStore) {
+        localSessions.push(next.data.id);
+      },
+    },
+    providerRuntime: {
+      async transitionModel(modelId: string) {
+        transitioned.push(modelId);
+      },
+    },
+    providerRouteSurface: "fullscreen",
+  };
+  const loadedTurns: string[][] = [];
+  const statuses: string[] = [];
+  const ui = {
+    async pickChoice(
+      _title: string,
+      items: ReadonlyArray<{ value: string; label: string }>,
+    ) {
+      const picked = items.find((item) => item.value === historical.data.id);
+      assert.ok(picked, "second historical chat must be offered by the dashboard picker");
+      return picked;
+    },
+    addMessage() {},
+    loadTurns(turns: ReadonlyArray<{ content: string }>) {
+      loadedTurns.push(turns.map((turn) => turn.content));
+    },
+    setStatus(message: string) {
+      statuses.push(message);
+    },
+  };
+
+  const switched = await pickDashboardChat(
+    ui as never,
+    runtimeContext as never,
+    false,
+  );
+
+  assert.equal(switched, true);
+  assert.equal(runtimeContext.session.data.id, historical.data.id);
+  assert.deepEqual(transitioned, ["synthetic/dashboard-historical-model"]);
+  assert.deepEqual(agentSessions, [historical.data.id]);
+  assert.deepEqual(localSessions, [historical.data.id]);
+  assert.deepEqual(loadedTurns, [["historical turn"]]);
+  assert.equal(statuses.at(-1), "Chat geöffnet: Second historical chat");
+  assert.deepEqual(runtimeContext.session.data.route, {
+    version: 1,
+    backendId: "openrouter",
+    accountFingerprint: "acct_or_dashboard_migrated_verified",
+    billingRealm: "openrouter-payg",
+    requestedModelId: "synthetic/dashboard-historical-model",
+    canonicalModelId: null,
+    resolutionState: "legacy-unverified",
+  });
+  const persisted = await SessionStore.openById(
+    workspace,
+    historical.data.id,
+    appHome,
+  );
+  assert.deepEqual(persisted.data.route, runtimeContext.session.data.route);
+  assert.equal(config.providerSetup.cross.enabled, false);
 });
 
 test("runCli orders storage, activation recovery, bounded inspection, route proof, agent, and plain UI", async () => {

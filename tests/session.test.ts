@@ -479,6 +479,28 @@ test("two instances on the same chat merge instead of overwriting", async () => 
   assert.ok(reopened.data.revision >= 3);
 });
 
+test("stale unchanged session adopts a foreign save without rewriting bytes or revision", async () => {
+  const { workspace, appHome } = await workspaceRoot("stale-unchanged-noop");
+  const initial = SessionStore.create(workspace, appHome, "Shared base");
+  initial.addTurn("user", "initial turn");
+  await initial.save();
+
+  const windowA = await SessionStore.openById(workspace, initial.data.id, appHome);
+  const windowB = await SessionStore.openById(workspace, initial.data.id, appHome);
+  windowB.rename("Foreign title");
+  windowB.addTurn("assistant", "foreign turn");
+  const outcomeB = await windowB.save();
+  const foreignBytes = await readFile(windowB.path, "utf8");
+  const foreignState = structuredClone(windowB.data);
+
+  const outcomeA = await windowA.save();
+
+  assert.equal(await readFile(windowA.path, "utf8"), foreignBytes);
+  assert.equal(outcomeA.revision, outcomeB.revision);
+  assert.deepEqual(windowA.data, foreignState);
+  assert.equal(windowA.data.revision, foreignState.revision);
+});
+
 test("concurrent merge distinguishes redaction projection from a local edit", async () => {
   const { workspace, appHome } = await workspaceRoot("redacted-merge");
   const secret = `${["sk", "or", "v1"].join("-")}-${"m".repeat(40)}`;
@@ -534,7 +556,9 @@ test("concurrent merge preserves an exact live scalar edit within one redaction 
   windowB.rename("Remote rename");
   await windowB.save();
 
+  const unchangedTimestamp = windowA.data.updatedAt;
   windowA.setSummary(secretB);
+  (windowA.data as PersistedSessionData).updatedAt = unchangedTimestamp;
   const outcome = await windowA.save();
   assert.equal(outcome.merged, true);
   assert.equal(windowA.data.summary, secretB);

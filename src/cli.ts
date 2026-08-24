@@ -96,6 +96,7 @@ import {
 } from "./reasoning.js";
 import {
   SessionStore,
+  migratedOpenRouterSessionConnection,
   migrateLegacySession,
   type SaveOutcome,
 } from "./session.js";
@@ -168,6 +169,7 @@ import {
   requirePersistableProviderState,
   validateProviderSetupState,
   validateRouteIdentityV1,
+  type ProviderConnectionStateV1,
   type ProviderSetupStateV1,
   type ProviderStateCommitRequest,
 } from "./provider-state.js";
@@ -230,6 +232,7 @@ export interface StartupStorageDependencies {
     workspace: string,
     appHome: string,
     options: { newChat: boolean; chatId?: string },
+    providerConnection?: ProviderConnectionStateV1,
   ) => Promise<SessionStore>;
 }
 
@@ -255,14 +258,14 @@ export async function initializeStartupStorage(
     pruneBrowserTempArtifacts: () => pruneBrowserTempArtifacts(),
     loadConfig,
     loadRules: (appHome) => RuleStore.load(appHome),
-    openSession: async (workspace, appHome, startup) => {
+    openSession: async (workspace, appHome, startup, providerConnection) => {
       if (startup.newChat || startup.chatId) {
         await migrateLegacySession(workspace, appHome);
         return startup.chatId
-          ? SessionStore.openById(workspace, startup.chatId, appHome)
+          ? SessionStore.openById(workspace, startup.chatId, appHome, providerConnection)
           : SessionStore.create(workspace, appHome);
       }
-      return SessionStore.open(workspace, appHome);
+      return SessionStore.open(workspace, appHome, providerConnection);
     },
     ...dependencies,
   };
@@ -290,7 +293,12 @@ export async function initializeStartupStorage(
   }
   const config = await deps.loadConfig(configPath(appHome));
   const ruleStore = await deps.loadRules(appHome);
-  const session = await deps.openSession(options.workspace, appHome, options);
+  const session = await deps.openSession(
+    options.workspace,
+    appHome,
+    options,
+    migratedOpenRouterSessionConnection(config.providerSetup),
+  );
   return {
     appHome,
     configPath: configPath(appHome),
@@ -3577,13 +3585,21 @@ function approvalChoiceLabel(mode: ApprovalMode): string {
   }
 }
 
-async function pickDashboardChat(
+/** @internal Exported so the dashboard chat-switch boundary can be regression tested. */
+export async function pickDashboardChat(
   ui: TerminalUi,
   context: RuntimeContext,
   preferNew: boolean,
 ): Promise<boolean> {
   await saveDashboardSessionPreferences(context, ui);
-  const chats = await SessionStore.list(context.workspace, context.session.appHome);
+  const migratedConnection = migratedOpenRouterSessionConnection(
+    context.config.providerSetup,
+  );
+  const chats = await SessionStore.list(
+    context.workspace,
+    context.session.appHome,
+    migratedConnection,
+  );
   const items = [
     {
       value: "__new__",
@@ -3617,6 +3633,7 @@ async function pickDashboardChat(
       context.workspace,
       picked.value,
       context.session.appHome,
+      migratedConnection,
     );
     if (next.data.model && next.data.model !== context.config.mainModel) {
       await context.providerRuntime.transitionModel(
