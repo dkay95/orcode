@@ -250,10 +250,17 @@ try:
         while True:
             time.sleep(1.0)
 
-    wait_for(b"ORCODE_PROVIDER_READY:")
-    wait_for(stage("hub", 1))
-    write_all(b"\r")
     scenario = config["scenario"]
+    wait_for(b"ORCODE_PROVIDER_READY:")
+
+    if scenario == "stop-secret-restart":
+        wait_for(stage("secret", 1))
+        paste(clean)
+        wait_for(stage("secret-restart", 1))
+        write_all(b"\r")
+    else:
+        wait_for(stage("hub", 1))
+        write_all(b"\r")
 
     if scenario == "success":
         complete_valid_secret(True)
@@ -309,6 +316,8 @@ try:
     elif scenario == "escape-cross":
         complete_valid_secret(False)
         finish_valid_flow(b"\x1b")
+    elif scenario == "stop-secret-restart":
+        pass
     else:
         raise RuntimeError("unknown-scenario")
 
@@ -702,11 +711,12 @@ async function runChildHarness(scenario) {
     counters.network += 1;
     throw new Error("Network is forbidden in the provider PTY proof.");
   };
-  const [{ TerminalUi }, setupUi, backends, providerState] = await Promise.all([
+  const [{ TerminalUi }, setupUi, backends, providerState, setup] = await Promise.all([
     import(pathToFileURL(join(absoluteModuleRoot, "tui.js")).href),
     import(pathToFileURL(join(absoluteModuleRoot, "setup-ui.js")).href),
     import(pathToFileURL(join(absoluteModuleRoot, "backends.js")).href),
     import(pathToFileURL(join(absoluteModuleRoot, "provider-state.js")).href),
+    import(pathToFileURL(join(absoluteModuleRoot, "setup.js")).href),
   ]);
 
   const observed = [];
@@ -808,8 +818,8 @@ async function runChildHarness(scenario) {
       },
     },
   ]);
-  const orchestrator = {
-    async activateCandidate(request) {
+  const activationCoordinator = {
+    async activate(request) {
       counters.activation += 1;
       counters.credentialStore += 1;
       counters.config += 1;
@@ -834,6 +844,11 @@ async function runChildHarness(scenario) {
       return { persisted: true, route, state: committed, warnings: [] };
     },
   };
+  const orchestrator = new setup.SetupOrchestrator({
+    registry,
+    stateStore,
+    activationCoordinator,
+  });
   const terminalState = {
     workspace: "provider-proof-workspace",
     projectStatus: "provider proof",
@@ -870,8 +885,15 @@ async function runChildHarness(scenario) {
   };
   const setStatus = ui.setStatus.bind(ui);
   let secretPasteStatusCount = 0;
+  let lifecyclePasteFinishedResolve;
+  const lifecyclePasteFinished = new Promise((resolvePromise) => {
+    lifecyclePasteFinishedResolve = resolvePromise;
+  });
   ui.setStatus = (status, busy) => {
     setStatus(status, busy);
+    if (scenario === "stop-secret-restart" && status.includes("eingefügt")) {
+      lifecyclePasteFinishedResolve();
+    }
     if (secretAttempt === 0 || busy !== false) return;
     secretPasteStatusCount += 1;
     if (secretPasteStatusCount % 2 !== 0) return;
@@ -935,16 +957,48 @@ async function runChildHarness(scenario) {
   try {
     if (!ui.supported) throw new Error("Real TTY pair required.");
     ui.start();
-    setupResult = await setupUi.runSetupHub({
-      surface,
-      orchestrator,
-      registry,
-      stateStore,
-    });
-    if (setupResult.kind === "cancelled" && scenario.startsWith("escape-")) {
-      const chat = ui.readInput();
-      emitStage("chat", 1);
-      chatAccepted = (await chat) === "weiter im chat";
+    if (scenario === "stop-secret-restart") {
+      const activeDataListeners = process.stdin.listenerCount("data");
+      let firstSettlementCount = 0;
+      const first = ui.readSecret("OpenRouter API-Key");
+      secretAttempt += 1;
+      emitStage("secret", 1);
+      void first.then(() => {
+        firstSettlementCount += 1;
+      });
+      await lifecyclePasteFinished;
+      ui.stop();
+      const stoppedDataListeners = process.stdin.listenerCount("data");
+      const firstValue = await first;
+      ui.start();
+      const restartedDataListeners = process.stdin.listenerCount("data");
+      const restarted = ui.readSecret("OpenRouter API-Key");
+      emitStage("secret-restart", 1);
+      const restartedValue = await restarted;
+      await new Promise((resolvePromise) => setImmediate(resolvePromise));
+      ui.stop();
+      setupResult = { kind: "cancelled", mode: "setup-required" };
+      setupResult.terminalLifecycle = {
+        activeDataListeners,
+        finalDataListeners: process.stdin.listenerCount("data"),
+        firstSettlementCount,
+        firstValueWasNull: firstValue === null,
+        restartedDataListeners,
+        restartedValueLength: restartedValue?.length ?? 0,
+        stoppedDataListeners,
+      };
+    } else {
+      setupResult = await setupUi.runSetupHub({
+        surface,
+        orchestrator,
+        registry,
+        stateStore,
+      });
+      if (setupResult.kind === "cancelled" && scenario.startsWith("escape-")) {
+        const chat = ui.readInput();
+        emitStage("chat", 1);
+        chatAccepted = (await chat) === "weiter im chat";
+      }
     }
   } catch {
     failure = true;
@@ -964,6 +1018,7 @@ async function runChildHarness(scenario) {
     routeReady: current.defaultRoute?.resolutionState === "resolved",
     setupKind: setupResult?.kind ?? "failed",
     setupMode: setupResult?.kind === "cancelled" ? setupResult.mode : null,
+    terminalLifecycle: setupResult?.terminalLifecycle,
   })}\n`);
   if (failure) process.exitCode = 1;
 }

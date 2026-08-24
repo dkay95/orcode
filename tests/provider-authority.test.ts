@@ -5,6 +5,7 @@ import * as setupModule from "../src/setup.js";
 import {
   BackendRegistry,
   type BackendAdapter,
+  type BackendModelDescriptor,
   type ProviderHealth,
   type ProviderInspection,
   type RouteIdentityV1,
@@ -22,16 +23,19 @@ import {
 import { OpenRouterService } from "../src/openrouter.js";
 import { DEFAULT_CONFIG } from "../src/config.js";
 import {
+  adoptDurablyCommittedProviderState,
   ProviderStateStore,
   createNeverConfiguredProviderState,
   validateProviderSetupState,
   type ProviderConnectionStateV1,
+  type ProviderStateCommitRequest,
   type ProviderSetupStateV1,
 } from "../src/provider-state.js";
 import { SetupOrchestrator, type SetupClock, type StartupSetupResult } from "../src/setup.js";
 import {
   ProviderCredentialAuthority,
   type ProviderAuthorityCoordinator,
+  type ProviderConnectionBindingV1,
 } from "../src/provider-authority.js";
 
 const NOW = 1_000_000;
@@ -46,6 +50,25 @@ const FINGERPRINT_B = openRouterAccountFingerprint(HMAC_KEY, CREATOR_B);
 const SLOT_A = "v1:inference:10000000-0000-4000-8000-000000000001";
 const SLOT_B = "v1:inference:20000000-0000-4000-8000-000000000002";
 
+async function withCappedProviderTimers<T>(
+  run: (realDelay: (milliseconds: number) => Promise<void>) => Promise<T>,
+): Promise<T> {
+  const originalSetTimeout = globalThis.setTimeout;
+  const realDelay = (milliseconds: number) => new Promise<void>((resolve) => {
+    originalSetTimeout(resolve, milliseconds);
+  });
+  globalThis.setTimeout = ((
+    handler: TimerHandler,
+    timeout?: number,
+    ...args: unknown[]
+  ) => originalSetTimeout(handler, Math.min(timeout ?? 0, 25), ...args)) as typeof setTimeout;
+  try {
+    return await run(realDelay);
+  } finally {
+    globalThis.setTimeout = originalSetTimeout;
+  }
+}
+
 type DesiredCredentialRequest = {
   connectionId: string;
   credentialKind?: "inference" | "management";
@@ -59,7 +82,15 @@ type DesiredCredentialRequest = {
 type DesiredCredentialAuthority = {
   withCredential<T>(
     request: DesiredCredentialRequest,
-    use: (secret: string, context: { source: "saved" | "environment" }) => Promise<T>,
+    use: (
+      secret: string,
+      context: {
+        source: "saved" | "environment";
+        binding: ProviderConnectionBindingV1;
+        candidatePermit: { readonly version: 1 };
+        publishIfCurrent(publish: () => void): Promise<void>;
+      },
+    ) => Promise<T>,
   ): Promise<
     | { kind: "available"; value: T }
     | { kind: "absent" | "invalid" | "ambiguous" | "invalid-pointer" | "forget-pending" | "recovery-required" | "stale" }
@@ -195,7 +226,29 @@ function availableAuthority(
       requests.push({ ...request });
       const secret = secrets[request.connectionId];
       if (!secret) return { kind: "absent" };
-      return { kind: "available", value: await use(secret, { source: "saved" }) };
+      const slotId = request.connectionId === "connection-b" ? SLOT_B : SLOT_A;
+      return {
+        kind: "available",
+        value: await use(secret, {
+          source: "saved",
+          candidatePermit: Object.freeze({ version: 1 as const }),
+          async publishIfCurrent(publish) { publish(); },
+          binding: {
+            version: 1,
+            stateRevision: 4,
+            connectionId: request.connectionId,
+            backendId: "openrouter",
+            enabled: true,
+            credentialPointer: {
+              kind: "versioned",
+              slot: Object.freeze({ version: 1, kind: "inference", id: slotId }),
+            },
+            accountFingerprint: secret === SECRET_B ? FINGERPRINT_B : FINGERPRINT_A,
+            billingRealm: "openrouter-payg",
+            isDefault: true,
+          },
+        }),
+      };
     },
   };
 }
@@ -527,7 +580,12 @@ test("fresh never-configured environment activation stays ready without a durabl
   const stateStore = new ProviderStateStore(createNeverConfiguredProviderState());
   const credentials = new AuthorityCredentials();
   const coordinator = authorityCoordinator();
-  const authority = realAuthority({ stateStore, credentials, coordinator });
+  const authority = realAuthority({
+    stateStore,
+    credentials,
+    environment: { OPENROUTER_API_KEY: SECRET_A },
+    coordinator,
+  });
   const observed = adapterWithAuthority({ authority: authority as never, credentials });
   const registry = new BackendRegistry([{ descriptor: OPENROUTER_DESCRIPTOR, adapter: observed.adapter }]);
   const activationCoordinator = {
@@ -878,6 +936,182 @@ test("model transition rejects an authority binding from a newer route revision"
   assert.deepEqual(activationRequests, []);
 });
 
+test("transitionModel deadline fences a delayed prepublication activation", async () => {
+  await withCappedProviderTimers(async (realDelay) => {
+    const state = stateWithConnections([
+      connection({ id: "connection-b", slot: SLOT_B, fingerprint: FINGERPRINT_B }),
+    ], route(FINGERPRINT_B));
+    const stateStore = new ProviderStateStore(state);
+    const credentials = new AuthorityCredentials({}, { [SLOT_B]: SECRET_B });
+    const coordinator = authorityCoordinator();
+    const authority = new ProviderCredentialAuthority({
+      stateStore,
+      credentials,
+      environment: {},
+      coordinator: () => coordinator,
+      now: Date.now,
+    });
+    const observed = adapterWithAuthority({ authority: authority as never, credentials });
+    const nextModel = "synthetic/deadline-transition-model";
+    const nextRoute = {
+      ...route(FINGERPRINT_B),
+      requestedModelId: nextModel,
+      canonicalModelId: nextModel,
+    };
+    let activationReached!: () => void;
+    const reached = new Promise<void>((resolve) => { activationReached = resolve; });
+    let releaseActivation!: () => void;
+    const activationSignals: AbortSignal[] = [];
+    const Runtime = (cliModule as unknown as {
+      DefaultProviderRuntime: new (...args: unknown[]) => RuntimeUnderTest & {
+        transitionModel(modelId: string, canonicalModelId: string): Promise<void>;
+      };
+    }).DefaultProviderRuntime;
+    const config = structuredClone(DEFAULT_CONFIG);
+    config.mainModel = MODEL;
+    config.providerSetup = stateStore.read();
+    const runtime = new Runtime(
+      observed.service,
+      credentials,
+      new BackendRegistry([{ descriptor: OPENROUTER_DESCRIPTOR, adapter: observed.adapter }]),
+      stateStore,
+      {
+        ensureRunnableRoute() { return route(FINGERPRINT_B); },
+        async activateCandidate(request: { signal: AbortSignal }) {
+          activationSignals.push(request.signal);
+          activationReached();
+          await new Promise<void>((resolve, reject) => {
+            let settled = false;
+            const onAbort = () => {
+              if (settled) return;
+              settled = true;
+              reject(request.signal.reason);
+            };
+            request.signal.addEventListener("abort", onAbort, { once: true });
+            releaseActivation = () => {
+              if (settled) return;
+              settled = true;
+              request.signal.removeEventListener("abort", onAbort);
+              resolve();
+            };
+          });
+          return { persisted: true, route: nextRoute, state: stateStore.read(), warnings: [] };
+        },
+      },
+      coordinator,
+      { beginRun() { return () => undefined; } },
+      { async apply() { return { kind: "unchanged" }; } },
+      null,
+      null,
+      MODEL,
+      config,
+      undefined,
+      { credentialAuthority: authority, adapter: observed.adapter, async recover() {} },
+    );
+
+    const attempt = runtime.transitionModel(nextModel, nextModel);
+    await reached;
+    const settlement = await Promise.race([
+      attempt.then(() => "fulfilled" as const, () => "rejected" as const),
+      realDelay(100).then(() => "still-pending" as const),
+    ]);
+    const configAtSettlement = config.mainModel;
+    releaseActivation();
+    await attempt.catch(() => undefined);
+    await realDelay(20);
+
+    assert.equal(settlement, "rejected");
+    assert.equal(activationSignals[0]?.aborted, true);
+    assert.equal(configAtSettlement, MODEL);
+    assert.equal(config.mainModel, MODEL);
+    assert.deepEqual(stateStore.read(), state);
+  });
+});
+
+test("transitionModel publication boundary waits for exact terminal reconciliation", async () => {
+  await withCappedProviderTimers(async (realDelay) => {
+    const state = stateWithConnections([
+      connection({ id: "connection-b", slot: SLOT_B, fingerprint: FINGERPRINT_B }),
+    ], route(FINGERPRINT_B));
+    const stateStore = new ProviderStateStore(state);
+    const credentials = new AuthorityCredentials({}, { [SLOT_B]: SECRET_B });
+    const coordinator = authorityCoordinator();
+    const authority = new ProviderCredentialAuthority({
+      stateStore,
+      credentials,
+      environment: {},
+      coordinator: () => coordinator,
+      now: Date.now,
+    });
+    const observed = adapterWithAuthority({ authority: authority as never, credentials });
+    const nextModel = "synthetic/committed-transition-model";
+    const nextRoute = {
+      ...route(FINGERPRINT_B),
+      requestedModelId: nextModel,
+      canonicalModelId: nextModel,
+    };
+    const committedState = {
+      ...state,
+      revision: state.revision + 1,
+      defaultRoute: nextRoute,
+    };
+    let publicationReached!: () => void;
+    const reached = new Promise<void>((resolve) => { publicationReached = resolve; });
+    let releasePublication!: () => void;
+    const publicationGate = new Promise<void>((resolve) => { releasePublication = resolve; });
+    const Runtime = (cliModule as unknown as {
+      DefaultProviderRuntime: new (...args: unknown[]) => RuntimeUnderTest & {
+        transitionModel(modelId: string, canonicalModelId: string): Promise<void>;
+      };
+    }).DefaultProviderRuntime;
+    const config = structuredClone(DEFAULT_CONFIG);
+    config.mainModel = MODEL;
+    config.providerSetup = stateStore.read();
+    const runtime = new Runtime(
+      observed.service,
+      credentials,
+      new BackendRegistry([{ descriptor: OPENROUTER_DESCRIPTOR, adapter: observed.adapter }]),
+      stateStore,
+      {
+        ensureRunnableRoute() { return route(FINGERPRINT_B); },
+        async activateCandidate() {
+          stateStore.replace(committedState, state.revision);
+          publicationReached();
+          await publicationGate;
+          return { persisted: true, route: nextRoute, state: stateStore.read(), warnings: [] };
+        },
+      },
+      coordinator,
+      { beginRun() { return () => undefined; } },
+      { async apply() { return { kind: "unchanged" }; } },
+      null,
+      null,
+      MODEL,
+      config,
+      undefined,
+      { credentialAuthority: authority, adapter: observed.adapter, async recover() {} },
+    );
+
+    const attempt = runtime.transitionModel(nextModel, nextModel);
+    await reached;
+    const beforeRelease = await Promise.race([
+      attempt.then(() => "fulfilled" as const, () => "rejected" as const),
+      realDelay(100).then(() => "still-pending" as const),
+    ]);
+    releasePublication();
+    const terminal = await attempt.then(
+      () => "fulfilled" as const,
+      () => "rejected" as const,
+    );
+
+    assert.equal(beforeRelease, "still-pending");
+    assert.equal(terminal, "fulfilled");
+    assert.equal(config.mainModel, nextModel);
+    assert.deepEqual(config.providerSetup, stateStore.read());
+    assert.deepEqual(stateStore.read(), committedState);
+  });
+});
+
 test("inference key save reads the exact durable credential instead of the stale runtime service", async () => {
   const state = stateWithConnections([
     connection({ id: "connection-a", slot: SLOT_A, fingerprint: FINGERPRINT_A }),
@@ -909,6 +1143,76 @@ test("inference key save reads the exact durable credential instead of the stale
 
   assert.equal(requests[0]?.candidate, SECRET_B);
   assert.equal(requests[0]?.targetConnectionId, "connection-b");
+});
+
+test("inference key save deadline fences a delayed prepublication activation", async () => {
+  await withCappedProviderTimers(async (realDelay) => {
+    const state = stateWithConnections([
+      connection({ id: "connection-b", slot: SLOT_B, fingerprint: FINGERPRINT_B }),
+    ], route(FINGERPRINT_B));
+    const stateStore = new ProviderStateStore(state);
+    const credentials = new AuthorityCredentials({}, { [SLOT_B]: SECRET_B });
+    const coordinator = authorityCoordinator();
+    const authority = new ProviderCredentialAuthority({
+      stateStore,
+      credentials,
+      environment: {},
+      coordinator: () => coordinator,
+      now: Date.now,
+    });
+    let activationReached!: () => void;
+    const reached = new Promise<void>((resolve) => { activationReached = resolve; });
+    let releaseActivation!: () => void;
+    const activationSignals: AbortSignal[] = [];
+    let readyCalls = 0;
+    const controller = cliModule.createProviderCredentialController({
+      stateStore,
+      openRouter: new OpenRouterService(SECRET_A),
+      credentials,
+      credentialAuthority: authority,
+      activationCoordinator: {
+        async activate(request: { signal: AbortSignal }) {
+          activationSignals.push(request.signal);
+          activationReached();
+          await new Promise<void>((resolve, reject) => {
+            let settled = false;
+            const onAbort = () => {
+              if (settled) return;
+              settled = true;
+              reject(request.signal.reason);
+            };
+            request.signal.addEventListener("abort", onAbort, { once: true });
+            releaseActivation = () => {
+              if (settled) return;
+              settled = true;
+              request.signal.removeEventListener("abort", onAbort);
+              resolve();
+            };
+          });
+          return { persisted: true, route: route(FINGERPRINT_B), state, warnings: [] };
+        },
+      },
+      getInferenceRoute: () => route(FINGERPRINT_B),
+      onInferenceReady() { readyCalls += 1; },
+    } as never);
+
+    const attempt = controller.apply({ kind: "save", credentialKind: "inference" });
+    await reached;
+    const settlement = await Promise.race([
+      attempt.then(() => "fulfilled" as const, () => "rejected" as const),
+      realDelay(100).then(() => "still-pending" as const),
+    ]);
+    const readyAtSettlement = readyCalls;
+    releaseActivation();
+    await attempt.catch(() => undefined);
+    await realDelay(20);
+
+    assert.equal(settlement, "rejected");
+    assert.equal(activationSignals[0]?.aborted, true);
+    assert.equal(readyAtSettlement, 0);
+    assert.equal(readyCalls, 0);
+    assert.deepEqual(stateStore.read(), state);
+  });
 });
 
 test("inference key save rejects a route decision from before the authority revision", async () => {
@@ -1074,6 +1378,1004 @@ test("provider setup carries the authority revision across a delayed model promp
   assert.equal(activationRequests[0]?.targetConnectionId, "connection-a");
 });
 
+test("manual saved setup authority expiry aborts hub and forbids late activation", async () => {
+  const credentials = new AuthorityCredentials({}, { [SLOT_A]: SECRET_A });
+  const stateStore = new ProviderStateStore(stateWithConnections([
+    connection({ id: "connection-a", slot: SLOT_A, fingerprint: FINGERPRINT_A }),
+  ], route(FINGERPRINT_A)));
+  const coordinator = authorityCoordinator();
+  const authority = new ProviderCredentialAuthority({
+    stateStore,
+    credentials,
+    environment: {},
+    coordinator: () => coordinator,
+    now: () => Date.now(),
+  });
+  const observed = adapterWithAuthority({ authority: authority as never, credentials });
+  const registry = new BackendRegistry([
+    { descriptor: OPENROUTER_DESCRIPTOR, adapter: observed.adapter },
+  ]);
+  let activationCalls = 0;
+  const activationCoordinator = {
+    async activate() {
+      activationCalls += 1;
+      return {
+        persisted: true,
+        route: route(FINGERPRINT_A),
+        state: stateStore.read(),
+        warnings: [],
+      };
+    },
+  };
+  const orchestrator = new SetupOrchestrator({
+    registry,
+    stateStore,
+    activationCoordinator,
+  });
+  const Runtime = (cliModule as unknown as {
+    DefaultProviderRuntime: new (...args: unknown[]) => RuntimeUnderTest;
+  }).DefaultProviderRuntime;
+  const config = structuredClone(DEFAULT_CONFIG);
+  config.mainModel = MODEL;
+  config.providerSetup = stateStore.read();
+  const runtime = new Runtime(
+    observed.service,
+    credentials,
+    registry,
+    stateStore,
+    orchestrator,
+    coordinator,
+    { beginRun() { return () => undefined; } },
+    { async apply() { return { kind: "unchanged" }; } },
+    null,
+    null,
+    MODEL,
+    config,
+    undefined,
+    { credentialAuthority: authority, adapter: observed.adapter, async recover() {} },
+  );
+  let modelPromptReached!: () => void;
+  let resolveModelPrompt!: (model: string) => void;
+  const reached = new Promise<void>((resolve) => { modelPromptReached = resolve; });
+  const modelPrompt = new Promise<string>((resolve) => { resolveModelPrompt = resolve; });
+  let presentations = 0;
+  let hubCalls = 0;
+  const attempt = runtime.runSetup({
+    async chooseHub(entries: ReadonlyArray<{ id: string }>) {
+      hubCalls += 1;
+      return entries.some((entry) => entry.id === "cross-later")
+        ? "cross-later"
+        : hubCalls === 1
+          ? "openrouter"
+          : null;
+    },
+    async readSecret() { throw new Error("saved pointer must not reprompt"); },
+    async chooseModel() {
+      modelPromptReached();
+      return modelPrompt;
+    },
+    async confirm() { return true; },
+    present() { presentations += 1; },
+  });
+  await reached;
+
+  const result = await Promise.race([
+    attempt,
+    new Promise<"still-pending">((resolve) => {
+      setTimeout(() => resolve("still-pending"), 8_750);
+    }),
+  ]);
+  assert.deepEqual(result, { kind: "cancelled", mode: "setup-required" });
+  const effectsAtSettlement = {
+    activationCalls,
+    presentations,
+    networkCalls: observed.calls.length,
+  };
+  resolveModelPrompt(MODEL);
+  await new Promise<void>((resolve) => setTimeout(resolve, 25));
+
+  assert.deepEqual({
+    activationCalls,
+    presentations,
+    networkCalls: observed.calls.length,
+  }, effectsAtSettlement);
+  assert.equal(activationCalls, 0);
+});
+
+test("DefaultProviderRuntime propagates aborted setup cancellation persistence rejection", async () => {
+  const failure = new Error("Provider cancellation persistence failed safely.");
+  const stateStore = new ProviderStateStore(createNeverConfiguredProviderState(), {
+    persist: async () => { throw failure; },
+  });
+  const credentials = new AuthorityCredentials();
+  const observed = adapterWithAuthority({ authority: availableAuthority({}), credentials });
+  const registry = new BackendRegistry([
+    { descriptor: OPENROUTER_DESCRIPTOR, adapter: observed.adapter },
+  ]);
+  const realOrchestrator = new SetupOrchestrator({
+    registry,
+    stateStore,
+    activationCoordinator: fakeActivationCoordinator(),
+  });
+  let cancellationCalls = 0;
+  const originalCancel = realOrchestrator.cancelSetup.bind(realOrchestrator);
+  realOrchestrator.cancelSetup = async (request) => {
+    cancellationCalls += 1;
+    return originalCancel(request);
+  };
+  const Runtime = (cliModule as unknown as {
+    DefaultProviderRuntime: new (...args: unknown[]) => RuntimeUnderTest;
+  }).DefaultProviderRuntime;
+  const config = structuredClone(DEFAULT_CONFIG);
+  config.providerSetup = stateStore.read();
+  const runtime = new Runtime(
+    observed.service,
+    credentials,
+    registry,
+    stateStore,
+    realOrchestrator,
+    authorityCoordinator(),
+    { beginRun() { return () => undefined; } },
+    { async apply() { return { kind: "unchanged" }; } },
+    null,
+    null,
+    MODEL,
+    config,
+  );
+  const reason = new DOMException("fixed public setup abort", "AbortError");
+  const presentations: unknown[] = [];
+
+  await assert.rejects(
+    runtime.runSetup({
+      async chooseHub() { throw new Error("aborted setup must not prompt"); },
+      async readSecret() { throw new Error("aborted setup must not read a secret"); },
+      async chooseModel() { throw new Error("aborted setup must not choose a model"); },
+      async confirm() { throw new Error("aborted setup must not confirm"); },
+      present(event: unknown) { presentations.push(event); },
+    }, {
+      generation: 41,
+      signal: AbortSignal.abort(reason),
+      deadlineAt: Date.now() + 1_000,
+      remainingMs: () => 1_000,
+      assertCurrent() { throw reason; },
+    }),
+    (error: unknown) => error === failure,
+  );
+  await new Promise<void>((resolve) => setImmediate(resolve));
+
+  assert.equal(cancellationCalls, 1);
+  assert.equal(stateStore.read().lifecycle, "never-configured");
+  assert.equal(stateStore.read().revision, 0);
+  assert.deepEqual(observed.calls, []);
+  assert.deepEqual(presentations, []);
+});
+
+test("DefaultProviderRuntime reconciles a committed cancelled lifecycle after persistence rejects", async () => {
+  const initial = createNeverConfiguredProviderState();
+  const stateStore = new ProviderStateStore(initial, {
+    persist: async (request) => {
+      const committed = request.build(initial);
+      adoptDurablyCommittedProviderState(request, committed);
+      throw new Error("fixed rejection after cancelled lifecycle publication");
+    },
+  });
+  const credentials = new AuthorityCredentials();
+  const observed = adapterWithAuthority({ authority: availableAuthority({}), credentials });
+  const registry = new BackendRegistry([
+    { descriptor: OPENROUTER_DESCRIPTOR, adapter: observed.adapter },
+  ]);
+  const realOrchestrator = new SetupOrchestrator({
+    registry,
+    stateStore,
+    activationCoordinator: fakeActivationCoordinator(),
+  });
+  let cancellationCalls = 0;
+  const originalCancel = realOrchestrator.cancelSetup.bind(realOrchestrator);
+  realOrchestrator.cancelSetup = async (request) => {
+    cancellationCalls += 1;
+    return originalCancel(request);
+  };
+  const Runtime = (cliModule as unknown as {
+    DefaultProviderRuntime: new (...args: unknown[]) => RuntimeUnderTest;
+  }).DefaultProviderRuntime;
+  const config = structuredClone(DEFAULT_CONFIG);
+  config.providerSetup = stateStore.read();
+  const runtime = new Runtime(
+    observed.service,
+    credentials,
+    registry,
+    stateStore,
+    realOrchestrator,
+    authorityCoordinator(),
+    { beginRun() { return () => undefined; } },
+    { async apply() { return { kind: "unchanged" }; } },
+    null,
+    null,
+    MODEL,
+    config,
+  );
+  const reason = new DOMException("fixed postpublication setup abort", "AbortError");
+
+  const result = await runtime.runSetup({
+    async chooseHub() { throw new Error("aborted setup must not prompt"); },
+    async readSecret() { throw new Error("aborted setup must not read a secret"); },
+    async chooseModel() { throw new Error("aborted setup must not choose a model"); },
+    async confirm() { throw new Error("aborted setup must not confirm"); },
+    present() {},
+  }, {
+    generation: 42,
+    signal: AbortSignal.abort(reason),
+    deadlineAt: Date.now() + 1_000,
+    remainingMs: () => 1_000,
+    assertCurrent() { throw reason; },
+  });
+
+  assert.deepEqual(result, { kind: "cancelled", mode: "setup-required" });
+  assert.equal(cancellationCalls, 1);
+  assert.equal(stateStore.read().lifecycle, "cancelled");
+  assert.equal(stateStore.read().revision, 1);
+  assert.deepEqual(config.providerSetup, stateStore.read());
+  assert.deepEqual(observed.calls, []);
+});
+
+test("pending provider authority blocks setup before prompt or candidate network", async (t) => {
+  const blockedFixtures: Array<{
+    name: string;
+    accessKind: "forget-pending" | "recovery-required";
+    slots: Readonly<Record<string, string | null>>;
+    environmentSecret: string | null;
+  }> = [
+    {
+      name: "saved slot with pending forget",
+      accessKind: "forget-pending" as const,
+      slots: { [SLOT_A]: SECRET_A },
+      environmentSecret: null,
+    },
+    {
+      name: "absent saved slot plus environment with pending forget",
+      accessKind: "forget-pending" as const,
+      slots: {},
+      environmentSecret: SECRET_B,
+    },
+    {
+      name: "saved slot with activation recovery required",
+      accessKind: "recovery-required" as const,
+      slots: { [SLOT_A]: SECRET_A },
+      environmentSecret: null,
+    },
+  ];
+  for (const fixture of blockedFixtures) {
+    await t.test(fixture.name, async () => {
+      const credentials = new AuthorityCredentials({}, fixture.slots);
+      const stateStore = new ProviderStateStore(stateWithConnections([
+        connection({ id: "connection-a", slot: SLOT_A, fingerprint: FINGERPRINT_A }),
+      ], route(FINGERPRINT_A)));
+      const authority = {
+        async withCredential() { return { kind: fixture.accessKind }; },
+      };
+      const observed = adapterWithAuthority({ authority: authority as never, credentials });
+      const registry = new BackendRegistry([
+        { descriptor: OPENROUTER_DESCRIPTOR, adapter: observed.adapter },
+      ]);
+      const Runtime = (cliModule as unknown as {
+        DefaultProviderRuntime: new (...args: unknown[]) => RuntimeUnderTest;
+      }).DefaultProviderRuntime;
+      const config = structuredClone(DEFAULT_CONFIG);
+      config.mainModel = MODEL;
+      config.providerSetup = stateStore.read();
+      const runtime = new Runtime(
+        observed.service,
+        credentials,
+        registry,
+        stateStore,
+        { async activateCandidate() { throw new Error("activation must remain blocked"); } },
+        {},
+        { beginRun() { return () => undefined; } },
+        { async apply() { return { kind: "unchanged" }; } },
+        null,
+        fixture.environmentSecret,
+        MODEL,
+        config,
+        undefined,
+        { credentialAuthority: authority, adapter: observed.adapter, async recover() {} },
+      );
+      const surfaceCalls: string[] = [];
+      let hubCalls = 0;
+      const surface = {
+        async chooseHub() {
+          surfaceCalls.push("hub");
+          hubCalls += 1;
+          return hubCalls === 1 ? "openrouter" : null;
+        },
+        async readSecret() { surfaceCalls.push("secret"); return SECRET_B; },
+        async chooseModel() { surfaceCalls.push("model"); return MODEL; },
+        async confirm() { surfaceCalls.push("confirm"); return true; },
+        present() { surfaceCalls.push("present"); },
+      };
+
+      const result = await runtime.runSetup(surface as never);
+
+      assert.deepEqual(result, { kind: "cancelled", mode: "setup-required" });
+      assert.deepEqual(
+        surfaceCalls.filter((call) => call !== "present"),
+        [],
+        "blocked authority must not reach an interactive prompt",
+      );
+      assert.deepEqual(observed.calls, []);
+      assert.deepEqual(credentials.effects, []);
+    });
+  }
+
+  await t.test("a journal appearing after the prompt is rechecked before connect", async () => {
+    const credentials = new AuthorityCredentials();
+    const stateStore = new ProviderStateStore(createNeverConfiguredProviderState());
+    let preflights = 0;
+    const authority = {
+      async withCredential() { return { kind: "absent" as const }; },
+      async preflightCandidate() {
+        preflights += 1;
+        return preflights === 1
+          ? { kind: "ready" as const }
+          : { kind: "recovery-required" as const };
+      },
+    };
+    const observed = adapterWithAuthority({ authority: authority as never, credentials });
+    const registry = new BackendRegistry([
+      { descriptor: OPENROUTER_DESCRIPTOR, adapter: observed.adapter },
+    ]);
+    const Runtime = (cliModule as unknown as {
+      DefaultProviderRuntime: new (...args: unknown[]) => RuntimeUnderTest;
+    }).DefaultProviderRuntime;
+    const config = structuredClone(DEFAULT_CONFIG);
+    config.mainModel = MODEL;
+    config.providerSetup = stateStore.read();
+    const runtime = new Runtime(
+      observed.service,
+      credentials,
+      registry,
+      stateStore,
+      { async activateCandidate() { throw new Error("activation must remain blocked"); } },
+      {},
+      { beginRun() { return () => undefined; } },
+      { async apply() { return { kind: "unchanged" }; } },
+      null,
+      null,
+      MODEL,
+      config,
+      undefined,
+      { credentialAuthority: authority, adapter: observed.adapter, async recover() {} },
+    );
+    let hubCalls = 0;
+    let secretPrompts = 0;
+    const surface = {
+      async chooseHub() { hubCalls += 1; return hubCalls === 1 ? "openrouter" : null; },
+      async readSecret() { secretPrompts += 1; return SECRET_A; },
+      async chooseModel() { return MODEL; },
+      async confirm() { return true; },
+      present() {},
+    };
+
+    const result = await runtime.runSetup(surface as never);
+
+    assert.deepEqual(result, { kind: "cancelled", mode: "setup-required" });
+    assert.equal(preflights, 2);
+    assert.equal(secretPrompts, 1);
+    assert.deepEqual(observed.calls, []);
+  });
+});
+
+test("candidate authority stays owned through connect and catalog", async (t) => {
+  for (const journalAt of ["before-connect", "before-catalog"] as const) {
+    await t.test(journalAt, async () => {
+      const stateStore = new ProviderStateStore(createNeverConfiguredProviderState());
+      const credentials = new AuthorityCredentials();
+      let authorityCalls = 0;
+      let authorityOwned = false;
+      let journalRequested = false;
+      let journalPending = false;
+      let connectWhilePending = 0;
+      let catalogWhilePending = 0;
+      const lease = { async assertHeld() {} };
+      const coordinator = {
+        async readAuthority<T>(
+          _request: unknown,
+          operation: (held: typeof lease) => Promise<T>,
+        ) {
+          authorityCalls += 1;
+          authorityOwned = true;
+          try {
+            return await operation(lease);
+          } finally {
+            authorityOwned = false;
+            if (
+              (journalAt === "before-connect" && authorityCalls === 2)
+              || journalRequested
+            ) {
+              journalPending = true;
+            }
+          }
+        },
+        async runExclusive() {
+          throw new Error("activation must not run after model cancellation");
+        },
+      };
+      const authority = realAuthority({
+        stateStore,
+        credentials,
+        coordinator: coordinator as never,
+      });
+      const adapter: BackendAdapter = {
+        backendId: "openrouter",
+        async inspect() { throw new Error("startup inspection is outside this setup test"); },
+        async reconnect() { throw new Error("reconnect is outside this setup test"); },
+        async connect() {
+          if (journalPending) connectWhilePending += 1;
+          if (journalAt === "before-catalog") {
+            journalRequested = true;
+            if (!authorityOwned) journalPending = true;
+          }
+          return {
+            candidateId: "candidate-authority-race",
+            backendId: "openrouter" as const,
+            connectionId: "connection-authority-race",
+            accountFingerprint: FINGERPRINT_A,
+            billingRealm: "openrouter-payg" as const,
+            health: healthyInspection(
+              "connection-authority-race",
+              FINGERPRINT_A,
+              1,
+            ).health,
+          };
+        },
+        async listModels() {
+          if (journalPending) catalogWhilePending += 1;
+          return [{
+            backendId: "openrouter" as const,
+            requestedModelId: MODEL,
+            canonicalModelId: MODEL,
+            displayName: "Authority-race model",
+            capabilities: {
+              textInput: true,
+              textOutput: true,
+              tools: true,
+              reasoning: false,
+            },
+          }];
+        },
+        async activate() { throw new Error("activation is outside this setup test"); },
+        async discardCandidate() {},
+        async logout() {},
+      };
+      const registry = new BackendRegistry([
+        { descriptor: OPENROUTER_DESCRIPTOR, adapter },
+      ]);
+      const Runtime = (cliModule as unknown as {
+        DefaultProviderRuntime: new (...args: unknown[]) => RuntimeUnderTest;
+      }).DefaultProviderRuntime;
+      const config = structuredClone(DEFAULT_CONFIG);
+      config.mainModel = MODEL;
+      config.providerSetup = stateStore.read();
+      const setupOrchestrator = new SetupOrchestrator({
+        registry,
+        stateStore,
+        activationCoordinator: {
+          async activate() { throw new Error("activation must not run"); },
+        },
+      });
+      const runtime = new Runtime(
+        {} as never,
+        credentials,
+        registry,
+        stateStore,
+        setupOrchestrator,
+        coordinator,
+        { beginRun() { return () => undefined; } },
+        { async apply() { return { kind: "unchanged" }; } },
+        null,
+        null,
+        MODEL,
+        config,
+        undefined,
+        { credentialAuthority: authority, adapter: adapter as never, async recover() {} },
+      );
+      let hubCalls = 0;
+      const result = await runtime.runSetup({
+        async chooseHub() {
+          hubCalls += 1;
+          return hubCalls === 1 ? "openrouter" : null;
+        },
+        async readSecret() { return SECRET_A; },
+        async chooseModel() { return null; },
+        async confirm() { return true; },
+        present() {},
+      });
+
+      assert.deepEqual(result, { kind: "cancelled", mode: "setup-required" });
+      assert.equal(connectWhilePending, 0);
+      assert.equal(catalogWhilePending, 0);
+    });
+  }
+});
+
+test("queued bounded authority operations never start after synchronous abort or deadline", async (t) => {
+  for (const mode of ["abort", "deadline"] as const) {
+    await t.test(mode, async () => {
+      const stateStore = new ProviderStateStore(createNeverConfiguredProviderState());
+      const credentials = new AuthorityCredentials();
+      let now = NOW;
+      let leaseAssertions = 0;
+      const coordinator: ProviderAuthorityCoordinator = {
+        async readAuthority(_request, operation) {
+          return operation({
+            async assertHeld() { leaseAssertions += 1; },
+          });
+        },
+      };
+      const authority = new ProviderCredentialAuthority({
+        stateStore,
+        credentials,
+        environment: {},
+        coordinator: () => coordinator,
+        now: () => now,
+      });
+      const controller = new AbortController();
+      const deadlineAt = NOW + 1;
+      const attempt = authority.preflightCandidate({
+        deadlineAt,
+        signal: controller.signal,
+      });
+
+      if (mode === "abort") {
+        const reason = new DOMException("fixed synchronous authority abort", "AbortError");
+        controller.abort(reason);
+        await assert.rejects(attempt, (error: unknown) => error === reason);
+      } else {
+        now = deadlineAt;
+        assert.deepEqual(await attempt, { kind: "stale" });
+      }
+      await Promise.resolve();
+      assert.equal(leaseAssertions, 0);
+    });
+  }
+});
+
+test("candidate authority rejects saved and environment credential swaps before provider connect", async (t) => {
+  for (const source of ["saved", "environment"] as const) {
+    await t.test(source, async () => {
+      const slots: Record<string, string | null> = source === "saved"
+        ? { [SLOT_A]: SECRET_A }
+        : {};
+      const environment: Record<string, string | undefined> = source === "environment"
+        ? { OPENROUTER_API_KEY: SECRET_A }
+        : {};
+      const credentials = new AuthorityCredentials({}, slots);
+      const stateStore = new ProviderStateStore(source === "saved"
+        ? stateWithConnections([
+            connection({ id: "connection-a", slot: SLOT_A, fingerprint: FINGERPRINT_A }),
+          ], route(FINGERPRINT_A))
+        : createNeverConfiguredProviderState());
+      let authorityCalls = 0;
+      const lease = { async assertHeld() {} };
+      const coordinator = {
+        async readAuthority<T>(
+          _request: unknown,
+          operation: (held: typeof lease) => Promise<T>,
+        ) {
+          authorityCalls += 1;
+          if (source === "environment" && authorityCalls === 2) {
+            environment.OPENROUTER_API_KEY = SECRET_B;
+          }
+          return operation(lease);
+        },
+        async runExclusive() {
+          throw new Error("activation must not run after a candidate permit swap");
+        },
+      };
+      const authority = realAuthority({
+        stateStore,
+        credentials,
+        environment,
+        coordinator: coordinator as never,
+      });
+      const observed = adapterWithAuthority({
+        authority: authority as never,
+        credentials,
+      });
+      const registry = new BackendRegistry([
+        { descriptor: OPENROUTER_DESCRIPTOR, adapter: observed.adapter },
+      ]);
+      const Runtime = (cliModule as unknown as {
+        DefaultProviderRuntime: new (...args: unknown[]) => RuntimeUnderTest;
+      }).DefaultProviderRuntime;
+      const config = structuredClone(DEFAULT_CONFIG);
+      config.mainModel = MODEL;
+      config.providerSetup = stateStore.read();
+      const runtime = new Runtime(
+        observed.service,
+        credentials,
+        registry,
+        stateStore,
+        { async activateCandidate() { throw new Error("activation must remain fenced"); } },
+        coordinator,
+        { beginRun() { return () => undefined; } },
+        { async apply() { return { kind: "unchanged" }; } },
+        null,
+        source === "environment" ? SECRET_A : null,
+        MODEL,
+        config,
+        undefined,
+        { credentialAuthority: authority, adapter: observed.adapter, async recover() {} },
+      );
+      let hubCalls = 0;
+      const result = await runtime.runSetup({
+        async chooseHub() {
+          hubCalls += 1;
+          if (source === "saved" && hubCalls === 1) {
+            slots[SLOT_A] = SECRET_B;
+            return "openrouter";
+          }
+          return null;
+        },
+        async readSecret() { throw new Error("candidate permit test must not reprompt"); },
+        async chooseModel() { return null; },
+        async confirm() { return true; },
+        present() {},
+      });
+
+      assert.deepEqual(result, { kind: "cancelled", mode: "setup-required" });
+      assert.deepEqual(observed.calls, []);
+      assert.equal(observed.service.hasKey, false);
+    });
+  }
+});
+
+test("candidate inspection reuses its held authority lease without nested acquisition", async () => {
+  const stateStore = new ProviderStateStore(createNeverConfiguredProviderState());
+  const credentials = new AuthorityCredentials();
+  let authorityOwned = false;
+  let nestedAcquisitions = 0;
+  const lease = { async assertHeld() {} };
+  const coordinator = {
+    async readAuthority<T>(
+      _request: unknown,
+      operation: (held: typeof lease) => Promise<T>,
+    ) {
+      if (authorityOwned) {
+        nestedAcquisitions += 1;
+        throw new Error("nested provider authority acquisition");
+      }
+      authorityOwned = true;
+      try {
+        return await operation(lease);
+      } finally {
+        authorityOwned = false;
+      }
+    },
+    async runExclusive() {
+      throw new Error("activation must not run after model cancellation");
+    },
+  };
+  const authority = realAuthority({
+    stateStore,
+    credentials,
+    coordinator: coordinator as never,
+  });
+  const observed = adapterWithAuthority({
+    authority: authority as never,
+    credentials,
+  });
+  const registry = new BackendRegistry([
+    { descriptor: OPENROUTER_DESCRIPTOR, adapter: observed.adapter },
+  ]);
+  const Runtime = (cliModule as unknown as {
+    DefaultProviderRuntime: new (...args: unknown[]) => RuntimeUnderTest;
+  }).DefaultProviderRuntime;
+  const config = structuredClone(DEFAULT_CONFIG);
+  config.mainModel = MODEL;
+  config.providerSetup = stateStore.read();
+  const setupOrchestrator = new SetupOrchestrator({
+    registry,
+    stateStore,
+    activationCoordinator: {
+      async activate() { throw new Error("activation must not run"); },
+    },
+  });
+  const runtime = new Runtime(
+    observed.service,
+    credentials,
+    registry,
+    stateStore,
+    setupOrchestrator,
+    coordinator,
+    { beginRun() { return () => undefined; } },
+    { async apply() { return { kind: "unchanged" }; } },
+    null,
+    null,
+    MODEL,
+    config,
+    undefined,
+    { credentialAuthority: authority, adapter: observed.adapter, async recover() {} },
+  );
+  let hubCalls = 0;
+
+  await runtime.runSetup({
+    async chooseHub() {
+      hubCalls += 1;
+      return hubCalls === 1 ? "openrouter" : null;
+    },
+    async readSecret() { return SECRET_A; },
+    async chooseModel() { return null; },
+    async confirm() { return true; },
+    present() {},
+  });
+
+  assert.equal(nestedAcquisitions, 0);
+});
+
+test("candidate authority abort releases ownership and fences an abort-ignoring catalog", async () => {
+  const stateStore = new ProviderStateStore(createNeverConfiguredProviderState());
+  const credentials = new AuthorityCredentials();
+  let authorityOwned = false;
+  const lease = { async assertHeld() {} };
+  const coordinator = {
+    async readAuthority<T>(
+      _request: unknown,
+      operation: (held: typeof lease) => Promise<T>,
+    ) {
+      authorityOwned = true;
+      try {
+        return await operation(lease);
+      } finally {
+        authorityOwned = false;
+      }
+    },
+    async runExclusive() {
+      throw new Error("activation must remain fenced after candidate abort");
+    },
+  };
+  const authority = realAuthority({
+    stateStore,
+    credentials,
+    coordinator: coordinator as never,
+  });
+  let catalogReached!: () => void;
+  let releaseCatalog!: () => void;
+  const reached = new Promise<void>((resolve) => { catalogReached = resolve; });
+  const catalog = new Promise<readonly BackendModelDescriptor[]>((resolve) => {
+    releaseCatalog = () => resolve([{
+      backendId: "openrouter",
+      requestedModelId: MODEL,
+      canonicalModelId: MODEL,
+      displayName: "Late candidate model",
+      capabilities: {
+        textInput: true,
+        textOutput: true,
+        tools: true,
+        reasoning: false,
+      },
+    }]);
+  });
+  let discardCalls = 0;
+  let activationCalls = 0;
+  const adapter: BackendAdapter = {
+    backendId: "openrouter",
+    async inspect() { throw new Error("startup inspection is outside this setup test"); },
+    async reconnect() { throw new Error("reconnect is outside this setup test"); },
+    async connect() {
+      return {
+        candidateId: "candidate-abort-ignoring-catalog",
+        backendId: "openrouter",
+        connectionId: "connection-abort-ignoring-catalog",
+        accountFingerprint: FINGERPRINT_A,
+        billingRealm: "openrouter-payg",
+        health: healthyInspection(
+          "connection-abort-ignoring-catalog",
+          FINGERPRINT_A,
+          1,
+        ).health,
+      };
+    },
+    async listModels() {
+      catalogReached();
+      return catalog;
+    },
+    async activate() { throw new Error("adapter activation is outside this setup test"); },
+    async discardCandidate() { discardCalls += 1; },
+    async logout() {},
+  };
+  const registry = new BackendRegistry([
+    { descriptor: OPENROUTER_DESCRIPTOR, adapter },
+  ]);
+  const Runtime = (cliModule as unknown as {
+    DefaultProviderRuntime: new (...args: unknown[]) => RuntimeUnderTest;
+  }).DefaultProviderRuntime;
+  const config = structuredClone(DEFAULT_CONFIG);
+  config.mainModel = MODEL;
+  config.providerSetup = stateStore.read();
+  const setupOrchestrator = new SetupOrchestrator({
+    registry,
+    stateStore,
+    activationCoordinator: {
+      async activate() { activationCalls += 1; throw new Error("late activation"); },
+    },
+  });
+  const runtime = new Runtime(
+    {} as never,
+    credentials,
+    registry,
+    stateStore,
+    setupOrchestrator,
+    coordinator,
+    { beginRun() { return () => undefined; } },
+    { async apply() { return { kind: "unchanged" }; } },
+    null,
+    null,
+    MODEL,
+    config,
+    undefined,
+    { credentialAuthority: authority, adapter: adapter as never, async recover() {} },
+  );
+  let hubCalls = 0;
+  let modelPrompts = 0;
+  const controller = new AbortController();
+  const attempt = runtime.runSetup({
+    async chooseHub() {
+      hubCalls += 1;
+      return hubCalls === 1 ? "openrouter" : null;
+    },
+    async readSecret() { return SECRET_A; },
+    async chooseModel() { modelPrompts += 1; return MODEL; },
+    async confirm() { return true; },
+    present() {},
+  }, {
+    generation: 91,
+    deadlineAt: Date.now() + 1_000,
+    signal: controller.signal,
+    remainingMs: () => 1_000,
+    assertCurrent() {},
+  } as never);
+  await reached;
+  const abortReason = new DOMException("fixed candidate catalog abort", "AbortError");
+  controller.abort(abortReason);
+
+  const settledAfterAbort = await Promise.race([
+    attempt.then(() => "settled" as const),
+    new Promise<"still-pending">((resolve) => {
+      setTimeout(() => resolve("still-pending"), 100);
+    }),
+  ]);
+  const ownedAfterAbort = authorityOwned;
+  releaseCatalog();
+  await attempt;
+  await new Promise<void>((resolve) => setImmediate(resolve));
+
+  assert.equal(settledAfterAbort, "settled");
+  assert.equal(ownedAfterAbort, false);
+  assert.equal(authorityOwned, false);
+  assert.equal(activationCalls, 0);
+  assert.equal(modelPrompts, 0);
+  assert.equal(discardCalls, 1);
+});
+
+test("candidate deadline discards a late rejected connect without publication", async () => {
+  const stateStore = new ProviderStateStore(createNeverConfiguredProviderState());
+  const credentials = new AuthorityCredentials();
+  const lease = { async assertHeld() {} };
+  const coordinator = {
+    async readAuthority<T>(
+      _request: unknown,
+      operation: (held: typeof lease) => Promise<T>,
+    ) {
+      return operation(lease);
+    },
+    async runExclusive() {
+      throw new Error("activation must remain fenced after candidate deadline");
+    },
+  };
+  const authority = realAuthority({
+    stateStore,
+    credentials,
+    coordinator: coordinator as never,
+  });
+  let connectReached!: () => void;
+  let releaseConnect!: () => void;
+  const reached = new Promise<void>((resolve) => { connectReached = resolve; });
+  const connectGate = new Promise<void>((resolve) => { releaseConnect = resolve; });
+  let discardCalls = 0;
+  let catalogCalls = 0;
+  const rejectedHealth = {
+    ...healthyInspection("connection-late-rejected", FINGERPRINT_A, 1).health,
+    credential: "rejected" as const,
+  };
+  const adapter: BackendAdapter = {
+    backendId: "openrouter",
+    async inspect() { throw new Error("startup inspection is outside this setup test"); },
+    async reconnect() { throw new Error("reconnect is outside this setup test"); },
+    async connect() {
+      connectReached();
+      await connectGate;
+      return {
+        candidateId: "candidate-late-rejected",
+        backendId: "openrouter",
+        connectionId: "connection-late-rejected",
+        accountFingerprint: FINGERPRINT_A,
+        billingRealm: "openrouter-payg",
+        health: rejectedHealth,
+      };
+    },
+    async listModels() { catalogCalls += 1; return []; },
+    async activate() { throw new Error("adapter activation is outside this setup test"); },
+    async discardCandidate() { discardCalls += 1; },
+    async logout() {},
+  };
+  const registry = new BackendRegistry([
+    { descriptor: OPENROUTER_DESCRIPTOR, adapter },
+  ]);
+  const Runtime = (cliModule as unknown as {
+    DefaultProviderRuntime: new (...args: unknown[]) => RuntimeUnderTest;
+  }).DefaultProviderRuntime;
+  const config = structuredClone(DEFAULT_CONFIG);
+  config.mainModel = MODEL;
+  config.providerSetup = stateStore.read();
+  const setupOrchestrator = new SetupOrchestrator({
+    registry,
+    stateStore,
+    activationCoordinator: {
+      async activate() { throw new Error("late activation"); },
+    },
+  });
+  const runtime = new Runtime(
+    {} as never,
+    credentials,
+    registry,
+    stateStore,
+    setupOrchestrator,
+    coordinator,
+    { beginRun() { return () => undefined; } },
+    { async apply() { return { kind: "unchanged" }; } },
+    null,
+    null,
+    MODEL,
+    config,
+    undefined,
+    { credentialAuthority: authority, adapter: adapter as never, async recover() {} },
+  );
+  let hubCalls = 0;
+  let presentations = 0;
+  const signal = new AbortController().signal;
+  const attempt = runtime.runSetup({
+    async chooseHub() {
+      hubCalls += 1;
+      return hubCalls === 1 ? "openrouter" : null;
+    },
+    async readSecret() { return SECRET_A; },
+    async chooseModel() { throw new Error("late model prompt"); },
+    async confirm() { return true; },
+    present() { presentations += 1; },
+  }, {
+    generation: 92,
+    deadlineAt: Date.now() + 75,
+    signal,
+    remainingMs: () => 75,
+    assertCurrent() {},
+  });
+  await reached;
+  const settled = await Promise.race([
+    attempt.then(() => "settled" as const),
+    new Promise<"still-pending">((resolve) => {
+      setTimeout(() => resolve("still-pending"), 500);
+    }),
+  ]);
+  const presentationsAtSettlement = presentations;
+  releaseConnect();
+  await new Promise<void>((resolve) => setTimeout(resolve, 25));
+
+  assert.equal(settled, "settled");
+  assert.equal(presentations, presentationsAtSettlement);
+  assert.equal(discardCalls, 1);
+  assert.equal(catalogCalls, 0);
+});
+
 test("parallel connection inspections cannot exchange credentials or active proofs", async () => {
   const requests: DesiredCredentialRequest[] = [];
   const observed = adapterWithAuthority({
@@ -1102,11 +2404,259 @@ test("parallel connection inspections cannot exchange credentials or active proo
   ]);
 });
 
+test("runtime bind rejects a mutable saved or environment secret until that exact credential is inspected", async (t) => {
+  for (const source of ["saved", "environment"] as const) {
+    await t.test(source, async () => {
+      let secret = SECRET_A;
+      let binding = {
+        version: 1 as const,
+        stateRevision: 4,
+        connectionId: "connection-a",
+        backendId: "openrouter" as const,
+        enabled: true,
+        credentialPointer: source === "saved"
+          ? {
+              kind: "versioned" as const,
+              slot: Object.freeze({ version: 1 as const, kind: "inference" as const, id: SLOT_A }),
+            }
+          : { kind: "legacy" as const, id: "legacy:inference" as const },
+        accountFingerprint: FINGERPRINT_A,
+        billingRealm: "openrouter-payg" as const,
+        isDefault: true,
+      };
+      const authority = {
+        async withCredential<T>(
+          _request: DesiredCredentialRequest,
+          use: (value: string, context: unknown) => Promise<T>,
+        ) {
+          return {
+            kind: "available" as const,
+            value: await use(secret, {
+              source,
+              binding: structuredClone(binding),
+              candidatePermit: Object.freeze({ version: 1 as const }),
+              async publishIfCurrent(publish: () => void) { publish(); },
+            }),
+          };
+        },
+      };
+      const observed = adapterWithAuthority({ authority: authority as never });
+      const signal = new AbortController().signal;
+      const inspectedA = await observed.adapter.inspect({
+        connectionId: "connection-a",
+        generation: 41,
+        deadlineAt: NOW + 5_000,
+        signal,
+      } as never);
+      assert.equal(inspectedA.accountFingerprint, FINGERPRINT_A);
+
+      secret = SECRET_B;
+      await assert.rejects(observed.adapter.bindRuntime({
+        connectionId: "connection-a",
+        generation: 41,
+        deadlineAt: NOW + 5_000,
+        signal,
+      }), /inspection|credential|binding|proof/i);
+      assert.equal(observed.service.hasKey, false);
+
+      binding = {
+        ...binding,
+        stateRevision: 5,
+        accountFingerprint: FINGERPRINT_B,
+      };
+      const inspectedB = await observed.adapter.inspect({
+        connectionId: "connection-a",
+        generation: 42,
+        deadlineAt: NOW + 5_000,
+        signal,
+      } as never);
+      assert.equal(inspectedB.accountFingerprint, FINGERPRINT_B);
+      await observed.adapter.bindRuntime({
+        connectionId: "connection-a",
+        generation: 42,
+        deadlineAt: NOW + 5_000,
+        signal,
+      });
+      assert.equal(observed.service.requireKey(), SECRET_B);
+    });
+  }
+});
+
+test("runtime bind re-inspects the same credential after authoritative identity adoption", async () => {
+  const credentials = new AuthorityCredentials({}, { [SLOT_A]: SECRET_A });
+  const stateStore = new ProviderStateStore(stateWithConnections([
+    connection({
+      id: "connection-a",
+      slot: SLOT_A,
+      fingerprint: FINGERPRINT_A,
+    }),
+  ], route(FINGERPRINT_A)));
+  const authority = realAuthority({ stateStore, credentials });
+  const observed = adapterWithAuthority({
+    authority: authority as never,
+    credentials,
+  });
+  const signal = new AbortController().signal;
+  const inspected = await observed.adapter.inspect({
+    connectionId: "connection-a",
+    generation: 43,
+    deadlineAt: NOW + 5_000,
+    signal,
+  } as never);
+  assert.equal(inspected.accountFingerprint, FINGERPRINT_A);
+
+  const adopted = stateStore.read();
+  stateStore.replace({ ...adopted }, adopted.revision);
+  await observed.adapter.bindRuntime({
+    connectionId: "connection-a",
+    generation: 43,
+    deadlineAt: NOW + 5_000,
+    signal,
+  });
+
+  assert.equal(observed.service.requireKey(), SECRET_A);
+  assert.equal(
+    observed.calls.filter((call) => call.url.endsWith("/key")).length,
+    2,
+    "the unchanged adopted binding must receive and publish its own exact provider proof",
+  );
+});
+
+test("aborted authoritative re-inspection cannot activate the runtime after late resolution", async () => {
+  const credentials = new AuthorityCredentials({}, { [SLOT_A]: SECRET_A });
+  const retained = connection({
+    id: "connection-a",
+    slot: SLOT_A,
+    fingerprint: FINGERPRINT_A,
+  });
+  const stateStore = new ProviderStateStore(stateWithConnections([
+    retained,
+  ], route(FINGERPRINT_A)));
+  const authority = realAuthority({ stateStore, credentials });
+  const observed = adapterWithAuthority({
+    authority: authority as never,
+    credentials,
+  });
+  const signal = new AbortController().signal;
+  const inspected = await observed.adapter.inspect({
+    connectionId: "connection-a",
+    generation: 44,
+    deadlineAt: NOW + 5_000,
+    signal,
+  } as never);
+  assert.equal(inspected.accountFingerprint, FINGERPRINT_A);
+
+  const current = stateStore.read();
+  stateStore.replace({
+    ...current,
+  }, current.revision);
+
+  const key = await observed.service.inspectKey(SECRET_A, signal);
+  const lateKey = { ...key, isManagementKey: undefined };
+  let releaseReinspection!: () => void;
+  let reinspectionReached!: () => void;
+  const reached = new Promise<void>((resolve) => { reinspectionReached = resolve; });
+  observed.service.inspectKey = async () => {
+    reinspectionReached();
+    return new Promise((resolve) => {
+      releaseReinspection = () => resolve(lateKey);
+    });
+  };
+  const controller = new AbortController();
+  const reason = new DOMException("fixed late reinspection abort", "AbortError");
+  const binding = observed.adapter.bindRuntime({
+    connectionId: "connection-a",
+    generation: 44,
+    deadlineAt: NOW + 5_000,
+    signal: controller.signal,
+  });
+  await reached;
+  controller.abort(reason);
+
+  await assert.rejects(binding, (error: unknown) => error === reason);
+  assert.equal(observed.service.hasKey, false);
+  releaseReinspection();
+  await new Promise<void>((resolve) => setTimeout(resolve, 25));
+  assert.equal(
+    observed.service.hasKey,
+    false,
+    "a late abort-ignoring provider result must not activate the singleton runtime",
+  );
+});
+
+test("authoritative binding swap during re-inspection cannot publish a stale runtime", async () => {
+  const credentials = new AuthorityCredentials({}, {
+    [SLOT_A]: SECRET_A,
+    [SLOT_B]: SECRET_B,
+  });
+  const stateStore = new ProviderStateStore(stateWithConnections([
+    connection({
+      id: "connection-a",
+      slot: SLOT_A,
+      fingerprint: FINGERPRINT_A,
+    }),
+  ], route(FINGERPRINT_A)));
+  const authority = realAuthority({ stateStore, credentials });
+  const observed = adapterWithAuthority({
+    authority: authority as never,
+    credentials,
+  });
+  const signal = new AbortController().signal;
+  const inspected = await observed.adapter.inspect({
+    connectionId: "connection-a",
+    generation: 45,
+    deadlineAt: NOW + 5_000,
+    signal,
+  } as never);
+  assert.equal(inspected.accountFingerprint, FINGERPRINT_A);
+
+  const adopted = stateStore.read();
+  stateStore.replace({ ...adopted }, adopted.revision);
+
+  const key = await observed.service.inspectKey(SECRET_A, signal);
+  const lateKey = { ...key, isManagementKey: undefined };
+  let releaseReinspection!: () => void;
+  let reinspectionReached!: () => void;
+  const reached = new Promise<void>((resolve) => { reinspectionReached = resolve; });
+  observed.service.inspectKey = async () => {
+    reinspectionReached();
+    return new Promise((resolve) => {
+      releaseReinspection = () => resolve(lateKey);
+    });
+  };
+  const binding = observed.adapter.bindRuntime({
+    connectionId: "connection-a",
+    generation: 45,
+    deadlineAt: NOW + 5_000,
+    signal,
+  });
+  await reached;
+
+  const current = stateStore.read();
+  stateStore.replace({
+    ...current,
+    connections: current.connections.map((item) => item.id === "connection-a"
+      ? {
+        ...item,
+        credentialSlot: SLOT_B,
+        accountFingerprint: FINGERPRINT_B,
+      }
+      : item),
+    defaultRoute: route(FINGERPRINT_B),
+  }, current.revision);
+  releaseReinspection();
+
+  await assert.rejects(binding);
+  assert.equal(stateStore.read().revision, current.revision + 1);
+  assert.equal(stateStore.read().connections[0]?.credentialSlot, SLOT_B);
+  assert.equal(observed.service.hasKey, false);
+});
+
 type RuntimeUnderTest = {
   execute(intent: Record<string, unknown>, surface: "plain"): Promise<Record<string, unknown>>;
   inspectStartup(): Promise<StartupSetupResult>;
   adoptCredentialActivation(route: RouteIdentityV1, persisted: boolean, secret: string): void;
-  runSetup(surface: unknown): Promise<Record<string, unknown>>;
+  runSetup(surface: unknown, startupAttempt?: unknown): Promise<Record<string, unknown>>;
 };
 
 function runtimeFixture(
@@ -1117,6 +2667,7 @@ function runtimeFixture(
   runtime: RuntimeUnderTest;
   stateStore: ProviderStateStore;
   reconnectRequests: unknown[][];
+  runtimeBindings: Array<{ connectionId?: string }>;
   coordinatorExclusiveCalls(): number;
 } {
   const Runtime = (cliModule as unknown as {
@@ -1124,6 +2675,7 @@ function runtimeFixture(
   }).DefaultProviderRuntime;
   const stateStore = new ProviderStateStore(initial);
   const reconnectRequests: unknown[][] = [];
+  const runtimeBindings: Array<{ connectionId?: string }> = [];
   let coordinatorExclusiveCalls = 0;
   const orchestrator = {
     async inspectStartup() {
@@ -1150,7 +2702,11 @@ function runtimeFixture(
   };
   const registry = {
     adapter() {
-      return {};
+      return {
+        async bindRuntime(request: { connectionId?: string }) {
+          runtimeBindings.push(request);
+        },
+      };
     },
     descriptor() {
       return { id: "openrouter", displayName: "OpenRouter", maturity: "stable" };
@@ -1191,6 +2747,7 @@ function runtimeFixture(
     runtime,
     stateStore,
     reconnectRequests,
+    runtimeBindings,
     coordinatorExclusiveCalls: () => coordinatorExclusiveCalls,
   };
 }
@@ -1227,6 +2784,8 @@ test("status reconnect default and confirmation select the same exact provider b
     (fixture.reconnectRequests[0]?.[1] as { connectionId?: string } | undefined)?.connectionId,
     "connection-b",
   );
+  assert.equal(fixture.runtimeBindings.length, 1);
+  assert.equal(fixture.runtimeBindings[0]?.connectionId, "connection-b");
   assert.equal(fixture.coordinatorExclusiveCalls(), 0, "reconnect must not hold a provider mutation lease around authority reads");
 
   const prompt = await fixture.runtime.execute(
@@ -1394,6 +2953,485 @@ test("explicit enable reuses the retained slot without replacement allocation", 
   assert.equal(observed.service.requireKey(), SECRET_A);
   assert.equal(credentials.effects.some((effect) => effect.startsWith("reserve:")), false);
   assert.equal(credentials.effects.some((effect) => effect.startsWith("write:")), false);
+});
+
+function retainedEnableFixture(
+  assertHeld: () => void | Promise<void> = () => undefined,
+  afterOperation: () => void | Promise<void> = () => undefined,
+  persist?: (request: ProviderStateCommitRequest) => Promise<ProviderSetupStateV1>,
+) {
+  const credentials = new AuthorityCredentials({}, { [SLOT_A]: SECRET_A });
+  const initialState = stateWithConnections([
+    connection({
+      id: "connection-disabled",
+      slot: SLOT_A,
+      fingerprint: FINGERPRINT_A,
+      enabled: false,
+    }),
+  ], null);
+  const stateStore = new ProviderStateStore(
+    initialState,
+    persist ? { persist } : {},
+  );
+  let exclusiveActive = false;
+  const lease = { async assertHeld() { await assertHeld(); } };
+  const coordinator = {
+    async readAuthority<T>(
+      _request: unknown,
+      operation: (held: typeof lease) => Promise<T>,
+    ) { return operation(lease); },
+    async runExclusive<T>(
+      _request: unknown,
+      operation: (held: typeof lease) => Promise<T>,
+    ) {
+      exclusiveActive = true;
+      try {
+        const value = await operation(lease);
+        await afterOperation();
+        return value;
+      } finally {
+        exclusiveActive = false;
+      }
+    },
+  };
+  const authority = realAuthority({ stateStore, credentials, coordinator });
+  const observed = adapterWithAuthority({ authority: authority as never, credentials });
+  const registry = new BackendRegistry([
+    { descriptor: OPENROUTER_DESCRIPTOR, adapter: observed.adapter },
+  ]);
+  const orchestrator = new SetupOrchestrator({
+    registry,
+    stateStore,
+    activationCoordinator: fakeActivationCoordinator(),
+  });
+  const Runtime = (cliModule as unknown as {
+    DefaultProviderRuntime: new (...args: unknown[]) => RuntimeUnderTest;
+  }).DefaultProviderRuntime;
+  const config = structuredClone(DEFAULT_CONFIG);
+  config.mainModel = MODEL;
+  config.providerSetup = stateStore.read();
+  const runtime = new Runtime(
+    observed.service,
+    credentials,
+    registry,
+    stateStore,
+    orchestrator,
+    coordinator,
+    { beginRun() { return () => undefined; } },
+    { async apply() { return { kind: "unchanged" }; } },
+    null,
+    null,
+    MODEL,
+    config,
+    undefined,
+    { credentialAuthority: authority, adapter: observed.adapter, async recover() {} },
+  );
+  return {
+    credentials,
+    stateStore,
+    observed,
+    runtime,
+    config,
+    exclusiveActive: () => exclusiveActive,
+  };
+}
+
+test("retained enable never publishes enabled default before a fallible runtime bind", async (t) => {
+  for (const failure of [
+    new Error("fixed retained runtime bind failure"),
+    Object.assign(new Error("fixed retained runtime bind deadline"), { name: "TimeoutError" }),
+  ]) {
+    await t.test(failure.name, async () => {
+      const fixture = retainedEnableFixture();
+      const beforeState = fixture.stateStore.read();
+      const beforeConfig = structuredClone(fixture.config.providerSetup);
+      fixture.observed.adapter.bindRuntimeUnderAuthorityLease = async () => {
+        throw failure;
+      };
+
+      const result = await fixture.runtime.execute(
+        { kind: "enable", backendId: "openrouter" },
+        "plain",
+      );
+
+      assert.deepEqual(result, {
+        kind: "setup",
+        backendId: "openrouter",
+        outcome: "cancelled",
+      });
+      assert.deepEqual(fixture.stateStore.read(), beforeState);
+      assert.deepEqual(fixture.config.providerSetup, beforeConfig);
+      assert.equal(fixture.observed.service.hasKey, false);
+      assert.equal(
+        fixture.credentials.effects.some((effect) =>
+          effect.startsWith("reserve:") || effect.startsWith("write:")
+        ),
+        false,
+      );
+    });
+  }
+});
+
+test("retained enable maps model dependency failures to fixed safe output without mutation", async () => {
+  const fixture = retainedEnableFixture();
+  const beforeState = fixture.stateStore.read();
+  const beforeConfig = structuredClone(fixture.config.providerSetup);
+  const sentinels = [
+    SECRET_B,
+    CREATOR_B,
+    "/Users/private-person/.orcode/provider-activation/private.json",
+    "C:\\Users\\private-person\\AppData\\Roaming\\orcode\\private.json",
+    '{"error":{"message":"provider raw body sentinel"}}',
+  ];
+  fixture.observed.adapter.listModels = async () => {
+    throw new Error(sentinels.join(" | "));
+  };
+
+  const result = await fixture.runtime.execute(
+    { kind: "enable", backendId: "openrouter" },
+    "plain",
+  );
+  const rendered = JSON.stringify(result);
+
+  assert.deepEqual(result, {
+    kind: "setup",
+    backendId: "openrouter",
+    outcome: "cancelled",
+  });
+  for (const sentinel of sentinels) assert.equal(rendered.includes(sentinel), false);
+  assert.deepEqual(fixture.stateStore.read(), beforeState);
+  assert.deepEqual(fixture.config.providerSetup, beforeConfig);
+  assert.equal(fixture.observed.service.hasKey, false);
+});
+
+test("retained enable bounds an abort-ignoring catalog and promptly releases ownership", async () => {
+  const fixture = retainedEnableFixture();
+  let catalogReached!: () => void;
+  const reached = new Promise<void>((resolve) => { catalogReached = resolve; });
+  fixture.observed.adapter.listModels = async () => {
+    catalogReached();
+    return new Promise(() => undefined);
+  };
+  const attempt = fixture.runtime.execute(
+    { kind: "enable", backendId: "openrouter" },
+    "plain",
+  );
+  await reached;
+
+  const settled = await Promise.race([
+    attempt,
+    new Promise<"still-pending">((resolve) => {
+      setTimeout(() => resolve("still-pending"), 5_250);
+    }),
+  ]);
+
+  assert.deepEqual(settled, {
+    kind: "setup",
+    backendId: "openrouter",
+    outcome: "cancelled",
+  });
+  assert.equal(fixture.exclusiveActive(), false);
+});
+
+test("retained enable bounds a stalled state commit and fences its late adoption", async () => {
+  let fixture!: ReturnType<typeof retainedEnableFixture>;
+  let persistReached!: () => void;
+  let releasePersist!: () => void;
+  const reached = new Promise<void>((resolve) => { persistReached = resolve; });
+  const gate = new Promise<void>((resolve) => { releasePersist = resolve; });
+  fixture = retainedEnableFixture(
+    () => undefined,
+    () => undefined,
+    async (request) => {
+      const candidate = request.build(fixture.stateStore.read());
+      persistReached();
+      await gate;
+      request.adopt(candidate);
+      return structuredClone(candidate);
+    },
+  );
+  const beforeState = fixture.stateStore.read();
+  const beforeConfig = structuredClone(fixture.config.providerSetup);
+  let logoutCalls = 0;
+  fixture.observed.adapter.logout = async () => {
+    logoutCalls += 1;
+    fixture.observed.service.forgetKey();
+  };
+  const attempt = fixture.runtime.execute(
+    { kind: "enable", backendId: "openrouter" },
+    "plain",
+  );
+  await reached;
+
+  const settled = await Promise.race([
+    attempt,
+    new Promise<"still-pending">((resolve) => {
+      setTimeout(() => resolve("still-pending"), 5_250);
+    }),
+  ]);
+  const ownedAtSettlement = fixture.exclusiveActive();
+  assert.equal(settled, "still-pending");
+  assert.equal(ownedAtSettlement, true);
+  assert.equal(logoutCalls, 0);
+  assert.deepEqual(fixture.stateStore.read(), beforeState);
+  assert.deepEqual(fixture.config.providerSetup, beforeConfig);
+  releasePersist();
+  const final = await attempt;
+  await new Promise<void>((resolve) => setImmediate(resolve));
+
+  const cancelled = {
+    kind: "setup",
+    backendId: "openrouter",
+    outcome: "cancelled",
+  } as const;
+  assert.deepEqual(final, cancelled);
+  assert.equal(fixture.exclusiveActive(), false);
+  assert.deepEqual(fixture.stateStore.read(), beforeState);
+  assert.deepEqual(fixture.config.providerSetup, beforeConfig);
+  assert.equal(fixture.observed.service.hasKey, false);
+  assert.equal(logoutCalls, 1);
+});
+
+test("retained enable completes an exact adopted tuple when persistence hangs after adoption", async () => {
+  let fixture!: ReturnType<typeof retainedEnableFixture>;
+  let persistReached!: () => void;
+  let releasePersist!: () => void;
+  const reached = new Promise<void>((resolve) => { persistReached = resolve; });
+  const gate = new Promise<void>((resolve) => { releasePersist = resolve; });
+  fixture = retainedEnableFixture(
+    () => undefined,
+    () => undefined,
+    async (request) => {
+      const candidate = request.build(fixture.stateStore.read());
+      request.adopt(candidate);
+      persistReached();
+      await gate;
+      return structuredClone(candidate);
+    },
+  );
+  const beforeConfig = structuredClone(fixture.config.providerSetup);
+  const attempt = fixture.runtime.execute(
+    { kind: "enable", backendId: "openrouter" },
+    "plain",
+  );
+  await reached;
+
+  const settled = await Promise.race([
+    attempt,
+    new Promise<"still-pending">((resolve) => {
+      setTimeout(() => resolve("still-pending"), 5_250);
+    }),
+  ]);
+  const committed = fixture.stateStore.read();
+  const ownedAtSettlement = fixture.exclusiveActive();
+  assert.equal(settled, "still-pending");
+  assert.equal(ownedAtSettlement, true);
+  assert.deepEqual(fixture.config.providerSetup, beforeConfig);
+  releasePersist();
+  const final = await attempt;
+  await new Promise<void>((resolve) => setImmediate(resolve));
+
+  const ready = {
+    kind: "setup",
+    backendId: "openrouter",
+    outcome: "ready",
+  } as const;
+  assert.deepEqual(final, ready);
+  assert.equal(fixture.exclusiveActive(), false);
+  assert.equal(committed.connections[0]?.enabled, true);
+  assert.deepEqual(fixture.config.providerSetup, committed);
+  assert.equal(fixture.observed.service.requireKey(), SECRET_A);
+});
+
+test("retained enable does not settle or logout before a late genuine durable-adoption outcome", async () => {
+  let fixture!: ReturnType<typeof retainedEnableFixture>;
+  let durable: ProviderSetupStateV1 | null = null;
+  let publicationReached!: () => void;
+  let releaseAdoption!: () => void;
+  let adoptionFinished!: () => void;
+  const published = new Promise<void>((resolve) => { publicationReached = resolve; });
+  const adoptionGate = new Promise<void>((resolve) => { releaseAdoption = resolve; });
+  const finished = new Promise<void>((resolve) => { adoptionFinished = resolve; });
+  fixture = retainedEnableFixture(
+    () => undefined,
+    () => undefined,
+    async (request) => {
+      const candidate = request.build(fixture.stateStore.read());
+      durable = structuredClone(candidate);
+      publicationReached();
+      await adoptionGate;
+      try {
+        adoptDurablyCommittedProviderState(request, candidate);
+      } finally {
+        adoptionFinished();
+      }
+      return structuredClone(candidate);
+    },
+  );
+  let logoutCalls = 0;
+  fixture.observed.adapter.logout = async () => {
+    logoutCalls += 1;
+    fixture.observed.service.forgetKey();
+  };
+  const beforeState = fixture.stateStore.read();
+  const beforeConfig = structuredClone(fixture.config.providerSetup);
+  const attempt = fixture.runtime.execute(
+    { kind: "enable", backendId: "openrouter" },
+    "plain",
+  );
+  await published;
+
+  const beforeAdoption = await Promise.race([
+    attempt.then(() => "settled" as const),
+    new Promise<"still-pending">((resolve) => {
+      setTimeout(() => resolve("still-pending"), 5_250);
+    }),
+  ]);
+  assert.equal(beforeAdoption, "still-pending");
+  assert.equal(logoutCalls, 0);
+  assert.equal(fixture.exclusiveActive(), true);
+  assert.deepEqual(fixture.stateStore.read(), beforeState);
+  assert.deepEqual(fixture.config.providerSetup, beforeConfig);
+
+  releaseAdoption();
+  await finished;
+  const final = await attempt;
+  const committed = fixture.stateStore.read();
+  const durableReadback = durable as ProviderSetupStateV1 | null;
+
+  assert.deepEqual(final, {
+    kind: "setup",
+    backendId: "openrouter",
+    outcome: "ready",
+  });
+  assert.ok(durableReadback);
+  assert.deepEqual(committed, durableReadback);
+  assert.deepEqual(fixture.config.providerSetup, durableReadback);
+  assert.equal(committed.connections[0]?.enabled, true);
+  assert.equal(committed.defaultRoute?.canonicalModelId, MODEL);
+  assert.equal(fixture.observed.service.requireKey(), SECRET_A);
+  assert.equal(logoutCalls, 0);
+  assert.equal(fixture.exclusiveActive(), false);
+});
+
+test("retained enable preserves one complete tuple when the post-commit fence is lost", async () => {
+  let fixture!: ReturnType<typeof retainedEnableFixture>;
+  fixture = retainedEnableFixture(() => {
+    if (fixture.stateStore.read().connections[0]?.enabled) {
+      throw new Error("fixed post-commit provider fence loss");
+    }
+  });
+
+  const result = await fixture.runtime.execute(
+    { kind: "enable", backendId: "openrouter" },
+    "plain",
+  );
+  const committed = fixture.stateStore.read();
+
+  assert.deepEqual(result, {
+    kind: "setup",
+    backendId: "openrouter",
+    outcome: "ready",
+  });
+  assert.equal(committed.connections[0]?.enabled, true);
+  assert.equal(committed.defaultRoute?.canonicalModelId, MODEL);
+  assert.deepEqual(fixture.config.providerSetup, committed);
+  assert.equal(fixture.observed.service.requireKey(), SECRET_A);
+});
+
+test("retained enable reports ready after an outer post-commit authority failure", async () => {
+  let fixture!: ReturnType<typeof retainedEnableFixture>;
+  fixture = retainedEnableFixture(
+    () => undefined,
+    () => {
+      if (fixture.stateStore.read().connections[0]?.enabled) {
+        throw new Error("fixed outer post-commit authority failure");
+      }
+    },
+  );
+
+  const result = await fixture.runtime.execute(
+    { kind: "enable", backendId: "openrouter" },
+    "plain",
+  );
+  const committed = fixture.stateStore.read();
+
+  assert.deepEqual(result, {
+    kind: "setup",
+    backendId: "openrouter",
+    outcome: "ready",
+  });
+  assert.equal(committed.connections[0]?.enabled, true);
+  assert.equal(committed.defaultRoute?.canonicalModelId, MODEL);
+  assert.deepEqual(fixture.config.providerSetup, committed);
+  assert.equal(fixture.observed.service.requireKey(), SECRET_A);
+});
+
+test("retained enable adopts a durable commit that rejects after exact adoption", async () => {
+  let fixture!: ReturnType<typeof retainedEnableFixture>;
+  let durable: ProviderSetupStateV1 | null = null;
+  fixture = retainedEnableFixture(
+    () => undefined,
+    () => undefined,
+    async (request) => {
+      const authoritative = durable ?? fixture.stateStore.read();
+      const candidate = request.build(structuredClone(authoritative));
+      durable = structuredClone(candidate);
+      request.adopt(candidate);
+      throw new Error("fixed post-adopt persistence release failure");
+    },
+  );
+
+  const result = await fixture.runtime.execute(
+    { kind: "enable", backendId: "openrouter" },
+    "plain",
+  );
+  const committed = fixture.stateStore.read();
+  const durableCommit = durable as ProviderSetupStateV1 | null;
+
+  assert.deepEqual(result, {
+    kind: "setup",
+    backendId: "openrouter",
+    outcome: "ready",
+  });
+  assert.ok(durableCommit);
+  assert.equal(durableCommit.connections[0]?.enabled, true);
+  assert.deepEqual(committed, durableCommit);
+  assert.deepEqual(fixture.config.providerSetup, durableCommit);
+  assert.equal(fixture.observed.service.requireKey(), SECRET_A);
+});
+
+test("retained enable adopts an exact commit when persistence resolves a wrong readback", async () => {
+  let fixture!: ReturnType<typeof retainedEnableFixture>;
+  let durable: ProviderSetupStateV1 | null = null;
+  fixture = retainedEnableFixture(
+    () => undefined,
+    () => undefined,
+    async (request) => {
+      const authoritative = fixture.stateStore.read();
+      const candidate = request.build(structuredClone(authoritative));
+      durable = structuredClone(candidate);
+      request.adopt(candidate);
+      return structuredClone(authoritative);
+    },
+  );
+
+  const result = await fixture.runtime.execute(
+    { kind: "enable", backendId: "openrouter" },
+    "plain",
+  );
+  const committed = fixture.stateStore.read();
+  const durableCommit = durable as ProviderSetupStateV1 | null;
+
+  assert.deepEqual(result, {
+    kind: "setup",
+    backendId: "openrouter",
+    outcome: "ready",
+  });
+  assert.ok(durableCommit);
+  assert.deepEqual(committed, durableCommit);
+  assert.deepEqual(fixture.config.providerSetup, durableCommit);
+  assert.equal(fixture.observed.service.requireKey(), SECRET_A);
 });
 
 test("process-only disable revokes automatic environment eligibility for later prompts", async () => {

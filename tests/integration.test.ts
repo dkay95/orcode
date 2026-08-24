@@ -444,6 +444,7 @@ async function recoverTaskTenActivationTuple(
     selectedCanonicalModelId: model.canonicalModelId,
     generation: 4,
     signal: new AbortController().signal,
+    deadlineAt: Number.MAX_SAFE_INTEGER,
     persistence: "persisted",
   }));
   now = 5_000;

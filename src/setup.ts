@@ -18,6 +18,7 @@ import type {
   ProviderActivationResult,
 } from "./provider-activation.js";
 import {
+  readProviderStateCommitAdoption,
   type ProviderConnectionStateV1,
   type ProviderSetupStateV1,
   type ProviderStateStore,
@@ -189,6 +190,15 @@ export interface ProviderStartupAttemptInput {
     result: StartupSetupResult,
     context: ProviderStartupStepContext,
   ): Promise<void>;
+}
+
+export interface SetupCancellationRequest {
+  /** Kept by identity at the caller boundary; never rendered or persisted. */
+  reason: unknown;
+  /** Durable setup state observed before the first interactive prompt. */
+  expectedRevision?: number;
+  /** Whole-startup generation, when cancellation belongs to that attempt. */
+  expectedGeneration?: number;
 }
 
 /** One abortable budget for every startup phase, including recovery. */
@@ -374,12 +384,64 @@ export class SetupOrchestrator {
     }
   }
 
-  async cancelSetup(): Promise<StartupSetupResult> {
-    const token = this.#reserveGeneration();
+  async cancelSetup(request: SetupCancellationRequest): Promise<StartupSetupResult> {
+    // Capture before waiting for an activation. A cancellation that began on
+    // older authority must never cancel the state committed by that activation.
+    const captured = this.#stateStore.read();
+    if (
+      request.expectedRevision !== undefined
+      && request.expectedRevision !== captured.revision
+    ) {
+      return this.#latestResult
+        ?? this.#setupRequiredResult(captured, this.#generation);
+    }
+
+    let token: GenerationToken;
+    if (request.expectedGeneration !== undefined) {
+      const expected = request.expectedGeneration;
+      if (
+        !Number.isSafeInteger(expected)
+        || expected < 1
+        || expected < this.#generation
+        || expected < this.#nextGeneration
+      ) {
+        return this.#latestResult
+          ?? this.#setupRequiredResult(captured, this.#generation);
+      }
+      if (this.#currentGeneration) this.#currentGeneration.closed = true;
+      this.#supersedeActiveProbes();
+      this.#generation = expected;
+      this.#nextGeneration = Math.max(this.#nextGeneration, expected);
+      token = { generation: expected, closed: false };
+      this.#currentGeneration = token;
+    } else {
+      token = this.#reserveGeneration();
+    }
     try {
       if (!(await this.#awaitGenerationTurn(token))) return this.#staleResult();
-      const captured = this.#stateStore.read();
-      const state = await this.#commitCancelled(captured, token.generation);
+      const current = this.#stateStore.read();
+      if (
+        current.revision !== captured.revision
+        || JSON.stringify(current) !== JSON.stringify(captured)
+      ) {
+        return this.#latestResult
+          ?? this.#setupRequiredResult(current, token.generation);
+      }
+      let state: ProviderSetupStateV1;
+      try {
+        state = await this.#commitCancelled(captured, token.generation);
+      } catch (error) {
+        const afterFailure = this.#stateStore.read();
+        if (
+          !this.#ownsGeneration(token)
+          || afterFailure.revision !== captured.revision
+          || JSON.stringify(afterFailure) !== JSON.stringify(captured)
+        ) {
+          return this.#latestResult
+            ?? this.#setupRequiredResult(afterFailure, token.generation);
+        }
+        throw error;
+      }
       if (!this.#ownsGeneration(token)) return this.#staleResult();
       const result = this.#setupRequiredResult(state, token.generation);
       this.#latestResult = result;
@@ -392,10 +454,21 @@ export class SetupOrchestrator {
     }
   }
 
-  ensureRunnableRoute(): RouteIdentityV1 {
+  ensureRunnableRoute(requestedRoute?: RouteIdentityV1): RouteIdentityV1 {
     const result = this.#latestResult;
     const state = this.#stateStore.read();
     const current = state.defaultRoute;
+    if (
+      requestedRoute
+      && result
+      && result.generation === this.#generation
+      && this.#currentGeneration?.generation === this.#generation
+      && this.#currentGeneration.closed
+      && isResolvedRoute(requestedRoute)
+      && this.#routeHasProof(requestedRoute, state, result.generation)
+    ) {
+      return structuredClone(requestedRoute);
+    }
     if (
       result
       && result.generation === this.#generation
@@ -1288,16 +1361,12 @@ export class SetupOrchestrator {
   ): Promise<never> {
     const generation = generationToken.generation;
     if (this.#ownsGeneration(generationToken)) {
-      try {
-        const state = await this.#commitCancelled(captured, generation);
-        if (!this.#ownsGeneration(generationToken)) throw abortReason(signal);
-        const result = this.#setupRequiredResult(state, generation);
-        this.#latestResult = result;
-        this.#proofs.clear();
-        this.#emit({ version: 1, type: "setup-required", generation });
-      } catch {
-        this.#proofs.clear();
-      }
+      const state = await this.#commitCancelled(captured, generation);
+      if (!this.#ownsGeneration(generationToken)) throw abortReason(signal);
+      const result = this.#setupRequiredResult(state, generation);
+      this.#latestResult = result;
+      this.#proofs.clear();
+      this.#emit({ version: 1, type: "setup-required", generation });
     }
     throw abortReason(signal);
   }
@@ -1308,46 +1377,54 @@ export class SetupOrchestrator {
     signal: AbortSignal,
   ): Promise<never> {
     if (generation === this.#generation) {
-      try {
-        const state = await this.#commitCancelled(captured, generation);
-        if (generation === this.#generation) {
-          const result = this.#setupRequiredResult(state, generation);
-          this.#latestResult = result;
-          this.#proofs.clear();
-        }
-      } catch {
+      const state = await this.#commitCancelled(captured, generation);
+      if (generation === this.#generation) {
+        const result = this.#setupRequiredResult(state, generation);
+        this.#latestResult = result;
         this.#proofs.clear();
       }
     }
     throw abortReason(signal);
   }
 
-  #commitCancelled(
+  async #commitCancelled(
     captured: ProviderSetupStateV1,
     generation: number,
   ): Promise<ProviderSetupStateV1> {
-    return this.#stateStore.commit(
-      captured.revision,
-      (current) => {
-        if (JSON.stringify(current) !== JSON.stringify(captured)) {
-          throw new Error("Provider state changed before setup cancellation.");
-        }
-        return {
-          ...current,
-          lifecycle: "cancelled",
-          cross: {
-            enabled: false,
-            preferredLead: current.cross.preferredLead,
-            preferredChallenger: current.cross.preferredChallenger,
-          },
-        };
-      },
-      () => {
-        if (generation !== this.#generation) {
-          throw new Error("Setup cancellation generation is stale.");
-        }
-      },
-    );
+    try {
+      return await this.#stateStore.commit(
+        captured.revision,
+        (current) => {
+          if (JSON.stringify(current) !== JSON.stringify(captured)) {
+            throw new Error("Provider state changed before setup cancellation.");
+          }
+          return {
+            ...current,
+            lifecycle: "cancelled",
+            cross: {
+              enabled: false,
+              preferredLead: current.cross.preferredLead,
+              preferredChallenger: current.cross.preferredChallenger,
+            },
+          };
+        },
+        () => {
+          if (generation !== this.#generation) {
+            throw new Error("Setup cancellation generation is stale.");
+          }
+        },
+      );
+    } catch (error) {
+      const committed = readProviderStateCommitAdoption(error);
+      if (
+        committed
+        && committed.revision === captured.revision + 1
+        && committed.lifecycle === "cancelled"
+      ) {
+        return committed;
+      }
+      throw error;
+    }
   }
 
   #listModelsBounded(

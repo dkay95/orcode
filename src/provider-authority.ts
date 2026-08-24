@@ -1,3 +1,4 @@
+import { createHmac, randomBytes } from "node:crypto";
 import {
   normalizeProviderSecret,
   type CredentialKind,
@@ -77,27 +78,72 @@ export interface ProviderCredentialRequest {
   signal: AbortSignal;
 }
 
+export interface ProviderCredentialUseContext {
+  source: "saved" | "environment";
+  binding: ProviderConnectionBindingV1;
+  candidatePermit: ProviderCandidateCredentialPermit;
+  publishIfCurrent(publish: () => void): Promise<void>;
+}
+
+export interface ProviderCandidateCredentialPermit {
+  readonly version: 1;
+}
+
+export interface ProviderCandidatePreflightRequest {
+  deadlineAt: number;
+  signal: AbortSignal;
+}
+
+export interface ProviderCandidateAuthorityRequest extends ProviderCandidatePreflightRequest {
+  credentialPermit?: ProviderCandidateCredentialPermit | null;
+  requireCredentialPermit?: boolean;
+}
+
+export interface ProviderCandidateSnapshotAuthorityRequest
+  extends ProviderCandidateAuthorityRequest {
+  candidate: string;
+  authoritativeState: ProviderSetupStateV1;
+}
+
+export type ProviderCandidatePreflightResult =
+  | { kind: "ready" }
+  | { kind: "forget-pending" | "recovery-required" | "stale" };
+
+export interface ProviderCandidateAuthorityLease extends ProviderAuthorityReadLease {
+  assertCurrent(): Promise<void>;
+}
+
+export type ProviderCandidateAuthorityResult<T> =
+  | { kind: "ready"; value: T }
+  | { kind: "forget-pending" | "recovery-required" | "stale" };
+
 export interface ProviderCredentialAuthorityLike {
+  environmentCandidatePermit?(
+    candidate: string,
+  ): ProviderCandidateCredentialPermit | null;
+  preflightCandidate?(
+    request: ProviderCandidatePreflightRequest,
+  ): Promise<ProviderCandidatePreflightResult>;
+  withCandidateAuthority?<T>(
+    request: ProviderCandidateAuthorityRequest,
+    use: (lease: ProviderCandidateAuthorityLease) => Promise<T>,
+  ): Promise<ProviderCandidateAuthorityResult<T>>;
+  validateCandidatePermitUnderLease?(
+    request: ProviderCandidateAuthorityRequest,
+    lease: ProviderAuthorityReadLease,
+  ): Promise<ProviderCandidatePreflightResult>;
+  validateCandidatePermitAgainstSnapshotUnderLease?(
+    request: ProviderCandidateSnapshotAuthorityRequest,
+    lease: ProviderAuthorityReadLease,
+  ): Promise<ProviderCandidatePreflightResult>;
   withCredential<T>(
     request: ProviderCredentialRequest,
-    use: (
-      secret: string,
-      context: {
-        source: "saved" | "environment";
-        binding: ProviderConnectionBindingV1;
-      },
-    ) => Promise<T>,
+    use: (secret: string, context: ProviderCredentialUseContext) => Promise<T>,
   ): Promise<ProviderCredentialAccessResult<T>>;
   withCredentialUnderLease?<T>(
     request: ProviderCredentialRequest,
     lease: ProviderAuthorityReadLease,
-    use: (
-      secret: string,
-      context: {
-        source: "saved" | "environment";
-        binding: ProviderConnectionBindingV1;
-      },
-    ) => Promise<T>,
+    use: (secret: string, context: ProviderCredentialUseContext) => Promise<T>,
   ): Promise<ProviderCredentialAccessResult<T>>;
 }
 
@@ -121,6 +167,13 @@ interface CredentialPermit {
   source: "saved" | "environment";
 }
 
+interface CandidateCredentialProof {
+  source: "saved" | "environment";
+  binding: ProviderConnectionBindingV1 | null;
+  stateRevision: number;
+  fingerprint: string;
+}
+
 /**
  * Single process authority for mapping durable provider bindings to callback-
  * scoped credentials. Secrets are never returned from this API.
@@ -131,6 +184,11 @@ export class ProviderCredentialAuthority implements ProviderCredentialAuthorityL
   readonly #environment: Readonly<Record<string, string | undefined>>;
   readonly #coordinator: () => ProviderAuthorityCoordinator;
   readonly #now: () => number;
+  readonly #candidateFingerprintKey = randomBytes(32);
+  readonly #candidatePermits = new WeakMap<
+    ProviderCandidateCredentialPermit,
+    CandidateCredentialProof
+  >();
   #automaticEnvironmentRevoked = false;
 
   constructor(options: ProviderCredentialAuthorityOptions) {
@@ -145,6 +203,24 @@ export class ProviderCredentialAuthority implements ProviderCredentialAuthorityL
     this.#automaticEnvironmentRevoked = true;
   }
 
+  environmentCandidatePermit(candidate: string): ProviderCandidateCredentialPermit | null {
+    let expected: string;
+    let current: string;
+    try {
+      expected = normalizeProviderSecret(candidate);
+      current = normalizeProviderSecret(this.#environment.OPENROUTER_API_KEY ?? "");
+    } catch {
+      return null;
+    }
+    if (expected !== current) return null;
+    return this.#issueCandidatePermit({
+      source: "environment",
+      binding: null,
+      stateRevision: this.#stateStore.read().revision,
+      fingerprint: this.#candidateFingerprint(expected),
+    });
+  }
+
   select(
     selector: ProviderBindingSelector,
     options: { allowDisabled?: boolean } = {},
@@ -156,15 +232,138 @@ export class ProviderCredentialAuthority implements ProviderCredentialAuthorityL
     );
   }
 
+  async preflightCandidate(
+    request: ProviderCandidatePreflightRequest,
+  ): Promise<ProviderCandidatePreflightResult> {
+    throwIfAborted(request.signal);
+    if (!Number.isFinite(request.deadlineAt) || request.deadlineAt <= this.#now()) {
+      return { kind: "stale" };
+    }
+    try {
+      await this.#coordinator().readAuthority({ signal: request.signal }, async (lease) => {
+        await this.#bounded(request, () => lease.assertHeld());
+      });
+      return { kind: "ready" };
+    } catch (error) {
+      return this.#preflightFailure(request, error);
+    }
+  }
+
+  async withCandidateAuthority<T>(
+    request: ProviderCandidateAuthorityRequest,
+    use: (lease: ProviderCandidateAuthorityLease) => Promise<T>,
+  ): Promise<ProviderCandidateAuthorityResult<T>> {
+    throwIfAborted(request.signal);
+    if (!Number.isFinite(request.deadlineAt) || request.deadlineAt <= this.#now()) {
+      return { kind: "stale" };
+    }
+    const credentialProof = request.credentialPermit
+      ? this.#candidatePermits.get(request.credentialPermit)
+      : undefined;
+    if ((request.requireCredentialPermit || request.credentialPermit) && !credentialProof) {
+      return { kind: "stale" };
+    }
+    try {
+      const value = await this.#coordinator().readAuthority(
+        { signal: request.signal },
+        async (providerLease) => {
+          let candidateAuthorityOpen = true;
+          const assertCurrent = async () => {
+            if (!candidateAuthorityOpen) throw new ProviderAuthorityDeadlineError();
+            await this.#bounded(request, () => providerLease.assertHeld());
+            if (credentialProof) {
+              await this.#assertCandidateCredentialCurrent(
+                request,
+                providerLease,
+                credentialProof,
+              );
+            }
+            if (!candidateAuthorityOpen) throw new ProviderAuthorityDeadlineError();
+          };
+          const lease: ProviderCandidateAuthorityLease = {
+            assertHeld: assertCurrent,
+            assertCurrent,
+          };
+          try {
+            await lease.assertCurrent();
+            const result = await this.#bounded(request, () => use(lease));
+            await lease.assertCurrent();
+            return result;
+          } finally {
+            candidateAuthorityOpen = false;
+          }
+        },
+      );
+      return { kind: "ready", value };
+    } catch (error) {
+      return this.#preflightFailure(request, error);
+    }
+  }
+
+  /**
+   * Revalidates an opaque candidate proof while activation already owns the
+   * provider lease. This deliberately never reacquires provider authority.
+   */
+  async validateCandidatePermitUnderLease(
+    request: ProviderCandidateAuthorityRequest,
+    lease: ProviderAuthorityReadLease,
+  ): Promise<ProviderCandidatePreflightResult> {
+    throwIfAborted(request.signal);
+    if (!Number.isFinite(request.deadlineAt) || request.deadlineAt <= this.#now()) {
+      return { kind: "stale" };
+    }
+    const credentialProof = request.credentialPermit
+      ? this.#candidatePermits.get(request.credentialPermit)
+      : undefined;
+    if ((request.requireCredentialPermit || request.credentialPermit) && !credentialProof) {
+      return { kind: "stale" };
+    }
+    try {
+      await this.#bounded(request, () => lease.assertHeld());
+      if (credentialProof) {
+        await this.#assertCandidateCredentialCurrent(request, lease, credentialProof);
+      }
+      await this.#bounded(request, () => lease.assertHeld());
+      return { kind: "ready" };
+    } catch (error) {
+      return this.#preflightFailure(request, error);
+    }
+  }
+
+  /**
+   * Revalidates an opaque candidate proof against an authoritative config
+   * snapshot while the caller already owns Runtime -> Provider -> Config.
+   * This path must never reacquire provider or config ownership.
+   */
+  async validateCandidatePermitAgainstSnapshotUnderLease(
+    request: ProviderCandidateSnapshotAuthorityRequest,
+    lease: ProviderAuthorityReadLease,
+  ): Promise<ProviderCandidatePreflightResult> {
+    throwIfAborted(request.signal);
+    if (!Number.isFinite(request.deadlineAt) || request.deadlineAt <= this.#now()) {
+      return { kind: "stale" };
+    }
+    const credentialProof = request.credentialPermit
+      ? this.#candidatePermits.get(request.credentialPermit)
+      : undefined;
+    if ((request.requireCredentialPermit || request.credentialPermit) && !credentialProof) {
+      return { kind: "stale" };
+    }
+    try {
+      await this.#bounded(request, () => lease.assertHeld());
+      if (credentialProof) {
+        await this.#assertCandidateCredentialMatchesSnapshot(request, credentialProof);
+      }
+      await this.#bounded(request, () => lease.assertHeld());
+      return { kind: "ready" };
+    } catch (error) {
+      return this.#preflightFailure(request, error);
+    }
+  }
+
   async withCredential<T>(
     request: ProviderCredentialRequest,
-    use: (
-      secret: string,
-      context: {
-        source: "saved" | "environment";
-        binding: ProviderConnectionBindingV1;
-      },
-    ) => Promise<T>,
+    use: (secret: string, context: ProviderCredentialUseContext) => Promise<T>,
   ): Promise<ProviderCredentialAccessResult<T>> {
     throwIfAborted(request.signal);
     if (!Number.isFinite(request.deadlineAt) || request.deadlineAt <= this.#now()) {
@@ -184,13 +383,7 @@ export class ProviderCredentialAuthority implements ProviderCredentialAuthorityL
   async withCredentialUnderLease<T>(
     request: ProviderCredentialRequest,
     lease: ProviderAuthorityReadLease,
-    use: (
-      secret: string,
-      context: {
-        source: "saved" | "environment";
-        binding: ProviderConnectionBindingV1;
-      },
-    ) => Promise<T>,
+    use: (secret: string, context: ProviderCredentialUseContext) => Promise<T>,
   ): Promise<ProviderCredentialAccessResult<T>> {
     throwIfAborted(request.signal);
     if (!Number.isFinite(request.deadlineAt) || request.deadlineAt <= this.#now()) {
@@ -199,19 +392,19 @@ export class ProviderCredentialAuthority implements ProviderCredentialAuthorityL
     let permit: CredentialPermit | ProviderCredentialAccessResult<never>;
     try {
       permit = await this.#readPermitUnderLease(request, lease);
-      await lease.assertHeld();
+      await this.#bounded(request, () => lease.assertHeld());
     } catch (error) {
       return this.#authorityFailure(request, error);
     }
-    return this.#usePermit(request, permit, use);
+    return this.#usePermit(request, permit, use, lease);
   }
 
   async #readPermitUnderLease(
     request: ProviderCredentialRequest,
     lease: ProviderAuthorityReadLease,
   ): Promise<CredentialPermit | ProviderCredentialAccessResult<never>> {
-    await lease.assertHeld();
-    const before = await this.#readAuthoritativeState();
+    await this.#bounded(request, () => lease.assertHeld());
+    const before = await this.#readAuthoritativeState(request);
     const selected = selectOpenRouterBinding(
       before,
       { kind: "connection", connectionId: request.connectionId },
@@ -224,10 +417,10 @@ export class ProviderCredentialAuthority implements ProviderCredentialAuthorityL
     let permit = request.credentialKind === "management"
       ? await this.#readManagementPermit(request, binding, before)
       : await this.#readInferencePermit(request, binding, before);
-    await lease.assertHeld();
+    await this.#bounded(request, () => lease.assertHeld());
     if ("secret" in permit) {
       const after = selectOpenRouterBinding(
-        await this.#readAuthoritativeState(),
+        await this.#readAuthoritativeState(request),
         { kind: "connection", connectionId: request.connectionId },
         request.allowDisabled ?? false,
       );
@@ -241,13 +434,8 @@ export class ProviderCredentialAuthority implements ProviderCredentialAuthorityL
   async #usePermit<T>(
     request: ProviderCredentialRequest,
     permit: CredentialPermit | ProviderCredentialAccessResult<never> | null,
-    use: (
-      secret: string,
-      context: {
-        source: "saved" | "environment";
-        binding: ProviderConnectionBindingV1;
-      },
-    ) => Promise<T>,
+    use: (secret: string, context: ProviderCredentialUseContext) => Promise<T>,
+    authorityLease?: ProviderAuthorityReadLease,
   ): Promise<ProviderCredentialAccessResult<T>> {
     const resolvedPermit = permit;
     if (!resolvedPermit || !("secret" in resolvedPermit)) {
@@ -258,11 +446,35 @@ export class ProviderCredentialAuthority implements ProviderCredentialAuthorityL
     const { binding, source } = resolvedPermit;
     let secret: string | null = resolvedPermit.secret;
     if (secret === null) return { kind: "stale" };
+    const candidatePermit = this.#issueCandidatePermit({
+      source,
+      binding: structuredClone(binding),
+      stateRevision: binding.stateRevision,
+      fingerprint: this.#candidateFingerprint(secret),
+    });
+    const publishIfCurrent = async (publish: () => void): Promise<void> => {
+      const expectedSecret = secret;
+      if (expectedSecret === null) throw new ProviderAuthorityStaleError();
+      await this.#publishIfCurrent(
+        request,
+        { binding, source, secret: expectedSecret },
+        publish,
+        authorityLease,
+      );
+    };
     try {
-      return {
-        kind: "available",
-        value: await use(secret, { source, binding: structuredClone(binding) }),
-      };
+      const value = await this.#bounded(
+        request,
+        () => use(secret!, {
+          source,
+          binding: structuredClone(binding),
+          candidatePermit,
+          publishIfCurrent,
+        }),
+      );
+      return { kind: "available", value };
+    } catch (error) {
+      return this.#authorityFailure(request, error);
     } finally {
       secret = null;
     }
@@ -272,6 +484,10 @@ export class ProviderCredentialAuthority implements ProviderCredentialAuthorityL
     request: ProviderCredentialRequest,
     error: unknown,
   ): ProviderCredentialAccessResult<T> {
+    if (
+      error instanceof ProviderAuthorityDeadlineError
+      || error instanceof ProviderAuthorityStaleError
+    ) return { kind: "stale" };
     const code = errorCode(error);
     if (code === "provider-credential-cleanup-pending") {
       return { kind: "forget-pending" };
@@ -283,17 +499,186 @@ export class ProviderCredentialAuthority implements ProviderCredentialAuthorityL
     return { kind: "recovery-required" };
   }
 
+  async #publishIfCurrent(
+    request: ProviderCredentialRequest,
+    expected: CredentialPermit,
+    publish: () => void,
+    authorityLease?: ProviderAuthorityReadLease,
+  ): Promise<void> {
+    const publishUnderLease = async (lease: ProviderAuthorityReadLease): Promise<void> => {
+      const current = await this.#readPermitUnderLease(request, lease);
+      if (
+        !("secret" in current)
+        || current.source !== expected.source
+        || current.secret !== expected.secret
+        || !sameBinding(current.binding, expected.binding)
+      ) {
+        throw new ProviderAuthorityStaleError();
+      }
+      await this.#bounded(request, () => lease.assertHeld());
+      this.#assertAttemptCurrent(request);
+      publish();
+    };
+    if (authorityLease) {
+      await publishUnderLease(authorityLease);
+      return;
+    }
+    await this.#coordinator().readAuthority(
+      { signal: request.signal },
+      publishUnderLease,
+    );
+  }
+
+  async #assertCandidateCredentialCurrent(
+    request: ProviderCandidateAuthorityRequest,
+    lease: ProviderAuthorityReadLease,
+    expected: CandidateCredentialProof,
+  ): Promise<void> {
+    if (!expected.binding) {
+      const state = await this.#readAuthoritativeState(request);
+      let current: string;
+      try {
+        current = normalizeProviderSecret(this.#environment.OPENROUTER_API_KEY ?? "");
+      } catch {
+        throw new ProviderAuthorityStaleError();
+      }
+      if (
+        state.revision !== expected.stateRevision
+        || expected.source !== "environment"
+        || this.#candidateFingerprint(current) !== expected.fingerprint
+      ) {
+        throw new ProviderAuthorityStaleError();
+      }
+      return;
+    }
+    const current = await this.#readPermitUnderLease({
+      connectionId: expected.binding.connectionId,
+      credentialKind: "inference",
+      purpose: "explicit-repair",
+      environmentEligibility: expected.source === "environment"
+        ? "explicit-repair"
+        : "forbidden",
+      allowDisabled: !expected.binding.enabled,
+      deadlineAt: request.deadlineAt,
+      signal: request.signal,
+    }, lease);
+    if (
+      !("secret" in current)
+      || current.source !== expected.source
+      || !sameBinding(current.binding, expected.binding)
+      || this.#candidateFingerprint(current.secret) !== expected.fingerprint
+    ) {
+      throw new ProviderAuthorityStaleError();
+    }
+  }
+
+  async #assertCandidateCredentialMatchesSnapshot(
+    request: ProviderCandidateSnapshotAuthorityRequest,
+    expected: CandidateCredentialProof,
+  ): Promise<void> {
+    let candidate: string;
+    try {
+      candidate = normalizeProviderSecret(request.candidate);
+    } catch {
+      throw new ProviderAuthorityStaleError();
+    }
+    const state = request.authoritativeState;
+    if (
+      state.revision !== expected.stateRevision
+      || this.#candidateFingerprint(candidate) !== expected.fingerprint
+    ) {
+      throw new ProviderAuthorityStaleError();
+    }
+    if (!expected.binding) {
+      let current: string;
+      try {
+        current = normalizeProviderSecret(this.#environment.OPENROUTER_API_KEY ?? "");
+      } catch {
+        throw new ProviderAuthorityStaleError();
+      }
+      if (
+        expected.source !== "environment"
+        || this.#candidateFingerprint(current) !== expected.fingerprint
+      ) {
+        throw new ProviderAuthorityStaleError();
+      }
+      return;
+    }
+    const selected = selectOpenRouterBinding(
+      state,
+      { kind: "connection", connectionId: expected.binding.connectionId },
+      !expected.binding.enabled,
+    );
+    if (selected.kind !== "exact" || !sameBinding(selected.binding, expected.binding)) {
+      throw new ProviderAuthorityStaleError();
+    }
+    const current = await this.#readInferencePermit({
+      connectionId: expected.binding.connectionId,
+      credentialKind: "inference",
+      purpose: "explicit-repair",
+      environmentEligibility: expected.source === "environment"
+        ? "explicit-repair"
+        : "forbidden",
+      allowDisabled: !expected.binding.enabled,
+      deadlineAt: request.deadlineAt,
+      signal: request.signal,
+    }, selected.binding, state);
+    if (
+      !("secret" in current)
+      || current.source !== expected.source
+      || !sameBinding(current.binding, expected.binding)
+      || this.#candidateFingerprint(current.secret) !== expected.fingerprint
+    ) {
+      throw new ProviderAuthorityStaleError();
+    }
+  }
+
+  #issueCandidatePermit(
+    proof: CandidateCredentialProof,
+  ): ProviderCandidateCredentialPermit {
+    const permit = Object.freeze({ version: 1 as const });
+    this.#candidatePermits.set(permit, {
+      ...proof,
+      binding: proof.binding ? structuredClone(proof.binding) : null,
+    });
+    return permit;
+  }
+
+  #candidateFingerprint(secret: string): string {
+    return createHmac("sha256", this.#candidateFingerprintKey)
+      .update(secret, "utf8")
+      .digest("hex");
+  }
+
+  #preflightFailure(
+    request: ProviderCandidatePreflightRequest,
+    error: unknown,
+  ): Exclude<ProviderCandidatePreflightResult, { kind: "ready" }> {
+    if (error instanceof ProviderAuthorityDeadlineError) return { kind: "stale" };
+    const code = errorCode(error);
+    if (code === "provider-credential-cleanup-pending") {
+      return { kind: "forget-pending" };
+    }
+    if (request.signal.aborted) throw abortFrom(request.signal);
+    return { kind: "recovery-required" };
+  }
+
   async #readInferencePermit(
     request: ProviderCredentialRequest,
     binding: ProviderConnectionBindingV1,
     state: ProviderSetupStateV1,
   ): Promise<CredentialPermit | ProviderCredentialAccessResult<never>> {
     let stored: string | null;
+    const pointer = binding.credentialPointer;
     try {
-      stored = binding.credentialPointer.kind === "legacy"
-        ? await this.#credentials.get("inference")
-        : await this.#credentials.readSlot(binding.credentialPointer.slot);
-    } catch {
+      stored = pointer.kind === "legacy"
+        ? await this.#bounded(request, () => this.#credentials.get("inference"))
+        : await this.#bounded(
+            request,
+            () => this.#credentials.readSlot(pointer.slot),
+          );
+    } catch (error) {
+      if (this.#isAttemptInterruption(request, error)) throw error;
       return { kind: "invalid" };
     }
     if (stored !== null) {
@@ -311,12 +696,21 @@ export class ProviderCredentialAuthority implements ProviderCredentialAuthorityL
     return this.#environmentPermit(binding, "OPENROUTER_API_KEY");
   }
 
-  async #readAuthoritativeState(): Promise<ProviderSetupStateV1> {
+  async #readAuthoritativeState(
+    request: ProviderCandidatePreflightRequest,
+  ): Promise<ProviderSetupStateV1> {
     const expectedRevision = this.#stateStore.read().revision;
     try {
-      await this.#stateStore.commit(expectedRevision, (authoritative) => {
-        throw new ProviderAuthoritySnapshot(authoritative);
-      });
+      await this.#bounded(
+        request,
+        () => this.#stateStore.commit(
+          expectedRevision,
+          (authoritative) => {
+            throw new ProviderAuthoritySnapshot(authoritative);
+          },
+          () => this.#assertAttemptCurrent(request),
+        ),
+      );
     } catch (error) {
       if (error instanceof ProviderAuthoritySnapshot) {
         return structuredClone(error.state);
@@ -333,8 +727,9 @@ export class ProviderCredentialAuthority implements ProviderCredentialAuthorityL
   ): Promise<CredentialPermit | ProviderCredentialAccessResult<never>> {
     let stored: string | null;
     try {
-      stored = await this.#credentials.get("management");
-    } catch {
+      stored = await this.#bounded(request, () => this.#credentials.get("management"));
+    } catch (error) {
+      if (this.#isAttemptInterruption(request, error)) throw error;
       return { kind: "invalid" };
     }
     if (stored !== null) {
@@ -383,6 +778,75 @@ export class ProviderCredentialAuthority implements ProviderCredentialAuthorityL
     return binding.credentialPointer.kind === "legacy"
       && enabled.length === 1
       && enabled[0]?.id === binding.connectionId;
+  }
+
+  #assertAttemptCurrent(request: ProviderCandidatePreflightRequest): void {
+    throwIfAborted(request.signal);
+    if (!Number.isFinite(request.deadlineAt) || request.deadlineAt <= this.#now()) {
+      throw new ProviderAuthorityDeadlineError();
+    }
+  }
+
+  #isAttemptInterruption(
+    request: ProviderCandidatePreflightRequest,
+    error: unknown,
+  ): boolean {
+    return error instanceof ProviderAuthorityDeadlineError || request.signal.aborted;
+  }
+
+  async #bounded<T>(
+    request: ProviderCandidatePreflightRequest,
+    operation: () => Promise<T>,
+  ): Promise<T> {
+    this.#assertAttemptCurrent(request);
+    const remaining = Math.max(0, request.deadlineAt - this.#now());
+    return new Promise<T>((resolve, reject) => {
+      let settled = false;
+      let timer: ReturnType<typeof setTimeout> | null = null;
+      const finish = (settle: () => void) => {
+        if (settled) return;
+        settled = true;
+        if (timer !== null) clearTimeout(timer);
+        request.signal.removeEventListener("abort", onAbort);
+        settle();
+      };
+      const onAbort = () => finish(() => reject(abortFrom(request.signal)));
+      if (remaining <= 0x7fff_ffff) {
+        timer = setTimeout(
+          () => finish(() => reject(new ProviderAuthorityDeadlineError())),
+          remaining,
+        );
+      }
+      request.signal.addEventListener("abort", onAbort, { once: true });
+      if (request.signal.aborted) {
+        onAbort();
+        return;
+      }
+      Promise.resolve()
+        .then(() => {
+          if (settled) throw new ProviderAuthorityDeadlineError();
+          this.#assertAttemptCurrent(request);
+          return operation();
+        })
+        .then(
+          (value) => finish(() => resolve(value)),
+          (error: unknown) => finish(() => reject(error)),
+        );
+    });
+  }
+}
+
+class ProviderAuthorityDeadlineError extends Error {
+  constructor() {
+    super("Provider authority deadline expired.");
+    this.name = "ProviderAuthorityDeadlineError";
+  }
+}
+
+class ProviderAuthorityStaleError extends Error {
+  constructor() {
+    super("Provider credential authority changed before publication.");
+    this.name = "ProviderAuthorityStaleError";
   }
 }
 

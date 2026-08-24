@@ -44,6 +44,15 @@ interface ProviderPtyRun {
     routeReady: boolean;
     setupKind: "ready" | "cancelled" | "failed";
     setupMode: "setup-required" | null;
+    terminalLifecycle?: {
+      activeDataListeners: number;
+      finalDataListeners: number;
+      firstSettlementCount: number;
+      firstValueWasNull: boolean;
+      restartedDataListeners: number;
+      restartedValueLength: number;
+      stoppedDataListeners: number;
+    };
   };
 }
 
@@ -289,6 +298,25 @@ test("real POSIX Escape after activation is Later keeps the route ready and Cros
   assert.equal(result.result.counters.activation, 1);
   assert.equal(result.result.counters.network, 0);
   assert.equal(result.result.routeReady, true);
+  assert.equal(result.result.crossEnabled, false);
+  assertTranscriptPrivate(result);
+});
+
+test("real POSIX stop clears a pending pasted secret before restart and balances raw listeners", POSIX_PTY_ONLY, async () => {
+  const result = await run("stop-secret-restart");
+
+  assert.equal(result.result.failure, false);
+  assert.deepEqual(result.result.terminalLifecycle, {
+    activeDataListeners: 2,
+    finalDataListeners: 1,
+    firstSettlementCount: 1,
+    firstValueWasNull: true,
+    restartedDataListeners: 2,
+    restartedValueLength: 0,
+    stoppedDataListeners: 1,
+  });
+  assert.equal(result.result.observedCandidateCount, 0);
+  assert.equal(result.result.routeReady, false);
   assert.equal(result.result.crossEnabled, false);
   assertTranscriptPrivate(result);
 });

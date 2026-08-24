@@ -1,4 +1,4 @@
-import { createHmac, randomUUID } from "node:crypto";
+import { createHmac, randomBytes, randomUUID } from "node:crypto";
 import {
   deriveProviderHeadline,
   type BackendAdapter,
@@ -17,6 +17,8 @@ import type {
   ProviderAuthorityReadLease,
   ProviderCredentialAccessResult,
   ProviderCredentialAuthorityLike,
+  ProviderConnectionBindingV1,
+  ProviderCredentialUseContext,
 } from "./provider-authority.js";
 import {
   OpenRouterHttpError,
@@ -76,6 +78,11 @@ export interface OpenRouterBackendAdapterOptions {
 interface InspectedSecret {
   balance: BalanceReport;
   inspection: OpenRouterInspection;
+  credentialProof?: {
+    binding: ProviderConnectionBindingV1;
+    source: "saved" | "environment";
+    fingerprint: string;
+  };
 }
 
 interface CandidateEntry extends InspectedSecret {
@@ -84,7 +91,7 @@ interface CandidateEntry extends InspectedSecret {
 }
 
 type InspectionCredentialAccess = (
-  use: (secret: string) => Promise<InspectedSecret>,
+  use: (secret: string, context: ProviderCredentialUseContext) => Promise<InspectedSecret>,
 ) => Promise<ProviderCredentialAccessResult<InspectedSecret>>;
 
 export function openRouterAccountFingerprint(
@@ -109,6 +116,7 @@ export class OpenRouterBackendAdapter implements BackendAdapter {
   readonly #now: () => number;
   readonly #createCandidateId: () => string;
   readonly #createConnectionId: () => string;
+  readonly #credentialProofKey = randomBytes(32);
   readonly #candidates = new Map<string, CandidateEntry>();
   readonly #activeInspections = new Map<string, InspectedSecret>();
   readonly #inspectionSequence = new Map<string, number>();
@@ -163,13 +171,18 @@ export class OpenRouterBackendAdapter implements BackendAdapter {
     this.#inspectionSequence.set(request.connectionId, inspectionSequence);
     this.#activeInspections.delete(request.connectionId);
     const selected = await access(
-      (secret) => this.#inspectSecret(
+      (secret, context) => this.#inspectSecret(
         secret,
         request.connectionId,
         request.generation,
         request.deadlineAt,
         request.signal,
         authorityLease,
+        {
+          binding: structuredClone(context.binding),
+          source: context.source,
+          fingerprint: this.#credentialFingerprint(secret),
+        },
       ),
     );
     if (selected.kind !== "available") {
@@ -208,6 +221,30 @@ export class OpenRouterBackendAdapter implements BackendAdapter {
     generation: number;
     signal: AbortSignal;
   }): Promise<ProviderCandidate> {
+    return this.#connectCandidate(request);
+  }
+
+  async connectUnderAuthorityLease(
+    request: {
+      connectionId?: string;
+      candidate: unknown;
+      generation: number;
+      signal: AbortSignal;
+    },
+    lease: ProviderAuthorityReadLease,
+  ): Promise<ProviderCandidate> {
+    return this.#connectCandidate(request, lease);
+  }
+
+  async #connectCandidate(
+    request: {
+      connectionId?: string;
+      candidate: unknown;
+      generation: number;
+      signal: AbortSignal;
+    },
+    authorityLease?: ProviderAuthorityReadLease,
+  ): Promise<ProviderCandidate> {
     if (typeof request.candidate !== "string") {
       throw new Error("OpenRouter candidate input is invalid.");
     }
@@ -218,6 +255,7 @@ export class OpenRouterBackendAdapter implements BackendAdapter {
       request.generation,
       Number.MAX_SAFE_INTEGER,
       request.signal,
+      authorityLease,
     );
     throwIfAborted(request.signal);
     const candidateId = this.#createCandidateId();
@@ -358,6 +396,7 @@ export class OpenRouterBackendAdapter implements BackendAdapter {
         lease,
         use,
       ),
+      lease,
     );
   }
 
@@ -369,8 +408,9 @@ export class OpenRouterBackendAdapter implements BackendAdapter {
       signal: AbortSignal;
     },
     access: (
-      use: (secret: string, context: { source: "saved" | "environment" }) => Promise<void>,
+      use: (secret: string, context: ProviderCredentialUseContext) => Promise<void>,
     ) => Promise<ProviderCredentialAccessResult<void>>,
+    authorityLease?: ProviderAuthorityReadLease,
   ): Promise<void> {
     const inspected = this.#activeInspections.get(request.connectionId);
     if (
@@ -382,15 +422,76 @@ export class OpenRouterBackendAdapter implements BackendAdapter {
     }
     const selected = await access(
       async (secret, context) => {
-        this.#service.activateValidatedKey(
-          secret,
-          context.source === "saved" ? "keychain" : "environment",
-          inspected.balance,
-        );
+        const proof = inspected.credentialProof;
+        const fingerprint = this.#credentialFingerprint(secret);
+        if (
+          !proof
+          || proof.source !== context.source
+          || proof.fingerprint !== fingerprint
+          || inspected.inspection.accountFingerprint !== context.binding.accountFingerprint
+          || inspected.inspection.billingRealm !== context.binding.billingRealm
+        ) {
+          this.#activeInspections.delete(request.connectionId);
+          throw new Error("OpenRouter credential inspection proof is stale.");
+        }
+        let authorized = inspected;
+        const bindingChanged = !sameCredentialBinding(proof.binding, context.binding);
+        if (bindingChanged) {
+          authorized = await this.#inspectSecret(
+            secret,
+            request.connectionId,
+            request.generation,
+            request.deadlineAt,
+            request.signal,
+            authorityLease,
+            {
+              binding: structuredClone(context.binding),
+              source: context.source,
+              fingerprint,
+            },
+          );
+          if (
+            !authorized.inspection.routeEligible
+            || authorized.inspection.accountFingerprint !== context.binding.accountFingerprint
+            || authorized.inspection.billingRealm !== context.binding.billingRealm
+          ) {
+            this.#activeInspections.delete(request.connectionId);
+            throw new Error("OpenRouter credential inspection proof is stale.");
+          }
+        }
+        await this.#assertCredentialAttemptCurrent(request, authorityLease);
+        await context.publishIfCurrent(() => {
+          if (bindingChanged) {
+            this.#activeInspections.set(request.connectionId, authorized);
+          }
+          this.#service.activateValidatedKey(
+            secret,
+            context.source === "saved" ? "keychain" : "environment",
+            authorized.balance,
+          );
+        });
       },
     );
     if (selected.kind !== "available") {
       throw new Error("OpenRouter runtime credential binding is unavailable.");
+    }
+  }
+
+  async #assertCredentialAttemptCurrent(
+    request: {
+      deadlineAt: number;
+      signal: AbortSignal;
+    },
+    authorityLease?: ProviderAuthorityReadLease,
+  ): Promise<void> {
+    throwIfAborted(request.signal);
+    if (!Number.isFinite(request.deadlineAt) || request.deadlineAt <= this.#now()) {
+      throw new Error("OpenRouter runtime credential binding deadline expired.");
+    }
+    await authorityLease?.assertHeld();
+    throwIfAborted(request.signal);
+    if (request.deadlineAt <= this.#now()) {
+      throw new Error("OpenRouter runtime credential binding deadline expired.");
     }
   }
 
@@ -412,16 +513,21 @@ export class OpenRouterBackendAdapter implements BackendAdapter {
     deadlineAt: number,
     signal: AbortSignal,
     authorityLease?: ProviderAuthorityReadLease,
+    credentialProof?: InspectedSecret["credentialProof"],
   ): Promise<InspectedSecret> {
     let key: KeyInfo;
     try {
       key = await this.#service.inspectKey(secret, signal);
     } catch (error) {
+      if (authorityLease) {
+        await this.#assertCredentialAttemptCurrent({ deadlineAt, signal }, authorityLease);
+      }
       return {
         balance: { key: {} },
         inspection: this.#inspectionFromKeyFailure(error, connectionId, generation),
       };
     }
+    await this.#assertCredentialAttemptCurrent({ deadlineAt, signal }, authorityLease);
 
     const expiry = credentialFromExpiry(key.expiresAt, this.#now());
     let credits: CreditInfo | undefined;
@@ -473,6 +579,7 @@ export class OpenRouterBackendAdapter implements BackendAdapter {
         creditsFailed = true;
       }
     }
+    await this.#assertCredentialAttemptCurrent({ deadlineAt, signal }, authorityLease);
 
     const spend = spendFromMetadata(key, credits);
     const health: ProviderHealth = {
@@ -487,11 +594,15 @@ export class OpenRouterBackendAdapter implements BackendAdapter {
     let identityFailure = false;
     if (typeof key.creatorUserId === "string" && key.creatorUserId.length > 0) {
       try {
+        await this.#assertCredentialAttemptCurrent({ deadlineAt, signal }, authorityLease);
+        const accountHmacKey = await this.#credentials.getOrCreateAccountHmacKey();
+        await this.#assertCredentialAttemptCurrent({ deadlineAt, signal }, authorityLease);
         accountFingerprint = openRouterAccountFingerprint(
-          await this.#credentials.getOrCreateAccountHmacKey(),
+          accountHmacKey,
           key.creatorUserId,
         );
       } catch {
+        await this.#assertCredentialAttemptCurrent({ deadlineAt, signal }, authorityLease);
         identityFailure = true;
       }
     }
@@ -532,7 +643,15 @@ export class OpenRouterBackendAdapter implements BackendAdapter {
           : {}),
       },
       inspection,
+      ...(credentialProof ? { credentialProof } : {}),
     };
+  }
+
+  #credentialFingerprint(secret: string): string {
+    return createHmac("sha256", this.#credentialProofKey)
+      .update("orcode-provider-credential-proof/v1\0", "utf8")
+      .update(secret, "utf8")
+      .digest("base64url");
   }
 
   #inspectionFromKeyFailure(
@@ -605,6 +724,13 @@ export class OpenRouterBackendAdapter implements BackendAdapter {
     };
   }
 
+}
+
+function sameCredentialBinding(
+  left: ProviderConnectionBindingV1,
+  right: ProviderConnectionBindingV1,
+): boolean {
+  return JSON.stringify(left) === JSON.stringify(right);
 }
 
 function explanationForCredentialAccess(

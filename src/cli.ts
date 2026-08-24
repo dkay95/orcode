@@ -53,9 +53,11 @@ import {
 } from "./commands.js";
 import {
   APP_HOME,
+  DEFAULT_CONFIG,
   assertConfigFileSnapshot,
   consumeConfigWarning,
   configPath,
+  isAtomicFilePostPublicationError,
   isApprovalMode,
   isCompressionMode,
   loadConfig,
@@ -63,6 +65,7 @@ import {
   readConfigFileSnapshot,
   saveConfig,
   withConfigWriteLock,
+  writeFileAtomicCreateSecure,
   writeFileAtomicSecure,
   type OrcodeConfigWithBudget,
 } from "./config.js";
@@ -141,6 +144,7 @@ import {
   createPlainSetupSurface,
   createTuiSetupSurface,
   runSetupHub,
+  type SetupHubOptions,
   type SetupHubResult,
   type SetupPreparedRoles,
   type SetupSurface,
@@ -165,7 +169,9 @@ import {
   type ProviderActivationRuntimeLease,
 } from "./provider-activation.js";
 import {
+  adoptDurablyCommittedProviderState,
   ProviderStateStore,
+  readProviderStateCommitAdoption,
   requirePersistableProviderState,
   validateProviderSetupState,
   validateRouteIdentityV1,
@@ -184,6 +190,9 @@ import {
   ProviderAuthoritySnapshot,
   parseOpenRouterCredentialPointer,
   selectOpenRouterBinding,
+  type ProviderCandidateAuthorityLease,
+  type ProviderCandidateAuthorityResult,
+  type ProviderCandidateCredentialPermit,
   type ProviderCredentialAuthorityLike,
 } from "./provider-authority.js";
 import { PrivateStore, type PrivateDirectoryClaim } from "./private-store.js";
@@ -452,6 +461,12 @@ export interface ProviderRuntime extends ProviderRouteIntentPort, ProviderComman
   resolveLegacyDefaultRoute(): Promise<StartupSetupResult>;
   runSetup(surface: SetupSurface | "plain" | "fullscreen"): Promise<SetupHubResult>;
   ensureRunnableRoute(): RouteIdentityV1;
+  currentSessionRoute(): RouteIdentityV1;
+  selectSessionRoute(
+    route: RouteIdentityV1,
+    surface?: SetupSurface | "plain" | "fullscreen",
+  ): Promise<RouteIdentityV1>;
+  adoptSession(session: SessionStore): void;
   readonly providerCredentials: ProviderCredentialIntentPort;
   runWithReadyRoute<T>(
     run: (route: RouteIdentityV1) => Promise<T>,
@@ -497,6 +512,26 @@ function assertModelBoundToRoute(modelId: string, route: RouteIdentityV1): void 
   }
 }
 
+function sameExactRoute(left: RouteIdentityV1, right: RouteIdentityV1): boolean {
+  return left.version === right.version
+    && left.backendId === right.backendId
+    && left.accountFingerprint === right.accountFingerprint
+    && left.billingRealm === right.billingRealm
+    && left.requestedModelId === right.requestedModelId
+    && left.canonicalModelId === right.canonicalModelId
+    && left.resolutionState === right.resolutionState;
+}
+
+function isProviderSetupRequired(error: unknown): boolean {
+  return error instanceof ProviderSetupRequiredError
+    || Boolean(
+      error
+      && typeof error === "object"
+      && "code" in error
+      && error.code === "provider-setup-required",
+    );
+}
+
 class SessionProviderRuntimeGuard implements ProviderActivationRuntimeGuard {
   #activationHeld = false;
   #activeRuns = 0;
@@ -508,12 +543,14 @@ class SessionProviderRuntimeGuard implements ProviderActivationRuntimeGuard {
     }
     this.#activationHeld = true;
     let held = true;
+    const assertHeld = () => {
+      if (!held || !this.#activationHeld || this.#activeRuns > 0) {
+        throw new Error("Provider runtime lease was lost.");
+      }
+    };
     return {
-      assertHeld: () => {
-        if (!held || !this.#activationHeld || this.#activeRuns > 0) {
-          throw new Error("Provider runtime lease was lost.");
-        }
-      },
+      assertHeld,
+      assertHeldSynchronously: assertHeld,
       release: () => {
         if (!held) return;
         held = false;
@@ -555,6 +592,15 @@ interface ProviderConfirmationBinding {
   processRouteGeneration: number;
 }
 
+const LEGACY_LOGOUT_COMMIT_PROOF = Symbol("legacy-logout-commit-proof");
+
+interface LegacyLogoutCommittedOutcome {
+  readonly proof: typeof LEGACY_LOGOUT_COMMIT_PROOF;
+  readonly state: ProviderSetupStateV1;
+  readonly result: Extract<ProviderCommandResult, { kind: "changed" }>;
+  completed: boolean;
+}
+
 class ProviderConfirmationStaleError extends Error {
   constructor(readonly confirmation: ProviderConfirmationResult) {
     super("Provider confirmation is stale.");
@@ -566,7 +612,14 @@ export class DefaultProviderRuntime implements ProviderRuntime {
   #preparedRoles: SetupPreparedRoles | null = null;
   #sessionRoute: RouteIdentityV1 | null = null;
   #sessionRoutePersisted = false;
+  #pendingSessionBinding: {
+    route: RouteIdentityV1;
+    connectionId: string;
+    generation: number;
+    ready: boolean;
+  } | null = null;
   #processRouteGeneration = 0;
+  #setupPublicationGeneration = 0;
   readonly #providerConfirmations = new Map<string, ProviderConfirmationBinding>();
   #startupAttemptGeneration = 0;
 
@@ -583,7 +636,7 @@ export class DefaultProviderRuntime implements ProviderRuntime {
     private environmentSecret: string | null,
     private readonly requestedModel: string,
     private readonly config: OrcodeConfigWithBudget,
-    private readonly session?: SessionStore,
+    private session?: SessionStore,
     private readonly authorityOptions?: {
       credentialAuthority: ProviderCredentialAuthority;
       adapter: OpenRouterBackendAdapter;
@@ -595,15 +648,51 @@ export class DefaultProviderRuntime implements ProviderRuntime {
     return this.#preparedRoles ? structuredClone(this.#preparedRoles) : null;
   }
 
+  #adoptExactSessionRoute(
+    route: RouteIdentityV1,
+    persisted: boolean,
+    synchronizeSession = true,
+    forceGeneration = false,
+    synchronizeConfig = true,
+  ): void {
+    const validated = validateRouteIdentityV1(route);
+    if (
+      !validated
+      || validated.resolutionState !== "resolved"
+      || !validated.canonicalModelId
+    ) {
+      throw new ProviderSetupRequiredError();
+    }
+    const hadPendingRoute = this.#pendingSessionBinding !== null;
+    if (
+      forceGeneration
+      || hadPendingRoute
+      || !this.#sessionRoute
+      || !sameExactRoute(this.#sessionRoute, validated)
+      || this.#sessionRoutePersisted !== persisted
+    ) {
+      this.#processRouteGeneration += 1;
+    }
+    this.#sessionRoute = structuredClone(validated);
+    this.#sessionRoutePersisted = persisted;
+    this.#pendingSessionBinding = null;
+    this.#preparedRoles = null;
+    if (synchronizeConfig) this.config.mainModel = validated.requestedModelId;
+    if (synchronizeSession && this.session) {
+      this.session.setPreferences(
+        validated.requestedModelId,
+        this.session.data.reasoning ?? getReasoningSetting(this.config),
+        validated,
+      );
+    }
+  }
+
   adoptCredentialActivation(
     route: RouteIdentityV1,
     persisted: boolean,
     secret: string,
   ): void {
-    this.#processRouteGeneration += 1;
-    this.#sessionRoute = structuredClone(route);
-    this.#sessionRoutePersisted = persisted;
-    this.#preparedRoles = null;
+    this.#adoptExactSessionRoute(route, persisted, true, true);
     this.environmentSecret = persisted ? null : secret;
     if (persisted) {
       this.#synchronizeAuthoritativeProviderState();
@@ -614,6 +703,7 @@ export class DefaultProviderRuntime implements ProviderRuntime {
     this.#processRouteGeneration += 1;
     this.#sessionRoute = null;
     this.#sessionRoutePersisted = false;
+    this.#pendingSessionBinding = null;
     this.#preparedRoles = null;
     this.environmentSecret = null;
     this.#synchronizeAuthoritativeProviderState();
@@ -623,7 +713,7 @@ export class DefaultProviderRuntime implements ProviderRuntime {
     const generation = typeof this.orchestrator.nextStartupGeneration === "function"
       ? this.orchestrator.nextStartupGeneration()
       : ++this.#startupAttemptGeneration;
-    return runProviderStartupAttempt({
+    const startup = await runProviderStartupAttempt({
       generation,
       recover: (context) => this.authorityOptions?.recover(context) ?? Promise.resolve(),
       inspect: async (context) => {
@@ -683,19 +773,52 @@ export class DefaultProviderRuntime implements ProviderRuntime {
         ) {
           return;
         }
+        const persistedSessionRoute = validateRouteIdentityV1(this.session?.data.route);
+        const desiredRoute = persistedSessionRoute?.resolutionState === "resolved"
+          ? persistedSessionRoute
+          : result.defaultRoute;
+        const provedRoute = this.orchestrator.ensureRunnableRoute(desiredRoute);
         const selected = selectOpenRouterBinding(
           this.stateStore.read(),
-          { kind: "route", route: result.defaultRoute },
+          { kind: "route", route: provedRoute },
         );
         if (selected.kind !== "exact") throw new ProviderSetupRequiredError();
+        if (
+          persistedSessionRoute?.resolutionState === "resolved"
+          && !sameExactRoute(persistedSessionRoute, result.defaultRoute)
+        ) {
+          const models = await this.authorityOptions.adapter.listModels({
+            connectionId: selected.binding.connectionId,
+            signal: context.signal,
+          });
+          context.assertCurrent();
+          const exact = models.filter((model) =>
+            model.backendId === provedRoute.backendId
+            && model.requestedModelId === provedRoute.requestedModelId
+            && model.canonicalModelId === provedRoute.canonicalModelId
+            && model.capabilities.textInput
+            && model.capabilities.textOutput
+          );
+          if (exact.length !== 1) throw new ProviderSetupRequiredError();
+        }
         await this.authorityOptions.adapter.bindRuntime({
           connectionId: selected.binding.connectionId,
           generation: result.generation,
           deadlineAt: context.deadlineAt,
           signal: context.signal,
         });
+        context.assertCurrent();
+        this.#adoptExactSessionRoute(provedRoute, true);
       },
     });
+    if (
+      !this.authorityOptions
+      && (startup.mode === "ready" || startup.mode === "ready-with-warning")
+      && startup.defaultRoute?.resolutionState === "resolved"
+    ) {
+      this.#adoptExactSessionRoute(startup.defaultRoute, true);
+    }
+    return startup;
   }
 
   async resolveLegacyDefaultRoute(): Promise<StartupSetupResult> {
@@ -714,13 +837,36 @@ export class DefaultProviderRuntime implements ProviderRuntime {
     const resolvedSurface = surface === "plain"
       ? createCliPlainSetupSurface()
       : surface;
+    const routePublicationGeneration = this.#processRouteGeneration;
+    const setupPublicationGeneration = ++this.#setupPublicationGeneration;
+    const setupPublicationOwnerIsCurrent = (): boolean => (
+      this.#setupPublicationGeneration === setupPublicationGeneration
+      && this.#processRouteGeneration === routePublicationGeneration
+    );
+    const setupAttemptIsCurrent = (): boolean => {
+      if (
+        !setupPublicationOwnerIsCurrent()
+        || startupAttempt?.signal.aborted
+      ) return false;
+      if (!startupAttempt) return true;
+      try {
+        if (startupAttempt.remainingMs() <= 0) return false;
+        startupAttempt.assertCurrent();
+        return true;
+      } catch {
+        return false;
+      }
+    };
     let activatedRoute: RouteIdentityV1 | null = null;
     let activatedPersisted = false;
+    let activationSettledAfterInterruption = false;
+    let cancellationCommitted = false;
     const setupOrchestrator = {
       activateCandidate: async (
         request: Parameters<SetupOrchestrator["activateCandidate"]>[0],
       ) => {
         const result = await this.orchestrator.activateCandidate(request);
+        activationSettledAfterInterruption = request.signal.aborted;
         const route = validateRouteIdentityV1(result.route);
         if (route?.resolutionState === "resolved" && route.canonicalModelId) {
           activatedRoute = route;
@@ -728,69 +874,185 @@ export class DefaultProviderRuntime implements ProviderRuntime {
         }
         return result;
       },
+      cancelSetup: async (
+        request: Parameters<SetupOrchestrator["cancelSetup"]>[0],
+      ) => {
+        const result = await this.orchestrator.cancelSetup(request);
+        const cancelled = this.stateStore.read();
+        cancellationCommitted = request.expectedRevision !== undefined
+          && cancelled.revision === request.expectedRevision + 1
+          && cancelled.lifecycle === "cancelled";
+        return result;
+      },
     } as SetupOrchestrator;
+    const manualController = startupAttempt ? null : new AbortController();
+    const signal = startupAttempt?.signal ?? manualController!.signal;
+    const deadlineAt = startupAttempt?.deadlineAt ?? Date.now() + 8_000;
+    let manualDeadlineTimer: ReturnType<typeof setTimeout> | null = null;
+    if (manualController) {
+      const timeout = new Error("Provider setup deadline expired.");
+      timeout.name = "TimeoutError";
+      const remaining = Math.max(0, deadlineAt - Date.now());
+      if (remaining === 0) manualController.abort(timeout);
+      else {
+        manualDeadlineTimer = setTimeout(() => {
+          if (!manualController.signal.aborted) manualController.abort(timeout);
+        }, Math.min(remaining, 0x7fff_ffff));
+      }
+    }
+    const environmentCandidatePermit = this.environmentSecret && this.authorityOptions
+      ? this.authorityOptions.credentialAuthority.environmentCandidatePermit?.(
+          this.environmentSecret,
+        ) ?? null
+      : null;
+    const preflightCandidate = async (): Promise<boolean> => {
+      const preflight = this.authorityOptions?.credentialAuthority.preflightCandidate;
+      if (!preflight) return true;
+      const result = await preflight.call(
+        this.authorityOptions!.credentialAuthority,
+        { deadlineAt, signal },
+      );
+      return result.kind === "ready";
+    };
+    const guardCandidate = this.authorityOptions?.credentialAuthority.withCandidateAuthority
+      ? <T>(
+          credentialPermit: Parameters<NonNullable<SetupHubOptions["withCandidateAuthority"]>>[0],
+          requireCredentialPermit: boolean,
+          use: (lease: ProviderCandidateAuthorityLease) => Promise<T>,
+        ): Promise<
+          ProviderCandidateAuthorityResult<T>
+        > => this.authorityOptions!.credentialAuthority.withCandidateAuthority!(
+          {
+            deadlineAt,
+            signal,
+            credentialPermit,
+            requireCredentialPermit,
+          },
+          use,
+        )
+      : undefined;
+    let terminalHub: Promise<SetupHubResult> | null = null;
     const executeHub = (
       savedSecret: string | null,
       targetConnectionId?: string,
       expectedRevision?: number,
-    ) => runSetupHub({
-      surface: resolvedSurface,
-      orchestrator: setupOrchestrator,
-      registry: this.registry,
-      stateStore: this.stateStore,
-      savedSecret,
-      environmentSecret: this.environmentSecret,
-      signal: startupAttempt?.signal,
-      deadlineAt: startupAttempt?.deadlineAt,
-      generation: startupAttempt?.generation,
-      targetConnectionId,
-      expectedRevision,
-    });
-    const state = this.stateStore.read();
-    const savedBinding = this.#sessionRoute
-      ? selectOpenRouterBinding(state, { kind: "route", route: this.#sessionRoute })
-      : state.defaultRoute
-        ? selectOpenRouterBinding(state, { kind: "default" })
-        : selectOpenRouterBinding(state, { kind: "backend", backendId: "openrouter" });
-    let result: SetupHubResult;
-    if (this.authorityOptions && savedBinding.kind === "exact") {
-      const signal = startupAttempt?.signal ?? new AbortController().signal;
-      const access = await this.authorityOptions.credentialAuthority.withCredential(
-        {
-          connectionId: savedBinding.binding.connectionId,
-          credentialKind: "inference",
-          purpose: "explicit-repair",
-          environmentEligibility: "forbidden",
-          deadlineAt: startupAttempt?.deadlineAt ?? Date.now() + 8_000,
-          signal,
-        },
-        (secret, context) => executeHub(
-          secret,
-          context.binding.connectionId,
-          context.binding.stateRevision,
-        ),
-      );
-      result = access.kind === "available"
-        ? access.value
-        : await executeHub(null);
-    } else {
-      result = await executeHub(null);
-    }
-    if (result.kind === "ready") {
-      this.#preparedRoles = result.preparedRoles
-        ? structuredClone(result.preparedRoles)
-        : null;
-      const nextSessionRoute = activatedRoute
-        ?? result.preparedRoles?.lead
-        ?? this.#sessionRoute;
-      if (JSON.stringify(nextSessionRoute) !== JSON.stringify(this.#sessionRoute)) {
-        this.#processRouteGeneration += 1;
+      savedCandidatePermit?: Parameters<NonNullable<SetupHubOptions["withCandidateAuthority"]>>[0],
+    ) => {
+      const pending = runSetupHub({
+        surface: resolvedSurface,
+        orchestrator: setupOrchestrator,
+        registry: this.registry,
+        stateStore: this.stateStore,
+        savedSecret,
+        environmentSecret: this.environmentSecret,
+        signal,
+        deadlineAt,
+        generation: startupAttempt?.generation,
+        targetConnectionId,
+        expectedRevision,
+        savedCandidatePermit,
+        environmentCandidatePermit,
+        preflightCandidate: this.authorityOptions ? preflightCandidate : undefined,
+        withCandidateAuthority: guardCandidate,
+        isCurrent: setupAttemptIsCurrent,
+      });
+      terminalHub = pending;
+      return pending;
+    };
+    try {
+      const state = this.stateStore.read();
+      const persistedSessionRoute = validateRouteIdentityV1(this.session?.data.route);
+      const desiredSavedRoute = this.#sessionRoute
+        ?? (persistedSessionRoute?.resolutionState === "resolved"
+          ? persistedSessionRoute
+          : null);
+      const savedBinding = desiredSavedRoute
+        ? selectOpenRouterBinding(state, { kind: "route", route: desiredSavedRoute })
+        : state.defaultRoute
+          ? selectOpenRouterBinding(state, { kind: "default" })
+          : selectOpenRouterBinding(state, { kind: "backend", backendId: "openrouter" });
+      let result: SetupHubResult;
+      if (this.authorityOptions && savedBinding.kind === "exact") {
+        const access = await this.authorityOptions.credentialAuthority.withCredential(
+          {
+            connectionId: savedBinding.binding.connectionId,
+            credentialKind: "inference",
+            purpose: "explicit-repair",
+            environmentEligibility: "forbidden",
+            deadlineAt,
+            signal,
+          },
+          (secret, context) => executeHub(
+            secret,
+            context.binding.connectionId,
+            context.binding.stateRevision,
+            context.candidatePermit,
+          ),
+        );
+        if (access.kind === "available") {
+          result = access.value;
+        } else if (providerAuthorityBlocksSetup(access.kind)) {
+          result = { kind: "cancelled", mode: "setup-required" };
+        } else {
+          result = await executeHub(null);
+        }
+      } else {
+        result = this.authorityOptions && !await preflightCandidate()
+          ? { kind: "cancelled", mode: "setup-required" }
+          : await executeHub(null);
       }
-      this.#sessionRoute = nextSessionRoute;
-      if (activatedRoute) this.#sessionRoutePersisted = activatedPersisted;
+      if (result.kind === "ready") {
+        const attemptIsCurrent = setupAttemptIsCurrent();
+        const currentDefaultRoute = validateRouteIdentityV1(this.stateStore.read().defaultRoute);
+        const activationCanPublish = activatedRoute !== null
+          && (!activatedPersisted
+            || (currentDefaultRoute !== null && sameExactRoute(currentDefaultRoute, activatedRoute)));
+        const reconcileCommittedActivation = activationCanPublish
+          && activationSettledAfterInterruption
+          && setupPublicationOwnerIsCurrent();
+        if (attemptIsCurrent || reconcileCommittedActivation) {
+          const preparedRolesCanPublish = attemptIsCurrent
+            && (activatedRoute === null || activationCanPublish);
+          const nextSessionRoute = activationCanPublish
+            ? activatedRoute
+            : preparedRolesCanPublish
+              ? result.preparedRoles?.lead ?? this.#sessionRoute
+              : this.#sessionRoute;
+          if (nextSessionRoute) {
+            this.#adoptExactSessionRoute(
+              nextSessionRoute,
+              activationCanPublish ? activatedPersisted : this.#sessionRoutePersisted,
+              true,
+              activationCanPublish,
+            );
+          }
+          this.#preparedRoles = preparedRolesCanPublish && result.preparedRoles
+            ? structuredClone(result.preparedRoles)
+            : null;
+        }
+      }
+      this.#synchronizeAuthoritativeProviderState();
+      return result;
+    } catch (error) {
+      if (signal.aborted && terminalHub !== null) {
+        try {
+          await terminalHub;
+        } catch (terminalError) {
+          this.#synchronizeAuthoritativeProviderState();
+          if (!cancellationCommitted) throw terminalError;
+        }
+      }
+      this.#synchronizeAuthoritativeProviderState();
+      if (signal.aborted && cancellationCommitted) {
+        return { kind: "cancelled", mode: "setup-required" };
+      }
+      throw error;
+    } finally {
+      if (manualDeadlineTimer !== null) clearTimeout(manualDeadlineTimer);
+      if (manualController && !manualController.signal.aborted) {
+        manualController.abort(new DOMException("The setup attempt settled.", "AbortError"));
+      }
     }
-    this.#synchronizeAuthoritativeProviderState();
-    return result;
   }
 
   migratedSessionConnection(): ProviderConnectionStateV1 | undefined {
@@ -805,29 +1067,212 @@ export class DefaultProviderRuntime implements ProviderRuntime {
     );
   }
 
+  currentSessionRoute(): RouteIdentityV1 {
+    return this.ensureRunnableRoute();
+  }
+
+  adoptSession(session: SessionStore): void {
+    const requestedRoute = validateRouteIdentityV1(session.data.route);
+    const pending = this.#pendingSessionBinding;
+    if (pending) {
+      if (
+        !pending.ready
+        || pending.generation !== this.#processRouteGeneration
+        || requestedRoute?.resolutionState !== "resolved"
+        || !requestedRoute.canonicalModelId
+        || !sameExactRoute(requestedRoute, pending.route)
+      ) {
+        throw new ProviderSetupRequiredError();
+      }
+      const selected = selectOpenRouterBinding(
+        this.stateStore.read(),
+        { kind: "route", route: pending.route },
+      );
+      if (
+        selected.kind !== "exact"
+        || selected.binding.connectionId !== pending.connectionId
+      ) {
+        throw new ProviderSetupRequiredError();
+      }
+      this.session = session;
+      this.#synchronizeAuthoritativeProviderState();
+      this.#adoptExactSessionRoute(requestedRoute, true);
+      return;
+    }
+
+    let route: RouteIdentityV1;
+    try {
+      route = this.ensureRunnableRoute();
+    } catch (error) {
+      if (!isProviderSetupRequired(error) || requestedRoute?.resolutionState === "resolved") {
+        throw error;
+      }
+      // A new/unresolved chat may own a setup-required runtime. It cannot run
+      // model bytes until setup publishes an exact route for this owner.
+      this.session = session;
+      return;
+    }
+    if (
+      requestedRoute?.resolutionState === "resolved"
+      && !sameExactRoute(requestedRoute, route)
+    ) {
+      throw new ProviderSetupRequiredError();
+    }
+    this.session = session;
+    session.setPreferences(
+      route.requestedModelId,
+      session.data.reasoning ?? getReasoningSetting(this.config),
+      route,
+    );
+  }
+
+  async selectSessionRoute(
+    route: RouteIdentityV1,
+    _surface?: SetupSurface | "plain" | "fullscreen",
+  ): Promise<RouteIdentityV1> {
+    const validated = validateRouteIdentityV1(route);
+    if (
+      !validated
+      || validated.resolutionState !== "resolved"
+      || !validated.canonicalModelId
+    ) {
+      throw new ProviderSetupRequiredError();
+    }
+    const initial = selectOpenRouterBinding(
+      this.stateStore.read(),
+      { kind: "route", route: validated },
+    );
+    if (initial.kind !== "exact") throw new ProviderSetupRequiredError();
+    if (
+      this.#sessionRoute
+      && this.#sessionRoutePersisted
+      && sameExactRoute(this.#sessionRoute, validated)
+    ) {
+      return structuredClone(validated);
+    }
+
+    const controller = new AbortController();
+    const runtimeLease = await this.runtimeGuard.acquire(controller.signal);
+    let primaryFailed = false;
+    try {
+      await runtimeLease.assertHeld();
+      const result = await this.orchestrator.reconnect("openrouter", {
+        connectionId: initial.binding.connectionId,
+        signal: controller.signal,
+      });
+      await runtimeLease.assertHeld();
+      const proved = this.orchestrator.ensureRunnableRoute(validated);
+      if (!sameExactRoute(proved, validated)) throw new ProviderSetupRequiredError();
+      const current = selectOpenRouterBinding(
+        this.stateStore.read(),
+        { kind: "route", route: proved },
+      );
+      if (
+        current.kind !== "exact"
+        || current.binding.connectionId !== initial.binding.connectionId
+      ) {
+        throw new ProviderSetupRequiredError();
+      }
+      const adapter = this.registry.adapter(validated.backendId);
+      const models = await adapter.listModels({
+        connectionId: current.binding.connectionId,
+        signal: controller.signal,
+      });
+      await runtimeLease.assertHeld();
+      const exact = models.filter((model) =>
+        model.backendId === validated.backendId
+        && model.requestedModelId === validated.requestedModelId
+        && model.canonicalModelId === validated.canonicalModelId
+        && model.capabilities.textInput
+        && model.capabilities.textOutput
+      );
+      if (exact.length !== 1 || !adapter.bindRuntime) {
+        throw new ProviderSetupRequiredError();
+      }
+      this.#processRouteGeneration += 1;
+      const pendingGeneration = this.#processRouteGeneration;
+      this.#pendingSessionBinding = {
+        route: structuredClone(proved),
+        connectionId: current.binding.connectionId,
+        generation: pendingGeneration,
+        ready: false,
+      };
+      await adapter.bindRuntime({
+        connectionId: current.binding.connectionId,
+        generation: result.generation,
+        deadlineAt: Date.now() + 5_000,
+        signal: controller.signal,
+      });
+      await runtimeLease.assertHeld();
+      const rebound = selectOpenRouterBinding(
+        this.stateStore.read(),
+        { kind: "route", route: proved },
+      );
+      const pending = this.#pendingSessionBinding;
+      if (
+        this.#processRouteGeneration !== pendingGeneration
+        || !pending
+        || pending.generation !== pendingGeneration
+        || pending.connectionId !== current.binding.connectionId
+        || !sameExactRoute(pending.route, proved)
+        || pending.ready
+        || rebound.kind !== "exact"
+        || rebound.binding.connectionId !== current.binding.connectionId
+      ) {
+        throw new ProviderSetupRequiredError();
+      }
+      pending.ready = true;
+      return structuredClone(proved);
+    } catch (error) {
+      primaryFailed = true;
+      if (error instanceof ProviderSetupRequiredError) throw error;
+      throw new ProviderSetupRequiredError();
+    } finally {
+      try {
+        await Promise.resolve(runtimeLease.release());
+      } catch (error) {
+        if (!primaryFailed) throw error;
+      }
+    }
+  }
+
   ensureRunnableRoute(): RouteIdentityV1 {
+    if (this.#pendingSessionBinding) throw new ProviderSetupRequiredError();
+    const requiredSessionRoute = validateRouteIdentityV1(this.session?.data.route);
+    if (
+      requiredSessionRoute?.resolutionState === "resolved"
+      && !this.#sessionRoute
+    ) {
+      throw new ProviderSetupRequiredError();
+    }
     if (this.#sessionRoute) {
+      if (
+        requiredSessionRoute?.resolutionState === "resolved"
+        && !sameExactRoute(requiredSessionRoute, this.#sessionRoute)
+      ) {
+        throw new ProviderSetupRequiredError();
+      }
       if (!this.#sessionRoutePersisted) {
         return structuredClone(this.#sessionRoute);
       }
       const state = this.stateStore.read();
-      const current = state.defaultRoute;
       const selected = selectOpenRouterBinding(
         state,
         { kind: "route", route: this.#sessionRoute },
       );
       if (
-        current
-        && selected.kind === "exact"
-        && sameRoute(current, this.#sessionRoute)
-        && current.requestedModelId === this.#sessionRoute.requestedModelId
-        && current.resolutionState === "resolved"
+        selected.kind === "exact"
+        && this.#sessionRoute.resolutionState === "resolved"
+        && this.#sessionRoute.canonicalModelId
       ) {
         return structuredClone(this.#sessionRoute);
       }
       this.#sessionRoute = null;
       this.#sessionRoutePersisted = false;
       this.#processRouteGeneration += 1;
+      if (requiredSessionRoute?.resolutionState === "resolved") {
+        throw new ProviderSetupRequiredError();
+      }
     }
     return this.orchestrator.ensureRunnableRoute();
   }
@@ -876,70 +1321,88 @@ export class DefaultProviderRuntime implements ProviderRuntime {
     const persistence = this.#sessionRoute
       ? (this.#sessionRoutePersisted ? "persisted" : "process-only")
       : (currentIsPersisted ? "persisted" : "process-only");
-    const controller = new AbortController();
+    const effectAttempt = createProviderEffectAttempt();
+    let terminalActivation: Promise<void> | null = null;
     const activateExactCandidate = async (
       candidate: string,
       expectedRevision: number,
       targetConnectionId?: string,
+      candidatePermit?: ProviderCandidateCredentialPermit,
     ): Promise<void> => {
-      const result = await this.orchestrator.activateCandidate({
-        expectedRevision,
-        candidate,
-        expectedRequestedModelId: modelId,
-        selectedCanonicalModelId,
-        signal: controller.signal,
-        persistence,
-        ...(targetConnectionId ? { targetConnectionId } : {}),
-      });
-      const route = validateRouteIdentityV1(result.route);
-      if (
-        !route
-        || route.resolutionState !== "resolved"
-        || route.requestedModelId !== modelId
-        || route.canonicalModelId !== selectedCanonicalModelId
-        || route.backendId !== current.backendId
-        || route.accountFingerprint !== current.accountFingerprint
-        || route.billingRealm !== current.billingRealm
-      ) {
-        throw new ProviderSetupRequiredError();
-      }
-      this.adoptCredentialActivation(route, result.persisted, candidate);
+      if (terminalActivation) throw new ProviderSetupRequiredError();
+      terminalActivation = (async () => {
+        const result = await this.orchestrator.activateCandidate({
+          expectedRevision,
+          candidate,
+          expectedRequestedModelId: modelId,
+          selectedCanonicalModelId,
+          signal: effectAttempt.signal,
+          deadlineAt: effectAttempt.deadlineAt,
+          persistence,
+          candidatePermit,
+          requireCandidatePermit: candidatePermit !== undefined,
+          ...(targetConnectionId ? { targetConnectionId } : {}),
+        });
+        const route = validateRouteIdentityV1(result.route);
+        if (
+          !route
+          || route.resolutionState !== "resolved"
+          || route.requestedModelId !== modelId
+          || route.canonicalModelId !== selectedCanonicalModelId
+          || route.backendId !== current.backendId
+          || route.accountFingerprint !== current.accountFingerprint
+          || route.billingRealm !== current.billingRealm
+        ) {
+          throw new ProviderSetupRequiredError();
+        }
+        this.adoptCredentialActivation(route, result.persisted, candidate);
+      })();
+      await terminalActivation;
     };
 
-    if (persistence === "persisted") {
-      if (persistedBinding.kind !== "exact" || !this.authorityOptions) {
+    try {
+      if (persistence === "persisted") {
+        if (persistedBinding.kind !== "exact" || !this.authorityOptions) {
+          throw new ProviderSetupRequiredError();
+        }
+        const access = await this.authorityOptions.credentialAuthority.withCredential(
+          {
+            connectionId: persistedBinding.binding.connectionId,
+            credentialKind: "inference",
+            purpose: "explicit-repair",
+            environmentEligibility: "forbidden",
+            deadlineAt: effectAttempt.deadlineAt,
+            signal: effectAttempt.signal,
+          },
+          async (candidate, context) => {
+            if (
+              context.binding.stateRevision !== state.revision
+              || context.binding.connectionId !== persistedBinding.binding.connectionId
+              || context.binding.accountFingerprint !== current.accountFingerprint
+              || context.binding.billingRealm !== current.billingRealm
+            ) {
+              throw new ProviderSetupRequiredError();
+            }
+            await activateExactCandidate(
+              candidate,
+              context.binding.stateRevision,
+              context.binding.connectionId,
+              context.candidatePermit,
+            );
+          },
+        );
+        if (access.kind === "available") return;
+        if (terminalActivation) return await terminalActivation;
         throw new ProviderSetupRequiredError();
       }
-      const access = await this.authorityOptions.credentialAuthority.withCredential(
-        {
-          connectionId: persistedBinding.binding.connectionId,
-          credentialKind: "inference",
-          purpose: "explicit-repair",
-          environmentEligibility: "forbidden",
-          deadlineAt: Date.now() + 8_000,
-          signal: controller.signal,
-        },
-        async (candidate, context) => {
-          if (
-            context.binding.stateRevision !== state.revision
-            || context.binding.connectionId !== persistedBinding.binding.connectionId
-            || context.binding.accountFingerprint !== current.accountFingerprint
-            || context.binding.billingRealm !== current.billingRealm
-          ) {
-            throw new ProviderSetupRequiredError();
-          }
-          await activateExactCandidate(
-            candidate,
-            context.binding.stateRevision,
-            context.binding.connectionId,
-          );
-        },
-      );
-      if (access.kind !== "available") throw new ProviderSetupRequiredError();
-      return;
-    }
 
-    await activateExactCandidate(this.openRouter.requireKey(), state.revision);
+      await activateExactCandidate(this.openRouter.requireKey(), state.revision);
+    } catch (error) {
+      if (terminalActivation) return await terminalActivation;
+      throw error;
+    } finally {
+      effectAttempt.close();
+    }
   }
 
   async runWithReadyRoute<T>(
@@ -955,6 +1418,7 @@ export class DefaultProviderRuntime implements ProviderRuntime {
         this.#processRouteGeneration += 1;
         this.#sessionRoute = null;
         this.#sessionRoutePersisted = false;
+        this.#pendingSessionBinding = null;
         this.#preparedRoles = null;
         await this.orchestrator.reconnect("openrouter");
       },
@@ -963,9 +1427,24 @@ export class DefaultProviderRuntime implements ProviderRuntime {
     });
   }
 
+  #desiredSessionRoute(state: ProviderSetupStateV1): RouteIdentityV1 | null {
+    if (this.#sessionRoute?.resolutionState === "resolved") {
+      return structuredClone(this.#sessionRoute);
+    }
+    const persistedSessionRoute = validateRouteIdentityV1(this.session?.data.route);
+    if (persistedSessionRoute?.resolutionState === "resolved") {
+      return structuredClone(persistedSessionRoute);
+    }
+    const defaultRoute = validateRouteIdentityV1(state.defaultRoute);
+    return defaultRoute?.resolutionState === "resolved"
+      ? structuredClone(defaultRoute)
+      : null;
+  }
+
   #selectedOpenRouterConnection(state: ProviderSetupStateV1) {
-    const selected = this.#sessionRoute
-      ? selectOpenRouterBinding(state, { kind: "route", route: this.#sessionRoute })
+    const desiredRoute = this.#desiredSessionRoute(state);
+    const selected = desiredRoute
+      ? selectOpenRouterBinding(state, { kind: "route", route: desiredRoute })
       : state.defaultRoute
         ? selectOpenRouterBinding(state, { kind: "default" })
         : selectOpenRouterBinding(state, { kind: "backend", backendId: "openrouter" });
@@ -1065,118 +1544,195 @@ export class DefaultProviderRuntime implements ProviderRuntime {
     if (retained.kind !== "exact" || retained.binding.enabled) return null;
 
     const controller = new AbortController();
+    const deadlineAt = Date.now() + 5_000;
+    const deadlineError = new Error("Provider enable deadline expired.");
+    deadlineError.name = "TimeoutError";
+    const deadlineTimer = setTimeout(() => {
+      controller.abort(deadlineError);
+    }, Math.max(0, deadlineAt - Date.now()));
+    const assertRetainedAttemptCurrent = (): void => {
+      if (!controller.signal.aborted && Date.now() >= deadlineAt) {
+        controller.abort(deadlineError);
+      }
+      if (controller.signal.aborted) {
+        throw controller.signal.reason instanceof Error
+          ? controller.signal.reason
+          : deadlineError;
+      }
+    };
     const connectionId = retained.binding.connectionId;
-    return this.activationCoordinator.runExclusive(
-      { signal: controller.signal, inspectCommitted: false },
-      async (lease) => {
-        await lease.assertHeld();
-        const current = this.stateStore.read();
-        const selected = selectOpenRouterBinding(
-          current,
-          { kind: "connection", connectionId },
-          true,
-        );
-        if (
-          selected.kind !== "exact"
-          || selected.binding.enabled
-          || selected.binding.accountFingerprint !== retained.binding.accountFingerprint
-          || selected.binding.billingRealm !== retained.binding.billingRealm
-          || selected.binding.credentialPointer.kind !== retained.binding.credentialPointer.kind
-          || (selected.binding.credentialPointer.kind === "legacy"
-            ? retained.binding.credentialPointer.kind !== "legacy"
-            : retained.binding.credentialPointer.kind !== "versioned"
-              || selected.binding.credentialPointer.slot.id !== retained.binding.credentialPointer.slot.id)
-        ) return false;
+    let committedTuple: {
+      state: ProviderSetupStateV1;
+      route: RouteIdentityV1;
+    } | null = null;
+    let committedAdopted = false;
+    const adoptCommittedTuple = (): boolean => {
+      const tuple = committedTuple;
+      if (!tuple) return false;
+      if (committedAdopted) return true;
+      this.config.providerSetup = requirePersistableProviderState(tuple.state);
+      this.#adoptExactSessionRoute(tuple.route, true, true, true, true);
+      committedAdopted = true;
+      return true;
+    };
+    try {
+      return await this.activationCoordinator.runExclusive(
+        { signal: controller.signal, inspectCommitted: false },
+        async (lease) => {
+          let runtimeBindAttempted = false;
+          try {
+            await lease.assertHeld();
+            const current = this.stateStore.read();
+            const selected = selectOpenRouterBinding(
+              current,
+              { kind: "connection", connectionId },
+              true,
+            );
+            if (
+              selected.kind !== "exact"
+              || selected.binding.enabled
+              || selected.binding.accountFingerprint !== retained.binding.accountFingerprint
+              || selected.binding.billingRealm !== retained.binding.billingRealm
+              || selected.binding.credentialPointer.kind !== retained.binding.credentialPointer.kind
+              || (selected.binding.credentialPointer.kind === "legacy"
+                ? retained.binding.credentialPointer.kind !== "legacy"
+                : retained.binding.credentialPointer.kind !== "versioned"
+                  || selected.binding.credentialPointer.slot.id !== retained.binding.credentialPointer.slot.id)
+            ) return false;
 
-        const connection = current.connections.find((item) => item.id === connectionId);
-        if (!connection) return false;
-        const generation = Math.max(
-          current.revision,
-          connection.lastHealth?.generation ?? 0,
-        ) + 1;
-        const deadlineAt = Date.now() + 5_000;
-        const inspection = await this.authorityOptions!.adapter.inspectUnderAuthorityLease({
-          connectionId,
-          generation,
-          deadlineAt,
-          signal: controller.signal,
-          purpose: "explicit-enable",
-          environmentEligibility: "forbidden",
-          allowDisabled: true,
-        }, lease);
-        await lease.assertHeld();
-        if (
-          !inspection.routeEligible
-          || inspection.accountFingerprint !== connection.accountFingerprint
-          || inspection.billingRealm !== connection.billingRealm
-        ) return false;
+            const connection = current.connections.find((item) => item.id === connectionId);
+            if (!connection) return false;
+            const generation = Math.max(
+              current.revision,
+              connection.lastHealth?.generation ?? 0,
+            ) + 1;
+            const inspection = await this.authorityOptions!.adapter.inspectUnderAuthorityLease({
+              connectionId,
+              generation,
+              deadlineAt,
+              signal: controller.signal,
+              purpose: "explicit-enable",
+              environmentEligibility: "forbidden",
+              allowDisabled: true,
+            }, lease);
+            await lease.assertHeld();
+            if (
+              !inspection.routeEligible
+              || inspection.accountFingerprint !== connection.accountFingerprint
+              || inspection.billingRealm !== connection.billingRealm
+            ) return false;
 
-        const models = await this.authorityOptions!.adapter.listModels({
-          connectionId,
-          signal: controller.signal,
-        });
-        await lease.assertHeld();
-        const exact = models.filter((model) =>
-          model.backendId === "openrouter"
-          && model.requestedModelId === this.requestedModel
-          && model.capabilities.textInput
-          && model.capabilities.textOutput
-        );
-        const canonical = new Set(exact.map((model) => model.canonicalModelId));
-        if (exact.length === 0 || canonical.size !== 1) return false;
-        const model = exact[0]!;
-        const route: RouteIdentityV1 = {
-          version: 1,
-          backendId: "openrouter",
-          accountFingerprint: connection.accountFingerprint,
-          billingRealm: "openrouter-payg",
-          requestedModelId: model.requestedModelId,
-          canonicalModelId: model.canonicalModelId,
-          resolutionState: "resolved",
-        };
-        const committed = await this.stateStore.commit(current.revision, (authoritative) => {
-          const authoritativeSelection = selectOpenRouterBinding(
-            authoritative,
-            { kind: "connection", connectionId },
-            true,
-          );
-          const authoritativeConnection = authoritative.connections.find((item) => item.id === connectionId);
-          if (
-            authoritativeSelection.kind !== "exact"
-            || authoritativeSelection.binding.enabled
-            || !authoritativeConnection
-            || authoritativeConnection.credentialSlot !== connection.credentialSlot
-            || authoritativeConnection.accountFingerprint !== connection.accountFingerprint
-            || authoritativeConnection.billingRealm !== connection.billingRealm
-          ) {
-            throw new Error("Provider enable binding changed before commit.");
+            const models = await abortableProviderAction(
+              () => this.authorityOptions!.adapter.listModels({
+                connectionId,
+                signal: controller.signal,
+              }),
+              controller.signal,
+            );
+            await lease.assertHeld();
+            const exact = models.filter((model) =>
+              model.backendId === "openrouter"
+              && model.requestedModelId === this.requestedModel
+              && model.capabilities.textInput
+              && model.capabilities.textOutput
+            );
+            const canonical = new Set(exact.map((model) => model.canonicalModelId));
+            if (exact.length === 0 || canonical.size !== 1) return false;
+            const model = exact[0]!;
+            const route: RouteIdentityV1 = {
+              version: 1,
+              backendId: "openrouter",
+              accountFingerprint: connection.accountFingerprint,
+              billingRealm: "openrouter-payg",
+              requestedModelId: model.requestedModelId,
+              canonicalModelId: model.canonicalModelId,
+              resolutionState: "resolved",
+            };
+            runtimeBindAttempted = true;
+            await this.authorityOptions!.adapter.bindRuntimeUnderAuthorityLease({
+              connectionId,
+              generation,
+              deadlineAt,
+              signal: controller.signal,
+              allowDisabled: true,
+            }, lease);
+            await lease.assertHeld();
+            const expectedCommittedState: ProviderSetupStateV1 = {
+              ...current,
+              revision: current.revision + 1,
+              lifecycle: "configured",
+              connections: current.connections.map((item) => item.id === connectionId
+                ? { ...item, enabled: true, lastHealth: structuredClone(inspection.health) }
+                : item),
+              defaultRoute: route,
+              cross: { enabled: false, preferredLead: null, preferredChallenger: null },
+            };
+            let committed: ProviderSetupStateV1;
+            try {
+              committed = await this.stateStore.commit(
+                current.revision,
+                (authoritative) => {
+                  const authoritativeSelection = selectOpenRouterBinding(
+                    authoritative,
+                    { kind: "connection", connectionId },
+                    true,
+                  );
+                  const authoritativeConnection = authoritative.connections.find(
+                    (item) => item.id === connectionId,
+                  );
+                  if (
+                    authoritativeSelection.kind !== "exact"
+                    || authoritativeSelection.binding.enabled
+                    || !authoritativeConnection
+                    || authoritativeConnection.credentialSlot !== connection.credentialSlot
+                    || authoritativeConnection.accountFingerprint !== connection.accountFingerprint
+                    || authoritativeConnection.billingRealm !== connection.billingRealm
+                  ) {
+                    throw new Error("Provider enable binding changed before commit.");
+                  }
+                  return {
+                    ...authoritative,
+                    lifecycle: "configured",
+                    connections: authoritative.connections.map((item) => item.id === connectionId
+                      ? { ...item, enabled: true, lastHealth: structuredClone(inspection.health) }
+                      : item),
+                    defaultRoute: route,
+                    cross: { enabled: false, preferredLead: null, preferredChallenger: null },
+                  };
+                },
+                assertRetainedAttemptCurrent,
+              );
+            } catch (error) {
+              const adopted = readProviderStateCommitAdoption(error);
+              if (adopted) {
+                committed = adopted;
+              } else {
+                const exactReadback = this.stateStore.read();
+                if (JSON.stringify(exactReadback) !== JSON.stringify(expectedCommittedState)) {
+                  throw error;
+                }
+                committed = exactReadback;
+              }
+            }
+            committedTuple = { state: committed, route };
+            await lease.assertHeld();
+            return adoptCommittedTuple();
+          } catch {
+            if (adoptCommittedTuple()) return true;
+            if (runtimeBindAttempted) {
+              const cleanupSignal = new AbortController().signal;
+              await this.authorityOptions!.adapter.logout({ signal: cleanupSignal })
+                .catch(() => undefined);
+            }
+            return false;
           }
-          return {
-            ...authoritative,
-            lifecycle: "configured",
-            connections: authoritative.connections.map((item) => item.id === connectionId
-              ? { ...item, enabled: true, lastHealth: structuredClone(inspection.health) }
-              : item),
-            defaultRoute: route,
-            cross: { enabled: false, preferredLead: null, preferredChallenger: null },
-          };
-        });
-        await lease.assertHeld();
-        await this.authorityOptions!.adapter.bindRuntimeUnderAuthorityLease({
-          connectionId,
-          generation,
-          deadlineAt,
-          signal: controller.signal,
-        }, lease);
-        await lease.assertHeld();
-        this.config.providerSetup = requirePersistableProviderState(committed);
-        this.#processRouteGeneration += 1;
-        this.#sessionRoute = structuredClone(route);
-        this.#sessionRoutePersisted = true;
-        this.#preparedRoles = null;
-        return true;
-      },
-    );
+        },
+      );
+    } catch {
+      return adoptCommittedTuple();
+    } finally {
+      clearTimeout(deadlineTimer);
+    }
   }
 
   async execute(
@@ -1236,7 +1792,8 @@ export class DefaultProviderRuntime implements ProviderRuntime {
     }
 
     if (intent.kind === "reconnect") {
-      const selected = this.#selectedOpenRouterConnection(this.stateStore.read());
+      const reconnectState = this.stateStore.read();
+      const selected = this.#selectedOpenRouterConnection(reconnectState);
       if (!selected) {
         return {
           kind: "reconnected",
@@ -1246,8 +1803,10 @@ export class DefaultProviderRuntime implements ProviderRuntime {
         };
       }
       const controller = new AbortController();
+      const reconnectRoute = this.#desiredSessionRoute(reconnectState);
       const runtimeLease = await this.runtimeGuard.acquire(controller.signal);
       let result: StartupSetupResult;
+      let routeReady = false;
       let primaryFailed = false;
       try {
         await runtimeLease.assertHeld();
@@ -1257,10 +1816,47 @@ export class DefaultProviderRuntime implements ProviderRuntime {
         });
         await runtimeLease.assertHeld();
         const adapter = this.registry.adapter("openrouter");
+        let provedRoute: RouteIdentityV1 | null = null;
+        if (reconnectRoute?.resolutionState === "resolved") {
+          try {
+            const candidate = this.orchestrator.ensureRunnableRoute(reconnectRoute);
+            if (sameExactRoute(candidate, reconnectRoute)) provedRoute = candidate;
+          } catch (error) {
+            if (!isProviderSetupRequired(error)) throw error;
+          }
+        }
+        const rebound = provedRoute
+          ? selectOpenRouterBinding(
+              this.stateStore.read(),
+              { kind: "route", route: provedRoute },
+            )
+          : null;
         if (
-          adapter.bindRuntime
-          && (result.mode === "ready" || result.mode === "ready-with-warning")
+          provedRoute
+          && rebound?.kind === "exact"
+          && rebound.binding.connectionId === selected.id
         ) {
+          const defaultRoute = validateRouteIdentityV1(reconnectState.defaultRoute);
+          if (!defaultRoute || !sameExactRoute(defaultRoute, provedRoute)) {
+            const catalogRoute = provedRoute;
+            const models = await adapter.listModels({
+              connectionId: selected.id,
+              signal: controller.signal,
+            });
+            await runtimeLease.assertHeld();
+            const exact = models.filter((model) =>
+              model.backendId === catalogRoute.backendId
+              && model.requestedModelId === catalogRoute.requestedModelId
+              && model.canonicalModelId === catalogRoute.canonicalModelId
+              && model.capabilities.textInput
+              && model.capabilities.textOutput
+            );
+            if (exact.length !== 1) provedRoute = null;
+          }
+        } else {
+          provedRoute = null;
+        }
+        if (adapter.bindRuntime && provedRoute) {
           await adapter.bindRuntime({
             connectionId: selected.id,
             generation: result.generation,
@@ -1268,6 +1864,28 @@ export class DefaultProviderRuntime implements ProviderRuntime {
             signal: controller.signal,
           });
           await runtimeLease.assertHeld();
+          const bound = selectOpenRouterBinding(
+            this.stateStore.read(),
+            { kind: "route", route: provedRoute },
+          );
+          if (bound.kind !== "exact" || bound.binding.connectionId !== selected.id) {
+            throw new ProviderSetupRequiredError();
+          }
+          this.#synchronizeAuthoritativeProviderState();
+          this.#adoptExactSessionRoute(provedRoute, true);
+          routeReady = true;
+        } else {
+          if (
+            reconnectRoute
+            && this.#sessionRoute
+            && sameExactRoute(this.#sessionRoute, reconnectRoute)
+          ) {
+            this.#processRouteGeneration += 1;
+            this.#sessionRoute = null;
+            this.#sessionRoutePersisted = false;
+            this.#preparedRoles = null;
+          }
+          this.#synchronizeAuthoritativeProviderState();
         }
       } catch (error) {
         primaryFailed = true;
@@ -1285,7 +1903,9 @@ export class DefaultProviderRuntime implements ProviderRuntime {
       return {
         kind: "reconnected",
         backendId: "openrouter",
-        headline: connection?.lastHealth
+        headline: !routeReady
+          ? "setup-required"
+          : connection?.lastHealth
           ? deriveProviderHeadline(connection.lastHealth)
           : result.mode,
         generation: result.generation,
@@ -1550,52 +2170,139 @@ export class DefaultProviderRuntime implements ProviderRuntime {
     connectionId: string | null,
     confirmationToken: string,
   ): Promise<ProviderCommandResult> {
-    return this.activationCoordinator.runExclusive(
-      { signal: new AbortController().signal, inspectCommitted: false },
-      async (lease) => {
-        await lease.assertHeld();
-        const current = this.stateStore.read();
-        if (!this.#consumeConfirmation(confirmationToken, "logout", current)) {
-          return this.#confirmationRequired("logout", current);
+    const committedOutcome: { value: LegacyLogoutCommittedOutcome | null } = { value: null };
+    try {
+      return await this.activationCoordinator.runExclusive(
+        { signal: new AbortController().signal, inspectCommitted: false },
+        async (lease) => {
+          await lease.assertHeld();
+          const current = this.stateStore.read();
+          const authorization = this.#consumeConfirmation(
+            confirmationToken,
+            "logout",
+            current,
+          );
+          if (!authorization) return this.#confirmationRequired("logout", current);
+          const selected = authorization.connection && connectionId === authorization.connection.id
+            ? current.connections.find((candidate) =>
+                candidate.id === authorization.connection!.id
+                && candidate.backendId === "openrouter"
+                && candidate.enabled === authorization.connection!.enabled
+                && candidate.credentialSlot === authorization.connection!.credentialSlot
+                && candidate.accountFingerprint === authorization.connection!.accountFingerprint
+                && candidate.billingRealm === authorization.connection!.billingRealm
+              )
+            : undefined;
+          if (authorization.connection && !selected) {
+            return this.#confirmationRequired("logout", current);
+          }
+          let next: ProviderSetupStateV1;
+          if (selected) {
+            try {
+              next = await this.stateStore.commit(current.revision, (authoritative) => {
+                if (!this.#confirmationMatches(authorization, "logout", authoritative)) {
+                  throw new ProviderConfirmationStaleError(
+                    this.#confirmationRequired("logout", authoritative),
+                  );
+                }
+                return {
+                  ...authoritative,
+                  lifecycle: "configured",
+                  connections: authoritative.connections.map((candidate) =>
+                    candidate.id === selected.id ? { ...candidate, enabled: false } : candidate
+                  ),
+                  defaultRoute: authoritative.defaultRoute
+                    && authoritative.defaultRoute.backendId === selected.backendId
+                    && authoritative.defaultRoute.accountFingerprint === selected.accountFingerprint
+                    && authoritative.defaultRoute.billingRealm === selected.billingRealm
+                    ? null
+                    : authoritative.defaultRoute,
+                  cross: { enabled: false, preferredLead: null, preferredChallenger: null },
+                };
+              });
+            } catch (error) {
+              const adopted = readProviderStateCommitAdoption(error);
+              if (!adopted) throw error;
+              const result: Extract<ProviderCommandResult, { kind: "changed" }> = {
+                kind: "changed",
+                operation: "logout",
+                backendId: "openrouter",
+                setupRequired: adopted.defaultRoute === null,
+                defaultCleared: current.defaultRoute !== null && adopted.defaultRoute === null,
+              };
+              committedOutcome.value = {
+                proof: LEGACY_LOGOUT_COMMIT_PROOF,
+                state: requirePersistableProviderState(adopted),
+                result,
+                completed: false,
+              };
+              throw error;
+            }
+          } else {
+            next = current;
+          }
+          const result: Extract<ProviderCommandResult, { kind: "changed" }> = {
+            kind: "changed",
+            operation: "logout",
+            backendId: "openrouter",
+            setupRequired: next.defaultRoute === null,
+            defaultCleared: current.defaultRoute !== null && next.defaultRoute === null,
+          };
+          committedOutcome.value = {
+            proof: LEGACY_LOGOUT_COMMIT_PROOF,
+            state: requirePersistableProviderState(next),
+            result,
+            completed: false,
+          };
+          return this.#completeCommittedLegacyLogout(committedOutcome.value, lease);
+        },
+      );
+    } catch (error) {
+      if (error instanceof ProviderConfirmationStaleError) return error.confirmation;
+      const committed = committedOutcome.value;
+      if (committed?.proof === LEGACY_LOGOUT_COMMIT_PROOF) {
+        if (committed.completed) return committed.result;
+        try {
+          return await this.activationCoordinator.runExclusive(
+            { signal: new AbortController().signal, inspectCommitted: false },
+            async (lease) => {
+              await lease.assertHeld();
+              if (
+                JSON.stringify(this.stateStore.read())
+                !== JSON.stringify(committed.state)
+              ) {
+                throw new ProviderSetupRequiredError();
+              }
+              return this.#completeCommittedLegacyLogout(committed, lease);
+            },
+          );
+        } catch (recoveryError) {
+          if (committed.completed) return committed.result;
+          throw recoveryError;
         }
-        const selected = connectionId === null
-          ? undefined
-          : current.connections.find((candidate) => candidate.id === connectionId);
-        const next = selected?.enabled
-          ? await this.stateStore.commit(current.revision, (authoritative) => ({
-              ...authoritative,
-              lifecycle: "configured",
-              connections: authoritative.connections.map((candidate) =>
-                candidate.id === connectionId ? { ...candidate, enabled: false } : candidate
-              ),
-              defaultRoute: authoritative.defaultRoute
-                && authoritative.defaultRoute.backendId === selected.backendId
-                && authoritative.defaultRoute.accountFingerprint === selected.accountFingerprint
-                && authoritative.defaultRoute.billingRealm === selected.billingRealm
-                ? null
-                : authoritative.defaultRoute,
-              cross: { enabled: false, preferredLead: null, preferredChallenger: null },
-            }))
-          : current;
-        await lease.assertHeld();
-        this.config.providerSetup = requirePersistableProviderState(next);
-        await lease.assertHeld();
-        this.openRouter.forgetKey();
-        this.#processRouteGeneration += 1;
-        this.#sessionRoute = null;
-        this.#sessionRoutePersisted = false;
-        this.#preparedRoles = null;
-        this.environmentSecret = null;
-        await lease.assertHeld();
-        return {
-          kind: "changed",
-          operation: "logout",
-          backendId: "openrouter",
-          setupRequired: next.defaultRoute === null,
-          defaultCleared: current.defaultRoute !== null && next.defaultRoute === null,
-        };
-      },
-    );
+      }
+      throw error;
+    }
+  }
+
+  async #completeCommittedLegacyLogout(
+    outcome: LegacyLogoutCommittedOutcome,
+    lease: ProviderCoordinatorLease,
+  ): Promise<Extract<ProviderCommandResult, { kind: "changed" }>> {
+    await lease.assertHeld();
+    this.config.providerSetup = requirePersistableProviderState(outcome.state);
+    await lease.assertHeld();
+    // The exact durable Legacy disable is now projected into this process.
+    this.openRouter.forgetKey();
+    this.#processRouteGeneration += 1;
+    this.#sessionRoute = null;
+    this.#sessionRoutePersisted = false;
+    this.#pendingSessionBinding = null;
+    this.#preparedRoles = null;
+    this.environmentSecret = null;
+    outcome.completed = true;
+    await lease.assertHeld();
+    return outcome.result;
   }
 }
 
@@ -2132,84 +2839,111 @@ export function createProviderCredentialController(input: {
         const targetConnection = selected.kind === "exact"
           ? state.connections.find((connection) => connection.id === selected.binding.connectionId)
           : undefined;
-        const signal = new AbortController().signal;
+        const effectAttempt = createProviderEffectAttempt();
+        const terminalActivation: {
+          current: Promise<{ persisted: boolean }> | null;
+        } = { current: null };
         const activateCandidate = async (
           candidate: string,
           expectedRevision: number,
           targetConnectionId?: string,
+          candidatePermit?: ProviderCandidateCredentialPermit,
         ) => {
-          const result = await input.activationCoordinator.activate({
-            expectedRevision,
-            candidate,
-            expectedRequestedModelId: route.requestedModelId,
-            selectedCanonicalModelId: route.canonicalModelId!,
-            generation: targetConnection?.lastHealth?.generation ?? 0,
-            signal,
-            persistence: "persisted",
-            ...(targetConnectionId ? { targetConnectionId } : {}),
-            onPersistenceFailure: intent.kind === "replace" && intent.allowProcessOnly
-              ? async () => (await intent.allowProcessOnly!("inference", "Der sichere Credential-Speicher ist nicht verfügbar."))
-                ? "process-only"
-                : "decline"
-              : undefined,
-          });
-          input.onInferenceReady?.(result.route, result.persisted, candidate);
-          return { persisted: result.persisted };
+          if (terminalActivation.current) throw new ProviderSetupRequiredError();
+          terminalActivation.current = (async () => {
+            const result = await input.activationCoordinator.activate({
+              expectedRevision,
+              candidate,
+              expectedRequestedModelId: route.requestedModelId,
+              selectedCanonicalModelId: route.canonicalModelId!,
+              generation: targetConnection?.lastHealth?.generation ?? 0,
+              signal: effectAttempt.signal,
+              deadlineAt: effectAttempt.deadlineAt,
+              persistence: "persisted",
+              candidatePermit,
+              requireCandidatePermit: candidatePermit !== undefined,
+              ...(targetConnectionId ? { targetConnectionId } : {}),
+              onPersistenceFailure: intent.kind === "replace" && intent.allowProcessOnly
+                ? async () => (await intent.allowProcessOnly!("inference", "Der sichere Credential-Speicher ist nicht verfügbar."))
+                  ? "process-only"
+                  : "decline"
+                : undefined,
+            });
+            input.onInferenceReady?.(result.route, result.persisted, candidate);
+            return { persisted: result.persisted };
+          })();
+          return terminalActivation.current;
         };
-        let activation: { persisted: boolean };
-        if (intent.kind === "save" && selected.kind === "exact") {
-          if (!input.credentialAuthority) {
-            await input.activationCoordinator.runExclusive(
-              { signal, inspectCommitted: false },
-              async (lease) => {
-                await lease.assertHeld();
-                throw new ProviderSetupRequiredError();
+        try {
+          let activation: { persisted: boolean };
+          if (intent.kind === "save" && selected.kind === "exact") {
+            if (!input.credentialAuthority) {
+              await input.activationCoordinator.runExclusive(
+                { signal: effectAttempt.signal, inspectCommitted: false },
+                async (lease) => {
+                  await lease.assertHeld();
+                  throw new ProviderSetupRequiredError();
+                },
+              );
+              throw new ProviderSetupRequiredError();
+            }
+            const access = await input.credentialAuthority.withCredential(
+              {
+                connectionId: selected.binding.connectionId,
+                credentialKind: "inference",
+                purpose: "explicit-repair",
+                environmentEligibility: "forbidden",
+                deadlineAt: effectAttempt.deadlineAt,
+                signal: effectAttempt.signal,
+              },
+              (candidate, context) => {
+                if (
+                  context.binding.stateRevision !== state.revision
+                  || context.binding.connectionId !== selected.binding.connectionId
+                  || context.binding.accountFingerprint !== selected.binding.accountFingerprint
+                  || context.binding.billingRealm !== selected.binding.billingRealm
+                ) {
+                  throw new ProviderSetupRequiredError();
+                }
+                return activateCandidate(
+                  candidate,
+                  context.binding.stateRevision,
+                  context.binding.connectionId,
+                  context.candidatePermit,
+                );
               },
             );
-            throw new ProviderSetupRequiredError();
+            if (access.kind === "available") activation = access.value;
+            else if (terminalActivation.current) activation = await terminalActivation.current;
+            else throw new ProviderSetupRequiredError();
+          } else {
+            const candidate = intent.kind === "save"
+              ? input.openRouter.requireKey()
+              : intent.candidate;
+            activation = await activateCandidate(
+              candidate,
+              state.revision,
+              targetConnection?.id,
+            );
           }
-          const access = await input.credentialAuthority.withCredential(
-            {
-              connectionId: selected.binding.connectionId,
+          return {
+            kind: "ready",
+            credentialKind: "inference",
+            persisted: activation.persisted,
+          };
+        } catch (error) {
+          if (terminalActivation.current) {
+            const activation = await terminalActivation.current;
+            return {
+              kind: "ready",
               credentialKind: "inference",
-              purpose: "explicit-repair",
-              environmentEligibility: "forbidden",
-              deadlineAt: Date.now() + 8_000,
-              signal,
-            },
-            (candidate, context) => {
-              if (
-                context.binding.stateRevision !== state.revision
-                || context.binding.connectionId !== selected.binding.connectionId
-                || context.binding.accountFingerprint !== selected.binding.accountFingerprint
-                || context.binding.billingRealm !== selected.binding.billingRealm
-              ) {
-                throw new ProviderSetupRequiredError();
-              }
-              return activateCandidate(
-                candidate,
-                context.binding.stateRevision,
-                context.binding.connectionId,
-              );
-            },
-          );
-          if (access.kind !== "available") throw new ProviderSetupRequiredError();
-          activation = access.value;
-        } else {
-          const candidate = intent.kind === "save"
-            ? input.openRouter.requireKey()
-            : intent.candidate;
-          activation = await activateCandidate(
-            candidate,
-            state.revision,
-            targetConnection?.id,
-          );
+              persisted: activation.persisted,
+            };
+          }
+          throw error;
+        } finally {
+          effectAttempt.close();
         }
-        return {
-          kind: "ready",
-          credentialKind: "inference",
-          persisted: activation.persisted,
-        };
       }
 
       const signal = new AbortController().signal;
@@ -2408,12 +3142,12 @@ async function persistProviderSetupStateOwned(
     await ownership.assertHeld();
     const target = await readConfigFileSnapshot(ownership.canonicalPath);
     await ownership.assertHeld();
-    if (target.kind !== "file") {
-      throw new Error("Provider state publication requires an initialized config.");
-    }
+    const raw = target.kind === "file"
+      ? target.raw
+      : `${JSON.stringify(DEFAULT_CONFIG, null, 2)}\n`;
     let parsed: unknown;
     try {
-      parsed = JSON.parse(target.raw);
+      parsed = JSON.parse(raw);
     } catch {
       throw new Error("Provider state publication requires a valid config.");
     }
@@ -2426,7 +3160,7 @@ async function persistProviderSetupStateOwned(
     if (current.revision !== request.expectedRevision) {
       throw new Error("Provider state publication revision is stale.");
     }
-    const span = findStartupTopLevelJsonValue(target.raw, "providerSetup");
+    const span = findStartupTopLevelJsonValue(raw, "providerSetup");
     if (!span) {
       throw new Error("Provider state publication requires an exact config field.");
     }
@@ -2442,22 +3176,29 @@ async function persistProviderSetupStateOwned(
     ) {
       throw new Error("Provider state publication candidate is invalid.");
     }
-    const nextRaw = `${target.raw.slice(0, span.start)}${JSON.stringify(candidate)}${target.raw.slice(span.end)}`;
+    const nextRaw = `${raw.slice(0, span.start)}${JSON.stringify(candidate)}${raw.slice(span.end)}`;
     request.assertCurrent();
     await ownership.assertHeld();
     let writeError: unknown;
     try {
-      await writeFileAtomicSecure(
+      const publish = target.kind === "absent"
+        ? writeFileAtomicCreateSecure
+        : writeFileAtomicSecure;
+      await publish(
         ownership.canonicalPath,
         nextRaw,
         async () => {
-          request.assertCurrent();
           await ownership.assertHeld();
           await assertConfigFileSnapshot(ownership.canonicalPath, target);
           await ownership.assertHeld();
+          request.assertCurrent();
+        },
+        () => {
+          request.assertCurrent();
         },
       );
     } catch (error) {
+      if (!isAtomicFilePostPublicationError(error)) throw error;
       writeError = error;
     }
     await ownership.assertHeld();
@@ -2467,8 +3208,7 @@ async function persistProviderSetupStateOwned(
       if (writeError !== undefined) throw writeError;
       throw new Error("Provider state publication could not be verified.");
     }
-    request.assertCurrent();
-    request.adopt(candidate);
+    adoptDurablyCommittedProviderState(request, candidate);
     return structuredClone(candidate);
   });
 }
@@ -2597,6 +3337,7 @@ export async function createDefaultProviderRuntime(
     adapter,
     stateStore,
     runtimeGuard,
+    candidateAuthority: credentialAuthority,
   });
   const orchestrator = new SetupOrchestrator({
     registry,
@@ -2757,6 +3498,7 @@ export async function runCli(
     dependencies.stderr.write(`${warning}\n`);
   }
   const { config, configPath: runtimeConfigPath, ruleStore, session } = startup;
+  let currentSession = session;
   const configWarning = consumeConfigWarning();
   if (configWarning) dependencies.stderr.write(`${configWarning}\n`);
   if (options.approval) {
@@ -2827,16 +3569,16 @@ export async function runCli(
         throw new ProviderSetupRequiredError();
       }
     }
-    if (!options.model && session.data.reasoning) {
-      setReasoningSetting(config, session.data.reasoning);
+    if (!options.model && currentSession.data.reasoning) {
+      setReasoningSetting(config, currentSession.data.reasoning);
     }
     config.mainModel = route.requestedModelId;
-    session.setPreferences(config.mainModel, getReasoningSetting(config));
+    currentSession.setPreferences(config.mainModel, getReasoningSetting(config), route);
     if (!agent) {
       agent = await dependencies.createAgent({
         openRouter: providerRuntime.openRouter,
         approvals,
-        session,
+        session: currentSession,
         config,
         workspace,
         sshSession,
@@ -2866,7 +3608,7 @@ export async function runCli(
       );
     }
     const effectivePrompt = await applyInterruptedRunNonInteractive(
-      session,
+      currentSession,
       options,
       out,
       prompt,
@@ -2903,7 +3645,10 @@ export async function runCli(
 
   const localRuntime: CommandLocalRuntime = {
     guard: await WorkspaceGuard.create(workspace),
-    journal: new ChangeJournal({ appHome: session.appHome, chatId: session.data.id }),
+    journal: new ChangeJournal({
+      appHome: currentSession.appHome,
+      chatId: currentSession.data.id,
+    }),
     setSession(next) {
       this.journal = new ChangeJournal({ appHome: next.appHome, chatId: next.data.id });
     },
@@ -2916,7 +3661,7 @@ export async function runCli(
     config,
     approvals,
     openRouter: providerRuntime.openRouter,
-    session,
+    session: currentSession,
     agent,
     credentials: providerRuntime.credentials,
     providerCredentials: providerRuntime.providerCredentials,
@@ -2928,6 +3673,13 @@ export async function runCli(
     ruleStore,
     sshSession,
     providerRuntime,
+    commitSessionHandoff(next: SessionStore) {
+      providerRuntime.adoptSession(next);
+      currentSession = next;
+      this.session = next;
+      this.agent?.setSession(next);
+      this.localRuntime.setSession(next);
+    },
     ensureAgentForPrompt,
     resumeFlag: options.resume,
     noResumeFlag: options.noResume,
@@ -2958,6 +3710,7 @@ interface RuntimeContext {
   openRouter: OpenRouterService;
   session: SessionStore;
   agent: OrcodeAgent | null;
+  commitSessionHandoff?(session: SessionStore): void;
   localRuntime: CommandLocalRuntime;
   providerCredentials: ProviderCredentialIntentPort;
   providerCommands: ProviderCommandIntentPort;
@@ -3987,13 +4740,43 @@ function approvalChoiceLabel(mode: ApprovalMode): string {
   }
 }
 
+/** Commits every mutable chat owner after the previous chat is durable. */
+function commitDashboardSessionHandoff(
+  context: RuntimeContext,
+  next: SessionStore,
+): void {
+  if (context.commitSessionHandoff) {
+    context.commitSessionHandoff(next);
+    return;
+  }
+  context.providerRuntime.adoptSession?.(next);
+  context.session = next;
+  context.agent?.setSession(next);
+  context.localRuntime.setSession(next);
+}
+
 /** @internal Exported so the dashboard chat-switch boundary can be regression tested. */
 export async function pickDashboardChat(
   ui: TerminalUi,
   context: RuntimeContext,
   preferNew: boolean,
 ): Promise<boolean> {
-  await saveDashboardSessionPreferences(context, ui);
+  let selectedRoute: RouteIdentityV1 | null = null;
+  let previousRoute = validateRouteIdentityV1(context.session.data.route);
+  if (typeof context.providerRuntime.currentSessionRoute === "function") {
+    try {
+      selectedRoute = context.providerRuntime.currentSessionRoute();
+      previousRoute = selectedRoute;
+    } catch (error) {
+      if (
+        !(error instanceof ProviderSetupRequiredError)
+        && !(typeof error === "object" && error !== null && "code" in error
+          && error.code === "provider-setup-required")
+      ) {
+        throw error;
+      }
+    }
+  }
   const migratedConnection = context.providerRuntime.migratedSessionConnection();
   const chats = await SessionStore.list(
     context.workspace,
@@ -4021,10 +4804,6 @@ export async function pickDashboardChat(
   let next: SessionStore;
   if (picked.value === "__new__") {
     next = SessionStore.create(context.workspace, context.session.appHome);
-    next.setPreferences(
-      context.config.mainModel,
-      getReasoningSetting(context.config),
-    );
   } else {
     if (picked.value === context.session.data.id) {
       return false;
@@ -4035,27 +4814,39 @@ export async function pickDashboardChat(
       context.session.appHome,
       migratedConnection,
     );
-    if (next.data.model && next.data.model !== context.config.mainModel) {
+    const historicalRoute = validateRouteIdentityV1(next.data.route);
+    if (historicalRoute?.resolutionState === "resolved") {
+      if (typeof context.providerRuntime.selectSessionRoute !== "function") {
+        throw new ProviderSetupRequiredError();
+      }
+      selectedRoute = await context.providerRuntime.selectSessionRoute(
+        historicalRoute,
+        context.providerRouteSurface,
+      );
+    } else if (next.data.model && next.data.model !== context.config.mainModel) {
       await context.providerRuntime.transitionModel(
         next.data.model,
         undefined,
         context.providerRouteSurface,
       );
-    }
-    if (next.data.model) {
-      context.config.mainModel = next.data.model;
-    }
-    if (next.data.reasoning) {
-      setReasoningSetting(context.config, next.data.reasoning);
+      selectedRoute = typeof context.providerRuntime.currentSessionRoute === "function"
+        ? context.providerRuntime.currentSessionRoute()
+        : historicalRoute;
     }
   }
 
-  context.session = next;
-  // Reuse the agent: rebuilding it dropped the cached model resolution, the
-  // compressor price cache and the undo journal on every chat switch.
-  context.agent?.setSession(next);
-  context.localRuntime.setSession(next);
-  await saveDashboardSessionPreferences(context, ui);
+  await saveDashboardSessionPreferences(context, ui, previousRoute ?? undefined);
+  commitDashboardSessionHandoff(context, next);
+  if (selectedRoute) context.config.mainModel = selectedRoute.requestedModelId;
+  if (next.data.reasoning) {
+    setReasoningSetting(context.config, next.data.reasoning);
+  }
+  next.setPreferences(
+    selectedRoute?.requestedModelId ?? next.data.model ?? context.config.mainModel,
+    getReasoningSetting(context.config),
+    selectedRoute ?? undefined,
+  );
+  await saveDashboardSessionPreferences(context, ui, selectedRoute ?? undefined);
   await saveConfig(context.config, context.configPath);
   ui.loadTurns(next.recentTurns(VISIBLE_TURNS));
   ui.setStatus(`Chat geöffnet: ${next.data.title}`, false);
@@ -4099,10 +4890,12 @@ function formatChatAge(value: string): string {
 async function saveDashboardSessionPreferences(
   context: RuntimeContext,
   ui?: TerminalUi,
+  route?: RouteIdentityV1,
 ): Promise<void> {
   context.session.setPreferences(
     context.config.mainModel,
     getReasoningSetting(context.config),
+    route,
   );
   reportSaveOutcome(await context.session.save(), ui);
 }
@@ -4978,6 +5771,69 @@ function summarizeModel(model: ModelInfo): string {
     price,
     capabilities.length ? capabilities.join(", ") : "Text",
   ].join(" · ");
+}
+
+function providerAuthorityBlocksSetup(kind: string): boolean {
+  return kind === "forget-pending"
+    || kind === "recovery-required"
+    || kind === "stale"
+    || kind === "ambiguous"
+    || kind === "invalid-pointer";
+}
+
+function createProviderEffectAttempt(timeoutMs = 8_000): {
+  signal: AbortSignal;
+  deadlineAt: number;
+  close(): void;
+} {
+  const controller = new AbortController();
+  const deadlineAt = Date.now() + timeoutMs;
+  const timeout = new Error("Provider effect deadline expired.");
+  timeout.name = "TimeoutError";
+  const timer = setTimeout(() => {
+    if (!controller.signal.aborted) controller.abort(timeout);
+  }, Math.min(timeoutMs, 0x7fff_ffff));
+  return {
+    signal: controller.signal,
+    deadlineAt,
+    close() {
+      clearTimeout(timer);
+    },
+  };
+}
+
+function abortableProviderAction<T>(
+  operation: () => Promise<T>,
+  signal: AbortSignal,
+): Promise<T> {
+  const abortReason = () => signal.reason instanceof Error
+    ? signal.reason
+    : new DOMException("The operation was aborted.", "AbortError");
+  if (signal.aborted) return Promise.reject(abortReason());
+  return new Promise<T>((resolve, reject) => {
+    let settled = false;
+    const finish = (settle: () => void) => {
+      if (settled) return;
+      settled = true;
+      signal.removeEventListener("abort", onAbort);
+      settle();
+    };
+    const onAbort = () => finish(() => reject(abortReason()));
+    signal.addEventListener("abort", onAbort, { once: true });
+    if (signal.aborted) {
+      onAbort();
+      return;
+    }
+    Promise.resolve()
+      .then(() => {
+        if (settled || signal.aborted) throw abortReason();
+        return operation();
+      })
+      .then(
+        (value) => finish(() => resolve(value)),
+        (error: unknown) => finish(() => reject(error)),
+      );
+  });
 }
 
 function pricePerMillion(value: number): string {

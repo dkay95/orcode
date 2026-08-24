@@ -397,6 +397,7 @@ async function crashAndRecoverRealActivation(
       selectedCanonicalModelId: model.canonicalModelId,
       generation: 4,
       signal: new AbortController().signal,
+      deadlineAt: Number.MAX_SAFE_INTEGER,
       persistence: "persisted",
     }),
     /privacy-simulated-crash:config-readback/,
@@ -502,6 +503,8 @@ async function realProviderInspectionCorpus(values: PrivacyProbes): Promise<stri
           kind: "available" as const,
           value: await use(secret, {
             source: "saved",
+            candidatePermit: Object.freeze({ version: 1 as const }),
+            async publishIfCurrent(publish) { publish(); },
             binding: {
               version: 1,
               stateRevision: 4,

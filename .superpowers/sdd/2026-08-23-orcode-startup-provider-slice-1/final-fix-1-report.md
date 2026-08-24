@@ -227,3 +227,451 @@ Evidence:
 - `.superpowers/sdd/2026-08-23-orcode-startup-provider-slice-1/final-fix-1-report.md`
 
 Exact commit subject: `fix: centralize provider credential authority`.
+
+## Final Fix 1 re-review addendum — manual deadline and durable adoption
+
+This addendum was completed on the frozen, intentionally uncommitted Fix 1
+worktree at `HEAD` `8d17a0c11f12efc5e8d3a9534e94ec2df113fc6d`.
+No existing change was reset or rewritten, and no commit was created.
+
+### Pre-change freeze and formal RED
+
+- `git diff -- src tests` SHA-256:
+  `24a7feba74dca5e82d6a8cdb3992124d6d1be9a1dce7a06a1b9a50ea861d0c24`.
+- `git diff -- src` SHA-256:
+  `72a9d14f6b50a072103df893c36d2e3b519c876ab8c9d3a6cbfe161b8c151fb1`.
+- After adding only the two regression tests, the source-only hash remained
+  exactly `72a9d14f6b50a072103df893c36d2e3b519c876ab8c9d3a6cbfe161b8c151fb1`.
+- The exact focused RED reached 2 tests: 0 passed, 2 failed, 0 skipped:
+  - `manual saved setup authority expiry aborts hub and forbids late activation`
+  - `post-readback cancellation adopts the exact committed provider state without a half tuple`
+- Both failures were the required behavioral failures: the late manual model
+  prompt performed one activation plus two presentations after settlement,
+  and the durable file held the new revision while the in-memory store exposed
+  no exact committed outcome.
+
+### Central correction
+
+- Independent manual setup now owns one abort controller and absolute 8-second
+  deadline. That same signal/deadline is threaded through saved-credential
+  authority, candidate authority, and `runSetupHub`; settlement aborts the
+  owner so an already-detached prompt cannot publish later effects. Startup
+  attempts continue to use their existing caller-owned signal, deadline, and
+  generation.
+- Exact durable config readback now invokes a `ProviderStateStore`-issued
+  WeakMap capability. A structurally forged request receives only the ordinary
+  checked adoption path. The genuine post-readback path rechecks currentness,
+  adopts only the byte-exact built candidate even when that final check reports
+  late cancellation, and returns the existing private typed committed outcome
+  without preserving or exposing the raw cancellation cause.
+- Existing retained-enable handling consumes that typed outcome into the full
+  State/Config/Runtime tuple; the pre-existing retained-enable adopted-outcome,
+  wrong-readback, post-commit-fence, and runtime-bind ordering tests remained
+  green.
+
+### GREEN and final freeze
+
+- Exact two-test GREEN: 2/2 passed, 0 failed, 0 skipped.
+- Direct serial focus (`cli`, provider authority, provider state): 203/203
+  passed, 0 failed, 0 skipped.
+- Serial affected provider focus (authority/state/backends/adapter/activation,
+  setup/UI, CLI/entrypoint, integration, credentials/config, commands/catalog,
+  sessions, privacy, and real provider PTY): 685/685 passed, 0 failed, 0
+  skipped.
+- `npx tsc -p tsconfig.json --noEmit`: PASS.
+- `npx tsc -p tsconfig.tests.json --noEmit`: PASS.
+- `node --import tsx scripts/render-command-docs.ts --check`: PASS.
+- Provider privacy: 3/3 passed, 0 failed, 0 skipped.
+- `git diff --check`: PASS.
+- Approved Spec SHA-256 remained
+  `e15d19821fafbac1f0fc21dd82702d41efa481a12bdcee97df238de2ee85f021`.
+- Approved Plan SHA-256 remained
+  `74914bc2e38c1ac7bb8b57dbfa0abfb1963d4da7acc3fbb6868434039ce22b2c`.
+- Final `git diff -- src tests` SHA-256:
+  `1dcf8527b08685d82e064845cfb014a1cb444d3a8925ab9c381b30a3850baf82`.
+- Final `git diff -- src` SHA-256:
+  `8b4b428ba6a8b921b1568376691050f1a7eba9daceaeaf2d85e43c7f919df391`.
+
+Files changed by this addendum only:
+
+- `src/cli.ts`
+- `src/provider-state.ts`
+- `tests/provider-authority.test.ts`
+- `tests/cli.test.ts`
+- this report
+
+No global/full `npm test` was run, per the re-review constraint.
+
+## Final Fix 1 delta — terminal retained commit and unforgeable outcome
+
+This final delta was completed on the frozen, intentionally uncommitted Fix 1
+worktree at `HEAD` `8d17a0c11f12efc5e8d3a9534e94ec2df113fc6d`.
+No existing change was reset or rewritten, and no commit was created.
+
+### Pre-change freeze and formal RED
+
+- `git diff -- src tests` SHA-256:
+  `1dcf8527b08685d82e064845cfb014a1cb444d3a8925ab9c381b30a3850baf82`.
+- `git diff -- src` SHA-256:
+  `8b4b428ba6a8b921b1568376691050f1a7eba9daceaeaf2d85e43c7f919df391`.
+- After adding only the two regression tests, the source-only hash remained
+  exactly `8b4b428ba6a8b921b1568376691050f1a7eba9daceaeaf2d85e43c7f919df391`.
+- The exact focused RED reached 2 tests: 0 passed, 2 failed, 0 skipped:
+  - `retained enable does not settle or logout before a late genuine durable-adoption outcome`
+  - `committed provider outcome rejects a prototype-shaped object with an own readCommitted override`
+- The failures demonstrated both reported defects: retained enable had already
+  settled at its deadline while the genuine durable adoption was still pending,
+  and a prototype-shaped object with an own virtual reader decoded as committed.
+
+### Central correction
+
+- Retained enable now awaits `ProviderStateStore.commit` to its exact terminal
+  result instead of racing and detaching that persistence operation at the
+  provider deadline. Once durable publication may have begun, the activation
+  lease and caller remain owned until the store proves either an unchanged old
+  tuple or an exact privately branded committed tuple. Cleanup and authority
+  release therefore cannot race a still-capable late adoption. Abortable
+  catalog and other pre-commit provider work retain their existing deadline.
+- Committed provider outcomes are now recorded in a module-private `WeakMap`
+  keyed by the exact error object. The decoder reads that map directly and
+  returns a clone; it no longer trusts `instanceof`, an error name, a prototype,
+  or a dynamically dispatched `readCommitted` method.
+- The two pre-existing stalled/adopted persistence tests were aligned with the
+  terminal contract: they prove no early settlement or ownership release and
+  then verify the exact old or committed tuple after persistence settles.
+
+### GREEN and final freeze
+
+- Exact two-test GREEN: 2/2 passed, 0 failed, 0 skipped.
+- Direct serial provider state + authority focus: 102/102 passed, 0 failed, 0
+  skipped.
+- Required serial provider state/authority/activation/CLI focus: 299/299
+  passed, 0 failed, 0 skipped.
+- `npx tsc -p tsconfig.json --noEmit`: PASS.
+- `npx tsc -p tsconfig.tests.json --noEmit`: PASS.
+- `node --import tsx scripts/render-command-docs.ts --check`: PASS.
+- Provider privacy: 3/3 passed, 0 failed, 0 skipped.
+- `git diff --check`: PASS.
+- Approved Spec SHA-256 remained
+  `e15d19821fafbac1f0fc21dd82702d41efa481a12bdcee97df238de2ee85f021`.
+- Approved Plan SHA-256 remained
+  `74914bc2e38c1ac7bb8b57dbfa0abfb1963d4da7acc3fbb6868434039ce22b2c`.
+- Final `git diff -- src tests` SHA-256:
+  `68d04a34338e04e42d2fc14347e21411e82a8b1430be5a01552861c142918546`.
+- Final `git diff -- src` SHA-256:
+  `7da250c3c882226683f65ce796c7998cf79d10b38db9b67a4a282f7fab41120c`.
+
+Files changed by this delta only:
+
+- `src/cli.ts`
+- `src/provider-state.ts`
+- `tests/provider-authority.test.ts`
+- `tests/provider-state.test.ts`
+- this report
+
+No global/full `npm test` was run, per the final-delta constraint.
+
+## Integrated Fix Round 1 — terminal provider effect fences
+
+This integrated round started from clean `HEAD`
+`21bef89843b604fc5a66cd644a423847827a33d1`. It preserves the merged Fix 1
+authority, Fix 2 session/logout, and Fix 3 terminal-lifecycle boundaries. No
+subscription, Kimi, version, approved Spec, or approved Plan content changed.
+
+### Formal tests-only RED
+
+- The pre-change `src` tree was exactly
+  `50677e8a175949dc83dc06ab9b16306b83e4aea7`.
+- After adding the complete regression matrix and before editing production,
+  the `src` tree was still exact and `git diff HEAD -- src` was empty with
+  SHA-256
+  `e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855`.
+- Formal result: 11 tests, 1 passed, 10 failed, 0 skipped. The one already
+  passing characterization was the post-publication cancelled-state
+  reconciliation case.
+
+The exact named matrix was:
+
+1. `transitionModel deadline fences a delayed prepublication activation`
+2. `transitionModel publication boundary waits for exact terminal reconciliation`
+3. `inference key save deadline fences a delayed prepublication activation`
+4. `saved candidate swap after catalog and model choice has zero activation effects`
+5. `environment candidate swap after catalog and model choice has zero activation effects`
+6. `saved candidate permit survives catalog and model choice into activation`
+7. `environment candidate permit survives catalog and model choice into activation`
+8. `DefaultProviderRuntime propagates aborted setup cancellation persistence rejection`
+9. `DefaultProviderRuntime reconciles a committed cancelled lifecycle after persistence rejects`
+10. `real activation writer abort microtask at the last async fence preserves the old tuple`
+11. `real activation writer lease expiry microtask cannot rename after the last async fence`
+
+### Central correction
+
+- Model transitions and inference-key save/replace now own one absolute
+  deadline and abort signal across credential authority and activation. A
+  started activation is retained to its terminal result; a deadline cannot
+  return while that promise may still publish config, state, runtime, or
+  session effects.
+- Opaque candidate permits now survive catalog/model selection and are
+  revalidated under the already-held Runtime -> Provider ownership before
+  candidate I/O and before durable publication. Saved-slot and environment
+  secret changes fail closed without nested provider acquisition.
+- Setup cancellation persistence errors are no longer swallowed. The runtime
+  reports `cancelled` only after the exact expected cancelled revision is
+  authoritative; a detached outer credential deadline now waits for the
+  already-started hub cancellation to commit or to return its safe persistence
+  failure.
+- Activation supplies the atomic writer's synchronous final `beforeRename`
+  hook. Immediately before rename, with no await/yield, it checks the owned
+  deadline signal, provider lease expiry, and the production runtime guard.
+  Exact post-rename readback classifies old/candidate/ambiguous publication;
+  after candidate publication is proven, adoption continues under retained
+  Runtime -> Provider ownership using a non-caller-abort signal.
+
+### Final verification and freeze
+
+- Formal named matrix: 11/11 passed, 0 failed, 0 skipped.
+- Provider state/authority/activation/setup/UI, serial: 305/305 passed, 0
+  failed, 0 skipped.
+- CLI/commands/session, serial: 217/217 passed, 0 failed, 0 skipped.
+- TUI/provider PTY/provider privacy, serial: 98/98 passed, 0 failed, 0 skipped.
+- Integration focus: 30/30 passed, 0 failed, 0 skipped.
+- Provider privacy standalone: 3/3 passed, 0 failed, 0 skipped.
+- `npx tsc -p tsconfig.json --noEmit`: PASS.
+- `npx tsc -p tsconfig.tests.json --noEmit`: PASS.
+- `node --import tsx scripts/render-command-docs.ts --check`: PASS.
+- `git diff --check`: PASS.
+- Approved Spec SHA-256 remained
+  `e15d19821fafbac1f0fc21dd82702d41efa481a12bdcee97df238de2ee85f021`.
+- Approved Plan SHA-256 remained
+  `74914bc2e38c1ac7bb8b57dbfa0abfb1963d4da7acc3fbb6868434039ce22b2c`.
+- Final pre-commit `git diff HEAD -- src tests` SHA-256:
+  `8042b511727b3270baf16b8f5052fb5ee843f647ea0210d5ec74aa5c47ce022f`.
+- Final pre-commit `git diff HEAD -- src` SHA-256:
+  `dacb867127db565b800ae732811632dc8989fbfa9a261a6de304b260ee3ff3f6`.
+
+Files changed by this round:
+
+- `src/cli.ts`
+- `src/provider-activation.ts`
+- `src/provider-authority.ts`
+- `src/setup-ui.ts`
+- `src/setup.ts`
+- `tests/cli.test.ts`
+- `tests/integration.test.ts`
+- `tests/provider-activation.test.ts`
+- `tests/provider-authority.test.ts`
+- `tests/provider-privacy.test.ts`
+- `tests/setup-ui.test.ts`
+- `tests/setup.test.ts`
+- this report
+
+No global/full `npm test` was run, per the integrated-review constraint.
+
+## Integrated Fix Round 2 — activation ownership reconciliation
+
+This round started from clean `HEAD`
+`30a377e057ebc5bd0743dbee77e15db41d4e380b`. Scope remained exactly the
+two security-review P1s: lock-aware candidate validation and terminal setup
+activation ownership. The session reviewer had no open finding, and the
+approved Spec and Plan remained byte-unchanged.
+
+### Formal tests-only RED
+
+- The exact pre-change `src` tree was
+  `7aeac1f0fde0e27d126d45db064830bebb5198b9`.
+- After adding both production-real regression tests and before editing
+  production, `git diff HEAD -- src` remained empty with SHA-256
+  `e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855`.
+- Formal result: 2 tests, 0 passed, 2 failed, 0 skipped:
+  - `persisted saved candidate permit validates under existing real config ownership and commits one exact tuple`
+  - `setup postpublication abort waits for exact activation terminal reconciliation without cancellation`
+- The first test exercised both saved-slot and environment permits through a
+  real atomic config writer plus `ProviderStateStore` backed by production
+  `persistProviderSetupState`; both failed through the nested config writer.
+- The second used the real activation coordinator, setup orchestrator, default
+  runtime, atomic writer, session, and a post-rename `config-readback` pause. It
+  observed one forbidden cancellation call before the terminal activation.
+
+### Central correction
+
+- Candidate authority now has a lock-aware snapshot-validation path for the
+  already-held Runtime -> Provider -> Config order. It validates the private
+  WeakMap permit, actual candidate fingerprint, exact state revision,
+  connection binding/pointer/source, and current saved-slot or environment
+  secret against the already-read authoritative `beforeSave.state`. It never
+  invokes `ProviderStateStore.commit`, reacquires Provider, or re-enters the
+  config writer.
+- Once setup invokes `activateCandidate`, it awaits that exact terminal promise
+  rather than racing it with an outer abort wrapper. A prepublication abort is
+  therefore classified only after coordinator cleanup; an exact committed
+  activation returns ready without starting cancellation CAS or emitting late
+  notice/Cross UI.
+- Default runtime adopts the exact committed Config/State/Runtime route into
+  Config and Session when activation itself settles after interruption and the
+  setup/process generations plus durable default route remain exact. This
+  exception is deliberately narrower than a general aborted setup: a later
+  abort during Cross-role publication retains the existing no-session-publish
+  fence.
+
+### Final verification and freeze
+
+- New Round-2 matrix: 2/2 passed, 0 failed, 0 skipped.
+- Original Integrated Round-1 matrix: 11/11 passed, 0 failed, 0 skipped.
+- Provider state/authority/activation/setup/UI, serial: 306/306 passed (the
+  prior 305-test block plus one new test), 0 failed, 0 skipped.
+- CLI/commands/session, serial: 218/218 passed (the prior 217-test block plus
+  one new test), 0 failed, 0 skipped.
+- TUI/provider PTY/provider privacy, serial: 98/98 passed, 0 failed, 0 skipped.
+- Integration focus: 30/30 passed, 0 failed, 0 skipped.
+- Provider privacy standalone: 3/3 passed, 0 failed, 0 skipped.
+- `npx tsc -p tsconfig.json --noEmit`: PASS.
+- `npx tsc -p tsconfig.tests.json --noEmit`: PASS.
+- `node --import tsx scripts/render-command-docs.ts --check`: PASS.
+- `git diff --check`: PASS.
+- Approved Spec SHA-256 remained
+  `e15d19821fafbac1f0fc21dd82702d41efa481a12bdcee97df238de2ee85f021`.
+- Approved Plan SHA-256 remained
+  `74914bc2e38c1ac7bb8b57dbfa0abfb1963d4da7acc3fbb6868434039ce22b2c`.
+- Final pre-commit `git diff HEAD -- src tests` SHA-256:
+  `e6c59d5a50dec882361b0aaa3790358052d158407729aac44e757c692ce79b6c`.
+- Final pre-commit `git diff HEAD -- src` SHA-256:
+  `3dff2563419eaf09f702a697927d17913560a5183bdd51441930ad2bf316f6f6`.
+
+Files changed by this round:
+
+- `src/cli.ts`
+- `src/provider-activation.ts`
+- `src/provider-authority.ts`
+- `src/setup-ui.ts`
+- `tests/cli.test.ts`
+- `tests/provider-activation.test.ts`
+- this report
+
+No global/full `npm test` was run, per the integrated-review constraint.
+
+## Integrated release closure — process-only reconciliation and first-run publication ownership
+
+This closure continued from committed Integrated Fix Round 2 at
+`32066c8b7c35d0da7361b456e0bd6a2fc2e65edc` and froze the production/test state
+at `900b33d419665fe34b4ad28513cf1ef09836244e`. Scope remained OpenRouter Stable
+provider startup only. Kimi, subscription membership, automatic multi-account
+pooling, Anthropic runtime support, the approved Spec/Plan, and the package
+version were not changed.
+
+### Terminal process-only ownership
+
+- A process-only setup activation that settles after outer interruption now
+  reconciles its exact runtime route without publishing a stale Config,
+  ProviderState, Session, or Cross tuple.
+- The terminal activation owner is no longer gated only by durable persistence;
+  it retains the exact setup/process generation and terminal promise for the
+  process-only route as well.
+- The production regression was captured as a named RED before the minimal
+  correction, followed by 13/13 focused Session/terminal tests and 9/9 focused
+  provider-security tests.
+
+### Full-suite harness stabilization
+
+- The first broad diagnostic run identified one timing-only failure in
+  `saved candidate swap after catalog and model choice has zero activation effects`.
+  Its fixture used a real 100 ms timer despite a fixed fake clock, so heavy
+  full-suite CPU load could expire the permit before the baseline observation.
+- Only the three non-deadline permit tests were changed to use their existing
+  non-expiring fixture deadline. Twelve parallel exact stress processes and the
+  adjacent permit matrix then passed. Production bytes were unchanged by this
+  harness-only commit.
+
+### Real first-run artifact failure and create-only correction
+
+- A built-artifact PTY smoke with a fresh isolated `HOME`, no provider keys,
+  and Escape at the provider picker exposed a real release blocker:
+  `Provider state publication failed.` The in-memory default state existed, but
+  no config file had yet been initialized.
+- Missing config is now treated as the exact logical `DEFAULT_CONFIG`
+  `never-configured` revision 0. A valid provider commit may create revision 1,
+  while corrupt, future, symlinked, non-regular, or changed targets still fail
+  closed.
+- Creation uses a same-directory private temp file plus atomic hard-link
+  publication. `EEXIST` cannot replace a config created after the final
+  snapshot fence. The successful smoke persists one exact `cancelled` revision
+  with no connection or route and mode `0600`.
+
+### Non-forgeable publication-phase ownership
+
+- Adversarial review found that byte-identical foreign config bytes could be
+  mistaken for this process's own publication after an ordinary pre-publish
+  error. The same ownership hole existed for replace and for first-run
+  activation, whose coordinator still selected the rename writer.
+- Both atomic writers now have a precise phase contract. Ordinary rejection
+  preserves the original pre-publication error identity. Only an error created
+  after a resolved `rename` or `link` receives a module-private `WeakSet` brand;
+  a structurally similar object is rejected. The marker never authorizes
+  adoption by itself: exact readback under still-held ownership is mandatory.
+- `saveConfig` and provider-state persistence reconcile only a genuine branded
+  post-publication failure. Create `EEXIST`, final-fence Abort, and rejected
+  replace paths reject even when the foreign bytes exactly equal the candidate.
+- Provider activation now selects the create-only writer for an absent config
+  and combines phase proof with exact readback:
+  - pre + exact old state: fixed failure with owned-candidate cleanup;
+  - pre + candidate bytes: ambiguous recovery, retaining candidate slot/journal;
+  - success or genuine branded post + exact candidate: one complete adoption;
+  - success/post + old, or any mismatched/unreadable readback: ambiguous recovery.
+- Deterministic mutation guards cover real create and replace post brands,
+  unbranded candidate readback, success with old readback, byte-identical
+  create/replace races, retained candidate artifacts, and unchanged foreign
+  inode/bytes.
+
+Three independent final reviews approved the integrated result with no
+P0/P1/P2 findings. Their fresh narrow evidence included 10/10 publication
+ownership tests, 6/6 activation phase-matrix tests, 20/20 TUI/Cross tests, and
+3/3 Session writer/merge tests.
+
+### Final built-artifact smoke
+
+The final committed build was launched in a real isolated PTY with a newly
+created `HOME` and both OpenRouter environment variables absent:
+
+1. provider picker rendered OpenRouter Stable and Anthropic Coming soon;
+2. Escape returned to a live setup-required dashboard;
+3. `/provider status` reported OpenRouter disabled/not checked and Cross off;
+4. `/quit` restored the terminal and exited 0;
+5. exact disk readback reported schema 1, provider revision 1, lifecycle
+   `cancelled`, zero connections, null route, `0600`, and a trailing newline.
+
+### Final full and release gates
+
+- `npm test -- --test-reporter=spec`: 1,644 tests reached; 1,643 passed; 0
+  failed; 0 cancelled; 1 skipped; exit 0; 44.17 seconds.
+- The sole skip remained the allowed Windows PrivateStore real-DACL integration
+  on non-Windows.
+- `npm run build`: PASS.
+- `node scripts/check-package.mjs`: PASS — `orcode@0.4.1`, 175 files, both bin
+  shims.
+- `node scripts/check-release-metadata.mjs --tag v0.4.1`: PASS on the final
+  serial run. One earlier concurrent invocation raced the package check's
+  temporary `dist` staging and saw `dist/cli.js` absent; it was not a product
+  failure and was deliberately rerun after package staging completed.
+- Provider privacy: 3/3 passed, 0 failed, 0 skipped.
+- Both TypeScript projects: PASS.
+- README command-doc check: PASS.
+- Final source/test commit tree: `96f13f777369fa05c6a9135491b9942d08f55a4d`.
+- Final `src` tree: `0eb2169caf69643fe0f5561239b299eeee5a02ce`.
+- Final `tests` tree: `0dba911bd5c288c989bed5a26f98c78ad76af38a`.
+- Final `git diff --check`: PASS; implementation worktree clean before this
+  evidence-only report append.
+
+Closure commits after Integrated Fix Round 2:
+
+- `8818d3b fix: reconcile process-only setup activation`
+- `4399beb test: stabilize candidate permit swap coverage`
+- `46ce7aa fix: initialize first-run provider state safely`
+- `900b33d fix: enforce provider publication ownership`
+
+Files changed by this closure before the evidence-only report append:
+
+- `src/cli.ts`
+- `src/config.ts`
+- `src/provider-activation.ts`
+- `tests/cli.test.ts`
+- `tests/config.test.ts`
+- `tests/provider-activation.test.ts`
