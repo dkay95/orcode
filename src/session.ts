@@ -48,6 +48,9 @@ const MAX_CHECKPOINTS = 50;
 const MAX_TOOL_CALLS = 200;
 const SPEND_HISTORY_DAYS = 90;
 const DEFAULT_TITLE = "Neuer Chat";
+/** Fixed copy: never echoes route fields, so no fingerprint or model reaches an error. */
+const ROUTE_INVALID_MESSAGE = "Chat-Route ist unvollständig oder unbekannt.";
+const ROUTE_MODEL_MISMATCH_MESSAGE = "Chat-Route passt nicht zum gewählten Modell.";
 
 /** A lock older than this belongs to a process that died mid-write. */
 const LOCK_STALE_MS = 30_000;
@@ -284,15 +287,29 @@ export class SessionStore {
     this.#data.updatedAt = new Date().toISOString();
   }
 
+  /**
+   * Persists the model preference together with the exact route that owns it.
+   * A route is stored complete or not at all: an incomplete, future, or
+   * foreign-shaped route and a model that does not belong to the route are
+   * rejected with fixed copy, so the chat never carries a cross-bound identity.
+   */
   setPreferences(model: string, reasoning: ReasoningSetting, route?: RouteIdentityV1): void {
-    this.#data.model = model.trim();
-    if (route) {
-      this.#data.route = structuredClone(route);
+    const trimmedModel = model.trim();
+    if (route !== undefined) {
+      const persistable = persistableSessionRoute(route);
+      if (persistable === null) {
+        throw new Error(ROUTE_INVALID_MESSAGE);
+      }
+      if (!routeOwnsModel(persistable, trimmedModel)) {
+        throw new Error(ROUTE_MODEL_MISMATCH_MESSAGE);
+      }
+      this.#data.route = persistable;
       this.#pendingLegacyRouteProjection = false;
-    } else if (this.#data.route?.requestedModelId !== this.#data.model) {
+    } else if (this.#data.route?.requestedModelId !== trimmedModel) {
       delete this.#data.route;
       this.#pendingLegacyRouteProjection = false;
     }
+    this.#data.model = trimmedModel;
     this.#data.reasoning = structuredClone(reasoning);
     this.#data.updatedAt = new Date().toISOString();
   }
@@ -1062,12 +1079,21 @@ function normalizeSession(
   const model = typeof value.model === "string" && value.model.trim()
     ? value.model.trim()
     : null;
-  const persistedRoute = validateRouteIdentityV1(value.route);
-  const route = persistedRoute ?? (
-    model !== null && isActiveMigratedOpenRouterConnection(providerConnection)
+  let route: RouteIdentityV1 | null;
+  if (value.route !== undefined) {
+    // A chat that carries a route key owns exactly that identity. A partial,
+    // future, or foreign-shaped route — or a model the route does not own —
+    // is corrupt state: fail closed rather than drop the route and let the
+    // model string be re-bound to whatever backend is the current default.
+    route = persistableSessionRoute(value.route);
+    if (route === null || model === null || !routeOwnsModel(route, model)) {
+      return null;
+    }
+  } else {
+    route = model !== null && isActiveMigratedOpenRouterConnection(providerConnection)
       ? mapLegacyOpenRouterModel(model, providerConnection)
-      : null
-  );
+      : null;
+  }
   return {
     version: 2,
     id,
@@ -1090,6 +1116,26 @@ function normalizeSession(
     createdAt,
     updatedAt,
   };
+}
+
+/**
+ * A route the chat file may own. Beyond the shared shape check, only the
+ * migrated OpenRouter connection ever produces a `legacy-unverified` route;
+ * any other backend must be fully resolved or it is not a runnable identity.
+ */
+function persistableSessionRoute(value: unknown): RouteIdentityV1 | null {
+  const route = validateRouteIdentityV1(value);
+  if (route === null) {
+    return null;
+  }
+  if (route.backendId !== "openrouter" && route.resolutionState !== "resolved") {
+    return null;
+  }
+  return route;
+}
+
+function routeOwnsModel(route: RouteIdentityV1, model: string): boolean {
+  return model === route.requestedModelId || model === route.canonicalModelId;
 }
 
 function isActiveMigratedOpenRouterConnection(
@@ -1584,17 +1630,28 @@ export function mergeSessions(
       mine.dailySpendUsd,
       theirs.dailySpendUsd,
     ),
-    ...(pickField(base.model, mine.model, theirs.model) !== undefined
-      ? { model: pickField(base.model, mine.model, theirs.model) }
-      : {}),
-    ...(pickField(base.route, mine.route, theirs.route) !== undefined
-      ? { route: pickField(base.route, mine.route, theirs.route) }
-      : {}),
+    ...pickField(sessionIdentity(base), sessionIdentity(mine), sessionIdentity(theirs)),
     ...(pickField(base.reasoning, mine.reasoning, theirs.reasoning) !== undefined
       ? { reasoning: pickField(base.reasoning, mine.reasoning, theirs.reasoning) }
       : {}),
     createdAt: earlier(mine.createdAt, theirs.createdAt),
     updatedAt: later(mine.updatedAt, theirs.updatedAt),
+  };
+}
+
+interface SessionIdentity {
+  model?: string;
+  route?: RouteIdentityV1;
+}
+
+/**
+ * Model and route are one identity: the route owns the model, so the merge
+ * must never combine one window's model with another window's route.
+ */
+function sessionIdentity(data: PersistedSessionData): SessionIdentity {
+  return {
+    ...(data.model !== undefined ? { model: data.model } : {}),
+    ...(data.route !== undefined ? { route: data.route } : {}),
   };
 }
 

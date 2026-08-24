@@ -19,6 +19,7 @@ import {
   chatLockPath,
   dayKey,
   exportSessionMarkdown,
+  mergeSessions,
   type PersistedSessionData,
   rankChatMatches,
   redactSensitive,
@@ -33,6 +34,7 @@ import {
 import type { ChatSummary, SessionData } from "../src/types.js";
 import type { RouteIdentityV1 } from "../src/backends.js";
 import type { ProviderConnectionStateV1 } from "../src/provider-state.js";
+import type { RouteIdentityV1 } from "../src/backends.js";
 
 async function workspaceRoot(prefix: string): Promise<{
   workspace: string;
@@ -1595,4 +1597,545 @@ test("search ignores blank queries", async () => {
   await store.save();
 
   assert.deepEqual(await SessionStore.search(workspace, "   ", appHome), []);
+});
+
+// ---------------------------------------------------------------------------
+// Task 7A — exact historical Kimi session identity
+// ---------------------------------------------------------------------------
+
+const KIMI_SESSION_REALM = "kimi-code-membership-provider-managed-overage" as const;
+
+const KIMI_SESSION_ROUTE: RouteIdentityV1 = Object.freeze({
+  version: 1,
+  backendId: "kimi-code",
+  accountFingerprint: "acct_kimi_session_fixture",
+  billingRealm: KIMI_SESSION_REALM,
+  requestedModelId: "k3",
+  canonicalModelId: "k3",
+  resolutionState: "resolved",
+});
+
+const LEGACY_OPENROUTER_DEFAULT_CONNECTION: ProviderConnectionStateV1 = Object.freeze({
+  id: "legacy-default-connection",
+  backendId: "openrouter",
+  enabled: true,
+  maturity: "stable",
+  credentialSlot: "legacy:inference",
+  accountFingerprint: "acct_legacy_openrouter_default",
+  accountFingerprintState: "provisional",
+  billingRealm: "openrouter-payg",
+  lastHealth: null,
+});
+
+/** Synthetic canaries; none of them is a real credential, header, body, or path. */
+const KIMI_CANARIES = Object.freeze({
+  rawKey: `sk-kimi-canary-${"q".repeat(40)}`,
+  header: "x-kimi-canary-header: canary-header-value-7f3a",
+  body: '{"error":{"message":"canary-body-7f3a"}}',
+  path: "/Users/canary/.kimi/credentials-7f3a",
+});
+
+async function writeKimiChatFile(
+  appHome: string,
+  workspace: string,
+  id: string,
+  overrides: Record<string, unknown>,
+): Promise<string> {
+  const directory = join(appHome, "chats", workspaceStorageHash(workspace));
+  await mkdir(directory, { recursive: true });
+  const timestamp = "2026-08-24T09:00:00.000Z";
+  const path = join(directory, `${id}.json`);
+  await writeFile(path, `${JSON.stringify({
+    version: 2,
+    id,
+    title: id,
+    workspace,
+    summary: "",
+    turns: [{ role: "user", content: "historical kimi turn", createdAt: timestamp }],
+    costs: { mainUsd: 0, compressorUsd: 0, voiceUsd: 0, totalUsd: 0, costKnowledge: "unknown" },
+    model: KIMI_SESSION_ROUTE.requestedModelId,
+    route: KIMI_SESSION_ROUTE,
+    reasoning: { mode: "auto" },
+    revision: 3,
+    checkpoints: [],
+    toolCalls: [],
+    dailySpendUsd: {},
+    createdAt: timestamp,
+    updatedAt: timestamp,
+    ...overrides,
+  }, null, 2)}\n`);
+  return path;
+}
+
+function assertNoCanary(text: string): void {
+  for (const [name, canary] of Object.entries(KIMI_CANARIES)) {
+    assert.ok(!text.includes(canary), `${name} canary leaked into: ${text.slice(0, 80)}`);
+  }
+  assert.ok(!text.includes("canary-header-value-7f3a"));
+  assert.ok(!text.includes("canary-body-7f3a"));
+  assert.ok(!text.includes("credentials-7f3a"));
+}
+
+test("kimi route persists exactly through create, save, and reopen with an OpenRouter default", async () => {
+  const { workspace, appHome } = await workspaceRoot("kimi-route-roundtrip");
+  const store = SessionStore.create(workspace, appHome, "Kimi Chat");
+  store.setPreferences("k3", { mode: "auto" }, KIMI_SESSION_ROUTE);
+  store.addTurn("user", "Bitte den Parser prüfen");
+  store.addCost("main", 0, "unknown");
+  await store.save();
+
+  const savedBytes = await readFile(store.path, "utf8");
+  const persisted = JSON.parse(savedBytes) as PersistedSessionData;
+  assert.deepEqual(persisted.route, KIMI_SESSION_ROUTE);
+  assert.equal(persisted.model, "k3");
+  assert.equal(persisted.costs.costKnowledge, "unknown");
+
+  const reopened = await SessionStore.openById(
+    workspace,
+    store.data.id,
+    appHome,
+    LEGACY_OPENROUTER_DEFAULT_CONNECTION,
+  );
+  assert.deepEqual(reopened.data.route, KIMI_SESSION_ROUTE);
+  assert.equal(reopened.data.model, "k3");
+  assert.equal(reopened.data.costs.costKnowledge, "unknown");
+  reopened.rebindPendingLegacyRoute(LEGACY_OPENROUTER_DEFAULT_CONNECTION);
+  assert.deepEqual(reopened.data.route, KIMI_SESSION_ROUTE);
+
+  const listed = await SessionStore.list(workspace, appHome, LEGACY_OPENROUTER_DEFAULT_CONNECTION);
+  assert.deepEqual(listed.find((chat) => chat.id === store.data.id)?.route, KIMI_SESSION_ROUTE);
+
+  const outcome = await reopened.save();
+  assert.equal(outcome.merged, false);
+  assert.equal(outcome.revision, persisted.revision);
+  assert.equal(await readFile(store.path, "utf8"), savedBytes);
+  assert.deepEqual(reopened.data.route, KIMI_SESSION_ROUTE);
+});
+
+test("setPreferences without a route keeps the exact kimi route for its model and never synthesizes one", async () => {
+  const { workspace, appHome } = await workspaceRoot("kimi-route-prefs");
+  const store = SessionStore.create(workspace, appHome, "Kimi Prefs");
+  store.setPreferences("k3", { mode: "auto" }, KIMI_SESSION_ROUTE);
+
+  store.setPreferences("k3", { mode: "effort", effort: "high" });
+  assert.deepEqual(store.data.route, KIMI_SESSION_ROUTE);
+
+  store.setPreferences("k3-256k", { mode: "auto" });
+  assert.equal(store.data.route, undefined);
+  assert.equal(store.data.model, "k3-256k");
+  await store.save();
+  const persisted = JSON.parse(await readFile(store.path, "utf8")) as PersistedSessionData;
+  assert.equal(persisted.route, undefined);
+  assert.equal(persisted.model, "k3-256k");
+});
+
+const INVALID_KIMI_ROUTES: ReadonlyArray<{ name: string; route: unknown }> = [
+  {
+    name: "future version",
+    route: { ...KIMI_SESSION_ROUTE, version: 2 },
+  },
+  {
+    name: "missing account fingerprint",
+    route: (() => {
+      const { accountFingerprint: _omit, ...rest } = KIMI_SESSION_ROUTE;
+      return rest;
+    })(),
+  },
+  {
+    name: "empty account fingerprint",
+    route: { ...KIMI_SESSION_ROUTE, accountFingerprint: "" },
+  },
+  {
+    name: "resolved without canonical model",
+    route: { ...KIMI_SESSION_ROUTE, canonicalModelId: null },
+  },
+  {
+    name: "kimi legacy-unverified projection",
+    route: { ...KIMI_SESSION_ROUTE, canonicalModelId: null, resolutionState: "legacy-unverified" },
+  },
+  {
+    name: "unknown billing realm",
+    route: { ...KIMI_SESSION_ROUTE, billingRealm: "kimi-code-membership-free-tier" },
+  },
+  {
+    name: "unknown backend",
+    route: { ...KIMI_SESSION_ROUTE, backendId: "kimi-platform" },
+  },
+  {
+    name: "unknown resolution state",
+    route: { ...KIMI_SESSION_ROUTE, resolutionState: "pending" },
+  },
+  {
+    name: "canary-bearing partial route",
+    route: {
+      version: 1,
+      backendId: "kimi-code",
+      accountFingerprint: KIMI_CANARIES.rawKey,
+      billingRealm: KIMI_SESSION_REALM,
+      requestedModelId: KIMI_CANARIES.header,
+      canonicalModelId: KIMI_CANARIES.body,
+      resolutionState: KIMI_CANARIES.path,
+    },
+  },
+  { name: "null route", route: null },
+  { name: "string route", route: "k3" },
+];
+
+test("setPreferences rejects incomplete, future, or partial kimi routes without persisting them", async () => {
+  const { workspace, appHome } = await workspaceRoot("kimi-route-reject-prefs");
+  for (const { name, route } of INVALID_KIMI_ROUTES) {
+    const store = SessionStore.create(workspace, appHome, `Reject ${name}`);
+    store.setPreferences("k3", { mode: "auto" }, KIMI_SESSION_ROUTE);
+    const before = structuredClone(store.data);
+    assert.throws(
+      () => store.setPreferences("k3", { mode: "effort", effort: "low" }, route as RouteIdentityV1),
+      (error: unknown) => {
+        assert.ok(error instanceof Error, name);
+        assert.match(error.message, /Chat-Route/, name);
+        assertNoCanary(error.message);
+        assert.ok(!error.message.includes("acct_kimi"), name);
+        return true;
+      },
+      name,
+    );
+    assert.deepEqual(store.data, before, name);
+    await store.save();
+    const persisted = JSON.parse(await readFile(store.path, "utf8")) as PersistedSessionData;
+    assert.deepEqual(persisted.route, KIMI_SESSION_ROUTE, name);
+    assert.equal(persisted.model, "k3", name);
+    assert.deepEqual(persisted.reasoning, { mode: "auto" }, name);
+  }
+});
+
+test("setPreferences rejects a model that does not belong to the supplied kimi route", async () => {
+  const { workspace, appHome } = await workspaceRoot("kimi-route-model-mismatch");
+  const store = SessionStore.create(workspace, appHome, "Kimi cross-bind");
+  store.setPreferences("k3", { mode: "auto" }, KIMI_SESSION_ROUTE);
+  const before = structuredClone(store.data);
+
+  assert.throws(
+    () => store.setPreferences("k3-256k", { mode: "auto" }, KIMI_SESSION_ROUTE),
+    (error: unknown) => {
+      assert.ok(error instanceof Error);
+      assert.match(error.message, /Chat-Route/);
+      assert.ok(!error.message.includes("acct_kimi"));
+      return true;
+    },
+  );
+  assert.deepEqual(store.data, before);
+
+  // A resolved route may be addressed by its canonical model id as well.
+  const aliasRoute: RouteIdentityV1 = {
+    ...KIMI_SESSION_ROUTE,
+    requestedModelId: "kimi-k3-alias",
+    canonicalModelId: "k3",
+  };
+  store.setPreferences("k3", { mode: "auto" }, aliasRoute);
+  assert.deepEqual(store.data.route, aliasRoute);
+  assert.equal(store.data.model, "k3");
+});
+
+const MISMATCHED_HISTORICAL_ROUTES: ReadonlyArray<{ name: string; route: RouteIdentityV1 }> = [
+  {
+    name: "replaced key / different account fingerprint",
+    route: { ...KIMI_SESSION_ROUTE, accountFingerprint: "acct_kimi_replaced_key" },
+  },
+  {
+    name: "different kimi canonical model",
+    route: { ...KIMI_SESSION_ROUTE, requestedModelId: "k3-256k", canonicalModelId: "k3-256k" },
+  },
+  {
+    name: "different billing realm",
+    route: { ...KIMI_SESSION_ROUTE, billingRealm: "openrouter-payg" },
+  },
+  {
+    name: "current OpenRouter default with the same model name",
+    route: {
+      version: 1,
+      backendId: "openrouter",
+      accountFingerprint: LEGACY_OPENROUTER_DEFAULT_CONNECTION.accountFingerprint,
+      billingRealm: "openrouter-payg",
+      requestedModelId: "k3",
+      canonicalModelId: "k3",
+      resolutionState: "resolved",
+    },
+  },
+];
+
+test("reopen preserves mismatched historical kimi identities exactly instead of substituting a tuple", async () => {
+  const { workspace, appHome } = await workspaceRoot("kimi-route-mismatch-preserved");
+  for (const [index, { name, route }] of MISMATCHED_HISTORICAL_ROUTES.entries()) {
+    const id = `kimi-mismatch-${index}`;
+    const path = await writeKimiChatFile(appHome, workspace, id, {
+      model: route.requestedModelId,
+      route,
+    });
+    const original = await readFile(path, "utf8");
+
+    const reopened = await SessionStore.openById(
+      workspace,
+      id,
+      appHome,
+      LEGACY_OPENROUTER_DEFAULT_CONNECTION,
+    );
+    assert.deepEqual(reopened.data.route, route, name);
+    assert.equal(reopened.data.model, route.requestedModelId, name);
+    assert.equal(await readFile(path, "utf8"), original, name);
+
+    const listed = await SessionStore.list(workspace, appHome, LEGACY_OPENROUTER_DEFAULT_CONNECTION);
+    assert.deepEqual(listed.find((chat) => chat.id === id)?.route, route, name);
+
+    const outcome = await reopened.save();
+    assert.equal(outcome.merged, false, name);
+    assert.equal(await readFile(path, "utf8"), original, name);
+    reopened.rebindPendingLegacyRoute(LEGACY_OPENROUTER_DEFAULT_CONNECTION);
+    assert.deepEqual(reopened.data.route, route, name);
+  }
+});
+
+test("reopen fails closed on malformed, partial, or future kimi routes instead of projecting a default", async () => {
+  const { workspace, appHome } = await workspaceRoot("kimi-route-fail-closed");
+  for (const [index, { name, route }] of INVALID_KIMI_ROUTES.entries()) {
+    const id = `kimi-invalid-${index}`;
+    const path = await writeKimiChatFile(appHome, workspace, id, { route });
+    const original = await readFile(path, "utf8");
+
+    await assert.rejects(
+      SessionStore.openById(workspace, id, appHome, LEGACY_OPENROUTER_DEFAULT_CONNECTION),
+      (error: unknown) => {
+        assert.ok(error instanceof Error, name);
+        assert.match(error.message, /Chat-Datei ist ungültig/, name);
+        assertNoCanary(error.message);
+        return true;
+      },
+      name,
+    );
+    await assert.rejects(
+      SessionStore.openById(workspace, id, appHome),
+      /Chat-Datei ist ungültig/,
+      name,
+    );
+    const listed = await SessionStore.list(workspace, appHome, LEGACY_OPENROUTER_DEFAULT_CONNECTION);
+    assert.equal(listed.some((chat) => chat.id === id), false, name);
+    assert.equal(await readFile(path, "utf8"), original, name);
+  }
+});
+
+test("reopen fails closed when the persisted model does not belong to the persisted kimi route", async () => {
+  const { workspace, appHome } = await workspaceRoot("kimi-route-model-cross-bind");
+  const id = "kimi-model-cross-bind";
+  const path = await writeKimiChatFile(appHome, workspace, id, { model: "k3-256k" });
+  const original = await readFile(path, "utf8");
+
+  await assert.rejects(
+    SessionStore.openById(workspace, id, appHome, LEGACY_OPENROUTER_DEFAULT_CONNECTION),
+    /Chat-Datei ist ungültig/,
+  );
+  const listed = await SessionStore.list(workspace, appHome, LEGACY_OPENROUTER_DEFAULT_CONNECTION);
+  assert.equal(listed.some((chat) => chat.id === id), false);
+  assert.equal(await readFile(path, "utf8"), original);
+});
+
+test("legacy openrouter chats without a route key still project lazily next to kimi chats", async () => {
+  const { workspace, appHome } = await workspaceRoot("kimi-route-legacy-neighbour");
+  const legacyId = "legacy-openrouter-neighbour";
+  // JSON.stringify drops the undefined key: the fixture has no route at all.
+  const legacyPath = await writeKimiChatFile(appHome, workspace, legacyId, {
+    model: "vendor/legacy-neighbour",
+    route: undefined,
+  });
+  const original = await readFile(legacyPath, "utf8");
+  assert.ok(!original.includes('"route"'));
+
+  const reopened = await SessionStore.openById(
+    workspace,
+    legacyId,
+    appHome,
+    LEGACY_OPENROUTER_DEFAULT_CONNECTION,
+  );
+  assert.deepEqual(reopened.data.route, {
+    version: 1,
+    backendId: "openrouter",
+    accountFingerprint: LEGACY_OPENROUTER_DEFAULT_CONNECTION.accountFingerprint,
+    billingRealm: "openrouter-payg",
+    requestedModelId: "vendor/legacy-neighbour",
+    canonicalModelId: null,
+    resolutionState: "legacy-unverified",
+  });
+  assert.equal(await readFile(legacyPath, "utf8"), original);
+});
+
+test("three-way merge keeps model and route as one identity", () => {
+  const timestamp = "2026-08-24T10:00:00.000Z";
+  const base: PersistedSessionData = {
+    version: 2,
+    id: "merge-identity",
+    title: "Merge identity",
+    workspace: "/synthetic/workspace",
+    summary: "",
+    turns: [],
+    costs: { mainUsd: 0, compressorUsd: 0, voiceUsd: 0, totalUsd: 0, costKnowledge: "known" },
+    revision: 1,
+    checkpoints: [],
+    toolCalls: [],
+    dailySpendUsd: {},
+    model: "k3",
+    route: structuredClone(KIMI_SESSION_ROUTE),
+    createdAt: timestamp,
+    updatedAt: timestamp,
+  };
+  const replacedKey: RouteIdentityV1 = {
+    ...KIMI_SESSION_ROUTE,
+    accountFingerprint: "acct_kimi_replaced_key",
+  };
+  const largeContext: RouteIdentityV1 = {
+    ...KIMI_SESSION_ROUTE,
+    requestedModelId: "k3-256k",
+    canonicalModelId: "k3-256k",
+  };
+
+  // Mine dropped the route with a model change; theirs rebound the same model
+  // to another account. The result must not cross-bind mine's model to theirs' route.
+  const mineDropped = { ...structuredClone(base), model: "synthetic/other" };
+  delete mineDropped.route;
+  const theirsRebound = { ...structuredClone(base), route: structuredClone(replacedKey) };
+  const dropped = mergeSessions(base, mineDropped, theirsRebound);
+  assert.equal(dropped.model, "synthetic/other");
+  assert.equal(dropped.route, undefined);
+
+  // Mine rebound the same model to another account; theirs moved to another
+  // model with its own route. Picking fields independently would produce
+  // model k3-256k with a k3 route — a cross-bound identity that must not exist.
+  const mineRebound = { ...structuredClone(base), route: structuredClone(replacedKey) };
+  const theirsMoved = { ...structuredClone(base), model: "k3-256k", route: structuredClone(largeContext) };
+  const rebound = mergeSessions(base, mineRebound, theirsMoved);
+  assert.equal(rebound.model, "k3");
+  assert.deepEqual(rebound.route, replacedKey);
+
+  // Both sides changed the identity: mine wins as one pair.
+  const mineLarge = { ...structuredClone(base), model: "k3-256k", route: structuredClone(largeContext) };
+  const bothChanged = mergeSessions(base, mineLarge, theirsRebound);
+  assert.equal(bothChanged.model, "k3-256k");
+  assert.deepEqual(bothChanged.route, largeContext);
+
+  // Only theirs changed: theirs' pair is adopted exactly.
+  const theirsLarge = { ...structuredClone(base), model: "k3-256k", route: structuredClone(largeContext) };
+  const theirsOnly = mergeSessions(base, structuredClone(base), theirsLarge);
+  assert.equal(theirsOnly.model, "k3-256k");
+  assert.deepEqual(theirsOnly.route, largeContext);
+
+  // Nobody changed the identity: it is preserved byte-exact.
+  const untouched = mergeSessions(base, structuredClone(base), structuredClone(base));
+  assert.equal(untouched.model, "k3");
+  assert.deepEqual(untouched.route, KIMI_SESSION_ROUTE);
+});
+
+test("concurrent windows preserve the exact kimi route and both turns", async () => {
+  const { workspace, appHome } = await workspaceRoot("kimi-route-concurrent");
+  const origin = SessionStore.create(workspace, appHome, "Kimi concurrent");
+  origin.setPreferences("k3", { mode: "auto" }, KIMI_SESSION_ROUTE);
+  origin.addTurn("user", "origin turn");
+  await origin.save();
+
+  const largeContext: RouteIdentityV1 = {
+    ...KIMI_SESSION_ROUTE,
+    requestedModelId: "k3-256k",
+    canonicalModelId: "k3-256k",
+  };
+  const routeWindow = await SessionStore.openById(workspace, origin.data.id, appHome);
+  const turnWindow = await SessionStore.openById(
+    workspace,
+    origin.data.id,
+    appHome,
+    LEGACY_OPENROUTER_DEFAULT_CONNECTION,
+  );
+  routeWindow.setPreferences("k3-256k", { mode: "auto" }, largeContext);
+  await routeWindow.save();
+  turnWindow.addTurn("assistant", "foreign turn");
+  const outcome = await turnWindow.save();
+  assert.equal(outcome.merged, true);
+
+  const persisted = await SessionStore.openById(
+    workspace,
+    origin.data.id,
+    appHome,
+    LEGACY_OPENROUTER_DEFAULT_CONNECTION,
+  );
+  assert.deepEqual(persisted.data.route, largeContext);
+  assert.equal(persisted.data.model, "k3-256k");
+  assert.deepEqual(
+    new Set(persisted.data.turns.map((turn) => turn.content)),
+    new Set(["origin turn", "foreign turn"]),
+  );
+});
+
+test("fork, clear, checkpoint restore, and run snapshot restore keep the exact kimi route", async () => {
+  const { workspace, appHome } = await workspaceRoot("kimi-route-lifecycle");
+  const store = SessionStore.create(workspace, appHome, "Kimi lifecycle");
+  store.setPreferences("k3", { mode: "auto" }, KIMI_SESSION_ROUTE);
+  store.addTurn("user", "first");
+  const checkpoint = store.createCheckpoint("before second");
+  store.addTurn("assistant", "second");
+  await store.save();
+
+  const fork = await store.fork();
+  assert.deepEqual(fork.data.route, KIMI_SESSION_ROUTE);
+  const reopenedFork = await SessionStore.openById(
+    workspace,
+    fork.data.id,
+    appHome,
+    LEGACY_OPENROUTER_DEFAULT_CONNECTION,
+  );
+  assert.deepEqual(reopenedFork.data.route, KIMI_SESSION_ROUTE);
+  assert.equal(reopenedFork.data.model, "k3");
+
+  store.restoreCheckpoint(checkpoint.id);
+  assert.equal(store.data.turns.length, 1);
+  assert.deepEqual(store.data.route, KIMI_SESSION_ROUTE);
+
+  const snapshot = store.snapshotRunState();
+  store.addTurn("assistant", "staged");
+  store.addCost("main", 0, "unknown");
+  store.restoreRunState(snapshot);
+  assert.deepEqual(store.data.route, KIMI_SESSION_ROUTE);
+  assert.equal(store.data.costs.costKnowledge, "unknown");
+
+  store.clear();
+  assert.deepEqual(store.data.route, KIMI_SESSION_ROUTE);
+  assert.equal(store.data.model, "k3");
+  await store.save();
+  const persisted = JSON.parse(await readFile(store.path, "utf8")) as PersistedSessionData;
+  assert.deepEqual(persisted.route, KIMI_SESSION_ROUTE);
+});
+
+test("privacy canaries never enter the serialized kimi session route or session errors", async () => {
+  const { workspace, appHome } = await workspaceRoot("kimi-route-canaries");
+  const store = SessionStore.create(workspace, appHome, "Kimi canaries");
+  store.setPreferences("k3", { mode: "auto" }, KIMI_SESSION_ROUTE);
+  store.addTurn(
+    "user",
+    `Key ${KIMI_CANARIES.rawKey} header ${KIMI_CANARIES.header} body ${KIMI_CANARIES.body} path ${KIMI_CANARIES.path}`,
+  );
+  await store.save();
+  const raw = await readFile(store.path, "utf8");
+  assert.ok(!raw.includes(KIMI_CANARIES.rawKey));
+  const persisted = JSON.parse(raw) as PersistedSessionData;
+  assert.deepEqual(persisted.route, KIMI_SESSION_ROUTE);
+  assertNoCanary(JSON.stringify(persisted.route));
+
+  const canaryRoute = INVALID_KIMI_ROUTES.find((entry) => entry.name === "canary-bearing partial route")!;
+  const id = "kimi-canary-file";
+  const path = await writeKimiChatFile(appHome, workspace, id, {
+    route: canaryRoute.route,
+    model: KIMI_CANARIES.header,
+  });
+  await assert.rejects(
+    SessionStore.openById(workspace, id, appHome, LEGACY_OPENROUTER_DEFAULT_CONNECTION),
+    (error: unknown) => {
+      assert.ok(error instanceof Error);
+      assertNoCanary(error.message);
+      return true;
+    },
+  );
+  assert.ok((await readFile(path, "utf8")).includes("canary-header-value-7f3a"), "fixture stays untouched");
 });
