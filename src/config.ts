@@ -384,6 +384,7 @@ export async function writeFileAtomicSecure(
   path: string,
   content: string,
   beforePublish?: () => Promise<void>,
+  beforeRename?: () => void,
 ): Promise<void> {
   await ensureSecureDirectory(dirname(path));
   const temporary = `${path}.${randomUUID()}.tmp`;
@@ -394,6 +395,10 @@ export async function writeFileAtomicSecure(
       flag: "wx",
     });
     await beforePublish?.();
+    const finalFenceResult: unknown = beforeRename?.();
+    if (finalFenceResult !== undefined) {
+      throw new Error("Atomic write beforeRename fence must be synchronous.");
+    }
     await rename(temporary, path);
   } catch (error) {
     await unlink(temporary).catch(() => {});

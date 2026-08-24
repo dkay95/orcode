@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import {
+  adoptDurablyCommittedProviderState,
   createNeverConfiguredProviderState,
   migrateLegacyOpenRouterState,
   projectLegacyModelRoutes,
@@ -544,13 +545,44 @@ test("committed provider state readback rejects a structurally forged outcome", 
   assert.equal(providerState.readProviderStateCommitAdoption!(forged), null);
 });
 
+test("durable provider state commit reconciles an exact publication after a later fence loss", async () => {
+  const initial = createNeverConfiguredProviderState();
+  let generationCurrent = true;
+  const store = new ProviderStateStore(initial, {
+    persist: async (request) => {
+      const built = request.build(initial);
+      request.assertCurrent();
+      generationCurrent = false;
+      adoptDurablyCommittedProviderState(request, built);
+      request.assertCurrent();
+      return structuredClone(built);
+    },
+  });
+
+  const committed = await store.commit(
+    initial.revision,
+    (current) => ({ ...current, lifecycle: "cancelled" }),
+    () => {
+      if (!generationCurrent) throw new Error("provider generation is stale");
+    },
+  ).catch((error: unknown) => {
+    const adopted = readProviderStateCommitAdoption(error);
+    assert.ok(adopted);
+    return adopted;
+  });
+
+  assert.equal(committed.revision, 1);
+  assert.equal(committed.lifecycle, "cancelled");
+  assert.deepEqual(store.read(), committed);
+});
+
 test("committed provider outcome rejects a prototype-shaped object with an own readCommitted override", async () => {
   const initial = createNeverConfiguredProviderState();
   const store = new ProviderStateStore(initial, {
     persist: async (request) => {
       const candidate = request.build(initial);
-      request.adopt(candidate);
-      throw new Error("fixed post-adoption persistence failure");
+      adoptDurablyCommittedProviderState(request, candidate);
+      throw new Error("fixed post-publication persistence failure");
     },
   });
   let genuine: unknown;
@@ -597,6 +629,10 @@ test("durable provider state capabilities are closed after successful settlement
   assert.throws(() => retained.assertCurrent(), /closed|settled|capability/i);
   assert.throws(() => retained.build(initial), /closed|settled|capability/i);
   assert.throws(() => retained.adopt(committed), /closed|settled|capability/i);
+  assert.throws(
+    () => adoptDurablyCommittedProviderState(retained, committed),
+    /closed|settled|capability/i,
+  );
   assert.deepEqual(store.read(), beforeLateCalls);
 });
 
@@ -622,6 +658,7 @@ test("durable provider state capabilities are closed after failed settlement", a
     () => retained.assertCurrent(),
     () => retained.build(initial),
     () => retained.adopt(forged),
+    () => adoptDurablyCommittedProviderState(retained, forged),
   ]) {
     try {
       callback();
@@ -631,6 +668,6 @@ test("durable provider state capabilities are closed after failed settlement", a
     }
   }
 
-  assert.deepEqual(lateOutcomes, ["rejected", "rejected", "rejected"]);
+  assert.deepEqual(lateOutcomes, ["rejected", "rejected", "rejected", "rejected"]);
   assert.deepEqual(store.read(), initial);
 });

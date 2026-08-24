@@ -1072,6 +1072,75 @@ test("/verify rounds accepts zero, renders repair semantics, and rejects values 
   assert.equal("maxRounds" in saved.verify, false);
 });
 
+test("chat open proves a foreign exact route before config, session, agent, or current-file mutation", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "routercode-command-foreign-route-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const workspace = join(root, "project");
+  const appHome = join(root, ".orcode");
+  const currentRoute = {
+    version: 1 as const,
+    backendId: "openrouter" as const,
+    accountFingerprint: "acct_command_current_111111",
+    billingRealm: "openrouter-payg" as const,
+    requestedModelId: "vendor/command-current",
+    canonicalModelId: "vendor/command-current",
+    resolutionState: "resolved" as const,
+  };
+  const foreignRoute = {
+    ...currentRoute,
+    accountFingerprint: "acct_command_foreign_222222",
+    requestedModelId: "vendor/command-foreign",
+    canonicalModelId: "vendor/command-foreign",
+  };
+  const current = SessionStore.create(workspace, appHome, "Command current");
+  current.setPreferences(currentRoute.requestedModelId, { mode: "auto" }, currentRoute);
+  await current.save();
+  const currentBytes = await readFile(current.path, "utf8");
+  const historical = SessionStore.create(workspace, appHome, "Command foreign");
+  historical.setPreferences(foreignRoute.requestedModelId, { mode: "auto" }, foreignRoute);
+  await historical.save();
+  const config = structuredClone(DEFAULT_CONFIG);
+  config.mainModel = currentRoute.requestedModelId;
+  const configBefore = structuredClone(config);
+  const selections: unknown[] = [];
+  const transitions: string[] = [];
+  const rebound: string[] = [];
+  const context = {
+    workspace,
+    config,
+    configPath: join(appHome, "config.json"),
+    session: current,
+    agent: { setSession(next: SessionStore) { rebound.push(next.data.id); } },
+    providerRoutes: {
+      currentSessionRoute() { return structuredClone(currentRoute); },
+      async selectSessionRoute(route: unknown) {
+        selections.push(structuredClone(route));
+        throw Object.assign(new Error("foreign command route requires setup"), {
+          code: "provider-setup-required",
+        });
+      },
+      async transitionModel(modelId: string) { transitions.push(modelId); },
+    },
+    providerRouteSurface: "plain",
+    out: { text() {}, error() {} },
+  } as unknown as CommandContext;
+
+  await assert.rejects(
+    handleSlashCommand(`/chat open ${historical.data.id}`, context),
+    (error: unknown) => Boolean(
+      error && typeof error === "object" && "code" in error
+      && error.code === "provider-setup-required"
+    ),
+  );
+
+  assert.deepEqual(selections, [foreignRoute]);
+  assert.deepEqual(transitions, []);
+  assert.equal(context.session, current);
+  assert.deepEqual(context.config, configBefore);
+  assert.deepEqual(rebound, []);
+  assert.equal(await readFile(current.path, "utf8"), currentBytes);
+});
+
 test("chat deletion asks exactly once; decline changes nothing and accept deletes the selected chat", async () => {
   const root = await mkdtemp(join(tmpdir(), "routercode-command-delete-"));
   const workspace = join(root, "project");

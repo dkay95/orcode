@@ -9,7 +9,11 @@ import {
   type ProviderCandidate,
   type ProviderInspection,
 } from "../src/backends.js";
-import { ProviderStateStore, createNeverConfiguredProviderState } from "../src/provider-state.js";
+import {
+  adoptDurablyCommittedProviderState,
+  ProviderStateStore,
+  createNeverConfiguredProviderState,
+} from "../src/provider-state.js";
 import { SetupOrchestrator, type SetupEvent } from "../src/setup.js";
 import {
   createPlainSetupSurface,
@@ -183,6 +187,38 @@ function fixture(surface: SetupSurface, options: { processOnlyNullState?: boolea
   };
   const orchestrator = new SetupOrchestrator({ registry, stateStore, activationCoordinator });
   return { adapter, stateStore, registry, orchestrator, activations, surface };
+}
+
+interface ObservedSetupCancellation {
+  reason: unknown;
+  expectedRevision?: number;
+  expectedGeneration?: number;
+}
+
+function observeSetupCancellations(
+  orchestrator: SetupOrchestrator,
+): ObservedSetupCancellation[] {
+  const observed: ObservedSetupCancellation[] = [];
+  const original = orchestrator.cancelSetup.bind(orchestrator);
+  (orchestrator as SetupOrchestrator & {
+    cancelSetup(request?: ObservedSetupCancellation): ReturnType<SetupOrchestrator["cancelSetup"]>;
+  }).cancelSetup = async (request?: ObservedSetupCancellation) => {
+    observed.push(request ?? { reason: undefined });
+    return original(request as never);
+  };
+  return observed;
+}
+
+function assertOneInteractiveCancellation(
+  observed: readonly ObservedSetupCancellation[],
+  phase: "hub" | "secret" | "model" | "persistence",
+): void {
+  assert.equal(observed.length, 1);
+  assert.deepEqual(observed[0]?.reason, {
+    code: "provider-setup-cancelled",
+    phase,
+  });
+  assert.equal(observed[0]?.expectedRevision, 0);
 }
 
 test("hub connects OpenRouter in secret, model, and explicit persistence order", async () => {
@@ -378,6 +414,187 @@ test("hub keeps exactly one setup prompt active at a time", async () => {
   assert.equal(surface.maxActivePrompts, 1);
 });
 
+test("hub cancellation publishes exactly one generation-aware cancelled lifecycle", async () => {
+  const surface = new ScriptedSurface([null]);
+  const context = fixture(surface);
+  const cancellations = observeSetupCancellations(context.orchestrator);
+
+  const result = await runSetupHub({ ...context, surface, generation: 17 });
+
+  assert.deepEqual(result, { kind: "cancelled", mode: "setup-required" });
+  assertOneInteractiveCancellation(cancellations, "hub");
+  assert.equal(cancellations[0]?.expectedGeneration, 17);
+  assert.equal(context.stateStore.read().lifecycle, "cancelled");
+  assert.deepEqual(surface.calls, ["hub"]);
+  assert.deepEqual(context.adapter.calls, []);
+});
+
+test("secret cancellation publishes exactly one cancelled lifecycle and stops setup", async () => {
+  const surface = new ScriptedSurface(["openrouter"], [null]);
+  const context = fixture(surface);
+  const cancellations = observeSetupCancellations(context.orchestrator);
+
+  const result = await runSetupHub({ ...context, surface });
+
+  assert.deepEqual(result, { kind: "cancelled", mode: "setup-required" });
+  assertOneInteractiveCancellation(cancellations, "secret");
+  assert.equal(context.stateStore.read().lifecycle, "cancelled");
+  assert.deepEqual(surface.calls, ["hub", "secret"]);
+  assert.deepEqual(context.adapter.calls, []);
+});
+
+test("model cancellation publishes exactly one cancelled lifecycle and emits no later setup action", async () => {
+  const surface = new ScriptedSurface(["openrouter"], ["sk-or-v1-test-key"], [null]);
+  const context = fixture(surface);
+  const cancellations = observeSetupCancellations(context.orchestrator);
+
+  const result = await runSetupHub({ ...context, surface });
+
+  assert.deepEqual(result, { kind: "cancelled", mode: "setup-required" });
+  assertOneInteractiveCancellation(cancellations, "model");
+  assert.equal(context.stateStore.read().lifecycle, "cancelled");
+  assert.deepEqual(surface.calls, ["hub", "secret", "model"]);
+  assert.deepEqual(context.adapter.calls, ["connect", "models", "discard"]);
+  assert.equal(context.activations.length, 0);
+});
+
+test("persistence cancellation publishes exactly one cancelled lifecycle and emits no later setup action", async () => {
+  const surface = new ScriptedSurface(
+    ["openrouter"],
+    ["sk-or-v1-test-key"],
+    [MODEL.canonicalModelId],
+    [false],
+  );
+  const context = fixture(surface);
+  const cancellations = observeSetupCancellations(context.orchestrator);
+
+  const result = await runSetupHub({ ...context, surface });
+
+  assert.deepEqual(result, { kind: "cancelled", mode: "setup-required" });
+  assertOneInteractiveCancellation(cancellations, "persistence");
+  assert.equal(context.stateStore.read().lifecycle, "cancelled");
+  assert.deepEqual(surface.calls, ["hub", "secret", "model", "confirm"]);
+  assert.deepEqual(context.adapter.calls, ["connect", "models", "discard"]);
+  assert.equal(context.activations.length, 0);
+});
+
+test("caller abort cancellation preserves the exact reason object and performs no later setup action", async () => {
+  const reason = new DOMException("exact setup caller cancellation", "AbortError");
+  const controller = new AbortController();
+  controller.abort(reason);
+  const surface = new ScriptedSurface(["openrouter"]);
+  const context = fixture(surface);
+  const cancellations = observeSetupCancellations(context.orchestrator);
+
+  const result = await runSetupHub({
+    ...context,
+    surface,
+    signal: controller.signal,
+    generation: 23,
+  });
+
+  assert.deepEqual(result, { kind: "cancelled", mode: "setup-required" });
+  assert.equal(cancellations.length, 1);
+  assert.equal(cancellations[0]?.reason, reason);
+  assert.equal(cancellations[0]?.expectedRevision, 0);
+  assert.equal(cancellations[0]?.expectedGeneration, 23);
+  assert.equal(context.stateStore.read().lifecycle, "cancelled");
+  assert.deepEqual(surface.calls, []);
+  assert.deepEqual(context.adapter.calls, []);
+});
+
+test("caller abort settles a pending hub prompt with the exact reason and one cancellation", async () => {
+  const reason = new DOMException("exact pending hub cancellation", "AbortError");
+  const controller = new AbortController();
+  const surface = new ScriptedSurface([]);
+  surface.chooseHub = async () => new Promise<string | null>(() => undefined);
+  const context = fixture(surface);
+  const cancellations = observeSetupCancellations(context.orchestrator);
+  const pending = runSetupHub({
+    ...context,
+    surface,
+    signal: controller.signal,
+    generation: 29,
+  });
+  await Promise.resolve();
+
+  controller.abort(reason);
+  const notSettled = Symbol("not-settled");
+  const result = await Promise.race([
+    pending,
+    new Promise<typeof notSettled>((resolve) => setImmediate(() => resolve(notSettled))),
+  ]);
+
+  assert.notEqual(result, notSettled);
+  assert.deepEqual(result, { kind: "cancelled", mode: "setup-required" });
+  assert.equal(cancellations.length, 1);
+  assert.equal(cancellations[0]?.reason, reason);
+  assert.equal(cancellations[0]?.expectedGeneration, 29);
+  assert.equal(context.stateStore.read().lifecycle, "cancelled");
+  assert.deepEqual(context.adapter.calls, []);
+});
+
+test("stale setup cancellation cannot overwrite a newer committed activation", async () => {
+  const surface = new ScriptedSurface([]);
+  const context = fixture(surface);
+  const before = context.stateStore.read();
+  const route = {
+    version: 1 as const,
+    backendId: "openrouter" as const,
+    accountFingerprint: "acct_newer_activation",
+    billingRealm: "openrouter-payg" as const,
+    requestedModelId: MODEL.requestedModelId,
+    canonicalModelId: MODEL.canonicalModelId,
+    resolutionState: "resolved" as const,
+  };
+  context.stateStore.replace({
+    ...before,
+    lifecycle: "configured",
+    connections: [{
+      id: "newer-activation",
+      backendId: "openrouter",
+      enabled: true,
+      maturity: "stable",
+      credentialSlot: "v1:inference:90000000-0000-4000-8000-000000000099",
+      accountFingerprint: route.accountFingerprint,
+      accountFingerprintState: "verified",
+      billingRealm: "openrouter-payg",
+      lastHealth: null,
+    }],
+    defaultRoute: route,
+  }, before.revision);
+  const activated = context.stateStore.read();
+
+  await (context.orchestrator.cancelSetup as unknown as (
+    request: ObservedSetupCancellation,
+  ) => Promise<unknown>)({
+    reason: new DOMException("stale cancellation", "AbortError"),
+    expectedRevision: before.revision,
+    expectedGeneration: 0,
+  });
+
+  assert.deepEqual(context.stateStore.read(), activated);
+  assert.equal(context.stateStore.read().lifecycle, "configured");
+});
+
+test("Cross Escape after committed ready is Later and never cancels setup", async () => {
+  const surface = new ScriptedSurface(
+    ["openrouter", null],
+    ["sk-or-v1-test-key"],
+    [MODEL.canonicalModelId],
+    [true],
+  );
+  const context = fixture(surface);
+  const cancellations = observeSetupCancellations(context.orchestrator);
+
+  const result = await runSetupHub({ ...context, surface });
+
+  assert.deepEqual(result, { kind: "ready" });
+  assert.deepEqual(cancellations, []);
+  assert.equal(context.stateStore.read().lifecycle, "configured");
+  assert.equal(context.stateStore.read().cross.enabled, false);
+});
+
 test("coming-soon provider explains itself without adapter or activation effects", async () => {
   const surface = new ScriptedSurface(["anthropic", null]);
   const context = fixture(surface);
@@ -500,6 +717,246 @@ test("Escape after activation is exactly Later and keeps the committed route wit
   assert.equal(state.lifecycle, "configured");
   assert.equal(state.defaultRoute?.canonicalModelId, MODEL.canonicalModelId);
   assert.equal(state.cross.enabled, false);
+});
+
+test("caller abort during post-activation Cross settles as Later with no late effects", async () => {
+  const surface = new ScriptedSurface(
+    [],
+    ["sk-or-v1-test-key"],
+    [MODEL.canonicalModelId, CHALLENGER.canonicalModelId],
+    [true],
+  );
+  const context = fixture(surface);
+  context.adapter.models = [MODEL, CHALLENGER];
+  const cancellations = observeSetupCancellations(context.orchestrator);
+  const controller = new AbortController();
+  let hubCalls = 0;
+  let resolveCross!: (value: string | null) => void;
+  let crossStarted!: () => void;
+  const reachedCross = new Promise<void>((resolve) => { crossStarted = resolve; });
+  surface.chooseHub = async (entries) => {
+    surface.calls.push("hub");
+    surface.entries.push([...entries]);
+    hubCalls += 1;
+    if (hubCalls === 1) return "openrouter";
+    crossStarted();
+    return new Promise<string | null>((resolve) => { resolveCross = resolve; });
+  };
+
+  const pending = runSetupHub({ ...context, surface, signal: controller.signal, generation: 31 });
+  await reachedCross;
+  const activated = context.stateStore.read();
+  const reason = new DOMException("post-activation setup caller cancellation", "AbortError");
+  controller.abort(reason);
+  const notSettled = Symbol("not-settled");
+  const result = await Promise.race([
+    pending,
+    new Promise<typeof notSettled>((resolve) => setImmediate(() => resolve(notSettled))),
+  ]);
+
+  assert.notEqual(result, notSettled);
+  assert.deepEqual(result, { kind: "ready" });
+  assert.deepEqual(cancellations, []);
+  assert.deepEqual(context.stateStore.read(), activated);
+
+  resolveCross("cross-prepare");
+  await Promise.resolve();
+  await Promise.resolve();
+  assert.deepEqual(context.stateStore.read(), activated);
+  assert.deepEqual(surface.calls, ["hub", "secret", "model", "confirm", "hub"]);
+});
+
+function blockingCrossRolePublicationFixture(
+  stage: "before-publication" | "after-publication" = "before-publication",
+) {
+  let durable = createNeverConfiguredProviderState();
+  let publicationEntered!: () => void;
+  const reachedPublication = new Promise<void>((resolve) => {
+    publicationEntered = resolve;
+  });
+  let releasePublication!: () => void;
+  const publicationRelease = new Promise<void>((resolve) => {
+    releasePublication = resolve;
+  });
+  const stateStore = new ProviderStateStore(durable, {
+    persist: async (request) => {
+      if (stage === "before-publication") {
+        publicationEntered();
+        await publicationRelease;
+      }
+      request.assertCurrent();
+      const next = request.build(durable);
+      request.assertCurrent();
+      durable = structuredClone(next);
+      if (stage === "after-publication") {
+        publicationEntered();
+        await publicationRelease;
+      }
+      adoptDurablyCommittedProviderState(request, next);
+      return structuredClone(next);
+    },
+  });
+  const adapter = new Adapter();
+  adapter.models = [MODEL, CHALLENGER];
+  const registry = new BackendRegistry([
+    { descriptor: OPENROUTER, adapter },
+    { descriptor: ANTHROPIC },
+  ]);
+  const activationCoordinator = {
+    async activate(request: ProviderActivationRequest): Promise<ProviderActivationResult> {
+      const route = {
+        version: 1 as const,
+        backendId: "openrouter" as const,
+        accountFingerprint: "acct",
+        billingRealm: "openrouter-payg" as const,
+        requestedModelId: request.selectedCanonicalModelId,
+        canonicalModelId: request.selectedCanonicalModelId,
+        resolutionState: "resolved" as const,
+      };
+      const previous = stateStore.read();
+      const state = stateStore.replace({
+        ...previous,
+        lifecycle: "configured",
+        connections: [{
+          id: "connection",
+          backendId: "openrouter",
+          enabled: true,
+          maturity: "stable",
+          credentialSlot: "v1:inference:90000000-0000-4000-8000-000000000072",
+          accountFingerprint: "acct",
+          accountFingerprintState: "verified",
+          billingRealm: "openrouter-payg",
+          lastHealth: null,
+        }],
+        defaultRoute: route,
+        cross: { enabled: false, preferredLead: null, preferredChallenger: null },
+      }, previous.revision);
+      durable = structuredClone(state);
+      return { persisted: true, warnings: [], state, route };
+    },
+  };
+  const orchestrator = new SetupOrchestrator({ registry, stateStore, activationCoordinator });
+  const surface = new ScriptedSurface(
+    ["openrouter", "cross-prepare"],
+    ["sk-or-v1-test-key"],
+    [MODEL.canonicalModelId, CHALLENGER.canonicalModelId],
+    [true],
+  );
+
+  return {
+    adapter,
+    durable: () => structuredClone(durable),
+    orchestrator,
+    reachedPublication,
+    registry,
+    releasePublication,
+    stateStore,
+    surface,
+  };
+}
+
+test("caller abort after Cross role commit entry leaves no prepublication effects", async () => {
+  const context = blockingCrossRolePublicationFixture();
+  const controller = new AbortController();
+  const pending = runSetupHub({
+    ...context,
+    signal: controller.signal,
+    isCurrent: () => true,
+  });
+  await context.reachedPublication;
+  const activated = context.durable();
+  const eventsAtPublication = context.surface.events.length;
+
+  controller.abort(new DOMException("Cross role publication cancelled", "AbortError"));
+  context.releasePublication();
+  const result = await pending;
+
+  assert.deepEqual(result, { kind: "ready" });
+  assert.deepEqual(context.durable(), activated);
+  assert.deepEqual(context.stateStore.read(), activated);
+  assert.equal(activated.cross.preferredLead, null);
+  assert.equal(activated.cross.preferredChallenger, null);
+  assert.equal(context.surface.events.length, eventsAtPublication);
+  assert.equal("preparedRoles" in result, false);
+});
+
+test("superseded Cross role commit entry leaves no prepublication effects", async () => {
+  const context = blockingCrossRolePublicationFixture();
+  let current = true;
+  const pending = runSetupHub({
+    ...context,
+    isCurrent: () => current,
+  });
+  await context.reachedPublication;
+  const activated = context.durable();
+  const eventsAtPublication = context.surface.events.length;
+
+  current = false;
+  context.releasePublication();
+  const result = await pending;
+
+  assert.deepEqual(result, { kind: "ready" });
+  assert.deepEqual(context.durable(), activated);
+  assert.deepEqual(context.stateStore.read(), activated);
+  assert.equal(activated.cross.preferredLead, null);
+  assert.equal(activated.cross.preferredChallenger, null);
+  assert.equal(context.surface.events.length, eventsAtPublication);
+  assert.equal("preparedRoles" in result, false);
+});
+
+test("caller abort after Cross role publication reconciles the exact committed state", async () => {
+  const context = blockingCrossRolePublicationFixture("after-publication");
+  const controller = new AbortController();
+  const pending = runSetupHub({
+    ...context,
+    signal: controller.signal,
+    isCurrent: () => true,
+  });
+  await context.reachedPublication;
+  const published = context.durable();
+  const eventsAtPublication = context.surface.events.length;
+
+  controller.abort(new DOMException("Cross role publication already committed", "AbortError"));
+  context.releasePublication();
+  const result = await pending;
+
+  assert.deepEqual(result, { kind: "ready" });
+  assert.deepEqual(context.durable(), published);
+  assert.deepEqual(context.stateStore.read(), published);
+  assert.equal(published.revision, 2);
+  assert.equal(published.cross.preferredLead?.canonicalModelId, MODEL.canonicalModelId);
+  assert.equal(
+    published.cross.preferredChallenger?.canonicalModelId,
+    CHALLENGER.canonicalModelId,
+  );
+  assert.equal(context.surface.events.length, eventsAtPublication);
+});
+
+test("supersession after Cross role publication reconciles the exact committed state", async () => {
+  const context = blockingCrossRolePublicationFixture("after-publication");
+  let current = true;
+  const pending = runSetupHub({
+    ...context,
+    isCurrent: () => current,
+  });
+  await context.reachedPublication;
+  const published = context.durable();
+  const eventsAtPublication = context.surface.events.length;
+
+  current = false;
+  context.releasePublication();
+  const result = await pending;
+
+  assert.deepEqual(result, { kind: "ready" });
+  assert.deepEqual(context.durable(), published);
+  assert.deepEqual(context.stateStore.read(), published);
+  assert.equal(published.revision, 2);
+  assert.equal(published.cross.preferredLead?.canonicalModelId, MODEL.canonicalModelId);
+  assert.equal(
+    published.cross.preferredChallenger?.canonicalModelId,
+    CHALLENGER.canonicalModelId,
+  );
+  assert.equal(context.surface.events.length, eventsAtPublication);
 });
 
 test("prepare roles stores distinct resolved models while Cross remains off and starts no collaboration", async () => {

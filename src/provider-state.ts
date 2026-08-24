@@ -306,6 +306,7 @@ export class ProviderStateStore {
     let buildCalls = 0;
     let builtCandidate: ProviderSetupStateV1 | null = null;
     let adoptedCandidate: ProviderSetupStateV1 | null = null;
+    let publicationCommitted = false;
     let protocolInvalid = false;
     let capabilitiesOpen = true;
 
@@ -317,6 +318,7 @@ export class ProviderStateStore {
 
     const assertCurrentCapability = (): void => {
       assertCapabilityOpen();
+      if (publicationCommitted) return;
       try {
         assertCurrent();
       } catch (error) {
@@ -380,7 +382,6 @@ export class ProviderStateStore {
         throw error;
       }
     };
-
     const adoptCommitted = (committed: ProviderSetupStateV1): void => {
       assertCapabilityOpen();
       let interrupted = false;
@@ -406,6 +407,7 @@ export class ProviderStateStore {
         }
         this.#state = structuredClone(validated);
         adoptedCandidate = structuredClone(validated);
+        publicationCommitted = true;
       } catch (error) {
         if (!interrupted || !adoptedCandidate) protocolInvalid = true;
         throw error;
@@ -454,10 +456,14 @@ export class ProviderStateStore {
         && JSON.stringify(this.#state) === JSON.stringify(adoptedCandidate)
         ? adoptedCandidate
         : null;
-      if (protocolInvalid && exactAdoption) {
+      if (
+        !publicationCommitted
+        && protocolInvalid
+        && exactAdoption
+      ) {
         this.#state = structuredClone(stateBeforeCommit);
       }
-      if (!protocolInvalid && exactAdoption) {
+      if (exactAdoption && (publicationCommitted || !protocolInvalid)) {
         throw new ProviderStateCommitAdoptedError(exactAdoption);
       }
       throw error;

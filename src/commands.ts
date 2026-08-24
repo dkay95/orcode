@@ -76,6 +76,7 @@ import {
 } from "./panel.js";
 import { renderPanel } from "./ui/panel-view.js";
 import type { SetupSurface } from "./setup-ui.js";
+import { ProviderSetupRequiredError, type RouteIdentityV1 } from "./backends.js";
 import { renderLines } from "./ui/compose.js";
 import { createTheme } from "./ui/theme.js";
 import {
@@ -155,6 +156,15 @@ export interface ProviderRouteIntentPort {
     run: () => Promise<T>,
     surface?: SetupSurface | "plain" | "fullscreen",
   ): Promise<T>;
+  /** Exact route currently bound to the model-facing runtime. */
+  currentSessionRoute?(): RouteIdentityV1;
+  /** Proves and stages an already persisted resolved session route. */
+  selectSessionRoute?(
+    route: RouteIdentityV1,
+    surface?: SetupSurface | "plain" | "fullscreen",
+  ): Promise<RouteIdentityV1>;
+  /** Commits the staged route together with current-session ownership. */
+  adoptSession?(session: SessionStore): void;
   transitionModel(
     modelId: string,
     canonicalModelId?: string,
@@ -246,6 +256,8 @@ export interface CommandContext<Agent extends OrcodeAgent | null = OrcodeAgent> 
   openRouter: OpenRouterService;
   session: SessionStore;
   agent: Agent;
+  /** Atomically transfers provider, session, agent, and local-runtime ownership. */
+  commitSessionHandoff?(session: SessionStore): void;
   localRuntime?: CommandLocalRuntime;
   providerCredentials?: ProviderCredentialIntentPort;
   /** Shared provider runtime seam for route-changing model/session commands. */
@@ -367,6 +379,19 @@ function commandLocalRuntime(
 function updateCommandSession(context: NullableCommandContext, next: SessionStore): void {
   context.agent?.setSession(next);
   context.localRuntime?.setSession(next);
+}
+
+function commitCommandSessionHandoff(
+  context: NullableCommandContext,
+  next: SessionStore,
+): void {
+  if (context.commitSessionHandoff) {
+    context.commitSessionHandoff(next);
+    return;
+  }
+  context.providerRoutes?.adoptSession?.(next);
+  context.session = next;
+  updateCommandSession(context, next);
 }
 
 function resetCommandConversation(context: NullableCommandContext): void {
@@ -1964,11 +1989,15 @@ async function replaceDeletedSession(
   context: CommandContext,
   next: SessionStore,
 ): Promise<void> {
-  context.session = next;
-  updateCommandSession(context, next);
+  const route = readableCommandSessionRoute(context, false);
+  if (route) {
+    context.config.mainModel = route.requestedModelId;
+  }
+  commitCommandSessionHandoff(context, next);
   next.setPreferences(
     context.config.mainModel,
     getReasoningSetting(context.config),
+    route,
   );
   await Promise.all([next.save(), saveContextConfig(context)]);
 }
@@ -1977,39 +2006,76 @@ async function replaceSession(
   context: CommandContext,
   next: SessionStore,
 ): Promise<void> {
-  if (context.session.data.id !== next.data.id) {
-    await saveSessionPreferences(context);
-  }
-  if (next.data.model && next.data.model !== context.config.mainModel) {
+  const previousRoute = readableCommandSessionRoute(context);
+  let selectedRoute = readableCommandSessionRoute(context, false);
+  if (next.data.route?.resolutionState === "resolved") {
+    if (!context.providerRoutes?.selectSessionRoute) {
+      throw new ProviderSetupRequiredError();
+    }
+    selectedRoute = await context.providerRoutes.selectSessionRoute(
+      next.data.route,
+      context.providerRouteSurface,
+    );
+  } else if (next.data.model && next.data.model !== context.config.mainModel) {
     await context.providerRoutes?.transitionModel(
       next.data.model,
       undefined,
       context.providerRouteSurface,
     );
+    selectedRoute = readableCommandSessionRoute(context, false) ?? next.data.route;
   }
-  context.session = next;
-  if (next.data.model) {
+  if (context.session.data.id !== next.data.id) {
+    await saveSessionPreferences(context, previousRoute);
+  }
+  commitCommandSessionHandoff(context, next);
+  if (selectedRoute) context.config.mainModel = selectedRoute.requestedModelId;
+  if (!selectedRoute && next.data.model) {
     context.config.mainModel = next.data.model;
   }
   if (next.data.reasoning) {
     setReasoningSetting(context.config, next.data.reasoning);
   }
-  // Swapping the chat keeps the cached model resolution, the compressor price
-  // cache and the change journal; rebuilding the agent threw all of that away.
-  updateCommandSession(context, next);
+  // The one handoff above keeps provider/runtime/session ownership exact while
+  // reusing the cached model resolution, compressor price cache, and journal.
   next.setPreferences(
     context.config.mainModel,
     getReasoningSetting(context.config),
+    selectedRoute,
   );
   await Promise.all([next.save(), saveContextConfig(context)]);
 }
 
-async function saveSessionPreferences(context: CommandContext): Promise<void> {
+async function saveSessionPreferences(
+  context: CommandContext,
+  route = readableCommandSessionRoute(context),
+): Promise<void> {
   context.session.setPreferences(
     context.config.mainModel,
     getReasoningSetting(context.config),
+    route,
   );
   await context.session.save();
+}
+
+function readableCommandSessionRoute(
+  context: CommandContext,
+  fallbackToPersisted = true,
+): RouteIdentityV1 | undefined {
+  if (!context.providerRoutes?.currentSessionRoute) {
+    return fallbackToPersisted ? context.session.data.route : undefined;
+  }
+  try {
+    return context.providerRoutes.currentSessionRoute();
+  } catch (error) {
+    if (
+      error instanceof ProviderSetupRequiredError
+      || (typeof error === "object" && error !== null && "code" in error
+        && error.code === "provider-setup-required")
+    ) {
+      return fallbackToPersisted ? context.session.data.route : undefined;
+    }
+    throw error;
+  }
 }
 
 function printCurrentChat(session: SessionStore, out: CommandOutput): void {

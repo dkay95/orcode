@@ -79,6 +79,36 @@ export interface SetupHubOptions {
     requireCredentialPermit: boolean,
     use: (lease: ProviderCandidateAuthorityLease) => Promise<T>,
   ) => Promise<ProviderCandidateAuthorityResult<T>>;
+  /** Exact runtime setup attempt; false fences every post-activation Cross effect. */
+  isCurrent?: () => boolean;
+}
+
+const SETUP_CALLER_ABORTED = Symbol("setup-caller-aborted");
+
+function awaitSetupInput<T>(
+  operation: Promise<T>,
+  signal?: AbortSignal,
+): Promise<T | typeof SETUP_CALLER_ABORTED> {
+  if (!signal) return operation;
+  if (signal.aborted) return Promise.resolve(SETUP_CALLER_ABORTED);
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const finish = (value: T | typeof SETUP_CALLER_ABORTED) => {
+      if (settled) return;
+      settled = true;
+      signal.removeEventListener("abort", onAbort);
+      resolve(value);
+    };
+    const onAbort = () => finish(SETUP_CALLER_ABORTED);
+    signal.addEventListener("abort", onAbort, { once: true });
+    if (signal.aborted) onAbort();
+    operation.then(finish, (error) => {
+      if (settled) return;
+      settled = true;
+      signal.removeEventListener("abort", onAbort);
+      reject(error);
+    });
+  });
 }
 
 /**
@@ -102,13 +132,30 @@ export async function runSetupHub(options: SetupHubOptions): Promise<SetupHubRes
 
 async function runSetupHubAttempt(options: SetupHubOptions): Promise<SetupHubResult> {
   const { surface, registry, orchestrator, stateStore } = options;
+  const cancellationRevision = options.expectedRevision ?? stateStore.read().revision;
+  let cancellation: Promise<SetupHubResult> | null = null;
+  const cancelOnce = (
+    phase: "hub" | "secret" | "model" | "persistence",
+    reason: unknown = { code: "provider-setup-cancelled", phase },
+  ): Promise<SetupHubResult> => {
+    if (!cancellation) {
+      cancellation = orchestrator.cancelSetup({
+        reason,
+        expectedRevision: cancellationRevision,
+        ...(options.generation === undefined
+          ? {}
+          : { expectedGeneration: options.generation }),
+      }).then(() => ({ kind: "cancelled" as const, mode: "setup-required" as const }));
+    }
+    return cancellation;
+  };
   const savedSecret = nonEmpty(options.savedSecret);
   let pendingEnvironment = savedSecret ? null : nonEmpty(options.environmentSecret);
   let savedAvailable = savedSecret !== null;
   let environmentOffered = false;
 
   while (true) {
-    if (options.signal?.aborted) return { kind: "cancelled", mode: "setup-required" };
+    if (options.signal?.aborted) return cancelOnce("hub", options.signal.reason);
     if (pendingEnvironment) {
       const secret = pendingEnvironment;
       pendingEnvironment = null;
@@ -121,18 +168,22 @@ async function runSetupHubAttempt(options: SetupHubOptions): Promise<SetupHubRes
         options,
       );
       if (outcome.kind === "ready") {
-        return completeCrossSetup(surface, registry, stateStore, outcome, options.signal!);
+        return completeCrossSetup(surface, registry, stateStore, outcome, options);
       }
-      if (outcome.kind === "cancelled") return { kind: "cancelled", mode: "setup-required" };
+      if (outcome.kind === "cancelled") {
+        return cancelOnce(outcome.phase, outcome.reason);
+      }
+      if (outcome.kind === "blocked") return { kind: "cancelled", mode: "setup-required" };
       continue;
     }
 
     const entries = hubEntries(registry, stateStore, environmentOffered);
-    const selected = await abortableSetupAction(
-      () => surface.chooseHub(entries),
-      options.signal!,
-    );
-    if (selected === null) return { kind: "cancelled", mode: "setup-required" };
+    const selected = await awaitSetupInput(surface.chooseHub(entries), options.signal);
+    if (selected === SETUP_CALLER_ABORTED) {
+      return cancelOnce("hub", options.signal?.reason);
+    }
+    if (options.signal?.aborted) return cancelOnce("hub", options.signal.reason);
+    if (selected === null) return cancelOnce("hub");
 
     if (selected === "openrouter:environment" && environmentOffered) {
       const environment = nonEmpty(options.environmentSecret);
@@ -146,9 +197,12 @@ async function runSetupHubAttempt(options: SetupHubOptions): Promise<SetupHubRes
         options,
       );
       if (outcome.kind === "ready") {
-        return completeCrossSetup(surface, registry, stateStore, outcome, options.signal!);
+        return completeCrossSetup(surface, registry, stateStore, outcome, options);
       }
-      if (outcome.kind === "cancelled") return { kind: "cancelled", mode: "setup-required" };
+      if (outcome.kind === "cancelled") {
+        return cancelOnce(outcome.phase, outcome.reason);
+      }
+      if (outcome.kind === "blocked") return { kind: "cancelled", mode: "setup-required" };
       continue;
     }
 
@@ -172,14 +226,19 @@ async function runSetupHubAttempt(options: SetupHubOptions): Promise<SetupHubRes
       // until its validation fails and is never silently replaced by env.
       askPersistence = false;
     } else {
-      candidate = await abortableSetupAction(
-        () => surface.readSecret({
+      const secretInput = await awaitSetupInput(
+        surface.readSecret({
           backendId: descriptor.id,
           message: `${descriptor.displayName} Zugangsschlüssel`,
         }),
-        options.signal!,
+        options.signal,
       );
-      if (candidate === null) return { kind: "cancelled", mode: "setup-required" };
+      if (secretInput === SETUP_CALLER_ABORTED) {
+        return cancelOnce("secret", options.signal?.reason);
+      }
+      candidate = secretInput;
+      if (options.signal?.aborted) return cancelOnce("secret", options.signal.reason);
+      if (candidate === null) return cancelOnce("secret");
     }
 
     const outcome = await activateOpenRouter(
@@ -191,9 +250,12 @@ async function runSetupHubAttempt(options: SetupHubOptions): Promise<SetupHubRes
       options,
     );
     if (outcome.kind === "ready") {
-      return completeCrossSetup(surface, registry, stateStore, outcome, options.signal!);
+      return completeCrossSetup(surface, registry, stateStore, outcome, options);
     }
-    if (outcome.kind === "cancelled") return { kind: "cancelled", mode: "setup-required" };
+    if (outcome.kind === "cancelled") {
+      return cancelOnce(outcome.phase, outcome.reason);
+    }
+    if (outcome.kind === "blocked") return { kind: "cancelled", mode: "setup-required" };
     if (usingSaved && outcome.kind === "rejected") {
       savedAvailable = false;
       environmentOffered = nonEmpty(options.environmentSecret) !== null;
@@ -204,7 +266,12 @@ async function runSetupHubAttempt(options: SetupHubOptions): Promise<SetupHubRes
 type ActivationFlow =
   | { kind: "retry" }
   | { kind: "rejected" }
-  | { kind: "cancelled" }
+  | { kind: "blocked" }
+  | {
+    kind: "cancelled";
+    phase: "model" | "persistence" | "hub" | "secret";
+    reason?: unknown;
+  }
   | {
     kind: "ready";
     route: RouteIdentityV1;
@@ -333,7 +400,12 @@ async function activateOpenRouter(
         ),
         signal,
       );
-      if (guarded.kind !== "ready") return { kind: "cancelled" };
+      if (guarded.kind !== "ready") {
+        if (signal.aborted) {
+          return { kind: "cancelled", phase: "model", reason: signal.reason };
+        }
+        return { kind: "blocked" };
+      }
       catalog = guarded.value;
     } else {
       if (options.preflightCandidate) {
@@ -344,19 +416,28 @@ async function activateOpenRouter(
             signal,
           );
         } catch {
-          return { kind: "cancelled" };
+          if (signal.aborted) {
+            return { kind: "cancelled", phase: "model", reason: signal.reason };
+          }
+          return { kind: "blocked" };
         }
-        if (!permitted) return { kind: "cancelled" };
+        if (!permitted) return { kind: "blocked" };
       }
       catalog = await abortableSetupAction(() => connectAndList(), signal);
     }
     if (catalog.kind !== "models") return catalog;
     const { models } = catalog;
-    const selectedCanonicalModelId = await abortableSetupAction(
-      () => surface.chooseModel({ backendId: "openrouter", models }),
+    const selectedCanonicalModelId = await awaitSetupInput(
+      surface.chooseModel({ backendId: "openrouter", models }),
       signal,
     );
-    if (selectedCanonicalModelId === null) return { kind: "cancelled" };
+    if (selectedCanonicalModelId === SETUP_CALLER_ABORTED) {
+      return { kind: "cancelled", phase: "model", reason: signal.reason };
+    }
+    if (signal.aborted) {
+      return { kind: "cancelled", phase: "model", reason: signal.reason };
+    }
+    if (selectedCanonicalModelId === null) return { kind: "cancelled", phase: "model" };
     const selectedModels = models.filter(
       (model) => model.canonicalModelId === selectedCanonicalModelId,
     );
@@ -367,15 +448,21 @@ async function activateOpenRouter(
     }
     const selectedModel = selectedModels[0]!;
     if (askPersistence) {
-      const accepted = await abortableSetupAction(
-        () => surface.confirm({
+      const accepted = await awaitSetupInput(
+        surface.confirm({
           id: "save-openrouter-key",
           message: "OpenRouter-Schlüssel sicher speichern?",
           defaultValue: true,
         }),
         signal,
       );
-      if (!accepted) return { kind: "cancelled" };
+      if (accepted === SETUP_CALLER_ABORTED) {
+        return { kind: "cancelled", phase: "persistence", reason: signal.reason };
+      }
+      if (signal.aborted) {
+        return { kind: "cancelled", phase: "persistence", reason: signal.reason };
+      }
+      if (!accepted) return { kind: "cancelled", phase: "persistence" };
     }
     const activation = await abortableSetupAction(
       () => orchestrator.activateCandidate({
@@ -394,7 +481,9 @@ async function activateOpenRouter(
     surface.present(notice("OpenRouter ist eingerichtet."));
     return { kind: "ready", route: activation.route, state: activation.state, models };
   } catch {
-    if (signal.aborted) return { kind: "cancelled" };
+    if (signal.aborted) {
+      return { kind: "cancelled", phase: "model", reason: signal.reason };
+    }
     // This boundary must never reveal credential bytes or provider error text.
     surface.present(notice("OpenRouter konnte nicht eingerichtet werden. Bitte erneut versuchen."));
     return { kind: "retry" };
@@ -502,73 +591,98 @@ async function completeCrossSetup(
   registry: BackendRegistry,
   stateStore: ProviderStateStore,
   activation: Extract<ActivationFlow, { kind: "ready" }>,
-  signal: AbortSignal,
+  attempt: Pick<SetupHubOptions, "signal" | "isCurrent">,
 ): Promise<SetupHubResult> {
-  try {
-    presentSetup(
-      surface,
-      providerState(hubEntries(registry, stateStore, false, activation.route)),
-      signal,
-    );
-    const action = await abortableSetupAction(() => surface.chooseHub([
-      { id: "cross-later", label: "Later", description: "Collaboration remains off.", disabled: false, current: true, generation: stateStore.read().revision },
-      { id: "cross-prepare", label: "Prepare roles", description: "Store two routes without starting collaboration.", disabled: false, current: false, generation: stateStore.read().revision },
-    ]), signal);
-    if (action === null || action === "cross-later") return { kind: "ready" };
-    if (action !== "cross-prepare") return { kind: "ready" };
+  const signal = attempt.signal ?? new AbortController().signal;
+  const activationIsCurrent = (): boolean => attempt.isCurrent?.() !== false
+    && (activation.state === null
+      || JSON.stringify(stateStore.read()) === JSON.stringify(activation.state));
+  const crossInputIsCurrent = (): boolean => !signal.aborted
+    && activationIsCurrent();
+  if (!crossInputIsCurrent()) return { kind: "ready" };
+  presentSetup(
+    surface,
+    providerState(hubEntries(registry, stateStore, false, activation.route)),
+    signal,
+  );
+  const action = await awaitSetupInput(surface.chooseHub([
+    { id: "cross-later", label: "Later", description: "Collaboration remains off.", disabled: false, current: true, generation: stateStore.read().revision },
+    { id: "cross-prepare", label: "Prepare roles", description: "Store two routes without starting collaboration.", disabled: false, current: false, generation: stateStore.read().revision },
+  ]), signal);
+  if (action === SETUP_CALLER_ABORTED || !crossInputIsCurrent()) return { kind: "ready" };
+  if (action === null || action === "cross-later") return { kind: "ready" };
+  if (action !== "cross-prepare") return { kind: "ready" };
 
-    const current = resolvedRoute(activation.route);
-    if (!current) {
+  const current = resolvedRoute(activation.route);
+  if (!current) {
+    if (crossInputIsCurrent()) {
       presentSetup(surface, notice("Prepare roles benötigt zwei unterschiedliche vollständig aufgelöste Modelle."), signal);
-      return { kind: "ready" };
     }
-    const choices = activation.models.filter((model) =>
-      current.resolutionState === "resolved"
-      && current.canonicalModelId !== model.canonicalModelId,
-    );
-    if (current.resolutionState !== "resolved" || !current.canonicalModelId || !choices.length) {
-      presentSetup(surface, notice("Prepare roles benötigt zwei unterschiedliche vollständig aufgelöste Modelle."), signal);
-      return { kind: "ready" };
-    }
-    const chosen = await abortableSetupAction(
-      () => surface.chooseModel({ backendId: current.backendId, models: choices }),
-      signal,
-    );
-    const challenger = choices.find((model) => model.canonicalModelId === chosen);
-    if (!challenger || challenger.canonicalModelId === current.canonicalModelId) {
-      presentSetup(surface, notice("Prepare roles benötigt zwei unterschiedliche vollständig aufgelöste Modelle."), signal);
-      return { kind: "ready" };
-    }
-    const challengerRoute = routeForModel(current, challenger);
-    if (!challengerRoute) {
-      presentSetup(surface, notice("Prepare roles benötigt zwei unterschiedliche vollständig aufgelöste Modelle."), signal);
-      return { kind: "ready" };
-    }
-    if (activation.state === null) {
-      presentSetup(surface, notice("Rollen sind nur für diese Prozessroute vorbereitet. Cross bleibt ausgeschaltet."), signal);
-      return { kind: "ready", preparedRoles: { lead: current, challenger: challengerRoute } };
-    }
-    await abortableSetupAction(
-      () => stateStore.commit(
-        stateStore.read().revision,
-        (state) => ({
-          ...state,
-          cross: {
-            enabled: false,
-            preferredLead: current,
-            preferredChallenger: challengerRoute,
-          },
-        }),
-        () => assertSetupAttemptCurrent(signal),
-      ),
-      signal,
-    );
-    presentSetup(surface, notice("Rollen wurden vorbereitet. Cross bleibt ausgeschaltet."), signal);
     return { kind: "ready" };
+  }
+  const choices = activation.models.filter((model) =>
+    current.resolutionState === "resolved"
+    && current.canonicalModelId !== model.canonicalModelId,
+  );
+  if (current.resolutionState !== "resolved" || !current.canonicalModelId || !choices.length) {
+    if (crossInputIsCurrent()) {
+      presentSetup(surface, notice("Prepare roles benötigt zwei unterschiedliche vollständig aufgelöste Modelle."), signal);
+    }
+    return { kind: "ready" };
+  }
+  const chosen = await awaitSetupInput(
+    surface.chooseModel({ backendId: current.backendId, models: choices }),
+    signal,
+  );
+  if (chosen === SETUP_CALLER_ABORTED || !crossInputIsCurrent()) return { kind: "ready" };
+  const challenger = choices.find((model) => model.canonicalModelId === chosen);
+  if (!challenger || challenger.canonicalModelId === current.canonicalModelId) {
+    presentSetup(surface, notice("Prepare roles benötigt zwei unterschiedliche vollständig aufgelöste Modelle."), signal);
+    return { kind: "ready" };
+  }
+  const challengerRoute = routeForModel(current, challenger);
+  if (!challengerRoute) {
+    presentSetup(surface, notice("Prepare roles benötigt zwei unterschiedliche vollständig aufgelöste Modelle."), signal);
+    return { kind: "ready" };
+  }
+  if (activation.state === null) {
+    presentSetup(surface, notice("Rollen sind nur für diese Prozessroute vorbereitet. Cross bleibt ausgeschaltet."), signal);
+    return { kind: "ready", preparedRoles: { lead: current, challenger: challengerRoute } };
+  }
+  const activationState = activation.state;
+  let staleActivation = false;
+  let preparedState: ReturnType<ProviderStateStore["read"]>;
+  const assertCrossCommitCurrent = (): void => {
+    if (crossInputIsCurrent()) return;
+    staleActivation = true;
+    throw new Error("Provider Cross activation was superseded.");
+  };
+  try {
+    preparedState = await stateStore.commit(activationState.revision, (state) => {
+      if (JSON.stringify(state) !== JSON.stringify(activationState)) {
+        staleActivation = true;
+        throw new Error("Provider Cross activation was superseded.");
+      }
+      return {
+        ...state,
+        cross: {
+          enabled: false,
+          preferredLead: current,
+          preferredChallenger: challengerRoute,
+        },
+      };
+    }, assertCrossCommitCurrent);
   } catch (error) {
-    if (signal.aborted) return { kind: "ready" };
+    if (staleActivation || !activationIsCurrent()) return { kind: "ready" };
     throw error;
   }
+  if (
+    signal.aborted
+    || attempt.isCurrent?.() === false
+    || JSON.stringify(stateStore.read()) !== JSON.stringify(preparedState)
+  ) return { kind: "ready" };
+  presentSetup(surface, notice("Rollen wurden vorbereitet. Cross bleibt ausgeschaltet."), signal);
+  return { kind: "ready" };
 }
 
 function compatibleMainModels(models: readonly BackendModelDescriptor[]): BackendModelDescriptor[] {
