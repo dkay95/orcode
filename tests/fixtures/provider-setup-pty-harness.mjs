@@ -711,11 +711,12 @@ async function runChildHarness(scenario) {
     counters.network += 1;
     throw new Error("Network is forbidden in the provider PTY proof.");
   };
-  const [{ TerminalUi }, setupUi, backends, providerState] = await Promise.all([
+  const [{ TerminalUi }, setupUi, backends, providerState, setup] = await Promise.all([
     import(pathToFileURL(join(absoluteModuleRoot, "tui.js")).href),
     import(pathToFileURL(join(absoluteModuleRoot, "setup-ui.js")).href),
     import(pathToFileURL(join(absoluteModuleRoot, "backends.js")).href),
     import(pathToFileURL(join(absoluteModuleRoot, "provider-state.js")).href),
+    import(pathToFileURL(join(absoluteModuleRoot, "setup.js")).href),
   ]);
 
   const observed = [];
@@ -817,8 +818,8 @@ async function runChildHarness(scenario) {
       },
     },
   ]);
-  const orchestrator = {
-    async activateCandidate(request) {
+  const activationCoordinator = {
+    async activate(request) {
       counters.activation += 1;
       counters.credentialStore += 1;
       counters.config += 1;
@@ -843,6 +844,11 @@ async function runChildHarness(scenario) {
       return { persisted: true, route, state: committed, warnings: [] };
     },
   };
+  const orchestrator = new setup.SetupOrchestrator({
+    registry,
+    stateStore,
+    activationCoordinator,
+  });
   const terminalState = {
     workspace: "provider-proof-workspace",
     projectStatus: "provider proof",
