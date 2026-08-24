@@ -103,7 +103,7 @@ test("provider catalog, completion, help, and generated docs expose the one flat
   assert.match(provider?.description ?? "", /OpenRouter.*Stable/i);
   assert.match(provider?.description ?? "", /Kimi Code Abo.*Preview/);
   assert.match(provider?.description ?? "", /Membership/);
-  assert.doesNotMatch(provider?.description ?? "", /Kimi[^;]*Stable/);
+  assert.doesNotMatch(provider?.description ?? "", /Kimi[^;]*Stable/i);
   assert.doesNotMatch(provider?.description ?? "", /Kimi[^;]*OAuth/i);
   assert.match(provider?.description ?? "", /Anthropic.*Coming soon/i);
   assert.doesNotMatch(provider?.usage ?? "", /kimi/i);
@@ -195,10 +195,15 @@ test("README command bytes are rendered and checked from the shared catalog", as
   const readme = await readFile(new URL("../README.md", import.meta.url), "utf8");
 
   assert.ok(readme.includes(block(generated)), "README must contain the exact generated block");
-  const start = readme.indexOf("<!-- orcode:command-docs:start -->");
-  const end = readme.indexOf("<!-- orcode:command-docs:end -->");
+  const startMarker = "<!-- orcode:command-docs:start -->";
+  const endMarker = "<!-- orcode:command-docs:end -->";
+  const countMarker = (marker: string): number => readme.split(marker).length - 1;
+  assert.equal(countMarker(startMarker), 1, "README must contain exactly one command-docs start marker");
+  assert.equal(countMarker(endMarker), 1, "README must contain exactly one command-docs end marker");
+  const start = readme.indexOf(startMarker);
+  const end = readme.indexOf(endMarker);
   assert.ok(start >= 0 && end > start, "README must carry the command-docs markers in order");
-  const readmeBlock = readme.slice(start, end + "<!-- orcode:command-docs:end -->".length);
+  const readmeBlock = readme.slice(start, end + endMarker.length);
   const providerRowPattern = /^\| `\/provider` \|[^\n]*$/m;
   const generatedProviderRow = generated.match(providerRowPattern)?.[0];
   const readmeProviderRow = readmeBlock.match(providerRowPattern)?.[0];
@@ -208,7 +213,7 @@ test("README command bytes are rendered and checked from the shared catalog", as
     assert.match(row, /OpenRouter Stable/);
     assert.match(row, /Kimi Code Abo Preview/);
     assert.match(row, /Anthropic \/ Claude-Abo Coming soon/);
-    assert.doesNotMatch(row, /Kimi[^;]*Stable/);
+    assert.doesNotMatch(row, /Kimi[^;]*Stable/i);
   }
   assert.match(generated, /`\/panel`/);
   assert.match(generated, /`\/resume`/);
