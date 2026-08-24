@@ -211,7 +211,11 @@ export type ProviderCommandResult =
       displayName: string;
       explanation: string;
     }
-  | { kind: "setup"; backendId: "openrouter"; outcome: "ready" | "cancelled" }
+  | {
+      kind: "setup";
+      backendId: ProviderCommandConnectableBackendId;
+      outcome: "ready" | "cancelled";
+    }
   | { kind: "status"; providers: readonly ProviderCommandStatusEntry[]; crossEnabled: false }
   | {
       kind: "models";
@@ -2582,8 +2586,31 @@ const PROVIDER_ACCOUNT_ACTIONS = [
 
 type ProviderAccountAction = (typeof PROVIDER_ACCOUNT_ACTIONS)[number];
 
+type ProviderBackendAction = Exclude<ProviderAccountAction, "setup" | "status">;
+
+/**
+ * Action-specific backend gate. Kimi Code is approved for connect, enable,
+ * disable, reconnect, models, and logout only; disconnect stays unapproved
+ * and must fail at the parser with the exact usage and zero port calls.
+ */
+const PROVIDER_BACKEND_ACTIONS: Record<ProviderCommandBackendId, ReadonlySet<ProviderBackendAction>> = {
+  openrouter: new Set<ProviderBackendAction>([
+    "connect", "enable", "disable", "disconnect", "reconnect", "models", "logout",
+  ]),
+  "kimi-code": new Set<ProviderBackendAction>([
+    "connect", "enable", "disable", "reconnect", "models", "logout",
+  ]),
+  anthropic: new Set<ProviderBackendAction>([
+    "connect", "enable", "disable", "disconnect", "reconnect", "models", "logout",
+  ]),
+};
+
 function isProviderAccountAction(value: string): value is ProviderAccountAction {
   return includesValue(PROVIDER_ACCOUNT_ACTIONS, value);
+}
+
+function isProviderCommandBackendId(value: string | undefined): value is ProviderCommandBackendId {
+  return value === "openrouter" || value === "kimi-code" || value === "anthropic";
 }
 
 async function providerAccountCommand(
@@ -2601,7 +2628,7 @@ async function providerAccountCommand(
   } else {
     if (args.length !== 1) throw new Error(PROVIDER_COMMAND_USAGE);
     const backendId = args[0]?.toLowerCase();
-    if (backendId !== "openrouter" && backendId !== "kimi-code" && backendId !== "anthropic") {
+    if (!isProviderCommandBackendId(backendId) || !PROVIDER_BACKEND_ACTIONS[backendId].has(action)) {
       throw new Error(PROVIDER_COMMAND_USAGE);
     }
     intent = { kind: action, backendId };
@@ -2638,7 +2665,10 @@ function renderProviderCommandResult(
     return;
   }
   if (result.kind === "setup") {
-    out.text(`Provider-Setup: ${result.outcome}`);
+    // OpenRouter output stays byte-identical; a Kimi setup/connect result is
+    // rendered under its own name and never relabeled as OpenRouter.
+    const prefix = result.backendId === "kimi-code" ? "Kimi Code · " : "";
+    out.text(`${prefix}Provider-Setup: ${result.outcome}`);
     return;
   }
   if (result.kind === "status") {

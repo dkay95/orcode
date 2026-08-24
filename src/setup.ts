@@ -35,6 +35,17 @@ function isKimiCatalogModelId(value: unknown): value is string {
   return typeof value === "string" && KIMI_CODE_CATALOG_MODEL_IDS.has(value);
 }
 
+/**
+ * The approved Kimi contract maps every catalog requested id to the identical
+ * canonical id. Any other pairing (including two different catalog ids) is
+ * rejected.
+ */
+function isExactKimiCatalogBinding(requestedModelId: unknown, canonicalModelId: unknown): boolean {
+  return isKimiCatalogModelId(requestedModelId)
+    && isKimiCatalogModelId(canonicalModelId)
+    && requestedModelId === canonicalModelId;
+}
+
 const DEFAULT_PROVIDER_TIMEOUT_MS = 5_000;
 const MAX_PROVIDER_TIMEOUT_MS = 15_000;
 const DEFAULT_STARTUP_TIMEOUT_MS = 8_000;
@@ -573,6 +584,13 @@ export class SetupOrchestrator {
       const result = this.#reduce(captured, generation, []);
       this.#latestResult = result;
       return result;
+    }
+    if (legacyRoute.backendId === "kimi-code") {
+      // Normative: a migration cannot create a proven Kimi connection. A
+      // legacy-unverified Kimi route is never auto-promoted; it requires an
+      // explicit route/setup choice, and this attempt performs zero Kimi
+      // adapter, catalog, or network calls and leaves state unchanged.
+      return this.#publishRouteChoice(captured, generation, legacyRoute);
     }
 
     const matchingConnections = captured.connections.filter((candidate) =>
@@ -1723,7 +1741,11 @@ function validHealth(value: unknown, generation: number): value is ProviderHealt
     && value.generation === generation;
 }
 
-function normalizeModelList(value: unknown): readonly BackendModelDescriptor[] | null {
+/**
+ * Pure catalog decoder. Kimi descriptors are catalog-gated and must bind each
+ * requested id to its identical canonical id; cross-pairs fail closed.
+ */
+export function normalizeModelList(value: unknown): readonly BackendModelDescriptor[] | null {
   if (!Array.isArray(value)) return null;
   const normalized: BackendModelDescriptor[] = [];
   for (const candidate of value) {
@@ -1768,7 +1790,7 @@ function normalizeModelList(value: unknown): readonly BackendModelDescriptor[] |
     ) continue;
     if (
       backendId === "kimi-code"
-      && (!isKimiCatalogModelId(requestedModelId) || !isKimiCatalogModelId(canonicalModelId))
+      && !isExactKimiCatalogBinding(requestedModelId, canonicalModelId)
     ) continue;
     normalized.push({
       backendId,
@@ -1829,8 +1851,7 @@ function safeRouteIdentity(value: unknown): RouteIdentityV1 | null {
     if (
       billingRealm !== "kimi-code-membership-provider-managed-overage"
       || resolutionState !== "resolved"
-      || !isKimiCatalogModelId(requestedModelId)
-      || !isKimiCatalogModelId(canonicalModelId)
+      || !isExactKimiCatalogBinding(requestedModelId, canonicalModelId)
     ) return null;
   } else if (billingRealm === "kimi-code-membership-provider-managed-overage") {
     return null;

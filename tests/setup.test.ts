@@ -2193,6 +2193,19 @@ test("every catalog-gated kimi model id survives the safe-route projection", asy
   }
 });
 
+function observedKimiRegistry(
+  adapter: FakeKimiAdapter,
+  openrouter: FakeAdapter,
+): BackendRegistry {
+  return new BackendRegistry([
+    { descriptor: KIMI_DESCRIPTOR, adapter },
+    { descriptor: OPENROUTER_DESCRIPTOR, adapter: openrouter },
+    { descriptor: ANTHROPIC_DESCRIPTOR },
+  ]);
+}
+
+const KIMI_CATALOG_IDS = ["k3", "k3-256k", "kimi-for-coding", "kimi-for-coding-highspeed"] as const;
+
 test("unsafe, mismatched, or openrouter-fallback kimi routes never emit a safe-route event", async () => {
   const cases: Array<{ name: string; route: RouteIdentityV1 }> = [
     {
@@ -2212,14 +2225,27 @@ test("unsafe, mismatched, or openrouter-fallback kimi routes never emit a safe-r
       route: kimiRoute({ canonicalModelId: "vendor/alien" }),
     },
     {
+      name: "cross-paired catalog ids k3 -> kimi-for-coding",
+      route: kimiRoute({ requestedModelId: "k3", canonicalModelId: "kimi-for-coding" }),
+    },
+    {
+      name: "cross-paired catalog ids kimi-for-coding -> k3",
+      route: kimiRoute({ requestedModelId: "kimi-for-coding", canonicalModelId: "k3" }),
+    },
+    {
+      name: "cross-paired catalog ids k3-256k -> k3",
+      route: kimiRoute({ requestedModelId: "k3-256k", canonicalModelId: "k3" }),
+    },
+    {
       name: "ambiguous legacy-unverified kimi route",
       route: kimiRoute({ canonicalModelId: null, resolutionState: "legacy-unverified" }),
     },
   ];
   for (const entry of cases) {
+    const openrouter = new FakeAdapter();
     const fixture = await setupFixture({
       state: kimiState(),
-      registry: kimiRegistry(new FakeKimiAdapter()),
+      registry: observedKimiRegistry(new FakeKimiAdapter(), openrouter),
       activationCoordinator: kimiActivation(entry.route, null),
     });
 
@@ -2239,80 +2265,157 @@ test("unsafe, mismatched, or openrouter-fallback kimi routes never emit a safe-r
       false,
       `${entry.name} must not emit a candidate-activation event`,
     );
+    assert.deepEqual(openrouter.calls, [], `${entry.name} must not fall back to openrouter`);
   }
 });
 
-test("kimi model normalization keeps only catalog-gated kimi models and preserves the kimi route", async () => {
-  const legacyRoute = kimiRoute({ canonicalModelId: null, resolutionState: "legacy-unverified" });
-  const adapter = new FakeKimiAdapter();
-  const owner = kimiConnection();
-  adapter.inspectionScripts = [(request) => kimiInspected(owner, request)];
-  adapter.models = [
-    kimiModel("k9"),
+test("kimi catalog normalization binds each requested id to its identical canonical id", async () => {
+  const { api } = await setupFixture();
+  const identityPairs = KIMI_CATALOG_IDS.map((modelId) => kimiModel(modelId));
+  const crossPairs = [
+    kimiModel("k3", "kimi-for-coding"),
+    kimiModel("kimi-for-coding", "k3"),
+    kimiModel("k3-256k", "k3"),
+    kimiModel("kimi-for-coding-highspeed", "kimi-for-coding"),
     kimiModel("k3", "vendor/alien"),
-    kimiModel("k3"),
+    kimiModel("k9"),
   ];
-  const fixture = await setupFixture({
-    state: kimiState({ defaultRoute: legacyRoute }),
-    registry: kimiRegistry(adapter),
-  });
-  await fixture.orchestrator.inspectStartup();
+  const openrouterAlias = model("vendor/requested", "vendor/canonical");
 
-  const result = await fixture.orchestrator.resolveLegacyDefaultRoute();
-  const resolved = fixture.stateStore.read().defaultRoute;
+  const normalized = api.normalizeModelList([
+    crossPairs[0],
+    ...identityPairs,
+    ...crossPairs.slice(1),
+    openrouterAlias,
+  ]);
 
-  assert.equal(result.mode, "ready");
-  assert.deepEqual(resolved, kimiRoute());
-  assert.equal(resolved?.backendId, "kimi-code");
-  assert.equal(resolved?.billingRealm, "kimi-code-membership-provider-managed-overage");
-  assert.equal(fixture.clock.activeTimers(), 0);
+  assert.deepEqual(normalized, [...identityPairs, openrouterAlias]);
+  for (const crossPair of crossPairs) {
+    assert.deepEqual(
+      api.normalizeModelList([crossPair]),
+      [],
+      `${crossPair.requestedModelId} -> ${crossPair.canonicalModelId} must fail closed`,
+    );
+  }
 });
 
-test("an unknown kimi model never resolves and never falls back to openrouter", async () => {
-  const legacyRoute = kimiRoute({
-    requestedModelId: "k9",
-    canonicalModelId: null,
-    resolutionState: "legacy-unverified",
-  });
-  const adapter = new FakeKimiAdapter();
-  const owner = kimiConnection();
-  adapter.inspectionScripts = [(request) => kimiInspected(owner, request)];
-  adapter.models = [kimiModel("k9"), kimiModel("k3")];
-  const fixture = await setupFixture({
-    state: kimiState({ defaultRoute: legacyRoute }),
-    registry: kimiRegistry(adapter),
-  });
-  await fixture.orchestrator.inspectStartup();
+test("a legacy-unverified kimi route is never auto-promoted and makes zero kimi or openrouter calls", async (t) => {
+  const cases: Array<{
+    name: string;
+    requestedModelId: string;
+    models: readonly BackendModelDescriptor[];
+  }> = [
+    {
+      name: "exact catalog match that would resolve for openrouter",
+      requestedModelId: "k3",
+      models: [kimiModel("k3")],
+    },
+    {
+      name: "unknown kimi model",
+      requestedModelId: "k9",
+      models: [kimiModel("k9"), kimiModel("k3")],
+    },
+    {
+      name: "cross-paired catalog ids",
+      requestedModelId: "k3",
+      models: [kimiModel("k3", "kimi-for-coding")],
+    },
+  ];
+  for (const entry of cases) {
+    await t.test(entry.name, async () => {
+      const legacyRoute = kimiRoute({
+        requestedModelId: entry.requestedModelId,
+        canonicalModelId: null,
+        resolutionState: "legacy-unverified",
+      });
+      const adapter = new FakeKimiAdapter();
+      const openrouter = new FakeAdapter();
+      const owner = kimiConnection();
+      adapter.inspectionScripts = [(request) => kimiInspected(owner, request)];
+      adapter.models = entry.models;
+      const fixture = await setupFixture({
+        state: kimiState({ defaultRoute: legacyRoute }),
+        registry: observedKimiRegistry(adapter, openrouter),
+      });
+      const startup = await fixture.orchestrator.inspectStartup();
+      assert.equal(startup.mode, "route-choice-required");
+      assert.deepEqual(adapter.calls, ["kimi-code.inspect"]);
+      const before = JSON.stringify(fixture.stateStore.read());
+      fixture.events.splice(0);
 
-  await fixture.orchestrator.resolveLegacyDefaultRoute();
-  const stored = fixture.stateStore.read().defaultRoute;
+      const first = await fixture.orchestrator.resolveLegacyDefaultRoute();
+      const repeated = await fixture.orchestrator.resolveLegacyDefaultRoute();
 
-  assert.deepEqual(stored, legacyRoute);
-  assert.equal(stored?.resolutionState, "legacy-unverified");
-  assert.equal(stored?.backendId, "kimi-code");
+      assert.equal(first.mode, "route-choice-required");
+      assert.equal(repeated.mode, "route-choice-required");
+      assert.deepEqual(first.readyRoutes, []);
+      assert.deepEqual(first.defaultRoute, legacyRoute);
+      assert.equal(JSON.stringify(fixture.stateStore.read()), before);
+      assert.equal(fixture.stateStore.read().defaultRoute?.resolutionState, "legacy-unverified");
+      assert.deepEqual(adapter.calls, ["kimi-code.inspect"], "zero kimi listModels calls");
+      assert.deepEqual(openrouter.calls, [], "zero openrouter fallback calls");
+      assert.deepEqual(fixture.activationCoordinator.calls, []);
+      assert.deepEqual(fixture.events, [
+        {
+          version: 1,
+          type: "route-choice-required",
+          generation: first.generation,
+          routeIds: [JSON.stringify(legacyRoute)],
+        },
+        {
+          version: 1,
+          type: "route-choice-required",
+          generation: repeated.generation,
+          routeIds: [JSON.stringify(legacyRoute)],
+        },
+      ]);
+      assert.equal(fixture.clock.activeTimers(), 0);
+    });
+  }
 });
 
 test("openrouter model normalization and rejection behavior stays byte-compatible", async () => {
-  const state = migrateLegacyOpenRouterState(
-    { mainModel: "vendor/legacy-requested" },
-    { connectionId: "legacy-byte-compat" },
-  );
-  const adapter = new FakeAdapter();
-  adapter.inspectionScripts = [(request) => inspected(state.connections[0]!, request, {
-    accountFingerprint: "acct_verified_byte_compat",
-  })];
-  adapter.models = [
-    kimiModel("k3"),
+  async function resolveLegacy(catalog: readonly BackendModelDescriptor[]) {
+    const state = migrateLegacyOpenRouterState(
+      { mainModel: "vendor/legacy-requested" },
+      { connectionId: "legacy-byte-compat" },
+    );
+    const adapter = new FakeAdapter();
+    adapter.inspectionScripts = [(request) => inspected(state.connections[0]!, request, {
+      accountFingerprint: "acct_verified_byte_compat",
+    })];
+    adapter.models = catalog;
+    const fixture = await setupFixture({ state, adapter });
+    await fixture.orchestrator.inspectStartup();
+    const result = await fixture.orchestrator.resolveLegacyDefaultRoute();
+    return {
+      result: JSON.stringify(result),
+      route: JSON.stringify(fixture.stateStore.read().defaultRoute),
+      state: JSON.stringify(fixture.stateStore.read()),
+      events: JSON.stringify(fixture.events),
+      calls: JSON.stringify(adapter.calls),
+      resolved: fixture.stateStore.read().defaultRoute,
+      mode: result.mode,
+    };
+  }
+  const control = await resolveLegacy([
     model("vendor/legacy-requested", "vendor/canonical-safe"),
-  ];
-  const fixture = await setupFixture({ state, adapter });
-  await fixture.orchestrator.inspectStartup();
+  ]);
+  const mixed = await resolveLegacy([
+    kimiModel("k3"),
+    kimiModel("k3", "kimi-for-coding"),
+    kimiModel("k9"),
+    model("vendor/legacy-requested", "vendor/canonical-safe"),
+  ]);
 
-  const result = await fixture.orchestrator.resolveLegacyDefaultRoute();
-  const resolved = fixture.stateStore.read().defaultRoute;
-
-  assert.equal(result.mode, "ready");
-  assert.equal(resolved?.backendId, "openrouter");
-  assert.equal(resolved?.canonicalModelId, "vendor/canonical-safe");
-  assert.equal(resolved?.billingRealm, "openrouter-payg");
+  assert.equal(control.mode, "ready");
+  assert.equal(control.resolved?.backendId, "openrouter");
+  assert.equal(control.resolved?.canonicalModelId, "vendor/canonical-safe");
+  assert.equal(control.resolved?.billingRealm, "openrouter-payg");
+  assert.equal(mixed.result, control.result);
+  assert.equal(mixed.route, control.route);
+  assert.equal(mixed.state, control.state);
+  assert.equal(mixed.events, control.events);
+  assert.equal(mixed.calls, control.calls);
+  assert.equal(control.state.includes("kimi"), false);
 });

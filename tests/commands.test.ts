@@ -13,6 +13,9 @@ import {
   validateAndActivateInferenceKey,
   validateAndActivateManagementKey,
   type CommandContext,
+  type ProviderCommandIntent,
+  type ProviderCommandIntentPort,
+  type ProviderCommandResult,
 } from "../src/commands.js";
 import { OpenRouterHttpError, OpenRouterService } from "../src/openrouter.js";
 import type { CredentialStoreLike } from "../src/credentials.js";
@@ -671,6 +674,118 @@ test("every kimi provider account command dispatches one exact kimi-code intent"
   ]);
 });
 
+/**
+ * Targeted privacy canaries for rendered provider status. Each canary names one
+ * class of private or fabricated data that must never reach the chat surface,
+ * while legitimate model names such as "K3", "K3 256K" or "K2.7" stay allowed.
+ */
+const PRIVATE_STATUS_CANARIES: ReadonlyArray<{ name: string; pattern: RegExp; samples: readonly string[] }> = [
+  {
+    name: "fabricated $0 or numeric quota",
+    pattern: /\$\s*\d|\b\d+[.,]\d{2}\s*(?:USD|EUR|\$|€)?\b|\b\d+\s*(?:USD|EUR|credits?|tokens?|requests?)\b|\b\d+\s*%/i,
+    samples: ["$0", "0.00 USD", "0 credits", "12 requests", "40 %"],
+  },
+  {
+    name: "raw quota label",
+    pattern: /\bquota\b|\bkontingent\b|\bremaining\b|\bbalance\b|\bguthaben\b|\busage\b/i,
+    samples: ["quota: none", "Guthaben", "remaining"],
+  },
+  {
+    name: "account id",
+    pattern: /\bacct_\w+|\baccount[-_ ]?id\b|\buser[-_]?\w*id\b/i,
+    samples: ["acct_kimi_primary", "account-id", "user_id"],
+  },
+  {
+    name: "email address",
+    pattern: /[\w.+-]+@[\w-]+\.[\w.-]+/,
+    samples: ["person@example.com"],
+  },
+  {
+    name: "key or fingerprint fragment",
+    pattern: /…|\bsk-[\w-]+|\bc0ffee\b|\bfeedface\b|fingerprint|\b[0-9a-f]{8,}\b/i,
+    samples: ["…feedface", "sk-or-v1-abc", "c0ffee", "deadbeef01", "fingerprint"],
+  },
+];
+
+test("private status canaries fire on private samples and stay silent on kimi model names", () => {
+  const legitimate = [
+    "Kimi K3 · k3 · k3",
+    "Kimi K3 256K · k3-256k · k3-256k",
+    "Kimi K2.7 Code · kimi-for-coding · kimi-for-coding",
+    "Kimi K2.7 Code HighSpeed · kimi-for-coding-highspeed · kimi-for-coding-highspeed",
+    "Kimi Code · Preview · enabled · ready · kimi-code-membership-provider-managed-overage · Standard",
+    "OpenRouter · ready · Generation 3",
+  ];
+  for (const canary of PRIVATE_STATUS_CANARIES) {
+    for (const sample of canary.samples) {
+      assert.match(sample, canary.pattern, `${canary.name} canary must fire on ${sample}`);
+    }
+    for (const line of legitimate) {
+      assert.doesNotMatch(line, canary.pattern, `${canary.name} canary must allow ${line}`);
+    }
+  }
+});
+
+test("a kimi setup or connect result is fully typed and rendered under its own name", async () => {
+  const intents: ProviderCommandIntent[] = [];
+  const output: string[] = [];
+  let backendId: "openrouter" | "kimi-code" = "kimi-code";
+  const port: ProviderCommandIntentPort = {
+    async execute(intent): Promise<ProviderCommandResult> {
+      intents.push(intent);
+      return { kind: "setup", backendId, outcome: "ready" };
+    },
+  };
+  const context = {
+    config: structuredClone(DEFAULT_CONFIG),
+    providerCommands: port,
+    out: {
+      text: (value: string) => output.push(value),
+      error: (value: string) => output.push(value),
+    },
+  } as unknown as CommandContext;
+
+  await handleSlashCommand("/provider connect kimi-code", context);
+  assert.deepEqual(intents, [{ kind: "connect", backendId: "kimi-code" }]);
+  assert.deepEqual(output, ["Kimi Code · Provider-Setup: ready"]);
+
+  output.length = 0;
+  backendId = "openrouter";
+  await handleSlashCommand("/provider connect openrouter", context);
+  assert.deepEqual(output, ["Provider-Setup: ready"]);
+});
+
+test("unapproved kimi disconnect is rejected with the exact usage and zero port calls", async () => {
+  const intents: ProviderCommandIntent[] = [];
+  const output: string[] = [];
+  const port: ProviderCommandIntentPort = {
+    async execute(intent): Promise<ProviderCommandResult> {
+      intents.push(intent);
+      return { kind: "unchanged", backendId: "openrouter", reason: "pure-domain-double" };
+    },
+  };
+  const context = {
+    config: structuredClone(DEFAULT_CONFIG),
+    providerCommands: port,
+    out: {
+      text: (value: string) => output.push(value),
+      error: (value: string) => output.push(value),
+    },
+  } as unknown as CommandContext;
+  const expected = "Verwendung: /provider [setup|connect|enable|disable|disconnect|reconnect|status|models|logout|sort|allow|deny|only|ignore|fallback|clear]";
+
+  for (const command of ["/provider disconnect kimi-code", "/provider disconnect KIMI-CODE"]) {
+    await assert.rejects(handleSlashCommand(command, context), (error: unknown) =>
+      error instanceof Error && error.message === expected
+    );
+  }
+  assert.deepEqual(intents, []);
+  assert.deepEqual(output, []);
+
+  await handleSlashCommand("/provider disconnect openrouter", context);
+  assert.deepEqual(intents, [{ kind: "disconnect", backendId: "openrouter" }]);
+});
+
 test("provider status renders kimi as preview on its own realm without private data", async () => {
   const output: string[] = [];
   const context = {
@@ -731,8 +846,9 @@ test("provider status renders kimi as preview on its own realm without private d
   assert.match(kimiLine, /credential=valid.*connectivity=connected.*spend=unknown.*runtime=not-applicable/s);
   assert.equal(kimiLine.toLowerCase().includes("openrouter"), false);
   assert.match(rendered, /OpenRouter.*enabled.*ready.*openrouter-payg/s);
-  assert.doesNotMatch(rendered, /feedface|c0ffee|…|acct_|@|quota/i);
-  assert.doesNotMatch(rendered, /\d/);
+  for (const canary of PRIVATE_STATUS_CANARIES) {
+    assert.doesNotMatch(rendered, canary.pattern, `status leaked ${canary.name}`);
+  }
 });
 
 test("kimi provider models render the kimi catalog and a kimi-specific empty message", async () => {
