@@ -7,10 +7,12 @@ import {
   adoptDurablyCommittedProviderState,
   createNeverConfiguredProviderState,
   migrateLegacyOpenRouterState,
+  migrateProviderSetupV1ToV2,
   projectLegacyModelRoutes,
   ProviderStateStore,
   readProviderStateCommitAdoption,
   type ProviderConnectionStateV1,
+  type ProviderSetupStateV2,
   type ProviderSetupStateV1,
   type ProviderStateCommitRequest,
   validateProviderSetupState,
@@ -63,6 +65,94 @@ test("a missing nested state in an existing config migrates OpenRouter without n
   assert.equal(result.defaultRoute?.canonicalModelId, null);
   assert.equal(result.defaultRoute?.resolutionState, "legacy-unverified");
   assert.equal(result.cross.enabled, false);
+});
+
+test("schema-1 provider setup migrates byte-stably to V2 without adding Kimi", () => {
+  const v1 = {
+    schemaVersion: 1,
+    revision: 7,
+    lifecycle: "configured",
+    connections: [{
+      id: "openrouter-verified",
+      backendId: "openrouter",
+      enabled: true,
+      maturity: "stable",
+      credentialSlot: "v1:inference:018f8d77-2d52-7cc0-8f6a-9fb1f3fc0711",
+      accountFingerprint: "acct_openrouter_verified",
+      accountFingerprintState: "verified",
+      billingRealm: "openrouter-payg",
+      lastHealth: null,
+    }],
+    defaultRoute: {
+      version: 1,
+      backendId: "openrouter",
+      accountFingerprint: "acct_openrouter_verified",
+      billingRealm: "openrouter-payg",
+      requestedModelId: "openai/gpt-5",
+      canonicalModelId: "openai/gpt-5",
+      resolutionState: "resolved",
+    },
+    cross: { enabled: false, preferredLead: null, preferredChallenger: null },
+  };
+  let fetchCalls = 0;
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (async () => { fetchCalls += 1; throw new Error("migration must not fetch"); }) as typeof fetch;
+  try {
+    const first = migrateProviderSetupV1ToV2(v1);
+    const second = migrateProviderSetupV1ToV2(first);
+    assert.equal(first.schemaVersion, 2);
+    assert.equal(JSON.stringify(second), JSON.stringify(first));
+    assert.equal(first.connections.some((connection) => connection.backendId === "kimi-code"), false);
+    assert.equal(first.connections[0]?.credentialSlot, v1.connections[0]?.credentialSlot);
+    assert.deepEqual(first.defaultRoute, v1.defaultRoute);
+    assert.deepEqual(first.cross, v1.cross);
+    assert.equal(fetchCalls, 0);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("V2 Kimi and OpenRouter connections accept only their own slots and realms", () => {
+  const kimiRoute = {
+    version: 1,
+    backendId: "kimi-code",
+    accountFingerprint: "acct_local_kimi",
+    billingRealm: "kimi-code-membership-provider-managed-overage",
+    requestedModelId: "kimi-for-coding",
+    canonicalModelId: "kimi-for-coding",
+    resolutionState: "resolved",
+  } as const;
+  const base: ProviderSetupStateV2 = {
+    schemaVersion: 2,
+    revision: 1,
+    lifecycle: "configured",
+    connections: [{
+      id: "kimi-connection",
+      backendId: "kimi-code",
+      enabled: true,
+      maturity: "preview",
+      credentialSlot: "v1:kimi-code:018f8d77-2d52-7cc0-8f6a-9fb1f3fc0711",
+      accountFingerprint: "acct_local_kimi",
+      accountFingerprintState: "verified",
+      billingRealm: "kimi-code-membership-provider-managed-overage",
+      lastHealth: null,
+    }],
+    defaultRoute: kimiRoute,
+    cross: { enabled: false, preferredLead: null, preferredChallenger: null },
+  };
+  assert.deepEqual(validateProviderSetupState(base), base);
+  assert.deepEqual(validateProviderSetupState({
+    ...base,
+    connections: [{ ...base.connections[0]!, credentialSlot: "v1:inference:018f8d77-2d52-7cc0-8f6a-9fb1f3fc0711" }],
+  }), { kind: "corrupt" });
+  assert.deepEqual(validateProviderSetupState({
+    ...base,
+    connections: [{ ...base.connections[0]!, billingRealm: "openrouter-payg" }],
+  }), { kind: "corrupt" });
+  assert.deepEqual(validateProviderSetupState({
+    ...base,
+    connections: [{ ...base.connections[0]!, backendId: "openrouter" }],
+  }), { kind: "corrupt" });
 });
 
 test("legacy model projection preserves every role without slash parsing", () => {

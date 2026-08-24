@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  BACKEND_IDS,
   BackendRegistry,
   ProviderComingSoonError,
   ProviderSetupRequiredError,
@@ -80,6 +81,21 @@ test("route identity compares backend account realm and canonical model", () => 
   assert.equal(sameRoute(route, { ...route, backendId: "codex" }), false);
   assert.equal(sameRoute(route, { ...route, billingRealm: "none" }), false);
   assert.equal(sameRoute(route, { ...route, canonicalModelId: "openai/gpt-2027" }), false);
+});
+
+test("Kimi Code is a first-class route identity with its provider-managed realm", () => {
+  const kimiRoute: RouteIdentityV1 = {
+    version: 1,
+    backendId: "kimi-code",
+    accountFingerprint: "acct_local_kimi",
+    billingRealm: "kimi-code-membership-provider-managed-overage",
+    requestedModelId: "kimi-for-coding",
+    canonicalModelId: "kimi-for-coding",
+    resolutionState: "resolved",
+  };
+
+  assert.deepEqual(BACKEND_IDS, ["openrouter", "kimi-code", "codex", "anthropic"]);
+  assert.equal(sameRoute(kimiRoute, { ...kimiRoute }), true);
 });
 
 test("coming-soon descriptors have no adapter and reject connect structurally", () => {

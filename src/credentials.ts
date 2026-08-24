@@ -5,6 +5,7 @@ import { setTimeout as delay } from "node:timers/promises";
 import { PrivateStore } from "./private-store.js";
 
 export type CredentialKind = "inference" | "management";
+export type CredentialSlotKind = CredentialKind | "kimi-code";
 
 export interface CredentialStoreLike {
   readonly location: string;
@@ -16,7 +17,7 @@ export interface CredentialStoreLike {
 
 export interface CredentialSlotRef {
   version: 1;
-  kind: CredentialKind;
+  kind: CredentialSlotKind;
   id: string;
 }
 
@@ -72,8 +73,7 @@ const HMAC_INIT_LEASE = "provider-account-hmac-init.lock";
 const HMAC_WAIT_ATTEMPTS = 80;
 const HMAC_WAIT_DELAY_MS = 25;
 
-interface ParsedSlot {
-  kind: CredentialKind;
+interface ParsedSlot extends CredentialSlotRef {
   id: string;
   account: string;
 }
@@ -105,8 +105,8 @@ export class CredentialStore implements VersionedCredentialStoreLike {
     this.#hmacLeasePath = appHome ? join(appHome, HMAC_INIT_LEASE) : null;
   }
 
-  reserveSlot(kind: CredentialSlotRef["kind"]): CredentialSlotRef {
-    if (kind !== "inference" && kind !== "management") {
+  reserveSlot(kind: CredentialSlotKind): CredentialSlotRef {
+    if (!isCredentialSlotKind(kind)) {
       throw new Error("Der Credential-Slot-Typ ist ungültig.");
     }
     const uuid = this.createUuid();
@@ -124,6 +124,7 @@ export class CredentialStore implements VersionedCredentialStoreLike {
       id,
     });
     this.#reservations.set(slot, {
+      version: 1,
       kind,
       id,
       account: `${SLOT_ACCOUNT_PREFIX}${id}`,
@@ -509,23 +510,31 @@ function rawStored(value: string | undefined | null): string | null {
     : value;
 }
 
-function parseSlotRef(slot: CredentialSlotRef): ParsedSlot {
-  const version = slot?.version;
-  const kind = slot?.kind;
-  const id = slot?.id;
-  if (
-    !slot ||
-    version !== 1 ||
-    (kind !== "inference" && kind !== "management")
-  ) {
-    throw new Error("Der Credential-Slot ist ungültig.");
-  }
-  const prefix = `v1:${kind}:`;
-  if (typeof id !== "string" || !id.startsWith(prefix)
-    || !CANONICAL_UUID.test(id.slice(prefix.length))) {
+export function parseCredentialSlotRef(value: unknown): CredentialSlotRef {
+  if (typeof value !== "string") {
     throw new Error("Der Credential-Slot ist ungültig oder nicht kanonisch.");
   }
-  return { kind, id, account: `${SLOT_ACCOUNT_PREFIX}${id}` };
+  const match = /^v1:(inference|management|kimi-code):([0-9a-f-]+)$/.exec(value);
+  if (!match || !CANONICAL_UUID.test(match[2] ?? "")) {
+    throw new Error("Der Credential-Slot ist ungültig oder nicht kanonisch.");
+  }
+  return Object.freeze({
+    version: 1 as const,
+    kind: match[1] as CredentialSlotKind,
+    id: value,
+  });
+}
+
+function parseSlotRef(slot: CredentialSlotRef): ParsedSlot {
+  const parsed = parseCredentialSlotRef(slot?.id);
+  if (slot?.version !== parsed.version || slot.kind !== parsed.kind) {
+    throw new Error("Der Credential-Slot ist ungültig oder nicht kanonisch.");
+  }
+  return { ...parsed, account: `${SLOT_ACCOUNT_PREFIX}${parsed.id}` };
+}
+
+function isCredentialSlotKind(value: unknown): value is CredentialSlotKind {
+  return value === "inference" || value === "management" || value === "kimi-code";
 }
 
 function decodeAccountHmacKey(value: string): Uint8Array {

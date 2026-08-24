@@ -3,7 +3,7 @@ import { mkdir, mkdtemp, readFile, readdir, rename, stat, symlink, writeFile } f
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { CredentialStore } from "../src/credentials.js";
+import { CredentialStore, parseCredentialSlotRef } from "../src/credentials.js";
 import * as credentialsModule from "../src/credentials.js";
 import { PosixPrivateStoreAdapter, PrivateStore } from "../src/private-store.js";
 
@@ -81,7 +81,7 @@ function fakeStore(options: {
   return { store, values, calls, createEntry };
 }
 
-type SlotKind = "inference" | "management";
+type SlotKind = "inference" | "management" | "kimi-code";
 type SlotRef = { version: 1; kind: SlotKind; id: string };
 type FutureCredentialStore = CredentialStore & {
   reserveSlot(kind: SlotKind): SlotRef;
@@ -136,6 +136,48 @@ test("provider secret normalization rejects embedded whitespace, NUL, ANSI, and 
       JSON.stringify(invalid.slice(0, 8)),
     );
   }
+});
+
+test("Kimi credential slot references are strict, canonical, frozen, and secret-free", () => {
+  const id = "v1:kimi-code:018f8d77-2d52-7cc0-8f6a-9fb1f3fc0711";
+  const parsed = parseCredentialSlotRef(id);
+  assert.deepEqual(parsed, { version: 1, kind: "kimi-code", id });
+  assert.equal(Object.isFrozen(parsed), true);
+  for (const invalid of [
+    "v1:KIMI-CODE:018f8d77-2d52-7cc0-8f6a-9fb1f3fc0711",
+    "v1:kimi-code:018F8D77-2D52-7CC0-8F6A-9FB1F3FC0711",
+    "legacy:kimi-code",
+    "v1:kimi-code:not-a-uuid",
+    { version: 1, kind: "kimi-code", id },
+  ]) {
+    assert.throws(() => parseCredentialSlotRef(invalid), /ungültig|kanonisch/i);
+  }
+});
+
+test("Kimi slots use the versioned provider-slot account namespace", async () => {
+  const { store, calls } = fakeStore();
+  const kimi = new CredentialStore(
+    (service, account) => {
+      calls.push(`factory:${service}/${account}`);
+      return {
+        async getPassword() { return undefined; },
+        async setPassword() {},
+        async deleteCredential() { return true; },
+      };
+    },
+    () => "018f8d77-2d52-7cc0-8f6a-9fb1f3fc0711",
+  );
+  const slot = kimi.reserveSlot("kimi-code");
+  await kimi.readSlot(slot);
+  assert.deepEqual(slot, {
+    version: 1,
+    kind: "kimi-code",
+    id: "v1:kimi-code:018f8d77-2d52-7cc0-8f6a-9fb1f3fc0711",
+  });
+  assert.deepEqual(calls, [
+    "factory:de.routercode.openrouter/provider-slot:v1:kimi-code:018f8d77-2d52-7cc0-8f6a-9fb1f3fc0711",
+  ]);
+  void store;
 });
 
 test("versioned slots are unique, exact, isolated from legacy slots, and reserve without keychain calls", async () => {

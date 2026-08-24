@@ -519,6 +519,20 @@ test("config schema v0 reads as current while unknown future versions are visibl
   assert.equal(await readFile(futurePath, "utf8"), futureRaw);
 });
 
+test("an unrelated save cannot overwrite nested provider setup schema 3", async () => {
+  const path = await configPath("provider-setup-schema-three");
+  const raw = `${JSON.stringify({
+    ...DEFAULT_CONFIG,
+    providerSetup: { schemaVersion: 3, opaque: "keep-exactly" },
+  })}\n`;
+  await writeFile(path, raw);
+  await assert.rejects(
+    saveConfig({ ...DEFAULT_CONFIG, mainModel: "unrelated/change" }, path),
+    /future-version/,
+  );
+  assert.equal(await readFile(path, "utf8"), raw);
+});
+
 test("missing config is never-configured while an existing legacy config is source-aware migrated", async () => {
   const missingPath = await configPath("provider-never-configured");
   const missing = await loadConfigDetailed(missingPath, {

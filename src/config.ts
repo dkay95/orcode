@@ -526,8 +526,11 @@ export async function migrateAppHome(
           connectionId: legacyConnectionId ??= createConnectionId(),
         });
       requirePersistableProviderState(providerSetup);
-      if (originalSchemaVersion === CONFIG_SCHEMA_VERSION && hasProviderSetup) {
-        return value;
+      if (
+        originalSchemaVersion === CONFIG_SCHEMA_VERSION
+        && hasProviderSetup
+      ) {
+        return { ...value, providerSetup };
       }
       return validateConfig({
         ...DEFAULT_CONFIG,
@@ -874,7 +877,7 @@ function currentPersistableProviderSetup(
   if (!isRecord(parsed) || !("providerSetup" in parsed)) return null;
   const providerSetup = validateProviderSetupState(parsed.providerSetup);
   requirePersistableProviderState(providerSetup);
-  return parsed.providerSetup as ProviderSetupState;
+  return providerSetup;
 }
 
 function normalizeProviderSetupInput(value: unknown): ProviderSetupState {

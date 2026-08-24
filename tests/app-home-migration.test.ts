@@ -700,7 +700,7 @@ test("legacy migration rebuilds from a source config writer that completes while
   assert.equal(await readFile(join(manifest.backupPath, "config.json"), "utf8"), writerBytes);
 });
 
-test("legacy migration preserves exact destination v1 bytes when a complete writer update wins ownership", async () => {
+test("legacy migration preserves destination v1 semantics when a complete writer update wins ownership", async () => {
   const root = await mkdtemp(join(tmpdir(), "orcode-migration-destination-writer-wins-"));
   const legacy = join(root, ".routercode");
   const target = join(root, ".orcode");
@@ -731,7 +731,36 @@ test("legacy migration preserves exact destination v1 bytes when a complete writ
   });
 
   assert.equal(result.status, "ready");
-  assert.equal(await readFile(join(target, "config.json"), "utf8"), writerBytes);
+  assert.deepEqual(JSON.parse(await readFile(join(target, "config.json"), "utf8")), JSON.parse(writerBytes));
+});
+
+test("app-home migration upgrades only nested provider setup V1 and does not create Kimi state", async () => {
+  const root = await mkdtemp(join(tmpdir(), "orcode-kimi-nested-state-"));
+  const legacy = join(root, ".routercode");
+  const target = join(root, ".orcode");
+  await seedHome(legacy);
+  const configPath = join(legacy, "config.json");
+  const original = {
+    schemaVersion: 1,
+    mainModel: "openai/gpt-5",
+    providerSetup: {
+      schemaVersion: 1,
+      revision: 2,
+      lifecycle: "configured",
+      connections: [],
+      defaultRoute: null,
+      cross: { enabled: false, preferredLead: null, preferredChallenger: null },
+    },
+  };
+  await writeFile(configPath, `${JSON.stringify(original)}\n`);
+  const outcome = await migrateAppHome(target, legacy);
+  const migrated = JSON.parse(await readFile(join(target, "config.json"), "utf8")) as typeof original;
+  assert.equal(outcome.status, "ready");
+  assert.equal(migrated.schemaVersion, 1);
+  assert.equal(migrated.providerSetup.schemaVersion, 2);
+  assert.deepEqual(migrated.providerSetup.connections, []);
+  assert.equal(migrated.providerSetup.lifecycle, original.providerSetup.lifecycle);
+  assert.deepEqual(migrated.providerSetup.cross, original.providerSetup.cross);
 });
 
 test("legacy migration refuses a destination future schema published while ownership waits", async () => {
@@ -1196,7 +1225,9 @@ test("current-home migration waits for a future provider writer and classifies i
   });
 
   assert.equal(result.status, "ready");
-  assert.equal(await readFile(config, "utf8"), finalBytes);
+  const expected = JSON.parse(finalBytes) as { providerSetup: { schemaVersion: number } };
+  expected.providerSetup.schemaVersion = 2;
+  assert.deepEqual(JSON.parse(await readFile(config, "utf8")), expected);
   assert.equal(await exists(migrationManifestPath(target)), false);
 });
 
@@ -1234,7 +1265,9 @@ test("current-home migration waits for a corrupt provider writer and classifies 
   });
 
   assert.equal(result.status, "ready");
-  assert.equal(await readFile(config, "utf8"), finalBytes);
+  const expected = JSON.parse(finalBytes) as { providerSetup: { schemaVersion: number } };
+  expected.providerSetup.schemaVersion = 2;
+  assert.deepEqual(JSON.parse(await readFile(config, "utf8")), expected);
   assert.equal(await exists(migrationManifestPath(target)), false);
 });
 
@@ -1390,7 +1423,7 @@ test("v0 config with valid nested provider state still normalizes legacy top-lev
   assert.equal(stored.providerSetup.lifecycle, "never-configured");
 });
 
-test("current v1 config with valid provider state remains byte-exact and preserves every model preference", async () => {
+test("current v1 config upgrades nested provider state and preserves every model preference", async () => {
   const root = await mkdtemp(join(tmpdir(), "orcode-v1-provider-byte-stability-"));
   const legacy = join(root, ".routercode");
   const target = join(root, ".orcode");
@@ -1439,6 +1472,7 @@ test("current v1 config with valid provider state remains byte-exact and preserv
     mainModel: string;
     compressorModel: string;
     fallbackModels: string[];
+    providerSetup: { schemaVersion: number };
   };
 
   assert.equal(result.status, "ready");
@@ -1456,7 +1490,8 @@ test("current v1 config with valid provider state remains byte-exact and preserv
       lastFallback: "vendor/fallback-21",
     },
   );
-  assert.equal(storedBytes, originalBytes);
+  assert.notEqual(storedBytes, originalBytes);
+  assert.equal(stored.providerSetup.schemaVersion, 2);
 });
 
 test("a current top-level config persists source-aware provider migration once", async () => {
@@ -1638,7 +1673,7 @@ test("committed v0 app-home fixture migrates through real startup without extern
       mode: "on-edit",
       maxRepairRounds: 1,
     });
-    assert.equal(storedConfig.providerSetup.schemaVersion, 1);
+    assert.equal(storedConfig.providerSetup.schemaVersion, 2);
     assert.equal(storedConfig.providerSetup.lifecycle, "migrated");
     assert.deepEqual(storedConfig.providerSetup.connections[0], {
       id: "fixture-provider-id",

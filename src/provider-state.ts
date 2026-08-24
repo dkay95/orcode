@@ -5,13 +5,15 @@ import {
   type ProviderHealth,
   type RouteIdentityV1,
 } from "./backends.js";
+import { parseCredentialSlotRef } from "./credentials.js";
 import { parseOpenRouterCredentialPointer } from "./provider-authority.js";
 import { isRecord } from "./utils.js";
 
-export const PROVIDER_SETUP_SCHEMA_VERSION = 1 as const;
+export const PROVIDER_SETUP_SCHEMA_VERSION = 2 as const;
 
 const BILLING_REALMS: readonly BillingRealm[] = [
   "openrouter-payg",
+  "kimi-code-membership-provider-managed-overage",
   "chatgpt-subscription-provider-managed-overage",
   "chatgpt-account-provider-managed-limits",
   "none",
@@ -29,7 +31,9 @@ export interface ProviderConnectionStateV1 {
   lastHealth: ProviderHealth | null;
 }
 
-export interface ProviderSetupStateV1 {
+export type ProviderConnectionStateV2 = ProviderConnectionStateV1;
+
+interface ProviderSetupStateSchemaV1 {
   schemaVersion: 1;
   revision: number;
   lifecycle: "never-configured" | "cancelled" | "migrated" | "configured";
@@ -42,24 +46,41 @@ export interface ProviderSetupStateV1 {
   };
 }
 
+export interface ProviderSetupStateV2 {
+  /** V1 is accepted only as a deprecated source-compatible input and migrated on validation. */
+  schemaVersion: 1 | 2;
+  revision: number;
+  lifecycle: "never-configured" | "cancelled" | "migrated" | "configured";
+  connections: ProviderConnectionStateV2[];
+  defaultRoute: RouteIdentityV1 | null;
+  cross: {
+    enabled: false;
+    preferredLead: RouteIdentityV1 | null;
+    preferredChallenger: RouteIdentityV1 | null;
+  };
+}
+
+/** @deprecated Use ProviderSetupStateV2. V1-shaped values are upgraded on validation. */
+export type ProviderSetupStateV1 = ProviderSetupStateV2;
+
 export type ProviderStateIssue =
   | { kind: "corrupt" }
   | { kind: "future-version"; version: number };
 
-export type ProviderSetupState = ProviderSetupStateV1 | ProviderStateIssue;
+export type ProviderSetupState = ProviderSetupStateV2 | ProviderStateIssue;
 
 export interface ProviderStateCommitRequest {
   expectedRevision: number;
-  build(current: ProviderSetupStateV1): ProviderSetupStateV1;
+  build(current: ProviderSetupStateV2): ProviderSetupStateV2;
   assertCurrent(): void;
-  adopt(committed: ProviderSetupStateV1): void;
+  adopt(committed: ProviderSetupStateV2): void;
 }
 
 const durableCommitAdopters = new WeakMap<
   ProviderStateCommitRequest,
-  (committed: ProviderSetupStateV1) => void
+  (committed: ProviderSetupStateV2) => void
 >();
-const durableCommitOutcomes = new WeakMap<object, ProviderSetupStateV1>();
+const durableCommitOutcomes = new WeakMap<object, ProviderSetupStateV2>();
 
 /**
  * Reports an exact durable candidate that was already adopted before a later
@@ -67,7 +88,7 @@ const durableCommitOutcomes = new WeakMap<object, ProviderSetupStateV1>();
  * tuple instead of attempting rollback or runtime cleanup.
  */
 class ProviderStateCommitAdoptedError extends Error {
-  constructor(committed: ProviderSetupStateV1) {
+  constructor(committed: ProviderSetupStateV2) {
     super("Provider state commit completed before persistence ownership settled.");
     this.name = "ProviderStateCommitAdoptedError";
     durableCommitOutcomes.set(this, structuredClone(committed));
@@ -76,7 +97,7 @@ class ProviderStateCommitAdoptedError extends Error {
 
 export function readProviderStateCommitAdoption(
   error: unknown,
-): ProviderSetupStateV1 | null {
+): ProviderSetupStateV2 | null {
   if (
     error === null
     || (typeof error !== "object" && typeof error !== "function")
@@ -93,7 +114,7 @@ export function readProviderStateCommitAdoption(
  */
 export function adoptDurablyCommittedProviderState(
   request: ProviderStateCommitRequest,
-  committed: ProviderSetupStateV1,
+  committed: ProviderSetupStateV2,
 ): void {
   const adoptCommitted = durableCommitAdopters.get(request);
   if (adoptCommitted) {
@@ -110,7 +131,7 @@ export interface ProviderStateStoreOptions {
    * writer/CAS ownership. They must build from the authoritative snapshot and
    * adopt the committed snapshot before releasing that ownership.
    */
-  persist?: (request: ProviderStateCommitRequest) => Promise<ProviderSetupStateV1>;
+  persist?: (request: ProviderStateCommitRequest) => Promise<ProviderSetupStateV2>;
 }
 
 export interface LegacyOpenRouterModelPreferences {
@@ -131,7 +152,7 @@ export interface LegacyModelRouteProjection {
   reasoning: Record<string, RouteIdentityV1>;
 }
 
-export function createNeverConfiguredProviderState(): ProviderSetupStateV1 {
+export function createNeverConfiguredProviderState(): ProviderSetupStateV2 {
   return {
     schemaVersion: PROVIDER_SETUP_SCHEMA_VERSION,
     revision: 0,
@@ -149,7 +170,7 @@ export function createNeverConfiguredProviderState(): ProviderSetupStateV1 {
 export function migrateLegacyOpenRouterState(
   legacyConfig: Record<string, unknown>,
   options: { connectionId: string },
-): ProviderSetupStateV1 {
+): ProviderSetupStateV2 {
   if (!options.connectionId) {
     throw new Error("Legacy provider migration requires a CSPRNG connection ID.");
   }
@@ -219,6 +240,26 @@ export function projectLegacyModelRoutes(
   };
 }
 
+export function migrateProviderSetupV1ToV2(value: unknown): ProviderSetupStateV2 {
+  if (isRecord(value) && value.schemaVersion === 2) {
+    const current = validateProviderSetupStateV2(value);
+    if (!isProviderStateIssue(current)) return current;
+  }
+  const legacy = validateProviderSetupStateV1(value);
+  if (isProviderStateIssue(legacy)) {
+    throw new Error(`Provider setup state is ${legacy.kind} and cannot be migrated.`);
+  }
+  const migrated = {
+    ...structuredClone(legacy),
+    schemaVersion: 2 as const,
+  };
+  const validated = validateProviderSetupStateV2(migrated);
+  if (isProviderStateIssue(validated)) {
+    throw new Error(`Provider setup state is ${validated.kind} after migration.`);
+  }
+  return validated;
+}
+
 export function validateProviderSetupState(value: unknown): ProviderSetupState {
   if (!isRecord(value)) {
     return { kind: "corrupt" };
@@ -230,15 +271,38 @@ export function validateProviderSetupState(value: unknown): ProviderSetupState {
   ) {
     return { kind: "future-version", version: value.schemaVersion };
   }
+  if (value.schemaVersion === 1) {
+    try {
+      return migrateProviderSetupV1ToV2(value);
+    } catch {
+      return { kind: "corrupt" };
+    }
+  }
   if (value.schemaVersion !== PROVIDER_SETUP_SCHEMA_VERSION) {
     return { kind: "corrupt" };
   }
+  return validateProviderSetupStateV2(value);
+}
+
+function validateProviderSetupStateV1(value: unknown): ProviderSetupStateSchemaV1 | ProviderStateIssue {
+  return validateProviderSetupStateStructure(value, 1) as ProviderSetupStateSchemaV1 | ProviderStateIssue;
+}
+
+function validateProviderSetupStateV2(value: unknown): ProviderSetupStateV2 | ProviderStateIssue {
+  return validateProviderSetupStateStructure(value, 2) as ProviderSetupStateV2 | ProviderStateIssue;
+}
+
+function validateProviderSetupStateStructure(
+  value: unknown,
+  schemaVersion: 1 | 2,
+): ProviderSetupStateSchemaV1 | ProviderSetupStateV2 | ProviderStateIssue {
+  if (!isRecord(value) || value.schemaVersion !== schemaVersion) return { kind: "corrupt" };
   if (
     !Number.isSafeInteger(value.revision)
     || Number(value.revision) < 0
     || !isLifecycle(value.lifecycle)
     || !Array.isArray(value.connections)
-    || !value.connections.every(isProviderConnectionStateV1)
+    || !value.connections.every((connection) => isProviderConnectionState(connection, schemaVersion))
     || new Set(value.connections.map((connection) => connection.id)).size !== value.connections.length
     || !isNullableRoute(value.defaultRoute)
     || !isRecord(value.cross)
@@ -248,7 +312,7 @@ export function validateProviderSetupState(value: unknown): ProviderSetupState {
   ) {
     return { kind: "corrupt" };
   }
-  const connections = value.connections as unknown as ProviderConnectionStateV1[];
+  const connections = value.connections as unknown as ProviderConnectionStateV2[];
   const routes = [
     value.defaultRoute,
     value.cross.preferredLead,
@@ -257,7 +321,7 @@ export function validateProviderSetupState(value: unknown): ProviderSetupState {
   if (!routes.every((route) => routeMatchesConnection(route, connections))) {
     return { kind: "corrupt" };
   }
-  return structuredClone(value) as unknown as ProviderSetupStateV1;
+  return structuredClone(value) as unknown as ProviderSetupStateSchemaV1 | ProviderSetupStateV2;
 }
 
 export function isProviderStateIssue(value: ProviderSetupState): value is ProviderStateIssue {
@@ -266,11 +330,13 @@ export function isProviderStateIssue(value: ProviderSetupState): value is Provid
 
 export function requirePersistableProviderState(
   value: ProviderSetupState,
-): ProviderSetupStateV1 {
+): ProviderSetupStateV2 {
   if (isProviderStateIssue(value)) {
     throw new Error(`Provider setup state is ${value.kind} and cannot be saved.`);
   }
-  return value;
+  return value.schemaVersion === 1
+    ? migrateProviderSetupV1ToV2(value)
+    : value;
 }
 
 /**
@@ -278,7 +344,7 @@ export function requirePersistableProviderState(
  * persistence remains in the existing private config store.
  */
 export class ProviderStateStore {
-  #state: ProviderSetupStateV1;
+  #state: ProviderSetupStateV2;
   readonly #persist: ProviderStateStoreOptions["persist"];
 
   constructor(initial: ProviderSetupState, options: ProviderStateStoreOptions = {}) {
@@ -286,11 +352,11 @@ export class ProviderStateStore {
     this.#persist = options.persist;
   }
 
-  read(): ProviderSetupStateV1 {
+  read(): ProviderSetupStateV2 {
     return structuredClone(this.#state);
   }
 
-  replace(next: ProviderSetupState, expectedRevision: number): ProviderSetupStateV1 {
+  replace(next: ProviderSetupState, expectedRevision: number): ProviderSetupStateV2 {
     this.#assertExpectedRevision(expectedRevision);
     this.#state = this.#prepareNext(next, expectedRevision, true);
     return this.read();
@@ -298,14 +364,14 @@ export class ProviderStateStore {
 
   async commit(
     expectedRevision: number,
-    build: (current: ProviderSetupStateV1) => ProviderSetupStateV1,
+    build: (current: ProviderSetupStateV2) => ProviderSetupStateV2,
     assertCurrent: () => void = () => undefined,
-  ): Promise<ProviderSetupStateV1> {
+  ): Promise<ProviderSetupStateV2> {
     this.#assertExpectedRevision(expectedRevision);
     const stateBeforeCommit = this.read();
     let buildCalls = 0;
-    let builtCandidate: ProviderSetupStateV1 | null = null;
-    let adoptedCandidate: ProviderSetupStateV1 | null = null;
+    let builtCandidate: ProviderSetupStateV2 | null = null;
+    let adoptedCandidate: ProviderSetupStateV2 | null = null;
     let publicationCommitted = false;
     let protocolInvalid = false;
     let capabilitiesOpen = true;
@@ -327,7 +393,7 @@ export class ProviderStateStore {
       }
     };
 
-    const buildCandidate = (current: ProviderSetupStateV1): ProviderSetupStateV1 => {
+    const buildCandidate = (current: ProviderSetupStateV2): ProviderSetupStateV2 => {
       assertCapabilityOpen();
       try {
         if (adoptedCandidate) {
@@ -357,7 +423,7 @@ export class ProviderStateStore {
       }
     };
 
-    const adopt = (committed: ProviderSetupStateV1): void => {
+    const adopt = (committed: ProviderSetupStateV2): void => {
       assertCapabilityOpen();
       try {
         if (adoptedCandidate) throw new Error("Provider state CAS may adopt exactly once.");
@@ -382,7 +448,7 @@ export class ProviderStateStore {
         throw error;
       }
     };
-    const adoptCommitted = (committed: ProviderSetupStateV1): void => {
+    const adoptCommitted = (committed: ProviderSetupStateV2): void => {
       assertCapabilityOpen();
       let interrupted = false;
       try {
@@ -491,7 +557,7 @@ export class ProviderStateStore {
     next: ProviderSetupState,
     expectedRevision: number,
     acceptAlreadyIncremented = false,
-  ): ProviderSetupStateV1 {
+  ): ProviderSetupStateV2 {
     const validated = requirePersistableProviderState(validateProviderSetupState(next));
     if (
       validated.revision !== expectedRevision
@@ -518,21 +584,26 @@ function isLifecycle(value: unknown): value is ProviderSetupStateV1["lifecycle"]
     || value === "configured";
 }
 
-function isProviderConnectionStateV1(value: unknown): value is ProviderConnectionStateV1 {
+function isProviderConnectionState(
+  value: unknown,
+  schemaVersion: 1 | 2,
+): value is ProviderConnectionStateV2 {
   if (!(isRecord(value)
     && nonEmptyString(value.id)
     && isBackendId(value.backendId)
     && typeof value.enabled === "boolean"
     && (value.maturity === "stable" || value.maturity === "preview")
     && typeof value.credentialSlot === "string"
-    && parseOpenRouterCredentialPointer(value.credentialSlot) !== null
     && nonEmptyString(value.accountFingerprint)
     && (value.accountFingerprintState === "provisional" || value.accountFingerprintState === "verified")
     && isBillingRealm(value.billingRealm)
     && (value.lastHealth === null || isProviderHealth(value.lastHealth)))) {
     return false;
   }
-  if (!matchesBackendContract(value as unknown as ProviderConnectionStateV1)) {
+  if (!hasValidCredentialSlot(value.backendId, value.credentialSlot, schemaVersion)) {
+    return false;
+  }
+  if (!matchesBackendContract(value as unknown as ProviderConnectionStateV2, schemaVersion)) {
     return false;
   }
   if (value.accountFingerprintState === "provisional") {
@@ -547,7 +618,26 @@ function isProviderConnectionStateV1(value: unknown): value is ProviderConnectio
   return true;
 }
 
-function matchesBackendContract(connection: ProviderConnectionStateV1): boolean {
+function hasValidCredentialSlot(
+  backendId: BackendId,
+  credentialSlot: string,
+  schemaVersion: 1 | 2,
+): boolean {
+  if (backendId === "kimi-code") {
+    if (schemaVersion !== 2) return false;
+    try {
+      return parseCredentialSlotRef(credentialSlot).kind === "kimi-code";
+    } catch {
+      return false;
+    }
+  }
+  return parseOpenRouterCredentialPointer(credentialSlot) !== null;
+}
+
+function matchesBackendContract(
+  connection: ProviderConnectionStateV2,
+  schemaVersion: 1 | 2,
+): boolean {
   if (connection.backendId === "openrouter") {
     return connection.maturity === "stable"
       && connection.billingRealm === "openrouter-payg";
@@ -559,12 +649,17 @@ function matchesBackendContract(connection: ProviderConnectionStateV1): boolean 
         || connection.billingRealm === "chatgpt-account-provider-managed-limits"
       );
   }
+  if (connection.backendId === "kimi-code") {
+    return schemaVersion === 2
+      && connection.maturity === "preview"
+      && connection.billingRealm === "kimi-code-membership-provider-managed-overage";
+  }
   return false;
 }
 
 function routeMatchesConnection(
   route: RouteIdentityV1,
-  connections: readonly ProviderConnectionStateV1[],
+  connections: readonly ProviderConnectionStateV2[],
 ): boolean {
   const connection = connections.find((candidate) =>
     candidate.backendId === route.backendId

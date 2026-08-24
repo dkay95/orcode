@@ -1,8 +1,9 @@
-export const BACKEND_IDS = ["openrouter", "codex", "anthropic"] as const;
+export const BACKEND_IDS = ["openrouter", "kimi-code", "codex", "anthropic"] as const;
 export type BackendId = (typeof BACKEND_IDS)[number];
 export type BackendMaturity = "stable" | "preview" | "coming-soon";
 export type BillingRealm =
   | "openrouter-payg"
+  | "kimi-code-membership-provider-managed-overage"
   | "chatgpt-subscription-provider-managed-overage"
   | "chatgpt-account-provider-managed-limits"
   | "none";
