@@ -529,6 +529,135 @@ test("partial SGR bytes are cleared before a restarted terminal accepts ordinary
   }
 });
 
+test("raw terminal data ownership is inert before start and balanced across stop suspend and restart", async () => {
+  const stdin = new FakeInput();
+  const stdout = new FakeOutput();
+  const terminal = ui(stdin, stdout);
+
+  assert.equal(stdin.listenerCount("data"), 0, "construction must not own a live raw listener");
+
+  terminal.start();
+  const firstActive = stdin.listenerCount("data");
+  assert.ok(firstActive > 0);
+  terminal.stop();
+  const stopped = stdin.listenerCount("data");
+  assert.equal(firstActive, stopped + 1, "stop must detach exactly the UI-owned raw listener");
+
+  terminal.start();
+  assert.equal(stdin.listenerCount("data"), firstActive, "restart must not accumulate listeners");
+  await terminal.suspend(async () => {
+    assert.equal(
+      stdin.listenerCount("data"),
+      stopped,
+      "suspend must detach the UI-owned raw listener while the terminal is released",
+    );
+  });
+  assert.equal(stdin.listenerCount("data"), firstActive, "resume must restore exactly one listener");
+
+  terminal.stop();
+  assert.equal(stdin.listenerCount("data"), stopped);
+});
+
+test("dispose permanently releases terminal input ownership", () => {
+  const stdin = new FakeInput();
+  const stdout = new FakeOutput();
+  const terminal = ui(stdin, stdout);
+
+  terminal.start();
+  const active = stdin.listenerCount("data");
+  terminal.dispose();
+  assert.equal(terminal.active, false);
+  assert.equal(stdin.listenerCount("data"), active - 1);
+  terminal.dispose();
+  terminal.start();
+  assert.equal(terminal.active, false, "a disposed terminal must not reacquire raw input");
+  assert.equal(stdin.listenerCount("data"), active - 1);
+});
+
+test("stop settles a pasted secret once and clears it before fallible terminal cleanup and restart", async () => {
+  class FallibleOutput extends FakeOutput {
+    failCleanup = false;
+
+    override write(value: string | Uint8Array): boolean {
+      if (this.failCleanup) throw new Error("fixed terminal cleanup failure");
+      return super.write(value);
+    }
+  }
+
+  const stdin = new FakeInput();
+  const stdout = new FallibleOutput();
+  const terminal = ui(stdin, stdout);
+  let settlements = 0;
+
+  terminal.start();
+  const pending = terminal.readSecret("OpenRouter API-Key");
+  void pending.then(() => {
+    settlements += 1;
+  });
+  press(stdin, "paste-start");
+  type(stdin, "stale-secret-bytes");
+  press(stdin, "paste-end");
+  emitTerminalData(stdin, "\u001b[<0;1");
+  stdout.failCleanup = true;
+
+  terminal.stop();
+  const stoppedValue = await Promise.race([
+    pending,
+    new Promise<"still-pending">((resolve) => setImmediate(() => resolve("still-pending"))),
+  ]);
+  assert.equal(stoppedValue, null);
+  assert.equal(settlements, 1);
+
+  stdout.failCleanup = false;
+  terminal.start();
+  const restarted = terminal.readSecret("OpenRouter API-Key");
+  press(stdin, "return");
+  assert.equal(await restarted, "", "restart must not resubmit bytes from the stopped secret");
+  assert.equal(settlements, 1, "the stopped resolver must remain settled exactly once");
+
+  const cleanInput = terminal.readInput();
+  type(stdin, "clean-after-stop");
+  press(stdin, "return");
+  assert.equal(await cleanInput, "clean-after-stop");
+  terminal.stop();
+});
+
+test("stop and restart preserve an ordinary chat draft", async () => {
+  const stdin = new FakeInput();
+  const stdout = new FakeOutput();
+  const terminal = ui(stdin, stdout);
+
+  terminal.start();
+  const input = terminal.readInput();
+  type(stdin, "draft survives");
+  terminal.stop();
+  terminal.start();
+  try {
+    press(stdin, "return");
+    assert.equal(await input, "draft survives");
+  } finally {
+    terminal.stop();
+  }
+});
+
+test("suspend and resume preserve a pending secret until explicit submission", async () => {
+  const stdin = new FakeInput();
+  const stdout = new FakeOutput();
+  const terminal = ui(stdin, stdout);
+
+  terminal.start();
+  try {
+    const secret = terminal.readSecret("OpenRouter API-Key");
+    type(stdin, "before-");
+    await terminal.suspend(async () => undefined);
+    type(stdin, "after");
+    press(stdin, "return");
+    assert.equal(await secret, "before-after");
+  } finally {
+    terminal.stop();
+  }
+});
+
 test("setup TUI retry shows one latest current revision card at narrow and wide widths and replaces status", async () => {
   for (const columns of [58, 120]) {
     const stdin = new FakeInput();

@@ -202,6 +202,7 @@ export class TerminalUi {
   #statusAt = 0;
   #mode: UiMode = "idle";
   #active = false;
+  #disposed = false;
   #renderTimer: NodeJS.Timeout | null = null;
   #inputResolve: ((value: string) => void) | null = null;
   #inputReject: ((error: Error) => void) | null = null;
@@ -237,10 +238,6 @@ export class TerminalUi {
   #attachments: ImageAttachment[] = [];
   #pasting = false;
   #pasteBuffer = "";
-  // Kept only while the secret entry is active. Unlike ordinary chat paste,
-  // this remains byte-for-byte so the common credential normalizer can reject
-  // embedded control/ANSI data instead of quietly changing the credential.
-  #rawSecretPaste = "";
   #secretLabel = "";
   #secretResolve: ((value: string | null) => void) | null = null;
   #recordingResolve: ((action: "stop" | "cancel") => void) | null = null;
@@ -277,9 +274,6 @@ export class TerminalUi {
       stdin.isTTY && stdout.isTTY && typeof stdin.setRawMode === "function",
     );
     this.#theme = theme ?? createTheme({ ascii: asciiRequested() });
-    // This listener deliberately precedes readline's keypress decoder. SGR
-    // mouse bytes otherwise arrive as ordinary text after an Escape prefix.
-    this.stdin.on("data", this.#onTerminalData);
     for (const signal of SIGNALS) {
       this.#signalHandlers.set(signal, () => this.#terminate(signal));
     }
@@ -649,7 +643,6 @@ export class TerminalUi {
     this.#pasting = false;
     this.#pasteBuffer = "";
     this.#clearMouseProtocol();
-    this.#rawSecretPaste = "";
     this.#resetQuery();
     this.#enterMode("secret", `${this.#secretLabel} eingeben`);
     return new Promise<string | null>((resolve) => {
@@ -755,10 +748,14 @@ export class TerminalUi {
   }
 
   start(): void {
-    if (!this.supported || this.#active) return;
+    if (!this.supported || this.#active || this.#disposed) return;
     emitKeypressEvents(this.stdin);
     this.stdin.setRawMode(true);
     this.stdin.resume();
+    // This listener must precede readline's keypress decoder. SGR mouse bytes
+    // otherwise arrive as ordinary text after an Escape prefix. It is owned
+    // only while the UI is active and is balanced in #detachTerminal.
+    this.stdin.prependListener("data", this.#onTerminalData);
     this.#active = true;
     // B12: a paste whose end marker never arrived must not survive a restart —
     // otherwise every later key, Ctrl+C included, is swallowed as paste text.
@@ -777,6 +774,7 @@ export class TerminalUi {
   }
 
   stop(): void {
+    this.#settleSecretForStop();
     if (!this.#active) return;
     try {
       this.#detachTerminal();
@@ -795,6 +793,14 @@ export class TerminalUi {
       }
       this.#forgetGeometry();
     }
+  }
+
+  /** Permanently releases terminal input ownership. A disposed UI cannot restart. */
+  dispose(): void {
+    if (this.#disposed) return;
+    this.#disposed = true;
+    this.stop();
+    this.stdin.off("data", this.#onTerminalData);
   }
 
   async suspend<T>(operation: () => Promise<T>): Promise<T> {
@@ -1083,6 +1089,7 @@ export class TerminalUi {
       clearTimeout(this.#renderTimer);
       this.#renderTimer = null;
     }
+    this.stdin.off("data", this.#onTerminalData);
     this.stdin.off("keypress", this.#onKeypress);
     process.off("SIGWINCH", this.#onResize);
     for (const [signal, handler] of this.#signalHandlers) process.off(signal, handler);
@@ -1099,6 +1106,22 @@ export class TerminalUi {
     this.#clearMouseProtocol();
     this.#forgetGeometry();
     this.#stopSpinner();
+  }
+
+  #settleSecretForStop(): void {
+    if (this.#secretResolve === null && this.#mode !== "secret") return;
+    const resolve = this.#secretResolve;
+    this.#secretResolve = null;
+    this.#secretLabel = "";
+    this.#inputChars = [];
+    this.#cursor = 0;
+    this.#pasting = false;
+    this.#pasteBuffer = "";
+    this.#clearMouseProtocol();
+    this.#mode = "idle";
+    this.#status = "Eingabe abgebrochen";
+    this.#statusAt = Date.now();
+    resolve?.(null);
   }
 
   #startSpinner(): void {
@@ -1712,15 +1735,11 @@ export class TerminalUi {
     const resolve = this.#secretResolve;
     this.#secretResolve = null;
     this.#secretLabel = "";
-    try {
-      this.#pasting = false;
-      this.#pasteBuffer = "";
-      this.#resetQuery();
-      this.#enterMode("busy", value === null ? "Eingabe abgebrochen" : "Key wird geprüft");
-      resolve?.(value);
-    } finally {
-      this.#rawSecretPaste = "";
-    }
+    this.#pasting = false;
+    this.#pasteBuffer = "";
+    this.#resetQuery();
+    this.#enterMode("busy", value === null ? "Eingabe abgebrochen" : "Key wird geprüft");
+    resolve?.(value);
   }
 
   #resolveRecording(action: "stop" | "cancel"): void {
@@ -1780,7 +1799,6 @@ export class TerminalUi {
   }
 
   #finishPaste(): void {
-    if (this.#mode === "secret") this.#rawSecretPaste += this.#pasteBuffer;
     const clean = this.#mode === "secret"
       ? this.#pasteBuffer
       : sanitizeTerminalText(this.#pasteBuffer)
