@@ -26,6 +26,13 @@ import {
 } from "../src/cli.js";
 import * as cliModule from "../src/cli.js";
 import { createPlainSetupSurface } from "../src/setup-ui.js";
+import type { SetupSurface } from "../src/setup-ui.js";
+import {
+  BackendRegistry,
+  type BackendAdapter,
+  type BackendDescriptor,
+  type BackendModelDescriptor,
+} from "../src/backends.js";
 import { COMMAND_CATALOG } from "../src/command-catalog.js";
 import {
   handleSlashCommand,
@@ -2416,6 +2423,181 @@ test("credential activation and key replacement synchronize the current session 
   assert.equal(fixture.config.mainModel, nextRoute.requestedModelId);
 });
 
+test("late Cross completion after newer activation cannot republish the old route or session owner", async () => {
+  const Runtime = (cliModule as unknown as {
+    DefaultProviderRuntime: new (...args: unknown[]) => {
+      runSetup(surface: SetupSurface): Promise<Record<string, unknown>>;
+      ensureRunnableRoute(): NonNullable<ProviderSetupStateV1["defaultRoute"]>;
+      adoptCredentialActivation(
+        route: NonNullable<ProviderSetupStateV1["defaultRoute"]>,
+        persisted: boolean,
+        secret: string,
+      ): void;
+    };
+  }).DefaultProviderRuntime;
+  const main: BackendModelDescriptor = {
+    backendId: "openrouter",
+    requestedModelId: "vendor/cross-a",
+    canonicalModelId: "vendor/cross-a",
+    displayName: "Cross A",
+    capabilities: { textInput: true, textOutput: true, tools: true, reasoning: true },
+  };
+  const challenger: BackendModelDescriptor = {
+    ...main,
+    requestedModelId: "vendor/cross-a-challenger",
+    canonicalModelId: "vendor/cross-a-challenger",
+    displayName: "Cross A challenger",
+  };
+  const descriptor: BackendDescriptor = {
+    id: "openrouter",
+    displayName: "OpenRouter",
+    maturity: "stable",
+    connectable: true,
+    kind: "raw-model",
+    credentialOwner: "orcode-keychain",
+    billingRealmKind: "api-payg",
+    capabilities: { models: true, tools: true, reasoning: true },
+  };
+  const routeA = {
+    ...bootstrapRoute(main.requestedModelId),
+    accountFingerprint: "acct_cross_old_111111",
+  } as NonNullable<ProviderSetupStateV1["defaultRoute"]>;
+  const routeB = {
+    ...bootstrapRoute("vendor/cross-b"),
+    accountFingerprint: "acct_cross_new_222222",
+  } as NonNullable<ProviderSetupStateV1["defaultRoute"]>;
+  const connection = (
+    id: string,
+    accountFingerprint: string,
+    credentialSlot: string,
+  ): ProviderConnectionStateV1 => ({
+    id,
+    backendId: "openrouter",
+    enabled: true,
+    maturity: "stable",
+    credentialSlot,
+    accountFingerprint,
+    accountFingerprintState: "verified",
+    billingRealm: "openrouter-payg",
+    lastHealth: null,
+  });
+  const connectionA = connection(
+    "cross-connection-a",
+    routeA.accountFingerprint,
+    "v1:inference:13131313-1313-4131-8131-131313131313",
+  );
+  const connectionB = connection(
+    "cross-connection-b",
+    routeB.accountFingerprint,
+    "v1:inference:14141414-1414-4141-8141-141414141414",
+  );
+  const adapter: BackendAdapter = {
+    backendId: "openrouter",
+    async inspect() { throw new Error("unused"); },
+    async reconnect() { throw new Error("unused"); },
+    async logout() {},
+    async discardCandidate() {},
+    async connect() {
+      return {
+        candidateId: "cross-candidate-a",
+        backendId: "openrouter",
+        connectionId: connectionA.id,
+        accountFingerprint: routeA.accountFingerprint,
+        billingRealm: "openrouter-payg",
+        health: {
+          credential: "valid",
+          connectivity: "connected",
+          spend: "available",
+          runtime: "ready",
+          observedAt: 1,
+          generation: 1,
+        },
+      };
+    },
+    async listModels() { return [main, challenger]; },
+    async activate() { throw new Error("unused"); },
+  };
+  const registry = new BackendRegistry([{ descriptor, adapter }]);
+  const stateStore = new ProviderStateStore(structuredClone(DEFAULT_CONFIG.providerSetup));
+  let runtimeAccount: string | null = null;
+  const orchestrator = {
+    async cancelSetup() { return {}; },
+    async activateCandidate() {
+      const before = stateStore.read();
+      const state = stateStore.replace({
+        ...before,
+        lifecycle: "configured",
+        connections: [connectionA],
+        defaultRoute: routeA,
+        cross: { enabled: false, preferredLead: null, preferredChallenger: null },
+      }, before.revision);
+      runtimeAccount = routeA.accountFingerprint;
+      return { persisted: true, warnings: [], state, route: routeA };
+    },
+    ensureRunnableRoute(route: NonNullable<ProviderSetupStateV1["defaultRoute"]>) {
+      return structuredClone(route);
+    },
+  };
+  let resolveCross!: (value: string | null) => void;
+  let crossStarted!: () => void;
+  const reachedCross = new Promise<void>((resolve) => { crossStarted = resolve; });
+  let hubCalls = 0;
+  let modelCalls = 0;
+  const surface: SetupSurface = {
+    async chooseHub() {
+      hubCalls += 1;
+      if (hubCalls === 1) return "openrouter";
+      crossStarted();
+      return new Promise<string | null>((resolve) => { resolveCross = resolve; });
+    },
+    async readSecret() { return "sk-or-v1-cross-test"; },
+    async chooseModel() {
+      modelCalls += 1;
+      return modelCalls === 1 ? main.canonicalModelId : challenger.canonicalModelId;
+    },
+    async confirm() { return true; },
+    present() {},
+  };
+  const config = structuredClone(DEFAULT_CONFIG);
+  const session = SessionStore.create("/synthetic/cross-generation", "/synthetic/.orcode");
+  const runtime = new Runtime(
+    {},
+    {},
+    registry,
+    stateStore,
+    orchestrator,
+    {},
+    { beginRun() { return () => undefined; } },
+    {},
+    null,
+    null,
+    main.requestedModelId,
+    config,
+    session,
+  );
+
+  const pending = runtime.runSetup(surface);
+  await reachedCross;
+  const activatedA = stateStore.read();
+  stateStore.replace({
+    ...activatedA,
+    connections: [connectionA, connectionB],
+    defaultRoute: routeB,
+    cross: { enabled: false, preferredLead: null, preferredChallenger: null },
+  }, activatedA.revision);
+  runtimeAccount = routeB.accountFingerprint;
+  runtime.adoptCredentialActivation(routeB, true, "newer-process-secret");
+  resolveCross("cross-prepare");
+  const result = await pending;
+
+  assert.deepEqual(result, { kind: "ready" });
+  assert.equal(stateStore.read().defaultRoute?.accountFingerprint, routeB.accountFingerprint);
+  assert.equal(stateStore.read().cross.preferredLead, null);
+  assert.equal(runtime.ensureRunnableRoute().accountFingerprint, routeB.accountFingerprint);
+  assert.equal(session.data.route?.accountFingerprint, routeB.accountFingerprint);
+  assert.equal(runtimeAccount, routeB.accountFingerprint);
+});
+
 test("reconnect synchronizes the current session to the exact rebound route", async () => {
   const Runtime = (cliModule as unknown as {
     DefaultProviderRuntime: new (...args: unknown[]) => {
@@ -3467,6 +3649,97 @@ test("disabled legacy logout forgets runtime only after exact durable commit rea
   assert.deepEqual(effects, ["build", "adopt", "readback", "runtime-forget"]);
   assert.equal(stateStore.read().connections[0]?.enabled, false);
   assert.equal(stateStore.read().revision, 1);
+});
+
+test("legacy logout completes or recovers the exact disabled tuple after first post-commit lease loss", async () => {
+  const Runtime = (cliModule as unknown as {
+    DefaultProviderRuntime: new (...args: unknown[]) => {
+      execute(intent: Record<string, unknown>, surface: "plain"): Promise<Record<string, unknown>>;
+    };
+  }).DefaultProviderRuntime;
+  const route = {
+    ...bootstrapRoute("vendor/legacy-post-commit"),
+    accountFingerprint: "acct_legacy_post_commit_555555",
+  } as NonNullable<ProviderSetupStateV1["defaultRoute"]>;
+  const initial: ProviderSetupStateV1 = {
+    schemaVersion: 1,
+    revision: 0,
+    lifecycle: "configured",
+    connections: [{
+      id: "legacy-post-commit-connection",
+      backendId: "openrouter",
+      enabled: true,
+      maturity: "stable",
+      credentialSlot: "legacy:inference",
+      accountFingerprint: route.accountFingerprint,
+      accountFingerprintState: "verified",
+      billingRealm: "openrouter-payg",
+      lastHealth: null,
+    }],
+    defaultRoute: route,
+    cross: { enabled: false, preferredLead: null, preferredChallenger: null },
+  };
+  let durable = structuredClone(initial);
+  const stateStore = new ProviderStateStore(initial, {
+    persist: async (request) => {
+      const next = request.build(structuredClone(durable));
+      durable = structuredClone(next);
+      request.adopt(next);
+      return structuredClone(next);
+    },
+  });
+  let coordinatorAcquisitions = 0;
+  const coordinator = {
+    async runExclusive<T>(
+      _request: unknown,
+      operation: (lease: { assertHeld(): Promise<void> }) => Promise<T>,
+    ): Promise<T> {
+      coordinatorAcquisitions += 1;
+      const acquisition = coordinatorAcquisitions;
+      return operation({
+        async assertHeld() {
+          if (acquisition === 1 && stateStore.read().revision === 1) {
+            throw new Error("fixed first post-commit legacy lease loss");
+          }
+        },
+      });
+    },
+  };
+  let runtimeForgets = 0;
+  const config = structuredClone(DEFAULT_CONFIG);
+  config.providerSetup = structuredClone(initial);
+  const runtime = new Runtime(
+    { forgetKey() { runtimeForgets += 1; } },
+    {},
+    {
+      descriptor() { return { id: "openrouter", displayName: "OpenRouter", maturity: "stable" }; },
+      entries() { return []; },
+    },
+    stateStore,
+    { ensureRunnableRoute: () => route },
+    coordinator,
+    { beginRun() { return () => undefined; } },
+    { async apply() { throw new Error("legacy logout must not call versioned cleanup"); } },
+    "legacy-secret",
+    null,
+    route.requestedModelId,
+    config,
+  );
+
+  const prompt = await runtime.execute({ kind: "logout", backendId: "openrouter" }, "plain");
+  const result = await runtime.execute({
+    kind: "logout",
+    backendId: "openrouter",
+    confirmationToken: prompt.confirmationToken,
+  }, "plain");
+
+  assert.equal(result.kind, "changed");
+  assert.equal(coordinatorAcquisitions, 2);
+  assert.equal(durable.revision, 1);
+  assert.equal(durable.connections[0]?.enabled, false);
+  assert.deepEqual(stateStore.read(), durable);
+  assert.deepEqual(config.providerSetup, durable);
+  assert.equal(runtimeForgets, 1);
 });
 
 for (const phase of ["prepared", "credential-deleted", "shared-reference"] as const) {

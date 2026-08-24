@@ -64,6 +64,8 @@ export interface SetupHubOptions {
   targetConnectionId?: string;
   /** Durable revision captured with an authority-backed saved credential. */
   expectedRevision?: number;
+  /** Exact runtime setup attempt; false fences every post-activation Cross effect. */
+  isCurrent?: () => boolean;
 }
 
 const SETUP_CALLER_ABORTED = Symbol("setup-caller-aborted");
@@ -134,7 +136,9 @@ export async function runSetupHub(options: SetupHubOptions): Promise<SetupHubRes
         false,
         options,
       );
-      if (outcome.kind === "ready") return completeCrossSetup(surface, registry, stateStore, outcome);
+      if (outcome.kind === "ready") {
+        return completeCrossSetup(surface, registry, stateStore, outcome, options);
+      }
       if (outcome.kind === "cancelled") {
         return cancelOnce(outcome.phase, outcome.reason);
       }
@@ -153,7 +157,9 @@ export async function runSetupHub(options: SetupHubOptions): Promise<SetupHubRes
       const environment = nonEmpty(options.environmentSecret);
       if (!environment) continue;
       const outcome = await activateOpenRouter(environment, "process-only", false, options);
-      if (outcome.kind === "ready") return completeCrossSetup(surface, registry, stateStore, outcome);
+      if (outcome.kind === "ready") {
+        return completeCrossSetup(surface, registry, stateStore, outcome, options);
+      }
       if (outcome.kind === "cancelled") {
         return cancelOnce(outcome.phase, outcome.reason);
       }
@@ -196,7 +202,9 @@ export async function runSetupHub(options: SetupHubOptions): Promise<SetupHubRes
     }
 
     const outcome = await activateOpenRouter(candidate!, persistence, askPersistence, options);
-    if (outcome.kind === "ready") return completeCrossSetup(surface, registry, stateStore, outcome);
+    if (outcome.kind === "ready") {
+      return completeCrossSetup(surface, registry, stateStore, outcome, options);
+    }
     if (outcome.kind === "cancelled") {
       return cancelOnce(outcome.phase, outcome.reason);
     }
@@ -346,12 +354,20 @@ async function completeCrossSetup(
   registry: BackendRegistry,
   stateStore: ProviderStateStore,
   activation: Extract<ActivationFlow, { kind: "ready" }>,
+  attempt: Pick<SetupHubOptions, "signal" | "isCurrent">,
 ): Promise<SetupHubResult> {
+  const activationIsCurrent = (): boolean => attempt.isCurrent?.() !== false
+    && (activation.state === null
+      || JSON.stringify(stateStore.read()) === JSON.stringify(activation.state));
+  const crossInputIsCurrent = (): boolean => !attempt.signal?.aborted
+    && activationIsCurrent();
+  if (!crossInputIsCurrent()) return { kind: "ready" };
   surface.present(providerState(hubEntries(registry, stateStore, false, activation.route)));
-  const action = await surface.chooseHub([
+  const action = await awaitSetupInput(surface.chooseHub([
     { id: "cross-later", label: "Later", description: "Collaboration remains off.", disabled: false, current: true, generation: stateStore.read().revision },
     { id: "cross-prepare", label: "Prepare roles", description: "Store two routes without starting collaboration.", disabled: false, current: false, generation: stateStore.read().revision },
-  ]);
+  ]), attempt.signal);
+  if (action === SETUP_CALLER_ABORTED || !crossInputIsCurrent()) return { kind: "ready" };
   if (action === null || action === "cross-later") return { kind: "ready" };
   if (action !== "cross-prepare") return { kind: "ready" };
 
@@ -368,7 +384,11 @@ async function completeCrossSetup(
     surface.present(notice("Prepare roles benötigt zwei unterschiedliche vollständig aufgelöste Modelle."));
     return { kind: "ready" };
   }
-  const chosen = await surface.chooseModel({ backendId: current.backendId, models: choices });
+  const chosen = await awaitSetupInput(
+    surface.chooseModel({ backendId: current.backendId, models: choices }),
+    attempt.signal,
+  );
+  if (chosen === SETUP_CALLER_ABORTED || !crossInputIsCurrent()) return { kind: "ready" };
   const challenger = choices.find((model) => model.canonicalModelId === chosen);
   if (!challenger || challenger.canonicalModelId === current.canonicalModelId) {
     surface.present(notice("Prepare roles benötigt zwei unterschiedliche vollständig aufgelöste Modelle."));
@@ -383,14 +403,33 @@ async function completeCrossSetup(
     surface.present(notice("Rollen sind nur für diese Prozessroute vorbereitet. Cross bleibt ausgeschaltet."));
     return { kind: "ready", preparedRoles: { lead: current, challenger: challengerRoute } };
   }
-  await stateStore.commit(stateStore.read().revision, (state) => ({
-    ...state,
-    cross: {
-      enabled: false,
-      preferredLead: current,
-      preferredChallenger: challengerRoute,
-    },
-  }));
+  const activationState = activation.state;
+  let staleActivation = false;
+  let preparedState: ReturnType<ProviderStateStore["read"]>;
+  try {
+    preparedState = await stateStore.commit(activationState.revision, (state) => {
+      if (JSON.stringify(state) !== JSON.stringify(activationState)) {
+        staleActivation = true;
+        throw new Error("Provider Cross activation was superseded.");
+      }
+      return {
+        ...state,
+        cross: {
+          enabled: false,
+          preferredLead: current,
+          preferredChallenger: challengerRoute,
+        },
+      };
+    });
+  } catch (error) {
+    if (staleActivation || !activationIsCurrent()) return { kind: "ready" };
+    throw error;
+  }
+  if (
+    attempt.signal?.aborted
+    || attempt.isCurrent?.() === false
+    || JSON.stringify(stateStore.read()) !== JSON.stringify(preparedState)
+  ) return { kind: "ready" };
   surface.present(notice("Rollen wurden vorbereitet. Cross bleibt ausgeschaltet."));
   return { kind: "ready" };
 }

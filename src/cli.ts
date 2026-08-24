@@ -581,6 +581,15 @@ interface ProviderConfirmationBinding {
   processRouteGeneration: number;
 }
 
+const LEGACY_LOGOUT_COMMIT_PROOF = Symbol("legacy-logout-commit-proof");
+
+interface LegacyLogoutCommittedOutcome {
+  readonly proof: typeof LEGACY_LOGOUT_COMMIT_PROOF;
+  readonly state: ProviderSetupStateV1;
+  readonly result: Extract<ProviderCommandResult, { kind: "changed" }>;
+  completed: boolean;
+}
+
 class ProviderConfirmationStaleError extends Error {
   constructor(readonly confirmation: ProviderConfirmationResult) {
     super("Provider confirmation is stale.");
@@ -599,6 +608,7 @@ export class DefaultProviderRuntime implements ProviderRuntime {
     ready: boolean;
   } | null = null;
   #processRouteGeneration = 0;
+  #setupPublicationGeneration = 0;
   readonly #providerConfirmations = new Map<string, ProviderConfirmationBinding>();
   #startupAttemptGeneration = 0;
 
@@ -816,6 +826,8 @@ export class DefaultProviderRuntime implements ProviderRuntime {
     const resolvedSurface = surface === "plain"
       ? createCliPlainSetupSurface()
       : surface;
+    const routePublicationGeneration = this.#processRouteGeneration;
+    const setupPublicationGeneration = ++this.#setupPublicationGeneration;
     let activatedRoute: RouteIdentityV1 | null = null;
     let activatedPersisted = false;
     const setupOrchestrator = {
@@ -850,6 +862,8 @@ export class DefaultProviderRuntime implements ProviderRuntime {
       generation: startupAttempt?.generation,
       targetConnectionId,
       expectedRevision,
+      isCurrent: () => this.#setupPublicationGeneration === setupPublicationGeneration
+        && this.#processRouteGeneration === routePublicationGeneration,
     });
     const state = this.stateStore.read();
     const persistedSessionRoute = validateRouteIdentityV1(this.session?.data.route);
@@ -887,18 +901,29 @@ export class DefaultProviderRuntime implements ProviderRuntime {
       result = await executeHub(null);
     }
     if (result.kind === "ready") {
-      const nextSessionRoute = activatedRoute
-        ?? result.preparedRoles?.lead
-        ?? this.#sessionRoute;
+      const currentDefaultRoute = validateRouteIdentityV1(this.stateStore.read().defaultRoute);
+      const activationCanPublish = activatedRoute !== null
+        && this.#setupPublicationGeneration === setupPublicationGeneration
+        && this.#processRouteGeneration === routePublicationGeneration
+        && (!activatedPersisted
+          || (currentDefaultRoute !== null && sameExactRoute(currentDefaultRoute, activatedRoute)));
+      const preparedRolesCanPublish = this.#setupPublicationGeneration === setupPublicationGeneration
+        && this.#processRouteGeneration === routePublicationGeneration
+        && (activatedRoute === null || activationCanPublish);
+      const nextSessionRoute = activationCanPublish
+        ? activatedRoute
+        : preparedRolesCanPublish
+        ? result.preparedRoles?.lead ?? this.#sessionRoute
+        : this.#sessionRoute;
       if (nextSessionRoute) {
         this.#adoptExactSessionRoute(
           nextSessionRoute,
-          activatedRoute ? activatedPersisted : this.#sessionRoutePersisted,
+          activationCanPublish ? activatedPersisted : this.#sessionRoutePersisted,
           true,
-          activatedRoute !== null,
+          activationCanPublish,
         );
       }
-      this.#preparedRoles = result.preparedRoles
+      this.#preparedRoles = preparedRolesCanPublish && result.preparedRoles
         ? structuredClone(result.preparedRoles)
         : null;
     }
@@ -1923,6 +1948,7 @@ export class DefaultProviderRuntime implements ProviderRuntime {
     connectionId: string | null,
     confirmationToken: string,
   ): Promise<ProviderCommandResult> {
+    const committedOutcome: { value: LegacyLogoutCommittedOutcome | null } = { value: null };
     try {
       return await this.activationCoordinator.runExclusive(
         { signal: new AbortController().signal, inspectCommitted: false },
@@ -1971,31 +1997,68 @@ export class DefaultProviderRuntime implements ProviderRuntime {
                 };
               })
             : current;
-          await lease.assertHeld();
-          this.config.providerSetup = requirePersistableProviderState(next);
-          await lease.assertHeld();
-          // A durable Legacy binding reaches this effect only after commit has
-          // adopted and verified its exact readback.
-          this.openRouter.forgetKey();
-          this.#processRouteGeneration += 1;
-          this.#sessionRoute = null;
-          this.#sessionRoutePersisted = false;
-          this.#preparedRoles = null;
-          this.environmentSecret = null;
-          await lease.assertHeld();
-          return {
+          const result: Extract<ProviderCommandResult, { kind: "changed" }> = {
             kind: "changed",
             operation: "logout",
             backendId: "openrouter",
             setupRequired: next.defaultRoute === null,
             defaultCleared: current.defaultRoute !== null && next.defaultRoute === null,
           };
+          committedOutcome.value = {
+            proof: LEGACY_LOGOUT_COMMIT_PROOF,
+            state: requirePersistableProviderState(next),
+            result,
+            completed: false,
+          };
+          return this.#completeCommittedLegacyLogout(committedOutcome.value, lease);
         },
       );
     } catch (error) {
       if (error instanceof ProviderConfirmationStaleError) return error.confirmation;
+      const committed = committedOutcome.value;
+      if (committed?.proof === LEGACY_LOGOUT_COMMIT_PROOF) {
+        if (committed.completed) return committed.result;
+        try {
+          return await this.activationCoordinator.runExclusive(
+            { signal: new AbortController().signal, inspectCommitted: false },
+            async (lease) => {
+              await lease.assertHeld();
+              if (
+                JSON.stringify(this.stateStore.read())
+                !== JSON.stringify(committed.state)
+              ) {
+                throw new ProviderSetupRequiredError();
+              }
+              return this.#completeCommittedLegacyLogout(committed, lease);
+            },
+          );
+        } catch (recoveryError) {
+          if (committed.completed) return committed.result;
+          throw recoveryError;
+        }
+      }
       throw error;
     }
+  }
+
+  async #completeCommittedLegacyLogout(
+    outcome: LegacyLogoutCommittedOutcome,
+    lease: ProviderCoordinatorLease,
+  ): Promise<Extract<ProviderCommandResult, { kind: "changed" }>> {
+    await lease.assertHeld();
+    this.config.providerSetup = requirePersistableProviderState(outcome.state);
+    await lease.assertHeld();
+    // The exact durable Legacy disable is now projected into this process.
+    this.openRouter.forgetKey();
+    this.#processRouteGeneration += 1;
+    this.#sessionRoute = null;
+    this.#sessionRoutePersisted = false;
+    this.#pendingSessionBinding = null;
+    this.#preparedRoles = null;
+    this.environmentSecret = null;
+    outcome.completed = true;
+    await lease.assertHeld();
+    return outcome.result;
   }
 }
 

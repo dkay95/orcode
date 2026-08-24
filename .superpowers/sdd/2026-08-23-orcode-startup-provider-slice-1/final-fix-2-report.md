@@ -208,3 +208,62 @@ first prompt belongs only to B.
 - `git diff --check`: PASS.
 
 Exact follow-up commit subject: `fix: bind chat handoff to exact session`.
+
+## Review round 2 — Cross publication and Legacy logout completion
+
+### Base and formal tests-only RED
+
+- Exact follow-up base: `edba1d8498838222e01195bdfb1f40959fa0f7e2`.
+- Before the first production edit, the complete `src` tree hash was
+  `46ccb9df0522e690f531fa0d4ce767d3e5a107177440d00dc476023ba623da14`;
+  `git diff --name-only -- src` was empty. After adding only tests, the same
+  hash was reproduced byte-for-byte.
+- The name-filtered formal matrix reached exactly 3 tests: 0 passed and 3
+  failed, with no TypeScript or harness failure:
+  1. `late Cross completion after newer activation cannot republish the old route or session owner`
+     published the superseded A route/session after durable and runtime B had
+     already become authoritative.
+  2. `caller abort during post-activation Cross settles as Later with no late effects`
+     stayed pending behind an unresolved Cross prompt.
+  3. `legacy logout completes or recovers the exact disabled tuple after first post-commit lease loss`
+     propagated the fixed first post-commit lease loss after the exact disabled
+     state had already committed and adopted.
+
+### Central correction
+
+- Post-activation Cross now carries the caller signal and an exact setup/runtime
+  generation fence. Both Cross prompts use the abort-aware setup-input boundary;
+  stale or aborted completion is `Later` and publishes no notice, roles, route,
+  session owner, or runtime projection.
+- A persisted Cross role commit compares against the exact activation state and
+  captured revision. Immediately before route/session adoption, `runSetup`
+  rechecks the same setup generation, process-route generation, and exact
+  persisted default route. A newer activation therefore remains the sole owner.
+- Legacy logout records a module-private exact committed outcome only after the
+  durable commit/adopt/readback returns. If the retained lease is then lost, it
+  reacquires the canonical activation authority, verifies the exact committed
+  disabled state, and completes State/Config/Runtime/session cleanup exactly
+  once. A trailing lease error after completion returns the committed result
+  instead of exposing a half tuple.
+
+### Review-round verification
+
+- Named review matrix: 3/3 passed.
+- `tests/setup-ui.test.ts`: 31/31 passed.
+- Prior Fix2 authority/session regression matrix: 14/14 passed, including the
+  three exact chat-handoff cases, foreign route proof, reconnect ordering,
+  credential/session synchronization, and Legacy logout replacement cases.
+- Serial combined setup/setup-UI/CLI/commands/session/integration focus:
+  332/332 passed.
+- `tests/provider-privacy.test.ts`: 3/3 passed after supplying the isolated
+  fresh-build harness with a temporary dependency symlink; it was removed
+  immediately after the run.
+- `npx tsc -p tsconfig.json --noEmit`: PASS.
+- `npx tsc -p tsconfig.tests.json --noEmit`: PASS.
+- `node --import tsx scripts/render-command-docs.ts --check`: PASS.
+- Approved setup Spec/Plan diff from `8d17a0c11f12efc5e8d3a9534e94ec2df113fc6d`:
+  empty.
+- `git diff --check`: PASS.
+- No global/full test or `npm run check` was run.
+
+Exact follow-up commit subject: `fix: fence provider Cross and logout completion`.

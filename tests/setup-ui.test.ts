@@ -598,6 +598,53 @@ test("Escape after activation is exactly Later and keeps the committed route wit
   assert.equal(state.cross.enabled, false);
 });
 
+test("caller abort during post-activation Cross settles as Later with no late effects", async () => {
+  const surface = new ScriptedSurface(
+    [],
+    ["sk-or-v1-test-key"],
+    [MODEL.canonicalModelId, CHALLENGER.canonicalModelId],
+    [true],
+  );
+  const context = fixture(surface);
+  context.adapter.models = [MODEL, CHALLENGER];
+  const cancellations = observeSetupCancellations(context.orchestrator);
+  const controller = new AbortController();
+  let hubCalls = 0;
+  let resolveCross!: (value: string | null) => void;
+  let crossStarted!: () => void;
+  const reachedCross = new Promise<void>((resolve) => { crossStarted = resolve; });
+  surface.chooseHub = async (entries) => {
+    surface.calls.push("hub");
+    surface.entries.push([...entries]);
+    hubCalls += 1;
+    if (hubCalls === 1) return "openrouter";
+    crossStarted();
+    return new Promise<string | null>((resolve) => { resolveCross = resolve; });
+  };
+
+  const pending = runSetupHub({ ...context, surface, signal: controller.signal, generation: 31 });
+  await reachedCross;
+  const activated = context.stateStore.read();
+  const reason = new DOMException("post-activation setup caller cancellation", "AbortError");
+  controller.abort(reason);
+  const notSettled = Symbol("not-settled");
+  const result = await Promise.race([
+    pending,
+    new Promise<typeof notSettled>((resolve) => setImmediate(() => resolve(notSettled))),
+  ]);
+
+  assert.notEqual(result, notSettled);
+  assert.deepEqual(result, { kind: "ready" });
+  assert.deepEqual(cancellations, []);
+  assert.deepEqual(context.stateStore.read(), activated);
+
+  resolveCross("cross-prepare");
+  await Promise.resolve();
+  await Promise.resolve();
+  assert.deepEqual(context.stateStore.read(), activated);
+  assert.deepEqual(surface.calls, ["hub", "secret", "model", "confirm", "hub"]);
+});
+
 test("prepare roles stores distinct resolved models while Cross remains off and starts no collaboration", async () => {
   const surface = new ScriptedSurface(
     ["openrouter", "cross-prepare"],
