@@ -1386,6 +1386,219 @@ async function providerForgetActivationFixture() {
   };
 }
 
+async function managementMutationLeaseFixture() {
+  const api = cliModule as typeof cliModule & {
+    ProviderCredentialForgetJournal: new (input: {
+      appHome: string;
+      privateStore: PrivateStore;
+    }) => {
+      begin(input: Record<string, unknown>): Promise<unknown>;
+    };
+    createProviderCredentialController(input: Record<string, unknown>): {
+      apply(intent: Record<string, unknown>): Promise<Record<string, unknown>>;
+    };
+  };
+  const root = await mkdtemp(join(tmpdir(), "orcode-management-effect-fence-"));
+  const configPath = join(root, "config.json");
+  const state: ProviderSetupStateV1 = {
+    schemaVersion: 1,
+    revision: 0,
+    lifecycle: "never-configured",
+    connections: [],
+    defaultRoute: null,
+    cross: { enabled: false, preferredLead: null, preferredChallenger: null },
+  };
+  const config = structuredClone(DEFAULT_CONFIG);
+  config.providerSetup = structuredClone(state);
+  await saveConfig(config, configPath);
+  const stateStore = new ProviderStateStore(state);
+  const privateStore = new PrivateStore({ root });
+  const runtimeGuardA = providerRuntimeGuardFixture();
+  let now = 100;
+  let uuid = 200;
+  const createUuid = () =>
+    `70000000-0000-4000-8000-${String(uuid++).padStart(12, "0")}`;
+  const coordinatorOptions = (runtimeGuard: ReturnType<typeof providerRuntimeGuardFixture>) => ({
+    appHome: root,
+    configPath,
+    privateStore,
+    credentials: {} as never,
+    adapter: {} as never,
+    stateStore,
+    runtimeGuard,
+    now: () => now,
+    createUuid,
+    waitForLease: async () => new Promise<void>((resolve) => setImmediate(resolve)),
+  });
+  const coordinatorA = new ProviderActivationCoordinator({
+    ...coordinatorOptions(runtimeGuardA),
+    leaseDurationMs: 10,
+  });
+  const coordinatorB = new ProviderActivationCoordinator({
+    ...coordinatorOptions(providerRuntimeGuardFixture()),
+    leaseDurationMs: 100,
+  });
+  const forgetJournal = new api.ProviderCredentialForgetJournal({
+    appHome: root,
+    privateStore,
+  });
+  return {
+    api,
+    coordinatorA,
+    async prepareCompetingForget() {
+      now = 1_000;
+      await coordinatorB.recoverAndRun(
+        { signal: new AbortController().signal, inspectCommitted: false },
+        async (lease) => {
+          await lease.assertHeld();
+          return forgetJournal.begin({
+            connectionId: null,
+            target: { kind: "legacy" },
+          });
+        },
+      );
+    },
+  };
+}
+
+test("management validation loss fences keychain set and runtime activation before either effect", async () => {
+  const fixture = await managementMutationLeaseFixture();
+  let resumeValidation!: () => void;
+  let validationReached!: () => void;
+  const validationPaused = new Promise<void>((resolve) => { validationReached = resolve; });
+  const validationResume = new Promise<void>((resolve) => { resumeValidation = resolve; });
+  const mutations: string[] = [];
+  const controller = fixture.api.createProviderCredentialController({
+    stateStore: new ProviderStateStore({
+      schemaVersion: 1,
+      revision: 0,
+      lifecycle: "never-configured",
+      connections: [],
+      defaultRoute: null,
+      cross: { enabled: false, preferredLead: null, preferredChallenger: null },
+    }),
+    openRouter: {
+      async validateManagementKey() {
+        validationReached();
+        await validationResume;
+        return { totalCredits: 10, totalUsage: 1 };
+      },
+      activateValidatedManagementKey() { mutations.push("runtime:activate"); },
+    },
+    credentials: {
+      async set() { mutations.push("keychain:set"); },
+      async deleteSlot() { return false; },
+    },
+    activationCoordinator: fixture.coordinatorA,
+  });
+  const applying = controller.apply({
+    kind: "replace",
+    credentialKind: "management",
+    candidate: `${STARTUP_KEY_PREFIX}${"m".repeat(48)}`,
+  });
+  await validationPaused;
+  await fixture.prepareCompetingForget();
+  resumeValidation();
+
+  await assert.rejects(applying, /fence|lease|recovery|activation/i);
+  assert.deepEqual(mutations, []);
+});
+
+test("management forget loss fences keychain and runtime deletion before either effect", async () => {
+  const fixture = await managementMutationLeaseFixture();
+  let resumeOperation!: () => void;
+  let operationReached!: () => void;
+  const operationPaused = new Promise<void>((resolve) => { operationReached = resolve; });
+  const operationResume = new Promise<void>((resolve) => { resumeOperation = resolve; });
+  const wrappedCoordinator = {
+    activate: fixture.coordinatorA.activate.bind(fixture.coordinatorA),
+    recoverAndRun: fixture.coordinatorA.recoverAndRun.bind(fixture.coordinatorA),
+    runExclusive: <T>(
+      request: Parameters<ProviderActivationCoordinator["runExclusive"]>[0],
+      operation: (lease: Parameters<Parameters<ProviderActivationCoordinator["runExclusive"]>[1]>[0]) => Promise<T>,
+    ) => fixture.coordinatorA.runExclusive(request, async (lease) => {
+      operationReached();
+      await operationResume;
+      return operation(lease);
+    }),
+  };
+  const mutations: string[] = [];
+  const controller = fixture.api.createProviderCredentialController({
+    stateStore: new ProviderStateStore({
+      schemaVersion: 1,
+      revision: 0,
+      lifecycle: "never-configured",
+      connections: [],
+      defaultRoute: null,
+      cross: { enabled: false, preferredLead: null, preferredChallenger: null },
+    }),
+    openRouter: {
+      forgetManagementKey() { mutations.push("runtime:forget"); },
+    },
+    credentials: {
+      async delete() { mutations.push("keychain:delete"); return true; },
+      async deleteSlot() { return false; },
+    },
+    activationCoordinator: wrappedCoordinator,
+  });
+  const applying = controller.apply({ kind: "forget", credentialKind: "management" });
+  await operationPaused;
+  await fixture.prepareCompetingForget();
+  resumeOperation();
+
+  await assert.rejects(applying, /fence|lease|recovery|activation/i);
+  assert.deepEqual(mutations, []);
+});
+
+test("management process-only approval loss fences runtime activation after failed persistence", async () => {
+  const fixture = await managementMutationLeaseFixture();
+  let resumeApproval!: () => void;
+  let approvalReached!: () => void;
+  const approvalPaused = new Promise<void>((resolve) => { approvalReached = resolve; });
+  const approvalResume = new Promise<void>((resolve) => { resumeApproval = resolve; });
+  const mutations: string[] = [];
+  let setAttempts = 0;
+  const controller = fixture.api.createProviderCredentialController({
+    stateStore: new ProviderStateStore({
+      schemaVersion: 1,
+      revision: 0,
+      lifecycle: "never-configured",
+      connections: [],
+      defaultRoute: null,
+      cross: { enabled: false, preferredLead: null, preferredChallenger: null },
+    }),
+    openRouter: {
+      async validateManagementKey() { return { totalCredits: 10, totalUsage: 1 }; },
+      activateValidatedManagementKey() { mutations.push("runtime:activate"); },
+    },
+    credentials: {
+      async set() {
+        setAttempts += 1;
+        throw new Error("synthetic management persistence unavailable");
+      },
+      async deleteSlot() { return false; },
+    },
+    activationCoordinator: fixture.coordinatorA,
+  });
+  const applying = controller.apply({
+    kind: "replace",
+    credentialKind: "management",
+    candidate: `${STARTUP_KEY_PREFIX}${"p".repeat(48)}`,
+    allowProcessOnly: async () => {
+      approvalReached();
+      await approvalResume;
+      return true;
+    },
+  });
+  await approvalPaused;
+  await fixture.prepareCompetingForget();
+  resumeApproval();
+
+  await assert.rejects(applying, /fence|lease|recovery|activation/i);
+  assert.equal(setAttempts, 1);
+  assert.deepEqual(mutations, []);
+});
+
 test("plain setup surface keeps secret input masked and maps cancelled prompts to null", async () => {
   const calls: Array<Record<string, unknown>> = [];
   const surface = createPlainSetupSurface({

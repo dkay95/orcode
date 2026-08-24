@@ -1256,6 +1256,7 @@ export function createProviderCredentialController(input: {
                       },
                     }
                   : { kind: "legacy" };
+              await lease.assertHeld();
               const forgetTransaction = await input.forgetJournal.begin({
                 connectionId: connection?.id ?? null,
                 target,
@@ -1269,7 +1270,9 @@ export function createProviderCredentialController(input: {
                 onStatePublished: input.onInferenceStatePublished,
               });
               if (settled.cleanupPending) throw new Error("cleanup-pending");
+              await lease.assertHeld();
               input.openRouter.forgetKey();
+              await lease.assertHeld();
               input.onInferenceForgotten?.();
               return {
                 kind: "forgotten" as const,
@@ -1287,8 +1290,11 @@ export function createProviderCredentialController(input: {
       }
 
       return input.activationCoordinator.runExclusive({ signal }, async (lease) => {
+        await lease.assertHeld();
         if (intent.kind === "forget") {
+          await lease.assertHeld();
           const removed = await input.credentials.delete?.("management") ?? false;
+          await lease.assertHeld();
           input.openRouter.forgetManagementKey();
           await lease.assertHeld();
           return { kind: "forgotten", credentialKind: "management", removed };
@@ -1296,12 +1302,17 @@ export function createProviderCredentialController(input: {
         const candidate = intent.kind === "save"
           ? input.openRouter.requireManagementKey()
           : normalizeProviderSecret(intent.candidate);
+        await lease.assertHeld();
         const credits = await input.openRouter.validateManagementKey(candidate);
+        await lease.assertHeld();
         let persisted = true;
         try {
           if (!input.credentials.set) throw new Error("Credential persistence unavailable.");
+          await lease.assertHeld();
           await input.credentials.set("management", candidate);
+          await lease.assertHeld();
         } catch (error) {
+          await lease.assertHeld();
           if (
             intent.kind !== "replace"
             || !intent.allowProcessOnly
@@ -1310,7 +1321,9 @@ export function createProviderCredentialController(input: {
             throw error;
           }
           persisted = false;
+          await lease.assertHeld();
         }
+        await lease.assertHeld();
         input.openRouter.activateValidatedManagementKey(
           candidate,
           persisted ? "keychain" : "interactive",

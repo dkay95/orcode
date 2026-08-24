@@ -283,9 +283,7 @@ export class ProviderActivationCoordinator {
           ? recovery.error
           : new ProviderActivationRecoveryRequiredError();
       }
-      await this.#assertNoPendingCredentialForget(providerLease);
-      await this.#assertFence(providerLease);
-      await assertRuntimeLease(runtimeLease);
+      await this.#assertMutationAllowed(providerLease, runtimeLease, true);
       const normalized = normalizeProviderSecret(request.candidate);
       const candidate = await this.#connectCandidate(
         normalized,
@@ -294,6 +292,7 @@ export class ProviderActivationCoordinator {
       );
       initialCandidateId = candidate.candidateId;
       await this.#boundary("candidate-validated");
+      await this.#assertMutationAllowed(providerLease, runtimeLease, true);
       const models = await this.#listModels(candidate.candidateId, request.signal);
       await this.#boundary("models-loaded");
       const selectedModel = selectExplicitModel(
@@ -305,13 +304,14 @@ export class ProviderActivationCoordinator {
       await this.#boundary("model-selected");
 
       if (request.persistence === "process-only") {
-        await assertRuntimeLease(runtimeLease);
+        await this.#assertMutationAllowed(providerLease, runtimeLease, true);
         const activated = await this.#activateRuntime(
           candidate.candidateId,
           selectedModel,
           request.signal,
         );
         await assertRuntimeLease(runtimeLease);
+        await this.#assertFence(providerLease);
         assertActivatedRoute(candidateRoute, activated);
         await this.#boundary("runtime-activated");
         return {
@@ -376,12 +376,12 @@ export class ProviderActivationCoordinator {
         expectedProviderSetupSha256: configFacts.digest,
         candidateProviderSetupSha256: providerSetupDigest(nextState),
       };
+      await this.#assertMutationAllowed(providerLease, runtimeLease, true);
       transaction = await this.#createJournal(manifest, providerLease);
       await this.#boundary("journal-written");
 
       try {
-        await this.#assertFence(providerLease);
-        await assertRuntimeLease(runtimeLease);
+        await this.#assertMutationAllowed(providerLease, runtimeLease, true);
         await this.#options.credentials.writeSlot(candidateSlot, normalized);
         await this.#assertFence(providerLease);
         await this.#boundary("slot-written");
@@ -426,14 +426,14 @@ export class ProviderActivationCoordinator {
             "Provider credential persistence failed without changing the active route.",
           );
         }
-        await this.#assertFence(providerLease);
-        await assertRuntimeLease(runtimeLease);
+        await this.#assertMutationAllowed(providerLease, runtimeLease, true);
         const activated = await this.#activateRuntime(
           candidate.candidateId,
           selectedModel,
           request.signal,
         );
         await assertRuntimeLease(runtimeLease);
+        await this.#assertFence(providerLease);
         assertActivatedRoute(candidateRoute, activated);
         await this.#boundary("runtime-activated");
         return {
@@ -445,6 +445,7 @@ export class ProviderActivationCoordinator {
       }
 
       manifest.phase = "credential-staged";
+      await this.#assertMutationAllowed(providerLease, runtimeLease, true);
       await this.#writeJournal(transaction, manifest, providerLease);
       await this.#assertFence(providerLease);
       let publication: "candidate" | "old" | "ambiguous";
@@ -470,6 +471,7 @@ export class ProviderActivationCoordinator {
             await assertRuntimeLease(runtimeLease);
             await ownership.assertHeld();
             try {
+              await this.#assertMutationAllowed(providerLease!, runtimeLease, true);
               await this.#options.writeConfigAtomic(
                 ownership.canonicalPath,
                 nextRaw,
@@ -548,14 +550,15 @@ export class ProviderActivationCoordinator {
       }
       await this.#boundary("config-readback");
       manifest.phase = "config-committed";
+      await this.#assertMutationAllowed(providerLease, runtimeLease, true);
       await this.#writeJournal(transaction, manifest, providerLease);
+      await this.#assertMutationAllowed(providerLease, runtimeLease, true);
       try {
         this.#options.stateStore.replace(nextState, current.revision);
       } catch {
         throw new ProviderActivationRecoveryRequiredError("provider-state-adoption-failed");
       }
-      await this.#assertFence(providerLease);
-      await assertRuntimeLease(runtimeLease);
+      await this.#assertMutationAllowed(providerLease, runtimeLease, true);
       let activated: CandidateProviderState;
       try {
         activated = await this.#activateRuntime(
@@ -564,11 +567,12 @@ export class ProviderActivationCoordinator {
           request.signal,
         );
         await assertRuntimeLease(runtimeLease);
+        await this.#assertFence(providerLease);
         assertActivatedRoute(candidateRoute, activated);
-      } catch {
+      } catch (error) {
+        if (error instanceof ProviderActivationRecoveryRequiredError) throw error;
         throw new ProviderActivationRecoveryRequiredError("provider-runtime-bind-ambiguous");
       }
-      await this.#assertFence(providerLease);
       await this.#boundary("runtime-activated");
       const warnings: string[] = [];
       const oldCleaned = await this.#cleanupPreviousSlot(
@@ -580,6 +584,7 @@ export class ProviderActivationCoordinator {
       if (!oldCleaned) warnings.push("provider-candidate-cleanup-retained");
       await this.#boundary("old-slot-cleaned");
       if (oldCleaned) {
+        await this.#assertMutationAllowed(providerLease, runtimeLease, true);
         await this.#removeJournal(transaction, providerLease);
         transaction = null;
       }
@@ -720,10 +725,11 @@ export class ProviderActivationCoordinator {
         await this.#assertNoPendingCredentialForget(providerLease);
       }
       const coordinatorLease: ProviderCoordinatorLease = {
-        assertHeld: async () => {
-          await assertRuntimeLease(runtimeLease);
-          await this.#assertFence(providerLease!);
-        },
+        assertHeld: () => this.#assertMutationAllowed(
+          providerLease!,
+          runtimeLease,
+          rejectPendingForget,
+        ),
       };
       await coordinatorLease.assertHeld();
       const value = await operation(coordinatorLease);
@@ -1049,6 +1055,20 @@ export class ProviderActivationCoordinator {
     } catch {
       throw new ProviderActivationRecoveryRequiredError("provider-lease-fence-lost");
     }
+  }
+
+  async #assertMutationAllowed(
+    lease: HeldProviderLease,
+    runtimeLease: ProviderActivationRuntimeLease,
+    rejectPendingForget: boolean,
+  ): Promise<void> {
+    await assertRuntimeLease(runtimeLease);
+    await this.#assertFence(lease);
+    if (rejectPendingForget) {
+      await this.#assertNoPendingCredentialForget(lease);
+      await this.#assertFence(lease);
+    }
+    await assertRuntimeLease(runtimeLease);
   }
 
   async #assertNoPendingCredentialForget(lease: HeldProviderLease): Promise<void> {

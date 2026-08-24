@@ -1934,6 +1934,140 @@ test("a paused expired owner is fenced after a newer activation reclaims the lea
   assert.equal(tuple.secret, NEW_SECRET);
 });
 
+for (const persistence of ["persisted", "process-only"] as const) {
+  test(`an expired ${persistence} owner cannot mutate runtime after a newer owner prepares credential forget`, async () => {
+    const fixture = await activationFixture({ now: 100 });
+    let now = 100;
+    let resumeA!: () => void;
+    let reachedA!: () => void;
+    const pausedA = new Promise<void>((resolve) => { reachedA = resolve; });
+    const resumePromiseA = new Promise<void>((resolve) => { resumeA = resolve; });
+    const coordinatorA = new fixture.api.ProviderActivationCoordinator({
+      appHome: fixture.appHome,
+      configPath: fixture.path,
+      privateStore: fixture.privateStore,
+      credentials: fixture.credentials,
+      adapter: fixture.adapter,
+      stateStore: fixture.stateStore,
+      runtimeGuard: fixture.runtimeGuard,
+      now: () => now,
+      createUuid: sequentialUuid(),
+      leaseDurationMs: 10,
+      waitForLease: async () => new Promise<void>((resolve) => setImmediate(resolve)),
+      onBoundary: async (boundary: Boundary) => {
+        if (boundary === "models-loaded") {
+          reachedA();
+          await resumePromiseA;
+        }
+      },
+    });
+    const activationA = coordinatorA.activate({ ...fixture.request, persistence });
+    await pausedA;
+
+    now = 1_000;
+    const adapterB = new FakeAdapter();
+    const coordinatorB = new fixture.api.ProviderActivationCoordinator({
+      appHome: fixture.appHome,
+      configPath: fixture.path,
+      privateStore: fixture.privateStore,
+      credentials: fixture.credentials,
+      adapter: adapterB,
+      stateStore: fixture.stateStore,
+      runtimeGuard: new FakeRuntimeGuard(),
+      now: () => now,
+      createUuid: sequentialUuid(),
+      leaseDurationMs: 100,
+      waitForLease: async () => new Promise<void>((resolve) => setImmediate(resolve)),
+    });
+    await coordinatorB.activate({ ...fixture.request, persistence: "process-only" });
+    assert.equal(adapterB.calls.filter((call) => call === "activate").length, 1);
+
+    const forgetClaim = await fixture.privateStore.createDirectoryExclusive(
+      join(fixture.appHome, fixture.api.PROVIDER_CREDENTIAL_FORGET_DIRECTORY),
+    );
+    assert.ok(forgetClaim);
+    await fixture.privateStore.writeClaimManifest(
+      forgetClaim,
+      `${JSON.stringify({
+        version: 1,
+        phase: "prepared",
+        connectionId: CONNECTION_ID,
+        target: { kind: "versioned", slot: OLD_SLOT },
+      })}\n`,
+      null,
+    );
+    const reservationsBeforeResume = fixture.credentials.calls.filter(
+      (call) => call === "reserveSlot",
+    ).length;
+
+    resumeA();
+    await assert.rejects(activationA, /fence|lease|recovery|activation/i);
+
+    assert.equal(
+      fixture.adapter.calls.filter((call) => call === "activate").length,
+      0,
+      "the expired owner must not begin a runtime bind",
+    );
+    assert.equal(
+      fixture.credentials.calls.filter((call) => call === "reserveSlot").length,
+      reservationsBeforeResume,
+      "the persisted control must not begin a durable candidate mutation",
+    );
+    await fixture.privateStore.assertDirectoryClaim(forgetClaim);
+  });
+}
+
+test("process-only activation reports the exact lost fence when ownership changes during runtime bind", async () => {
+  const fixture = await activationFixture({ now: 100 });
+  let now = 100;
+  let resumeA!: () => void;
+  let reachedA!: () => void;
+  const pausedA = new Promise<void>((resolve) => { reachedA = resolve; });
+  fixture.adapter.activateReached = reachedA;
+  fixture.adapter.activatePause = new Promise<void>((resolve) => { resumeA = resolve; });
+  const coordinatorA = new fixture.api.ProviderActivationCoordinator({
+    appHome: fixture.appHome,
+    configPath: fixture.path,
+    privateStore: fixture.privateStore,
+    credentials: fixture.credentials,
+    adapter: fixture.adapter,
+    stateStore: fixture.stateStore,
+    runtimeGuard: fixture.runtimeGuard,
+    now: () => now,
+    createUuid: sequentialUuid(),
+    leaseDurationMs: 10,
+    waitForLease: async () => new Promise<void>((resolve) => setImmediate(resolve)),
+  });
+  const activationA = coordinatorA.activate({
+    ...fixture.request,
+    persistence: "process-only",
+  });
+  await pausedA;
+  assert.equal(fixture.adapter.runtimeSecret, NEW_SECRET, "the external bind effect already happened");
+
+  now = 1_000;
+  const coordinatorB = new fixture.api.ProviderActivationCoordinator({
+    appHome: fixture.appHome,
+    configPath: fixture.path,
+    privateStore: fixture.privateStore,
+    credentials: fixture.credentials,
+    adapter: new FakeAdapter(),
+    stateStore: fixture.stateStore,
+    runtimeGuard: new FakeRuntimeGuard(),
+    now: () => now,
+    createUuid: sequentialUuid(),
+    leaseDurationMs: 100,
+    waitForLease: async () => new Promise<void>((resolve) => setImmediate(resolve)),
+  });
+  await coordinatorB.activate({ ...fixture.request, persistence: "process-only" });
+  resumeA();
+
+  const error = await activationA.catch((reason: unknown) => reason);
+  assert.ok(error instanceof fixture.api.ProviderActivationRecoveryRequiredError);
+  assert.equal(error.code, "provider-lease-fence-lost");
+  assert.equal(fixture.runtimeGuard.releaseCalls, 1);
+});
+
 function providerState(
   oldSlot: CredentialSlotRef | "legacy:inference" | null,
 ): ProviderSetupStateV1 {
