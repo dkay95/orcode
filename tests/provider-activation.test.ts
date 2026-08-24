@@ -2372,7 +2372,7 @@ test("persisted saved candidate permit validates under existing real config owne
           credentialKind: "inference",
           purpose: "explicit-repair",
           environmentEligibility: "forbidden",
-          deadlineAt: 10_100,
+          deadlineAt: fixture.request.deadlineAt,
           signal: new AbortController().signal,
         }, async (secret, context) => ({ secret, permit: context.candidatePermit }));
         assert.equal(access.kind, "available");
@@ -2388,7 +2388,6 @@ test("persisted saved candidate permit validates under existing real config owne
         candidate,
         candidatePermit: permit,
         requireCandidatePermit: true,
-        deadlineAt: 10_100,
       });
       const memory = stateStore.read();
       const disk = (JSON.parse(await readFile(fixture.path, "utf8")) as {
@@ -2449,11 +2448,11 @@ test("saved candidate swap after catalog and model choice has zero activation ef
     credentialKind: "inference",
     purpose: "explicit-repair",
     environmentEligibility: "forbidden",
-    deadlineAt: 10_100,
+    deadlineAt: fixture.request.deadlineAt,
     signal: new AbortController().signal,
   }, async (candidate, context) => {
     const catalog = await authority.withCandidateAuthority({
-      deadlineAt: 10_100,
+      deadlineAt: fixture.request.deadlineAt,
       signal: new AbortController().signal,
       credentialPermit: context.candidatePermit,
       requireCredentialPermit: true,
@@ -2480,7 +2479,6 @@ test("saved candidate swap after catalog and model choice has zero activation ef
       candidate,
       candidatePermit: context.candidatePermit,
       requireCandidatePermit: true,
-      deadlineAt: 10_100,
     });
   });
 
@@ -2526,7 +2524,7 @@ test("environment candidate swap after catalog and model choice has zero activat
   const permit = authority.environmentCandidatePermit(NEW_SECRET);
   assert.ok(permit);
   const catalog = await authority.withCandidateAuthority({
-    deadlineAt: 10_100,
+    deadlineAt: fixture.request.deadlineAt,
     signal: new AbortController().signal,
     credentialPermit: permit,
     requireCredentialPermit: true,
@@ -2556,7 +2554,6 @@ test("environment candidate swap after catalog and model choice has zero activat
     ...fixture.request,
     candidatePermit: permit,
     requireCandidatePermit: true,
-    deadlineAt: 10_100,
   }));
 
   assert.equal(await readFile(fixture.path, "utf8"), beforeConfig);
