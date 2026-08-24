@@ -2461,6 +2461,289 @@ test("global key forget refuses shared provider references without partial mutat
   }
 });
 
+test("global key forget refuses authoritative shared Legacy references when in-memory state is empty", async () => {
+  const api = cliModule as typeof cliModule & {
+    ProviderCredentialForgetJournal: new (input: {
+      appHome: string;
+      privateStore: PrivateStore;
+    }) => {
+      begin(input: Record<string, unknown>): Promise<unknown>;
+      markDeleted(transaction: unknown): Promise<void>;
+      complete(transaction: unknown): Promise<void>;
+      readPending(): Promise<unknown>;
+    };
+    createProviderCredentialController(input: Record<string, unknown>): {
+      apply(intent: Record<string, unknown>): Promise<Record<string, unknown>>;
+    };
+    persistProviderSetupState(
+      path: string,
+      request: ProviderStateCommitRequest,
+    ): Promise<ProviderSetupStateV1>;
+  };
+  const root = await mkdtemp(join(tmpdir(), "orcode-global-key-forget-authoritative-shared-"));
+  const configPath = join(root, "config.json");
+  const stale: ProviderSetupStateV1 = {
+    schemaVersion: 1,
+    revision: 0,
+    lifecycle: "never-configured",
+    connections: [],
+    defaultRoute: null,
+    cross: { enabled: false, preferredLead: null, preferredChallenger: null },
+  };
+  const authoritative: ProviderSetupStateV1 = {
+    schemaVersion: 1,
+    revision: 0,
+    lifecycle: "configured",
+    connections: ["durable-legacy-one", "durable-legacy-two"].map((id, index) => ({
+      id,
+      backendId: "openrouter" as const,
+      enabled: false,
+      maturity: "stable" as const,
+      credentialSlot: "legacy:inference",
+      accountFingerprint: `acct_durable_legacy_${index}_111111`,
+      accountFingerprintState: "verified" as const,
+      billingRealm: "openrouter-payg" as const,
+      lastHealth: null,
+    })),
+    defaultRoute: null,
+    cross: { enabled: false, preferredLead: null, preferredChallenger: null },
+  };
+  const config = structuredClone(DEFAULT_CONFIG);
+  config.providerSetup = structuredClone(authoritative);
+  await saveConfig(config, configPath);
+  const beforeBytes = await readFile(configPath, "utf8");
+  let durableBoundaryCalls = 0;
+  const stateStore = new ProviderStateStore(stale, {
+    persist: async (request) => {
+      durableBoundaryCalls += 1;
+      return api.persistProviderSetupState(configPath, request);
+    },
+  });
+  const realJournal = new api.ProviderCredentialForgetJournal({
+    appHome: root,
+    privateStore: new PrivateStore({ root }),
+  });
+  const journalEffects = { begin: 0, markDeleted: 0, complete: 0 };
+  const journal = {
+    async begin(input: Parameters<typeof realJournal.begin>[0]) {
+      journalEffects.begin += 1;
+      return realJournal.begin(input);
+    },
+    async markDeleted(transaction: Parameters<typeof realJournal.markDeleted>[0]) {
+      journalEffects.markDeleted += 1;
+      await realJournal.markDeleted(transaction);
+    },
+    async complete(transaction: Parameters<typeof realJournal.complete>[0]) {
+      journalEffects.complete += 1;
+      await realJournal.complete(transaction);
+    },
+  };
+  const secret = `${STARTUP_KEY_PREFIX}${"h".repeat(48)}`;
+  const openRouter = new OpenRouterService(secret);
+  const credentialEffects = { legacyDelete: 0, versionedDelete: 0 };
+  const credentials = {
+    location: "Test-Speicher",
+    async delete() {
+      credentialEffects.legacyDelete += 1;
+      return true;
+    },
+    async deleteSlot() {
+      credentialEffects.versionedDelete += 1;
+      return true;
+    },
+  };
+  let published = 0;
+  let forgotten = 0;
+  const controller = api.createProviderCredentialController({
+    stateStore,
+    openRouter,
+    credentials,
+    activationCoordinator: providerCoordinatorMutationFixture(providerRuntimeGuardFixture()),
+    forgetJournal: journal,
+    onInferenceStatePublished() { published += 1; },
+    onInferenceForgotten() { forgotten += 1; },
+  });
+  const output: string[] = [];
+  const prompts: string[] = [];
+  const context = {
+    openRouter,
+    credentials,
+    providerCredentials: controller,
+    confirmCredentialForget: async (_kind: string, message: string) => {
+      prompts.push(message);
+      return true;
+    },
+    out: {
+      text(value: string) { output.push(value); },
+      error(value: string, hint?: string) { output.push(hint ? `${value}\n${hint}` : value); },
+    },
+  } as unknown as CommandContext;
+
+  await handleSlashCommand("/key forget", context);
+
+  assert.equal(durableBoundaryCalls, 1);
+  assert.deepEqual(journalEffects, { begin: 0, markDeleted: 0, complete: 0 });
+  assert.deepEqual(credentialEffects, { legacyDelete: 0, versionedDelete: 0 });
+  assert.equal(published, 0);
+  assert.equal(forgotten, 0);
+  assert.equal(openRouter.hasKey, true);
+  assert.deepEqual(stateStore.read(), stale);
+  assert.equal(await readFile(configPath, "utf8"), beforeBytes);
+  const restarted = new ProviderStateStore(
+    (JSON.parse(beforeBytes) as { providerSetup: ProviderSetupStateV1 }).providerSetup,
+  );
+  assert.deepEqual(restarted.read(), authoritative);
+  assert.deepEqual(await realJournal.readPending(), null);
+  assert.deepEqual(prompts, [
+    "API-Key aus Test-Speicher und Prozessspeicher entfernen? Bei mehreren Provider-Verbindungen bleibt er unverändert.",
+  ]);
+  assert.deepEqual(output, [
+    "API-Key unverändert: Mehrere OpenRouter-Verbindungen sind eingerichtet. Entferne sie einzeln mit /provider logout.",
+  ]);
+  assert.doesNotMatch(output.join("\n"), new RegExp(secret));
+});
+
+test("global key forget removes the sole authoritative disabled v1 connection when in-memory state is empty", async () => {
+  const api = cliModule as typeof cliModule & {
+    ProviderCredentialForgetJournal: new (input: {
+      appHome: string;
+      privateStore: PrivateStore;
+    }) => {
+      begin(input: Record<string, unknown>): Promise<unknown>;
+      markDeleted(transaction: unknown): Promise<void>;
+      complete(transaction: unknown): Promise<void>;
+      readPending(): Promise<unknown>;
+    };
+    createProviderCredentialController(input: Record<string, unknown>): {
+      apply(intent: Record<string, unknown>): Promise<Record<string, unknown>>;
+    };
+    persistProviderSetupState(
+      path: string,
+      request: ProviderStateCommitRequest,
+    ): Promise<ProviderSetupStateV1>;
+  };
+  const root = await mkdtemp(join(tmpdir(), "orcode-global-key-forget-authoritative-disabled-"));
+  const configPath = join(root, "config.json");
+  const stale: ProviderSetupStateV1 = {
+    schemaVersion: 1,
+    revision: 0,
+    lifecycle: "never-configured",
+    connections: [],
+    defaultRoute: null,
+    cross: { enabled: false, preferredLead: null, preferredChallenger: null },
+  };
+  const slot = "v1:inference:cccccccc-cccc-4ccc-8ccc-cccccccccccc";
+  const authoritative: ProviderSetupStateV1 = {
+    schemaVersion: 1,
+    revision: 0,
+    lifecycle: "configured",
+    connections: [{
+      id: "durable-disabled-v1",
+      backendId: "openrouter",
+      enabled: false,
+      maturity: "stable",
+      credentialSlot: slot,
+      accountFingerprint: "acct_durable_disabled_222222",
+      accountFingerprintState: "verified",
+      billingRealm: "openrouter-payg",
+      lastHealth: null,
+    }],
+    defaultRoute: null,
+    cross: { enabled: false, preferredLead: null, preferredChallenger: null },
+  };
+  const config = structuredClone(DEFAULT_CONFIG);
+  config.providerSetup = structuredClone(authoritative);
+  await saveConfig(config, configPath);
+  let durableBoundaryCalls = 0;
+  const stateStore = new ProviderStateStore(stale, {
+    persist: async (request) => {
+      durableBoundaryCalls += 1;
+      return api.persistProviderSetupState(configPath, request);
+    },
+  });
+  const realJournal = new api.ProviderCredentialForgetJournal({
+    appHome: root,
+    privateStore: new PrivateStore({ root }),
+  });
+  const journalEffects = { begin: 0, markDeleted: 0, complete: 0 };
+  const journal = {
+    async begin(input: Parameters<typeof realJournal.begin>[0]) {
+      journalEffects.begin += 1;
+      return realJournal.begin(input);
+    },
+    async markDeleted(transaction: Parameters<typeof realJournal.markDeleted>[0]) {
+      journalEffects.markDeleted += 1;
+      await realJournal.markDeleted(transaction);
+    },
+    async complete(transaction: Parameters<typeof realJournal.complete>[0]) {
+      journalEffects.complete += 1;
+      await realJournal.complete(transaction);
+    },
+  };
+  const secret = `${STARTUP_KEY_PREFIX}${"u".repeat(48)}`;
+  const slots = new Map([[slot, secret]]);
+  const openRouter = new OpenRouterService(secret);
+  const credentialEffects = { legacyDelete: 0, versionedDelete: 0 };
+  const credentials = {
+    location: "Test-Speicher",
+    async delete() {
+      credentialEffects.legacyDelete += 1;
+      return true;
+    },
+    async deleteSlot(reference: CredentialSlotRef) {
+      credentialEffects.versionedDelete += 1;
+      return slots.delete(reference.id);
+    },
+  };
+  const published: ProviderSetupStateV1[] = [];
+  let forgotten = 0;
+  const controller = api.createProviderCredentialController({
+    stateStore,
+    openRouter,
+    credentials,
+    activationCoordinator: providerCoordinatorMutationFixture(providerRuntimeGuardFixture()),
+    forgetJournal: journal,
+    onInferenceStatePublished(state: ProviderSetupStateV1) {
+      published.push(structuredClone(state));
+    },
+    onInferenceForgotten() { forgotten += 1; },
+  });
+  const output: string[] = [];
+  const context = {
+    openRouter,
+    credentials,
+    providerCredentials: controller,
+    confirmCredentialForget: async () => true,
+    out: {
+      text(value: string) { output.push(value); },
+      error(value: string, hint?: string) { output.push(hint ? `${value}\n${hint}` : value); },
+    },
+  } as unknown as CommandContext;
+
+  await handleSlashCommand("/key forget", context);
+
+  assert.ok(durableBoundaryCalls >= 1);
+  assert.deepEqual(journalEffects, { begin: 1, markDeleted: 1, complete: 1 });
+  assert.deepEqual(credentialEffects, { legacyDelete: 0, versionedDelete: 1 });
+  assert.equal(slots.has(slot), false);
+  assert.equal(openRouter.hasKey, false);
+  assert.equal(forgotten, 1);
+  assert.deepEqual(published.map((state) => state.revision), [1, 2]);
+  assert.equal(published.every((state) => state.defaultRoute === null), true);
+  const durable = (JSON.parse(await readFile(configPath, "utf8")) as {
+    providerSetup: ProviderSetupStateV1;
+  }).providerSetup;
+  assert.deepEqual(stateStore.read(), durable);
+  assert.equal(durable.revision, 2);
+  assert.deepEqual(durable.connections, []);
+  assert.equal(durable.defaultRoute, null);
+  assert.deepEqual(new ProviderStateStore(durable).read(), durable);
+  assert.deepEqual(await realJournal.readPending(), null);
+  assert.deepEqual(output, ["API-Key aus Prozessspeicher und Test-Speicher entfernt."]);
+  assert.doesNotMatch(output.join("\n"), /shared-reference|Mehrere OpenRouter-Verbindungen/i);
+  assert.doesNotMatch(output.join("\n"), new RegExp(secret));
+});
+
 const STARTUP_KEY_PREFIX = `${["sk", "or", "v1"].join("-")}-`;
 
 function providerRuntimeGuardFixture() {

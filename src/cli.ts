@@ -1484,10 +1484,13 @@ async function settleProviderCredentialForget(input: {
   assertHeld?(): void | Promise<void>;
   onStatePublished?(state: ProviderSetupStateV1): void;
   onAuthoritativeMismatch?(state: ProviderSetupStateV1): never;
+  initialAuthoritativeState?: ProviderSetupStateV1;
 }): Promise<{ cleanupPending: boolean; removed: boolean; retained: boolean }> {
   await input.assertHeld?.();
   const { connectionId, target } = input.transaction.manifest;
-  let state = input.stateStore.read();
+  let state = input.initialAuthoritativeState
+    ? structuredClone(input.initialAuthoritativeState)
+    : input.stateStore.read();
   let expectedAuthoritative = structuredClone(state);
   const connection = connectionId === null
     ? undefined
@@ -1696,6 +1699,30 @@ export function providerServiceStartupCredential(
   return { stored: { kind: "absent" }, environment: null };
 }
 
+class ProviderAuthoritativeSnapshotRead extends Error {
+  constructor(readonly state: ProviderSetupStateV1) {
+    super("Provider authoritative snapshot read completed.");
+    this.name = "ProviderAuthoritativeSnapshotRead";
+  }
+}
+
+async function readAuthoritativeProviderState(
+  stateStore: ProviderStateStore,
+): Promise<ProviderSetupStateV1> {
+  const expectedRevision = stateStore.read().revision;
+  try {
+    await stateStore.commit(expectedRevision, (authoritative) => {
+      throw new ProviderAuthoritativeSnapshotRead(structuredClone(authoritative));
+    });
+  } catch (error) {
+    if (error instanceof ProviderAuthoritativeSnapshotRead) {
+      return structuredClone(error.state);
+    }
+    throw error;
+  }
+  throw new Error("Provider authoritative snapshot read did not settle.");
+}
+
 export function createProviderCredentialController(input: {
   stateStore: ProviderStateStore;
   openRouter: OpenRouterService;
@@ -1770,16 +1797,28 @@ export function createProviderCredentialController(input: {
               if (intent.authorize && !intent.authorize()) {
                 throw new Error("Provider confirmation authorization was rejected.");
               }
-              const state = input.stateStore.read();
+              await lease.assertHeld();
+              const state = intent.targetConnectionId
+                ? input.stateStore.read()
+                : await readAuthoritativeProviderState(input.stateStore);
+              await lease.assertHeld();
+              const openRouterConnections = state.connections.filter((candidate) =>
+                candidate.backendId === "openrouter"
+              );
+              if (!intent.targetConnectionId && openRouterConnections.length > 1) {
+                return {
+                  kind: "unchanged" as const,
+                  credentialKind: "inference" as const,
+                  reason: "shared-reference" as const,
+                };
+              }
               const connection = intent.targetConnectionId
                 ? state.connections.find((candidate) =>
                     candidate.backendId === "openrouter"
                     && candidate.id === intent.targetConnectionId
                     && candidate.credentialSlot === intent.targetCredentialSlot
                   )
-                : state.connections.find((candidate) =>
-                    candidate.backendId === "openrouter" && candidate.enabled
-                  );
+                : openRouterConnections[0];
               if (intent.targetConnectionId && !connection) {
                 throw new Error("Provider confirmation target changed.");
               }
@@ -1794,18 +1833,6 @@ export function createProviderCredentialController(input: {
                     },
                     }
                   : { kind: "legacy" };
-              const sharedReference = !intent.targetConnectionId
-                && state.connections.some((candidate) =>
-                  candidate.backendId === "openrouter"
-                  && candidate.id !== connection?.id
-                );
-              if (sharedReference) {
-                return {
-                  kind: "unchanged" as const,
-                  credentialKind: "inference" as const,
-                  reason: "shared-reference" as const,
-                };
-              }
               await lease.assertHeld();
               const forgetTransaction = await input.forgetJournal.begin({
                 connectionId: connection?.id ?? null,
@@ -1819,6 +1846,7 @@ export function createProviderCredentialController(input: {
                 assertHeld: () => lease.assertHeld(),
                 onStatePublished: input.onInferenceStatePublished,
                 onAuthoritativeMismatch: intent.onAuthoritativeMismatch,
+                initialAuthoritativeState: intent.targetConnectionId ? undefined : state,
               });
               if (settled.cleanupPending) throw new Error("cleanup-pending");
               await lease.assertHeld();
@@ -1933,7 +1961,10 @@ export async function persistProviderSetupState(
   try {
     return await persistProviderSetupStateOwned(path, request);
   } catch (error) {
-    if (error instanceof ProviderConfirmationStaleError) throw error;
+    if (
+      error instanceof ProviderConfirmationStaleError
+      || error instanceof ProviderAuthoritativeSnapshotRead
+    ) throw error;
     throw new Error("Provider state publication failed.");
   }
 }
