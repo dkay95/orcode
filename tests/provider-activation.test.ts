@@ -2328,6 +2328,92 @@ test("real activation writer lease expiry microtask cannot rename after the last
   );
 });
 
+test("persisted saved candidate permit validates under existing real config ownership and commits one exact tuple", async () => {
+  const failures: Array<{ source: "saved" | "environment"; message: string }> = [];
+  const cli = await import("../src/cli.js");
+
+  for (const source of ["saved", "environment"] as const) {
+    try {
+      const fixture = await activationFixture({ oldSlot: source === "saved" ? OLD_SLOT : null });
+      const stateStore = new ProviderStateStore(fixture.oldState, {
+        persist: (request) => cli.persistProviderSetupState(fixture.path, request),
+      });
+      const environment: Record<string, string | undefined> = source === "environment"
+        ? { OPENROUTER_API_KEY: NEW_SECRET }
+        : {};
+      if (source === "saved") fixture.credentials.slots.set(OLD_SLOT.id, NEW_SECRET);
+      let coordinator!: InstanceType<typeof fixture.api.ProviderActivationCoordinator>;
+      const authority = new ProviderCredentialAuthority({
+        stateStore,
+        credentials: fixture.credentials,
+        environment,
+        coordinator: () => coordinator,
+        now: () => 10_000,
+      });
+      coordinator = new fixture.api.ProviderActivationCoordinator({
+        appHome: fixture.appHome,
+        configPath: fixture.path,
+        privateStore: fixture.privateStore,
+        credentials: fixture.credentials,
+        adapter: fixture.adapter,
+        stateStore,
+        runtimeGuard: fixture.runtimeGuard,
+        candidateAuthority: authority,
+        now: () => 10_000,
+        createUuid: sequentialUuid(),
+        leaseDurationMs: 100,
+      });
+
+      let candidate = NEW_SECRET;
+      let permit = authority.environmentCandidatePermit(candidate);
+      if (source === "saved") {
+        const access = await authority.withCredential({
+          connectionId: CONNECTION_ID,
+          credentialKind: "inference",
+          purpose: "explicit-repair",
+          environmentEligibility: "forbidden",
+          deadlineAt: 10_100,
+          signal: new AbortController().signal,
+        }, async (secret, context) => ({ secret, permit: context.candidatePermit }));
+        assert.equal(access.kind, "available");
+        if (access.kind !== "available") throw new Error("saved permit was unavailable");
+        candidate = access.value.secret;
+        permit = access.value.permit;
+      }
+      assert.ok(permit);
+
+      const result = await coordinator.activate({
+        ...fixture.request,
+        expectedRevision: stateStore.read().revision,
+        candidate,
+        candidatePermit: permit,
+        requireCandidatePermit: true,
+        deadlineAt: 10_100,
+      });
+      const memory = stateStore.read();
+      const disk = (JSON.parse(await readFile(fixture.path, "utf8")) as {
+        providerSetup: ProviderSetupStateV1;
+      }).providerSetup;
+      const tuple = await tupleForState(memory, fixture.credentials);
+
+      assert.deepEqual(disk, memory);
+      assert.deepEqual(result.state, memory);
+      assert.deepEqual(result.route, memory.defaultRoute);
+      assert.deepEqual(fixture.adapter.runtimeRoute, memory.defaultRoute);
+      assert.equal(tuple.connection?.credentialSlot, tuple.slotId);
+      assert.equal(tuple.secret, NEW_SECRET);
+      assert.deepEqual(await journalDirectories(fixture.appHome), []);
+    } catch (error) {
+      failures.push({
+        source,
+        message: error instanceof Error ? `${error.name}: ${error.message}` : String(error),
+      });
+    }
+  }
+
+  assert.deepEqual(failures, []);
+});
+
 test("saved candidate swap after catalog and model choice has zero activation effects", async () => {
   const fixture = await activationFixture();
   fixture.credentials.slots.set(OLD_SLOT.id, NEW_SECRET);

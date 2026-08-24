@@ -58,6 +58,7 @@ import {
 } from "../src/provider-state.js";
 import { PrivateStore } from "../src/private-store.js";
 import { SessionStore } from "../src/session.js";
+import { SetupOrchestrator } from "../src/setup.js";
 import type { ModelInfo } from "../src/types.js";
 
 type BootstrapRuntimeDouble = {
@@ -2607,6 +2608,201 @@ test("prepublication Cross abort cannot publish the activated route into session
   assert.equal(runtime.preparedRoles, null);
   assert.equal(notices.length, noticesAtPublication);
   assert.throws(() => runtime.ensureRunnableRoute(), /no published runtime route/);
+});
+
+test("setup postpublication abort waits for exact activation terminal reconciliation without cancellation", async () => {
+  const root = await mkdtemp(join(tmpdir(), "orcode-setup-postpublication-"));
+  const configPath = join(root, "config.json");
+  const initial = structuredClone(DEFAULT_CONFIG.providerSetup) as ProviderSetupStateV1;
+  const config = structuredClone(DEFAULT_CONFIG);
+  config.providerSetup = structuredClone(initial);
+  await saveConfig(config, configPath);
+  const stateStore = new ProviderStateStore(initial);
+  const secret = `${STARTUP_KEY_PREFIX}${"t".repeat(48)}`;
+  const accountFingerprint = "acct_setup_postpublication_111111";
+  const model: BackendModelDescriptor = {
+    backendId: "openrouter",
+    requestedModelId: "vendor/setup-postpublication",
+    canonicalModelId: "vendor/setup-postpublication",
+    displayName: "Setup postpublication",
+    capabilities: { textInput: true, textOutput: true, tools: true, reasoning: true },
+  };
+  const route = {
+    version: 1 as const,
+    backendId: "openrouter" as const,
+    accountFingerprint,
+    billingRealm: "openrouter-payg" as const,
+    requestedModelId: model.requestedModelId,
+    canonicalModelId: model.canonicalModelId,
+    resolutionState: "resolved" as const,
+  };
+  const slots = new Map<string, string>();
+  let reservation = 1;
+  const credentials = {
+    reserveSlot(kind: "inference" | "management") {
+      const id = `v1:${kind}:81818181-8181-4181-8181-${String(reservation++).padStart(12, "0")}`;
+      return Object.freeze({ version: 1 as const, kind, id });
+    },
+    async writeSlot(slot: CredentialSlotRef, value: string) { slots.set(slot.id, value); },
+    async readSlot(slot: CredentialSlotRef) { return slots.get(slot.id) ?? null; },
+    async deleteSlot(slot: CredentialSlotRef) { return slots.delete(slot.id); },
+  };
+  let runtimeRoute: typeof route | null = null;
+  const adapter: BackendAdapter = {
+    backendId: "openrouter",
+    async inspect() { throw new Error("unused"); },
+    async reconnect() { throw new Error("unused"); },
+    async logout() {},
+    async connect(request) {
+      assert.equal(request.candidate, secret);
+      return {
+        candidateId: "candidate-setup-postpublication",
+        backendId: "openrouter",
+        connectionId: "connection-setup-postpublication",
+        accountFingerprint,
+        billingRealm: "openrouter-payg",
+        health: {
+          credential: "valid",
+          connectivity: "connected",
+          spend: "available",
+          runtime: "ready",
+          observedAt: 1,
+          generation: request.generation,
+        },
+      };
+    },
+    async listModels() { return [model]; },
+    async activate(request) {
+      runtimeRoute = structuredClone(route);
+      return {
+        candidateId: request.candidateId,
+        backendId: "openrouter",
+        connectionId: "connection-setup-postpublication",
+        accountFingerprint,
+        billingRealm: "openrouter-payg",
+        route: structuredClone(route),
+      };
+    },
+    async discardCandidate() {},
+  };
+  const descriptor: BackendDescriptor = {
+    id: "openrouter",
+    displayName: "OpenRouter",
+    maturity: "stable",
+    connectable: true,
+    kind: "raw-model",
+    credentialOwner: "orcode-keychain",
+    billingRealmKind: "api-payg",
+    capabilities: { models: true, tools: true, reasoning: true },
+  };
+  const registry = new BackendRegistry([{ descriptor, adapter }]);
+  const runtimeGuard = providerRuntimeGuardFixture();
+  let reachedReadback!: () => void;
+  const readbackReached = new Promise<void>((resolve) => { reachedReadback = resolve; });
+  let releaseReadback!: () => void;
+  const readbackRelease = new Promise<void>((resolve) => { releaseReadback = resolve; });
+  let uuid = 1;
+  const coordinator = new ProviderActivationCoordinator({
+    appHome: root,
+    configPath,
+    privateStore: new PrivateStore({ root }),
+    credentials: credentials as never,
+    adapter,
+    stateStore,
+    runtimeGuard,
+    createUuid: () => `82828282-8282-4282-8282-${String(uuid++).padStart(12, "0")}`,
+    onBoundary: async (boundary) => {
+      if (boundary !== "config-readback") return;
+      reachedReadback();
+      await readbackRelease;
+    },
+  });
+  const orchestrator = new SetupOrchestrator({
+    registry,
+    stateStore,
+    activationCoordinator: coordinator,
+  });
+  let cancelCalls = 0;
+  const originalCancel = orchestrator.cancelSetup.bind(orchestrator);
+  orchestrator.cancelSetup = async (request) => {
+    cancelCalls += 1;
+    return originalCancel(request);
+  };
+  const Runtime = (cliModule as unknown as {
+    DefaultProviderRuntime: new (...args: unknown[]) => {
+      runSetup(surface: SetupSurface, attempt: Record<string, unknown>): Promise<Record<string, unknown>>;
+    };
+  }).DefaultProviderRuntime;
+  const session = SessionStore.create("/synthetic/setup-postpublication", "/synthetic/.orcode");
+  const runtime = new Runtime(
+    new OpenRouterService(undefined),
+    credentials,
+    registry,
+    stateStore,
+    orchestrator,
+    coordinator,
+    runtimeGuard,
+    { async apply() { throw new Error("unused"); } },
+    null,
+    null,
+    model.requestedModelId,
+    config,
+    session,
+  );
+  const presentations: unknown[] = [];
+  let hubCalls = 0;
+  const surface: SetupSurface = {
+    async chooseHub() {
+      hubCalls += 1;
+      return hubCalls === 1 ? "openrouter" : "cross-later";
+    },
+    async readSecret() { return secret; },
+    async chooseModel() { return model.canonicalModelId; },
+    async confirm() { return true; },
+    present(event) { presentations.push(structuredClone(event)); },
+  };
+  const controller = new AbortController();
+  const reason = new DOMException("fixed setup postpublication abort", "AbortError");
+  const pending = runtime.runSetup(surface, {
+    generation: 41,
+    deadlineAt: Date.now() + 5_000,
+    signal: controller.signal,
+    remainingMs: () => 5_000,
+    assertCurrent() {
+      if (controller.signal.aborted) throw reason;
+    },
+  });
+  await readbackReached;
+  const presentationsAtAbort = presentations.length;
+
+  controller.abort(reason);
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  const stillPending = Symbol("still-pending");
+  const early = await Promise.race([
+    pending,
+    new Promise<typeof stillPending>((resolve) => setImmediate(() => resolve(stillPending))),
+  ]);
+  const cancelCallsBeforeRelease = cancelCalls;
+  releaseReadback();
+  const result = await pending;
+  const disk = (JSON.parse(await readFile(configPath, "utf8")) as {
+    providerSetup: ProviderSetupStateV1;
+  }).providerSetup;
+  const memory = stateStore.read();
+  const active = memory.connections.find((connection) => connection.enabled);
+
+  assert.equal(early, stillPending);
+  assert.equal(cancelCallsBeforeRelease, 0);
+  assert.deepEqual(result, { kind: "ready" });
+  assert.equal(cancelCalls, 0);
+  assert.deepEqual(disk, memory);
+  assert.deepEqual(memory.defaultRoute, route);
+  assert.deepEqual(runtimeRoute, route);
+  assert.deepEqual(session.data.route, route);
+  assert.equal(session.data.model, model.requestedModelId);
+  assert.equal(config.mainModel, model.requestedModelId);
+  assert.equal(active?.credentialSlot === undefined ? null : slots.get(active.credentialSlot), secret);
+  assert.equal(presentations.length - presentationsAtAbort, 0);
 });
 
 test("late Cross completion after newer activation cannot republish the old route or session owner", async () => {

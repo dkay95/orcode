@@ -836,10 +836,13 @@ export class DefaultProviderRuntime implements ProviderRuntime {
       : surface;
     const routePublicationGeneration = this.#processRouteGeneration;
     const setupPublicationGeneration = ++this.#setupPublicationGeneration;
+    const setupPublicationOwnerIsCurrent = (): boolean => (
+      this.#setupPublicationGeneration === setupPublicationGeneration
+      && this.#processRouteGeneration === routePublicationGeneration
+    );
     const setupAttemptIsCurrent = (): boolean => {
       if (
-        this.#setupPublicationGeneration !== setupPublicationGeneration
-        || this.#processRouteGeneration !== routePublicationGeneration
+        !setupPublicationOwnerIsCurrent()
         || startupAttempt?.signal.aborted
       ) return false;
       if (!startupAttempt) return true;
@@ -853,12 +856,14 @@ export class DefaultProviderRuntime implements ProviderRuntime {
     };
     let activatedRoute: RouteIdentityV1 | null = null;
     let activatedPersisted = false;
+    let activationSettledAfterInterruption = false;
     let cancellationCommitted = false;
     const setupOrchestrator = {
       activateCandidate: async (
         request: Parameters<SetupOrchestrator["activateCandidate"]>[0],
       ) => {
         const result = await this.orchestrator.activateCandidate(request);
+        activationSettledAfterInterruption = request.signal.aborted;
         const route = validateRouteIdentityV1(result.route);
         if (route?.resolutionState === "resolved" && route.canonicalModelId) {
           activatedRoute = route;
@@ -993,28 +998,36 @@ export class DefaultProviderRuntime implements ProviderRuntime {
           ? { kind: "cancelled", mode: "setup-required" }
           : await executeHub(null);
       }
-      if (result.kind === "ready" && setupAttemptIsCurrent()) {
+      if (result.kind === "ready") {
+        const attemptIsCurrent = setupAttemptIsCurrent();
         const currentDefaultRoute = validateRouteIdentityV1(this.stateStore.read().defaultRoute);
         const activationCanPublish = activatedRoute !== null
           && (!activatedPersisted
             || (currentDefaultRoute !== null && sameExactRoute(currentDefaultRoute, activatedRoute)));
-        const preparedRolesCanPublish = activatedRoute === null || activationCanPublish;
-        const nextSessionRoute = activationCanPublish
-          ? activatedRoute
-          : preparedRolesCanPublish
-            ? result.preparedRoles?.lead ?? this.#sessionRoute
-            : this.#sessionRoute;
-        if (nextSessionRoute) {
-          this.#adoptExactSessionRoute(
-            nextSessionRoute,
-            activationCanPublish ? activatedPersisted : this.#sessionRoutePersisted,
-            true,
-            activationCanPublish,
-          );
+        const reconcileCommittedActivation = activatedPersisted
+          && activationCanPublish
+          && activationSettledAfterInterruption
+          && setupPublicationOwnerIsCurrent();
+        if (attemptIsCurrent || reconcileCommittedActivation) {
+          const preparedRolesCanPublish = attemptIsCurrent
+            && (activatedRoute === null || activationCanPublish);
+          const nextSessionRoute = activationCanPublish
+            ? activatedRoute
+            : preparedRolesCanPublish
+              ? result.preparedRoles?.lead ?? this.#sessionRoute
+              : this.#sessionRoute;
+          if (nextSessionRoute) {
+            this.#adoptExactSessionRoute(
+              nextSessionRoute,
+              activationCanPublish ? activatedPersisted : this.#sessionRoutePersisted,
+              true,
+              activationCanPublish,
+            );
+          }
+          this.#preparedRoles = preparedRolesCanPublish && result.preparedRoles
+            ? structuredClone(result.preparedRoles)
+            : null;
         }
-        this.#preparedRoles = preparedRolesCanPublish && result.preparedRoles
-          ? structuredClone(result.preparedRoles)
-          : null;
       }
       this.#synchronizeAuthoritativeProviderState();
       return result;

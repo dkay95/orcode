@@ -459,24 +459,23 @@ async function activateOpenRouter(
       }
       if (!accepted) return { kind: "cancelled", phase: "persistence" };
     }
-    const activation = await abortableSetupAction(
-      () => orchestrator.activateCandidate({
-        expectedRevision: options.expectedRevision ?? stateStore.read().revision,
-        candidate: secret,
-        expectedRequestedModelId: selectedModel.requestedModelId,
-        selectedCanonicalModelId,
-        signal,
-        deadlineAt: options.deadlineAt ?? Number.MAX_SAFE_INTEGER,
-        persistence,
-        candidatePermit: credentialPermit,
-        requireCandidatePermit: requireCredentialPermit,
-        targetConnectionId: options.targetConnectionId,
-        startupGeneration: options.generation,
-      }),
+    const activationPromise = orchestrator.activateCandidate({
+      expectedRevision: options.expectedRevision ?? stateStore.read().revision,
+      candidate: secret,
+      expectedRequestedModelId: selectedModel.requestedModelId,
+      selectedCanonicalModelId,
       signal,
-    );
-    assertSetupAttemptCurrent(signal);
-    surface.present(notice("OpenRouter ist eingerichtet."));
+      deadlineAt: options.deadlineAt ?? Number.MAX_SAFE_INTEGER,
+      persistence,
+      candidatePermit: credentialPermit,
+      requireCandidatePermit: requireCredentialPermit,
+      targetConnectionId: options.targetConnectionId,
+      startupGeneration: options.generation,
+    });
+    const activation = await activationPromise;
+    if (!signal.aborted && options.isCurrent?.() !== false) {
+      surface.present(notice("OpenRouter ist eingerichtet."));
+    }
     return { kind: "ready", route: activation.route, state: activation.state, models };
   } catch {
     if (signal.aborted) {

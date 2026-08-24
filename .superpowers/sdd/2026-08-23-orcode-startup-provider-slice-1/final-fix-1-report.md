@@ -466,3 +466,85 @@ Files changed by this round:
 - this report
 
 No global/full `npm test` was run, per the integrated-review constraint.
+
+## Integrated Fix Round 2 — activation ownership reconciliation
+
+This round started from clean `HEAD`
+`30a377e057ebc5bd0743dbee77e15db41d4e380b`. Scope remained exactly the
+two security-review P1s: lock-aware candidate validation and terminal setup
+activation ownership. The session reviewer had no open finding, and the
+approved Spec and Plan remained byte-unchanged.
+
+### Formal tests-only RED
+
+- The exact pre-change `src` tree was
+  `7aeac1f0fde0e27d126d45db064830bebb5198b9`.
+- After adding both production-real regression tests and before editing
+  production, `git diff HEAD -- src` remained empty with SHA-256
+  `e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855`.
+- Formal result: 2 tests, 0 passed, 2 failed, 0 skipped:
+  - `persisted saved candidate permit validates under existing real config ownership and commits one exact tuple`
+  - `setup postpublication abort waits for exact activation terminal reconciliation without cancellation`
+- The first test exercised both saved-slot and environment permits through a
+  real atomic config writer plus `ProviderStateStore` backed by production
+  `persistProviderSetupState`; both failed through the nested config writer.
+- The second used the real activation coordinator, setup orchestrator, default
+  runtime, atomic writer, session, and a post-rename `config-readback` pause. It
+  observed one forbidden cancellation call before the terminal activation.
+
+### Central correction
+
+- Candidate authority now has a lock-aware snapshot-validation path for the
+  already-held Runtime -> Provider -> Config order. It validates the private
+  WeakMap permit, actual candidate fingerprint, exact state revision,
+  connection binding/pointer/source, and current saved-slot or environment
+  secret against the already-read authoritative `beforeSave.state`. It never
+  invokes `ProviderStateStore.commit`, reacquires Provider, or re-enters the
+  config writer.
+- Once setup invokes `activateCandidate`, it awaits that exact terminal promise
+  rather than racing it with an outer abort wrapper. A prepublication abort is
+  therefore classified only after coordinator cleanup; an exact committed
+  activation returns ready without starting cancellation CAS or emitting late
+  notice/Cross UI.
+- Default runtime adopts the exact committed Config/State/Runtime route into
+  Config and Session when activation itself settles after interruption and the
+  setup/process generations plus durable default route remain exact. This
+  exception is deliberately narrower than a general aborted setup: a later
+  abort during Cross-role publication retains the existing no-session-publish
+  fence.
+
+### Final verification and freeze
+
+- New Round-2 matrix: 2/2 passed, 0 failed, 0 skipped.
+- Original Integrated Round-1 matrix: 11/11 passed, 0 failed, 0 skipped.
+- Provider state/authority/activation/setup/UI, serial: 306/306 passed (the
+  prior 305-test block plus one new test), 0 failed, 0 skipped.
+- CLI/commands/session, serial: 218/218 passed (the prior 217-test block plus
+  one new test), 0 failed, 0 skipped.
+- TUI/provider PTY/provider privacy, serial: 98/98 passed, 0 failed, 0 skipped.
+- Integration focus: 30/30 passed, 0 failed, 0 skipped.
+- Provider privacy standalone: 3/3 passed, 0 failed, 0 skipped.
+- `npx tsc -p tsconfig.json --noEmit`: PASS.
+- `npx tsc -p tsconfig.tests.json --noEmit`: PASS.
+- `node --import tsx scripts/render-command-docs.ts --check`: PASS.
+- `git diff --check`: PASS.
+- Approved Spec SHA-256 remained
+  `e15d19821fafbac1f0fc21dd82702d41efa481a12bdcee97df238de2ee85f021`.
+- Approved Plan SHA-256 remained
+  `74914bc2e38c1ac7bb8b57dbfa0abfb1963d4da7acc3fbb6868434039ce22b2c`.
+- Final pre-commit `git diff HEAD -- src tests` SHA-256:
+  `e6c59d5a50dec882361b0aaa3790358052d158407729aac44e757c692ce79b6c`.
+- Final pre-commit `git diff HEAD -- src` SHA-256:
+  `3dff2563419eaf09f702a697927d17913560a5183bdd51441930ad2bf316f6f6`.
+
+Files changed by this round:
+
+- `src/cli.ts`
+- `src/provider-activation.ts`
+- `src/provider-authority.ts`
+- `src/setup-ui.ts`
+- `tests/cli.test.ts`
+- `tests/provider-activation.test.ts`
+- this report
+
+No global/full `npm test` was run, per the integrated-review constraint.

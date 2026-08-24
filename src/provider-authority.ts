@@ -99,6 +99,12 @@ export interface ProviderCandidateAuthorityRequest extends ProviderCandidatePref
   requireCredentialPermit?: boolean;
 }
 
+export interface ProviderCandidateSnapshotAuthorityRequest
+  extends ProviderCandidateAuthorityRequest {
+  candidate: string;
+  authoritativeState: ProviderSetupStateV1;
+}
+
 export type ProviderCandidatePreflightResult =
   | { kind: "ready" }
   | { kind: "forget-pending" | "recovery-required" | "stale" };
@@ -124,6 +130,10 @@ export interface ProviderCredentialAuthorityLike {
   ): Promise<ProviderCandidateAuthorityResult<T>>;
   validateCandidatePermitUnderLease?(
     request: ProviderCandidateAuthorityRequest,
+    lease: ProviderAuthorityReadLease,
+  ): Promise<ProviderCandidatePreflightResult>;
+  validateCandidatePermitAgainstSnapshotUnderLease?(
+    request: ProviderCandidateSnapshotAuthorityRequest,
     lease: ProviderAuthorityReadLease,
   ): Promise<ProviderCandidatePreflightResult>;
   withCredential<T>(
@@ -312,6 +322,37 @@ export class ProviderCredentialAuthority implements ProviderCredentialAuthorityL
       await this.#bounded(request, () => lease.assertHeld());
       if (credentialProof) {
         await this.#assertCandidateCredentialCurrent(request, lease, credentialProof);
+      }
+      await this.#bounded(request, () => lease.assertHeld());
+      return { kind: "ready" };
+    } catch (error) {
+      return this.#preflightFailure(request, error);
+    }
+  }
+
+  /**
+   * Revalidates an opaque candidate proof against an authoritative config
+   * snapshot while the caller already owns Runtime -> Provider -> Config.
+   * This path must never reacquire provider or config ownership.
+   */
+  async validateCandidatePermitAgainstSnapshotUnderLease(
+    request: ProviderCandidateSnapshotAuthorityRequest,
+    lease: ProviderAuthorityReadLease,
+  ): Promise<ProviderCandidatePreflightResult> {
+    throwIfAborted(request.signal);
+    if (!Number.isFinite(request.deadlineAt) || request.deadlineAt <= this.#now()) {
+      return { kind: "stale" };
+    }
+    const credentialProof = request.credentialPermit
+      ? this.#candidatePermits.get(request.credentialPermit)
+      : undefined;
+    if ((request.requireCredentialPermit || request.credentialPermit) && !credentialProof) {
+      return { kind: "stale" };
+    }
+    try {
+      await this.#bounded(request, () => lease.assertHeld());
+      if (credentialProof) {
+        await this.#assertCandidateCredentialMatchesSnapshot(request, credentialProof);
       }
       await this.#bounded(request, () => lease.assertHeld());
       return { kind: "ready" };
@@ -521,6 +562,67 @@ export class ProviderCredentialAuthority implements ProviderCredentialAuthorityL
       deadlineAt: request.deadlineAt,
       signal: request.signal,
     }, lease);
+    if (
+      !("secret" in current)
+      || current.source !== expected.source
+      || !sameBinding(current.binding, expected.binding)
+      || this.#candidateFingerprint(current.secret) !== expected.fingerprint
+    ) {
+      throw new ProviderAuthorityStaleError();
+    }
+  }
+
+  async #assertCandidateCredentialMatchesSnapshot(
+    request: ProviderCandidateSnapshotAuthorityRequest,
+    expected: CandidateCredentialProof,
+  ): Promise<void> {
+    let candidate: string;
+    try {
+      candidate = normalizeProviderSecret(request.candidate);
+    } catch {
+      throw new ProviderAuthorityStaleError();
+    }
+    const state = request.authoritativeState;
+    if (
+      state.revision !== expected.stateRevision
+      || this.#candidateFingerprint(candidate) !== expected.fingerprint
+    ) {
+      throw new ProviderAuthorityStaleError();
+    }
+    if (!expected.binding) {
+      let current: string;
+      try {
+        current = normalizeProviderSecret(this.#environment.OPENROUTER_API_KEY ?? "");
+      } catch {
+        throw new ProviderAuthorityStaleError();
+      }
+      if (
+        expected.source !== "environment"
+        || this.#candidateFingerprint(current) !== expected.fingerprint
+      ) {
+        throw new ProviderAuthorityStaleError();
+      }
+      return;
+    }
+    const selected = selectOpenRouterBinding(
+      state,
+      { kind: "connection", connectionId: expected.binding.connectionId },
+      !expected.binding.enabled,
+    );
+    if (selected.kind !== "exact" || !sameBinding(selected.binding, expected.binding)) {
+      throw new ProviderAuthorityStaleError();
+    }
+    const current = await this.#readInferencePermit({
+      connectionId: expected.binding.connectionId,
+      credentialKind: "inference",
+      purpose: "explicit-repair",
+      environmentEligibility: expected.source === "environment"
+        ? "explicit-repair"
+        : "forbidden",
+      allowDisabled: !expected.binding.enabled,
+      deadlineAt: request.deadlineAt,
+      signal: request.signal,
+    }, selected.binding, state);
     if (
       !("secret" in current)
       || current.source !== expected.source

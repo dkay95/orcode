@@ -158,7 +158,8 @@ export interface ProviderActivationCoordinatorOptions {
   runtimeGuard: ProviderActivationRuntimeGuard;
   candidateAuthority?: Pick<
     ProviderCredentialAuthorityLike,
-    "validateCandidatePermitUnderLease"
+    | "validateCandidatePermitUnderLease"
+    | "validateCandidatePermitAgainstSnapshotUnderLease"
   >;
   now?: () => number;
   createUuid?: () => string;
@@ -523,7 +524,12 @@ export class ProviderActivationCoordinator {
                   await ownership.assertHeld();
                   await this.#assertFence(providerLease!);
                   await assertRuntimeLease(runtimeLease);
-                  await this.#validateCandidatePermit(request, providerLease!, runtimeLease);
+                  await this.#validateCandidatePermitAgainstSnapshot(
+                    request,
+                    beforeSave.state,
+                    providerLease!,
+                    runtimeLease,
+                  );
                   await assertConfigFileSnapshot(
                     ownership.canonicalPath,
                     beforeSave.target,
@@ -1225,6 +1231,49 @@ export class ProviderActivationCoordinator {
         signal: request.signal,
         credentialPermit: request.candidatePermit,
         requireCredentialPermit: request.requireCandidatePermit,
+      },
+      {
+        assertHeld: () => this.#assertMutationAllowed(
+          lease,
+          runtimeLease,
+          true,
+          request.signal,
+        ),
+      },
+    );
+    if (result.kind !== "ready") {
+      throw new ProviderActivationError(
+        "provider-candidate-authority-stale",
+        "Provider candidate authority changed before activation.",
+      );
+    }
+  }
+
+  async #validateCandidatePermitAgainstSnapshot(
+    request: ProviderActivationRequest,
+    authoritativeState: ProviderSetupStateV1,
+    lease: HeldProviderLease,
+    runtimeLease: ProviderActivationRuntimeLease,
+  ): Promise<void> {
+    this.#assertActivationAttemptCurrent(request);
+    if (!request.candidatePermit && !request.requireCandidatePermit) return;
+    const validate = this.#options.candidateAuthority
+      ?.validateCandidatePermitAgainstSnapshotUnderLease;
+    if (!validate) {
+      throw new ProviderActivationError(
+        "provider-candidate-authority-stale",
+        "Provider candidate authority is unavailable.",
+      );
+    }
+    const result = await validate.call(
+      this.#options.candidateAuthority,
+      {
+        deadlineAt: request.deadlineAt,
+        signal: request.signal,
+        credentialPermit: request.candidatePermit,
+        requireCredentialPermit: request.requireCandidatePermit,
+        candidate: request.candidate,
+        authoritativeState,
       },
       {
         assertHeld: () => this.#assertMutationAllowed(
