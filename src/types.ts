@@ -22,6 +22,9 @@ export type ReasoningSetting =
   | { mode: "effort"; effort: ReasoningEffort }
   | { mode: "budget"; maxTokens: number };
 
+/** Whether a displayed USD amount is complete or provider-managed/unknown. */
+export type CostKnowledge = "known" | "unknown";
+
 /** Whether OpenRouter may select a backup provider for the chosen model. */
 export type ProviderFallbackPolicy = boolean;
 
@@ -101,6 +104,8 @@ export interface CostLedger {
   compressorUsd: number;
   voiceUsd: number;
   totalUsd: number;
+  /** Missing in legacy sessions means known. */
+  costKnowledge?: CostKnowledge;
 }
 
 export interface ChatTurn {
@@ -130,6 +135,8 @@ export interface ChatSummary {
   workspace: string;
   turnCount: number;
   costUsd: number;
+  /** Missing in legacy summaries means known. */
+  costKnowledge?: CostKnowledge;
   model?: string;
   route?: RouteIdentityV1;
   reasoning?: ReasoningSetting;
@@ -257,6 +264,8 @@ export type AgentRunEvent =
       type: "run-start";
       model: string;
       maxSteps: number;
+      /** Missing in legacy/OpenRouter run logs means known. */
+      costKnowledge?: CostKnowledge;
       /**
        * The user's prompt for this run. Optional so older run logs (written
        * before this field existed) still deserialize; a resume flow that
@@ -286,6 +295,8 @@ export type AgentRunEvent =
        */
       cachedTokens: number;
       costUsd: number;
+      /** Missing in legacy run logs means known. */
+      costKnowledge?: CostKnowledge;
       timestamp: number;
     }
   | {

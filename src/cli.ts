@@ -4089,7 +4089,9 @@ async function runDashboard(
       balance: balance
         ? formatBalanceSummary(balance, spentSinceStart)
         : balanceLabel,
-      sessionCost: formatUsd(context.session.data.costs.totalUsd),
+      sessionCost: context.session.data.costs.costKnowledge === "unknown"
+        ? "providerverwaltet / unbekannt"
+        : formatUsd(context.session.data.costs.totalUsd),
       maxCost: formatUsd(context.config.maxCostUsd),
       maxSteps: context.config.maxSteps,
       keyStatus: dashboardKeyStatus(context.openRouter),
@@ -4708,7 +4710,7 @@ async function runDashboard(
             ? "Lauf abgebrochen. Bereits ausgeführte Tool-Aktionen wurden nicht automatisch zurückgenommen; der Teiltext wurde gespeichert."
             : context.openRouter.safeMessage(error),
         );
-        if (partial && partial.costUsd > 0) {
+        if (partial && (partial.costUsd > 0 || partial.costKnowledge === "unknown")) {
           ui.addMessage(
             "system",
             `${runResultLabel(partial.outcome)} · ${formatRunCost(partial)}`,
@@ -4863,7 +4865,7 @@ function chatChoice(
   return {
     value: chat.id,
     label: chat.title,
-    description: `${chat.turnCount} Nachrichten · ${formatUsd(chat.costUsd)}${model} · ${formatChatAge(chat.updatedAt)} · ${chat.id.slice(0, 8)}`,
+    description: `${chat.turnCount} Nachrichten · ${formatChatCost(chat)}${model} · ${formatChatAge(chat.updatedAt)} · ${chat.id.slice(0, 8)}`,
   };
 }
 
@@ -5194,10 +5196,24 @@ function runResultLabel(outcome: AgentRunOutcome): string {
   return runOutcomeLabel(outcome === "completed" ? "complete" : outcome);
 }
 
-function formatRunCost(result: AgentRunResult): string {
+export function formatRunCost(result: AgentRunResult): string {
+  if (result.costKnowledge === "unknown") {
+    return result.costUsd > 0
+      ? `mindestens ${formatUsd(result.costUsd)} · weitere providerverwaltete Kosten unbekannt`
+      : "providerverwaltet / unbekannt";
+  }
   return result.compressorCostUsd > 0
     ? `${formatUsd(result.costUsd)} (Main ${formatUsd(result.mainCostUsd)} · Kompressor ${formatUsd(result.compressorCostUsd)})`
     : formatUsd(result.costUsd);
+}
+
+export function formatChatCost(chat: Pick<ChatSummary, "costKnowledge" | "costUsd">): string {
+  if (chat.costKnowledge === "unknown") {
+    return chat.costUsd > 0
+      ? `mindestens ${formatUsd(chat.costUsd)} · weitere providerverwaltete Kosten unbekannt`
+      : "providerverwaltet / unbekannt";
+  }
+  return formatUsd(chat.costUsd);
 }
 
 function formatRouting(selectedModel: string, resolvedModel: string): string {

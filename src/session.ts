@@ -20,6 +20,7 @@ import {
   REASONING_EFFORTS,
   type ChatSummary,
   type ChatTurn,
+  type CostKnowledge,
   type CostLedger,
   type ReasoningSetting,
   type SessionData,
@@ -63,6 +64,8 @@ export interface SessionCheckpoint {
   /** Number of turns that existed when the checkpoint was taken. */
   turnIndex: number;
   costUsd: number;
+  /** Missing in legacy checkpoints means known. */
+  costKnowledge?: CostKnowledge;
   createdAt: string;
 }
 
@@ -339,7 +342,16 @@ export class SessionStore {
     this.#data.updatedAt = new Date().toISOString();
   }
 
-  addCost(kind: "main" | "compressor" | "voice", amount: number): void {
+  addCost(
+    kind: "main" | "compressor" | "voice",
+    amount: number,
+    knowledge: CostKnowledge = "known",
+  ): void {
+    if (knowledge === "unknown") {
+      this.#data.costs.costKnowledge = "unknown";
+      this.#data.updatedAt = new Date().toISOString();
+      return;
+    }
     if (!Number.isFinite(amount) || amount <= 0) {
       return;
     }
@@ -364,6 +376,7 @@ export class SessionStore {
    */
   clear(): void {
     const { id, title, workspace, model, route, reasoning, createdAt } = this.#data;
+    const costKnowledge = knowledgeOf(this.#data.costs);
     this.#data = {
       ...emptySession(workspace, id, title),
       model,
@@ -373,6 +386,7 @@ export class SessionStore {
       revision: this.#data.revision,
       dailySpendUsd: { ...this.#data.dailySpendUsd },
     };
+    this.#data.costs.costKnowledge = costKnowledge;
   }
 
   recentTurns(count = 8): ChatTurn[] {
@@ -404,6 +418,10 @@ export class SessionStore {
     restored.costs.voiceUsd += voiceDelta;
     restored.costs.totalUsd =
       restored.costs.mainUsd + restored.costs.compressorUsd + restored.costs.voiceUsd;
+    restored.costs.costKnowledge = knowledgeOf(current.costs) === "unknown"
+      || knowledgeOf(restored.costs) === "unknown"
+      ? "unknown"
+      : "known";
     const days = new Set([
       ...Object.keys(restored.dailySpendUsd),
       ...Object.keys(current.dailySpendUsd),
@@ -443,6 +461,7 @@ export class SessionStore {
       label: normalizeCheckpointLabel(label, this.#data.turns.length),
       turnIndex: this.#data.turns.length,
       costUsd: this.#data.costs.totalUsd,
+      costKnowledge: knowledgeOf(this.#data.costs),
       createdAt: new Date().toISOString(),
     };
     this.#data.checkpoints.push(checkpoint);
@@ -662,6 +681,7 @@ export interface WorkspaceSpend {
   day: string;
   dayUsd: number;
   totalUsd: number;
+  costKnowledge: CostKnowledge;
   chatCount: number;
 }
 
@@ -677,14 +697,17 @@ export async function workspaceSpend(
   const sessions = await loadAllSessions(workspace, appHome);
   let dayUsd = 0;
   let totalUsd = 0;
+  let costKnowledge: CostKnowledge = "known";
   for (const session of sessions) {
     dayUsd += session.dailySpendUsd[day] ?? 0;
     totalUsd += session.costs.totalUsd;
+    if (knowledgeOf(session.costs) === "unknown") costKnowledge = "unknown";
   }
   return {
     day,
     dayUsd: roundUsd(dayUsd),
     totalUsd: roundUsd(totalUsd),
+    costKnowledge,
     chatCount: sessions.length,
   };
 }
@@ -707,9 +730,13 @@ export function exportSessionMarkdown(data: SessionExportInput): string {
   lines.push(`- Erstellt: ${formatTimestamp(data.createdAt)}`);
   lines.push(`- Aktualisiert: ${formatTimestamp(data.updatedAt)}`);
   lines.push(`- Nachrichten: ${data.turns.length}`);
-  lines.push(
-    `- Kosten: gesamt ${formatUsd(data.costs.totalUsd)} (Hauptmodell ${formatUsd(data.costs.mainUsd)}, Kompressor ${formatUsd(data.costs.compressorUsd)}, Transkription ${formatUsd(data.costs.voiceUsd)})`,
-  );
+  if (knowledgeOf(data.costs) === "unknown") {
+    lines.push(`- Kosten: ${formatUnknownCost(data.costs.totalUsd)}`);
+  } else {
+    lines.push(
+      `- Kosten: gesamt ${formatUsd(data.costs.totalUsd)} (Hauptmodell ${formatUsd(data.costs.mainUsd)}, Kompressor ${formatUsd(data.costs.compressorUsd)}, Transkription ${formatUsd(data.costs.voiceUsd)})`,
+    );
+  }
   lines.push("");
 
   if (data.summary.trim()) {
@@ -720,7 +747,7 @@ export function exportSessionMarkdown(data: SessionExportInput): string {
     lines.push("## Checkpoints", "");
     for (const checkpoint of checkpoints) {
       lines.push(
-        `- **${checkpoint.label}** — nach Nachricht ${checkpoint.turnIndex}, ${formatTimestamp(checkpoint.createdAt)}, ${formatUsd(checkpoint.costUsd)}`,
+        `- **${checkpoint.label}** — nach Nachricht ${checkpoint.turnIndex}, ${formatTimestamp(checkpoint.createdAt)}, ${knowledgeOf(checkpoint) === "unknown" ? formatUnknownCost(checkpoint.costUsd) : formatUsd(checkpoint.costUsd)}`,
       );
     }
     lines.push("");
@@ -934,6 +961,7 @@ function emptySession(
       compressorUsd: 0,
       voiceUsd: 0,
       totalUsd: 0,
+      costKnowledge: "known",
     },
     revision: 0,
     checkpoints: [],
@@ -948,6 +976,7 @@ function withPersistenceFields(data: SessionData): PersistedSessionData {
   const candidate = data as Partial<PersistedSessionData> & SessionData;
   return {
     ...data,
+    costs: normalizeCosts(data.costs),
     revision: nonNegativeInteger(candidate.revision),
     checkpoints: normalizeCheckpoints(candidate.checkpoints),
     toolCalls: normalizeToolCalls(candidate.toolCalls),
@@ -1054,6 +1083,7 @@ function normalizeCheckpoints(value: unknown): SessionCheckpoint[] {
       ),
       turnIndex: nonNegativeInteger(candidate.turnIndex),
       costUsd: nonNegativeNumber(candidate.costUsd),
+      costKnowledge: candidate.costKnowledge === "unknown" ? "unknown" : "known",
       createdAt,
     });
   }
@@ -1122,6 +1152,7 @@ function normalizeCosts(value: unknown): CostLedger {
     compressorUsd,
     voiceUsd,
     totalUsd: mainUsd + compressorUsd + voiceUsd,
+    costKnowledge: costs.costKnowledge === "unknown" ? "unknown" : "known",
   };
 }
 
@@ -1132,6 +1163,7 @@ function toSummary(data: PersistedSessionData): ChatSummary {
     workspace: data.workspace,
     turnCount: data.turns.length,
     costUsd: data.costs.totalUsd,
+    costKnowledge: knowledgeOf(data.costs),
     model: data.model,
     route: data.route ? structuredClone(data.route) : undefined,
     reasoning: data.reasoning,
@@ -1207,6 +1239,16 @@ function nonNegativeInteger(value: unknown): number {
 
 function roundUsd(value: number): number {
   return Math.round(value * 1e6) / 1e6;
+}
+
+function knowledgeOf(value: { readonly costKnowledge?: unknown }): CostKnowledge {
+  return value.costKnowledge === "unknown" ? "unknown" : "known";
+}
+
+function formatUnknownCost(knownAmount: number): string {
+  return knownAmount > 0
+    ? `mindestens ${formatUsd(knownAmount)}; weitere providerverwaltete Kosten sind unbekannt`
+    : "providerverwaltet / unbekannt";
 }
 
 function describeReasoning(reasoning: ReasoningSetting | undefined): string {
@@ -1430,6 +1472,7 @@ function fingerprint(data: PersistedSessionData): string {
     projected.revision,
     projected.turns.length,
     projected.costs.totalUsd,
+    knowledgeOf(projected.costs),
     projected.updatedAt,
     projected.checkpoints.length,
     projected.toolCalls.length,
@@ -1565,7 +1608,18 @@ function mergeCosts(
     roundUsd(theirs.compressorUsd + (mine.compressorUsd - base.compressorUsd)),
   );
   const voiceUsd = Math.max(0, roundUsd(theirs.voiceUsd + (mine.voiceUsd - base.voiceUsd)));
-  return { mainUsd, compressorUsd, voiceUsd, totalUsd: roundUsd(mainUsd + compressorUsd + voiceUsd) };
+  const costKnowledge = knowledgeOf(base) === "unknown"
+    || knowledgeOf(mine) === "unknown"
+    || knowledgeOf(theirs) === "unknown"
+    ? "unknown"
+    : "known";
+  return {
+    mainUsd,
+    compressorUsd,
+    voiceUsd,
+    totalUsd: roundUsd(mainUsd + compressorUsd + voiceUsd),
+    costKnowledge,
+  };
 }
 
 function mergeSpend(

@@ -22,6 +22,8 @@ import {
   type RetryClock,
 } from "./reconnect.js";
 import { PanelAuthenticationRejectedError, type PanelCall } from "./panel.js";
+import type { ModelRuntime, RuntimeModelInfo } from "./model-runtime.js";
+import type { RouteIdentityV1 } from "./backends.js";
 import { errorMessage, isRecord } from "./utils.js";
 
 const API_BASE = "https://openrouter.ai/api/v1";
@@ -1331,8 +1333,8 @@ export interface ProviderRequestField {
 export function providerField(config: {
   sort?: "price" | "throughput" | "latency";
   dataCollection?: "allow" | "deny";
-  only?: string[];
-  ignore?: string[];
+  only?: readonly string[];
+  ignore?: readonly string[];
   allowFallbacks?: boolean;
 }): ProviderRequestField {
   const field: ProviderRequestField = {};
@@ -1352,6 +1354,96 @@ export function providerField(config: {
     field.allowFallbacks = config.allowFallbacks;
   }
   return field;
+}
+
+/** Provider-neutral projection of the existing OpenRouter service. */
+export function createOpenRouterModelRuntime(
+  service: OpenRouterService,
+  config: {
+    readonly mainModel: string;
+    readonly fallbackModels: readonly string[];
+    readonly provider: {
+      readonly sort?: "price" | "throughput" | "latency";
+      readonly dataCollection?: "allow" | "deny";
+      readonly only?: readonly string[];
+      readonly ignore?: readonly string[];
+      readonly allowFallbacks?: boolean;
+    };
+  },
+  boundRoute: RouteIdentityV1,
+): ModelRuntime {
+  const exactBoundRoute = Object.freeze({
+    version: boundRoute.version,
+    backendId: boundRoute.backendId,
+    accountFingerprint: boundRoute.accountFingerprint,
+    billingRealm: boundRoute.billingRealm,
+    requestedModelId: boundRoute.requestedModelId,
+    canonicalModelId: boundRoute.canonicalModelId,
+    resolutionState: boundRoute.resolutionState,
+  });
+  const requireOpenRouterRoute = (route: RouteIdentityV1): void => {
+    if (route.version !== 1
+      || route.backendId !== "openrouter"
+      || route.accountFingerprint !== exactBoundRoute.accountFingerprint
+      || route.billingRealm !== exactBoundRoute.billingRealm
+      || route.requestedModelId !== exactBoundRoute.requestedModelId
+      || route.canonicalModelId !== exactBoundRoute.canonicalModelId
+      || route.resolutionState !== exactBoundRoute.resolutionState) {
+      throw new Error("OpenRouter runtime route binding changed.");
+    }
+  };
+  requireOpenRouterRoute(exactBoundRoute);
+  return {
+    backendId: "openrouter",
+    createClient({ route, scope }) {
+      requireOpenRouterRoute(route);
+      return service.client({ scope });
+    },
+    async inspectSpend(signal) {
+      return { kind: "known", balance: await service.checkBalance(signal) };
+    },
+    async listModels(search = "", signal) {
+      const models = await service.listModels(search, false, signal);
+      return models.map((model): RuntimeModelInfo => ({
+        id: model.id,
+        name: model.name,
+        contextLength: model.contextLength,
+        reasoning: model.reasoning === undefined
+          ? undefined
+          : {
+            ...model.reasoning,
+            supportedEfforts: model.reasoning.supportedEfforts === null
+              ? null
+              : [...model.reasoning.supportedEfforts],
+          },
+        price: Number.isFinite(model.promptPrice)
+          && Number.isFinite(model.completionPrice)
+          && model.promptPrice >= 0
+          && model.completionPrice >= 0
+          ? {
+              kind: "known",
+              promptUsdPerToken: model.promptPrice,
+              completionUsdPerToken: model.completionPrice,
+            }
+          : { kind: "unknown" },
+      }));
+    },
+    dispatchFields({ route, allowWeb }) {
+      requireOpenRouterRoute(route);
+      return {
+        backendId: "openrouter",
+        models: modelsField(config.mainModel, config.fallbackModels),
+        provider: providerField(config.provider),
+        ...(allowWeb ? { plugins: [{ id: "web" as const, maxResults: 5 as const }] } : {}),
+      };
+    },
+    onConnectionEvent(listener) {
+      return service.onConnectionEvent(listener);
+    },
+    safeMessage(error) {
+      return service.safeMessage(error);
+    },
+  };
 }
 
 /**

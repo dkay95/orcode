@@ -1,5 +1,5 @@
 import type { OpenRouter } from "@openrouter/agent";
-import type { OrcodeConfig } from "./types.js";
+import type { CostKnowledge, OrcodeConfig } from "./types.js";
 import { SessionStore } from "./session.js";
 import { SDK_RETRY_CODES } from "./reconnect.js";
 import { errorMessage, formatUsd } from "./utils.js";
@@ -16,6 +16,7 @@ export const MIN_COMPRESSION_SAVING = 0.15;
 export type CompressionSkipReason =
   | "disabled"
   | "below-threshold"
+  | "cost-unknown"
   | "estimated-cost-limit"
   | "empty-handoff"
   | "insufficient-saving"
@@ -35,6 +36,7 @@ export interface CompressionResult {
   used: boolean;
   handoff: string;
   costUsd: number;
+  costKnowledge: CostKnowledge;
   originalChars: number;
   compressedChars: number;
   /** Never negative: a handoff that grows the context is discarded instead. */
@@ -49,12 +51,15 @@ export interface CompressionResult {
 }
 
 export interface CompressContextOptions {
-  client: OpenRouter;
+  /** May be omitted only when unknown pricing makes the call ineligible. */
+  client?: OpenRouter;
   config: OrcodeConfig;
   session: SessionStore;
   signal?: AbortSignal;
   /** Optional price source; without it the cost limit can only be checked afterwards. */
   lookupPrice?: CompressorPriceLookup;
+  /** Unknown provider pricing forbids a call whose USD cap cannot be enforced. */
+  costKnowledge?: CostKnowledge;
   /**
    * Forces compression past the char-threshold check (K7f: the measured
    * `inputTokens` of the previous run exceeded `contextBudgetRatio ×
@@ -76,6 +81,7 @@ export async function compressContext(
   options: CompressContextOptions,
 ): Promise<CompressionResult> {
   const { client, config, session, signal, lookupPrice, force } = options;
+  const costKnowledge = options.costKnowledge ?? "known";
   const rawContext = uncompressedContext(session);
   const warnings: string[] = [];
 
@@ -88,10 +94,29 @@ export async function compressContext(
       rawContext,
       reason: config.compressionMode === "off" ? "disabled" : "below-threshold",
       costUsd: 0,
+      costKnowledge,
       estimatedCostUsd: null,
       limitEnforcedUpfront: false,
       warnings,
     });
+  }
+
+  if (costKnowledge === "unknown") {
+    warnings.push(
+      "Kompression übersprungen: Die Kosten dieses providerverwalteten Modells sind unbekannt; das USD-Limit kann nicht verlässlich erzwungen werden.",
+    );
+    return unusedResult({
+      rawContext,
+      reason: "cost-unknown",
+      costUsd: 0,
+      costKnowledge,
+      estimatedCostUsd: null,
+      limitEnforcedUpfront: false,
+      warnings,
+    });
+  }
+  if (!client) {
+    throw new Error("Compressor client is required when costs are known.");
   }
 
   const price = await resolvePrice(lookupPrice, config.compressorModel, signal);
@@ -106,6 +131,7 @@ export async function compressContext(
       rawContext,
       reason: "estimated-cost-limit",
       costUsd: 0,
+      costKnowledge,
       estimatedCostUsd,
       limitEnforcedUpfront: true,
       warnings,
@@ -156,6 +182,7 @@ export async function compressContext(
       rawContext,
       reason: "failed",
       costUsd: observedCost,
+      costKnowledge,
       estimatedCostUsd,
       limitEnforcedUpfront: estimatedCostUsd !== null,
       warnings,
@@ -173,6 +200,7 @@ export async function compressContext(
       rawContext,
       reason: "empty-handoff",
       costUsd,
+      costKnowledge,
       estimatedCostUsd,
       limitEnforcedUpfront: estimatedCostUsd !== null,
       warnings,
@@ -190,6 +218,7 @@ export async function compressContext(
       rawContext,
       reason: "insufficient-saving",
       costUsd,
+      costKnowledge,
       estimatedCostUsd,
       limitEnforcedUpfront: estimatedCostUsd !== null,
       warnings,
@@ -200,6 +229,7 @@ export async function compressContext(
     used: true,
     handoff,
     costUsd,
+    costKnowledge,
     originalChars: rawContext.length,
     compressedChars: handoff.length,
     savedPercent: Math.round(savedRatio * 100),
@@ -228,11 +258,13 @@ export function rawCompressionResult(
   rawContext: string,
   reason?: CompressionSkipReason,
   warnings: string[] = [],
+  costKnowledge: CostKnowledge = "known",
 ): CompressionResult {
   return unusedResult({
     rawContext,
     ...(reason ? { reason } : {}),
     costUsd: 0,
+    costKnowledge,
     estimatedCostUsd: null,
     limitEnforcedUpfront: false,
     warnings,
@@ -243,6 +275,7 @@ function unusedResult(options: {
   rawContext: string;
   reason?: CompressionSkipReason;
   costUsd: number;
+  costKnowledge: CostKnowledge;
   estimatedCostUsd: number | null;
   limitEnforcedUpfront: boolean;
   warnings: string[];
@@ -251,6 +284,7 @@ function unusedResult(options: {
     used: false,
     handoff: options.rawContext,
     costUsd: options.costUsd,
+    costKnowledge: options.costKnowledge,
     originalChars: options.rawContext.length,
     compressedChars: options.rawContext.length,
     savedPercent: 0,

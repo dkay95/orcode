@@ -187,6 +187,29 @@ test("without a price the limit is named honestly instead of pretended", async (
   assert.match(result.warnings.join("\n"), /konnte vorab nicht geprüft werden/);
 });
 
+test("provider-managed unknown cost skips compression instead of synthesizing a zero-dollar cap", async () => {
+  const session = await freshSession("unknown-provider-cost");
+  fill(session, 8);
+  const client = countingClient(() => "must not run");
+
+  const result = await compressContext({
+    client: client.client as never,
+    config: config({ compressionMode: "always" }),
+    session,
+    costKnowledge: "unknown",
+    lookupPrice: async () => null,
+  });
+
+  assert.equal(client.calls, 0);
+  assert.equal(result.used, false);
+  assert.equal(result.skipReason, "cost-unknown");
+  assert.equal(result.costKnowledge, "unknown");
+  assert.equal(result.costUsd, 0);
+  assert.equal(result.limitEnforcedUpfront, false);
+  assert.match(result.warnings.join("\n"), /providerverwaltet|unbekannt/i);
+  assert.doesNotMatch(result.warnings.join("\n"), /kostenlos|0(?:[,.]0+)?\s*\$/i);
+});
+
 test("an actual cost above the limit is reported clearly", async () => {
   const session = await freshSession("overrun");
   fill(session, 8);

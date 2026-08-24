@@ -803,6 +803,87 @@ test("workspace spend answers the budget question and survives /clear", async ()
   assert.ok(Math.abs(afterClear.totalUsd - 0.1) < 1e-9);
 });
 
+test("unknown provider-managed model cost persists without entering USD accumulation or free formatting", async () => {
+  const { workspace, appHome } = await workspaceRoot("unknown-cost");
+  const store = SessionStore.create(workspace, appHome, "Kimi unknown cost");
+  store.addCost("main", 999, "unknown");
+  assert.equal(store.data.costs.costKnowledge, "unknown");
+  assert.equal(store.data.costs.mainUsd, 0);
+  assert.equal(store.data.costs.totalUsd, 0);
+  await store.save();
+
+  const reopened = await SessionStore.openById(workspace, store.data.id, appHome);
+  assert.equal(reopened.data.costs.costKnowledge, "unknown");
+  assert.equal(reopened.data.costs.totalUsd, 0);
+  const [summary] = await SessionStore.list(workspace, appHome);
+  assert.equal(summary?.costKnowledge, "unknown");
+  assert.equal(summary?.costUsd, 0);
+  const spend = await workspaceSpend(workspace, appHome);
+  assert.equal(spend.costKnowledge, "unknown");
+  assert.equal(spend.dayUsd, 0);
+  assert.equal(spend.totalUsd, 0);
+
+  const markdown = reopened.exportMarkdown();
+  assert.match(markdown, /unbekannt|providerverwaltet/i);
+  assert.doesNotMatch(markdown, /kostenlos|\$0(?:\.0+)?\b|0(?:,0+)?\s*\$/i);
+});
+
+test("legacy cost ledgers normalize to known numeric cost", () => {
+  const markdown = exportSessionMarkdown({
+    version: 2,
+    id: "legacy-known-cost",
+    title: "Legacy",
+    workspace: "/tmp/legacy",
+    summary: "",
+    turns: [],
+    costs: { mainUsd: 0.125, compressorUsd: 0, voiceUsd: 0, totalUsd: 0.125 },
+    createdAt: "2026-07-24T08:00:00.000Z",
+    updatedAt: "2026-07-24T08:00:00.000Z",
+  });
+  assert.match(markdown, /\$0\.125/);
+  assert.doesNotMatch(markdown, /providerverwaltet/i);
+});
+
+test("unknown cost knowledge is monotonic across concurrent merge, checkpoint restore, and export", async () => {
+  const { workspace, appHome } = await workspaceRoot("unknown-cost-merge");
+  const base = SessionStore.create(workspace, appHome, "Merged Kimi cost");
+  base.addTurn("user", "start");
+  await base.save();
+  const kimiWindow = await SessionStore.openById(workspace, base.data.id, appHome);
+  const knownWindow = await SessionStore.openById(workspace, base.data.id, appHome);
+
+  kimiWindow.addCost("main", 0, "unknown");
+  const checkpoint = kimiWindow.createCheckpoint("Kimi checkpoint");
+  assert.equal(checkpoint.costKnowledge, "unknown");
+  knownWindow.addCost("main", 0.25, "known");
+  await knownWindow.save();
+  await kimiWindow.save();
+
+  const merged = await SessionStore.openById(workspace, base.data.id, appHome);
+  assert.equal(merged.data.costs.costKnowledge, "unknown");
+  assert.equal(merged.data.costs.totalUsd, 0.25, "known amounts remain numeric without resolving unknown spend");
+  assert.equal(merged.listCheckpoints()[0]?.costKnowledge, "unknown");
+  merged.restoreCheckpoint("Kimi checkpoint");
+  assert.equal(merged.data.costs.costKnowledge, "unknown");
+  const markdown = merged.exportMarkdown();
+  assert.match(markdown, /Kimi checkpoint.*(?:providerverwaltet|unbekannt)/i);
+  assert.match(markdown, /Kosten:.*(?:providerverwaltet|unbekannt)/i);
+  assert.doesNotMatch(markdown, /Kimi checkpoint[^\n]*\$0(?:\.0+)?\b/i);
+});
+
+test("a persisted legacy ledger without costKnowledge reopens as known", async () => {
+  const { workspace, appHome } = await workspaceRoot("legacy-cost-knowledge");
+  const store = SessionStore.create(workspace, appHome, "Legacy known");
+  store.addCost("main", 0.125);
+  await store.save();
+  const raw = JSON.parse(await readFile(store.path, "utf8")) as { costs: Record<string, unknown> };
+  delete raw.costs.costKnowledge;
+  await writeFile(store.path, `${JSON.stringify(raw, null, 2)}\n`, "utf8");
+  const reopened = await SessionStore.openById(workspace, store.data.id, appHome);
+  assert.equal(reopened.data.costs.costKnowledge, "known");
+  assert.equal(reopened.data.costs.totalUsd, 0.125);
+});
+
 test("markdown export contains metadata, turns, tool calls and costs", async () => {
   const { workspace, appHome } = await workspaceRoot("export");
   const store = SessionStore.create(workspace, appHome, "Export-Test");

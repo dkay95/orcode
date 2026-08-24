@@ -439,6 +439,7 @@ export class TerminalUi {
         step: 1,
         maxSteps: event.maxSteps,
         costUsd: 0,
+        costKnowledge: event.costKnowledge === "unknown" ? "unknown" : "known",
         running: true,
       };
       this.#mode = "busy";
@@ -452,7 +453,10 @@ export class TerminalUi {
       if (event.type === "model-start" || event.type === "model-end" || event.type === "reasoning") {
         run.step = event.step;
       }
-      if (event.type === "model-end") run.costUsd += event.costUsd;
+      if (event.type === "model-end") {
+        run.costUsd += event.costUsd;
+        if (event.costKnowledge === "unknown") run.costKnowledge = "unknown";
+      }
       if (event.type === "run-end") {
         run.running = false;
         for (const id of this.#processes.keys()) this.#rememberTerminalProcess(id);

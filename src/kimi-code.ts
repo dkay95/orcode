@@ -355,7 +355,7 @@ export class KimiCodeService {
       if (response.status !== 200) {
         const body = await readBoundedJson(response, controller.signal);
         this.#assertRequestCurrent(request, controller.signal);
-        const failure = classifyHttpFailure(response.status, body);
+        const failure = classifyKimiCodeHttpFailure(response.status, body);
         throw requestError(failure);
       }
       const body = await readBoundedJson(response, controller.signal);
@@ -615,7 +615,13 @@ function parseStructuredProviderError(value: unknown): StructuredProviderError |
   return { message: error.message };
 }
 
-function classifyHttpFailure(status: number, value: unknown): KimiCodeFailure {
+/**
+ * Shared bounded classifier for Kimi metadata and model HTTP failures.
+ * Callers must parse a capped JSON body first and discard the raw value after
+ * this function returns; only the frozen secretless failure union crosses the
+ * credential-authority boundary.
+ */
+export function classifyKimiCodeHttpFailure(status: number, value: unknown): KimiCodeFailure {
   const structured = parseStructuredProviderError(value);
   if (!structured) return INVALID_RESPONSE_FAILURE;
   const message = structured.message;

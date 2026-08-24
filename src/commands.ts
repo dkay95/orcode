@@ -1737,7 +1737,7 @@ async function chatCommand(
       ...chats.map((chat) => ({
         name: `${chat.id === context.session.data.id ? "●" : "○"} ${chat.title}`,
         value: chat.id,
-        description: `${chat.turnCount} Nachrichten · ${usd(chat.costUsd)} · ${formatChatDate(chat.updatedAt)}`,
+        description: `${chat.turnCount} Nachrichten · ${displayCost(chat.costUsd, chat.costKnowledge)} · ${formatChatDate(chat.updatedAt)}`,
       })),
     ];
     const selected = await search({
@@ -1782,7 +1782,7 @@ async function chatCommand(
     for (const chat of chats) {
       const marker = chat.id === context.session.data.id ? chalk.green("●") : "○";
       context.out.text(
-        `${marker} ${chat.title} · ${chat.turnCount} Nachrichten · ${usd(chat.costUsd)} · ${formatChatDate(chat.updatedAt)} · ${chat.id}`,
+        `${marker} ${chat.title} · ${chat.turnCount} Nachrichten · ${displayCost(chat.costUsd, chat.costKnowledge)} · ${formatChatDate(chat.updatedAt)} · ${chat.id}`,
       );
     }
     return;
@@ -1863,7 +1863,7 @@ async function chatCommand(
         matches.map((match) => ({
           name: `${match.chat.id === context.session.data.id ? "●" : "○"} ${match.chat.title}`,
           value: match.chat.id,
-          description: `${match.chat.turnCount} Nachrichten · ${usd(match.chat.costUsd)} · ${formatChatDate(match.chat.updatedAt)} · ${match.chat.id}`,
+          description: `${match.chat.turnCount} Nachrichten · ${displayCost(match.chat.costUsd, match.chat.costKnowledge)} · ${formatChatDate(match.chat.updatedAt)} · ${match.chat.id}`,
         })),
     });
     if (selected !== context.session.data.id) {
@@ -1900,7 +1900,7 @@ async function chatCommand(
     for (const hit of shown) {
       const marker = hit.chat.id === context.session.data.id ? chalk.green("●") : "○";
       context.out.text(
-        `${marker} ${hit.chat.title} · ${hit.chat.turnCount} Nachrichten · ${usd(hit.chat.costUsd)} · ${formatChatDate(hit.chat.updatedAt)} · ${hit.chat.id}`,
+        `${marker} ${hit.chat.title} · ${hit.chat.turnCount} Nachrichten · ${displayCost(hit.chat.costUsd, hit.chat.costKnowledge)} · ${formatChatDate(hit.chat.updatedAt)} · ${hit.chat.id}`,
       );
       if (hit.snippet) {
         context.out.text(`  ${chalk.dim(hit.snippet)}`);
@@ -2176,6 +2176,10 @@ async function stepsCommand(args: string[], context: CommandContext): Promise<vo
 
 function printCosts(session: SessionStore, out: CommandOutput): void {
   const costs = session.data.costs;
+  if (costs.costKnowledge === "unknown") {
+    out.text(`Sitzungskosten: ${displayCost(costs.totalUsd, "unknown")}`);
+    return;
+  }
   out.text(
     `Sitzungskosten: Main ${usd(costs.mainUsd)} · Kompressor ${usd(costs.compressorUsd)} · Transkription ${usd(costs.voiceUsd)} · Gesamt ${usd(costs.totalUsd)}`,
   );
@@ -2250,7 +2254,7 @@ async function checkpointCommand(
     }
     for (const checkpoint of checkpoints) {
       context.out.text(
-        `${checkpoint.label} · nach ${checkpoint.turnIndex} Nachrichten · ${usd(checkpoint.costUsd)} · ${formatChatDate(checkpoint.createdAt)} · ${checkpoint.id.slice(0, 8)}`,
+        `${checkpoint.label} · nach ${checkpoint.turnIndex} Nachrichten · ${displayCost(checkpoint.costUsd, checkpoint.costKnowledge)} · ${formatChatDate(checkpoint.createdAt)} · ${checkpoint.id.slice(0, 8)}`,
       );
     }
     return;
@@ -2298,7 +2302,7 @@ async function budgetCommand(
     );
     context.out.text(`Budget: ${budgetSummary(context.config.budget)}`);
     context.out.text(
-      `Verbraucht in diesem Workspace: heute ${usd(spend.dayUsd)} · gesamt ${usd(spend.totalUsd)} über ${spend.chatCount} Chat(s)`,
+      `Verbraucht in diesem Workspace: heute ${displayCost(spend.dayUsd, spend.costKnowledge)} · gesamt ${displayCost(spend.totalUsd, spend.costKnowledge)} über ${spend.chatCount} Chat(s)`,
     );
     context.out.text(
       chalk.dim(
@@ -2885,6 +2889,15 @@ function tokenize(value: string): string[] {
 
 function usd(value: number): string {
   return `$${value.toFixed(value < 0.01 ? 5 : 2)}`;
+}
+
+function displayCost(value: number, knowledge?: "known" | "unknown"): string {
+  if (knowledge === "unknown") {
+    return value > 0
+      ? `mindestens ${usd(value)} · weitere providerverwaltete Kosten unbekannt`
+      : "providerverwaltet / unbekannt";
+  }
+  return usd(value);
 }
 
 function compactNumber(value: number): string {

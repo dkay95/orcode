@@ -4,6 +4,7 @@ import {
   buildReasoningRequest,
   getReasoningSetting,
   planReasoningRequest,
+  planRuntimeReasoningRequest,
   reasoningChoices,
   reasoningLabel,
   setReasoningSetting,
@@ -204,5 +205,80 @@ test("unsupported effort and mandatory off are rejected", () => {
         },
       ),
     /erfordert Reasoning/,
+  );
+});
+
+const kimiK3: ModelInfo = {
+  ...model,
+  id: "k3",
+  name: "Kimi K3",
+  contextLength: 262_144,
+  promptPrice: 0,
+  completionPrice: 0,
+  reasoning: {
+    defaultEffort: "high",
+    defaultEnabled: true,
+    mandatory: true,
+    supportedEfforts: ["low", "high", "max"],
+    supportsMaxTokens: false,
+  },
+};
+
+const kimiK27: ModelInfo = {
+  ...kimiK3,
+  id: "kimi-for-coding",
+  name: "Kimi K2.7 Code",
+  reasoning: {
+    defaultEffort: null,
+    defaultEnabled: true,
+    mandatory: true,
+    supportedEfforts: null,
+    supportsMaxTokens: false,
+  },
+};
+
+test("Kimi rejects off and token budgets before generic OpenRouter degradation", () => {
+  for (const kimi of [kimiK3, kimiK27]) {
+    assert.throws(
+      () => planRuntimeReasoningRequest({ mode: "effort", effort: "none" }, kimi, "kimi-code"),
+      /Kimi.*Reasoning/i,
+    );
+    assert.throws(
+      () => planRuntimeReasoningRequest({ mode: "budget", maxTokens: 2_000 }, kimi, "kimi-code"),
+      /Kimi.*Token-Budget/i,
+    );
+  }
+});
+
+test("K3 preserves the reviewed effort inputs for the strict bridge mapping", () => {
+  assert.deepEqual(planRuntimeReasoningRequest({ mode: "auto" }, kimiK3, "kimi-code"), {
+    degraded: false,
+  });
+  for (const effort of ["low", "medium", "high", "xhigh", "max"] as const) {
+    assert.deepEqual(
+      planRuntimeReasoningRequest({ mode: "effort", effort }, kimiK3, "kimi-code"),
+      { request: { enabled: true, effort }, degraded: false },
+      effort,
+    );
+  }
+});
+
+test("every persisted K2.7 effort normalizes to its fixed thinking mode before the bridge", () => {
+  assert.deepEqual(planRuntimeReasoningRequest({ mode: "auto" }, kimiK27, "kimi-code"), {
+    degraded: false,
+  });
+  for (const effort of ["low", "medium", "high", "xhigh", "max"] as const) {
+    const plan = planRuntimeReasoningRequest({ mode: "effort", effort }, kimiK27, "kimi-code");
+    assert.deepEqual(plan.request, { enabled: true }, effort);
+    assert.equal(plan.degraded, true, effort);
+    assert.match(plan.note ?? "", /feste.*Thinking/i, effort);
+  }
+});
+
+test("OpenRouter runtime reasoning stays byte-compatible with the existing planner", () => {
+  const setting = { mode: "effort", effort: "medium" } as const;
+  assert.deepEqual(
+    planRuntimeReasoningRequest(setting, model, "openrouter"),
+    planReasoningRequest(setting, model),
   );
 });

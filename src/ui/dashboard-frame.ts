@@ -18,6 +18,7 @@ import {
 } from "./render-frame.js";
 import { span, type Line, type Span } from "./spans.js";
 import type { Theme } from "./theme.js";
+import type { CostKnowledge } from "../types.js";
 
 export interface DashboardState {
   workspace: string;
@@ -57,6 +58,7 @@ export interface RunSnapshot {
   step: number;
   maxSteps: number;
   costUsd: number;
+  costKnowledge?: CostKnowledge;
   running: boolean;
 }
 
@@ -134,7 +136,14 @@ function headerInfo(state: DashboardState, contextPercent?: number): HeaderInfo 
   if (git) info.git = git;
   const cost = state.sessionCost.match(/-?\d+(?:[.,]\d+)?/);
   const parsed = cost ? Number(cost[0].replace(",", ".")) : Number.NaN;
-  if (Number.isFinite(parsed)) info.costUsd = parsed;
+  if (Number.isFinite(parsed)) {
+    info.costUsd = parsed;
+  } else if (/providerverwaltet|unbekannt/i.test(state.sessionCost)) {
+    // HeaderInfo has a numeric cost slot only. Keep the unknown/provider-owned
+    // label visible in the adjacent right-aligned account segment rather than
+    // silently dropping it or manufacturing $0.
+    info.balance = `${state.sessionCost} · ${state.balance}`;
+  }
   return info;
 }
 
@@ -220,7 +229,11 @@ function statusInfo(input: DashboardFrameInput): StatusInfo | undefined {
       spinning: input.run.running,
       elapsedMs: Math.max(0, now - input.run.startedAt),
       step: `Schritt ${input.run.step}/${input.run.maxSteps}`,
-      cost: `$${input.run.costUsd.toFixed(4)}`,
+      cost: input.run.costKnowledge === "unknown"
+        ? (input.run.costUsd > 0
+            ? `≥$${input.run.costUsd.toFixed(4)} · providerverwaltet`
+            : "Kosten unbekannt · providerverwaltet")
+        : `$${input.run.costUsd.toFixed(4)}`,
       lastEventAgeMs: Math.max(0, now - input.run.lastEventAt),
       cancelHint: queue || "Ctrl+C Abbruch",
     };

@@ -23,11 +23,11 @@ import {
 import { ConversationStore } from "./conversation.js";
 import {
   OpenRouterService,
-  modelsField,
-  providerField,
+  createOpenRouterModelRuntime,
   shouldEnableWebSearch,
-  webSearchPlugin,
 } from "./openrouter.js";
+import type { RouteIdentityV1 } from "./backends.js";
+import type { ModelRuntime, RuntimeModelInfo } from "./model-runtime.js";
 import { formatSecretWarning, scanForSecrets } from "./secrets.js";
 import { ProcessEventRedactor, redactText } from "./redaction.js";
 import { createRunId, RunLog } from "./runlog.js";
@@ -44,13 +44,13 @@ import {
 import type {
   AgentRunEvent,
   BalanceInfo,
-  ModelInfo,
+  CostKnowledge,
   ProcessCompletion,
   ProcessOperation,
 } from "./types.js";
 import {
   getReasoningSetting,
-  planReasoningRequest,
+  planRuntimeReasoningRequest,
 } from "./reasoning.js";
 import {
   ChangeJournal,
@@ -90,6 +90,7 @@ export interface AgentRunResult {
   costUsd: number;
   mainCostUsd: number;
   compressorCostUsd: number;
+  costKnowledge: CostKnowledge;
   compression: CompressionResult;
   selectedModel: string;
   resolvedModel: string;
@@ -144,7 +145,7 @@ export class OrcodeAgent {
   };
   #lastResolvedModel: string | null = null;
   #compressorPrice: { model: string; price: CompressorPrice | null } | null = null;
-  #mainModelInfo: { model: string; info: ModelInfo | null } | null = null;
+  #mainModelInfo: { model: string; info: RuntimeModelInfo | null } | null = null;
   // K7: the SDK's opaque conversation state, kept alive across runs on the
   // same chat so consecutive turns can resume it instead of rebuilding from
   // scratch. Reopened whenever the chat file path changes (new session, a
@@ -161,7 +162,8 @@ export class OrcodeAgent {
   readonly #readRegistry = new ReadRegistry();
 
   private constructor(
-    private readonly openRouter: OpenRouterService,
+    private readonly runtime: ModelRuntime,
+    private route: RouteIdentityV1,
     private readonly approvals: ApprovalManager,
     session: SessionStore,
     private readonly config: OrcodeConfigWithBudget,
@@ -180,7 +182,10 @@ export class OrcodeAgent {
   }
 
   static async create(options: {
-    openRouter: OpenRouterService;
+    /** Temporary compatibility path until Task 6 resolves provider runtimes. */
+    openRouter?: OpenRouterService;
+    runtime?: ModelRuntime;
+    route?: RouteIdentityV1;
     approvals: ApprovalManager;
     session: SessionStore;
     config: OrcodeConfigWithBudget;
@@ -195,8 +200,20 @@ export class OrcodeAgent {
     /** Test-only seam; production always uses `createCodingTools`. */
     codingToolsFactory?: typeof createCodingTools;
   }): Promise<OrcodeAgent> {
+    const route = immutableRuntimeRoute(
+      options.route ?? legacyOpenRouterRuntimeRoute(options.session, options.config.mainModel),
+    );
+    const runtime = options.runtime
+      ?? (options.openRouter
+        ? createOpenRouterModelRuntime(options.openRouter, options.config, route)
+        : null);
+    if (!runtime) throw new Error("Model runtime is required.");
+    if (runtime.backendId !== route.backendId) {
+      throw new Error("Model runtime does not match the selected route.");
+    }
     return new OrcodeAgent(
-      options.openRouter,
+      runtime,
+      route,
       options.approvals,
       options.session,
       options.config,
@@ -227,13 +244,21 @@ export class OrcodeAgent {
     return this.#binding.artifacts;
   }
 
-  /**
-   * Swap every chat-scoped writer atomically while retaining model caches, so
-   * switching chats does not require a fresh agent.
-   */
+  /** Swap chat-scoped writers atomically and retain only exact-route caches. */
   setSession(session: SessionStore): void {
     const next = createChatBinding(session);
+    const sessionRoute = session.data.route
+      ? immutableRuntimeRoute(session.data.route)
+      : this.route;
+    const routeChanged = !exactRuntimeRoute(sessionRoute, this.route);
     this.#binding = next;
+    this.#lastUsage = null;
+    if (routeChanged) {
+      this.route = sessionRoute;
+      this.#mainModelInfo = null;
+      this.#compressorPrice = null;
+      this.#lastResolvedModel = null;
+    }
   }
 
   /**
@@ -302,10 +327,11 @@ export class OrcodeAgent {
       type: "run-start",
       model: this.config.mainModel,
       maxSteps: this.config.maxSteps,
+      ...(this.runtime.backendId === "kimi-code" ? { costKnowledge: "unknown" as const } : {}),
       prompt,
       timestamp: startedAt,
     });
-    const stopListening = this.openRouter.onConnectionEvent((event) => {
+    const stopListening = this.runtime.onConnectionEvent((event) => {
       emitStatus(
         observer,
         formatConnectionEvent(event),
@@ -403,15 +429,30 @@ export class OrcodeAgent {
       ? `${prompt}\n\n${imageSummary}`
       : prompt;
     const notices: string[] = [];
+    // Prove the exact route before spend inspection or any other provider
+    // operation. A chat switched to another account must fail closed and make
+    // the caller rebuild its route-bound runtime.
+    const dispatch = this.runtime.dispatchFields({
+      route: this.route,
+      allowWeb: shouldEnableWebSearch(this.config.web, promptForContext),
+    });
     // The workspace budget is checked before anything is paid for — including
     // the compressor call, which happens further down.
     await this.#enforceBudget(notices, observer);
-    observer.onStatus?.("OpenRouter-Guthaben und Key-Limit prüfen");
-    const balance = await this.openRouter.checkBalance(observer.signal);
-    assertSpendAvailable(balance);
+    observer.onStatus?.("Provider-Nutzung und Limits prüfen");
+    const runtimeSpend = await this.runtime.inspectSpend(observer.signal);
+    const costKnowledge: CostKnowledge = runtimeSpend.kind === "known" ? "known" : "unknown";
+    if (runtimeSpend.kind === "known") {
+      assertSpendAvailable(runtimeSpend.balance);
+    } else {
+      const notice =
+        "Die USD-Kosten dieses providerverwalteten Modells sind unbekannt; das Lauf-Kostenlimit kann nicht erzwungen werden.";
+      notices.push(notice);
+      emitStatus(observer, notice, chalk.yellow);
+    }
     throwIfAborted(observer.signal);
 
-    const client = this.openRouter.client({ scope: "main" });
+    const client = this.runtime.createClient({ route: this.route, scope: "main" });
     // K7: opened here, before anything else touches it — same instance across
     // runs on this chat, so consecutive turns resume it instead of rebuilding.
     const conversation = await this.#conversationFor();
@@ -419,7 +460,7 @@ export class OrcodeAgent {
     // K7f: a context-budget overrun measured on the *previous* run forces a
     // compression pass now, even below the char threshold.
     const forceCompress = this.#shouldCutContext();
-    let compression = await this.#compress(observer, forceCompress);
+    let compression = await this.#compress(observer, forceCompress, costKnowledge);
     // The compressor call is already paid for even if the run is cancelled
     // later, so book and persist it right away. This write only touches the
     // cost ledger — the destructive part of compression happens after a
@@ -473,7 +514,6 @@ export class OrcodeAgent {
           ? { kind: "fresh-seed", handoff: compression.handoff }
           : { kind: "none" };
     const sessionSnapshot = this.#session.snapshotRunState();
-
     observer.onStatus?.(`${this.config.mainModel} arbeitet`);
     // K7d: `instructions` carries only what practically never changes within
     // a chat (workspace, selected model) — the cache-relevant prefix stays
@@ -489,6 +529,7 @@ export class OrcodeAgent {
       maxCostUsd: this.config.maxCostUsd,
       maxSteps: this.config.maxSteps,
       lastResolvedModel: this.#lastResolvedModel,
+      costKnowledge,
     });
     const projectNotes = projectNotesBlock(
       await loadProjectNotes(this.guard.root),
@@ -497,15 +538,21 @@ export class OrcodeAgent {
       this.config.mainModel,
       observer.signal,
     );
-    const reasoningPlan = planReasoningRequest(
+    const reasoningPlan = planRuntimeReasoningRequest(
       getReasoningSetting(this.config),
       modelInfo,
+      this.runtime.backendId,
     );
     const reasoning = reasoningPlan.request;
     if (reasoningPlan.degraded && reasoningPlan.note) {
       // A silently reinterpreted thinking setting is worse than a slower one.
       notices.push(reasoningPlan.note);
       emitStatus(observer, reasoningPlan.note, chalk.yellow);
+    }
+    if (costKnowledge === "unknown") {
+      // The provider may account for an attempted request even when no numeric
+      // usage arrives. Preserve the uncertainty across success and failure.
+      this.#session.addCost("main", 0, "unknown");
     }
     let observedCost = 0;
     // K7f: tracks the most recently measured input size of this run, so the
@@ -718,14 +765,7 @@ export class OrcodeAgent {
       notices.push(warning);
       emitStatus(observer, warning, chalk.yellow);
     }
-    const models = modelsField(
-      this.config.mainModel,
-      this.config.fallbackModels,
-    );
-    const provider = providerField(this.config.provider);
-    const plugins = shouldEnableWebSearch(this.config.web, promptForContext)
-      ? [webSearchPlugin()]
-      : undefined;
+    const plugins = dispatch.backendId === "openrouter" ? dispatch.plugins : undefined;
     if (historySource.kind === "fresh-seed") {
       conversation.reset(historySource.handoff);
     }
@@ -753,47 +793,20 @@ export class OrcodeAgent {
       pendingModelStep = null;
       announceModelStep(phaseStepOffset + 1);
       const remainingSteps = Math.max(1, this.config.maxSteps - phaseStepOffset);
-      const remainingCost = Math.max(
-        Number.EPSILON,
-        this.config.maxCostUsd - observedCost,
-      );
       let result: ReturnType<typeof client.callModel>;
       try {
-        result = client.callModel({
-          models,
-          instructions,
-          input,
-          ...(reasoning ? { reasoning } : {}),
-          ...(Object.keys(provider).length > 0 ? { provider } : {}),
-          ...(phasePlugins ? { plugins: phasePlugins } : {}),
-          tools,
-          // Every phase stays on the same chat route and cache key. The
-          // transient developer item is stripped by ConversationStore before
-          // the phase buffer can become the root's one durable commit.
-          state: conversation.accessor(transientDeveloperMessages),
-          cacheControl: { type: "ephemeral" },
-          promptCacheKey: this.#session.data.id,
-          sessionId: this.#session.data.id,
-          // The SDK enforces the remaining root budget for this phase. Global
-          // offsets below keep events and tool ids monotone across phases.
-          stopWhen: [
-            stepCountIs(remainingSteps),
-            maxCost(remainingCost),
-          ],
-          allowFinalResponse:
-            "Tool execution has stopped. Summarize the verified outcome, any remaining blocker, and the most useful next step. Do not claim unverified success.",
-          onTurnStart: ({ numberOfTurns }) => {
-            pendingModelStep = Math.max(
-              pendingModelStep ?? 0,
-              phaseStepOffset + numberOfTurns + 1,
-            );
-          },
-          hooks: {
+        const onTurnStart = ({ numberOfTurns }: { numberOfTurns: number }): void => {
+          pendingModelStep = Math.max(
+            pendingModelStep ?? 0,
+            phaseStepOffset + numberOfTurns + 1,
+          );
+        };
+        const hooks: NonNullable<Parameters<typeof client.callModel>[0]["hooks"]> = {
             Stop: [
               {
                 handler: () => {
                   stopReasons.push(
-                    observedCost >= this.config.maxCostUsd
+                    costKnowledge === "known" && observedCost >= this.config.maxCostUsd
                       ? "cost-limit"
                       : "step-limit",
                   );
@@ -809,7 +822,7 @@ export class OrcodeAgent {
                   durationMs,
                   turnNumber,
                 }) => {
-                  const callCost = usage?.cost ?? 0;
+                  const callCost = costKnowledge === "known" ? (usage?.cost ?? 0) : 0;
                   observedCost += callCost;
                   if (usage?.inputTokens) {
                     lastInputTokens = usage.inputTokens;
@@ -827,17 +840,59 @@ export class OrcodeAgent {
                     reasoningTokens: usage?.reasoningTokens ?? 0,
                     cachedTokens: usage?.cachedTokens ?? 0,
                     costUsd: callCost,
+                    costKnowledge,
                     timestamp: Date.now(),
                   });
-                  this.#session.addCost("main", callCost);
+                  this.#session.addCost("main", callCost, costKnowledge);
                 },
               },
             ],
-          },
-        }, {
-          ...(observer.signal ? { signal: observer.signal } : {}),
-          retryCodes: [...SDK_RETRY_CODES],
-        });
+          };
+        if (dispatch.backendId === "openrouter") {
+          const remainingCost = Math.max(
+            Number.EPSILON,
+            this.config.maxCostUsd - observedCost,
+          );
+          result = client.callModel({
+            models: [...dispatch.models],
+            instructions,
+            input,
+            ...(reasoning ? { reasoning } : {}),
+            ...(Object.keys(dispatch.provider).length > 0 ? { provider: dispatch.provider } : {}),
+            ...(phasePlugins ? { plugins: [...phasePlugins] } : {}),
+            tools,
+            state: conversation.accessor(transientDeveloperMessages),
+            cacheControl: { type: "ephemeral" },
+            promptCacheKey: this.#session.data.id,
+            sessionId: this.#session.data.id,
+            stopWhen: [stepCountIs(remainingSteps), maxCost(remainingCost)],
+            allowFinalResponse:
+              "Tool execution has stopped. Summarize the verified outcome, any remaining blocker, and the most useful next step. Do not claim unverified success.",
+            onTurnStart,
+            hooks,
+          }, {
+            ...(observer.signal ? { signal: observer.signal } : {}),
+            retryCodes: [...SDK_RETRY_CODES],
+          });
+        } else {
+          result = client.callModel({
+            model: dispatch.model,
+            instructions,
+            input,
+            ...(reasoning ? { reasoning } : {}),
+            tools,
+            state: conversation.accessor(transientDeveloperMessages),
+            promptCacheKey: this.#session.data.id,
+            stopWhen: [stepCountIs(remainingSteps)],
+            allowFinalResponse:
+              "Tool execution has stopped. Summarize the verified outcome, any remaining blocker, and the most useful next step. Do not claim unverified success.",
+            onTurnStart,
+            hooks,
+          }, {
+            ...(observer.signal ? { signal: observer.signal } : {}),
+            retryCodes: [...SDK_RETRY_CODES],
+          });
+        }
       } catch (error) {
         return { failure: error, suggestions: [] };
       }
@@ -892,7 +947,7 @@ export class OrcodeAgent {
         if (!answer.visibleText) {
           phaseFailure = reasoningStreamError;
         } else {
-          const notice = `Der Reasoning-Stream ist abgebrochen (${this.openRouter.safeMessage(reasoningStreamError)}); die Antwort selbst ist vollständig.`;
+          const notice = `Der Reasoning-Stream ist abgebrochen (${this.runtime.safeMessage(reasoningStreamError)}); die Antwort selbst ist vollständig.`;
           notices.push(notice);
           emitStatus(observer, notice, chalk.yellow);
         }
@@ -906,16 +961,16 @@ export class OrcodeAgent {
           if (!answer.visibleText) {
             phaseFailure = error;
           } else {
-            const notice = `Die Abschlussdaten des Laufs fehlen (${this.openRouter.safeMessage(error)}); die Antwort selbst ist vollständig.`;
+            const notice = `Die Abschlussdaten des Laufs fehlen (${this.runtime.safeMessage(error)}); die Antwort selbst ist vollständig.`;
             notices.push(notice);
             emitStatus(observer, notice, chalk.yellow);
           }
         }
       }
-      const responseCost = response?.usage?.cost ?? 0;
+      const responseCost = costKnowledge === "known" ? (response?.usage?.cost ?? 0) : 0;
       if (observedCost === costBeforePhase && responseCost > 0) {
         observedCost += responseCost;
-        this.#session.addCost("main", responseCost);
+        this.#session.addCost("main", responseCost, costKnowledge);
       }
       if (response?.model) {
         resolvedModel = response.model;
@@ -982,7 +1037,7 @@ export class OrcodeAgent {
             verification.status !== "failed" ||
             repairs >= this.config.verify.maxRepairRounds ||
             modelStep >= this.config.maxSteps ||
-            observedCost >= this.config.maxCostUsd
+            (costKnowledge === "known" && observedCost >= this.config.maxCostUsd)
           ) {
             outcome = "unverified";
             break;
@@ -1070,6 +1125,8 @@ export class OrcodeAgent {
         if (
           this.#session.data.costs.totalUsd >
           sessionSnapshot.data.costs.totalUsd
+          || (this.#session.data.costs.costKnowledge === "unknown"
+            && sessionSnapshot.data.costs.costKnowledge !== "unknown")
         ) {
           await this.#session.save().catch(() => {});
         }
@@ -1086,7 +1143,7 @@ export class OrcodeAgent {
           await conversation.commit(this.#session.data.turns.length);
         } catch (error) {
           conversation.invalidate();
-          const notice = `SDK-Kontext konnte nicht gespeichert werden; der nächste Lauf baut den vollständigen Verlauf neu auf: ${this.openRouter.safeMessage(error)}`;
+          const notice = `SDK-Kontext konnte nicht gespeichert werden; der nächste Lauf baut den vollständigen Verlauf neu auf: ${this.runtime.safeMessage(error)}`;
           notices.push(notice);
           emitStatus(observer, notice, chalk.yellow);
         }
@@ -1097,6 +1154,8 @@ export class OrcodeAgent {
       if (
         this.#session.data.costs.totalUsd >
         sessionSnapshot.data.costs.totalUsd
+        || (this.#session.data.costs.costKnowledge === "unknown"
+          && sessionSnapshot.data.costs.costKnowledge !== "unknown")
       ) {
         await this.#session.save().catch(() => {});
       }
@@ -1113,6 +1172,7 @@ export class OrcodeAgent {
       costUsd: mainCostUsd + compression.costUsd,
       mainCostUsd,
       compressorCostUsd: compression.costUsd,
+      costKnowledge,
       compression,
       selectedModel: this.config.mainModel,
       resolvedModel,
@@ -1147,29 +1207,34 @@ export class OrcodeAgent {
       return;
     }
     const verdict = evaluateBudget(this.config.budget, spend);
-    if (!verdict.exceeded || !verdict.message) {
-      return;
+    if (verdict.exceeded && verdict.message) {
+      if (verdict.action === "block") {
+        throw new Error(
+          `${verdict.message} Der Lauf wurde nicht gestartet. Passe das Budget mit /budget an.`,
+        );
+      }
+      notices.push(verdict.message);
+      emitStatus(observer, verdict.message, chalk.yellow);
     }
-    if (verdict.action === "block") {
-      throw new Error(
-        `${verdict.message} Der Lauf wurde nicht gestartet. Passe das Budget mit /budget an.`,
-      );
+    if (spend.costKnowledge === "unknown") {
+      const notice =
+        "Das Workspace-USD-Budget ist wegen providerverwalteter unbekannter Kosten nicht vollständig erzwingbar.";
+      notices.push(notice);
+      emitStatus(observer, notice, chalk.yellow);
     }
-    notices.push(verdict.message);
-    emitStatus(observer, verdict.message, chalk.yellow);
   }
 
   /** Model metadata for the main route; cached, never fatal. */
   async #mainModelInfoFor(
     modelId: string,
     signal?: AbortSignal,
-  ): Promise<ModelInfo | null> {
+  ): Promise<RuntimeModelInfo | null> {
     if (this.#mainModelInfo?.model === modelId) {
       return this.#mainModelInfo.info;
     }
-    let info: ModelInfo | null = null;
+    let info: RuntimeModelInfo | null = null;
     try {
-      const models = await this.openRouter.listModels(modelId, false, signal);
+      const models = await this.runtime.listModels(modelId, signal);
       info = models.find((candidate) => candidate.id === modelId) ?? null;
     } catch {
       info = null;
@@ -1195,14 +1260,18 @@ export class OrcodeAgent {
   async #compress(
     observer: AgentRunObserver,
     force = false,
+    costKnowledge: CostKnowledge = "known",
   ): Promise<CompressionResult> {
     try {
       return await compressContext({
         // A separate scope keeps the compressor's reconnect counter apart from
         // the main run's and labels the connection events accordingly.
-        client: this.openRouter.client({ scope: "compressor" }),
+        ...(costKnowledge === "known"
+          ? { client: this.runtime.createClient({ route: this.route, scope: "compressor" }) }
+          : {}),
         config: this.config,
         session: this.#session,
+        costKnowledge,
         ...(observer.signal ? { signal: observer.signal } : {}),
         lookupPrice: (model, signal) => this.#compressorPriceFor(model, signal),
         force,
@@ -1213,8 +1282,9 @@ export class OrcodeAgent {
         uncompressedContext(this.#session),
         "failed",
         [
-          `Kompressor fehlgeschlagen; unkomprimierter Kontext wird verwendet: ${this.openRouter.safeMessage(error)}`,
+          `Kompressor fehlgeschlagen; unkomprimierter Kontext wird verwendet: ${this.runtime.safeMessage(error)}`,
         ],
+        costKnowledge,
       );
     }
   }
@@ -1228,12 +1298,12 @@ export class OrcodeAgent {
     }
     let price: CompressorPrice | null = null;
     try {
-      const models = await this.openRouter.listModels(model, false, signal);
+      const models = await this.runtime.listModels(model, signal);
       const match = models.find((candidate) => candidate.id === model);
-      if (match && match.promptPrice >= 0 && match.completionPrice >= 0) {
+      if (match?.price.kind === "known") {
         price = {
-          promptUsdPerToken: match.promptPrice,
-          completionUsdPerToken: match.completionPrice,
+          promptUsdPerToken: match.price.promptUsdPerToken,
+          completionUsdPerToken: match.price.completionUsdPerToken,
         };
       }
     } catch {
@@ -1244,6 +1314,55 @@ export class OrcodeAgent {
     this.#compressorPrice = { model, price };
     return price;
   }
+}
+
+function legacyOpenRouterRuntimeRoute(
+  session: SessionStore,
+  modelId: string,
+): RouteIdentityV1 {
+  const persisted = session.data.route;
+  if (persisted?.backendId === "openrouter") {
+    return Object.freeze({
+      version: persisted.version,
+      backendId: persisted.backendId,
+      accountFingerprint: persisted.accountFingerprint,
+      billingRealm: persisted.billingRealm,
+      requestedModelId: persisted.requestedModelId,
+      canonicalModelId: persisted.canonicalModelId,
+      resolutionState: persisted.resolutionState,
+    });
+  }
+  return Object.freeze({
+    version: 1,
+    backendId: "openrouter",
+    accountFingerprint: "legacy-openrouter-runtime",
+    billingRealm: "openrouter-payg",
+    requestedModelId: modelId,
+    canonicalModelId: modelId,
+    resolutionState: "legacy-unverified",
+  });
+}
+
+function immutableRuntimeRoute(route: RouteIdentityV1): RouteIdentityV1 {
+  return Object.freeze({
+    version: route.version,
+    backendId: route.backendId,
+    accountFingerprint: route.accountFingerprint,
+    billingRealm: route.billingRealm,
+    requestedModelId: route.requestedModelId,
+    canonicalModelId: route.canonicalModelId,
+    resolutionState: route.resolutionState,
+  });
+}
+
+function exactRuntimeRoute(left: RouteIdentityV1, right: RouteIdentityV1): boolean {
+  return left.version === right.version
+    && left.backendId === right.backendId
+    && left.accountFingerprint === right.accountFingerprint
+    && left.billingRealm === right.billingRealm
+    && left.requestedModelId === right.requestedModelId
+    && left.canonicalModelId === right.canonicalModelId
+    && left.resolutionState === right.resolutionState;
 }
 
 function createChatBinding(session: SessionStore): {
@@ -1530,6 +1649,7 @@ export interface RunLimitsOptions {
   maxCostUsd: number;
   maxSteps: number;
   lastResolvedModel: string | null;
+  costKnowledge?: CostKnowledge;
 }
 
 /**
@@ -1540,7 +1660,9 @@ export interface RunLimitsOptions {
  */
 export function buildRunLimitsMessage(options: RunLimitsOptions): string {
   return [
-    `RUN LIMITS: approval mode ${options.approvalMode}, at most ${options.maxSteps} model steps, $${options.maxCostUsd.toFixed(4)} for the main model.`,
+    options.costKnowledge === "unknown"
+      ? `RUN LIMITS: approval mode ${options.approvalMode}, at most ${options.maxSteps} model steps. Main-model USD cost is provider-managed and unknown, so no USD stop can be enforced.`
+      : `RUN LIMITS: approval mode ${options.approvalMode}, at most ${options.maxSteps} model steps, $${options.maxCostUsd.toFixed(4)} for the main model.`,
     options.lastResolvedModel
       ? `The previous turn resolved to "${options.lastResolvedModel}". This is historical context, not proof of the current turn's upstream route.`
       : "",

@@ -1141,6 +1141,36 @@ test("chat open proves a foreign exact route before config, session, agent, or c
   assert.equal(await readFile(current.path, "utf8"), currentBytes);
 });
 
+test("chat, search, session, and checkpoint commands never render unknown Kimi cost as zero", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "routercode-command-unknown-cost-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const workspace = join(root, "project");
+  const appHome = join(root, ".orcode");
+  const session = SessionStore.create(workspace, appHome, "Kimi unknown");
+  session.addTurn("user", "needle unknown provider cost");
+  session.addCost("main", 0, "unknown");
+  session.createCheckpoint("Kimi checkpoint");
+  await session.save();
+  const output: string[] = [];
+  const context = {
+    workspace,
+    session,
+    config: structuredClone(DEFAULT_CONFIG),
+    out: {
+      text: (value: string) => output.push(value),
+      error: (value: string) => output.push(value),
+    },
+  } as unknown as CommandContext;
+
+  for (const command of ["/cost", "/budget", "/chat list", "/chat search needle", "/checkpoint list"]) {
+    output.length = 0;
+    await handleSlashCommand(command, context);
+    const rendered = output.join("\n");
+    assert.match(rendered, /providerverwaltet|unbekannt/i, command);
+    assert.doesNotMatch(rendered, /kostenlos|\$0(?:\.0+)?\b|0(?:,0+)?\s*\$/i, command);
+  }
+});
+
 test("chat deletion asks exactly once; decline changes nothing and accept deletes the selected chat", async () => {
   const root = await mkdtemp(join(tmpdir(), "routercode-command-delete-"));
   const workspace = join(root, "project");

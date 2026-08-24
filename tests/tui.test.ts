@@ -935,6 +935,61 @@ test("a running tool shows exactly one spinner, phase, step and cost", () => {
   assert.match(screen, /npm run check/);
 });
 
+test("a running Kimi task renders provider-managed cost instead of a zero-dollar value", () => {
+  const frame = buildDashboardFrame(
+    input({
+      mode: "busy",
+      now: NOW + 1_000,
+      state: { ...state, sessionCost: "providerverwaltet / unbekannt" },
+      run: {
+        phase: "Modell arbeitet",
+        startedAt: NOW,
+        lastEventAt: NOW,
+        step: 1,
+        maxSteps: 12,
+        costUsd: 0,
+        costKnowledge: "unknown",
+        running: true,
+      },
+    }),
+  );
+  const screen = text(frame.lines);
+  assert.match(screen, /providerverwaltet|unbekannt/i);
+  assert.doesNotMatch(screen, /kostenlos|\$0(?:\.0+)?\b|0(?:,0+)?\s*\$/i);
+});
+
+test("an idle Kimi session keeps provider-managed cost visible in the dashboard header", () => {
+  const frame = buildDashboardFrame(input({
+    width: 160,
+    state: { ...state, sessionCost: "providerverwaltet / unbekannt" },
+  }));
+  const header = plainText(frame.lines[0]!);
+  assert.match(header, /providerverwaltet|unbekannt/i);
+  assert.doesNotMatch(header, /kostenlos|\$0(?:\.0+)?\b|0(?:,0+)?\s*\$/i);
+});
+
+test("Kimi run-start marks live TUI cost unknown before the first model-end", () => {
+  const stdin = new FakeInput();
+  const stdout = new FakeOutput();
+  const terminal = ui(stdin, stdout);
+  terminal.start();
+  try {
+    terminal.handleRunEvent({
+      type: "run-start",
+      model: "k3",
+      maxSteps: 12,
+      prompt: "hello",
+      costKnowledge: "unknown",
+      timestamp: NOW,
+    });
+    const statusLine = plainText(terminal.frame().lines.at(-2)!);
+    assert.match(statusLine, /providerverwaltet|unbekannt/i);
+    assert.doesNotMatch(statusLine, /kostenlos|\$0(?:\.0+)?\b|0(?:,0+)?\s*\$/i);
+  } finally {
+    terminal.stop();
+  }
+});
+
 test("secret entry never renders the actual API key", () => {
   const secret = `${["sk", "or", "v1"].join("-")}-this-must-never-be-rendered`;
   const frame = buildDashboardFrame(

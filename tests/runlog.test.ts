@@ -789,6 +789,35 @@ test("read accepts versioned and legacy events while isolating future versions",
   assert.deepEqual(read, [legacy, modern, terminal]);
 });
 
+test("model-end unknown cost knowledge survives the versioned run-log envelope", async () => {
+  const home = await appHome("unknown-cost");
+  const chatId = "chat-unknown-cost";
+  const runId = createRunId();
+  const log = await RunLog.open(home, chatId, runId);
+  const event: AgentRunEvent = {
+    type: "model-end",
+    model: "k3",
+    step: 1,
+    durationMs: 50,
+    inputTokens: 12,
+    outputTokens: 4,
+    reasoningTokens: 2,
+    cachedTokens: 0,
+    costUsd: 0,
+    costKnowledge: "unknown",
+    timestamp: 20,
+  };
+  log.write(event);
+  await log.close();
+
+  const read: AgentRunEvent[] = [];
+  for await (const persisted of RunLog.read(home, chatId, runId)) read.push(persisted);
+  assert.deepEqual(read, [event]);
+  const raw = await readFile(runLogPath(home, chatId, runId), "utf8");
+  assert.match(raw, /"costKnowledge":"unknown"/);
+  assert.doesNotMatch(raw, /kostenlos|free/i);
+});
+
 test("resume reads a mixed legacy and envelope log without losing timing or cost", async () => {
   const home = await appHome("resume-mixed");
   const chatId = "chat-resume-mixed";

@@ -14,6 +14,7 @@ import {
   projectNotesBlock,
   shouldCutContext,
 } from "../src/agent.js";
+import type { RouteIdentityV1 } from "../src/backends.js";
 import { ApprovalManager } from "../src/approval.js";
 import {
   DEFAULT_CONFIG,
@@ -21,6 +22,7 @@ import {
 } from "../src/config.js";
 import { ConversationStore } from "../src/conversation.js";
 import { OpenRouterService } from "../src/openrouter.js";
+import type { ModelRuntime } from "../src/model-runtime.js";
 import { RunLog, runLogPath } from "../src/runlog.js";
 import { SessionStore } from "../src/session.js";
 import { createSshSession } from "../src/ssh.js";
@@ -45,6 +47,16 @@ const healthy = {
     remaining: 16,
   },
 };
+
+const KIMI_RUNTIME_ROUTE: RouteIdentityV1 = Object.freeze({
+  version: 1,
+  backendId: "kimi-code",
+  accountFingerprint: "acct_kimi_agent_fixture",
+  billingRealm: "kimi-code-membership-provider-managed-overage",
+  requestedModelId: "k3",
+  canonicalModelId: "k3",
+  resolutionState: "resolved",
+});
 
 test("spend gate accepts available balance", () => {
   assert.doesNotThrow(() => assertSpendAvailable(healthy));
@@ -240,6 +252,173 @@ test("a successful run persists the turn, books the cost once, and reports the o
   );
   assert.equal(persisted.data.turns.length, 2);
   assert.equal(persisted.data.costs.totalUsd, result.costUsd);
+});
+
+test("a Kimi runtime owns the exact route, skips unknown compressor spend, and never fabricates zero cost", async () => {
+  const setup = await createAgent({
+    mainModel: "k3",
+    compressorModel: "k3",
+    compressionMode: "always",
+    web: "on",
+    maxCostUsd: 0.01,
+  });
+  for (let index = 0; index < 6; index += 1) {
+    setup.session.addTurn(index % 2 === 0 ? "user" : "assistant", `Kimi history ${index}`);
+  }
+  await setup.session.save();
+  const fake = fakeClient(() => ({
+    text: ["Kimi fertig."],
+    before: async (emit) => emit.modelCall(0, 0),
+    response: { model: "k3", usage: {} },
+  }));
+  const scopes: string[] = [];
+  const runtime: ModelRuntime = {
+    backendId: "kimi-code",
+    onConnectionEvent: () => () => {},
+    createClient(request) {
+      assert.deepEqual(request.route, KIMI_RUNTIME_ROUTE);
+      scopes.push(request.scope);
+      return fake.client as never;
+    },
+    async inspectSpend() {
+      return { kind: "unknown" };
+    },
+    async listModels(modelId) {
+      assert.equal(modelId, "k3");
+      return [{
+        id: "k3",
+        name: "Kimi K3",
+        contextLength: 262_144,
+        reasoning: {
+          defaultEffort: "high",
+          defaultEnabled: true,
+          mandatory: true,
+          supportedEfforts: ["low", "high", "max"],
+          supportsMaxTokens: false,
+        },
+        price: { kind: "unknown" },
+      }];
+    },
+    dispatchFields({ route, allowWeb }) {
+      assert.deepEqual(route, KIMI_RUNTIME_ROUTE);
+      assert.equal(allowWeb, true);
+      return { backendId: "kimi-code", model: "k3" };
+    },
+    safeMessage() {
+      return "Kimi-Anfrage fehlgeschlagen.";
+    },
+  };
+  const agent = await OrcodeAgent.create({
+    runtime,
+    route: KIMI_RUNTIME_ROUTE,
+    approvals: new ApprovalManager("read-only"),
+    session: setup.session,
+    config: setup.config,
+    workspace: setup.workspace,
+  });
+  const events: AgentRunEvent[] = [];
+
+  const result = await agent.run("Bitte mit Kimi erledigen", {
+    onText: () => {},
+    onEvent: (event) => events.push(event),
+  });
+
+  assert.deepEqual(scopes, ["main"], "unknown Kimi compressor cost must skip before client creation");
+  assert.equal(fake.requests.length, 1);
+  const request = fake.requests[0]!;
+  assert.equal(request.model, "k3");
+  assert.equal("models" in request, false);
+  assert.equal("provider" in request, false);
+  assert.equal("plugins" in request, false);
+  assert.equal("cacheControl" in request, false);
+  assert.equal("sessionId" in request, false);
+  assert.equal(request.promptCacheKey, setup.session.data.id);
+  assert.equal(request.stopWhen?.length, 1, "Kimi must keep the step cap but omit maxCost");
+  assert.equal(result.costKnowledge, "unknown");
+  assert.equal(result.costUsd, 0);
+  assert.equal(result.compression.skipReason, "cost-unknown");
+  assert.equal(result.compression.costKnowledge, "unknown");
+  assert.match(result.notices.join("\n"), /providerverwaltet|unbekannt/i);
+  const runStart = events.find((event) => event.type === "run-start");
+  assert.equal(runStart?.type === "run-start" ? runStart.costKnowledge : null, "unknown");
+  const modelEnd = events.find((event) => event.type === "model-end");
+  assert.equal(modelEnd?.type === "model-end" ? modelEnd.costKnowledge : null, "unknown");
+  assert.equal(setup.session.data.costs.costKnowledge, "unknown");
+  assert.equal(setup.session.data.costs.totalUsd, 0);
+});
+
+test("a session route change clears route-scoped caches and fails closed before foreign runtime spend", async () => {
+  const setup = await createAgent({ mainModel: "k3", compressorModel: "k3" });
+  setup.session.setPreferences("k3", { mode: "auto" }, KIMI_RUNTIME_ROUTE);
+  await setup.session.save();
+  const fake = fakeClient(() => ({
+    text: ["Kimi fertig."],
+    before: async (emit) => emit.modelCall(0, 0),
+    response: { model: "k3", usage: {} },
+  }));
+  let spendCalls = 0;
+  let modelListCalls = 0;
+  const sameRoute = (route: RouteIdentityV1): boolean =>
+    JSON.stringify(route) === JSON.stringify(KIMI_RUNTIME_ROUTE);
+  const runtime: ModelRuntime = {
+    backendId: "kimi-code",
+    onConnectionEvent: () => () => {},
+    createClient({ route }) {
+      if (!sameRoute(route)) throw new Error("runtime route binding changed");
+      return fake.client as never;
+    },
+    async inspectSpend() {
+      spendCalls += 1;
+      return { kind: "unknown" };
+    },
+    async listModels() {
+      modelListCalls += 1;
+      return [{
+        id: "k3",
+        name: "Kimi K3",
+        contextLength: 262_144,
+        reasoning: {
+          defaultEffort: "high",
+          defaultEnabled: true,
+          mandatory: true,
+          supportedEfforts: ["low", "high", "max"],
+          supportsMaxTokens: false,
+        },
+        price: { kind: "unknown" },
+      }];
+    },
+    dispatchFields({ route }) {
+      if (!sameRoute(route)) throw new Error("runtime route binding changed");
+      return { backendId: "kimi-code", model: "k3" };
+    },
+    safeMessage: () => "safe",
+  };
+  const agent = await OrcodeAgent.create({
+    runtime,
+    route: KIMI_RUNTIME_ROUTE,
+    approvals: new ApprovalManager("read-only"),
+    session: setup.session,
+    config: setup.config,
+    workspace: setup.workspace,
+  });
+  await agent.run("first", { onText: () => {} });
+  assert.equal(modelListCalls, 1);
+  assert.equal(spendCalls, 1);
+
+  const foreign = SessionStore.create(setup.workspace, setup.appHome, "Foreign route");
+  foreign.setPreferences("k3", { mode: "auto" }, {
+    ...KIMI_RUNTIME_ROUTE,
+    accountFingerprint: "acct_kimi_foreign",
+  });
+  agent.setSession(foreign);
+  await assert.rejects(agent.run("must not dispatch", { onText: () => {} }), /route binding changed/);
+  assert.equal(spendCalls, 1, "foreign route must fail before provider spend inspection");
+
+  const rebound = SessionStore.create(setup.workspace, setup.appHome, "Original route again");
+  rebound.setPreferences("k3", { mode: "auto" }, KIMI_RUNTIME_ROUTE);
+  agent.setSession(rebound);
+  await agent.run("third", { onText: () => {} });
+  assert.equal(modelListCalls, 2, "an intervening route change must evict model metadata");
 });
 
 test("the main model call binds routing, reasoning, web search, identifiers, and cost once", async () => {
@@ -1019,6 +1198,27 @@ test("a blocking workspace budget stops the run before anything is paid for", as
     client.requests.length,
     0,
     "es darf kein Modellaufruf stattgefunden haben",
+  );
+});
+
+test("a known over-budget lower bound still blocks when provider-managed cost is also unknown", async () => {
+  const setup = await createAgent({
+    budget: { dailyLimitUsd: 0.1, totalLimitUsd: null, onExceed: "block" },
+  });
+  setup.session.addCost("main", 0.5, "known");
+  setup.session.addCost("main", 0, "unknown");
+  await setup.session.save();
+  const client = fakeClient(() => ({ text: ["darf nicht passieren"] }));
+  const agent = await setup.agent(client.client);
+
+  await assert.rejects(
+    agent.run("Analysiere", { onText: () => {} }),
+    /Tagesbudget/,
+  );
+  assert.equal(
+    client.requests.length,
+    0,
+    "the known minimum must block before a request even when the total remains unknown",
   );
 });
 
@@ -2430,6 +2630,8 @@ interface FakeRequest {
   reasoning?: unknown;
   plugins?: Array<{ id: string; maxResults?: number }>;
   tools?: readonly unknown[];
+  maxOutputTokens?: number;
+  stopWhen?: readonly unknown[];
   state?: FakeStateAccessor;
   cacheControl?: unknown;
   promptCacheKey?: string;

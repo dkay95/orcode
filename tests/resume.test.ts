@@ -315,6 +315,7 @@ test("buildResumePrompt omits sections the summary has no data for, never fabric
     tools: [],
     filesChanged: [],
     costUsd: 0,
+    costKnowledge: "known",
     answerCharsSoFar: 0,
     partialAnswerText: "",
     brokeOffAt: "vor dem ersten aufgezeichneten Ereignis",
@@ -344,6 +345,49 @@ test("formatInterruptedRunNotice reports time, task, file count, and cost, and f
   assert.match(notice, /\$0\.003/);
   assert.match(notice, /extern verändert/);
   assert.match(notice, /a\.ts/);
+});
+
+test("resume summaries preserve unknown provider-managed cost without rendering it as free", () => {
+  const summary = summarizeRun([
+    { type: "run-start", model: "k3", maxSteps: 40, prompt: "Weiter", timestamp: 1 },
+    {
+      type: "model-end",
+      model: "k3",
+      step: 1,
+      durationMs: 10,
+      inputTokens: 10,
+      outputTokens: 5,
+      reasoningTokens: 2,
+      cachedTokens: 0,
+      costUsd: 0,
+      costKnowledge: "unknown",
+      timestamp: 2,
+    },
+  ]);
+  assert.equal(summary.costKnowledge, "unknown");
+  assert.equal(summary.costUsd, 0);
+  for (const text of [buildResumePrompt(summary), formatInterruptedRunNotice(summary, [])]) {
+    assert.match(text, /providerverwaltet|unbekannt/i);
+    assert.doesNotMatch(text, /kostenlos|\$0(?:\.0+)?\b|0(?:,0+)?\s*\$/i);
+  }
+});
+
+test("a Kimi run interrupted before its first model-end remains unknown from run-start alone", () => {
+  const summary = summarizeRun([
+    {
+      type: "run-start",
+      model: "k3",
+      maxSteps: 40,
+      prompt: "Weiter",
+      costKnowledge: "unknown",
+      timestamp: 1,
+    },
+  ]);
+  assert.equal(summary.costKnowledge, "unknown");
+  for (const text of [buildResumePrompt(summary), formatInterruptedRunNotice(summary, [])]) {
+    assert.match(text, /providerverwaltet|unbekannt/i);
+    assert.doesNotMatch(text, /kostenlos|\$0(?:\.0+)?\b|0(?:,0+)?\s*\$/i);
+  }
 });
 
 // ---------------------------------------------------------------------------

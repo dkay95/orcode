@@ -9,7 +9,7 @@ import {
   type UndoRunOutcome,
   type WorkspaceGuard,
 } from "./workspace.js";
-import type { AgentRunEvent } from "./types.js";
+import type { AgentRunEvent, CostKnowledge } from "./types.js";
 import { formatUsd, hasCode, isRecord, truncate } from "./utils.js";
 
 /**
@@ -162,6 +162,7 @@ export interface RunSummary {
   filesChanged: string[];
   /** Sum of every `model-end` event's cost — the compressor's own cost is not logged as an event and is not included. */
   costUsd: number;
+  costKnowledge: CostKnowledge;
   /** How many characters of the final answer had already streamed before the log broke off. */
   answerCharsSoFar: number;
   /** The partial answer text itself, capped to a sane length for display/reuse. */
@@ -182,6 +183,7 @@ export function summarizeRun(events: readonly AgentRunEvent[]): RunSummary {
   let startedAt: number | null = null;
   let prompt: string | null = null;
   let costUsd = 0;
+  let costKnowledge: CostKnowledge = "known";
   let answerText = "";
   const tools = new Map<string, ToolCallSummary>();
   const filesChanged = new Set<string>();
@@ -195,9 +197,11 @@ export function summarizeRun(events: readonly AgentRunEvent[]): RunSummary {
         if (event.prompt) {
           prompt = event.prompt;
         }
+        if (event.costKnowledge === "unknown") costKnowledge = "unknown";
         break;
       case "model-end":
         costUsd += event.costUsd;
+        if (event.costKnowledge === "unknown") costKnowledge = "unknown";
         break;
       case "text":
         answerText += event.delta;
@@ -252,6 +256,7 @@ export function summarizeRun(events: readonly AgentRunEvent[]): RunSummary {
     tools: [...tools.values()],
     filesChanged: [...filesChanged].sort(),
     costUsd,
+    costKnowledge,
     answerCharsSoFar: answerText.length,
     partialAnswerText: truncate(answerText, PARTIAL_ANSWER_CAP),
     brokeOffAt: describeBrokeOffAt(events.at(-1)),
@@ -347,7 +352,9 @@ export function buildResumePrompt(summary: RunSummary): string {
     );
   }
 
-  if (summary.costUsd > 0) {
+  if (summary.costKnowledge === "unknown") {
+    lines.push("", `Bereits angefallene Kosten (Hauptmodell): ${unknownRunCost(summary.costUsd)}`);
+  } else if (summary.costUsd > 0) {
     lines.push("", `Bereits angefallene Kosten (Hauptmodell): ${formatUsd(summary.costUsd)}`);
   }
 
@@ -394,7 +401,9 @@ export function formatInterruptedRunNotice(
       }`,
     );
   }
-  if (summary.costUsd > 0) {
+  if (summary.costKnowledge === "unknown") {
+    lines.push(`Kosten dieses Laufs: ${unknownRunCost(summary.costUsd)}`);
+  } else if (summary.costUsd > 0) {
     lines.push(`Kosten dieses Laufs: ${formatUsd(summary.costUsd)}`);
   }
   const drifted = fileDrift.filter((entry) => entry.status !== "matches");
@@ -406,6 +415,12 @@ export function formatInterruptedRunNotice(
     );
   }
   return lines.join("\n");
+}
+
+function unknownRunCost(knownAmount: number): string {
+  return knownAmount > 0
+    ? `mindestens ${formatUsd(knownAmount)}; weitere providerverwaltete Kosten sind unbekannt`
+    : "providerverwaltet / unbekannt";
 }
 
 function driftLabel(status: FileDriftEntry["status"]): string {

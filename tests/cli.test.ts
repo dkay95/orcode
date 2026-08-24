@@ -13,6 +13,8 @@ import {
   createCliPlainSetupSurface,
   createOpenRouterServiceForStartup,
   executeProviderModelAction,
+  formatChatCost,
+  formatRunCost,
   homeWorkspaceWarning,
   initializeDashboardKey,
   initializeStartupStorage,
@@ -24,6 +26,7 @@ import {
   resolveCliCommandName,
   runOutcomeExitCode,
 } from "../src/cli.js";
+import type { AgentRunResult } from "../src/agent.js";
 import * as cliModule from "../src/cli.js";
 import { createPlainSetupSurface } from "../src/setup-ui.js";
 import type { SetupSurface } from "../src/setup-ui.js";
@@ -7993,6 +7996,27 @@ test("runOutcomeExitCode maps the documented five codes (K8)", () => {
   // Forward-compatible with A4's future "unverified" outcome (exit 3) even
   // though `AgentRunOutcome` does not carry that member yet.
   assert.equal(runOutcomeExitCode("unverified" as never), 3);
+});
+
+test("CLI run-cost formatting never presents unknown Kimi membership spend as free", () => {
+  const result = {
+    costKnowledge: "unknown",
+    costUsd: 0,
+    mainCostUsd: 0,
+    compressorCostUsd: 0,
+  } as AgentRunResult;
+  const formatted = formatRunCost(result);
+  assert.match(formatted, /providerverwaltet|unbekannt/i);
+  assert.doesNotMatch(formatted, /kostenlos|\$0(?:\.0+)?\b|0(?:,0+)?\s*\$/i);
+});
+
+test("CLI chat-list cost formatting preserves unknown provider-managed session spend", () => {
+  const formatted = formatChatCost({
+    costUsd: 0,
+    costKnowledge: "unknown",
+  });
+  assert.match(formatted, /providerverwaltet|unbekannt/i);
+  assert.doesNotMatch(formatted, /kostenlos|\$0(?:\.0+)?\b|0(?:,0+)?\s*\$/i);
 });
 
 test("tracked TypeScript source contains no embedded NUL bytes", () => {
