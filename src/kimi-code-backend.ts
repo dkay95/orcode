@@ -647,24 +647,26 @@ export class KimiCodeBackendAdapter implements BackendAdapter {
     deadlineAt: number,
     previous: ActiveInspectionMetadata | null,
   ): InspectedMetadata {
+    const observedAt = this.#readNow();
     if (
       failure.code === "kimi-code-model-unavailable"
       && failure.unavailableModelId
       && previous
       && previous.accountFingerprint === accountFingerprint
+      && previous.deadlineAt > observedAt
       && this.#isGenerationCurrent(connectionId, generation)
     ) {
       const models = Object.freeze(previous.models.filter(
         (model) => model.canonicalModelId !== failure.unavailableModelId,
       ));
       if (models.length > 0) {
-        const health = healthy(this.#readNow(), generation);
+        const health = healthy(observedAt, generation);
         const metadata = Object.freeze({
           connectionId,
           accountFingerprint,
           models,
           generation,
-          deadlineAt,
+          deadlineAt: Math.min(previous.deadlineAt, deadlineAt),
           health,
         });
         return {
@@ -684,7 +686,7 @@ export class KimiCodeBackendAdapter implements BackendAdapter {
       }
     }
 
-    const health = healthFromFailure(failure, this.#readNow(), generation);
+    const health = healthFromFailure(failure, observedAt, generation);
     return {
       inspection: {
         backendId: "kimi-code",
