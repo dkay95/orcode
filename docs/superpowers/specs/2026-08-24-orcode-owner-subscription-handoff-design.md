@@ -77,7 +77,7 @@ The reviewed public documentation supports these individual seams:
   documents API keys and optional Organization and Project routing headers.
   API usage is attributed to that API organization/project route, not to a
   ChatGPT subscription profile.
-- [OpenAI's Europe Terms of Use](https://openai.com/policies/terms-of-use/)
+- [OpenAI's Europe Terms of Use](https://openai.com/policies/eu-terms-of-use/)
   prohibit sharing account credentials or making an account available to
   somebody else and prohibit circumventing rate limits, restrictions, or
   protective measures. Those rules make collaborator isolation mandatory and
@@ -1675,5 +1675,5 @@ This specification intentionally leaves no implementation-driving TBD:
   reviewed 2026-08-24.
 - OpenAI, [API reference overview](https://developers.openai.com/api/reference/overview),
   reviewed 2026-08-24.
-- OpenAI, [Europe Terms of Use](https://openai.com/policies/terms-of-use/),
+- OpenAI, [Europe Terms of Use](https://openai.com/policies/eu-terms-of-use/),
   updated 2026-01-16 and reviewed 2026-08-24.
