@@ -1197,6 +1197,7 @@ test("candidate activation delegates once and emits only privacy-safe normalized
     expectedRequestedModelId: "vendor/chosen",
     selectedCanonicalModelId: "vendor/canonical",
     signal: new AbortController().signal,
+    deadlineAt: Number.MAX_SAFE_INTEGER,
     persistence: "persisted",
   });
 
@@ -1242,6 +1243,7 @@ test("concurrent candidate activations are serialized before coordinator commit"
     expectedRequestedModelId: activatedRoute.requestedModelId,
     selectedCanonicalModelId: "vendor/canonical",
     signal: new AbortController().signal,
+    deadlineAt: Number.MAX_SAFE_INTEGER,
     persistence: "persisted" as const,
   };
 
@@ -1293,6 +1295,7 @@ test("new inspection generation waits for an in-flight activation before taking 
     expectedRequestedModelId: `vendor/${primary.id}`,
     selectedCanonicalModelId: "vendor/canonical",
     signal: new AbortController().signal,
+    deadlineAt: Number.MAX_SAFE_INTEGER,
     persistence: "persisted",
   });
   await flushMicrotasks();
@@ -1591,6 +1594,7 @@ test("back-to-back generations register ownership before an activation wait", as
     expectedRequestedModelId: activatedRoute.requestedModelId,
     selectedCanonicalModelId: activatedRoute.canonicalModelId!,
     signal: new AbortController().signal,
+    deadlineAt: Number.MAX_SAFE_INTEGER,
     persistence: "persisted",
   });
   await flushMicrotasks();
@@ -1875,6 +1879,7 @@ test("candidate activation event reconstructs only the exact safe route schema",
     expectedRequestedModelId: "vendor/chosen",
     selectedCanonicalModelId: "vendor/canonical",
     signal: new AbortController().signal,
+    deadlineAt: Number.MAX_SAFE_INTEGER,
     persistence: "persisted",
   });
   const activationEvent = fixture.events.find((event) => event.type === "candidate-activation");

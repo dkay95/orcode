@@ -50,6 +50,25 @@ const FINGERPRINT_B = openRouterAccountFingerprint(HMAC_KEY, CREATOR_B);
 const SLOT_A = "v1:inference:10000000-0000-4000-8000-000000000001";
 const SLOT_B = "v1:inference:20000000-0000-4000-8000-000000000002";
 
+async function withCappedProviderTimers<T>(
+  run: (realDelay: (milliseconds: number) => Promise<void>) => Promise<T>,
+): Promise<T> {
+  const originalSetTimeout = globalThis.setTimeout;
+  const realDelay = (milliseconds: number) => new Promise<void>((resolve) => {
+    originalSetTimeout(resolve, milliseconds);
+  });
+  globalThis.setTimeout = ((
+    handler: TimerHandler,
+    timeout?: number,
+    ...args: unknown[]
+  ) => originalSetTimeout(handler, Math.min(timeout ?? 0, 25), ...args)) as typeof setTimeout;
+  try {
+    return await run(realDelay);
+  } finally {
+    globalThis.setTimeout = originalSetTimeout;
+  }
+}
+
 type DesiredCredentialRequest = {
   connectionId: string;
   credentialKind?: "inference" | "management";
@@ -917,6 +936,182 @@ test("model transition rejects an authority binding from a newer route revision"
   assert.deepEqual(activationRequests, []);
 });
 
+test("transitionModel deadline fences a delayed prepublication activation", async () => {
+  await withCappedProviderTimers(async (realDelay) => {
+    const state = stateWithConnections([
+      connection({ id: "connection-b", slot: SLOT_B, fingerprint: FINGERPRINT_B }),
+    ], route(FINGERPRINT_B));
+    const stateStore = new ProviderStateStore(state);
+    const credentials = new AuthorityCredentials({}, { [SLOT_B]: SECRET_B });
+    const coordinator = authorityCoordinator();
+    const authority = new ProviderCredentialAuthority({
+      stateStore,
+      credentials,
+      environment: {},
+      coordinator: () => coordinator,
+      now: Date.now,
+    });
+    const observed = adapterWithAuthority({ authority: authority as never, credentials });
+    const nextModel = "synthetic/deadline-transition-model";
+    const nextRoute = {
+      ...route(FINGERPRINT_B),
+      requestedModelId: nextModel,
+      canonicalModelId: nextModel,
+    };
+    let activationReached!: () => void;
+    const reached = new Promise<void>((resolve) => { activationReached = resolve; });
+    let releaseActivation!: () => void;
+    const activationSignals: AbortSignal[] = [];
+    const Runtime = (cliModule as unknown as {
+      DefaultProviderRuntime: new (...args: unknown[]) => RuntimeUnderTest & {
+        transitionModel(modelId: string, canonicalModelId: string): Promise<void>;
+      };
+    }).DefaultProviderRuntime;
+    const config = structuredClone(DEFAULT_CONFIG);
+    config.mainModel = MODEL;
+    config.providerSetup = stateStore.read();
+    const runtime = new Runtime(
+      observed.service,
+      credentials,
+      new BackendRegistry([{ descriptor: OPENROUTER_DESCRIPTOR, adapter: observed.adapter }]),
+      stateStore,
+      {
+        ensureRunnableRoute() { return route(FINGERPRINT_B); },
+        async activateCandidate(request: { signal: AbortSignal }) {
+          activationSignals.push(request.signal);
+          activationReached();
+          await new Promise<void>((resolve, reject) => {
+            let settled = false;
+            const onAbort = () => {
+              if (settled) return;
+              settled = true;
+              reject(request.signal.reason);
+            };
+            request.signal.addEventListener("abort", onAbort, { once: true });
+            releaseActivation = () => {
+              if (settled) return;
+              settled = true;
+              request.signal.removeEventListener("abort", onAbort);
+              resolve();
+            };
+          });
+          return { persisted: true, route: nextRoute, state: stateStore.read(), warnings: [] };
+        },
+      },
+      coordinator,
+      { beginRun() { return () => undefined; } },
+      { async apply() { return { kind: "unchanged" }; } },
+      null,
+      null,
+      MODEL,
+      config,
+      undefined,
+      { credentialAuthority: authority, adapter: observed.adapter, async recover() {} },
+    );
+
+    const attempt = runtime.transitionModel(nextModel, nextModel);
+    await reached;
+    const settlement = await Promise.race([
+      attempt.then(() => "fulfilled" as const, () => "rejected" as const),
+      realDelay(100).then(() => "still-pending" as const),
+    ]);
+    const configAtSettlement = config.mainModel;
+    releaseActivation();
+    await attempt.catch(() => undefined);
+    await realDelay(20);
+
+    assert.equal(settlement, "rejected");
+    assert.equal(activationSignals[0]?.aborted, true);
+    assert.equal(configAtSettlement, MODEL);
+    assert.equal(config.mainModel, MODEL);
+    assert.deepEqual(stateStore.read(), state);
+  });
+});
+
+test("transitionModel publication boundary waits for exact terminal reconciliation", async () => {
+  await withCappedProviderTimers(async (realDelay) => {
+    const state = stateWithConnections([
+      connection({ id: "connection-b", slot: SLOT_B, fingerprint: FINGERPRINT_B }),
+    ], route(FINGERPRINT_B));
+    const stateStore = new ProviderStateStore(state);
+    const credentials = new AuthorityCredentials({}, { [SLOT_B]: SECRET_B });
+    const coordinator = authorityCoordinator();
+    const authority = new ProviderCredentialAuthority({
+      stateStore,
+      credentials,
+      environment: {},
+      coordinator: () => coordinator,
+      now: Date.now,
+    });
+    const observed = adapterWithAuthority({ authority: authority as never, credentials });
+    const nextModel = "synthetic/committed-transition-model";
+    const nextRoute = {
+      ...route(FINGERPRINT_B),
+      requestedModelId: nextModel,
+      canonicalModelId: nextModel,
+    };
+    const committedState = {
+      ...state,
+      revision: state.revision + 1,
+      defaultRoute: nextRoute,
+    };
+    let publicationReached!: () => void;
+    const reached = new Promise<void>((resolve) => { publicationReached = resolve; });
+    let releasePublication!: () => void;
+    const publicationGate = new Promise<void>((resolve) => { releasePublication = resolve; });
+    const Runtime = (cliModule as unknown as {
+      DefaultProviderRuntime: new (...args: unknown[]) => RuntimeUnderTest & {
+        transitionModel(modelId: string, canonicalModelId: string): Promise<void>;
+      };
+    }).DefaultProviderRuntime;
+    const config = structuredClone(DEFAULT_CONFIG);
+    config.mainModel = MODEL;
+    config.providerSetup = stateStore.read();
+    const runtime = new Runtime(
+      observed.service,
+      credentials,
+      new BackendRegistry([{ descriptor: OPENROUTER_DESCRIPTOR, adapter: observed.adapter }]),
+      stateStore,
+      {
+        ensureRunnableRoute() { return route(FINGERPRINT_B); },
+        async activateCandidate() {
+          stateStore.replace(committedState, state.revision);
+          publicationReached();
+          await publicationGate;
+          return { persisted: true, route: nextRoute, state: stateStore.read(), warnings: [] };
+        },
+      },
+      coordinator,
+      { beginRun() { return () => undefined; } },
+      { async apply() { return { kind: "unchanged" }; } },
+      null,
+      null,
+      MODEL,
+      config,
+      undefined,
+      { credentialAuthority: authority, adapter: observed.adapter, async recover() {} },
+    );
+
+    const attempt = runtime.transitionModel(nextModel, nextModel);
+    await reached;
+    const beforeRelease = await Promise.race([
+      attempt.then(() => "fulfilled" as const, () => "rejected" as const),
+      realDelay(100).then(() => "still-pending" as const),
+    ]);
+    releasePublication();
+    const terminal = await attempt.then(
+      () => "fulfilled" as const,
+      () => "rejected" as const,
+    );
+
+    assert.equal(beforeRelease, "still-pending");
+    assert.equal(terminal, "fulfilled");
+    assert.equal(config.mainModel, nextModel);
+    assert.deepEqual(config.providerSetup, stateStore.read());
+    assert.deepEqual(stateStore.read(), committedState);
+  });
+});
+
 test("inference key save reads the exact durable credential instead of the stale runtime service", async () => {
   const state = stateWithConnections([
     connection({ id: "connection-a", slot: SLOT_A, fingerprint: FINGERPRINT_A }),
@@ -948,6 +1143,76 @@ test("inference key save reads the exact durable credential instead of the stale
 
   assert.equal(requests[0]?.candidate, SECRET_B);
   assert.equal(requests[0]?.targetConnectionId, "connection-b");
+});
+
+test("inference key save deadline fences a delayed prepublication activation", async () => {
+  await withCappedProviderTimers(async (realDelay) => {
+    const state = stateWithConnections([
+      connection({ id: "connection-b", slot: SLOT_B, fingerprint: FINGERPRINT_B }),
+    ], route(FINGERPRINT_B));
+    const stateStore = new ProviderStateStore(state);
+    const credentials = new AuthorityCredentials({}, { [SLOT_B]: SECRET_B });
+    const coordinator = authorityCoordinator();
+    const authority = new ProviderCredentialAuthority({
+      stateStore,
+      credentials,
+      environment: {},
+      coordinator: () => coordinator,
+      now: Date.now,
+    });
+    let activationReached!: () => void;
+    const reached = new Promise<void>((resolve) => { activationReached = resolve; });
+    let releaseActivation!: () => void;
+    const activationSignals: AbortSignal[] = [];
+    let readyCalls = 0;
+    const controller = cliModule.createProviderCredentialController({
+      stateStore,
+      openRouter: new OpenRouterService(SECRET_A),
+      credentials,
+      credentialAuthority: authority,
+      activationCoordinator: {
+        async activate(request: { signal: AbortSignal }) {
+          activationSignals.push(request.signal);
+          activationReached();
+          await new Promise<void>((resolve, reject) => {
+            let settled = false;
+            const onAbort = () => {
+              if (settled) return;
+              settled = true;
+              reject(request.signal.reason);
+            };
+            request.signal.addEventListener("abort", onAbort, { once: true });
+            releaseActivation = () => {
+              if (settled) return;
+              settled = true;
+              request.signal.removeEventListener("abort", onAbort);
+              resolve();
+            };
+          });
+          return { persisted: true, route: route(FINGERPRINT_B), state, warnings: [] };
+        },
+      },
+      getInferenceRoute: () => route(FINGERPRINT_B),
+      onInferenceReady() { readyCalls += 1; },
+    } as never);
+
+    const attempt = controller.apply({ kind: "save", credentialKind: "inference" });
+    await reached;
+    const settlement = await Promise.race([
+      attempt.then(() => "fulfilled" as const, () => "rejected" as const),
+      realDelay(100).then(() => "still-pending" as const),
+    ]);
+    const readyAtSettlement = readyCalls;
+    releaseActivation();
+    await attempt.catch(() => undefined);
+    await realDelay(20);
+
+    assert.equal(settlement, "rejected");
+    assert.equal(activationSignals[0]?.aborted, true);
+    assert.equal(readyAtSettlement, 0);
+    assert.equal(readyCalls, 0);
+    assert.deepEqual(stateStore.read(), state);
+  });
 });
 
 test("inference key save rejects a route decision from before the authority revision", async () => {
@@ -1131,8 +1396,8 @@ test("manual saved setup authority expiry aborts hub and forbids late activation
     { descriptor: OPENROUTER_DESCRIPTOR, adapter: observed.adapter },
   ]);
   let activationCalls = 0;
-  const orchestrator = {
-    async activateCandidate() {
+  const activationCoordinator = {
+    async activate() {
       activationCalls += 1;
       return {
         persisted: true,
@@ -1142,6 +1407,11 @@ test("manual saved setup authority expiry aborts hub and forbids late activation
       };
     },
   };
+  const orchestrator = new SetupOrchestrator({
+    registry,
+    stateStore,
+    activationCoordinator,
+  });
   const Runtime = (cliModule as unknown as {
     DefaultProviderRuntime: new (...args: unknown[]) => RuntimeUnderTest;
   }).DefaultProviderRuntime;
@@ -1210,6 +1480,142 @@ test("manual saved setup authority expiry aborts hub and forbids late activation
     networkCalls: observed.calls.length,
   }, effectsAtSettlement);
   assert.equal(activationCalls, 0);
+});
+
+test("DefaultProviderRuntime propagates aborted setup cancellation persistence rejection", async () => {
+  const failure = new Error("Provider cancellation persistence failed safely.");
+  const stateStore = new ProviderStateStore(createNeverConfiguredProviderState(), {
+    persist: async () => { throw failure; },
+  });
+  const credentials = new AuthorityCredentials();
+  const observed = adapterWithAuthority({ authority: availableAuthority({}), credentials });
+  const registry = new BackendRegistry([
+    { descriptor: OPENROUTER_DESCRIPTOR, adapter: observed.adapter },
+  ]);
+  const realOrchestrator = new SetupOrchestrator({
+    registry,
+    stateStore,
+    activationCoordinator: fakeActivationCoordinator(),
+  });
+  let cancellationCalls = 0;
+  const originalCancel = realOrchestrator.cancelSetup.bind(realOrchestrator);
+  realOrchestrator.cancelSetup = async (request) => {
+    cancellationCalls += 1;
+    return originalCancel(request);
+  };
+  const Runtime = (cliModule as unknown as {
+    DefaultProviderRuntime: new (...args: unknown[]) => RuntimeUnderTest;
+  }).DefaultProviderRuntime;
+  const config = structuredClone(DEFAULT_CONFIG);
+  config.providerSetup = stateStore.read();
+  const runtime = new Runtime(
+    observed.service,
+    credentials,
+    registry,
+    stateStore,
+    realOrchestrator,
+    authorityCoordinator(),
+    { beginRun() { return () => undefined; } },
+    { async apply() { return { kind: "unchanged" }; } },
+    null,
+    null,
+    MODEL,
+    config,
+  );
+  const reason = new DOMException("fixed public setup abort", "AbortError");
+  const presentations: unknown[] = [];
+
+  await assert.rejects(
+    runtime.runSetup({
+      async chooseHub() { throw new Error("aborted setup must not prompt"); },
+      async readSecret() { throw new Error("aborted setup must not read a secret"); },
+      async chooseModel() { throw new Error("aborted setup must not choose a model"); },
+      async confirm() { throw new Error("aborted setup must not confirm"); },
+      present(event: unknown) { presentations.push(event); },
+    }, {
+      generation: 41,
+      signal: AbortSignal.abort(reason),
+      deadlineAt: Date.now() + 1_000,
+      remainingMs: () => 1_000,
+      assertCurrent() { throw reason; },
+    }),
+    (error: unknown) => error === failure,
+  );
+  await new Promise<void>((resolve) => setImmediate(resolve));
+
+  assert.equal(cancellationCalls, 1);
+  assert.equal(stateStore.read().lifecycle, "never-configured");
+  assert.equal(stateStore.read().revision, 0);
+  assert.deepEqual(observed.calls, []);
+  assert.deepEqual(presentations, []);
+});
+
+test("DefaultProviderRuntime reconciles a committed cancelled lifecycle after persistence rejects", async () => {
+  const initial = createNeverConfiguredProviderState();
+  const stateStore = new ProviderStateStore(initial, {
+    persist: async (request) => {
+      const committed = request.build(initial);
+      adoptDurablyCommittedProviderState(request, committed);
+      throw new Error("fixed rejection after cancelled lifecycle publication");
+    },
+  });
+  const credentials = new AuthorityCredentials();
+  const observed = adapterWithAuthority({ authority: availableAuthority({}), credentials });
+  const registry = new BackendRegistry([
+    { descriptor: OPENROUTER_DESCRIPTOR, adapter: observed.adapter },
+  ]);
+  const realOrchestrator = new SetupOrchestrator({
+    registry,
+    stateStore,
+    activationCoordinator: fakeActivationCoordinator(),
+  });
+  let cancellationCalls = 0;
+  const originalCancel = realOrchestrator.cancelSetup.bind(realOrchestrator);
+  realOrchestrator.cancelSetup = async (request) => {
+    cancellationCalls += 1;
+    return originalCancel(request);
+  };
+  const Runtime = (cliModule as unknown as {
+    DefaultProviderRuntime: new (...args: unknown[]) => RuntimeUnderTest;
+  }).DefaultProviderRuntime;
+  const config = structuredClone(DEFAULT_CONFIG);
+  config.providerSetup = stateStore.read();
+  const runtime = new Runtime(
+    observed.service,
+    credentials,
+    registry,
+    stateStore,
+    realOrchestrator,
+    authorityCoordinator(),
+    { beginRun() { return () => undefined; } },
+    { async apply() { return { kind: "unchanged" }; } },
+    null,
+    null,
+    MODEL,
+    config,
+  );
+  const reason = new DOMException("fixed postpublication setup abort", "AbortError");
+
+  const result = await runtime.runSetup({
+    async chooseHub() { throw new Error("aborted setup must not prompt"); },
+    async readSecret() { throw new Error("aborted setup must not read a secret"); },
+    async chooseModel() { throw new Error("aborted setup must not choose a model"); },
+    async confirm() { throw new Error("aborted setup must not confirm"); },
+    present() {},
+  }, {
+    generation: 42,
+    signal: AbortSignal.abort(reason),
+    deadlineAt: Date.now() + 1_000,
+    remainingMs: () => 1_000,
+    assertCurrent() { throw reason; },
+  });
+
+  assert.deepEqual(result, { kind: "cancelled", mode: "setup-required" });
+  assert.equal(cancellationCalls, 1);
+  assert.equal(stateStore.read().lifecycle, "cancelled");
+  assert.equal(stateStore.read().revision, 1);
+  assert.deepEqual(config.providerSetup, stateStore.read());
+  assert.deepEqual(observed.calls, []);
 });
 
 test("pending provider authority blocks setup before prompt or candidate network", async (t) => {
@@ -1786,12 +2192,19 @@ test("candidate authority abort releases ownership and fences an abort-ignoring 
   const config = structuredClone(DEFAULT_CONFIG);
   config.mainModel = MODEL;
   config.providerSetup = stateStore.read();
+  const setupOrchestrator = new SetupOrchestrator({
+    registry,
+    stateStore,
+    activationCoordinator: {
+      async activate() { activationCalls += 1; throw new Error("late activation"); },
+    },
+  });
   const runtime = new Runtime(
     {} as never,
     credentials,
     registry,
     stateStore,
-    { async activateCandidate() { activationCalls += 1; throw new Error("late activation"); } },
+    setupOrchestrator,
     coordinator,
     { beginRun() { return () => undefined; } },
     { async apply() { return { kind: "unchanged" }; } },

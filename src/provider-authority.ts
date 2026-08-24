@@ -122,6 +122,10 @@ export interface ProviderCredentialAuthorityLike {
     request: ProviderCandidateAuthorityRequest,
     use: (lease: ProviderCandidateAuthorityLease) => Promise<T>,
   ): Promise<ProviderCandidateAuthorityResult<T>>;
+  validateCandidatePermitUnderLease?(
+    request: ProviderCandidateAuthorityRequest,
+    lease: ProviderAuthorityReadLease,
+  ): Promise<ProviderCandidatePreflightResult>;
   withCredential<T>(
     request: ProviderCredentialRequest,
     use: (secret: string, context: ProviderCredentialUseContext) => Promise<T>,
@@ -246,7 +250,7 @@ export class ProviderCredentialAuthority implements ProviderCredentialAuthorityL
     const credentialProof = request.credentialPermit
       ? this.#candidatePermits.get(request.credentialPermit)
       : undefined;
-    if (request.requireCredentialPermit && !credentialProof) {
+    if ((request.requireCredentialPermit || request.credentialPermit) && !credentialProof) {
       return { kind: "stale" };
     }
     try {
@@ -281,6 +285,36 @@ export class ProviderCredentialAuthority implements ProviderCredentialAuthorityL
         },
       );
       return { kind: "ready", value };
+    } catch (error) {
+      return this.#preflightFailure(request, error);
+    }
+  }
+
+  /**
+   * Revalidates an opaque candidate proof while activation already owns the
+   * provider lease. This deliberately never reacquires provider authority.
+   */
+  async validateCandidatePermitUnderLease(
+    request: ProviderCandidateAuthorityRequest,
+    lease: ProviderAuthorityReadLease,
+  ): Promise<ProviderCandidatePreflightResult> {
+    throwIfAborted(request.signal);
+    if (!Number.isFinite(request.deadlineAt) || request.deadlineAt <= this.#now()) {
+      return { kind: "stale" };
+    }
+    const credentialProof = request.credentialPermit
+      ? this.#candidatePermits.get(request.credentialPermit)
+      : undefined;
+    if ((request.requireCredentialPermit || request.credentialPermit) && !credentialProof) {
+      return { kind: "stale" };
+    }
+    try {
+      await this.#bounded(request, () => lease.assertHeld());
+      if (credentialProof) {
+        await this.#assertCandidateCredentialCurrent(request, lease, credentialProof);
+      }
+      await this.#bounded(request, () => lease.assertHeld());
+      return { kind: "ready" };
     } catch (error) {
       return this.#preflightFailure(request, error);
     }
@@ -401,7 +435,6 @@ export class ProviderCredentialAuthority implements ProviderCredentialAuthorityL
     } catch (error) {
       return this.#authorityFailure(request, error);
     } finally {
-      this.#candidatePermits.delete(candidatePermit);
       secret = null;
     }
   }

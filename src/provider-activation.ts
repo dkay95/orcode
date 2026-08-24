@@ -23,6 +23,10 @@ import {
   type VersionedCredentialStoreLike,
 } from "./credentials.js";
 import type { OpenRouterBackendAdapter } from "./openrouter-backend.js";
+import type {
+  ProviderCandidateCredentialPermit,
+  ProviderCredentialAuthorityLike,
+} from "./provider-authority.js";
 import {
   PrivateStore,
   type PrivateDirectoryClaim,
@@ -89,6 +93,7 @@ export interface ProviderActivationResult {
 
 export interface ProviderActivationRuntimeLease {
   assertHeld(): void | Promise<void>;
+  assertHeldSynchronously?(): void;
   release(): void | Promise<void>;
 }
 
@@ -103,7 +108,10 @@ export interface ProviderActivationRequest {
   selectedCanonicalModelId: string;
   generation: number;
   signal: AbortSignal;
+  deadlineAt: number;
   persistence: "persisted" | "process-only";
+  candidatePermit?: ProviderCandidateCredentialPermit | null;
+  requireCandidatePermit?: boolean;
   targetConnectionId?: string;
   onPersistenceFailure?: () => Promise<"process-only" | "decline">;
 }
@@ -148,6 +156,10 @@ export interface ProviderActivationCoordinatorOptions {
   adapter: OpenRouterBackendAdapter | ActivationAdapter;
   stateStore: ProviderStateStore;
   runtimeGuard: ProviderActivationRuntimeGuard;
+  candidateAuthority?: Pick<
+    ProviderCredentialAuthorityLike,
+    "validateCandidatePermitUnderLease"
+  >;
   now?: () => number;
   createUuid?: () => string;
   leaseDurationMs?: number;
@@ -157,6 +169,7 @@ export interface ProviderActivationCoordinatorOptions {
     path: string,
     content: string,
     beforePublish?: () => Promise<void>,
+    beforeRename?: () => void,
   ) => Promise<void>;
   /** @deprecated Transactional activation uses writeConfigAtomic for byte preservation. */
   saveConfig?: typeof saveConfigDefault;
@@ -259,7 +272,7 @@ export class ProviderActivationCoordinator {
   }
 
   async activate(request: ProviderActivationRequest): Promise<ProviderActivationResult> {
-    throwIfAborted(request.signal);
+    this.#assertActivationAttemptCurrent(request);
     let runtimeLease: ProviderActivationRuntimeLease;
     try {
       runtimeLease = await this.#options.runtimeGuard.acquire(request.signal);
@@ -301,6 +314,7 @@ export class ProviderActivationCoordinator {
         throw new StaleProviderGenerationError();
       }
       await this.#assertMutationAllowed(providerLease, runtimeLease, true, request.signal);
+      await this.#validateCandidatePermit(request, providerLease, runtimeLease);
       const normalized = normalizeProviderSecret(request.candidate);
       const candidate = await this.#connectCandidate(
         normalized,
@@ -324,6 +338,7 @@ export class ProviderActivationCoordinator {
 
       if (request.persistence === "process-only") {
         await this.#assertMutationAllowed(providerLease, runtimeLease, true, request.signal);
+        await this.#validateCandidatePermit(request, providerLease, runtimeLease);
         const activated = await this.#activateRuntime(
           candidate.candidateId,
           selectedModel,
@@ -360,6 +375,7 @@ export class ProviderActivationCoordinator {
       }
       await this.#assertFence(providerLease);
       assertNoRetainedIdentityCollision(current, candidate);
+      await this.#validateCandidatePermit(request, providerLease, runtimeLease);
       let candidateSlot: CredentialSlotRef;
       try {
         candidateSlot = this.#options.credentials.reserveSlot("inference");
@@ -448,6 +464,7 @@ export class ProviderActivationCoordinator {
           );
         }
         await this.#assertMutationAllowed(providerLease, runtimeLease, true, request.signal);
+        await this.#validateCandidatePermit(request, providerLease, runtimeLease);
         const activated = await this.#activateRuntime(
           candidate.candidateId,
           selectedModel,
@@ -506,12 +523,19 @@ export class ProviderActivationCoordinator {
                   await ownership.assertHeld();
                   await this.#assertFence(providerLease!);
                   await assertRuntimeLease(runtimeLease);
+                  await this.#validateCandidatePermit(request, providerLease!, runtimeLease);
                   await assertConfigFileSnapshot(
                     ownership.canonicalPath,
                     beforeSave.target,
                   );
                   await ownership.assertHeld();
                   throwIfAborted(request.signal);
+                },
+                () => {
+                  this.#assertActivationAttemptCurrent(request);
+                  this.#assertSynchronousProviderFence(providerLease!);
+                  assertRuntimeLeaseSynchronously(runtimeLease);
+                  this.#assertActivationAttemptCurrent(request);
                 },
               );
             } catch {
@@ -576,23 +600,28 @@ export class ProviderActivationCoordinator {
       if (publication === "ambiguous") {
         throw new ProviderActivationRecoveryRequiredError("provider-config-commit-ambiguous");
       }
+      // The exact candidate config is now durable. Caller cancellation is too
+      // late to roll it back, so retain Runtime -> Provider ownership and
+      // finish adopting that exact tuple instead of exposing a detached half
+      // commit. Provider/runtime ownership failures still fail closed below.
+      const committedSignal = new AbortController().signal;
       await this.#boundary("config-readback");
       manifest.phase = "config-committed";
-      await this.#assertMutationAllowed(providerLease, runtimeLease, true, request.signal);
+      await this.#assertMutationAllowed(providerLease, runtimeLease, true, committedSignal);
       await this.#writeJournal(transaction, manifest, providerLease);
-      await this.#assertMutationAllowed(providerLease, runtimeLease, true, request.signal);
+      await this.#assertMutationAllowed(providerLease, runtimeLease, true, committedSignal);
       try {
         this.#options.stateStore.replace(nextState, current.revision);
       } catch {
         throw new ProviderActivationRecoveryRequiredError("provider-state-adoption-failed");
       }
-      await this.#assertMutationAllowed(providerLease, runtimeLease, true, request.signal);
+      await this.#assertMutationAllowed(providerLease, runtimeLease, true, committedSignal);
       let activated: CandidateProviderState;
       try {
         activated = await this.#activateRuntime(
           revalidatedCandidateId ?? candidate.candidateId,
           selectedModel,
-          request.signal,
+          committedSignal,
         );
         await assertRuntimeLease(runtimeLease);
         await this.#assertFence(providerLease);
@@ -612,7 +641,7 @@ export class ProviderActivationCoordinator {
       if (!oldCleaned) warnings.push("provider-candidate-cleanup-retained");
       await this.#boundary("old-slot-cleaned");
       if (oldCleaned) {
-        await this.#assertMutationAllowed(providerLease, runtimeLease, true, request.signal);
+        await this.#assertMutationAllowed(providerLease, runtimeLease, true, committedSignal);
         await this.#removeJournal(transaction, providerLease);
         transaction = null;
       }
@@ -1036,10 +1065,11 @@ export class ProviderActivationCoordinator {
     signal: AbortSignal,
   ): Promise<CandidateProviderState> {
     try {
-      return await abortableDependency(
-        () => this.#options.adapter.activate({ candidateId, model, signal }),
-        signal,
-      );
+      throwIfAborted(signal);
+      // Runtime activation can publish process state. Once invoked it must
+      // settle while Runtime -> Provider ownership remains held; abort may be
+      // observed by the adapter but must never detach its publication promise.
+      return await this.#options.adapter.activate({ candidateId, model, signal });
     } catch (error) {
       if (isAbort(error, signal)) throw abortFrom(signal);
       throw new ProviderActivationError(
@@ -1155,6 +1185,61 @@ export class ProviderActivationCoordinator {
       }
     } catch {
       throw new ProviderActivationRecoveryRequiredError("provider-lease-fence-lost");
+    }
+  }
+
+  #assertSynchronousProviderFence(lease: HeldProviderLease): void {
+    if (this.#leaseNow() >= lease.owner.expiresAt) {
+      throw new ProviderActivationRecoveryRequiredError("provider-lease-fence-lost");
+    }
+  }
+
+  #assertActivationAttemptCurrent(request: ProviderActivationRequest): void {
+    throwIfAborted(request.signal);
+    if (!Number.isFinite(request.deadlineAt) || this.#leaseNow() >= request.deadlineAt) {
+      throw new ProviderActivationError(
+        "provider-activation-deadline",
+        "Provider activation deadline expired.",
+      );
+    }
+  }
+
+  async #validateCandidatePermit(
+    request: ProviderActivationRequest,
+    lease: HeldProviderLease,
+    runtimeLease: ProviderActivationRuntimeLease,
+  ): Promise<void> {
+    this.#assertActivationAttemptCurrent(request);
+    if (!request.candidatePermit && !request.requireCandidatePermit) return;
+    const validate = this.#options.candidateAuthority?.validateCandidatePermitUnderLease;
+    if (!validate) {
+      throw new ProviderActivationError(
+        "provider-candidate-authority-stale",
+        "Provider candidate authority is unavailable.",
+      );
+    }
+    const result = await validate.call(
+      this.#options.candidateAuthority,
+      {
+        deadlineAt: request.deadlineAt,
+        signal: request.signal,
+        credentialPermit: request.candidatePermit,
+        requireCredentialPermit: request.requireCandidatePermit,
+      },
+      {
+        assertHeld: () => this.#assertMutationAllowed(
+          lease,
+          runtimeLease,
+          true,
+          request.signal,
+        ),
+      },
+    );
+    if (result.kind !== "ready") {
+      throw new ProviderActivationError(
+        "provider-candidate-authority-stale",
+        "Provider candidate authority changed before activation.",
+      );
     }
   }
 
@@ -2049,6 +2134,16 @@ function createCanonicalUuid(createUuid: () => string): string {
 async function assertRuntimeLease(lease: ProviderActivationRuntimeLease): Promise<void> {
   try {
     await lease.assertHeld();
+  } catch {
+    throw new ProviderActivationRecoveryRequiredError(
+      "provider-runtime-guard-lost",
+    );
+  }
+}
+
+function assertRuntimeLeaseSynchronously(lease: ProviderActivationRuntimeLease): void {
+  try {
+    lease.assertHeldSynchronously?.();
   } catch {
     throw new ProviderActivationRecoveryRequiredError(
       "provider-runtime-guard-lost",

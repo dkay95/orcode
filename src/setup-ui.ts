@@ -73,7 +73,7 @@ export interface SetupHubOptions {
   environmentCandidatePermit?: ProviderCandidateCredentialPermit | null;
   /** Reasserts that no provider cleanup/recovery journal blocks candidate IO. */
   preflightCandidate?: () => Promise<boolean>;
-  /** Holds candidate authority only across connect and catalog network effects. */
+  /** Proves candidate authority across catalog selection and activation. */
   withCandidateAuthority?: <T>(
     credentialPermit: ProviderCandidateCredentialPermit | null,
     requireCredentialPermit: boolean,
@@ -466,7 +466,10 @@ async function activateOpenRouter(
         expectedRequestedModelId: selectedModel.requestedModelId,
         selectedCanonicalModelId,
         signal,
+        deadlineAt: options.deadlineAt ?? Number.MAX_SAFE_INTEGER,
         persistence,
+        candidatePermit: credentialPermit,
+        requireCandidatePermit: requireCredentialPermit,
         targetConnectionId: options.targetConnectionId,
         startupGeneration: options.generation,
       }),

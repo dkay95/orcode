@@ -397,6 +397,7 @@ async function crashAndRecoverRealActivation(
       selectedCanonicalModelId: model.canonicalModelId,
       generation: 4,
       signal: new AbortController().signal,
+      deadlineAt: Number.MAX_SAFE_INTEGER,
       persistence: "persisted",
     }),
     /privacy-simulated-crash:config-readback/,

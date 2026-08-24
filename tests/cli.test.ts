@@ -6494,6 +6494,7 @@ for (const persistence of ["persisted", "process-only"] as const) {
         selectedCanonicalModelId: fixture.route.canonicalModelId!,
         generation: 1,
         signal: new AbortController().signal,
+        deadlineAt: Number.MAX_SAFE_INTEGER,
         persistence,
       }),
       /cleanup|recovery|pending/i,

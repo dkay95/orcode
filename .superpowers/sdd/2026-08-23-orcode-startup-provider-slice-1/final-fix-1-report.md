@@ -370,3 +370,99 @@ Files changed by this delta only:
 - this report
 
 No global/full `npm test` was run, per the final-delta constraint.
+
+## Integrated Fix Round 1 — terminal provider effect fences
+
+This integrated round started from clean `HEAD`
+`21bef89843b604fc5a66cd644a423847827a33d1`. It preserves the merged Fix 1
+authority, Fix 2 session/logout, and Fix 3 terminal-lifecycle boundaries. No
+subscription, Kimi, version, approved Spec, or approved Plan content changed.
+
+### Formal tests-only RED
+
+- The pre-change `src` tree was exactly
+  `50677e8a175949dc83dc06ab9b16306b83e4aea7`.
+- After adding the complete regression matrix and before editing production,
+  the `src` tree was still exact and `git diff HEAD -- src` was empty with
+  SHA-256
+  `e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855`.
+- Formal result: 11 tests, 1 passed, 10 failed, 0 skipped. The one already
+  passing characterization was the post-publication cancelled-state
+  reconciliation case.
+
+The exact named matrix was:
+
+1. `transitionModel deadline fences a delayed prepublication activation`
+2. `transitionModel publication boundary waits for exact terminal reconciliation`
+3. `inference key save deadline fences a delayed prepublication activation`
+4. `saved candidate swap after catalog and model choice has zero activation effects`
+5. `environment candidate swap after catalog and model choice has zero activation effects`
+6. `saved candidate permit survives catalog and model choice into activation`
+7. `environment candidate permit survives catalog and model choice into activation`
+8. `DefaultProviderRuntime propagates aborted setup cancellation persistence rejection`
+9. `DefaultProviderRuntime reconciles a committed cancelled lifecycle after persistence rejects`
+10. `real activation writer abort microtask at the last async fence preserves the old tuple`
+11. `real activation writer lease expiry microtask cannot rename after the last async fence`
+
+### Central correction
+
+- Model transitions and inference-key save/replace now own one absolute
+  deadline and abort signal across credential authority and activation. A
+  started activation is retained to its terminal result; a deadline cannot
+  return while that promise may still publish config, state, runtime, or
+  session effects.
+- Opaque candidate permits now survive catalog/model selection and are
+  revalidated under the already-held Runtime -> Provider ownership before
+  candidate I/O and before durable publication. Saved-slot and environment
+  secret changes fail closed without nested provider acquisition.
+- Setup cancellation persistence errors are no longer swallowed. The runtime
+  reports `cancelled` only after the exact expected cancelled revision is
+  authoritative; a detached outer credential deadline now waits for the
+  already-started hub cancellation to commit or to return its safe persistence
+  failure.
+- Activation supplies the atomic writer's synchronous final `beforeRename`
+  hook. Immediately before rename, with no await/yield, it checks the owned
+  deadline signal, provider lease expiry, and the production runtime guard.
+  Exact post-rename readback classifies old/candidate/ambiguous publication;
+  after candidate publication is proven, adoption continues under retained
+  Runtime -> Provider ownership using a non-caller-abort signal.
+
+### Final verification and freeze
+
+- Formal named matrix: 11/11 passed, 0 failed, 0 skipped.
+- Provider state/authority/activation/setup/UI, serial: 305/305 passed, 0
+  failed, 0 skipped.
+- CLI/commands/session, serial: 217/217 passed, 0 failed, 0 skipped.
+- TUI/provider PTY/provider privacy, serial: 98/98 passed, 0 failed, 0 skipped.
+- Integration focus: 30/30 passed, 0 failed, 0 skipped.
+- Provider privacy standalone: 3/3 passed, 0 failed, 0 skipped.
+- `npx tsc -p tsconfig.json --noEmit`: PASS.
+- `npx tsc -p tsconfig.tests.json --noEmit`: PASS.
+- `node --import tsx scripts/render-command-docs.ts --check`: PASS.
+- `git diff --check`: PASS.
+- Approved Spec SHA-256 remained
+  `e15d19821fafbac1f0fc21dd82702d41efa481a12bdcee97df238de2ee85f021`.
+- Approved Plan SHA-256 remained
+  `74914bc2e38c1ac7bb8b57dbfa0abfb1963d4da7acc3fbb6868434039ce22b2c`.
+- Final pre-commit `git diff HEAD -- src tests` SHA-256:
+  `8042b511727b3270baf16b8f5052fb5ee843f647ea0210d5ec74aa5c47ce022f`.
+- Final pre-commit `git diff HEAD -- src` SHA-256:
+  `dacb867127db565b800ae732811632dc8989fbfa9a261a6de304b260ee3ff3f6`.
+
+Files changed by this round:
+
+- `src/cli.ts`
+- `src/provider-activation.ts`
+- `src/provider-authority.ts`
+- `src/setup-ui.ts`
+- `src/setup.ts`
+- `tests/cli.test.ts`
+- `tests/integration.test.ts`
+- `tests/provider-activation.test.ts`
+- `tests/provider-authority.test.ts`
+- `tests/provider-privacy.test.ts`
+- `tests/setup-ui.test.ts`
+- `tests/setup.test.ts`
+- this report
+
+No global/full `npm test` was run, per the integrated-review constraint.

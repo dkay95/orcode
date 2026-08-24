@@ -18,6 +18,7 @@ import type {
   ProviderActivationResult,
 } from "./provider-activation.js";
 import {
+  readProviderStateCommitAdoption,
   type ProviderConnectionStateV1,
   type ProviderSetupStateV1,
   type ProviderStateStore,
@@ -1360,16 +1361,12 @@ export class SetupOrchestrator {
   ): Promise<never> {
     const generation = generationToken.generation;
     if (this.#ownsGeneration(generationToken)) {
-      try {
-        const state = await this.#commitCancelled(captured, generation);
-        if (!this.#ownsGeneration(generationToken)) throw abortReason(signal);
-        const result = this.#setupRequiredResult(state, generation);
-        this.#latestResult = result;
-        this.#proofs.clear();
-        this.#emit({ version: 1, type: "setup-required", generation });
-      } catch {
-        this.#proofs.clear();
-      }
+      const state = await this.#commitCancelled(captured, generation);
+      if (!this.#ownsGeneration(generationToken)) throw abortReason(signal);
+      const result = this.#setupRequiredResult(state, generation);
+      this.#latestResult = result;
+      this.#proofs.clear();
+      this.#emit({ version: 1, type: "setup-required", generation });
     }
     throw abortReason(signal);
   }
@@ -1380,46 +1377,54 @@ export class SetupOrchestrator {
     signal: AbortSignal,
   ): Promise<never> {
     if (generation === this.#generation) {
-      try {
-        const state = await this.#commitCancelled(captured, generation);
-        if (generation === this.#generation) {
-          const result = this.#setupRequiredResult(state, generation);
-          this.#latestResult = result;
-          this.#proofs.clear();
-        }
-      } catch {
+      const state = await this.#commitCancelled(captured, generation);
+      if (generation === this.#generation) {
+        const result = this.#setupRequiredResult(state, generation);
+        this.#latestResult = result;
         this.#proofs.clear();
       }
     }
     throw abortReason(signal);
   }
 
-  #commitCancelled(
+  async #commitCancelled(
     captured: ProviderSetupStateV1,
     generation: number,
   ): Promise<ProviderSetupStateV1> {
-    return this.#stateStore.commit(
-      captured.revision,
-      (current) => {
-        if (JSON.stringify(current) !== JSON.stringify(captured)) {
-          throw new Error("Provider state changed before setup cancellation.");
-        }
-        return {
-          ...current,
-          lifecycle: "cancelled",
-          cross: {
-            enabled: false,
-            preferredLead: current.cross.preferredLead,
-            preferredChallenger: current.cross.preferredChallenger,
-          },
-        };
-      },
-      () => {
-        if (generation !== this.#generation) {
-          throw new Error("Setup cancellation generation is stale.");
-        }
-      },
-    );
+    try {
+      return await this.#stateStore.commit(
+        captured.revision,
+        (current) => {
+          if (JSON.stringify(current) !== JSON.stringify(captured)) {
+            throw new Error("Provider state changed before setup cancellation.");
+          }
+          return {
+            ...current,
+            lifecycle: "cancelled",
+            cross: {
+              enabled: false,
+              preferredLead: current.cross.preferredLead,
+              preferredChallenger: current.cross.preferredChallenger,
+            },
+          };
+        },
+        () => {
+          if (generation !== this.#generation) {
+            throw new Error("Setup cancellation generation is stale.");
+          }
+        },
+      );
+    } catch (error) {
+      const committed = readProviderStateCommitAdoption(error);
+      if (
+        committed
+        && committed.revision === captured.revision + 1
+        && committed.lifecycle === "cancelled"
+      ) {
+        return committed;
+      }
+      throw error;
+    }
   }
 
   #listModelsBounded(

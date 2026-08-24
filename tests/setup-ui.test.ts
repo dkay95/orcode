@@ -696,6 +696,64 @@ test("an environment candidate is automatically process-only only without a save
   assert.equal(context.activations[0]?.persistence, "process-only");
 });
 
+test("saved candidate permit survives catalog and model choice into activation", async () => {
+  const surface = new ScriptedSurface(["openrouter", "cross-later"], [], [MODEL.canonicalModelId]);
+  const context = fixture(surface);
+  const permit = Object.freeze({ version: 1 as const });
+
+  const result = await runSetupHub({
+    ...context,
+    surface,
+    savedSecret: "sk-or-v1-saved-permit",
+    savedCandidatePermit: permit,
+    withCandidateAuthority: async (candidatePermit, requireCandidatePermit, use) => {
+      assert.equal(candidatePermit, permit);
+      assert.equal(requireCandidatePermit, true);
+      return {
+        kind: "ready",
+        value: await use({ async assertHeld() {}, async assertCurrent() {} }),
+      };
+    },
+  });
+  const activation = context.activations[0] as ProviderActivationRequest & {
+    candidatePermit?: unknown;
+    requireCandidatePermit?: boolean;
+  };
+
+  assert.deepEqual(result, { kind: "ready" });
+  assert.equal(activation.candidatePermit, permit);
+  assert.equal(activation.requireCandidatePermit, true);
+});
+
+test("environment candidate permit survives catalog and model choice into activation", async () => {
+  const surface = new ScriptedSurface(["cross-later"], [], [MODEL.canonicalModelId]);
+  const context = fixture(surface, { processOnlyNullState: true });
+  const permit = Object.freeze({ version: 1 as const });
+
+  const result = await runSetupHub({
+    ...context,
+    surface,
+    environmentSecret: "sk-or-v1-environment-permit",
+    environmentCandidatePermit: permit,
+    withCandidateAuthority: async (candidatePermit, requireCandidatePermit, use) => {
+      assert.equal(candidatePermit, permit);
+      assert.equal(requireCandidatePermit, true);
+      return {
+        kind: "ready",
+        value: await use({ async assertHeld() {}, async assertCurrent() {} }),
+      };
+    },
+  });
+  const activation = context.activations[0] as ProviderActivationRequest & {
+    candidatePermit?: unknown;
+    requireCandidatePermit?: boolean;
+  };
+
+  assert.deepEqual(result, { kind: "ready" });
+  assert.equal(activation.candidatePermit, permit);
+  assert.equal(activation.requireCandidatePermit, true);
+});
+
 test("cancelling persistence returns setup-required without a second hub prompt", async () => {
   const surface = new ScriptedSurface(["openrouter"], ["sk-or-v1-test-key"], [MODEL.canonicalModelId], [false]);
   const context = fixture(surface);

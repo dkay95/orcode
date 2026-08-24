@@ -376,6 +376,7 @@ async function activationFixture(options: ActivationFixtureOptions = {}) {
     selectedCanonicalModelId: MODEL.canonicalModelId,
     generation: 4,
     signal: new AbortController().signal,
+    deadlineAt: Number.MAX_SAFE_INTEGER,
     persistence: "persisted" as const,
   };
   return {
@@ -2238,6 +2239,250 @@ test("deadline and abort release authority ownership and block late publication"
     assert.deepEqual(fixture.stateStore.read(), beforeState);
     assert.deepEqual(fixture.adapter.runtimeRoute, oldRoute());
   });
+});
+
+test("real activation writer abort microtask at the last async fence preserves the old tuple", async () => {
+  const fixture = await activationFixture();
+  const beforeConfig = await readFile(fixture.path, "utf8");
+  const beforeState = fixture.stateStore.read();
+  const beforeSlots = new Map(fixture.credentials.slots);
+  const beforeRuntime = structuredClone(fixture.adapter.runtimeRoute);
+  const controller = new AbortController();
+  const reason = new DOMException("fixed activation rename abort", "AbortError");
+  const coordinator = new fixture.api.ProviderActivationCoordinator({
+    appHome: fixture.appHome,
+    configPath: fixture.path,
+    privateStore: fixture.privateStore,
+    credentials: fixture.credentials,
+    adapter: fixture.adapter,
+    stateStore: fixture.stateStore,
+    runtimeGuard: fixture.runtimeGuard,
+    now: () => 10_000,
+    createUuid: sequentialUuid(),
+    leaseDurationMs: 100,
+    writeConfigAtomic: (
+      path: string,
+      content: string,
+      beforePublish?: () => Promise<void>,
+      beforeRename?: () => void,
+    ) => writeFileAtomicSecure(path, content, async () => {
+      await beforePublish?.();
+      queueMicrotask(() => controller.abort(reason));
+    }, beforeRename),
+  });
+
+  await assert.rejects(
+    coordinator.activate({ ...fixture.request, signal: controller.signal }),
+  );
+
+  assert.equal(await readFile(fixture.path, "utf8"), beforeConfig);
+  assert.deepEqual(fixture.stateStore.read(), beforeState);
+  assert.deepEqual(fixture.credentials.slots, beforeSlots);
+  assert.deepEqual(fixture.adapter.runtimeRoute, beforeRuntime);
+  assert.deepEqual(
+    await readdir(join(fixture.appHome, "provider-activation")).catch(() => []),
+    [],
+  );
+});
+
+test("real activation writer lease expiry microtask cannot rename after the last async fence", async () => {
+  const fixture = await activationFixture();
+  const beforeConfig = await readFile(fixture.path, "utf8");
+  const beforeState = fixture.stateStore.read();
+  const beforeRuntime = structuredClone(fixture.adapter.runtimeRoute);
+  let now = 10_000;
+  let stagedSlots: Map<string, string> | null = null;
+  const coordinator = new fixture.api.ProviderActivationCoordinator({
+    appHome: fixture.appHome,
+    configPath: fixture.path,
+    privateStore: fixture.privateStore,
+    credentials: fixture.credentials,
+    adapter: fixture.adapter,
+    stateStore: fixture.stateStore,
+    runtimeGuard: fixture.runtimeGuard,
+    now: () => now,
+    createUuid: sequentialUuid(),
+    leaseDurationMs: 100,
+    writeConfigAtomic: (
+      path: string,
+      content: string,
+      beforePublish?: () => Promise<void>,
+      beforeRename?: () => void,
+    ) => writeFileAtomicSecure(path, content, async () => {
+      await beforePublish?.();
+      stagedSlots = new Map(fixture.credentials.slots);
+      queueMicrotask(() => { now = 10_100; });
+    }, beforeRename),
+  });
+
+  await assert.rejects(coordinator.activate(fixture.request));
+
+  assert.equal(await readFile(fixture.path, "utf8"), beforeConfig);
+  assert.deepEqual(fixture.stateStore.read(), beforeState);
+  assert.deepEqual(fixture.adapter.runtimeRoute, beforeRuntime);
+  assert.ok(stagedSlots);
+  assert.deepEqual(fixture.credentials.slots, stagedSlots);
+  assert.equal(
+    (await readdir(join(fixture.appHome, "provider-activation"))).length,
+    1,
+  );
+});
+
+test("saved candidate swap after catalog and model choice has zero activation effects", async () => {
+  const fixture = await activationFixture();
+  fixture.credentials.slots.set(OLD_SLOT.id, NEW_SECRET);
+  let coordinator: InstanceType<typeof fixture.api.ProviderActivationCoordinator>;
+  const authority = new ProviderCredentialAuthority({
+    stateStore: fixture.stateStore,
+    credentials: fixture.credentials,
+    environment: {},
+    coordinator: () => coordinator,
+    now: () => 10_000,
+  });
+  coordinator = new fixture.api.ProviderActivationCoordinator({
+    appHome: fixture.appHome,
+    configPath: fixture.path,
+    privateStore: fixture.privateStore,
+    credentials: fixture.credentials,
+    adapter: fixture.adapter,
+    stateStore: fixture.stateStore,
+    runtimeGuard: fixture.runtimeGuard,
+    candidateAuthority: authority,
+    now: () => 10_000,
+    createUuid: sequentialUuid(),
+    leaseDurationMs: 100,
+  });
+  const beforeConfig = await readFile(fixture.path, "utf8");
+  const beforeState = fixture.stateStore.read();
+  const beforeRuntime = structuredClone(fixture.adapter.runtimeRoute);
+  let callsAfterCatalog: string[] = [];
+  let slotsAfterSwap = new Map<string, string>();
+
+  const access = await authority.withCredential({
+    connectionId: CONNECTION_ID,
+    credentialKind: "inference",
+    purpose: "explicit-repair",
+    environmentEligibility: "forbidden",
+    deadlineAt: 10_100,
+    signal: new AbortController().signal,
+  }, async (candidate, context) => {
+    const catalog = await authority.withCandidateAuthority({
+      deadlineAt: 10_100,
+      signal: new AbortController().signal,
+      credentialPermit: context.candidatePermit,
+      requireCredentialPermit: true,
+    }, async (lease) => {
+      const connected = await fixture.adapter.connect({
+        candidate,
+        generation: 4,
+        signal: new AbortController().signal,
+      });
+      await lease.assertCurrent();
+      await fixture.adapter.listModels({
+        candidateId: connected.candidateId,
+        signal: new AbortController().signal,
+      });
+      await lease.assertCurrent();
+      return connected.candidateId;
+    });
+    assert.equal(catalog.kind, "ready");
+    callsAfterCatalog = [...fixture.adapter.calls];
+    fixture.credentials.slots.set(OLD_SLOT.id, FOREIGN_SECRET);
+    slotsAfterSwap = new Map(fixture.credentials.slots);
+    return coordinator.activate({
+      ...fixture.request,
+      candidate,
+      candidatePermit: context.candidatePermit,
+      requireCandidatePermit: true,
+      deadlineAt: 10_100,
+    });
+  });
+
+  assert.notEqual(access.kind, "available");
+  assert.equal(await readFile(fixture.path, "utf8"), beforeConfig);
+  assert.deepEqual(fixture.stateStore.read(), beforeState);
+  assert.deepEqual(fixture.adapter.runtimeRoute, beforeRuntime);
+  assert.deepEqual(fixture.adapter.calls, callsAfterCatalog);
+  assert.deepEqual(fixture.credentials.slots, slotsAfterSwap);
+  assert.equal(fixture.credentials.calls.includes("reserveSlot"), false);
+  assert.deepEqual(
+    await readdir(join(fixture.appHome, "provider-activation")).catch(() => []),
+    [],
+  );
+});
+
+test("environment candidate swap after catalog and model choice has zero activation effects", async () => {
+  const fixture = await activationFixture({ oldSlot: null });
+  const environment: Record<string, string | undefined> = {
+    OPENROUTER_API_KEY: NEW_SECRET,
+  };
+  let coordinator: InstanceType<typeof fixture.api.ProviderActivationCoordinator>;
+  const authority = new ProviderCredentialAuthority({
+    stateStore: fixture.stateStore,
+    credentials: fixture.credentials,
+    environment,
+    coordinator: () => coordinator,
+    now: () => 10_000,
+  });
+  coordinator = new fixture.api.ProviderActivationCoordinator({
+    appHome: fixture.appHome,
+    configPath: fixture.path,
+    privateStore: fixture.privateStore,
+    credentials: fixture.credentials,
+    adapter: fixture.adapter,
+    stateStore: fixture.stateStore,
+    runtimeGuard: fixture.runtimeGuard,
+    candidateAuthority: authority,
+    now: () => 10_000,
+    createUuid: sequentialUuid(),
+    leaseDurationMs: 100,
+  });
+  const permit = authority.environmentCandidatePermit(NEW_SECRET);
+  assert.ok(permit);
+  const catalog = await authority.withCandidateAuthority({
+    deadlineAt: 10_100,
+    signal: new AbortController().signal,
+    credentialPermit: permit,
+    requireCredentialPermit: true,
+  }, async (lease) => {
+    const connected = await fixture.adapter.connect({
+      candidate: NEW_SECRET,
+      generation: 4,
+      signal: new AbortController().signal,
+    });
+    await lease.assertCurrent();
+    await fixture.adapter.listModels({
+      candidateId: connected.candidateId,
+      signal: new AbortController().signal,
+    });
+    await lease.assertCurrent();
+    return connected.candidateId;
+  });
+  assert.equal(catalog.kind, "ready");
+  const callsAfterCatalog = [...fixture.adapter.calls];
+  environment.OPENROUTER_API_KEY = FOREIGN_SECRET;
+  const beforeConfig = await readFile(fixture.path, "utf8");
+  const beforeState = fixture.stateStore.read();
+  const beforeSlots = new Map(fixture.credentials.slots);
+  const beforeRuntime = structuredClone(fixture.adapter.runtimeRoute);
+
+  await assert.rejects(coordinator.activate({
+    ...fixture.request,
+    candidatePermit: permit,
+    requireCandidatePermit: true,
+    deadlineAt: 10_100,
+  }));
+
+  assert.equal(await readFile(fixture.path, "utf8"), beforeConfig);
+  assert.deepEqual(fixture.stateStore.read(), beforeState);
+  assert.deepEqual(fixture.adapter.runtimeRoute, beforeRuntime);
+  assert.deepEqual(fixture.adapter.calls, callsAfterCatalog);
+  assert.deepEqual(fixture.credentials.slots, beforeSlots);
+  assert.equal(fixture.credentials.calls.includes("reserveSlot"), false);
+  assert.deepEqual(
+    await readdir(join(fixture.appHome, "provider-activation")).catch(() => []),
+    [],
+  );
 });
 
 test("targeted replacement rejects duplicate account realm identity in both connection orders", async (t) => {

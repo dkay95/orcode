@@ -189,6 +189,7 @@ import {
   selectOpenRouterBinding,
   type ProviderCandidateAuthorityLease,
   type ProviderCandidateAuthorityResult,
+  type ProviderCandidateCredentialPermit,
   type ProviderCredentialAuthorityLike,
 } from "./provider-authority.js";
 import { PrivateStore, type PrivateDirectoryClaim } from "./private-store.js";
@@ -539,12 +540,14 @@ class SessionProviderRuntimeGuard implements ProviderActivationRuntimeGuard {
     }
     this.#activationHeld = true;
     let held = true;
+    const assertHeld = () => {
+      if (!held || !this.#activationHeld || this.#activeRuns > 0) {
+        throw new Error("Provider runtime lease was lost.");
+      }
+    };
     return {
-      assertHeld: () => {
-        if (!held || !this.#activationHeld || this.#activeRuns > 0) {
-          throw new Error("Provider runtime lease was lost.");
-        }
-      },
+      assertHeld,
+      assertHeldSynchronously: assertHeld,
       release: () => {
         if (!held) return;
         held = false;
@@ -850,6 +853,7 @@ export class DefaultProviderRuntime implements ProviderRuntime {
     };
     let activatedRoute: RouteIdentityV1 | null = null;
     let activatedPersisted = false;
+    let cancellationCommitted = false;
     const setupOrchestrator = {
       activateCandidate: async (
         request: Parameters<SetupOrchestrator["activateCandidate"]>[0],
@@ -862,9 +866,16 @@ export class DefaultProviderRuntime implements ProviderRuntime {
         }
         return result;
       },
-      cancelSetup: (
+      cancelSetup: async (
         request: Parameters<SetupOrchestrator["cancelSetup"]>[0],
-      ) => this.orchestrator.cancelSetup(request),
+      ) => {
+        const result = await this.orchestrator.cancelSetup(request);
+        const cancelled = this.stateStore.read();
+        cancellationCommitted = request.expectedRevision !== undefined
+          && cancelled.revision === request.expectedRevision + 1
+          && cancelled.lifecycle === "cancelled";
+        return result;
+      },
     } as SetupOrchestrator;
     const manualController = startupAttempt ? null : new AbortController();
     const signal = startupAttempt?.signal ?? manualController!.signal;
@@ -912,29 +923,34 @@ export class DefaultProviderRuntime implements ProviderRuntime {
           use,
         )
       : undefined;
+    let terminalHub: Promise<SetupHubResult> | null = null;
     const executeHub = (
       savedSecret: string | null,
       targetConnectionId?: string,
       expectedRevision?: number,
       savedCandidatePermit?: Parameters<NonNullable<SetupHubOptions["withCandidateAuthority"]>>[0],
-    ) => runSetupHub({
-      surface: resolvedSurface,
-      orchestrator: setupOrchestrator,
-      registry: this.registry,
-      stateStore: this.stateStore,
-      savedSecret,
-      environmentSecret: this.environmentSecret,
-      signal,
-      deadlineAt,
-      generation: startupAttempt?.generation,
-      targetConnectionId,
-      expectedRevision,
-      savedCandidatePermit,
-      environmentCandidatePermit,
-      preflightCandidate: this.authorityOptions ? preflightCandidate : undefined,
-      withCandidateAuthority: guardCandidate,
-      isCurrent: setupAttemptIsCurrent,
-    });
+    ) => {
+      const pending = runSetupHub({
+        surface: resolvedSurface,
+        orchestrator: setupOrchestrator,
+        registry: this.registry,
+        stateStore: this.stateStore,
+        savedSecret,
+        environmentSecret: this.environmentSecret,
+        signal,
+        deadlineAt,
+        generation: startupAttempt?.generation,
+        targetConnectionId,
+        expectedRevision,
+        savedCandidatePermit,
+        environmentCandidatePermit,
+        preflightCandidate: this.authorityOptions ? preflightCandidate : undefined,
+        withCandidateAuthority: guardCandidate,
+        isCurrent: setupAttemptIsCurrent,
+      });
+      terminalHub = pending;
+      return pending;
+    };
     try {
       const state = this.stateStore.read();
       const persistedSessionRoute = validateRouteIdentityV1(this.session?.data.route);
@@ -1003,9 +1019,19 @@ export class DefaultProviderRuntime implements ProviderRuntime {
       this.#synchronizeAuthoritativeProviderState();
       return result;
     } catch (error) {
-      if (!signal.aborted) throw error;
+      if (signal.aborted && terminalHub !== null) {
+        try {
+          await terminalHub;
+        } catch (terminalError) {
+          this.#synchronizeAuthoritativeProviderState();
+          if (!cancellationCommitted) throw terminalError;
+        }
+      }
       this.#synchronizeAuthoritativeProviderState();
-      return { kind: "cancelled", mode: "setup-required" };
+      if (signal.aborted && cancellationCommitted) {
+        return { kind: "cancelled", mode: "setup-required" };
+      }
+      throw error;
     } finally {
       if (manualDeadlineTimer !== null) clearTimeout(manualDeadlineTimer);
       if (manualController && !manualController.signal.aborted) {
@@ -1280,70 +1306,88 @@ export class DefaultProviderRuntime implements ProviderRuntime {
     const persistence = this.#sessionRoute
       ? (this.#sessionRoutePersisted ? "persisted" : "process-only")
       : (currentIsPersisted ? "persisted" : "process-only");
-    const controller = new AbortController();
+    const effectAttempt = createProviderEffectAttempt();
+    let terminalActivation: Promise<void> | null = null;
     const activateExactCandidate = async (
       candidate: string,
       expectedRevision: number,
       targetConnectionId?: string,
+      candidatePermit?: ProviderCandidateCredentialPermit,
     ): Promise<void> => {
-      const result = await this.orchestrator.activateCandidate({
-        expectedRevision,
-        candidate,
-        expectedRequestedModelId: modelId,
-        selectedCanonicalModelId,
-        signal: controller.signal,
-        persistence,
-        ...(targetConnectionId ? { targetConnectionId } : {}),
-      });
-      const route = validateRouteIdentityV1(result.route);
-      if (
-        !route
-        || route.resolutionState !== "resolved"
-        || route.requestedModelId !== modelId
-        || route.canonicalModelId !== selectedCanonicalModelId
-        || route.backendId !== current.backendId
-        || route.accountFingerprint !== current.accountFingerprint
-        || route.billingRealm !== current.billingRealm
-      ) {
-        throw new ProviderSetupRequiredError();
-      }
-      this.adoptCredentialActivation(route, result.persisted, candidate);
+      if (terminalActivation) throw new ProviderSetupRequiredError();
+      terminalActivation = (async () => {
+        const result = await this.orchestrator.activateCandidate({
+          expectedRevision,
+          candidate,
+          expectedRequestedModelId: modelId,
+          selectedCanonicalModelId,
+          signal: effectAttempt.signal,
+          deadlineAt: effectAttempt.deadlineAt,
+          persistence,
+          candidatePermit,
+          requireCandidatePermit: candidatePermit !== undefined,
+          ...(targetConnectionId ? { targetConnectionId } : {}),
+        });
+        const route = validateRouteIdentityV1(result.route);
+        if (
+          !route
+          || route.resolutionState !== "resolved"
+          || route.requestedModelId !== modelId
+          || route.canonicalModelId !== selectedCanonicalModelId
+          || route.backendId !== current.backendId
+          || route.accountFingerprint !== current.accountFingerprint
+          || route.billingRealm !== current.billingRealm
+        ) {
+          throw new ProviderSetupRequiredError();
+        }
+        this.adoptCredentialActivation(route, result.persisted, candidate);
+      })();
+      await terminalActivation;
     };
 
-    if (persistence === "persisted") {
-      if (persistedBinding.kind !== "exact" || !this.authorityOptions) {
+    try {
+      if (persistence === "persisted") {
+        if (persistedBinding.kind !== "exact" || !this.authorityOptions) {
+          throw new ProviderSetupRequiredError();
+        }
+        const access = await this.authorityOptions.credentialAuthority.withCredential(
+          {
+            connectionId: persistedBinding.binding.connectionId,
+            credentialKind: "inference",
+            purpose: "explicit-repair",
+            environmentEligibility: "forbidden",
+            deadlineAt: effectAttempt.deadlineAt,
+            signal: effectAttempt.signal,
+          },
+          async (candidate, context) => {
+            if (
+              context.binding.stateRevision !== state.revision
+              || context.binding.connectionId !== persistedBinding.binding.connectionId
+              || context.binding.accountFingerprint !== current.accountFingerprint
+              || context.binding.billingRealm !== current.billingRealm
+            ) {
+              throw new ProviderSetupRequiredError();
+            }
+            await activateExactCandidate(
+              candidate,
+              context.binding.stateRevision,
+              context.binding.connectionId,
+              context.candidatePermit,
+            );
+          },
+        );
+        if (access.kind === "available") return;
+        if (terminalActivation) return await terminalActivation;
         throw new ProviderSetupRequiredError();
       }
-      const access = await this.authorityOptions.credentialAuthority.withCredential(
-        {
-          connectionId: persistedBinding.binding.connectionId,
-          credentialKind: "inference",
-          purpose: "explicit-repair",
-          environmentEligibility: "forbidden",
-          deadlineAt: Date.now() + 8_000,
-          signal: controller.signal,
-        },
-        async (candidate, context) => {
-          if (
-            context.binding.stateRevision !== state.revision
-            || context.binding.connectionId !== persistedBinding.binding.connectionId
-            || context.binding.accountFingerprint !== current.accountFingerprint
-            || context.binding.billingRealm !== current.billingRealm
-          ) {
-            throw new ProviderSetupRequiredError();
-          }
-          await activateExactCandidate(
-            candidate,
-            context.binding.stateRevision,
-            context.binding.connectionId,
-          );
-        },
-      );
-      if (access.kind !== "available") throw new ProviderSetupRequiredError();
-      return;
-    }
 
-    await activateExactCandidate(this.openRouter.requireKey(), state.revision);
+      await activateExactCandidate(this.openRouter.requireKey(), state.revision);
+    } catch (error) {
+      if (terminalActivation) return await terminalActivation;
+      throw error;
+    } finally {
+      effectAttempt.close();
+    }
   }
 
   async runWithReadyRoute<T>(
@@ -2780,84 +2824,111 @@ export function createProviderCredentialController(input: {
         const targetConnection = selected.kind === "exact"
           ? state.connections.find((connection) => connection.id === selected.binding.connectionId)
           : undefined;
-        const signal = new AbortController().signal;
+        const effectAttempt = createProviderEffectAttempt();
+        const terminalActivation: {
+          current: Promise<{ persisted: boolean }> | null;
+        } = { current: null };
         const activateCandidate = async (
           candidate: string,
           expectedRevision: number,
           targetConnectionId?: string,
+          candidatePermit?: ProviderCandidateCredentialPermit,
         ) => {
-          const result = await input.activationCoordinator.activate({
-            expectedRevision,
-            candidate,
-            expectedRequestedModelId: route.requestedModelId,
-            selectedCanonicalModelId: route.canonicalModelId!,
-            generation: targetConnection?.lastHealth?.generation ?? 0,
-            signal,
-            persistence: "persisted",
-            ...(targetConnectionId ? { targetConnectionId } : {}),
-            onPersistenceFailure: intent.kind === "replace" && intent.allowProcessOnly
-              ? async () => (await intent.allowProcessOnly!("inference", "Der sichere Credential-Speicher ist nicht verfügbar."))
-                ? "process-only"
-                : "decline"
-              : undefined,
-          });
-          input.onInferenceReady?.(result.route, result.persisted, candidate);
-          return { persisted: result.persisted };
+          if (terminalActivation.current) throw new ProviderSetupRequiredError();
+          terminalActivation.current = (async () => {
+            const result = await input.activationCoordinator.activate({
+              expectedRevision,
+              candidate,
+              expectedRequestedModelId: route.requestedModelId,
+              selectedCanonicalModelId: route.canonicalModelId!,
+              generation: targetConnection?.lastHealth?.generation ?? 0,
+              signal: effectAttempt.signal,
+              deadlineAt: effectAttempt.deadlineAt,
+              persistence: "persisted",
+              candidatePermit,
+              requireCandidatePermit: candidatePermit !== undefined,
+              ...(targetConnectionId ? { targetConnectionId } : {}),
+              onPersistenceFailure: intent.kind === "replace" && intent.allowProcessOnly
+                ? async () => (await intent.allowProcessOnly!("inference", "Der sichere Credential-Speicher ist nicht verfügbar."))
+                  ? "process-only"
+                  : "decline"
+                : undefined,
+            });
+            input.onInferenceReady?.(result.route, result.persisted, candidate);
+            return { persisted: result.persisted };
+          })();
+          return terminalActivation.current;
         };
-        let activation: { persisted: boolean };
-        if (intent.kind === "save" && selected.kind === "exact") {
-          if (!input.credentialAuthority) {
-            await input.activationCoordinator.runExclusive(
-              { signal, inspectCommitted: false },
-              async (lease) => {
-                await lease.assertHeld();
-                throw new ProviderSetupRequiredError();
+        try {
+          let activation: { persisted: boolean };
+          if (intent.kind === "save" && selected.kind === "exact") {
+            if (!input.credentialAuthority) {
+              await input.activationCoordinator.runExclusive(
+                { signal: effectAttempt.signal, inspectCommitted: false },
+                async (lease) => {
+                  await lease.assertHeld();
+                  throw new ProviderSetupRequiredError();
+                },
+              );
+              throw new ProviderSetupRequiredError();
+            }
+            const access = await input.credentialAuthority.withCredential(
+              {
+                connectionId: selected.binding.connectionId,
+                credentialKind: "inference",
+                purpose: "explicit-repair",
+                environmentEligibility: "forbidden",
+                deadlineAt: effectAttempt.deadlineAt,
+                signal: effectAttempt.signal,
+              },
+              (candidate, context) => {
+                if (
+                  context.binding.stateRevision !== state.revision
+                  || context.binding.connectionId !== selected.binding.connectionId
+                  || context.binding.accountFingerprint !== selected.binding.accountFingerprint
+                  || context.binding.billingRealm !== selected.binding.billingRealm
+                ) {
+                  throw new ProviderSetupRequiredError();
+                }
+                return activateCandidate(
+                  candidate,
+                  context.binding.stateRevision,
+                  context.binding.connectionId,
+                  context.candidatePermit,
+                );
               },
             );
-            throw new ProviderSetupRequiredError();
+            if (access.kind === "available") activation = access.value;
+            else if (terminalActivation.current) activation = await terminalActivation.current;
+            else throw new ProviderSetupRequiredError();
+          } else {
+            const candidate = intent.kind === "save"
+              ? input.openRouter.requireKey()
+              : intent.candidate;
+            activation = await activateCandidate(
+              candidate,
+              state.revision,
+              targetConnection?.id,
+            );
           }
-          const access = await input.credentialAuthority.withCredential(
-            {
-              connectionId: selected.binding.connectionId,
+          return {
+            kind: "ready",
+            credentialKind: "inference",
+            persisted: activation.persisted,
+          };
+        } catch (error) {
+          if (terminalActivation.current) {
+            const activation = await terminalActivation.current;
+            return {
+              kind: "ready",
               credentialKind: "inference",
-              purpose: "explicit-repair",
-              environmentEligibility: "forbidden",
-              deadlineAt: Date.now() + 8_000,
-              signal,
-            },
-            (candidate, context) => {
-              if (
-                context.binding.stateRevision !== state.revision
-                || context.binding.connectionId !== selected.binding.connectionId
-                || context.binding.accountFingerprint !== selected.binding.accountFingerprint
-                || context.binding.billingRealm !== selected.binding.billingRealm
-              ) {
-                throw new ProviderSetupRequiredError();
-              }
-              return activateCandidate(
-                candidate,
-                context.binding.stateRevision,
-                context.binding.connectionId,
-              );
-            },
-          );
-          if (access.kind !== "available") throw new ProviderSetupRequiredError();
-          activation = access.value;
-        } else {
-          const candidate = intent.kind === "save"
-            ? input.openRouter.requireKey()
-            : intent.candidate;
-          activation = await activateCandidate(
-            candidate,
-            state.revision,
-            targetConnection?.id,
-          );
+              persisted: activation.persisted,
+            };
+          }
+          throw error;
+        } finally {
+          effectAttempt.close();
         }
-        return {
-          kind: "ready",
-          credentialKind: "inference",
-          persisted: activation.persisted,
-        };
       }
 
       const signal = new AbortController().signal;
@@ -3247,6 +3318,7 @@ export async function createDefaultProviderRuntime(
     adapter,
     stateStore,
     runtimeGuard,
+    candidateAuthority: credentialAuthority,
   });
   const orchestrator = new SetupOrchestrator({
     registry,
@@ -5688,6 +5760,27 @@ function providerAuthorityBlocksSetup(kind: string): boolean {
     || kind === "stale"
     || kind === "ambiguous"
     || kind === "invalid-pointer";
+}
+
+function createProviderEffectAttempt(timeoutMs = 8_000): {
+  signal: AbortSignal;
+  deadlineAt: number;
+  close(): void;
+} {
+  const controller = new AbortController();
+  const deadlineAt = Date.now() + timeoutMs;
+  const timeout = new Error("Provider effect deadline expired.");
+  timeout.name = "TimeoutError";
+  const timer = setTimeout(() => {
+    if (!controller.signal.aborted) controller.abort(timeout);
+  }, Math.min(timeoutMs, 0x7fff_ffff));
+  return {
+    signal: controller.signal,
+    deadlineAt,
+    close() {
+      clearTimeout(timer);
+    },
+  };
 }
 
 function abortableProviderAction<T>(
