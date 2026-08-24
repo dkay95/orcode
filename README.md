@@ -17,14 +17,20 @@ exactly what that does and does not cover yet.
 - **Node.js 22 or newer.** orcode is pure JavaScript/TypeScript on
   Node's standard library plus a small dependency set; it is not tied to a
   specific OS.
-- **An OpenRouter API key.** Get one at
-  [openrouter.ai/keys](https://openrouter.ai/keys). orcode needs at
-  least an inference key; an optional separate management key unlocks the
-  `/balance` full-account view (see [Privacy and data flow](#privacy-and-data-flow)).
-- **Optionally, a Kimi Code membership API key** for the Preview Kimi Code
-  provider. This is a key you create yourself in the Kimi Code Console for
-  third-party tools; it is not a Kimi login. See
-  [Kimi Code (Preview)](#kimi-code-preview).
+- **A key for at least one provider.** orcode's provider hub has three
+  rows: OpenRouter Stable; Kimi Code Abo Preview (membership key);
+  Anthropic / Claude-Abo Coming soon (not connectable yet). You need one of
+  the first two:
+  - **An OpenRouter API key** if you use OpenRouter. Get one at
+    [openrouter.ai/keys](https://openrouter.ai/keys). orcode needs at
+    least an inference key; an optional separate management key unlocks the
+    `/balance` full-account view (see [Privacy and data flow](#privacy-and-data-flow)).
+  - **A Kimi Code membership API key** if you use the Preview Kimi Code
+    provider. This is a key you create yourself in the Kimi Code Console for
+    third-party tools; it is not a Kimi login, and an ordinary chat on a
+    Kimi route does not need an OpenRouter key alongside it. See
+    [Kimi Code (Preview)](#kimi-code-preview) for what that connection does
+    and does not cover yet.
 
 Shell execution is platform-native; Windows does not require an additional
 POSIX shell:
@@ -71,31 +77,48 @@ orcode
    orcode
    ```
 
-2. On first run, with no `OPENROUTER_API_KEY` in the environment and no key
-   saved yet, orcode asks for your OpenRouter API key with hidden
-   input, validates it live against OpenRouter, and then stores it in your
-   OS's native credential store (Keychain on macOS, Credential Manager on
-   Windows, Secret Service/libsecret on Linux). Later starts load and
-   re-validate that saved key automatically. A valid but unfunded key stays
-   saved and active: paid runs are blocked until credit is available, but the
-   key is not erased and you are not asked to replace it. Expiry or exhausted
-   limit metadata likewise does not erase a key; replacement is reserved for a
-   missing key or an explicit authentication rejection, never a transient
-   network error.
+2. On first run, with no key saved yet and no `OPENROUTER_API_KEY` in the
+   environment, orcode shows the provider hub: OpenRouter Stable; Kimi Code
+   Abo Preview; Anthropic / Claude-Abo Coming soon (cannot be selected yet).
+   Choose one provider and paste that provider's key with hidden input:
 
-3. Pick a model with `/model` (interactive search over OpenRouter's
-   tool-capable models — shows pricing, context size, and capabilities), or
-   pass one on the command line:
+   - **OpenRouter:** orcode validates the API key live against OpenRouter
+     and then stores it in your OS's native credential store (Keychain on
+     macOS, Credential Manager on Windows, Secret Service/libsecret on
+     Linux). Later starts load and re-validate that saved key
+     automatically. A valid but unfunded key stays saved and active: paid
+     runs are blocked until credit is available, but the key is not erased
+     and you are not asked to replace it. Expiry or exhausted limit metadata
+     likewise does not erase a key; replacement is reserved for a missing
+     key or an explicit authentication rejection, never a transient network
+     error.
+   - **Kimi Code Abo:** paste only your Kimi Code membership key; no
+     OpenRouter key is requested for that route. The connection is
+     validated against the Kimi catalog and stored in the same credential
+     store. What this Preview provider does and does not cover is described
+     in [Kimi Code (Preview)](#kimi-code-preview).
+
+   If `OPENROUTER_API_KEY` is set, orcode activates OpenRouter from it
+   instead of showing the hub (see below).
+
+3. On an OpenRouter route, pick a model with `/model` (interactive search
+   over OpenRouter's tool-capable models — shows pricing, context size, and
+   capabilities), or pass one on the command line:
 
    ```bash
    orcode --model openrouter/auto
    ```
 
+   A Kimi Code route uses one of the four Kimi model IDs listed in
+   [Kimi Code (Preview)](#kimi-code-preview); `/provider models kimi-code`
+   shows which of them your membership currently returns.
+
 4. Choose an approval mode if the default (`ask`) is not what you want —
    see below — then just type your task at the prompt.
 
-To skip the API-key prompt entirely (useful for scripting or CI), set the
-key non-interactively:
+To skip the OpenRouter key prompt entirely (useful for scripting or CI), set
+the key non-interactively. This applies to OpenRouter only; there is no Kimi
+environment variable:
 
 ```bash
 export OPENROUTER_API_KEY="your-key"
@@ -381,16 +404,16 @@ reads an OpenRouter key. `/models` still lists OpenRouter models — use
 
 ## Privacy and data flow
 
-- **What leaves your machine:** your prompts, the contents of files the
-  agent reads or writes, shell command output, and Git diffs are sent to
-  OpenRouter and, through it, to whichever underlying model provider is
-  behind the model you selected (for example Anthropic, OpenAI, Google, or
-  another OpenRouter-listed provider, depending on your choice). If you use
-  the compressor, the same applies to whatever session context it
-  processes — potentially a different provider than your main model, since
-  the compressor model is chosen independently. If you enable `/web`,
-  search queries go through OpenRouter's web-search plugin as well. Nothing
-  is sent anywhere else by orcode itself.
+- **What leaves your machine on an OpenRouter route:** your prompts, the
+  contents of files the agent reads or writes, shell command output, and Git
+  diffs are sent to OpenRouter and, through it, to whichever underlying
+  model provider is behind the model you selected (for example Anthropic,
+  OpenAI, Google, or another OpenRouter-listed provider, depending on your
+  choice). If you use the compressor, the same applies to whatever session
+  context it processes — potentially a different provider than your main
+  model, since the compressor model is chosen independently. If you enable
+  `/web`, search queries go through OpenRouter's web-search plugin as well.
+  On an OpenRouter route, nothing is sent anywhere else by orcode itself.
 - **With a Kimi Code route,** the same categories of data go to
   `api.kimi.com` (Kimi) instead of OpenRouter, for the main model and — if
   enabled — for the compressor, which uses the same Kimi connection. Every
