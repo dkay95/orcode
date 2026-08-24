@@ -65,6 +65,8 @@ export interface SetupHubOptions {
   /** Existing whole-startup attempt. Omitted for an independent manual setup. */
   signal?: AbortSignal;
   deadlineAt?: number;
+  /** Lazily starts the provider-contact budget after interactive secret input. */
+  resolveProviderDeadline?: () => number;
   generation?: number;
   targetConnectionId?: string;
   /** Durable revision captured with an authority-backed saved credential. */
@@ -84,6 +86,7 @@ export interface SetupHubOptions {
 }
 
 const SETUP_CALLER_ABORTED = Symbol("setup-caller-aborted");
+const MANUAL_PROVIDER_CONTACT_MAX_MS = 15_000;
 
 function awaitSetupInput<T>(
   operation: Promise<T>,
@@ -303,6 +306,12 @@ async function activateOpenRouter(
   signal.addEventListener("abort", onAbort, { once: true });
   try {
     const secret = normalizeProviderSecret(rawSecret);
+    // Human input is deliberately outside this provider-contact budget. Once
+    // contact begins, connect, catalog selection, and activation share one
+    // absolute deadline; an external startup deadline is never extended.
+    const candidateDeadlineAt = options.deadlineAt
+      ?? options.resolveProviderDeadline?.()
+      ?? Date.now() + MANUAL_PROVIDER_CONTACT_MAX_MS;
     const activeAdapter = registry.adapter("openrouter");
     adapter = activeAdapter;
     const connectAndList = async (
@@ -332,6 +341,7 @@ async function activateOpenRouter(
           connectionId: options.targetConnectionId,
           candidate: secret,
           generation: options.generation ?? 0,
+          deadlineAt: candidateDeadlineAt,
           signal,
         });
         void pending.then(
@@ -466,7 +476,7 @@ async function activateOpenRouter(
       expectedRequestedModelId: selectedModel.requestedModelId,
       selectedCanonicalModelId,
       signal,
-      deadlineAt: options.deadlineAt ?? Number.MAX_SAFE_INTEGER,
+      deadlineAt: candidateDeadlineAt,
       persistence,
       candidatePermit: credentialPermit,
       requireCandidatePermit: requireCredentialPermit,

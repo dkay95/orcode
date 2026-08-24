@@ -12,6 +12,7 @@ import {
   type ProviderHealth,
   type RouteIdentityV1,
 } from "../src/backends.js";
+import { KIMI_CODE_DESCRIPTOR } from "../src/kimi-code-backend.js";
 
 const ready: ProviderHealth = {
   credential: "valid",
@@ -130,6 +131,25 @@ test("registry preserves insertion order for valid descriptors", () => {
     { descriptor: anthropic },
   ]);
   assert.deepEqual(registry.entries().map(({ id }) => id), ["openrouter", "anthropic"]);
+});
+
+test("registry permits exactly one explicitly Preview Kimi adapter", () => {
+  const registry = new BackendRegistry([
+    { descriptor: KIMI_CODE_DESCRIPTOR, adapter: adapter("kimi-code") },
+  ]);
+  assert.equal(registry.descriptor("kimi-code"), KIMI_CODE_DESCRIPTOR);
+  assert.equal(registry.adapter("kimi-code").backendId, "kimi-code");
+
+  for (const descriptor of [
+    { ...KIMI_CODE_DESCRIPTOR, maturity: "stable" as const },
+    { ...KIMI_CODE_DESCRIPTOR, maturity: "coming-soon" as const, connectable: false },
+    { ...KIMI_CODE_DESCRIPTOR, connectable: false },
+  ]) {
+    assert.throws(
+      () => new BackendRegistry([{ descriptor, adapter: adapter("kimi-code") }]),
+      /kimi.*preview/i,
+    );
+  }
 });
 
 test("registry rejects contradictory descriptor and adapter combinations", () => {

@@ -32,6 +32,11 @@ import {
   OpenRouterBackendAdapter,
   openRouterAccountFingerprint,
 } from "../src/openrouter-backend.js";
+import { KimiCodeBackendAdapter } from "../src/kimi-code-backend.js";
+import {
+  KimiCodeService,
+  kimiCodeAccountFingerprint,
+} from "../src/kimi-code.js";
 import { OpenRouterService } from "../src/openrouter.js";
 import {
   ProviderActivationCoordinator,
@@ -698,4 +703,115 @@ test("provider privacy scanner recursively covers committed fixtures PTY output 
   for (const artifact of afterRecovery) {
     assertProviderPrivate(`${artifact.path}\n${artifact.bytes}`, values);
   }
+});
+
+test("Kimi metadata inspection and candidate state discard provider diagnostics and raw membership keys", async () => {
+  const credential = `fixture-kimi-membership-privacy-${"z".repeat(40)}`;
+  const values = probes(credential);
+  const hmacKey = new Uint8Array(32).fill(13);
+  const accountFingerprint = kimiCodeAccountFingerprint(hmacKey, credential);
+  const slot: CredentialSlotRef = Object.freeze({
+    version: 1,
+    kind: "kimi-code",
+    id: "v1:kimi-code:10000000-0000-4000-8000-000000000099",
+  });
+  let responseMode: "failure" | "success" = "failure";
+  const calls: string[] = [];
+  const service = new KimiCodeService({
+    now: () => 1_000,
+    fetchImpl: async (url) => {
+      calls.push(url);
+      if (responseMode === "failure") {
+        return new Response(JSON.stringify({
+          error: {
+            message: "The API Key appears to be invalid or may have expired. Please verify your credentials and try again.",
+            type: values.providerBody,
+            param: values.creatorId,
+            code: null,
+          },
+        }), {
+          status: 401,
+          headers: {
+            "content-type": "application/json",
+            "x-request-id": values.uniqueCredentialBody,
+          },
+        });
+      }
+      return new Response(JSON.stringify({
+        object: "list",
+        data: [{
+          id: "kimi-for-coding",
+          object: "model",
+          created: 1_777_777_777,
+          owned_by: "kimi-code",
+        }],
+      }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    },
+  });
+  const adapter = new KimiCodeBackendAdapter({
+    service,
+    credentials: {
+      async getOrCreateAccountHmacKey() { return new Uint8Array(hmacKey); },
+    },
+    credentialAuthority: {
+      async withCredential(request, use) {
+        return {
+          kind: "available" as const,
+          value: await use(credential, {
+            source: "saved",
+            candidatePermit: Object.freeze({ version: 1 as const }),
+            async publishIfCurrent(publish) { publish(); },
+            binding: {
+              version: 2,
+              stateRevision: 4,
+              connectionId: request.connectionId,
+              backendId: "kimi-code",
+              enabled: true,
+              credentialPointer: { kind: "versioned", slot },
+              accountFingerprint,
+              billingRealm: "kimi-code-membership-provider-managed-overage",
+              isDefault: true,
+            },
+          }),
+        };
+      },
+    },
+    now: () => 1_000,
+    createCandidateId: () => "privacy-kimi-candidate",
+    createConnectionId: () => "privacy-kimi-connection",
+  });
+
+  const failure = await adapter.inspect({
+    connectionId: "privacy-kimi-connection",
+    generation: 4,
+    deadlineAt: 2_000,
+    signal: new AbortController().signal,
+    purpose: "startup-inspect",
+    environmentEligibility: "forbidden",
+  });
+  assert.equal(failure.explanationCode, "kimi-code-invalid-response");
+  assertProviderPrivate(JSON.stringify(failure), values);
+
+  responseMode = "success";
+  const candidate = await adapter.connect({
+    connectionId: "privacy-kimi-connection",
+    candidate: credential,
+    generation: 5,
+    deadlineAt: 2_000,
+    signal: new AbortController().signal,
+  });
+  const models = await adapter.listModels({
+    candidateId: candidate.candidateId,
+    signal: new AbortController().signal,
+  });
+  const activated = await adapter.activate({
+    candidateId: candidate.candidateId,
+    model: models[0]!,
+    signal: new AbortController().signal,
+  });
+  assertProviderPrivate(JSON.stringify({ candidate, models, activated }), values);
+  assert.deepEqual(calls, calls.map(() => "https://api.kimi.com/coding/v1/models"));
 });

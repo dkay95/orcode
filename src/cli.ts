@@ -887,19 +887,13 @@ export class DefaultProviderRuntime implements ProviderRuntime {
     } as SetupOrchestrator;
     const manualController = startupAttempt ? null : new AbortController();
     const signal = startupAttempt?.signal ?? manualController!.signal;
-    const deadlineAt = startupAttempt?.deadlineAt ?? Date.now() + 8_000;
-    let manualDeadlineTimer: ReturnType<typeof setTimeout> | null = null;
-    if (manualController) {
-      const timeout = new Error("Provider setup deadline expired.");
-      timeout.name = "TimeoutError";
-      const remaining = Math.max(0, deadlineAt - Date.now());
-      if (remaining === 0) manualController.abort(timeout);
-      else {
-        manualDeadlineTimer = setTimeout(() => {
-          if (!manualController.signal.aborted) manualController.abort(timeout);
-        }, Math.min(remaining, 0x7fff_ffff));
-      }
-    }
+    const deadlineAt = startupAttempt?.deadlineAt;
+    let manualProviderDeadlineAt: number | undefined;
+    const resolveProviderDeadline = (): number => {
+      if (deadlineAt !== undefined) return deadlineAt;
+      manualProviderDeadlineAt ??= Date.now() + 15_000;
+      return manualProviderDeadlineAt;
+    };
     const environmentCandidatePermit = this.environmentSecret && this.authorityOptions
       ? this.authorityOptions.credentialAuthority.environmentCandidatePermit?.(
           this.environmentSecret,
@@ -910,7 +904,7 @@ export class DefaultProviderRuntime implements ProviderRuntime {
       if (!preflight) return true;
       const result = await preflight.call(
         this.authorityOptions!.credentialAuthority,
-        { deadlineAt, signal },
+        { deadlineAt: resolveProviderDeadline(), signal },
       );
       return result.kind === "ready";
     };
@@ -923,7 +917,7 @@ export class DefaultProviderRuntime implements ProviderRuntime {
           ProviderCandidateAuthorityResult<T>
         > => this.authorityOptions!.credentialAuthority.withCandidateAuthority!(
           {
-            deadlineAt,
+            deadlineAt: resolveProviderDeadline(),
             signal,
             credentialPermit,
             requireCredentialPermit,
@@ -947,6 +941,7 @@ export class DefaultProviderRuntime implements ProviderRuntime {
         environmentSecret: this.environmentSecret,
         signal,
         deadlineAt,
+        resolveProviderDeadline,
         generation: startupAttempt?.generation,
         targetConnectionId,
         expectedRevision,
@@ -980,7 +975,7 @@ export class DefaultProviderRuntime implements ProviderRuntime {
             credentialKind: "inference",
             purpose: "explicit-repair",
             environmentEligibility: "forbidden",
-            deadlineAt,
+            deadlineAt: resolveProviderDeadline(),
             signal,
           },
           (secret, context) => executeHub(
@@ -998,7 +993,7 @@ export class DefaultProviderRuntime implements ProviderRuntime {
           result = await executeHub(null);
         }
       } else {
-        result = this.authorityOptions && !await preflightCandidate()
+        result = this.authorityOptions && startupAttempt && !await preflightCandidate()
           ? { kind: "cancelled", mode: "setup-required" }
           : await executeHub(null);
       }
@@ -1049,7 +1044,6 @@ export class DefaultProviderRuntime implements ProviderRuntime {
       }
       throw error;
     } finally {
-      if (manualDeadlineTimer !== null) clearTimeout(manualDeadlineTimer);
       if (manualController && !manualController.signal.aborted) {
         manualController.abort(new DOMException("The setup attempt settled.", "AbortError"));
       }

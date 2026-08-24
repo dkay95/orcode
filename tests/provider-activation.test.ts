@@ -323,12 +323,19 @@ class FakeKimiAdapter {
   readonly backendId = "kimi-code" as const;
   readonly candidates = new Map<string, string>();
   readonly calls: string[] = [];
+  readonly deadlines: number[] = [];
   candidateCounter = 0;
   currentGeneration = 4;
   advanceGenerationAfterList = false;
 
-  async connect(request: { candidate: unknown; generation: number; signal: AbortSignal }): Promise<ProviderCandidate> {
+  async connect(request: {
+    candidate: unknown;
+    generation: number;
+    deadlineAt: number;
+    signal: AbortSignal;
+  }): Promise<ProviderCandidate> {
     this.calls.push("connect");
+    this.deadlines.push(request.deadlineAt);
     const candidateId = `kimi-candidate-${++this.candidateCounter}`;
     this.candidates.set(candidateId, request.candidate as string);
     return {
@@ -3485,6 +3492,18 @@ test("Kimi persisted activation writes and publishes one exact v2 Kimi tuple thr
   assert.equal(adapter.calls.includes("activate"), true);
   const loaded = await loadConfigDetailed(configPath);
   assert.equal((loaded.config.providerSetup as ProviderSetupStateV2).connections[0]?.backendId, "kimi-code");
+});
+
+test("Kimi initial and post-slot revalidation receive the exact activation deadline", async () => {
+  const fixture = await kimiActivationFixture();
+  const exactDeadline = 77_777;
+
+  await fixture.coordinator().activate({
+    ...fixture.request,
+    deadlineAt: exactDeadline,
+  });
+
+  assert.deepEqual(fixture.adapter.deadlines, [exactDeadline, exactDeadline]);
 });
 
 for (const boundary of boundaries) {

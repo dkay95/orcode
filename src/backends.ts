@@ -57,9 +57,21 @@ export interface BackendDescriptor {
 export interface BackendAdapter {
   readonly backendId: BackendId;
   inspect(request: ProviderInspectionRequest): Promise<ProviderInspection>;
-  connect(request: { connectionId?: string; candidate: unknown; generation: number; signal: AbortSignal }): Promise<ProviderCandidate>;
+  connect(request: {
+    connectionId?: string;
+    candidate: unknown;
+    generation: number;
+    deadlineAt: number;
+    signal: AbortSignal;
+  }): Promise<ProviderCandidate>;
   connectUnderAuthorityLease?(
-    request: { connectionId?: string; candidate: unknown; generation: number; signal: AbortSignal },
+    request: {
+      connectionId?: string;
+      candidate: unknown;
+      generation: number;
+      deadlineAt: number;
+      signal: AbortSignal;
+    },
     lease: { assertHeld(): Promise<void> },
   ): Promise<ProviderCandidate>;
   listModels(request: { connectionId?: string; candidateId?: string; signal: AbortSignal }): Promise<readonly BackendModelDescriptor[]>;
@@ -178,6 +190,19 @@ export class BackendRegistry {
       const { descriptor, adapter } = entry;
       if (descriptor.id === "codex") {
         throw new Error("Backend codex is reserved in Slice 1 and cannot be registered.");
+      }
+      if (
+        descriptor.id === "kimi-code"
+        && (
+          descriptor.maturity !== "preview"
+          || !descriptor.connectable
+          || !adapter
+          || descriptor.kind !== "raw-model"
+          || descriptor.credentialOwner !== "orcode-keychain"
+          || descriptor.billingRealmKind !== "provider-managed"
+        )
+      ) {
+        throw new Error("Backend kimi-code must remain an explicitly connectable Preview adapter.");
       }
       if (
         descriptor.id === "anthropic"

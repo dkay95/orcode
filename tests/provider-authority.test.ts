@@ -1381,7 +1381,11 @@ test("provider setup carries the authority revision across a delayed model promp
   assert.equal(activationRequests[0]?.targetConnectionId, "connection-a");
 });
 
-test("manual saved setup authority expiry aborts hub and forbids late activation", async () => {
+test("manual saved setup authority expiry aborts hub and forbids late activation", async (t) => {
+  t.mock.timers.enable({
+    apis: ["Date", "setTimeout"],
+    now: 1_000_000,
+  });
   const credentials = new AuthorityCredentials({}, { [SLOT_A]: SECRET_A });
   const stateStore = new ProviderStateStore(stateWithConnections([
     connection({ id: "connection-a", slot: SLOT_A, fingerprint: FINGERPRINT_A }),
@@ -1462,12 +1466,13 @@ test("manual saved setup authority expiry aborts hub and forbids late activation
   });
   await reached;
 
-  const result = await Promise.race([
-    attempt,
-    new Promise<"still-pending">((resolve) => {
-      setTimeout(() => resolve("still-pending"), 8_750);
-    }),
-  ]);
+  let settled = false;
+  void attempt.then(() => { settled = true; });
+  t.mock.timers.tick(14_999);
+  await Promise.resolve();
+  assert.equal(settled, false, "manual provider authority expired before the exact 15s budget");
+  t.mock.timers.tick(1);
+  const result = await attempt;
   assert.deepEqual(result, { kind: "cancelled", mode: "setup-required" });
   const effectsAtSettlement = {
     activationCalls,
@@ -1475,7 +1480,7 @@ test("manual saved setup authority expiry aborts hub and forbids late activation
     networkCalls: observed.calls.length,
   };
   resolveModelPrompt(MODEL);
-  await new Promise<void>((resolve) => setTimeout(resolve, 25));
+  await new Promise<void>((resolve) => setImmediate(resolve));
 
   assert.deepEqual({
     activationCalls,
@@ -1713,13 +1718,12 @@ test("pending provider authority blocks setup before prompt or candidate network
     const credentials = new AuthorityCredentials();
     const stateStore = new ProviderStateStore(createNeverConfiguredProviderState());
     let preflights = 0;
+    let cancellationCalls = 0;
     const authority = {
       async withCredential() { return { kind: "absent" as const }; },
       async preflightCandidate() {
         preflights += 1;
-        return preflights === 1
-          ? { kind: "ready" as const }
-          : { kind: "recovery-required" as const };
+        return { kind: "recovery-required" as const };
       },
     };
     const observed = adapterWithAuthority({ authority: authority as never, credentials });
@@ -1737,7 +1741,10 @@ test("pending provider authority blocks setup before prompt or candidate network
       credentials,
       registry,
       stateStore,
-      { async activateCandidate() { throw new Error("activation must remain blocked"); } },
+      {
+        async activateCandidate() { throw new Error("activation must remain blocked"); },
+        async cancelSetup() { cancellationCalls += 1; return {}; },
+      },
       {},
       { beginRun() { return () => undefined; } },
       { async apply() { return { kind: "unchanged" }; } },
@@ -1761,8 +1768,9 @@ test("pending provider authority blocks setup before prompt or candidate network
     const result = await runtime.runSetup(surface as never);
 
     assert.deepEqual(result, { kind: "cancelled", mode: "setup-required" });
-    assert.equal(preflights, 2);
+    assert.equal(preflights, 1);
     assert.equal(secretPrompts, 1);
+    assert.equal(cancellationCalls, 0, "recovery block returns setup-required without lifecycle cancellation");
     assert.deepEqual(observed.calls, []);
   });
 });
@@ -1965,7 +1973,7 @@ test("candidate authority rejects saved and environment credential swaps before 
           operation: (held: typeof lease) => Promise<T>,
         ) {
           authorityCalls += 1;
-          if (source === "environment" && authorityCalls === 2) {
+          if (source === "environment" && authorityCalls === 1) {
             environment.OPENROUTER_API_KEY = SECRET_B;
           }
           return operation(lease);
@@ -1993,12 +2001,16 @@ test("candidate authority rejects saved and environment credential swaps before 
       const config = structuredClone(DEFAULT_CONFIG);
       config.mainModel = MODEL;
       config.providerSetup = stateStore.read();
+      let cancellationCalls = 0;
       const runtime = new Runtime(
         observed.service,
         credentials,
         registry,
         stateStore,
-        { async activateCandidate() { throw new Error("activation must remain fenced"); } },
+        {
+          async activateCandidate() { throw new Error("activation must remain fenced"); },
+          async cancelSetup() { cancellationCalls += 1; return {}; },
+        },
         coordinator,
         { beginRun() { return () => undefined; } },
         { async apply() { return { kind: "unchanged" }; } },
@@ -2028,6 +2040,11 @@ test("candidate authority rejects saved and environment credential swaps before 
       assert.deepEqual(result, { kind: "cancelled", mode: "setup-required" });
       assert.deepEqual(observed.calls, []);
       assert.equal(observed.service.hasKey, false);
+      assert.equal(
+        cancellationCalls,
+        0,
+        "candidate-authority rejection remains a recovery block, not lifecycle cancellation",
+      );
     });
   }
 });

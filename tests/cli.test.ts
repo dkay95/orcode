@@ -2427,6 +2427,404 @@ test("credential activation and key replacement synchronize the current session 
   assert.equal(fixture.config.mainModel, nextRoute.requestedModelId);
 });
 
+function setupDeadlineRuntimeFixture(options: {
+  saved?: boolean;
+  candidateAuthority?: boolean;
+} = {}) {
+  const Runtime = (cliModule as unknown as {
+    DefaultProviderRuntime: new (...args: unknown[]) => {
+      runSetup(
+        surface: SetupSurface,
+        attempt?: {
+          generation: number;
+          deadlineAt: number;
+          signal: AbortSignal;
+          remainingMs(): number;
+          assertCurrent(): void;
+        },
+      ): Promise<Record<string, unknown>>;
+    };
+  }).DefaultProviderRuntime;
+  const model: BackendModelDescriptor = {
+    backendId: "openrouter",
+    requestedModelId: "vendor/deadline-main",
+    canonicalModelId: "vendor/deadline-main",
+    displayName: "Deadline main",
+    capabilities: { textInput: true, textOutput: true, tools: true, reasoning: true },
+  };
+  const route = {
+    version: 1 as const,
+    backendId: "openrouter" as const,
+    accountFingerprint: "acct_deadline_fixture_111111",
+    billingRealm: "openrouter-payg" as const,
+    requestedModelId: model.requestedModelId,
+    canonicalModelId: model.canonicalModelId,
+    resolutionState: "resolved" as const,
+  };
+  const connection: ProviderConnectionStateV1 = {
+    id: "deadline-connection",
+    backendId: "openrouter",
+    enabled: true,
+    maturity: "stable",
+    credentialSlot: "v1:inference:91919191-9191-4191-8191-919191919191",
+    accountFingerprint: route.accountFingerprint,
+    accountFingerprintState: "verified",
+    billingRealm: "openrouter-payg",
+    lastHealth: null,
+  };
+  const initial: ProviderSetupStateV2 = options.saved
+    ? {
+        schemaVersion: 2,
+        revision: 0,
+        lifecycle: "configured",
+        connections: [connection],
+        defaultRoute: route,
+        cross: { enabled: false, preferredLead: null, preferredChallenger: null },
+      }
+    : structuredClone(DEFAULT_CONFIG.providerSetup) as ProviderSetupStateV2;
+  const stateStore = new ProviderStateStore(initial);
+  const deadlines = {
+    preflight: [] as number[],
+    candidateAuthority: [] as number[],
+    credentialAuthority: [] as number[],
+    connect: [] as number[],
+    activation: [] as number[],
+  };
+  const contactObservedAt = {
+    preflight: [] as number[],
+    candidateAuthority: [] as number[],
+    credentialAuthority: [] as number[],
+  };
+  const providerEffects: string[] = [];
+  const adapter: BackendAdapter = {
+    backendId: "openrouter",
+    async inspect() { throw new Error("unused"); },
+    async reconnect() { throw new Error("unused"); },
+    async logout() {},
+    async discardCandidate() { providerEffects.push("discard"); },
+    async connect(request) {
+      providerEffects.push("connect");
+      deadlines.connect.push(request.deadlineAt);
+      return {
+        candidateId: "deadline-candidate",
+        backendId: "openrouter",
+        connectionId: connection.id,
+        accountFingerprint: route.accountFingerprint,
+        billingRealm: "openrouter-payg",
+        health: {
+          credential: "valid",
+          connectivity: "connected",
+          spend: "available",
+          runtime: "ready",
+          observedAt: 1,
+          generation: request.generation,
+        },
+      };
+    },
+    async listModels() {
+      providerEffects.push("models");
+      return [model];
+    },
+    async activate() { throw new Error("unused"); },
+  };
+  const descriptor: BackendDescriptor = {
+    id: "openrouter",
+    displayName: "OpenRouter",
+    maturity: "stable",
+    connectable: true,
+    kind: "raw-model",
+    credentialOwner: "orcode-keychain",
+    billingRealmKind: "api-payg",
+    capabilities: { models: true, tools: true, reasoning: true },
+  };
+  const registry = new BackendRegistry([{ descriptor, adapter }]);
+  const activationCoordinator = {
+    async activate(request: { deadlineAt: number; persistence: "persisted" | "process-only" }) {
+      providerEffects.push("activate");
+      deadlines.activation.push(request.deadlineAt);
+      const previous = stateStore.read();
+      const state = stateStore.replace({
+        ...previous,
+        lifecycle: "configured",
+        connections: [connection],
+        defaultRoute: route,
+        cross: { enabled: false, preferredLead: null, preferredChallenger: null },
+      }, previous.revision);
+      return {
+        persisted: request.persistence === "persisted",
+        warnings: [],
+        state,
+        route,
+      };
+    },
+  };
+  const orchestrator = new SetupOrchestrator({
+    registry,
+    stateStore,
+    activationCoordinator: activationCoordinator as never,
+  });
+  const candidatePermit = Object.freeze({ version: 1 as const });
+  const credentialAuthority: Record<string, unknown> = {
+    async preflightCandidate(request: { deadlineAt: number }) {
+      providerEffects.push("preflight");
+      contactObservedAt.preflight.push(Date.now());
+      deadlines.preflight.push(request.deadlineAt);
+      return { kind: "ready" as const };
+    },
+    async withCredential<T>(
+      request: { deadlineAt: number },
+      use: (secret: string, context: Record<string, unknown>) => Promise<T>,
+    ) {
+      providerEffects.push("credential-authority");
+      contactObservedAt.credentialAuthority.push(Date.now());
+      deadlines.credentialAuthority.push(request.deadlineAt);
+      const value = await use("sk-or-v1-saved-deadline-key", {
+        source: "saved",
+        binding: {
+          connectionId: connection.id,
+          stateRevision: stateStore.read().revision,
+        },
+        candidatePermit,
+        async publishIfCurrent(publish: () => void) { publish(); },
+      });
+      return { kind: "available" as const, value };
+    },
+  };
+  if (options.candidateAuthority) {
+    credentialAuthority.withCandidateAuthority = async <T>(
+      request: { deadlineAt: number },
+      use: (lease: { assertHeld(): Promise<void>; assertCurrent(): Promise<void> }) => Promise<T>,
+    ) => {
+      providerEffects.push("candidate-authority");
+      contactObservedAt.candidateAuthority.push(Date.now());
+      deadlines.candidateAuthority.push(request.deadlineAt);
+      const lease = {
+        async assertHeld() {},
+        async assertCurrent() {},
+      };
+      return { kind: "ready" as const, value: await use(lease) };
+    };
+  }
+  const config = structuredClone(DEFAULT_CONFIG);
+  config.providerSetup = structuredClone(initial);
+  const runtime = new Runtime(
+    new OpenRouterService(undefined),
+    {} as CredentialStore,
+    registry,
+    stateStore,
+    orchestrator,
+    activationCoordinator,
+    { beginRun() { return () => undefined; } },
+    {},
+    options.saved ? "sk-or-v1-saved-deadline-key" : null,
+    null,
+    model.requestedModelId,
+    config,
+    undefined,
+    {
+      credentialAuthority,
+      adapter,
+      async recover() {},
+    },
+  );
+  return { runtime, model, deadlines, contactObservedAt, providerEffects };
+}
+
+test("manual setup starts one provider deadline only after secret input and reuses it", async () => {
+  const fixture = setupDeadlineRuntimeFixture();
+  let releaseHub!: (selection: string) => void;
+  let hubReached!: () => void;
+  const reachedHub = new Promise<void>((resolve) => { hubReached = resolve; });
+  const hubSelection = new Promise<string>((resolve) => { releaseHub = resolve; });
+  let releaseSecret!: (secret: string) => void;
+  let secretReached!: () => void;
+  const reachedSecret = new Promise<void>((resolve) => { secretReached = resolve; });
+  const secret = new Promise<string>((resolve) => { releaseSecret = resolve; });
+  let hubCalls = 0;
+  const surface: SetupSurface = {
+    async chooseHub() {
+      hubCalls += 1;
+      if (hubCalls > 1) return "cross-later";
+      hubReached();
+      return hubSelection;
+    },
+    async readSecret() {
+      secretReached();
+      return secret;
+    },
+    async chooseModel() { return fixture.model.canonicalModelId; },
+    async confirm() { return true; },
+    present() {},
+  };
+
+  const pending = fixture.runtime.runSetup(surface);
+  await reachedHub;
+  const effectsBeforeHubSelection = [...fixture.providerEffects];
+  releaseHub("openrouter");
+  await reachedSecret;
+  const effectsBeforeSecret = [...fixture.providerEffects];
+  releaseSecret("sk-or-v1-manual-deadline-key");
+  let testTimer: ReturnType<typeof setTimeout> | undefined;
+  const result = await Promise.race([
+    pending,
+    new Promise<Record<string, unknown>>((resolve) => {
+      testTimer = setTimeout(() => resolve({
+        kind: "test-timeout",
+        effects: [...fixture.providerEffects],
+      }), 500);
+    }),
+  ]);
+  if (testTimer !== undefined) clearTimeout(testTimer);
+
+  assert.deepEqual(result, { kind: "ready" });
+  assert.deepEqual(effectsBeforeHubSelection, []);
+  assert.deepEqual(effectsBeforeSecret, []);
+  assert.equal(fixture.deadlines.preflight.length, 1);
+  const deadlineAt = fixture.deadlines.preflight[0]!;
+  const providerContactObservedAt = fixture.contactObservedAt.preflight[0]!;
+  assert.ok(Number.isFinite(deadlineAt));
+  assert.ok(deadlineAt > providerContactObservedAt);
+  assert.ok(deadlineAt - providerContactObservedAt <= 15_000);
+  assert.ok(deadlineAt - providerContactObservedAt >= 14_000);
+  assert.deepEqual(fixture.deadlines.connect, [deadlineAt]);
+  assert.deepEqual(fixture.deadlines.activation, [deadlineAt]);
+});
+
+test("manual setup keeps delayed hub and secret input outside the old eight-second timer", async (t) => {
+  t.mock.timers.enable({
+    apis: ["Date", "setTimeout"],
+    now: 1_000_000,
+  });
+  const fixture = setupDeadlineRuntimeFixture();
+  let releaseHub!: (selection: string) => void;
+  let hubReached!: () => void;
+  const reachedHub = new Promise<void>((resolve) => { hubReached = resolve; });
+  const hubSelection = new Promise<string>((resolve) => { releaseHub = resolve; });
+  let releaseSecret!: (secret: string) => void;
+  let secretReached!: () => void;
+  const reachedSecret = new Promise<void>((resolve) => { secretReached = resolve; });
+  const secret = new Promise<string>((resolve) => { releaseSecret = resolve; });
+  let hubCalls = 0;
+  const surface: SetupSurface = {
+    async chooseHub() {
+      hubCalls += 1;
+      if (hubCalls > 1) return "cross-later";
+      hubReached();
+      return hubSelection;
+    },
+    async readSecret() {
+      secretReached();
+      return secret;
+    },
+    async chooseModel() { return fixture.model.canonicalModelId; },
+    async confirm() { return true; },
+    present() {},
+  };
+
+  const pending = fixture.runtime.runSetup(surface);
+  await reachedHub;
+  t.mock.timers.tick(4_001);
+  assert.deepEqual(fixture.providerEffects, []);
+  releaseHub("openrouter");
+  await reachedSecret;
+  t.mock.timers.tick(4_001);
+  assert.deepEqual(fixture.providerEffects, []);
+  releaseSecret("sk-or-v1-delayed-manual-key");
+  const result = await pending;
+
+  assert.deepEqual(result, { kind: "ready" });
+  const deadlineAt = fixture.deadlines.preflight[0];
+  assert.equal(deadlineAt, 1_023_002);
+  assert.deepEqual(fixture.deadlines.connect, [deadlineAt]);
+  assert.deepEqual(fixture.deadlines.activation, [deadlineAt]);
+});
+
+test("manual candidate authority reuses the exact lazily resolved deadline", async () => {
+  const fixture = setupDeadlineRuntimeFixture({ candidateAuthority: true });
+  let hubCalls = 0;
+  const surface: SetupSurface = {
+    async chooseHub() {
+      hubCalls += 1;
+      return hubCalls === 1 ? "openrouter" : "cross-later";
+    },
+    async readSecret() { return "sk-or-v1-candidate-authority-deadline"; },
+    async chooseModel() { return fixture.model.canonicalModelId; },
+    async confirm() { return true; },
+    present() {},
+  };
+
+  const result = await fixture.runtime.runSetup(surface);
+
+  assert.deepEqual(result, { kind: "ready" });
+  assert.deepEqual(fixture.deadlines.preflight, []);
+  assert.equal(fixture.deadlines.candidateAuthority.length, 1);
+  const deadlineAt = fixture.deadlines.candidateAuthority[0]!;
+  const contactObservedAt = fixture.contactObservedAt.candidateAuthority[0]!;
+  assert.ok(Number.isFinite(deadlineAt));
+  assert.ok(deadlineAt > contactObservedAt);
+  assert.ok(deadlineAt - contactObservedAt <= 15_000);
+  assert.deepEqual(fixture.deadlines.connect, [deadlineAt]);
+  assert.deepEqual(fixture.deadlines.activation, [deadlineAt]);
+});
+
+test("manual saved credential authority shares one deadline with candidate contact and activation", async () => {
+  const fixture = setupDeadlineRuntimeFixture({ saved: true, candidateAuthority: true });
+  let hubCalls = 0;
+  const surface: SetupSurface = {
+    async chooseHub() {
+      hubCalls += 1;
+      return hubCalls === 1 ? "openrouter" : "cross-later";
+    },
+    async readSecret() { throw new Error("saved setup must not prompt for a secret"); },
+    async chooseModel() { return fixture.model.canonicalModelId; },
+    async confirm() { throw new Error("saved setup must not ask to persist again"); },
+    present() {},
+  };
+
+  const result = await fixture.runtime.runSetup(surface);
+
+  assert.deepEqual(result, { kind: "ready" });
+  assert.equal(fixture.deadlines.credentialAuthority.length, 1);
+  const deadlineAt = fixture.deadlines.credentialAuthority[0]!;
+  assert.deepEqual(fixture.deadlines.preflight, []);
+  assert.deepEqual(fixture.deadlines.candidateAuthority, [deadlineAt]);
+  assert.deepEqual(fixture.deadlines.connect, [deadlineAt]);
+  assert.deepEqual(fixture.deadlines.activation, [deadlineAt]);
+});
+
+test("startup setup preserves its supplied absolute deadline byte-identically", async () => {
+  const fixture = setupDeadlineRuntimeFixture();
+  let hubCalls = 0;
+  const surface: SetupSurface = {
+    async chooseHub() {
+      hubCalls += 1;
+      return hubCalls === 1 ? "openrouter" : "cross-later";
+    },
+    async readSecret() { return "sk-or-v1-startup-deadline"; },
+    async chooseModel() { return fixture.model.canonicalModelId; },
+    async confirm() { return true; },
+    present() {},
+  };
+  const controller = new AbortController();
+  const deadlineAt = Date.now() + 10_000;
+
+  const result = await fixture.runtime.runSetup(surface, {
+    generation: 71,
+    deadlineAt,
+    signal: controller.signal,
+    remainingMs: () => deadlineAt - Date.now(),
+    assertCurrent() {
+      if (controller.signal.aborted) throw controller.signal.reason;
+    },
+  });
+
+  assert.deepEqual(result, { kind: "ready" });
+  assert.ok(fixture.deadlines.preflight.length >= 1);
+  assert.equal(fixture.deadlines.preflight.every((value) => value === deadlineAt), true);
+  assert.deepEqual(fixture.deadlines.connect, [deadlineAt]);
+  assert.deepEqual(fixture.deadlines.activation, [deadlineAt]);
+});
+
 test("prepublication Cross abort cannot publish the activated route into session runtime", async () => {
   const Runtime = (cliModule as unknown as {
     DefaultProviderRuntime: new (...args: unknown[]) => {

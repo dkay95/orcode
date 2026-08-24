@@ -159,6 +159,7 @@ interface ActivationAdapter {
     connectionId?: string;
     candidate: unknown;
     generation: number;
+    deadlineAt: number;
     signal: AbortSignal;
   }): Promise<ProviderCandidate>;
   listModels(request: {
@@ -371,6 +372,7 @@ export class ProviderActivationCoordinator {
       const candidate = await this.#connectCandidate(
         normalized,
         request.generation,
+        request.deadlineAt,
         request.signal,
         request.targetConnectionId,
         adapter,
@@ -503,6 +505,7 @@ export class ProviderActivationCoordinator {
         const revalidated = await this.#connectCandidate(
           readback,
           request.generation,
+          request.deadlineAt,
           request.signal,
           candidate.connectionId,
           adapter,
@@ -1080,6 +1083,7 @@ export class ProviderActivationCoordinator {
     const candidate = await this.#connectCandidate(
       candidateSecret,
       manifest.expectedRevision + 1,
+      lease.owner.expiresAt,
       request.signal,
       manifest.candidateConnectionId,
       adapter,
@@ -1121,6 +1125,7 @@ export class ProviderActivationCoordinator {
   async #connectCandidate(
     secret: string,
     generation: number,
+    deadlineAt: number,
     signal: AbortSignal,
     connectionId: string | undefined,
     adapter: ActivationAdapter | BackendAdapter,
@@ -1131,6 +1136,7 @@ export class ProviderActivationCoordinator {
           ...(connectionId ? { connectionId } : {}),
           candidate: secret,
           generation,
+          deadlineAt,
           signal,
         }),
         signal,

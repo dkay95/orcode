@@ -120,6 +120,7 @@ class Adapter implements BackendAdapter {
   readonly offline = new Set<string>();
   models: readonly BackendModelDescriptor[] = [MODEL];
   connectRequest: Parameters<BackendAdapter["connect"]>[0] | null = null;
+  connectObservedAt: number | null = null;
   modelRequest: Parameters<BackendAdapter["listModels"]>[0] | null = null;
 
   async inspect(): Promise<ProviderInspection> { throw new Error("not used"); }
@@ -127,6 +128,7 @@ class Adapter implements BackendAdapter {
   async logout(): Promise<void> { this.calls.push("logout"); }
   async discardCandidate(): Promise<void> { this.calls.push("discard"); }
   async connect(request: Parameters<BackendAdapter["connect"]>[0]): Promise<ProviderCandidate> {
+    this.connectObservedAt = Date.now();
     this.connectRequest = request;
     this.calls.push("connect");
     this.connected.push(String(request.candidate));
@@ -257,10 +259,78 @@ test("automatic setup carries one startup signal generation and target through c
   assert.notEqual(scopedSignal, controller.signal);
   assert.equal(context.adapter.connectRequest?.generation, 41);
   assert.equal(context.adapter.connectRequest?.connectionId, "connection-startup");
+  assert.equal(context.adapter.connectRequest?.deadlineAt, deadlineAt);
   assert.equal(context.adapter.modelRequest?.signal, scopedSignal);
   assert.equal(context.activations[0]?.signal, scopedSignal);
   assert.equal(context.activations[0]?.generation, 41);
   assert.equal(context.activations[0]?.targetConnectionId, "connection-startup");
+  assert.equal(context.activations[0]?.deadlineAt, deadlineAt);
+});
+
+test("manual provider contact creates one finite fifteen-second deadline for connect and activation", async () => {
+  const surface = new ScriptedSurface(
+    ["openrouter", "cross-later"],
+    ["sk-or-v1-test-key"],
+    [MODEL.canonicalModelId],
+    [true],
+  );
+  const context = fixture(surface);
+
+  const result = await runSetupHub({ ...context, surface });
+
+  assert.deepEqual(result, { kind: "ready" });
+  const observedAt = context.adapter.connectObservedAt;
+  const connectDeadlineAt = context.adapter.connectRequest?.deadlineAt;
+  assert.ok(observedAt !== null);
+  assert.ok(connectDeadlineAt !== undefined);
+  assert.ok(Number.isFinite(connectDeadlineAt));
+  assert.ok(connectDeadlineAt > observedAt);
+  assert.ok(connectDeadlineAt - observedAt <= 15_000);
+  assert.equal(context.activations[0]?.deadlineAt, connectDeadlineAt);
+});
+
+test("manual provider deadline resolver stays lazy until secret input and is reused exactly", async () => {
+  let releaseSecret!: (secret: string) => void;
+  let secretReached!: () => void;
+  const reachedSecret = new Promise<void>((resolve) => { secretReached = resolve; });
+  const secret = new Promise<string>((resolve) => { releaseSecret = resolve; });
+  let hubCalls = 0;
+  const surface: SetupSurface = {
+    async chooseHub() {
+      hubCalls += 1;
+      return hubCalls === 1 ? "openrouter" : "cross-later";
+    },
+    async readSecret() {
+      secretReached();
+      return secret;
+    },
+    async chooseModel() { return MODEL.canonicalModelId; },
+    async confirm() { return true; },
+    present() {},
+  };
+  const context = fixture(surface);
+  const resolvedDeadlineAt = Date.now() + 12_345;
+  let resolverCalls = 0;
+
+  const pending = runSetupHub({
+    ...context,
+    surface,
+    resolveProviderDeadline() {
+      resolverCalls += 1;
+      return resolvedDeadlineAt;
+    },
+  });
+  await reachedSecret;
+
+  assert.equal(resolverCalls, 0);
+  assert.deepEqual(context.adapter.calls, []);
+  assert.deepEqual([...context.activations], []);
+
+  releaseSecret("sk-or-v1-test-key");
+  assert.deepEqual(await pending, { kind: "ready" });
+  assert.equal(resolverCalls, 1);
+  assert.equal(context.adapter.connectRequest?.deadlineAt, resolvedDeadlineAt);
+  assert.equal(context.activations[0]?.deadlineAt, resolvedDeadlineAt);
 });
 
 test("startup abort revokes a connected candidate even when catalog ignores abort forever", async () => {
