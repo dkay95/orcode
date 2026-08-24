@@ -185,6 +185,38 @@ function fixture(surface: SetupSurface, options: { processOnlyNullState?: boolea
   return { adapter, stateStore, registry, orchestrator, activations, surface };
 }
 
+interface ObservedSetupCancellation {
+  reason: unknown;
+  expectedRevision?: number;
+  expectedGeneration?: number;
+}
+
+function observeSetupCancellations(
+  orchestrator: SetupOrchestrator,
+): ObservedSetupCancellation[] {
+  const observed: ObservedSetupCancellation[] = [];
+  const original = orchestrator.cancelSetup.bind(orchestrator);
+  (orchestrator as SetupOrchestrator & {
+    cancelSetup(request?: ObservedSetupCancellation): ReturnType<SetupOrchestrator["cancelSetup"]>;
+  }).cancelSetup = async (request?: ObservedSetupCancellation) => {
+    observed.push(request ?? { reason: undefined });
+    return original(request as never);
+  };
+  return observed;
+}
+
+function assertOneInteractiveCancellation(
+  observed: readonly ObservedSetupCancellation[],
+  phase: "hub" | "secret" | "model" | "persistence",
+): void {
+  assert.equal(observed.length, 1);
+  assert.deepEqual(observed[0]?.reason, {
+    code: "provider-setup-cancelled",
+    phase,
+  });
+  assert.equal(observed[0]?.expectedRevision, 0);
+}
+
 test("hub connects OpenRouter in secret, model, and explicit persistence order", async () => {
   const surface = new ScriptedSurface(["openrouter", "cross-later"], ["sk-or-v1-test-key"], [MODEL.canonicalModelId], [true]);
   const context = fixture(surface);
@@ -259,6 +291,187 @@ test("hub keeps exactly one setup prompt active at a time", async () => {
 
   assert.deepEqual(result, { kind: "ready" });
   assert.equal(surface.maxActivePrompts, 1);
+});
+
+test("hub cancellation publishes exactly one generation-aware cancelled lifecycle", async () => {
+  const surface = new ScriptedSurface([null]);
+  const context = fixture(surface);
+  const cancellations = observeSetupCancellations(context.orchestrator);
+
+  const result = await runSetupHub({ ...context, surface, generation: 17 });
+
+  assert.deepEqual(result, { kind: "cancelled", mode: "setup-required" });
+  assertOneInteractiveCancellation(cancellations, "hub");
+  assert.equal(cancellations[0]?.expectedGeneration, 17);
+  assert.equal(context.stateStore.read().lifecycle, "cancelled");
+  assert.deepEqual(surface.calls, ["hub"]);
+  assert.deepEqual(context.adapter.calls, []);
+});
+
+test("secret cancellation publishes exactly one cancelled lifecycle and stops setup", async () => {
+  const surface = new ScriptedSurface(["openrouter"], [null]);
+  const context = fixture(surface);
+  const cancellations = observeSetupCancellations(context.orchestrator);
+
+  const result = await runSetupHub({ ...context, surface });
+
+  assert.deepEqual(result, { kind: "cancelled", mode: "setup-required" });
+  assertOneInteractiveCancellation(cancellations, "secret");
+  assert.equal(context.stateStore.read().lifecycle, "cancelled");
+  assert.deepEqual(surface.calls, ["hub", "secret"]);
+  assert.deepEqual(context.adapter.calls, []);
+});
+
+test("model cancellation publishes exactly one cancelled lifecycle and emits no later setup action", async () => {
+  const surface = new ScriptedSurface(["openrouter"], ["sk-or-v1-test-key"], [null]);
+  const context = fixture(surface);
+  const cancellations = observeSetupCancellations(context.orchestrator);
+
+  const result = await runSetupHub({ ...context, surface });
+
+  assert.deepEqual(result, { kind: "cancelled", mode: "setup-required" });
+  assertOneInteractiveCancellation(cancellations, "model");
+  assert.equal(context.stateStore.read().lifecycle, "cancelled");
+  assert.deepEqual(surface.calls, ["hub", "secret", "model"]);
+  assert.deepEqual(context.adapter.calls, ["connect", "models", "discard"]);
+  assert.equal(context.activations.length, 0);
+});
+
+test("persistence cancellation publishes exactly one cancelled lifecycle and emits no later setup action", async () => {
+  const surface = new ScriptedSurface(
+    ["openrouter"],
+    ["sk-or-v1-test-key"],
+    [MODEL.canonicalModelId],
+    [false],
+  );
+  const context = fixture(surface);
+  const cancellations = observeSetupCancellations(context.orchestrator);
+
+  const result = await runSetupHub({ ...context, surface });
+
+  assert.deepEqual(result, { kind: "cancelled", mode: "setup-required" });
+  assertOneInteractiveCancellation(cancellations, "persistence");
+  assert.equal(context.stateStore.read().lifecycle, "cancelled");
+  assert.deepEqual(surface.calls, ["hub", "secret", "model", "confirm"]);
+  assert.deepEqual(context.adapter.calls, ["connect", "models", "discard"]);
+  assert.equal(context.activations.length, 0);
+});
+
+test("caller abort cancellation preserves the exact reason object and performs no later setup action", async () => {
+  const reason = new DOMException("exact setup caller cancellation", "AbortError");
+  const controller = new AbortController();
+  controller.abort(reason);
+  const surface = new ScriptedSurface(["openrouter"]);
+  const context = fixture(surface);
+  const cancellations = observeSetupCancellations(context.orchestrator);
+
+  const result = await runSetupHub({
+    ...context,
+    surface,
+    signal: controller.signal,
+    generation: 23,
+  });
+
+  assert.deepEqual(result, { kind: "cancelled", mode: "setup-required" });
+  assert.equal(cancellations.length, 1);
+  assert.equal(cancellations[0]?.reason, reason);
+  assert.equal(cancellations[0]?.expectedRevision, 0);
+  assert.equal(cancellations[0]?.expectedGeneration, 23);
+  assert.equal(context.stateStore.read().lifecycle, "cancelled");
+  assert.deepEqual(surface.calls, []);
+  assert.deepEqual(context.adapter.calls, []);
+});
+
+test("caller abort settles a pending hub prompt with the exact reason and one cancellation", async () => {
+  const reason = new DOMException("exact pending hub cancellation", "AbortError");
+  const controller = new AbortController();
+  const surface = new ScriptedSurface([]);
+  surface.chooseHub = async () => new Promise<string | null>(() => undefined);
+  const context = fixture(surface);
+  const cancellations = observeSetupCancellations(context.orchestrator);
+  const pending = runSetupHub({
+    ...context,
+    surface,
+    signal: controller.signal,
+    generation: 29,
+  });
+  await Promise.resolve();
+
+  controller.abort(reason);
+  const notSettled = Symbol("not-settled");
+  const result = await Promise.race([
+    pending,
+    new Promise<typeof notSettled>((resolve) => setImmediate(() => resolve(notSettled))),
+  ]);
+
+  assert.notEqual(result, notSettled);
+  assert.deepEqual(result, { kind: "cancelled", mode: "setup-required" });
+  assert.equal(cancellations.length, 1);
+  assert.equal(cancellations[0]?.reason, reason);
+  assert.equal(cancellations[0]?.expectedGeneration, 29);
+  assert.equal(context.stateStore.read().lifecycle, "cancelled");
+  assert.deepEqual(context.adapter.calls, []);
+});
+
+test("stale setup cancellation cannot overwrite a newer committed activation", async () => {
+  const surface = new ScriptedSurface([]);
+  const context = fixture(surface);
+  const before = context.stateStore.read();
+  const route = {
+    version: 1 as const,
+    backendId: "openrouter" as const,
+    accountFingerprint: "acct_newer_activation",
+    billingRealm: "openrouter-payg" as const,
+    requestedModelId: MODEL.requestedModelId,
+    canonicalModelId: MODEL.canonicalModelId,
+    resolutionState: "resolved" as const,
+  };
+  context.stateStore.replace({
+    ...before,
+    lifecycle: "configured",
+    connections: [{
+      id: "newer-activation",
+      backendId: "openrouter",
+      enabled: true,
+      maturity: "stable",
+      credentialSlot: "v1:inference:90000000-0000-4000-8000-000000000099",
+      accountFingerprint: route.accountFingerprint,
+      accountFingerprintState: "verified",
+      billingRealm: "openrouter-payg",
+      lastHealth: null,
+    }],
+    defaultRoute: route,
+  }, before.revision);
+  const activated = context.stateStore.read();
+
+  await (context.orchestrator.cancelSetup as unknown as (
+    request: ObservedSetupCancellation,
+  ) => Promise<unknown>)({
+    reason: new DOMException("stale cancellation", "AbortError"),
+    expectedRevision: before.revision,
+    expectedGeneration: 0,
+  });
+
+  assert.deepEqual(context.stateStore.read(), activated);
+  assert.equal(context.stateStore.read().lifecycle, "configured");
+});
+
+test("Cross Escape after committed ready is Later and never cancels setup", async () => {
+  const surface = new ScriptedSurface(
+    ["openrouter", null],
+    ["sk-or-v1-test-key"],
+    [MODEL.canonicalModelId],
+    [true],
+  );
+  const context = fixture(surface);
+  const cancellations = observeSetupCancellations(context.orchestrator);
+
+  const result = await runSetupHub({ ...context, surface });
+
+  assert.deepEqual(result, { kind: "ready" });
+  assert.deepEqual(cancellations, []);
+  assert.equal(context.stateStore.read().lifecycle, "configured");
+  assert.equal(context.stateStore.read().cross.enabled, false);
 });
 
 test("coming-soon provider explains itself without adapter or activation effects", async () => {

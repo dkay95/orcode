@@ -452,6 +452,12 @@ export interface ProviderRuntime extends ProviderRouteIntentPort, ProviderComman
   resolveLegacyDefaultRoute(): Promise<StartupSetupResult>;
   runSetup(surface: SetupSurface | "plain" | "fullscreen"): Promise<SetupHubResult>;
   ensureRunnableRoute(): RouteIdentityV1;
+  currentSessionRoute(): RouteIdentityV1;
+  selectSessionRoute(
+    route: RouteIdentityV1,
+    surface?: SetupSurface | "plain" | "fullscreen",
+  ): Promise<RouteIdentityV1>;
+  adoptSession(session: SessionStore): void;
   readonly providerCredentials: ProviderCredentialIntentPort;
   runWithReadyRoute<T>(
     run: (route: RouteIdentityV1) => Promise<T>,
@@ -495,6 +501,16 @@ function assertModelBoundToRoute(modelId: string, route: RouteIdentityV1): void 
   if (modelId !== route.requestedModelId && modelId !== route.canonicalModelId) {
     throw new ProviderSetupRequiredError();
   }
+}
+
+function sameExactRoute(left: RouteIdentityV1, right: RouteIdentityV1): boolean {
+  return left.version === right.version
+    && left.backendId === right.backendId
+    && left.accountFingerprint === right.accountFingerprint
+    && left.billingRealm === right.billingRealm
+    && left.requestedModelId === right.requestedModelId
+    && left.canonicalModelId === right.canonicalModelId
+    && left.resolutionState === right.resolutionState;
 }
 
 class SessionProviderRuntimeGuard implements ProviderActivationRuntimeGuard {
@@ -583,7 +599,7 @@ export class DefaultProviderRuntime implements ProviderRuntime {
     private environmentSecret: string | null,
     private readonly requestedModel: string,
     private readonly config: OrcodeConfigWithBudget,
-    private readonly session?: SessionStore,
+    private session?: SessionStore,
     private readonly authorityOptions?: {
       credentialAuthority: ProviderCredentialAuthority;
       adapter: OpenRouterBackendAdapter;
@@ -595,15 +611,48 @@ export class DefaultProviderRuntime implements ProviderRuntime {
     return this.#preparedRoles ? structuredClone(this.#preparedRoles) : null;
   }
 
+  #adoptExactSessionRoute(
+    route: RouteIdentityV1,
+    persisted: boolean,
+    synchronizeSession = true,
+    forceGeneration = false,
+    synchronizeConfig = true,
+  ): void {
+    const validated = validateRouteIdentityV1(route);
+    if (
+      !validated
+      || validated.resolutionState !== "resolved"
+      || !validated.canonicalModelId
+    ) {
+      throw new ProviderSetupRequiredError();
+    }
+    if (
+      forceGeneration
+      || !this.#sessionRoute
+      || !sameExactRoute(this.#sessionRoute, validated)
+      || this.#sessionRoutePersisted !== persisted
+    ) {
+      this.#processRouteGeneration += 1;
+    }
+    this.#sessionRoute = structuredClone(validated);
+    this.#sessionRoutePersisted = persisted;
+    this.#preparedRoles = null;
+    if (synchronizeConfig) this.config.mainModel = validated.requestedModelId;
+    if (synchronizeSession && this.session) {
+      this.session.setPreferences(
+        validated.requestedModelId,
+        this.session.data.reasoning ?? getReasoningSetting(this.config),
+        validated,
+      );
+    }
+  }
+
   adoptCredentialActivation(
     route: RouteIdentityV1,
     persisted: boolean,
     secret: string,
   ): void {
-    this.#processRouteGeneration += 1;
-    this.#sessionRoute = structuredClone(route);
-    this.#sessionRoutePersisted = persisted;
-    this.#preparedRoles = null;
+    this.#adoptExactSessionRoute(route, persisted, true, true);
     this.environmentSecret = persisted ? null : secret;
     if (persisted) {
       this.#synchronizeAuthoritativeProviderState();
@@ -623,7 +672,7 @@ export class DefaultProviderRuntime implements ProviderRuntime {
     const generation = typeof this.orchestrator.nextStartupGeneration === "function"
       ? this.orchestrator.nextStartupGeneration()
       : ++this.#startupAttemptGeneration;
-    return runProviderStartupAttempt({
+    const startup = await runProviderStartupAttempt({
       generation,
       recover: (context) => this.authorityOptions?.recover(context) ?? Promise.resolve(),
       inspect: async (context) => {
@@ -683,19 +732,52 @@ export class DefaultProviderRuntime implements ProviderRuntime {
         ) {
           return;
         }
+        const persistedSessionRoute = validateRouteIdentityV1(this.session?.data.route);
+        const desiredRoute = persistedSessionRoute?.resolutionState === "resolved"
+          ? persistedSessionRoute
+          : result.defaultRoute;
+        const provedRoute = this.orchestrator.ensureRunnableRoute(desiredRoute);
         const selected = selectOpenRouterBinding(
           this.stateStore.read(),
-          { kind: "route", route: result.defaultRoute },
+          { kind: "route", route: provedRoute },
         );
         if (selected.kind !== "exact") throw new ProviderSetupRequiredError();
+        if (
+          persistedSessionRoute?.resolutionState === "resolved"
+          && !sameExactRoute(persistedSessionRoute, result.defaultRoute)
+        ) {
+          const models = await this.authorityOptions.adapter.listModels({
+            connectionId: selected.binding.connectionId,
+            signal: context.signal,
+          });
+          context.assertCurrent();
+          const exact = models.filter((model) =>
+            model.backendId === provedRoute.backendId
+            && model.requestedModelId === provedRoute.requestedModelId
+            && model.canonicalModelId === provedRoute.canonicalModelId
+            && model.capabilities.textInput
+            && model.capabilities.textOutput
+          );
+          if (exact.length !== 1) throw new ProviderSetupRequiredError();
+        }
         await this.authorityOptions.adapter.bindRuntime({
           connectionId: selected.binding.connectionId,
           generation: result.generation,
           deadlineAt: context.deadlineAt,
           signal: context.signal,
         });
+        context.assertCurrent();
+        this.#adoptExactSessionRoute(provedRoute, true);
       },
     });
+    if (
+      !this.authorityOptions
+      && (startup.mode === "ready" || startup.mode === "ready-with-warning")
+      && startup.defaultRoute?.resolutionState === "resolved"
+    ) {
+      this.#adoptExactSessionRoute(startup.defaultRoute, true);
+    }
+    return startup;
   }
 
   async resolveLegacyDefaultRoute(): Promise<StartupSetupResult> {
@@ -728,6 +810,9 @@ export class DefaultProviderRuntime implements ProviderRuntime {
         }
         return result;
       },
+      cancelSetup: (
+        request: Parameters<SetupOrchestrator["cancelSetup"]>[0],
+      ) => this.orchestrator.cancelSetup(request),
     } as SetupOrchestrator;
     const executeHub = (
       savedSecret: string | null,
@@ -747,8 +832,13 @@ export class DefaultProviderRuntime implements ProviderRuntime {
       expectedRevision,
     });
     const state = this.stateStore.read();
-    const savedBinding = this.#sessionRoute
-      ? selectOpenRouterBinding(state, { kind: "route", route: this.#sessionRoute })
+    const persistedSessionRoute = validateRouteIdentityV1(this.session?.data.route);
+    const desiredSavedRoute = this.#sessionRoute
+      ?? (persistedSessionRoute?.resolutionState === "resolved"
+        ? persistedSessionRoute
+        : null);
+    const savedBinding = desiredSavedRoute
+      ? selectOpenRouterBinding(state, { kind: "route", route: desiredSavedRoute })
       : state.defaultRoute
         ? selectOpenRouterBinding(state, { kind: "default" })
         : selectOpenRouterBinding(state, { kind: "backend", backendId: "openrouter" });
@@ -777,17 +867,20 @@ export class DefaultProviderRuntime implements ProviderRuntime {
       result = await executeHub(null);
     }
     if (result.kind === "ready") {
-      this.#preparedRoles = result.preparedRoles
-        ? structuredClone(result.preparedRoles)
-        : null;
       const nextSessionRoute = activatedRoute
         ?? result.preparedRoles?.lead
         ?? this.#sessionRoute;
-      if (JSON.stringify(nextSessionRoute) !== JSON.stringify(this.#sessionRoute)) {
-        this.#processRouteGeneration += 1;
+      if (nextSessionRoute) {
+        this.#adoptExactSessionRoute(
+          nextSessionRoute,
+          activatedRoute ? activatedPersisted : this.#sessionRoutePersisted,
+          true,
+          activatedRoute !== null,
+        );
       }
-      this.#sessionRoute = nextSessionRoute;
-      if (activatedRoute) this.#sessionRoutePersisted = activatedPersisted;
+      this.#preparedRoles = result.preparedRoles
+        ? structuredClone(result.preparedRoles)
+        : null;
     }
     this.#synchronizeAuthoritativeProviderState();
     return result;
@@ -805,29 +898,146 @@ export class DefaultProviderRuntime implements ProviderRuntime {
     );
   }
 
+  currentSessionRoute(): RouteIdentityV1 {
+    return this.ensureRunnableRoute();
+  }
+
+  adoptSession(session: SessionStore): void {
+    const route = this.ensureRunnableRoute();
+    this.session = session;
+    session.setPreferences(
+      route.requestedModelId,
+      session.data.reasoning ?? getReasoningSetting(this.config),
+      route,
+    );
+  }
+
+  async selectSessionRoute(
+    route: RouteIdentityV1,
+    _surface?: SetupSurface | "plain" | "fullscreen",
+  ): Promise<RouteIdentityV1> {
+    const validated = validateRouteIdentityV1(route);
+    if (
+      !validated
+      || validated.resolutionState !== "resolved"
+      || !validated.canonicalModelId
+    ) {
+      throw new ProviderSetupRequiredError();
+    }
+    const initial = selectOpenRouterBinding(
+      this.stateStore.read(),
+      { kind: "route", route: validated },
+    );
+    if (initial.kind !== "exact") throw new ProviderSetupRequiredError();
+    if (
+      this.#sessionRoute
+      && this.#sessionRoutePersisted
+      && sameExactRoute(this.#sessionRoute, validated)
+    ) {
+      return structuredClone(validated);
+    }
+
+    const controller = new AbortController();
+    const runtimeLease = await this.runtimeGuard.acquire(controller.signal);
+    let primaryFailed = false;
+    try {
+      await runtimeLease.assertHeld();
+      const result = await this.orchestrator.reconnect("openrouter", {
+        connectionId: initial.binding.connectionId,
+        signal: controller.signal,
+      });
+      await runtimeLease.assertHeld();
+      const proved = this.orchestrator.ensureRunnableRoute(validated);
+      if (!sameExactRoute(proved, validated)) throw new ProviderSetupRequiredError();
+      const current = selectOpenRouterBinding(
+        this.stateStore.read(),
+        { kind: "route", route: proved },
+      );
+      if (
+        current.kind !== "exact"
+        || current.binding.connectionId !== initial.binding.connectionId
+      ) {
+        throw new ProviderSetupRequiredError();
+      }
+      const adapter = this.registry.adapter(validated.backendId);
+      const models = await adapter.listModels({
+        connectionId: current.binding.connectionId,
+        signal: controller.signal,
+      });
+      await runtimeLease.assertHeld();
+      const exact = models.filter((model) =>
+        model.backendId === validated.backendId
+        && model.requestedModelId === validated.requestedModelId
+        && model.canonicalModelId === validated.canonicalModelId
+        && model.capabilities.textInput
+        && model.capabilities.textOutput
+      );
+      if (exact.length !== 1 || !adapter.bindRuntime) {
+        throw new ProviderSetupRequiredError();
+      }
+      await adapter.bindRuntime({
+        connectionId: current.binding.connectionId,
+        generation: result.generation,
+        deadlineAt: Date.now() + 5_000,
+        signal: controller.signal,
+      });
+      await runtimeLease.assertHeld();
+      const rebound = selectOpenRouterBinding(
+        this.stateStore.read(),
+        { kind: "route", route: proved },
+      );
+      if (
+        rebound.kind !== "exact"
+        || rebound.binding.connectionId !== current.binding.connectionId
+      ) {
+        throw new ProviderSetupRequiredError();
+      }
+      this.#synchronizeAuthoritativeProviderState();
+      this.#adoptExactSessionRoute(proved, true, false, false, false);
+      return structuredClone(proved);
+    } catch (error) {
+      primaryFailed = true;
+      if (error instanceof ProviderSetupRequiredError) throw error;
+      throw new ProviderSetupRequiredError();
+    } finally {
+      try {
+        await Promise.resolve(runtimeLease.release());
+      } catch (error) {
+        if (!primaryFailed) throw error;
+      }
+    }
+  }
+
   ensureRunnableRoute(): RouteIdentityV1 {
+    const requiredSessionRoute = validateRouteIdentityV1(this.session?.data.route);
+    if (
+      requiredSessionRoute?.resolutionState === "resolved"
+      && !this.#sessionRoute
+    ) {
+      throw new ProviderSetupRequiredError();
+    }
     if (this.#sessionRoute) {
       if (!this.#sessionRoutePersisted) {
         return structuredClone(this.#sessionRoute);
       }
       const state = this.stateStore.read();
-      const current = state.defaultRoute;
       const selected = selectOpenRouterBinding(
         state,
         { kind: "route", route: this.#sessionRoute },
       );
       if (
-        current
-        && selected.kind === "exact"
-        && sameRoute(current, this.#sessionRoute)
-        && current.requestedModelId === this.#sessionRoute.requestedModelId
-        && current.resolutionState === "resolved"
+        selected.kind === "exact"
+        && this.#sessionRoute.resolutionState === "resolved"
+        && this.#sessionRoute.canonicalModelId
       ) {
         return structuredClone(this.#sessionRoute);
       }
       this.#sessionRoute = null;
       this.#sessionRoutePersisted = false;
       this.#processRouteGeneration += 1;
+      if (requiredSessionRoute?.resolutionState === "resolved") {
+        throw new ProviderSetupRequiredError();
+      }
     }
     return this.orchestrator.ensureRunnableRoute();
   }
@@ -964,8 +1174,13 @@ export class DefaultProviderRuntime implements ProviderRuntime {
   }
 
   #selectedOpenRouterConnection(state: ProviderSetupStateV1) {
-    const selected = this.#sessionRoute
-      ? selectOpenRouterBinding(state, { kind: "route", route: this.#sessionRoute })
+    const persistedSessionRoute = validateRouteIdentityV1(this.session?.data.route);
+    const desiredRoute = this.#sessionRoute
+      ?? (persistedSessionRoute?.resolutionState === "resolved"
+        ? persistedSessionRoute
+        : null);
+    const selected = desiredRoute
+      ? selectOpenRouterBinding(state, { kind: "route", route: desiredRoute })
       : state.defaultRoute
         ? selectOpenRouterBinding(state, { kind: "default" })
         : selectOpenRouterBinding(state, { kind: "backend", backendId: "openrouter" });
@@ -1170,10 +1385,7 @@ export class DefaultProviderRuntime implements ProviderRuntime {
         }, lease);
         await lease.assertHeld();
         this.config.providerSetup = requirePersistableProviderState(committed);
-        this.#processRouteGeneration += 1;
-        this.#sessionRoute = structuredClone(route);
-        this.#sessionRoutePersisted = true;
-        this.#preparedRoles = null;
+        this.#adoptExactSessionRoute(route, true, true, true);
         return true;
       },
     );
@@ -1236,7 +1448,8 @@ export class DefaultProviderRuntime implements ProviderRuntime {
     }
 
     if (intent.kind === "reconnect") {
-      const selected = this.#selectedOpenRouterConnection(this.stateStore.read());
+      const reconnectState = this.stateStore.read();
+      const selected = this.#selectedOpenRouterConnection(reconnectState);
       if (!selected) {
         return {
           kind: "reconnected",
@@ -1246,6 +1459,17 @@ export class DefaultProviderRuntime implements ProviderRuntime {
         };
       }
       const controller = new AbortController();
+      const reconnectRoute = this.#sessionRoute
+        && this.#sessionRoute.backendId === selected.backendId
+        && this.#sessionRoute.accountFingerprint === selected.accountFingerprint
+        && this.#sessionRoute.billingRealm === selected.billingRealm
+        ? structuredClone(this.#sessionRoute)
+        : reconnectState.defaultRoute
+          && reconnectState.defaultRoute.backendId === selected.backendId
+          && reconnectState.defaultRoute.accountFingerprint === selected.accountFingerprint
+          && reconnectState.defaultRoute.billingRealm === selected.billingRealm
+          ? structuredClone(reconnectState.defaultRoute)
+          : null;
       const runtimeLease = await this.runtimeGuard.acquire(controller.signal);
       let result: StartupSetupResult;
       let primaryFailed = false;
@@ -1257,10 +1481,21 @@ export class DefaultProviderRuntime implements ProviderRuntime {
         });
         await runtimeLease.assertHeld();
         const adapter = this.registry.adapter("openrouter");
-        if (
-          adapter.bindRuntime
-          && (result.mode === "ready" || result.mode === "ready-with-warning")
-        ) {
+        let provedRoute: RouteIdentityV1 | null = null;
+        if (reconnectRoute?.resolutionState === "resolved") {
+          try {
+            provedRoute = this.orchestrator.ensureRunnableRoute(reconnectRoute);
+          } catch (error) {
+            if (
+              !(error instanceof ProviderSetupRequiredError)
+              && !(typeof error === "object" && error !== null && "code" in error
+                && error.code === "provider-setup-required")
+            ) {
+              throw error;
+            }
+          }
+        }
+        if (adapter.bindRuntime && provedRoute) {
           await adapter.bindRuntime({
             connectionId: selected.id,
             generation: result.generation,
@@ -1268,6 +1503,18 @@ export class DefaultProviderRuntime implements ProviderRuntime {
             signal: controller.signal,
           });
           await runtimeLease.assertHeld();
+          this.#synchronizeAuthoritativeProviderState();
+          this.#adoptExactSessionRoute(provedRoute, true);
+        } else if (
+          reconnectRoute
+          && this.#sessionRoute
+          && sameExactRoute(this.#sessionRoute, reconnectRoute)
+        ) {
+          this.#processRouteGeneration += 1;
+          this.#sessionRoute = null;
+          this.#sessionRoutePersisted = false;
+          this.#preparedRoles = null;
+          this.#synchronizeAuthoritativeProviderState();
         }
       } catch (error) {
         primaryFailed = true;
@@ -1550,52 +1797,79 @@ export class DefaultProviderRuntime implements ProviderRuntime {
     connectionId: string | null,
     confirmationToken: string,
   ): Promise<ProviderCommandResult> {
-    return this.activationCoordinator.runExclusive(
-      { signal: new AbortController().signal, inspectCommitted: false },
-      async (lease) => {
-        await lease.assertHeld();
-        const current = this.stateStore.read();
-        if (!this.#consumeConfirmation(confirmationToken, "logout", current)) {
-          return this.#confirmationRequired("logout", current);
-        }
-        const selected = connectionId === null
-          ? undefined
-          : current.connections.find((candidate) => candidate.id === connectionId);
-        const next = selected?.enabled
-          ? await this.stateStore.commit(current.revision, (authoritative) => ({
-              ...authoritative,
-              lifecycle: "configured",
-              connections: authoritative.connections.map((candidate) =>
-                candidate.id === connectionId ? { ...candidate, enabled: false } : candidate
-              ),
-              defaultRoute: authoritative.defaultRoute
-                && authoritative.defaultRoute.backendId === selected.backendId
-                && authoritative.defaultRoute.accountFingerprint === selected.accountFingerprint
-                && authoritative.defaultRoute.billingRealm === selected.billingRealm
-                ? null
-                : authoritative.defaultRoute,
-              cross: { enabled: false, preferredLead: null, preferredChallenger: null },
-            }))
-          : current;
-        await lease.assertHeld();
-        this.config.providerSetup = requirePersistableProviderState(next);
-        await lease.assertHeld();
-        this.openRouter.forgetKey();
-        this.#processRouteGeneration += 1;
-        this.#sessionRoute = null;
-        this.#sessionRoutePersisted = false;
-        this.#preparedRoles = null;
-        this.environmentSecret = null;
-        await lease.assertHeld();
-        return {
-          kind: "changed",
-          operation: "logout",
-          backendId: "openrouter",
-          setupRequired: next.defaultRoute === null,
-          defaultCleared: current.defaultRoute !== null && next.defaultRoute === null,
-        };
-      },
-    );
+    try {
+      return await this.activationCoordinator.runExclusive(
+        { signal: new AbortController().signal, inspectCommitted: false },
+        async (lease) => {
+          await lease.assertHeld();
+          const current = this.stateStore.read();
+          const authorization = this.#consumeConfirmation(
+            confirmationToken,
+            "logout",
+            current,
+          );
+          if (!authorization) return this.#confirmationRequired("logout", current);
+          const selected = authorization.connection && connectionId === authorization.connection.id
+            ? current.connections.find((candidate) =>
+                candidate.id === authorization.connection!.id
+                && candidate.backendId === "openrouter"
+                && candidate.enabled === authorization.connection!.enabled
+                && candidate.credentialSlot === authorization.connection!.credentialSlot
+                && candidate.accountFingerprint === authorization.connection!.accountFingerprint
+                && candidate.billingRealm === authorization.connection!.billingRealm
+              )
+            : undefined;
+          if (authorization.connection && !selected) {
+            return this.#confirmationRequired("logout", current);
+          }
+          const next = selected
+            ? await this.stateStore.commit(current.revision, (authoritative) => {
+                if (!this.#confirmationMatches(authorization, "logout", authoritative)) {
+                  throw new ProviderConfirmationStaleError(
+                    this.#confirmationRequired("logout", authoritative),
+                  );
+                }
+                return {
+                  ...authoritative,
+                  lifecycle: "configured",
+                  connections: authoritative.connections.map((candidate) =>
+                    candidate.id === selected.id ? { ...candidate, enabled: false } : candidate
+                  ),
+                  defaultRoute: authoritative.defaultRoute
+                    && authoritative.defaultRoute.backendId === selected.backendId
+                    && authoritative.defaultRoute.accountFingerprint === selected.accountFingerprint
+                    && authoritative.defaultRoute.billingRealm === selected.billingRealm
+                    ? null
+                    : authoritative.defaultRoute,
+                  cross: { enabled: false, preferredLead: null, preferredChallenger: null },
+                };
+              })
+            : current;
+          await lease.assertHeld();
+          this.config.providerSetup = requirePersistableProviderState(next);
+          await lease.assertHeld();
+          // A durable Legacy binding reaches this effect only after commit has
+          // adopted and verified its exact readback.
+          this.openRouter.forgetKey();
+          this.#processRouteGeneration += 1;
+          this.#sessionRoute = null;
+          this.#sessionRoutePersisted = false;
+          this.#preparedRoles = null;
+          this.environmentSecret = null;
+          await lease.assertHeld();
+          return {
+            kind: "changed",
+            operation: "logout",
+            backendId: "openrouter",
+            setupRequired: next.defaultRoute === null,
+            defaultCleared: current.defaultRoute !== null && next.defaultRoute === null,
+          };
+        },
+      );
+    } catch (error) {
+      if (error instanceof ProviderConfirmationStaleError) return error.confirmation;
+      throw error;
+    }
   }
 }
 
@@ -2831,7 +3105,7 @@ export async function runCli(
       setReasoningSetting(config, session.data.reasoning);
     }
     config.mainModel = route.requestedModelId;
-    session.setPreferences(config.mainModel, getReasoningSetting(config));
+    session.setPreferences(config.mainModel, getReasoningSetting(config), route);
     if (!agent) {
       agent = await dependencies.createAgent({
         openRouter: providerRuntime.openRouter,
@@ -3993,7 +4267,22 @@ export async function pickDashboardChat(
   context: RuntimeContext,
   preferNew: boolean,
 ): Promise<boolean> {
-  await saveDashboardSessionPreferences(context, ui);
+  let selectedRoute: RouteIdentityV1 | null = null;
+  let previousRoute = validateRouteIdentityV1(context.session.data.route);
+  if (typeof context.providerRuntime.currentSessionRoute === "function") {
+    try {
+      selectedRoute = context.providerRuntime.currentSessionRoute();
+      previousRoute = selectedRoute;
+    } catch (error) {
+      if (
+        !(error instanceof ProviderSetupRequiredError)
+        && !(typeof error === "object" && error !== null && "code" in error
+          && error.code === "provider-setup-required")
+      ) {
+        throw error;
+      }
+    }
+  }
   const migratedConnection = context.providerRuntime.migratedSessionConnection();
   const chats = await SessionStore.list(
     context.workspace,
@@ -4021,10 +4310,6 @@ export async function pickDashboardChat(
   let next: SessionStore;
   if (picked.value === "__new__") {
     next = SessionStore.create(context.workspace, context.session.appHome);
-    next.setPreferences(
-      context.config.mainModel,
-      getReasoningSetting(context.config),
-    );
   } else {
     if (picked.value === context.session.data.id) {
       return false;
@@ -4035,27 +4320,45 @@ export async function pickDashboardChat(
       context.session.appHome,
       migratedConnection,
     );
-    if (next.data.model && next.data.model !== context.config.mainModel) {
+    const historicalRoute = validateRouteIdentityV1(next.data.route);
+    if (historicalRoute?.resolutionState === "resolved") {
+      if (typeof context.providerRuntime.selectSessionRoute !== "function") {
+        throw new ProviderSetupRequiredError();
+      }
+      selectedRoute = await context.providerRuntime.selectSessionRoute(
+        historicalRoute,
+        context.providerRouteSurface,
+      );
+    } else if (next.data.model && next.data.model !== context.config.mainModel) {
       await context.providerRuntime.transitionModel(
         next.data.model,
         undefined,
         context.providerRouteSurface,
       );
-    }
-    if (next.data.model) {
-      context.config.mainModel = next.data.model;
-    }
-    if (next.data.reasoning) {
-      setReasoningSetting(context.config, next.data.reasoning);
+      selectedRoute = typeof context.providerRuntime.currentSessionRoute === "function"
+        ? context.providerRuntime.currentSessionRoute()
+        : historicalRoute;
     }
   }
+
+  await saveDashboardSessionPreferences(context, ui, previousRoute ?? undefined);
+  if (selectedRoute) context.config.mainModel = selectedRoute.requestedModelId;
+  if (next.data.reasoning) {
+    setReasoningSetting(context.config, next.data.reasoning);
+  }
+  next.setPreferences(
+    selectedRoute?.requestedModelId ?? next.data.model ?? context.config.mainModel,
+    getReasoningSetting(context.config),
+    selectedRoute ?? undefined,
+  );
+  if (selectedRoute) context.providerRuntime.adoptSession?.(next);
 
   context.session = next;
   // Reuse the agent: rebuilding it dropped the cached model resolution, the
   // compressor price cache and the undo journal on every chat switch.
   context.agent?.setSession(next);
   context.localRuntime.setSession(next);
-  await saveDashboardSessionPreferences(context, ui);
+  await saveDashboardSessionPreferences(context, ui, selectedRoute ?? undefined);
   await saveConfig(context.config, context.configPath);
   ui.loadTurns(next.recentTurns(VISIBLE_TURNS));
   ui.setStatus(`Chat geöffnet: ${next.data.title}`, false);
@@ -4099,10 +4402,12 @@ function formatChatAge(value: string): string {
 async function saveDashboardSessionPreferences(
   context: RuntimeContext,
   ui?: TerminalUi,
+  route?: RouteIdentityV1,
 ): Promise<void> {
   context.session.setPreferences(
     context.config.mainModel,
     getReasoningSetting(context.config),
+    route,
   );
   reportSaveOutcome(await context.session.save(), ui);
 }

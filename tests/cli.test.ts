@@ -650,6 +650,82 @@ test("dashboard picker opens a second historical chat through the migrated conne
   assert.equal(config.providerSetup.cross.enabled, false);
 });
 
+test("dashboard proves a foreign historical route before current chat, config, or agent mutation", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "orcode-dashboard-foreign-route-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const workspace = join(root, "workspace");
+  const appHome = join(root, ".orcode");
+  const currentRoute = {
+    ...bootstrapRoute("vendor/current"),
+    accountFingerprint: "acct_current_dashboard_111111",
+  } as unknown as NonNullable<ProviderSetupStateV1["defaultRoute"]>;
+  const foreignRoute = {
+    ...bootstrapRoute("vendor/foreign"),
+    accountFingerprint: "acct_foreign_dashboard_222222",
+  } as unknown as NonNullable<ProviderSetupStateV1["defaultRoute"]>;
+  const current = SessionStore.create(workspace, appHome, "Current exact chat");
+  current.setPreferences(currentRoute.requestedModelId, { mode: "auto" }, currentRoute);
+  current.addTurn("user", "current exact turn");
+  await current.save();
+  const currentBytes = await readFile(current.path, "utf8");
+  const historical = SessionStore.create(workspace, appHome, "Foreign exact chat");
+  historical.setPreferences(foreignRoute.requestedModelId, { mode: "auto" }, foreignRoute);
+  historical.addTurn("user", "foreign exact turn");
+  await historical.save();
+
+  const config = structuredClone(DEFAULT_CONFIG);
+  config.mainModel = currentRoute.requestedModelId;
+  const configBefore = structuredClone(config);
+  const routeSelections: Array<Record<string, unknown>> = [];
+  const agentSessions: string[] = [];
+  const localSessions: string[] = [];
+  const runtimeContext = {
+    workspace,
+    configPath: join(appHome, "config.json"),
+    config,
+    session: current,
+    agent: { setSession(next: SessionStore) { agentSessions.push(next.data.id); } },
+    localRuntime: { setSession(next: SessionStore) { localSessions.push(next.data.id); } },
+    providerRuntime: {
+      migratedSessionConnection() { return undefined; },
+      currentSessionRoute() { return structuredClone(currentRoute); },
+      async selectSessionRoute(route: Record<string, unknown>) {
+        routeSelections.push(structuredClone(route));
+        throw Object.assign(new Error("foreign route requires setup"), {
+          code: "provider-setup-required",
+        });
+      },
+      async transitionModel() {
+        throw new Error("foreign route must not transition on the current account");
+      },
+    },
+    providerRouteSurface: "fullscreen",
+  };
+  const ui = {
+    async pickChoice() {
+      return { value: historical.data.id, label: historical.data.title };
+    },
+    addMessage() {},
+    loadTurns() { throw new Error("failed route proof must not load foreign turns"); },
+    setStatus() { throw new Error("failed route proof must not publish a switched status"); },
+  };
+
+  await assert.rejects(
+    pickDashboardChat(ui as never, runtimeContext as never, false),
+    (error: unknown) => Boolean(
+      error && typeof error === "object" && "code" in error
+      && error.code === "provider-setup-required"
+    ),
+  );
+
+  assert.deepEqual(routeSelections, [foreignRoute]);
+  assert.equal(runtimeContext.session, current);
+  assert.deepEqual(runtimeContext.config, configBefore);
+  assert.deepEqual(agentSessions, []);
+  assert.deepEqual(localSessions, []);
+  assert.equal(await readFile(current.path, "utf8"), currentBytes);
+});
+
 test("runCli orders storage, activation recovery, bounded inspection, route proof, agent, and plain UI", async () => {
   const calls: string[] = [];
   const runtime = bootstrapRuntime({ events: calls });
@@ -676,6 +752,40 @@ test("runCli orders storage, activation recovery, bounded inspection, route proo
     "agent:create",
     "plain",
   ]);
+});
+
+test("runCli synchronizes the exact startup route into the current session before agent creation", async () => {
+  const route = {
+    ...bootstrapRoute("vendor/startup-exact"),
+    accountFingerprint: "acct_startup_exact_333333",
+  } as unknown as NonNullable<ProviderSetupStateV1["defaultRoute"]>;
+  const storage = bootstrapStorage();
+  const preferences: unknown[][] = [];
+  (storage as unknown as {
+    session: { setPreferences(...args: unknown[]): void };
+  }).session.setPreferences = ((...args: unknown[]) => {
+    preferences.push(args);
+  });
+  let sessionRouteAtAgentCreation: unknown;
+
+  const exitCode = await invokeRunCli(["--plain"], {
+    initializeStorage: async () => storage,
+    createProviderRuntime: async () => bootstrapRuntime({
+      route: route as unknown as Record<string, unknown>,
+    }),
+    createAgent: async () => {
+      sessionRouteAtAgentCreation = preferences.at(-1)?.[2];
+      return {} as never;
+    },
+    runPlain: async () => undefined,
+    runDashboard: async () => undefined,
+    stdout: { write: () => true },
+    stderr: { write: () => true },
+  });
+
+  assert.equal(exitCode, 0);
+  assert.deepEqual(sessionRouteAtAgentCreation, route);
+  assert.deepEqual(preferences.at(-1), [route.requestedModelId, { mode: "auto" }, route]);
 });
 
 test("runCli opens route choice for a healthy secondary and never silently replaces the degraded default", async () => {
@@ -1883,6 +1993,7 @@ test("the real provider runtime command port fences active runs and keeps Coming
 function providerCommandReviewFixture(options: {
   state?: ProviderSetupStateV1;
   route?: NonNullable<ProviderSetupStateV1["defaultRoute"]>;
+  session?: SessionStore;
 } = {}) {
   const Runtime = (cliModule as unknown as {
     DefaultProviderRuntime: new (...args: unknown[]) => {
@@ -1961,15 +2072,368 @@ function providerCommandReviewFixture(options: {
     null,
     route.requestedModelId,
     config,
+    options.session,
   );
   return {
     runtime,
     stateStore,
+    config,
     route,
     slot,
     effects: () => ({ stateEffects, credentialEffects, runtimeEffects }),
   };
 }
+
+test("credential activation and key replacement synchronize the current session to the exact returned route", () => {
+  const session = SessionStore.create("/synthetic/provider-route-sync", "/synthetic/.orcode");
+  const oldRoute = {
+    ...bootstrapRoute("vendor/old-account"),
+    accountFingerprint: "acct_old_session_111111",
+  } as NonNullable<ProviderSetupStateV1["defaultRoute"]>;
+  session.setPreferences(oldRoute.requestedModelId, { mode: "auto" }, oldRoute);
+  const nextRoute = {
+    ...bootstrapRoute("vendor/new-account"),
+    accountFingerprint: "acct_new_session_222222",
+  } as NonNullable<ProviderSetupStateV1["defaultRoute"]>;
+  const fixture = providerCommandReviewFixture({ route: nextRoute, session });
+
+  fixture.runtime.adoptCredentialActivation(
+    nextRoute as unknown as Record<string, unknown>,
+    true,
+    "replacement-secret",
+  );
+
+  assert.equal(session.data.model, nextRoute.requestedModelId);
+  assert.deepEqual(session.data.route, nextRoute);
+  assert.equal(fixture.config.mainModel, nextRoute.requestedModelId);
+});
+
+test("reconnect synchronizes the current session to the exact rebound route", async () => {
+  const Runtime = (cliModule as unknown as {
+    DefaultProviderRuntime: new (...args: unknown[]) => {
+      execute(intent: Record<string, unknown>, surface: "plain"): Promise<Record<string, unknown>>;
+    };
+  }).DefaultProviderRuntime;
+  const route = {
+    ...bootstrapRoute("vendor/reconnect-exact"),
+    accountFingerprint: "acct_reconnect_exact_333333",
+  } as NonNullable<ProviderSetupStateV1["defaultRoute"]>;
+  const state: ProviderSetupStateV1 = {
+    schemaVersion: 1,
+    revision: 0,
+    lifecycle: "configured",
+    connections: [{
+      id: "reconnect-exact-connection",
+      backendId: "openrouter",
+      enabled: true,
+      maturity: "stable",
+      credentialSlot: "legacy:inference",
+      accountFingerprint: route.accountFingerprint,
+      accountFingerprintState: "verified",
+      billingRealm: "openrouter-payg",
+      lastHealth: null,
+    }],
+    defaultRoute: route,
+    cross: { enabled: false, preferredLead: null, preferredChallenger: null },
+  };
+  const stateStore = new ProviderStateStore(state);
+  const session = SessionStore.create("/synthetic/reconnect-route-sync", "/synthetic/.orcode");
+  const staleRoute = {
+    ...route,
+    requestedModelId: "vendor/stale-session",
+    canonicalModelId: "vendor/stale-session",
+  };
+  session.setPreferences(staleRoute.requestedModelId, { mode: "auto" }, staleRoute);
+  const bindingCalls: unknown[] = [];
+  const config = structuredClone(DEFAULT_CONFIG);
+  config.providerSetup = structuredClone(state);
+  const runtime = new Runtime(
+    {},
+    {},
+    {
+      descriptor() { return { id: "openrouter", displayName: "OpenRouter", maturity: "stable" }; },
+      entries() { return []; },
+      adapter() {
+        return {
+          async bindRuntime(request: unknown) { bindingCalls.push(structuredClone(request)); },
+        };
+      },
+    },
+    stateStore,
+    {
+      async reconnect() {
+        return {
+          mode: "ready",
+          generation: 31,
+          defaultRoute: route,
+          readyRoutes: [route],
+          warnings: [],
+          crossEnabled: false,
+        };
+      },
+      ensureRunnableRoute() { return route; },
+    },
+    {},
+    {
+      async acquire() {
+        return {
+          assertHeld() {},
+          release() {},
+        };
+      },
+      beginRun() { return () => undefined; },
+    },
+    {},
+    "saved-secret",
+    null,
+    route.requestedModelId,
+    config,
+    session,
+  );
+
+  const result = await runtime.execute({ kind: "reconnect", backendId: "openrouter" }, "plain");
+
+  assert.equal(result.kind, "reconnected");
+  assert.equal(bindingCalls.length, 1);
+  assert.equal(session.data.model, route.requestedModelId);
+  assert.deepEqual(session.data.route, route);
+  assert.equal(config.mainModel, route.requestedModelId);
+});
+
+test("historical route selection proves catalogs and binds the exact foreign connection before session adoption", async () => {
+  const Runtime = (cliModule as unknown as {
+    DefaultProviderRuntime: new (...args: unknown[]) => {
+      selectSessionRoute(route: Record<string, unknown>, surface: "plain"): Promise<Record<string, unknown>>;
+      ensureRunnableRoute(): Record<string, unknown>;
+      adoptSession(session: SessionStore): void;
+    };
+  }).DefaultProviderRuntime;
+  const currentRoute = {
+    ...bootstrapRoute("vendor/current-exact"),
+    accountFingerprint: "acct_selection_current_111111",
+  } as unknown as NonNullable<ProviderSetupStateV1["defaultRoute"]>;
+  const foreignRoute = {
+    ...bootstrapRoute("vendor/foreign-exact"),
+    accountFingerprint: "acct_selection_foreign_222222",
+  } as unknown as NonNullable<ProviderSetupStateV1["defaultRoute"]>;
+  const connection = (
+    id: string,
+    route: NonNullable<ProviderSetupStateV1["defaultRoute"]>,
+    slot: string,
+  ) => ({
+    id,
+    backendId: "openrouter" as const,
+    enabled: true,
+    maturity: "stable" as const,
+    credentialSlot: slot,
+    accountFingerprint: route.accountFingerprint,
+    accountFingerprintState: "verified" as const,
+    billingRealm: "openrouter-payg" as const,
+    lastHealth: null,
+  });
+  const initial: ProviderSetupStateV1 = {
+    schemaVersion: 1,
+    revision: 0,
+    lifecycle: "configured",
+    connections: [
+      connection("selection-current", currentRoute, "legacy:inference"),
+      connection(
+        "selection-foreign",
+        foreignRoute,
+        "v1:inference:34343434-3434-4343-8343-343434343434",
+      ),
+    ],
+    defaultRoute: currentRoute,
+    cross: { enabled: false, preferredLead: null, preferredChallenger: null },
+  };
+  const events: string[] = [];
+  const config = structuredClone(DEFAULT_CONFIG);
+  config.mainModel = currentRoute.requestedModelId;
+  config.providerSetup = structuredClone(initial);
+  const originalSession = SessionStore.create("/synthetic/route-selection", "/synthetic/.orcode");
+  originalSession.setPreferences(currentRoute.requestedModelId, { mode: "auto" }, currentRoute);
+  const targetSession = SessionStore.create("/synthetic/route-selection", "/synthetic/.orcode");
+  targetSession.setPreferences(foreignRoute.requestedModelId, { mode: "auto" }, foreignRoute);
+  const runtime = new Runtime(
+    {},
+    {},
+    {
+      descriptor() { return { id: "openrouter", displayName: "OpenRouter", maturity: "stable" }; },
+      entries() { return []; },
+      adapter() {
+        return {
+          async listModels(request: { connectionId?: string }) {
+            events.push(`models:${request.connectionId}`);
+            return [{
+              backendId: "openrouter",
+              requestedModelId: foreignRoute.requestedModelId,
+              canonicalModelId: foreignRoute.canonicalModelId,
+              displayName: "Foreign exact",
+              capabilities: { textInput: true, textOutput: true, tools: true, reasoning: true },
+            }];
+          },
+          async bindRuntime(request: { connectionId: string; generation: number }) {
+            events.push(`bind:${request.connectionId}:${request.generation}`);
+          },
+        };
+      },
+    },
+    new ProviderStateStore(initial),
+    {
+      async reconnect(_backendId: string, options: { connectionId?: string }) {
+        events.push(`reconnect:${options.connectionId}`);
+        return {
+          mode: "route-choice-required",
+          generation: 44,
+          defaultRoute: currentRoute,
+          readyRoutes: [foreignRoute],
+          warnings: [],
+          crossEnabled: false,
+        };
+      },
+      ensureRunnableRoute(route: Record<string, unknown>) {
+        events.push(`prove:${String(route.accountFingerprint)}`);
+        return route;
+      },
+    },
+    {},
+    {
+      async acquire() {
+        return { assertHeld() {}, release() {} };
+      },
+      beginRun() { return () => undefined; },
+    },
+    {},
+    "saved-secret",
+    null,
+    currentRoute.requestedModelId,
+    config,
+    originalSession,
+  );
+
+  const selected = await runtime.selectSessionRoute(
+    foreignRoute as unknown as Record<string, unknown>,
+    "plain",
+  );
+
+  assert.deepEqual(selected, foreignRoute);
+  assert.deepEqual(runtime.ensureRunnableRoute(), foreignRoute);
+  assert.deepEqual(originalSession.data.route, currentRoute);
+  assert.equal(config.mainModel, currentRoute.requestedModelId);
+  runtime.adoptSession(targetSession);
+  assert.deepEqual(targetSession.data.route, foreignRoute);
+  assert.deepEqual(events, [
+    "reconnect:selection-foreign",
+    `prove:${foreignRoute.accountFingerprint}`,
+    "models:selection-foreign",
+    "bind:selection-foreign:44",
+  ]);
+});
+
+test("failed startup proof for a foreign current session cannot fall back to the runnable default account", async () => {
+  const Runtime = (cliModule as unknown as {
+    DefaultProviderRuntime: new (...args: unknown[]) => {
+      inspectStartup(): Promise<Record<string, unknown>>;
+      ensureRunnableRoute(): Record<string, unknown>;
+    };
+  }).DefaultProviderRuntime;
+  const currentRoute = {
+    ...bootstrapRoute("vendor/startup-current"),
+    accountFingerprint: "acct_startup_current_555555",
+  } as unknown as NonNullable<ProviderSetupStateV1["defaultRoute"]>;
+  const foreignRoute = {
+    ...bootstrapRoute("vendor/startup-foreign"),
+    accountFingerprint: "acct_startup_foreign_666666",
+  } as unknown as NonNullable<ProviderSetupStateV1["defaultRoute"]>;
+  const initial: ProviderSetupStateV1 = {
+    schemaVersion: 1,
+    revision: 0,
+    lifecycle: "configured",
+    connections: [
+      {
+        id: "startup-current-connection",
+        backendId: "openrouter",
+        enabled: true,
+        maturity: "stable",
+        credentialSlot: "legacy:inference",
+        accountFingerprint: currentRoute.accountFingerprint,
+        accountFingerprintState: "verified",
+        billingRealm: "openrouter-payg",
+        lastHealth: null,
+      },
+      {
+        id: "startup-foreign-connection",
+        backendId: "openrouter",
+        enabled: true,
+        maturity: "stable",
+        credentialSlot: "v1:inference:56565656-5656-4565-8565-565656565656",
+        accountFingerprint: foreignRoute.accountFingerprint,
+        accountFingerprintState: "verified",
+        billingRealm: "openrouter-payg",
+        lastHealth: null,
+      },
+    ],
+    defaultRoute: currentRoute,
+    cross: { enabled: false, preferredLead: null, preferredChallenger: null },
+  };
+  const session = SessionStore.create("/synthetic/startup-foreign", "/synthetic/.orcode");
+  session.setPreferences(foreignRoute.requestedModelId, { mode: "auto" }, foreignRoute);
+  const stateStore = new ProviderStateStore(initial);
+  const config = structuredClone(DEFAULT_CONFIG);
+  config.providerSetup = structuredClone(initial);
+  const orchestrator = {
+    nextStartupGeneration() { return 1; },
+    async inspectStartup() {
+      return {
+        mode: "ready",
+        generation: 1,
+        defaultRoute: currentRoute,
+        readyRoutes: [currentRoute, foreignRoute],
+        warnings: [],
+        crossEnabled: false,
+      };
+    },
+    ensureRunnableRoute(requested?: Record<string, unknown>) {
+      return requested ?? currentRoute;
+    },
+  };
+  const runtime = new Runtime(
+    {},
+    {},
+    { entries() { return []; } },
+    stateStore,
+    orchestrator,
+    {},
+    { beginRun() { return () => undefined; } },
+    {},
+    "saved-secret",
+    null,
+    currentRoute.requestedModelId,
+    config,
+    session,
+    {
+      credentialAuthority: {},
+      adapter: {
+        async listModels() { return []; },
+        async bindRuntime() { throw new Error("model proof must fail before bind"); },
+      },
+      async recover() {},
+    },
+  );
+
+  const inspected = await runtime.inspectStartup();
+
+  assert.equal(inspected.mode, "setup-required");
+  assert.throws(
+    () => runtime.ensureRunnableRoute(),
+    (error: unknown) => Boolean(
+      error && typeof error === "object" && "code" in error
+      && error.code === "provider-setup-required"
+    ),
+  );
+  assert.deepEqual(session.data.route, foreignRoute);
+  assert.equal(config.mainModel, DEFAULT_CONFIG.mainModel);
+});
 
 test("provider confirmation tokens bind every destructive intent to the exact fenced provider identity", async () => {
   for (const operation of ["disable", "disconnect", "logout"] as const) {
@@ -2355,6 +2819,216 @@ for (const operation of ["disable", "disconnect"] as const) {
     assert.equal(config.providerSetup.connections[0]?.enabled, true);
   });
 }
+
+test("legacy logout rechecks the retained confirmation inside authoritative commit for same-revision replacements", async (t) => {
+  const Runtime = (cliModule as unknown as {
+    DefaultProviderRuntime: new (...args: unknown[]) => {
+      execute(intent: Record<string, unknown>, surface: "plain"): Promise<Record<string, unknown>>;
+    };
+  }).DefaultProviderRuntime;
+  const approvedRoute = {
+    ...bootstrapRoute("vendor/legacy-approved"),
+    accountFingerprint: "acct_legacy_approved_111111",
+  } as NonNullable<ProviderSetupStateV1["defaultRoute"]>;
+  const approved: ProviderSetupStateV1 = {
+    schemaVersion: 1,
+    revision: 0,
+    lifecycle: "configured",
+    connections: [{
+      id: "legacy-authoritative-target",
+      backendId: "openrouter",
+      enabled: true,
+      maturity: "stable",
+      credentialSlot: "legacy:inference",
+      accountFingerprint: approvedRoute.accountFingerprint,
+      accountFingerprintState: "verified",
+      billingRealm: "openrouter-payg",
+      lastHealth: null,
+    }],
+    defaultRoute: approvedRoute,
+    cross: { enabled: false, preferredLead: null, preferredChallenger: null },
+  };
+  const replacements: Array<{ name: string; state: ProviderSetupStateV1 }> = [
+    {
+      name: "fingerprint",
+      state: {
+        ...structuredClone(approved),
+        connections: [{
+          ...approved.connections[0]!,
+          accountFingerprint: "acct_legacy_replacement_222222",
+        }],
+        defaultRoute: {
+          ...approvedRoute,
+          accountFingerprint: "acct_legacy_replacement_222222",
+        },
+      },
+    },
+    {
+      name: "credential slot",
+      state: {
+        ...structuredClone(approved),
+        connections: [{
+          ...approved.connections[0]!,
+          credentialSlot: "v1:inference:12121212-1212-4121-8121-121212121212",
+        }],
+      },
+    },
+    {
+      name: "default route",
+      state: {
+        ...structuredClone(approved),
+        defaultRoute: {
+          ...approvedRoute,
+          requestedModelId: "vendor/legacy-replacement",
+          canonicalModelId: "vendor/legacy-replacement",
+        },
+      },
+    },
+    {
+      name: "backend and billing realm",
+      state: {
+        ...structuredClone(approved),
+        connections: [{
+          ...approved.connections[0]!,
+          backendId: "codex",
+          maturity: "preview",
+          accountFingerprint: "acct_codex_replacement_333333",
+          billingRealm: "chatgpt-account-provider-managed-limits",
+        }],
+        defaultRoute: {
+          ...approvedRoute,
+          backendId: "codex",
+          accountFingerprint: "acct_codex_replacement_333333",
+          billingRealm: "chatgpt-account-provider-managed-limits",
+        },
+      },
+    },
+  ];
+
+  for (const replacement of replacements) {
+    await t.test(replacement.name, async () => {
+      let durable = structuredClone(replacement.state);
+      let buildCalls = 0;
+      let adoptCalls = 0;
+      let runtimeForgets = 0;
+      const stateStore = new ProviderStateStore(approved, {
+        persist: async (request) => {
+          request.assertCurrent();
+          buildCalls += 1;
+          const next = request.build(structuredClone(durable));
+          durable = structuredClone(next);
+          request.adopt(next);
+          adoptCalls += 1;
+          return structuredClone(next);
+        },
+      });
+      const config = structuredClone(DEFAULT_CONFIG);
+      config.providerSetup = structuredClone(approved);
+      const runtime = new Runtime(
+        { forgetKey() { runtimeForgets += 1; } },
+        {},
+        {
+          descriptor() { return { id: "openrouter", displayName: "OpenRouter", maturity: "stable" }; },
+          entries() { return []; },
+        },
+        stateStore,
+        { ensureRunnableRoute: () => approvedRoute },
+        providerCoordinatorMutationFixture(providerRuntimeGuardFixture()),
+        { beginRun() { return () => undefined; } },
+        { async apply() { throw new Error("legacy logout must not call versioned credential cleanup"); } },
+        "legacy-secret",
+        null,
+        approvedRoute.requestedModelId,
+        config,
+      );
+
+      const prompt = await runtime.execute({ kind: "logout", backendId: "openrouter" }, "plain");
+      const result = await runtime.execute({
+        kind: "logout",
+        backendId: "openrouter",
+        confirmationToken: prompt.confirmationToken,
+      }, "plain");
+
+      assert.equal(result.kind, "confirmation-required");
+      assert.notEqual(result.confirmationToken, prompt.confirmationToken);
+      assert.equal(buildCalls, 1);
+      assert.equal(adoptCalls, 0);
+      assert.equal(runtimeForgets, 0);
+      assert.deepEqual(durable, replacement.state);
+      assert.deepEqual(stateStore.read(), approved);
+      assert.deepEqual(config.providerSetup, approved);
+    });
+  }
+});
+
+test("disabled legacy logout forgets runtime only after exact durable commit readback", async () => {
+  const Runtime = (cliModule as unknown as {
+    DefaultProviderRuntime: new (...args: unknown[]) => {
+      execute(intent: Record<string, unknown>, surface: "plain"): Promise<Record<string, unknown>>;
+    };
+  }).DefaultProviderRuntime;
+  const initial: ProviderSetupStateV1 = {
+    schemaVersion: 1,
+    revision: 0,
+    lifecycle: "configured",
+    connections: [{
+      id: "disabled-legacy-readback",
+      backendId: "openrouter",
+      enabled: false,
+      maturity: "stable",
+      credentialSlot: "legacy:inference",
+      accountFingerprint: "acct_disabled_legacy_444444",
+      accountFingerprintState: "verified",
+      billingRealm: "openrouter-payg",
+      lastHealth: null,
+    }],
+    defaultRoute: null,
+    cross: { enabled: false, preferredLead: null, preferredChallenger: null },
+  };
+  const effects: string[] = [];
+  const stateStore = new ProviderStateStore(initial, {
+    persist: async (request) => {
+      request.assertCurrent();
+      effects.push("build");
+      const next = request.build(stateStore.read());
+      effects.push("adopt");
+      request.adopt(next);
+      effects.push("readback");
+      return structuredClone(next);
+    },
+  });
+  const config = structuredClone(DEFAULT_CONFIG);
+  config.providerSetup = structuredClone(initial);
+  const runtime = new Runtime(
+    { forgetKey() { effects.push("runtime-forget"); } },
+    {},
+    {
+      descriptor() { return { id: "openrouter", displayName: "OpenRouter", maturity: "stable" }; },
+      entries() { return []; },
+    },
+    stateStore,
+    { ensureRunnableRoute() { throw new Error("disabled legacy route is not runnable"); } },
+    providerCoordinatorMutationFixture(providerRuntimeGuardFixture()),
+    { beginRun() { return () => undefined; } },
+    { async apply() { throw new Error("legacy logout must not call versioned cleanup"); } },
+    "legacy-secret",
+    null,
+    "vendor/disabled-legacy",
+    config,
+  );
+
+  const prompt = await runtime.execute({ kind: "logout", backendId: "openrouter" }, "plain");
+  const result = await runtime.execute({
+    kind: "logout",
+    backendId: "openrouter",
+    confirmationToken: prompt.confirmationToken,
+  }, "plain");
+
+  assert.equal(result.kind, "changed");
+  assert.deepEqual(effects, ["build", "adopt", "readback", "runtime-forget"]);
+  assert.equal(stateStore.read().connections[0]?.enabled, false);
+  assert.equal(stateStore.read().revision, 1);
+});
 
 for (const phase of ["prepared", "credential-deleted", "shared-reference"] as const) {
   test(`logout rejects same-revision authoritative target replacement in ${phase} phase`, async () => {

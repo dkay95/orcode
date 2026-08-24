@@ -191,6 +191,15 @@ export interface ProviderStartupAttemptInput {
   ): Promise<void>;
 }
 
+export interface SetupCancellationRequest {
+  /** Kept by identity at the caller boundary; never rendered or persisted. */
+  reason: unknown;
+  /** Durable setup state observed before the first interactive prompt. */
+  expectedRevision?: number;
+  /** Whole-startup generation, when cancellation belongs to that attempt. */
+  expectedGeneration?: number;
+}
+
 /** One abortable budget for every startup phase, including recovery. */
 export async function runProviderStartupAttempt(
   input: ProviderStartupAttemptInput,
@@ -374,12 +383,64 @@ export class SetupOrchestrator {
     }
   }
 
-  async cancelSetup(): Promise<StartupSetupResult> {
-    const token = this.#reserveGeneration();
+  async cancelSetup(request: SetupCancellationRequest): Promise<StartupSetupResult> {
+    // Capture before waiting for an activation. A cancellation that began on
+    // older authority must never cancel the state committed by that activation.
+    const captured = this.#stateStore.read();
+    if (
+      request.expectedRevision !== undefined
+      && request.expectedRevision !== captured.revision
+    ) {
+      return this.#latestResult
+        ?? this.#setupRequiredResult(captured, this.#generation);
+    }
+
+    let token: GenerationToken;
+    if (request.expectedGeneration !== undefined) {
+      const expected = request.expectedGeneration;
+      if (
+        !Number.isSafeInteger(expected)
+        || expected < 1
+        || expected < this.#generation
+        || expected < this.#nextGeneration
+      ) {
+        return this.#latestResult
+          ?? this.#setupRequiredResult(captured, this.#generation);
+      }
+      if (this.#currentGeneration) this.#currentGeneration.closed = true;
+      this.#supersedeActiveProbes();
+      this.#generation = expected;
+      this.#nextGeneration = Math.max(this.#nextGeneration, expected);
+      token = { generation: expected, closed: false };
+      this.#currentGeneration = token;
+    } else {
+      token = this.#reserveGeneration();
+    }
     try {
       if (!(await this.#awaitGenerationTurn(token))) return this.#staleResult();
-      const captured = this.#stateStore.read();
-      const state = await this.#commitCancelled(captured, token.generation);
+      const current = this.#stateStore.read();
+      if (
+        current.revision !== captured.revision
+        || JSON.stringify(current) !== JSON.stringify(captured)
+      ) {
+        return this.#latestResult
+          ?? this.#setupRequiredResult(current, token.generation);
+      }
+      let state: ProviderSetupStateV1;
+      try {
+        state = await this.#commitCancelled(captured, token.generation);
+      } catch (error) {
+        const afterFailure = this.#stateStore.read();
+        if (
+          !this.#ownsGeneration(token)
+          || afterFailure.revision !== captured.revision
+          || JSON.stringify(afterFailure) !== JSON.stringify(captured)
+        ) {
+          return this.#latestResult
+            ?? this.#setupRequiredResult(afterFailure, token.generation);
+        }
+        throw error;
+      }
       if (!this.#ownsGeneration(token)) return this.#staleResult();
       const result = this.#setupRequiredResult(state, token.generation);
       this.#latestResult = result;
@@ -392,10 +453,21 @@ export class SetupOrchestrator {
     }
   }
 
-  ensureRunnableRoute(): RouteIdentityV1 {
+  ensureRunnableRoute(requestedRoute?: RouteIdentityV1): RouteIdentityV1 {
     const result = this.#latestResult;
     const state = this.#stateStore.read();
     const current = state.defaultRoute;
+    if (
+      requestedRoute
+      && result
+      && result.generation === this.#generation
+      && this.#currentGeneration?.generation === this.#generation
+      && this.#currentGeneration.closed
+      && isResolvedRoute(requestedRoute)
+      && this.#routeHasProof(requestedRoute, state, result.generation)
+    ) {
+      return structuredClone(requestedRoute);
+    }
     if (
       result
       && result.generation === this.#generation
