@@ -57,18 +57,22 @@ The reviewed public documentation supports these individual seams:
 
 - [Codex authentication](https://learn.chatgpt.com/docs/auth) distinguishes
   ChatGPT subscription login from API-key authentication, documents browser
-  and device-code login, and states that the CLI caches one local login's
-  details in a file or operating-system credential store.
+  and device-code login, documents `cli_auth_credentials_store` for selecting
+  file or operating-system credential-store caching, and describes a fallback
+  that copies one `auth.json` cache to a headless Codex environment.
 - [Codex basic configuration](https://learn.chatgpt.com/docs/config-file/config-basic)
-  documents the user configuration surface used to require protected
-  credential storage and isolated runtime settings.
+  documents configuration layers, their precedence, and named configuration
+  profiles selected with `--profile`. It does not describe those profiles as
+  authentication identities or account pools.
 - [Codex pricing](https://learn.chatgpt.com/docs/pricing) documents that Codex
   is included in eligible ChatGPT plans, that limits are shared and
   task-dependent, and that API-key use is separately usage-based.
 - [The Codex app-server protocol](https://learn.chatgpt.com/docs/app-server)
   documents `account/login/start`, `account/read`,
   `account/rateLimits/read`, rate-limit notifications, typed turn errors,
-  thread start/resume, and turn lifecycle events.
+  thread start/resume, turn lifecycle events, and the experimental
+  `chatgptAuthTokens` mode for a host application that already owns the user's
+  ChatGPT authentication lifecycle.
 - [The OpenAI API overview](https://developers.openai.com/api/reference/overview)
   documents API keys and optional Organization and Project routing headers.
   API usage is attributed to that API organization/project route, not to a
@@ -86,16 +90,40 @@ runtime. They are not evidence of a provider-supported pool.
 
 ### 2.2 What the public documentation does not promise
 
-As of 2026-08-24, the reviewed public OpenAI documentation exposes no contract
-for any of the following:
+Two documented authentication seams must not be mistaken for pooling support:
+
+- Codex authentication describes copying a single `auth.json` cache from a
+  browser-capable machine to a trusted headless Codex environment, while
+  warning that the file contains access tokens and must be treated like a
+  password.
+- The app-server protocol describes experimental `chatgptAuthTokens` for a
+  host application that already owns the user's ChatGPT authentication
+  lifecycle, supplies the access token and account identifier, and services
+  token-refresh requests.
+
+Those are documented credential-portability and host-owned-auth seams for
+their stated contexts. Neither is a contract for multi-account subscription
+pooling, subscription handoff, or account rotation. As of 2026-08-24, the
+reviewed public OpenAI documentation exposes no contract for any of the
+following:
 
 - aggregating or pooling multiple personal ChatGPT subscriptions;
 - automatically rotating among personal subscription accounts;
 - transferring a live provider turn, thread, token, cache, or entitlement
   between accounts;
-- reading, exporting, or reusing a Codex login token in another runtime;
+- using credential portability or externally managed tokens to construct a
+  multi-account subscription pool, handoff, or rotation mechanism;
 - treating a configuration profile as an authentication pool;
 - lending one person's subscription access to collaborators or remote users.
+
+Orcode deliberately excludes both documented credential seams from this
+feature as a stricter security and product choice. Owner subscription handoff
+never reads, copies, imports, or exports `auth.json`; never supplies or
+refreshes ChatGPT tokens through `chatgptAuthTokens`; and never converts either
+seam into an enrollment shortcut. Every profile instead completes its own
+Codex-managed browser or device-code login in its isolated runtime. This is an
+Orcode restriction, not a claim that the two seams are absent from the
+official documentation.
 
 Absence of a documented contract is not permission. Orcode therefore names
 this feature **owner subscription handoff**, keeps every switch explicit, and
@@ -459,6 +487,14 @@ sanitized account readiness. It does not scrape a browser, intercept a
 redirect, parse the CLI's credential file, read process memory, or copy a token
 from another Codex installation.
 
+The official authentication documentation's headless `auth.json` copy
+fallback and the app-server's experimental `chatgptAuthTokens` mode are
+recognized but intentionally unavailable to this feature. Orcode neither
+copies/imports the cache nor takes ownership of the ChatGPT authentication
+lifecycle or acts as a token-refresh broker. Each profile must use the managed
+login seams above; documented credential portability does not become multi-
+account handoff authority.
+
 ### 6.2 One isolated Codex home per profile
 
 Every subscription profile gets a canonical, private, Orcode-owned Codex home
@@ -467,10 +503,11 @@ runtime launches with only that home and the profile-specific configuration.
 It does not inherit global login state, plugins, configuration, shell
 credential variables, or an ambient `OPENAI_API_KEY`.
 
-The Codex credential store is configured with the documented
-`cli_auth_credentials_store = "keyring"` setting where the supported runtime
-offers that option. Provider credentials remain owned and refreshed by Codex.
-Orcode persists only the non-secret binding metadata in section 5.
+The Codex credential store is configured with the
+[`cli_auth_credentials_store = "keyring"`](https://learn.chatgpt.com/docs/auth#credential-storage)
+setting documented by Codex authentication where the supported runtime offers
+that option. Provider credentials remain owned and refreshed by Codex. Orcode
+persists only the non-secret binding metadata in section 5.
 
 The profile home and all parents must be canonical, owner-only, non-symlinked,
 non-networked paths. The runtime, config, keyring namespace, and executable are
@@ -1372,6 +1409,11 @@ gate is green for an exact Codex version and operating system.
   `UsageLimitExceeded`, turn terminal events, thread start/resume, and logout.
 - Assert that local CLI help still exposes the intended device-login seam and
   never infer a native pool from `--profile`.
+- Recognize the documented headless `auth.json` copy fallback and experimental
+  app-server `chatgptAuthTokens` mode, then prove that this feature rejects
+  both, including externally managed token-refresh requests. The gate records
+  this as Orcode policy and never as evidence that the seams are undocumented
+  or that they authorize subscription pooling or handoff.
 - Contract fixtures contain synthetic typed metadata only, never captured
   credentials or production account payloads.
 
@@ -1545,6 +1587,8 @@ This design does not provide:
   for collaborators, teams, tenants, customers, or anonymous users;
 - token extraction, import, export, copying, decryption, comparison, or manual
   paste;
+- the documented headless `auth.json` cache-copy fallback or experimental
+  app-server `chatgptAuthTokens` mode for owner subscription handoff;
 - browser cookie reuse or reuse of the user's global Codex credential store;
 - a claim that configuration profiles are account profiles;
 - handoff for `profile_only`, unknown, stale, same-account, incomparable-
@@ -1574,8 +1618,12 @@ This specification intentionally leaves no implementation-driving TBD:
   owner-only handoff around documented individual login and runtime seams.
 - **Can `--profile` select accounts safely?** Not by itself. Independent homes
   and keyring namespaces must be proven per platform/version.
-- **Can Orcode copy a login between profiles?** No. Every profile uses its own
-  official login.
+- **Do documented `auth.json` copying or experimental `chatgptAuthTokens`
+  authorize this handoff?** No. They are real credential-portability and
+  host-owned-auth seams, but Orcode excludes both from this feature as a
+  stricter security and product rule. Neither is a contract for multi-account
+  subscription pooling, handoff, or rotation. Every profile uses its own
+  Codex-managed official login.
 - **Can a 429 trigger the prompt?** No. Section 8.3 requires typed,
   corroborated exhaustion evidence.
 - **Can a reached preflight trigger the prompt?** No. Without a terminally
