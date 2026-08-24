@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { readFileSync } from "node:fs";
+import { readFileSync, writeFileSync } from "node:fs";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -6039,6 +6039,132 @@ test("restart recovery derives inspection credentials only from the recovered ve
   assert.equal(recovered.reference === "legacy:inference" ? recovered.reference : recovered.reference.id, newSlot);
   assert.equal(recovered.stored.kind, "present");
   assert.equal(recovered.environment, null);
+});
+
+test("first-run cancellation initializes an absent config with the exact committed provider state", async () => {
+  const persist = (cliModule as typeof cliModule & {
+    persistProviderSetupState?: (
+      path: string,
+      request: ProviderStateCommitRequest,
+    ) => Promise<ProviderSetupStateV1>;
+  }).persistProviderSetupState;
+  assert.equal(typeof persist, "function");
+
+  const directory = await mkdtemp(join(tmpdir(), "orcode-provider-first-cancel-"));
+  const path = join(directory, "config.json");
+  const initial = structuredClone(DEFAULT_CONFIG.providerSetup) as ProviderSetupStateV1;
+  const stateStore = new ProviderStateStore(initial, {
+    persist: (request) => persist!(path, request),
+  });
+
+  const committed = await stateStore.commit(initial.revision, (current) => ({
+    ...current,
+    lifecycle: "cancelled",
+  }));
+  const disk = JSON.parse(await readFile(path, "utf8")) as typeof DEFAULT_CONFIG;
+  const expected = structuredClone(DEFAULT_CONFIG);
+  expected.providerSetup = structuredClone(committed);
+
+  assert.equal(committed.revision, initial.revision + 1);
+  assert.equal(committed.lifecycle, "cancelled");
+  assert.deepEqual(stateStore.read(), committed);
+  assert.deepEqual(disk, expected);
+});
+
+test("first-run absent provider commit cannot replace a config created at the final publication fence", async () => {
+  const persist = (cliModule as typeof cliModule & {
+    persistProviderSetupState?: (
+      path: string,
+      request: ProviderStateCommitRequest,
+    ) => Promise<ProviderSetupStateV1>;
+  }).persistProviderSetupState;
+  assert.equal(typeof persist, "function");
+
+  const directory = await mkdtemp(join(tmpdir(), "orcode-provider-first-race-"));
+  const path = join(directory, "config.json");
+  const initial = structuredClone(DEFAULT_CONFIG.providerSetup) as ProviderSetupStateV1;
+  const candidate = { ...initial, revision: 1, lifecycle: "cancelled" as const };
+  const foreign = { ...structuredClone(DEFAULT_CONFIG), mainModel: "foreign/owner" };
+  const foreignRaw = `${JSON.stringify(foreign, null, 2)}\n`;
+  let assertions = 0;
+  let adopted = false;
+
+  await assert.rejects(
+    persist!(path, {
+      expectedRevision: initial.revision,
+      assertCurrent() {
+        assertions += 1;
+        if (assertions === 4) {
+          writeFileSync(path, foreignRaw, {
+            encoding: "utf8",
+            mode: 0o600,
+            flag: "wx",
+          });
+        }
+      },
+      build(current) {
+        assert.deepEqual(current, initial);
+        return candidate;
+      },
+      adopt() {
+        adopted = true;
+      },
+    }),
+    /Provider state publication failed/,
+  );
+
+  assert.equal(assertions, 4);
+  assert.equal(await readFile(path, "utf8"), foreignRaw);
+  assert.equal(adopted, false);
+});
+
+test("first-run absent provider commit preserves a config created by a final-fence abort", async () => {
+  const persist = (cliModule as typeof cliModule & {
+    persistProviderSetupState?: (
+      path: string,
+      request: ProviderStateCommitRequest,
+    ) => Promise<ProviderSetupStateV1>;
+  }).persistProviderSetupState;
+  assert.equal(typeof persist, "function");
+
+  const directory = await mkdtemp(join(tmpdir(), "orcode-provider-first-abort-"));
+  const path = join(directory, "config.json");
+  const initial = structuredClone(DEFAULT_CONFIG.providerSetup) as ProviderSetupStateV1;
+  const candidate = { ...initial, revision: 1, lifecycle: "cancelled" as const };
+  const foreign = { ...structuredClone(DEFAULT_CONFIG), mainModel: "foreign/abort-owner" };
+  const foreignRaw = `${JSON.stringify(foreign, null, 2)}\n`;
+  const reason = new DOMException("fixed first-run publication abort", "AbortError");
+  let assertions = 0;
+  let adopted = false;
+
+  await assert.rejects(
+    persist!(path, {
+      expectedRevision: initial.revision,
+      assertCurrent() {
+        assertions += 1;
+        if (assertions === 4) {
+          writeFileSync(path, foreignRaw, {
+            encoding: "utf8",
+            mode: 0o600,
+            flag: "wx",
+          });
+          throw reason;
+        }
+      },
+      build(current) {
+        assert.deepEqual(current, initial);
+        return candidate;
+      },
+      adopt() {
+        adopted = true;
+      },
+    }),
+    /Provider state publication failed/,
+  );
+
+  assert.equal(assertions, 4);
+  assert.equal(await readFile(path, "utf8"), foreignRaw);
+  assert.equal(adopted, false);
 });
 
 test("startup durable provider commits preserve every unrelated config byte under exact revision CAS", async () => {

@@ -53,6 +53,7 @@ import {
 } from "./commands.js";
 import {
   APP_HOME,
+  DEFAULT_CONFIG,
   assertConfigFileSnapshot,
   consumeConfigWarning,
   configPath,
@@ -63,6 +64,7 @@ import {
   readConfigFileSnapshot,
   saveConfig,
   withConfigWriteLock,
+  writeFileAtomicCreateSecure,
   writeFileAtomicSecure,
   type OrcodeConfigWithBudget,
 } from "./config.js";
@@ -3139,12 +3141,12 @@ async function persistProviderSetupStateOwned(
     await ownership.assertHeld();
     const target = await readConfigFileSnapshot(ownership.canonicalPath);
     await ownership.assertHeld();
-    if (target.kind !== "file") {
-      throw new Error("Provider state publication requires an initialized config.");
-    }
+    const raw = target.kind === "file"
+      ? target.raw
+      : `${JSON.stringify(DEFAULT_CONFIG, null, 2)}\n`;
     let parsed: unknown;
     try {
-      parsed = JSON.parse(target.raw);
+      parsed = JSON.parse(raw);
     } catch {
       throw new Error("Provider state publication requires a valid config.");
     }
@@ -3157,7 +3159,7 @@ async function persistProviderSetupStateOwned(
     if (current.revision !== request.expectedRevision) {
       throw new Error("Provider state publication revision is stale.");
     }
-    const span = findStartupTopLevelJsonValue(target.raw, "providerSetup");
+    const span = findStartupTopLevelJsonValue(raw, "providerSetup");
     if (!span) {
       throw new Error("Provider state publication requires an exact config field.");
     }
@@ -3173,12 +3175,15 @@ async function persistProviderSetupStateOwned(
     ) {
       throw new Error("Provider state publication candidate is invalid.");
     }
-    const nextRaw = `${target.raw.slice(0, span.start)}${JSON.stringify(candidate)}${target.raw.slice(span.end)}`;
+    const nextRaw = `${raw.slice(0, span.start)}${JSON.stringify(candidate)}${raw.slice(span.end)}`;
     request.assertCurrent();
     await ownership.assertHeld();
     let writeError: unknown;
     try {
-      await writeFileAtomicSecure(
+      const publish = target.kind === "absent"
+        ? writeFileAtomicCreateSecure
+        : writeFileAtomicSecure;
+      await publish(
         ownership.canonicalPath,
         nextRaw,
         async () => {

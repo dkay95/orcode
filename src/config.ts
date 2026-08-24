@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import {
   chmod,
+  link,
   mkdir,
   readFile,
   rename,
@@ -400,6 +401,46 @@ export async function writeFileAtomicSecure(
       throw new Error("Atomic write beforeRename fence must be synchronous.");
     }
     await rename(temporary, path);
+  } catch (error) {
+    await unlink(temporary).catch(() => {});
+    throw error;
+  }
+  try {
+    await chmod(path, SECURE_FILE_MODE);
+  } catch (error) {
+    if (!hasCode(error, "ENOENT")) {
+      throw error;
+    }
+  }
+}
+
+/**
+ * Atomically publishes one newly created secure file without ever replacing an
+ * existing target. The hard-link publish is the create-only CAS: if another
+ * writer creates `path` after the last snapshot fence, `link` fails with
+ * `EEXIST` and leaves those foreign bytes untouched.
+ */
+export async function writeFileAtomicCreateSecure(
+  path: string,
+  content: string,
+  beforePublish?: () => Promise<void>,
+  beforeLink?: () => void,
+): Promise<void> {
+  await ensureSecureDirectory(dirname(path));
+  const temporary = `${path}.${randomUUID()}.tmp`;
+  try {
+    await writeFile(temporary, content, {
+      encoding: "utf8",
+      mode: SECURE_FILE_MODE,
+      flag: "wx",
+    });
+    await beforePublish?.();
+    const finalFenceResult: unknown = beforeLink?.();
+    if (finalFenceResult !== undefined) {
+      throw new Error("Atomic create beforeLink fence must be synchronous.");
+    }
+    await link(temporary, path);
+    await unlink(temporary);
   } catch (error) {
     await unlink(temporary).catch(() => {});
     throw error;
