@@ -1449,12 +1449,19 @@ test("candidate authority stays owned through connect and catalog", async (t) =>
       const config = structuredClone(DEFAULT_CONFIG);
       config.mainModel = MODEL;
       config.providerSetup = stateStore.read();
+      const setupOrchestrator = new SetupOrchestrator({
+        registry,
+        stateStore,
+        activationCoordinator: {
+          async activate() { throw new Error("activation must not run"); },
+        },
+      });
       const runtime = new Runtime(
         {} as never,
         credentials,
         registry,
         stateStore,
-        { async activateCandidate() { throw new Error("activation must not run"); } },
+        setupOrchestrator,
         coordinator,
         { beginRun() { return () => undefined; } },
         { async apply() { return { kind: "unchanged" }; } },
@@ -1660,12 +1667,19 @@ test("candidate inspection reuses its held authority lease without nested acquis
   const config = structuredClone(DEFAULT_CONFIG);
   config.mainModel = MODEL;
   config.providerSetup = stateStore.read();
+  const setupOrchestrator = new SetupOrchestrator({
+    registry,
+    stateStore,
+    activationCoordinator: {
+      async activate() { throw new Error("activation must not run"); },
+    },
+  });
   const runtime = new Runtime(
     observed.service,
     credentials,
     registry,
     stateStore,
-    { async activateCandidate() { throw new Error("activation must not run"); } },
+    setupOrchestrator,
     coordinator,
     { beginRun() { return () => undefined; } },
     { async apply() { return { kind: "unchanged" }; } },
