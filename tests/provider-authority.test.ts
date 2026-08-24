@@ -37,6 +37,7 @@ import {
   type ProviderAuthorityCoordinator,
   type ProviderConnectionBindingV1,
   type ProviderConnectionBindingV2,
+  type ProviderCredentialRequest,
   selectProviderBinding,
 } from "../src/provider-authority.js";
 
@@ -3779,10 +3780,20 @@ function kimiState(slot = KIMI_SLOT): ProviderSetupStateV2 {
 test("Kimi authority binds the literal Kimi slot only inside its callback and never consults OpenRouter environment", async () => {
   const kimiSecret = "fixture-kimi-membership-key-not-a-real-secret";
   const credentials = new AuthorityCredentials({}, { [KIMI_SLOT]: kimiSecret });
+  let openRouterEnvironmentReads = 0;
+  const environment = new Proxy({} as Record<string, string | undefined>, {
+    get(_target, property) {
+      if (property === "OPENROUTER_API_KEY") {
+        openRouterEnvironmentReads += 1;
+        throw new Error("Kimi must not inspect OpenRouter environment");
+      }
+      return undefined;
+    },
+  });
   const authority = realAuthority({
     stateStore: new ProviderStateStore(kimiState()),
     credentials,
-    environment: { OPENROUTER_API_KEY: SECRET_A },
+    environment,
   });
   let binding: ProviderConnectionBindingV2 | null = null;
   let observedInsideCallback: readonly string[] = [];
@@ -3802,6 +3813,7 @@ test("Kimi authority binds the literal Kimi slot only inside its callback and ne
   assert.deepEqual(result, { kind: "available", value: "used" });
   assert.deepEqual(observedInsideCallback, [`read:${KIMI_SLOT}`]);
   assert.deepEqual(credentials.effects, [`read:${KIMI_SLOT}`]);
+  assert.equal(openRouterEnvironmentReads, 0);
   assert.deepEqual(binding, {
     version: 2,
     stateRevision: 4,
@@ -3823,3 +3835,78 @@ test("generic selection rejects a Kimi connection whose slot kind belongs to Ope
   });
   assert.deepEqual(selected, { kind: "invalid-pointer" });
 });
+
+test("Kimi exact authority tuple mutations fence publication", async (t) => {
+  const mutations: Readonly<Record<string, (state: ProviderSetupStateV2) => ProviderSetupStateV2>> = {
+    revision: (state) => state,
+    connection: (state) => ({
+      ...state,
+      connections: [{ ...state.connections[0]!, id: "kimi-replaced" }],
+    }),
+    fingerprint: (state) => ({
+      ...state,
+      connections: [{ ...state.connections[0]!, accountFingerprint: "acct_kimi_changed" }],
+      defaultRoute: { ...state.defaultRoute!, accountFingerprint: "acct_kimi_changed" },
+    }),
+    realm: (state) => ({
+      ...state,
+      connections: [{
+        ...state.connections[0]!,
+        backendId: "openrouter",
+        maturity: "stable",
+        credentialSlot: "v1:inference:018f8d77-2d52-7cc0-8f6a-9fb1f3fc0712",
+        billingRealm: "openrouter-payg",
+      }],
+      defaultRoute: {
+        ...state.defaultRoute!,
+        backendId: "openrouter",
+        billingRealm: "openrouter-payg",
+      },
+    }),
+    slot: (state) => ({
+      ...state,
+      connections: [{
+        ...state.connections[0]!,
+        credentialSlot: "v1:kimi-code:018f8d77-2d52-7cc0-8f6a-9fb1f3fc0712",
+      }],
+    }),
+  };
+  for (const [name, mutate] of Object.entries(mutations)) {
+    await t.test(name, async () => {
+      const stateStore = new ProviderStateStore(kimiState());
+      const authority = realAuthority({
+        stateStore,
+        credentials: new AuthorityCredentials({}, { [KIMI_SLOT]: "fixture-kimi-membership-key-not-a-real-secret" }),
+      });
+      let published = false;
+      const result = await authority.withCredential({
+        backendId: "kimi-code",
+        connectionId: "kimi-main",
+        purpose: "runtime-bind",
+        environmentEligibility: "forbidden",
+        deadlineAt: NOW + 5_000,
+        signal: new AbortController().signal,
+      }, async (_secret, context) => {
+        const current = stateStore.read();
+        stateStore.replace(mutate(current), current.revision);
+        await context.publishIfCurrent(() => { published = true; });
+      });
+      assert.deepEqual(result, { kind: "stale" });
+      assert.equal(published, false);
+    });
+  }
+});
+
+// Kimi requests must never be able to opt into an environment credential at
+// the type boundary. Removing the discriminated request union must make this
+// negative contract fail TypeScript compilation.
+// @ts-expect-error Kimi has no environment-credential eligibility modes.
+const KIMI_ENVIRONMENT_REQUEST_MUST_NOT_TYPECHECK: ProviderCredentialRequest = {
+  backendId: "kimi-code",
+  connectionId: "kimi-main",
+  purpose: "runtime-bind",
+  environmentEligibility: "automatic-if-no-saved",
+  deadlineAt: NOW + 5_000,
+  signal: new AbortController().signal,
+};
+void KIMI_ENVIRONMENT_REQUEST_MUST_NOT_TYPECHECK;

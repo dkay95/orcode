@@ -63,6 +63,22 @@ const MODEL: BackendModelDescriptor = Object.freeze({
     reasoning: true,
   },
 });
+const KIMI_MODEL: BackendModelDescriptor = Object.freeze({
+  ...MODEL,
+  backendId: "kimi-code",
+  requestedModelId: "kimi-for-coding",
+  canonicalModelId: "kimi-for-coding",
+  displayName: "Kimi for Coding",
+});
+const KIMI_OLD_SLOT: CredentialSlotRef = Object.freeze({
+  version: 1,
+  kind: "kimi-code",
+  id: "v1:kimi-code:00000000-0000-4000-8000-000000000041",
+});
+const KIMI_SECRET = "fixture-kimi-membership-key-not-a-real-secret";
+const KIMI_CONNECTION_ID = "kimi-main";
+const KIMI_FINGERPRINT = "acct_local_kimi";
+const KIMI_REALM = "kimi-code-membership-provider-managed-overage" as const;
 
 const boundaries = [
   "candidate-validated",
@@ -290,6 +306,52 @@ class FakeAdapter {
       accountFingerprint: NEW_FINGERPRINT,
       billingRealm: "openrouter-payg",
       route,
+    };
+  }
+
+  async discardCandidate(candidateId: string): Promise<void> {
+    this.calls.push("discardCandidate");
+    this.candidates.delete(candidateId);
+  }
+}
+
+class FakeKimiAdapter {
+  readonly backendId = "kimi-code" as const;
+  readonly candidates = new Map<string, string>();
+  readonly calls: string[] = [];
+  candidateCounter = 0;
+
+  async connect(request: { candidate: unknown; generation: number; signal: AbortSignal }): Promise<ProviderCandidate> {
+    this.calls.push("connect");
+    const candidateId = `kimi-candidate-${++this.candidateCounter}`;
+    this.candidates.set(candidateId, request.candidate as string);
+    return {
+      candidateId,
+      backendId: "kimi-code",
+      connectionId: KIMI_CONNECTION_ID,
+      accountFingerprint: KIMI_FINGERPRINT,
+      billingRealm: KIMI_REALM,
+      health: healthy(request.generation),
+    };
+  }
+
+  async listModels(request: { candidateId?: string; signal: AbortSignal }): Promise<readonly BackendModelDescriptor[]> {
+    assert.equal(this.candidates.has(request.candidateId ?? ""), true);
+    this.calls.push("listModels");
+    return [KIMI_MODEL];
+  }
+
+  async activate(request: { candidateId: string; model: BackendModelDescriptor; signal: AbortSignal }): Promise<CandidateProviderState> {
+    assert.equal(this.candidates.has(request.candidateId), true);
+    assert.equal(request.model.backendId, "kimi-code");
+    this.calls.push("activate");
+    return {
+      candidateId: request.candidateId,
+      backendId: "kimi-code",
+      connectionId: KIMI_CONNECTION_ID,
+      accountFingerprint: KIMI_FINGERPRINT,
+      billingRealm: KIMI_REALM,
+      route: kimiActivationRoute(),
     };
   }
 
@@ -2832,6 +2894,39 @@ test("targeted replacement rejects duplicate account realm identity in both conn
   }
 });
 
+function kimiActivationRoute(): RouteIdentityV1 {
+  return {
+    version: 1,
+    backendId: "kimi-code",
+    accountFingerprint: KIMI_FINGERPRINT,
+    billingRealm: KIMI_REALM,
+    requestedModelId: KIMI_MODEL.requestedModelId,
+    canonicalModelId: KIMI_MODEL.canonicalModelId,
+    resolutionState: "resolved",
+  };
+}
+
+function kimiActivationState(): ProviderSetupStateV2 {
+  return {
+    schemaVersion: 2,
+    revision: 3,
+    lifecycle: "configured",
+    connections: [{
+      id: KIMI_CONNECTION_ID,
+      backendId: "kimi-code",
+      enabled: true,
+      maturity: "preview",
+      credentialSlot: KIMI_OLD_SLOT.id,
+      accountFingerprint: KIMI_FINGERPRINT,
+      accountFingerprintState: "verified",
+      billingRealm: KIMI_REALM,
+      lastHealth: null,
+    }],
+    defaultRoute: kimiActivationRoute(),
+    cross: { enabled: false, preferredLead: null, preferredChallenger: null },
+  };
+}
+
 function providerState(
   oldSlot: CredentialSlotRef | "legacy:inference" | null,
 ): ProviderSetupStateV2 {
@@ -3028,4 +3123,112 @@ test("activation journal v2 carries an exact Kimi backend and Kimi credential sl
     candidateProviderSetupSha256: "2".repeat(64),
   };
   assert.equal(journal.credentialSlotKind, journal.backendId);
+});
+
+test("activation pins one verified adapter instance for the entire transaction", async () => {
+  const fixture = await activationFixture();
+  const first = new FakeAdapter();
+  const second = new FakeAdapter();
+  let resolverCalls = 0;
+  const coordinator = new fixture.api.ProviderActivationCoordinator({
+    appHome: fixture.appHome,
+    configPath: fixture.path,
+    privateStore: fixture.privateStore,
+    credentials: fixture.credentials,
+    adapterResolver: () => {
+      resolverCalls += 1;
+      return resolverCalls === 1 ? first : second;
+    },
+    stateStore: fixture.stateStore,
+    runtimeGuard: fixture.runtimeGuard,
+    now: () => 10_000,
+    createUuid: sequentialUuid(),
+    leaseDurationMs: 100,
+    waitForLease: async () => new Promise<void>((resolve) => setImmediate(resolve)),
+  });
+
+  const result = await coordinator.activate(fixture.request);
+
+  assert.equal(result.persisted, true);
+  assert.equal(resolverCalls, 1);
+  assert.deepEqual(second.calls, []);
+});
+
+test("activation deadline settles despite a runtime guard that ignores its signal and publishes nothing", async () => {
+  const fixture = await activationFixture();
+  const beforeConfig = await readFile(fixture.path, "utf8");
+  const coordinator = new fixture.api.ProviderActivationCoordinator({
+    appHome: fixture.appHome,
+    configPath: fixture.path,
+    privateStore: fixture.privateStore,
+    credentials: fixture.credentials,
+    adapterResolver: () => fixture.adapter,
+    stateStore: fixture.stateStore,
+    runtimeGuard: {
+      acquire: async () => new Promise<RuntimeLease>(() => undefined),
+    },
+    now: () => 10_000,
+    createUuid: sequentialUuid(),
+    leaseDurationMs: 100,
+  });
+
+  const started = Date.now();
+  await assert.rejects(
+    coordinator.activate({ ...fixture.request, deadlineAt: 10_020 }),
+    (error: unknown) => typeof error === "object" && error !== null
+      && "code" in error && error.code === "provider-activation-deadline",
+  );
+
+  assert.ok(Date.now() - started < 500, "deadline must bound an abort-ignoring runtime acquire");
+  assert.equal(await readFile(fixture.path, "utf8"), beforeConfig);
+  assert.equal(fixture.credentials.calls.includes("reserveSlot"), false);
+});
+
+test("Kimi persisted activation writes and publishes one exact v2 Kimi tuple through a Kimi resolver", async () => {
+  const appHome = await mkdtemp(join(tmpdir(), "orcode-kimi-activation-"));
+  const configPath = join(appHome, "config.json");
+  const oldState = kimiActivationState();
+  await saveConfig({ ...structuredClone(DEFAULT_CONFIG), providerSetup: oldState }, configPath);
+  const credentials = new FakeCredentials(null);
+  credentials.slots.set(KIMI_OLD_SLOT.id, OLD_SECRET);
+  const adapter = new FakeKimiAdapter();
+  const resolverArguments: string[] = [];
+  const activationModule = await import("../src/provider-activation.js");
+  const coordinator = new activationModule.ProviderActivationCoordinator({
+    appHome,
+    configPath,
+    privateStore: new PrivateStore({ root: appHome }),
+    credentials,
+    adapterResolver: (backendId) => {
+      resolverArguments.push(backendId);
+      assert.equal(backendId, "kimi-code");
+      return adapter;
+    },
+    stateStore: new ProviderStateStore(oldState),
+    runtimeGuard: new FakeRuntimeGuard(),
+    now: () => 10_000,
+    createUuid: sequentialUuid(),
+    leaseDurationMs: 100,
+  });
+
+  const result = await coordinator.activate({
+    backendId: "kimi-code",
+    expectedRevision: oldState.revision,
+    candidate: KIMI_SECRET,
+    expectedRequestedModelId: KIMI_MODEL.requestedModelId,
+    selectedCanonicalModelId: KIMI_MODEL.canonicalModelId,
+    generation: 4,
+    signal: new AbortController().signal,
+    deadlineAt: Number.MAX_SAFE_INTEGER,
+    persistence: "persisted",
+  });
+
+  assert.equal(result.persisted, true);
+  assert.deepEqual(resolverArguments, ["kimi-code"]);
+  assert.equal(result.route.backendId, "kimi-code");
+  assert.equal(result.route.billingRealm, KIMI_REALM);
+  assert.equal(result.state?.connections[0]?.credentialSlot.startsWith("v1:kimi-code:"), true);
+  assert.equal(adapter.calls.includes("activate"), true);
+  const loaded = await loadConfigDetailed(configPath);
+  assert.equal((loaded.config.providerSetup as ProviderSetupStateV2).connections[0]?.backendId, "kimi-code");
 });

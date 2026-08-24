@@ -121,16 +121,26 @@ export interface ProviderAuthorityCoordinator {
   ): Promise<T>;
 }
 
-export interface ProviderCredentialRequest {
-  backendId: "openrouter" | "kimi-code";
+interface ProviderCredentialRequestBase {
   connectionId: string;
-  credentialKind?: CredentialKind;
   purpose: CredentialAccessPurpose;
-  environmentEligibility: EnvironmentEligibility;
   allowDisabled?: boolean;
   deadlineAt: number;
   signal: AbortSignal;
 }
+
+/** Kimi has no environment or management credential path. */
+export type ProviderCredentialRequest =
+  | (ProviderCredentialRequestBase & {
+    backendId: "openrouter";
+    credentialKind?: CredentialKind;
+    environmentEligibility: EnvironmentEligibility;
+  })
+  | (ProviderCredentialRequestBase & {
+    backendId: "kimi-code";
+    credentialKind?: "inference";
+    environmentEligibility: "forbidden";
+  });
 
 export interface ProviderCredentialUseContext {
   source: "saved" | "environment";
@@ -469,6 +479,11 @@ export class ProviderCredentialAuthority implements ProviderCredentialAuthorityL
     }
     const binding = selected.binding;
     if (binding.backendId !== request.backendId) return { kind: "stale" };
+    if (request.backendId === "kimi-code"
+      && (request.environmentEligibility !== "forbidden"
+        || (request as { credentialKind?: CredentialKind }).credentialKind === "management")) {
+      return { kind: "invalid-pointer" };
+    }
     if (request.credentialKind === "management" && binding.backendId !== "openrouter") {
       return { kind: "invalid-pointer" };
     }
@@ -609,18 +624,12 @@ export class ProviderCredentialAuthority implements ProviderCredentialAuthorityL
       }
       return;
     }
-    const current = await this.#readPermitUnderLease({
-      backendId: expected.binding.backendId,
-      connectionId: expected.binding.connectionId,
-      credentialKind: "inference",
-      purpose: "explicit-repair",
-      environmentEligibility: expected.source === "environment"
-        ? "explicit-repair"
-        : "forbidden",
-      allowDisabled: !expected.binding.enabled,
-      deadlineAt: request.deadlineAt,
-      signal: request.signal,
-    }, lease);
+    const binding = expected.binding;
+    if (!binding) throw new ProviderAuthorityStaleError();
+    const current = await this.#readPermitUnderLease(
+      this.#revalidationRequest({ ...expected, binding }, request),
+      lease,
+    );
     if (
       !("secret" in current)
       || current.source !== expected.source
@@ -671,18 +680,13 @@ export class ProviderCredentialAuthority implements ProviderCredentialAuthorityL
     if (selected.kind !== "exact" || !sameBinding(selected.binding, expected.binding)) {
       throw new ProviderAuthorityStaleError();
     }
-    const current = await this.#readInferencePermit({
-      backendId: expected.binding.backendId,
-      connectionId: expected.binding.connectionId,
-      credentialKind: "inference",
-      purpose: "explicit-repair",
-      environmentEligibility: expected.source === "environment"
-        ? "explicit-repair"
-        : "forbidden",
-      allowDisabled: !expected.binding.enabled,
-      deadlineAt: request.deadlineAt,
-      signal: request.signal,
-    }, selected.binding, state);
+    const binding = expected.binding;
+    if (!binding) throw new ProviderAuthorityStaleError();
+    const current = await this.#readInferencePermit(
+      this.#revalidationRequest({ ...expected, binding }, request),
+      selected.binding,
+      state,
+    );
     if (
       !("secret" in current)
       || current.source !== expected.source
@@ -702,6 +706,29 @@ export class ProviderCredentialAuthority implements ProviderCredentialAuthorityL
       binding: proof.binding ? structuredClone(proof.binding) : null,
     });
     return permit;
+  }
+
+  #revalidationRequest(
+    expected: CandidateCredentialProof & { binding: ProviderConnectionBindingV2 },
+    request: ProviderCandidatePreflightRequest,
+  ): ProviderCredentialRequest {
+    const base = {
+      connectionId: expected.binding.connectionId,
+      credentialKind: "inference" as const,
+      purpose: "explicit-repair" as const,
+      allowDisabled: !expected.binding.enabled,
+      deadlineAt: request.deadlineAt,
+      signal: request.signal,
+    };
+    return expected.binding.backendId === "kimi-code"
+      ? { ...base, backendId: "kimi-code", environmentEligibility: "forbidden" }
+      : {
+        ...base,
+        backendId: "openrouter",
+        environmentEligibility: expected.source === "environment"
+          ? "explicit-repair"
+          : "forbidden",
+      };
   }
 
   #candidateFingerprint(secret: string): string {

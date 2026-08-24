@@ -308,11 +308,26 @@ export class ProviderActivationCoordinator {
   }
 
   async activate(request: ProviderActivationRequest): Promise<ProviderActivationResult> {
+    const deadline = this.#activationDeadline(request);
+    request = { ...request, signal: deadline.signal };
     this.#assertActivationAttemptCurrent(request);
+    // Candidate IDs belong to one adapter instance. Pin a verified resolver
+    // result before any activation lease, credential, or config mutation.
+    let adapter: ActivationAdapter | BackendAdapter;
+    try {
+      adapter = this.#adapterFor(request.backendId);
+    } catch (error) {
+      deadline.dispose();
+      throw error;
+    }
     let runtimeLease: ProviderActivationRuntimeLease;
     try {
-      runtimeLease = await this.#options.runtimeGuard.acquire(request.signal);
+      runtimeLease = await this.#awaitActivation(
+        request,
+        () => this.#options.runtimeGuard.acquire(request.signal),
+      );
     } catch (error) {
+      deadline.dispose();
       if (isAbort(error, request.signal)) throw abortFrom(request.signal);
       throw new ProviderActivationError(
         "provider-runtime-not-idle",
@@ -339,7 +354,10 @@ export class ProviderActivationCoordinator {
           : new ProviderActivationRecoveryRequiredError();
       }
       await this.#assertMutationAllowed(providerLease, runtimeLease, true, request.signal);
-      const preflight = await readConfigFacts(this.#options.configPath);
+      const preflight = await this.#awaitActivation(
+        request,
+        () => readConfigFacts(this.#options.configPath),
+      );
       if (preflight.kind !== "valid" && preflight.kind !== "absent") {
         throw new ProviderActivationRecoveryRequiredError("provider-config-unreadable");
       }
@@ -358,17 +376,17 @@ export class ProviderActivationCoordinator {
         request.generation,
         request.signal,
         request.targetConnectionId,
-        request.backendId,
+        adapter,
       );
       if (candidate.backendId !== request.backendId || candidate.billingRealm !== policy.billingRealm) {
         throw new ProviderActivationError("provider-candidate-backend-mismatch", "Provider candidate backend is invalid.");
       }
       initialCandidateId = candidate.candidateId;
-      await this.#boundary("candidate-validated");
+      await this.#awaitActivation(request, () => this.#boundary("candidate-validated"));
       await this.#assertMutationAllowed(providerLease, runtimeLease, true, request.signal);
       assertNoRetainedIdentityCollision(preflight.state, candidate);
-      const models = await this.#listModels(candidate.candidateId, request.signal, request.backendId);
-      await this.#boundary("models-loaded");
+      const models = await this.#listModels(candidate.candidateId, request.signal, adapter);
+      await this.#awaitActivation(request, () => this.#boundary("models-loaded"));
       const selectedModel = selectExplicitModel(
         models,
         request.expectedRequestedModelId,
@@ -376,7 +394,7 @@ export class ProviderActivationCoordinator {
         request.backendId,
       );
       const candidateRoute = routeForCandidate(candidate, selectedModel);
-      await this.#boundary("model-selected");
+      await this.#awaitActivation(request, () => this.#boundary("model-selected"));
 
       if (request.persistence === "process-only") {
         await this.#assertMutationAllowed(providerLease, runtimeLease, true, request.signal);
@@ -385,10 +403,13 @@ export class ProviderActivationCoordinator {
           candidate.candidateId,
           selectedModel,
           request.signal,
+          adapter,
         );
         await assertRuntimeLease(runtimeLease);
         await this.#assertFence(providerLease);
         assertActivatedRoute(candidateRoute, activated);
+        // Runtime activation may already have published process state. Preserve
+        // the exact completion path if caller cancellation arrives after it.
         await this.#boundary("runtime-activated");
         return {
           persisted: false,
@@ -400,7 +421,10 @@ export class ProviderActivationCoordinator {
 
       await this.#assertFence(providerLease);
       await assertRuntimeLease(runtimeLease);
-      const configFacts = await readConfigFacts(this.#options.configPath);
+      const configFacts = await this.#awaitActivation(
+        request,
+        () => readConfigFacts(this.#options.configPath),
+      );
       if (configFacts.kind !== "valid" && configFacts.kind !== "absent") {
         throw new ProviderActivationRecoveryRequiredError("provider-config-unreadable");
       }
@@ -457,32 +481,38 @@ export class ProviderActivationCoordinator {
       };
       await this.#assertMutationAllowed(providerLease, runtimeLease, true, request.signal);
       transaction = await this.#createJournal(manifest, providerLease);
-      await this.#boundary("journal-written");
+      await this.#awaitActivation(request, () => this.#boundary("journal-written"));
 
       try {
         await this.#assertMutationAllowed(providerLease, runtimeLease, true, request.signal);
-        await this.#options.credentials.writeSlot(candidateSlot, normalized);
+        await this.#awaitActivation(
+          request,
+          () => this.#options.credentials.writeSlot(candidateSlot, normalized),
+        );
         await this.#assertFence(providerLease);
-        await this.#boundary("slot-written");
+        await this.#awaitActivation(request, () => this.#boundary("slot-written"));
         await this.#assertFence(providerLease);
-        const readback = await this.#options.credentials.readSlot(candidateSlot);
+        const readback = await this.#awaitActivation(
+          request,
+          () => this.#options.credentials.readSlot(candidateSlot),
+        );
         await this.#assertFence(providerLease);
         if (readback !== normalized) {
           throw new ProviderActivationRecoveryRequiredError("provider-candidate-readback-mismatch");
         }
-        await this.#boundary("slot-readback");
+        await this.#awaitActivation(request, () => this.#boundary("slot-readback"));
         await this.#assertFence(providerLease);
         const revalidated = await this.#connectCandidate(
           readback,
           request.generation,
           request.signal,
           candidate.connectionId,
-          request.backendId,
+          adapter,
         );
         revalidatedCandidateId = revalidated.candidateId;
         assertSameCandidate(candidate, revalidated);
         await this.#assertFence(providerLease);
-        await this.#boundary("candidate-revalidated");
+        await this.#awaitActivation(request, () => this.#boundary("candidate-revalidated"));
       } catch (error) {
         if (isBoundaryFault(error)) throw error;
         if (error instanceof ProviderActivationRecoveryRequiredError) throw error;
@@ -513,6 +543,7 @@ export class ProviderActivationCoordinator {
           candidate.candidateId,
           selectedModel,
           request.signal,
+          adapter,
         );
         await assertRuntimeLease(runtimeLease);
         await this.#assertFence(providerLease);
@@ -604,6 +635,8 @@ export class ProviderActivationCoordinator {
             await this.#assertFence(providerLease!);
             await assertRuntimeLease(runtimeLease);
             await ownership.assertHeld();
+            // A callback here may observe the just-published file. Do not let
+            // caller cancellation detach that durable tuple before readback.
             await this.#boundary("config-written");
             await ownership.assertHeld();
             await this.#assertFence(providerLease!);
@@ -664,7 +697,12 @@ export class ProviderActivationCoordinator {
       // finish adopting that exact tuple instead of exposing a detached half
       // commit. Provider/runtime ownership failures still fail closed below.
       const committedSignal = new AbortController().signal;
-      await this.#boundary("config-readback");
+      const committedRequest: ProviderActivationRequest = {
+        ...request,
+        signal: committedSignal,
+        deadlineAt: Number.MAX_SAFE_INTEGER,
+      };
+      await this.#awaitActivation(committedRequest, () => this.#boundary("config-readback"));
       manifest.phase = "config-committed";
       await this.#assertMutationAllowed(providerLease, runtimeLease, true, committedSignal);
       await this.#writeJournal(transaction, manifest, providerLease);
@@ -681,6 +719,7 @@ export class ProviderActivationCoordinator {
           revalidatedCandidateId ?? candidate.candidateId,
           selectedModel,
           committedSignal,
+          adapter,
         );
         await assertRuntimeLease(runtimeLease);
         await this.#assertFence(providerLease);
@@ -689,7 +728,7 @@ export class ProviderActivationCoordinator {
         if (error instanceof ProviderActivationRecoveryRequiredError) throw error;
         throw new ProviderActivationRecoveryRequiredError("provider-runtime-bind-ambiguous");
       }
-      await this.#boundary("runtime-activated");
+      await this.#awaitActivation(committedRequest, () => this.#boundary("runtime-activated"));
       const warnings: string[] = [];
       const oldCleaned = await this.#cleanupPreviousSlot(
         previousSlot,
@@ -698,7 +737,7 @@ export class ProviderActivationCoordinator {
         providerLease,
       );
       if (!oldCleaned) warnings.push("provider-candidate-cleanup-retained");
-      await this.#boundary("old-slot-cleaned");
+      await this.#awaitActivation(committedRequest, () => this.#boundary("old-slot-cleaned"));
       if (oldCleaned) {
         await this.#assertMutationAllowed(providerLease, runtimeLease, true, committedSignal);
         await this.#removeJournal(transaction, providerLease);
@@ -716,10 +755,12 @@ export class ProviderActivationCoordinator {
       throw error;
     } finally {
       if (initialCandidateId) {
-        await this.#adapterFor(request.backendId).discardCandidate(initialCandidateId).catch(() => undefined);
+        const candidateId = initialCandidateId;
+        await Promise.resolve().then(() => adapter.discardCandidate(candidateId)).catch(() => undefined);
       }
       if (revalidatedCandidateId) {
-        await this.#adapterFor(request.backendId).discardCandidate(revalidatedCandidateId).catch(() => undefined);
+        const candidateId = revalidatedCandidateId;
+        await Promise.resolve().then(() => adapter.discardCandidate(candidateId)).catch(() => undefined);
       }
       if (!simulatedCrash) {
         let releaseFailed = false;
@@ -742,6 +783,7 @@ export class ProviderActivationCoordinator {
         }
       }
       void transaction;
+      deadline.dispose();
     }
   }
 
@@ -962,6 +1004,9 @@ export class ProviderActivationCoordinator {
     }
     const transaction = journals[0]!;
     const manifest = transaction.manifest;
+    // Recovery has the same adapter-instance boundary as a new activation:
+    // resolve once before reading or changing a journal tuple.
+    const adapter = this.#adapterFor(manifest.backendId);
     const facts = await readConfigFacts(this.#options.configPath);
     await this.#assertFence(lease);
     if (facts.kind !== "valid" && facts.kind !== "absent") {
@@ -1028,7 +1073,7 @@ export class ProviderActivationCoordinator {
       manifest.expectedRevision + 1,
       request.signal,
       manifest.candidateConnectionId,
-      manifest.backendId,
+      adapter,
     );
     try {
       await assertRuntimeLease(runtimeLease);
@@ -1037,7 +1082,7 @@ export class ProviderActivationCoordinator {
         || candidate.billingRealm !== manifest.candidateRoute.billingRealm) {
         throw new ProviderActivationRecoveryRequiredError("provider-candidate-identity-mismatch");
       }
-      const models = await this.#listModels(candidate.candidateId, request.signal, manifest.backendId);
+      const models = await this.#listModels(candidate.candidateId, request.signal, adapter);
       await assertRuntimeLease(runtimeLease);
       const model = models.find((entry) =>
         entry.backendId === manifest.backendId
@@ -1052,14 +1097,14 @@ export class ProviderActivationCoordinator {
       await this.#removeJournal(transaction, lease);
       await assertRuntimeLease(runtimeLease);
       try {
-        const activated = await this.#activateRuntime(candidate.candidateId, model, request.signal);
+        const activated = await this.#activateRuntime(candidate.candidateId, model, request.signal, adapter);
         await assertRuntimeLease(runtimeLease);
         assertActivatedRoute(manifest.candidateRoute, activated);
       } catch {
         throw new ProviderActivationRecoveryRequiredError("provider-runtime-bind-ambiguous");
       }
     } finally {
-      await this.#adapterFor(manifest.backendId).discardCandidate(candidate.candidateId).catch(() => undefined);
+      await Promise.resolve().then(() => adapter.discardCandidate(candidate.candidateId)).catch(() => undefined);
     }
     return Object.freeze([]);
   }
@@ -1068,24 +1113,24 @@ export class ProviderActivationCoordinator {
     secret: string,
     generation: number,
     signal: AbortSignal,
-    connectionId?: string,
-    backendId: "openrouter" | "kimi-code" = "openrouter",
+    connectionId: string | undefined,
+    adapter: ActivationAdapter | BackendAdapter,
   ): Promise<ProviderCandidate> {
     try {
       const candidate = await abortableDependency(
-        () => this.#adapterFor(backendId).connect({
+        () => adapter.connect({
           ...(connectionId ? { connectionId } : {}),
           candidate: secret,
           generation,
           signal,
         }),
         signal,
-        (lateCandidate) => this.#adapterFor(backendId)
-          .discardCandidate(lateCandidate.candidateId)
+        (lateCandidate) => Promise.resolve()
+          .then(() => adapter.discardCandidate(lateCandidate.candidateId))
           .catch(() => undefined),
       );
-      const policy = requireActivationPolicy(backendId);
-      if (candidate.backendId !== backendId
+      const policy = requireActivationPolicy(adapter.backendId as "openrouter" | "kimi-code");
+      if (candidate.backendId !== adapter.backendId
         || candidate.billingRealm !== policy.billingRealm
         || candidate.health.credential !== "valid"
         || candidate.health.connectivity !== "connected"
@@ -1106,11 +1151,11 @@ export class ProviderActivationCoordinator {
   async #listModels(
     candidateId: string,
     signal: AbortSignal,
-    backendId: "openrouter" | "kimi-code" = "openrouter",
+    adapter: ActivationAdapter | BackendAdapter,
   ): Promise<readonly BackendModelDescriptor[]> {
     try {
       return await abortableDependency(
-        () => this.#adapterFor(backendId).listModels({ candidateId, signal }),
+        () => adapter.listModels({ candidateId, signal }),
         signal,
       );
     } catch (error) {
@@ -1126,13 +1171,15 @@ export class ProviderActivationCoordinator {
     candidateId: string,
     model: BackendModelDescriptor,
     signal: AbortSignal,
+    adapter: ActivationAdapter | BackendAdapter,
   ): Promise<CandidateProviderState> {
     try {
       throwIfAborted(signal);
       // Runtime activation can publish process state. Once invoked it must
       // settle while Runtime -> Provider ownership remains held; abort may be
       // observed by the adapter but must never detach its publication promise.
-      return await this.#adapterFor(model.backendId as "openrouter" | "kimi-code").activate({ candidateId, model, signal });
+      if (model.backendId !== adapter.backendId) throw new Error("adapter-model-mismatch");
+      return await adapter.activate({ candidateId, model, signal });
     } catch (error) {
       if (isAbort(error, signal)) throw abortFrom(signal);
       throw new ProviderActivationError(
@@ -1281,7 +1328,7 @@ export class ProviderActivationCoordinator {
         "Provider candidate authority is unavailable.",
       );
     }
-    const result = await validate.call(
+    const result = await this.#awaitActivation(request, () => validate.call(
       this.#options.candidateAuthority,
       {
         deadlineAt: request.deadlineAt,
@@ -1297,7 +1344,7 @@ export class ProviderActivationCoordinator {
           request.signal,
         ),
       },
-    );
+    ));
     if (result.kind !== "ready") {
       throw new ProviderActivationError(
         "provider-candidate-authority-stale",
@@ -1322,7 +1369,7 @@ export class ProviderActivationCoordinator {
         "Provider candidate authority is unavailable.",
       );
     }
-    const result = await validate.call(
+    const result = await this.#awaitActivation(request, () => validate.call(
       this.#options.candidateAuthority,
       {
         deadlineAt: request.deadlineAt,
@@ -1340,7 +1387,7 @@ export class ProviderActivationCoordinator {
           request.signal,
         ),
       },
-    );
+    ));
     if (result.kind !== "ready") {
       throw new ProviderActivationError(
         "provider-candidate-authority-stale",
@@ -1435,6 +1482,39 @@ export class ProviderActivationCoordinator {
     } catch {
       throw new ProviderActivationRecoveryRequiredError("provider-adapter-unavailable");
     }
+  }
+
+  #activationDeadline(request: ProviderActivationRequest): {
+    signal: AbortSignal;
+    dispose(): void;
+  } {
+    const controller = new AbortController();
+    const remaining = Math.max(0, request.deadlineAt - this.#leaseNow());
+    const abort = () => controller.abort(new ProviderActivationError(
+      "provider-activation-deadline",
+      "Provider activation deadline expired.",
+    ));
+    const timer = remaining <= 0x7fff_ffff ? setTimeout(abort, remaining) : null;
+    const relayAbort = () => controller.abort(request.signal.reason);
+    request.signal.addEventListener("abort", relayAbort, { once: true });
+    if (request.signal.aborted) relayAbort();
+    return {
+      signal: controller.signal,
+      dispose: () => {
+        if (timer !== null) clearTimeout(timer);
+        request.signal.removeEventListener("abort", relayAbort);
+      },
+    };
+  }
+
+  async #awaitActivation<T>(
+    request: ProviderActivationRequest,
+    operation: () => Promise<T>,
+  ): Promise<T> {
+    this.#assertActivationAttemptCurrent(request);
+    const value = await abortableDependency(operation, request.signal);
+    this.#assertActivationAttemptCurrent(request);
+    return value;
   }
 
   async #waitForLease(signal: AbortSignal): Promise<void> {
@@ -2119,30 +2199,49 @@ function parseLegacyOpenRouterJournalV1(
   value: Record<string, unknown>,
   transactionId: string,
 ): ProviderActivationJournalV1 | null {
-  try {
-    validateJournalV1(value, transactionId);
-    const candidateSlot = parseCredentialSlot(value.candidateSlot);
-    const previousSlot = parsePreviousSlot(value.previousSlot, "openrouter");
-    const candidateRoute = parseStrictRoute(value.candidateRoute);
-    if (!candidateSlot || candidateSlot.kind !== "inference" || previousSlot === undefined
-      || !candidateRoute || candidateRoute.backendId !== "openrouter"
-      || candidateRoute.billingRealm !== "openrouter-payg") return null;
-    return {
-      version: 1, transactionId, expectedRevision: Number(value.expectedRevision),
-      phase: value.phase as ProviderActivationJournalV1["phase"], backendId: "openrouter",
-      candidateSlot, previousSlot, candidateConnectionId: String(value.candidateConnectionId),
-      candidateRoute, expectedProviderSetupSha256: String(value.expectedProviderSetupSha256),
-      candidateProviderSetupSha256: String(value.candidateProviderSetupSha256),
-    };
-  } catch { return null; }
+  if (!isFrozenOpenRouterJournalV1Shape(value, transactionId)) return null;
+  const candidateSlot = parseFrozenOpenRouterInferenceSlotV1(value.candidateSlot);
+  const previousSlot = parseFrozenOpenRouterPreviousSlotV1(value.previousSlot);
+  const candidateRoute = parseFrozenOpenRouterRouteV1(value.candidateRoute);
+  if (!candidateSlot || previousSlot === undefined || !candidateRoute) return null;
+  return {
+    version: 1,
+    transactionId,
+    expectedRevision: value.expectedRevision,
+    phase: value.phase,
+    backendId: "openrouter",
+    candidateSlot,
+    previousSlot,
+    candidateConnectionId: value.candidateConnectionId,
+    candidateRoute,
+    expectedProviderSetupSha256: value.expectedProviderSetupSha256,
+    candidateProviderSetupSha256: value.candidateProviderSetupSha256,
+  };
 }
 
 function validateJournal(value: ProviderActivationJournal, transactionId: string): void {
-  if (value.version === 1) validateJournalV1(value, transactionId);
-  else validateJournalV2(value, transactionId);
+  if (value.version === 1) {
+    if (!isRecord(value) || !parseLegacyOpenRouterJournalV1(value, transactionId)) {
+      throw new Error("invalid-provider-activation-journal");
+    }
+    return;
+  }
+  validateJournalV2(value, transactionId);
 }
 
-function validateJournalV1(value: unknown, transactionId: string): asserts value is ProviderActivationJournalV1 {
+function isFrozenOpenRouterJournalV1Shape(
+  value: Record<string, unknown>,
+  transactionId: string,
+): value is Record<string, unknown> & {
+  version: 1;
+  transactionId: string;
+  expectedRevision: number;
+  phase: ProviderActivationJournalV1["phase"];
+  backendId: "openrouter";
+  candidateConnectionId: string;
+  expectedProviderSetupSha256: string;
+  candidateProviderSetupSha256: string;
+} {
   if (!isRecord(value)
     || !exactKeys(value, [
       "version",
@@ -2167,18 +2266,62 @@ function validateJournalV1(value: unknown, transactionId: string): asserts value
       && value.phase !== "credential-staged"
       && value.phase !== "config-committed")
     || value.backendId !== "openrouter"
-    || !isInferenceSlot(value.candidateSlot)
-    || parsePreviousSlot(value.previousSlot, "openrouter") === undefined
     || typeof value.candidateConnectionId !== "string"
     || value.candidateConnectionId.length === 0
     || value.candidateConnectionId.length > 256
-    || parseStrictRoute(value.candidateRoute)?.backendId !== "openrouter"
     || typeof value.expectedProviderSetupSha256 !== "string"
     || !/^[0-9a-f]{64}$/.test(value.expectedProviderSetupSha256)
     || typeof value.candidateProviderSetupSha256 !== "string"
-    || !/^[0-9a-f]{64}$/.test(value.candidateProviderSetupSha256)) {
-    throw new Error("invalid-provider-activation-journal");
+    || !/^[0-9a-f]{64}$/.test(value.candidateProviderSetupSha256)) return false;
+  return true;
+}
+
+function parseFrozenOpenRouterInferenceSlotV1(value: unknown): CredentialSlotRef | null {
+  if (!isRecord(value)
+    || !exactKeys(value, ["version", "kind", "id"])
+    || value.version !== 1
+    || value.kind !== "inference"
+    || typeof value.id !== "string"
+    || !value.id.startsWith("v1:inference:")
+    || !CANONICAL_UUID.test(value.id.slice("v1:inference:".length))) return null;
+  return Object.freeze({ version: 1 as const, kind: "inference" as const, id: value.id });
+}
+
+function parseFrozenOpenRouterPreviousSlotV1(
+  value: unknown,
+): ProviderActivationJournalV1["previousSlot"] | undefined {
+  if (value === null) return null;
+  const slot = parseFrozenOpenRouterInferenceSlotV1(value);
+  if (slot) return slot;
+  if (isRecord(value)
+    && exactKeys(value, ["version", "kind", "id"])
+    && value.version === 0
+    && value.kind === "inference"
+    && value.id === "legacy:inference") {
+    return { version: 0, kind: "inference", id: "legacy:inference" };
   }
+  return undefined;
+}
+
+function parseFrozenOpenRouterRouteV1(value: unknown): RouteIdentityV1 | null {
+  if (!isRecord(value)
+    || !exactKeys(value, ["version", "backendId", "accountFingerprint", "billingRealm", "requestedModelId", "canonicalModelId", "resolutionState"])
+    || value.version !== 1
+    || value.backendId !== "openrouter"
+    || value.billingRealm !== "openrouter-payg"
+    || value.resolutionState !== "resolved"
+    || typeof value.accountFingerprint !== "string" || value.accountFingerprint.length > 512
+    || typeof value.requestedModelId !== "string" || value.requestedModelId.length > 512
+    || typeof value.canonicalModelId !== "string" || value.canonicalModelId.length > 512) return null;
+  return {
+    version: 1,
+    backendId: "openrouter",
+    accountFingerprint: value.accountFingerprint,
+    billingRealm: "openrouter-payg",
+    requestedModelId: value.requestedModelId,
+    canonicalModelId: value.canonicalModelId,
+    resolutionState: "resolved",
+  };
 }
 
 function validateJournalV2(value: unknown, transactionId: string): asserts value is ProviderActivationJournalV2 {
@@ -2245,10 +2388,6 @@ function parsePreviousSlot(
     return { version: 0, kind: "inference", id: "legacy:inference" };
   }
   return undefined;
-}
-
-function isInferenceSlot(value: unknown): boolean {
-  return parseCredentialSlot(value)?.kind === "inference";
 }
 
 function parseStrictRoute(value: unknown): RouteIdentityV1 | null {
