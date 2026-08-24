@@ -548,3 +548,130 @@ Files changed by this round:
 - this report
 
 No global/full `npm test` was run, per the integrated-review constraint.
+
+## Integrated release closure — process-only reconciliation and first-run publication ownership
+
+This closure continued from committed Integrated Fix Round 2 at
+`32066c8b7c35d0da7361b456e0bd6a2fc2e65edc` and froze the production/test state
+at `900b33d419665fe34b4ad28513cf1ef09836244e`. Scope remained OpenRouter Stable
+provider startup only. Kimi, subscription membership, automatic multi-account
+pooling, Anthropic runtime support, the approved Spec/Plan, and the package
+version were not changed.
+
+### Terminal process-only ownership
+
+- A process-only setup activation that settles after outer interruption now
+  reconciles its exact runtime route without publishing a stale Config,
+  ProviderState, Session, or Cross tuple.
+- The terminal activation owner is no longer gated only by durable persistence;
+  it retains the exact setup/process generation and terminal promise for the
+  process-only route as well.
+- The production regression was captured as a named RED before the minimal
+  correction, followed by 13/13 focused Session/terminal tests and 9/9 focused
+  provider-security tests.
+
+### Full-suite harness stabilization
+
+- The first broad diagnostic run identified one timing-only failure in
+  `saved candidate swap after catalog and model choice has zero activation effects`.
+  Its fixture used a real 100 ms timer despite a fixed fake clock, so heavy
+  full-suite CPU load could expire the permit before the baseline observation.
+- Only the three non-deadline permit tests were changed to use their existing
+  non-expiring fixture deadline. Twelve parallel exact stress processes and the
+  adjacent permit matrix then passed. Production bytes were unchanged by this
+  harness-only commit.
+
+### Real first-run artifact failure and create-only correction
+
+- A built-artifact PTY smoke with a fresh isolated `HOME`, no provider keys,
+  and Escape at the provider picker exposed a real release blocker:
+  `Provider state publication failed.` The in-memory default state existed, but
+  no config file had yet been initialized.
+- Missing config is now treated as the exact logical `DEFAULT_CONFIG`
+  `never-configured` revision 0. A valid provider commit may create revision 1,
+  while corrupt, future, symlinked, non-regular, or changed targets still fail
+  closed.
+- Creation uses a same-directory private temp file plus atomic hard-link
+  publication. `EEXIST` cannot replace a config created after the final
+  snapshot fence. The successful smoke persists one exact `cancelled` revision
+  with no connection or route and mode `0600`.
+
+### Non-forgeable publication-phase ownership
+
+- Adversarial review found that byte-identical foreign config bytes could be
+  mistaken for this process's own publication after an ordinary pre-publish
+  error. The same ownership hole existed for replace and for first-run
+  activation, whose coordinator still selected the rename writer.
+- Both atomic writers now have a precise phase contract. Ordinary rejection
+  preserves the original pre-publication error identity. Only an error created
+  after a resolved `rename` or `link` receives a module-private `WeakSet` brand;
+  a structurally similar object is rejected. The marker never authorizes
+  adoption by itself: exact readback under still-held ownership is mandatory.
+- `saveConfig` and provider-state persistence reconcile only a genuine branded
+  post-publication failure. Create `EEXIST`, final-fence Abort, and rejected
+  replace paths reject even when the foreign bytes exactly equal the candidate.
+- Provider activation now selects the create-only writer for an absent config
+  and combines phase proof with exact readback:
+  - pre + exact old state: fixed failure with owned-candidate cleanup;
+  - pre + candidate bytes: ambiguous recovery, retaining candidate slot/journal;
+  - success or genuine branded post + exact candidate: one complete adoption;
+  - success/post + old, or any mismatched/unreadable readback: ambiguous recovery.
+- Deterministic mutation guards cover real create and replace post brands,
+  unbranded candidate readback, success with old readback, byte-identical
+  create/replace races, retained candidate artifacts, and unchanged foreign
+  inode/bytes.
+
+Three independent final reviews approved the integrated result with no
+P0/P1/P2 findings. Their fresh narrow evidence included 10/10 publication
+ownership tests, 6/6 activation phase-matrix tests, 20/20 TUI/Cross tests, and
+3/3 Session writer/merge tests.
+
+### Final built-artifact smoke
+
+The final committed build was launched in a real isolated PTY with a newly
+created `HOME` and both OpenRouter environment variables absent:
+
+1. provider picker rendered OpenRouter Stable and Anthropic Coming soon;
+2. Escape returned to a live setup-required dashboard;
+3. `/provider status` reported OpenRouter disabled/not checked and Cross off;
+4. `/quit` restored the terminal and exited 0;
+5. exact disk readback reported schema 1, provider revision 1, lifecycle
+   `cancelled`, zero connections, null route, `0600`, and a trailing newline.
+
+### Final full and release gates
+
+- `npm test -- --test-reporter=spec`: 1,644 tests reached; 1,643 passed; 0
+  failed; 0 cancelled; 1 skipped; exit 0; 44.17 seconds.
+- The sole skip remained the allowed Windows PrivateStore real-DACL integration
+  on non-Windows.
+- `npm run build`: PASS.
+- `node scripts/check-package.mjs`: PASS — `orcode@0.4.1`, 175 files, both bin
+  shims.
+- `node scripts/check-release-metadata.mjs --tag v0.4.1`: PASS on the final
+  serial run. One earlier concurrent invocation raced the package check's
+  temporary `dist` staging and saw `dist/cli.js` absent; it was not a product
+  failure and was deliberately rerun after package staging completed.
+- Provider privacy: 3/3 passed, 0 failed, 0 skipped.
+- Both TypeScript projects: PASS.
+- README command-doc check: PASS.
+- Final source/test commit tree: `96f13f777369fa05c6a9135491b9942d08f55a4d`.
+- Final `src` tree: `0eb2169caf69643fe0f5561239b299eeee5a02ce`.
+- Final `tests` tree: `0dba911bd5c288c989bed5a26f98c78ad76af38a`.
+- Final `git diff --check`: PASS; implementation worktree clean before this
+  evidence-only report append.
+
+Closure commits after Integrated Fix Round 2:
+
+- `8818d3b fix: reconcile process-only setup activation`
+- `4399beb test: stabilize candidate permit swap coverage`
+- `46ce7aa fix: initialize first-run provider state safely`
+- `900b33d fix: enforce provider publication ownership`
+
+Files changed by this closure before the evidence-only report append:
+
+- `src/cli.ts`
+- `src/config.ts`
+- `src/provider-activation.ts`
+- `tests/cli.test.ts`
+- `tests/config.test.ts`
+- `tests/provider-activation.test.ts`
