@@ -160,6 +160,8 @@ class FakeCredentials implements VersionedCredentialStoreLike {
   readonly reservations = new WeakSet<object>();
   reservationCounter = 0;
   failWrite: "before" | "after" | null = null;
+  writePause: Promise<void> | null = null;
+  writeReached: (() => void) | null = null;
   failDelete = false;
 
   constructor(oldSlot: CredentialSlotRef | "legacy:inference" | null = OLD_SLOT) {
@@ -185,6 +187,8 @@ class FakeCredentials implements VersionedCredentialStoreLike {
     this.calls.push(`writeSlot:${slot.id}`);
     assert.equal(this.reservations.has(slot), true, "writeSlot must receive the exact frozen reservation");
     if (this.failWrite === "before") throw new Error("raw-keyring-write-before-secret-marker");
+    this.writeReached?.();
+    if (this.writePause) await this.writePause;
     this.slots.set(slot.id, secret);
     if (this.failWrite === "after") throw new Error("raw-keyring-write-after-secret-marker");
   }
@@ -493,6 +497,91 @@ async function activationFixture(options: ActivationFixtureOptions = {}) {
     }),
     coordinator: () => coordinator,
     coordinatorWith: (overrides: Record<string, unknown>) => makeCoordinator(overrides),
+  };
+}
+
+interface KimiActivationFixtureOptions {
+  crashAfter?: Boundary;
+}
+
+async function kimiActivationFixture(options: KimiActivationFixtureOptions = {}) {
+  const appHome = await mkdtemp(join(tmpdir(), "orcode-kimi-activation-"));
+  const path = join(appHome, "config.json");
+  const oldState = kimiActivationState();
+  const initialConfig = {
+    ...structuredClone(DEFAULT_CONFIG),
+    providerSetup: oldState,
+  } satisfies OrcodeConfigWithBudget;
+  await saveConfig(initialConfig, path);
+  const credentials = new FakeCredentials(null);
+  credentials.slots.set(KIMI_OLD_SLOT.id, OLD_SECRET);
+  const adapter = new FakeKimiAdapter();
+  const runtimeGuard = new FakeRuntimeGuard();
+  const stateStore = new ProviderStateStore(oldState);
+  const privateStore = new PrivateStore({ root: appHome });
+  const resolverArguments: string[] = [];
+  const api = await import("../src/provider-activation.js");
+  let now = 10_000;
+  const makeCoordinator = (overrides: Record<string, unknown> = {}) => new api.ProviderActivationCoordinator({
+    appHome,
+    configPath: path,
+    privateStore,
+    credentials,
+    adapterResolver: (backendId) => {
+      resolverArguments.push(backendId);
+      assert.equal(backendId, "kimi-code");
+      return adapter;
+    },
+    stateStore,
+    runtimeGuard,
+    now: () => now,
+    createUuid: sequentialUuid(),
+    leaseDurationMs: 100,
+    waitForLease: async () => new Promise<void>((resolve) => setImmediate(resolve)),
+    onBoundary: options.crashAfter
+      ? async (boundary: Boundary) => {
+        if (boundary === options.crashAfter) throw new Error(`simulated-crash:${boundary}`);
+      }
+      : async () => undefined,
+    ...overrides,
+  });
+  let coordinator = makeCoordinator();
+  const request = {
+    backendId: "kimi-code" as const,
+    expectedRevision: oldState.revision,
+    candidate: KIMI_SECRET,
+    expectedRequestedModelId: KIMI_MODEL.requestedModelId,
+    selectedCanonicalModelId: KIMI_MODEL.canonicalModelId,
+    generation: 4,
+    signal: new AbortController().signal,
+    deadlineAt: Number.MAX_SAFE_INTEGER,
+    persistence: "persisted" as const,
+  };
+  return {
+    api,
+    appHome,
+    path,
+    oldState,
+    initialConfig,
+    credentials,
+    adapter,
+    runtimeGuard,
+    stateStore,
+    privateStore,
+    resolverArguments,
+    request,
+    activate: () => coordinator.activate(request),
+    coordinator: () => coordinator,
+    coordinatorWith: (overrides: Record<string, unknown>) => makeCoordinator(overrides),
+    restartAndRecover: async (inspectCommitted = true) => {
+      now += 1_000;
+      coordinator = makeCoordinator({
+        runtimeGuard: new FakeRuntimeGuard(),
+        onBoundary: async () => undefined,
+      });
+      await coordinator.recover({ signal: new AbortController().signal, inspectCommitted });
+      return readTuple(path, credentials);
+    },
   };
 }
 
@@ -1581,6 +1670,51 @@ test("literal legacy OpenRouter journal v1 recovers through the frozen validator
   assert.deepEqual(await journalDirectories(fixture.appHome), []);
   assert.equal(fixture.credentials.slots.get(OLD_SLOT.id), OLD_SECRET);
   assert.equal(fixture.credentials.slots.has(v2.candidateSlot.id), false);
+});
+
+test("frozen journal-v1 rejects malformed historical identity and slot shapes without mutation", async (t) => {
+  const mutations: Readonly<Record<string, (legacy: Record<string, unknown>) => void>> = {
+    "empty account fingerprint": (legacy) => { (legacy.candidateRoute as Record<string, unknown>).accountFingerprint = ""; },
+    "empty requested model": (legacy) => { (legacy.candidateRoute as Record<string, unknown>).requestedModelId = ""; },
+    "empty canonical model": (legacy) => { (legacy.candidateRoute as Record<string, unknown>).canonicalModelId = ""; },
+    "Kimi backend": (legacy) => { (legacy.candidateRoute as Record<string, unknown>).backendId = "kimi-code"; },
+    "wrong realm": (legacy) => { (legacy.candidateRoute as Record<string, unknown>).billingRealm = "wrong-realm"; },
+    "management candidate slot": (legacy) => { (legacy.candidateSlot as Record<string, unknown>).kind = "management"; },
+    "Kimi previous slot": (legacy) => { legacy.previousSlot = { version: 1, kind: "kimi-code", id: "v1:kimi-code:10000000-0000-4000-8000-000000000009" }; },
+    "extra key": (legacy) => { legacy.future = true; },
+  };
+  for (const [name, mutate] of Object.entries(mutations)) {
+    await t.test(name, async () => {
+      const fixture = await activationFixture({ crashAfter: "journal-written" });
+      await assert.rejects(fixture.activate());
+      const [transactionId] = await journalDirectories(fixture.appHome);
+      assert.ok(transactionId);
+      const manifestPath = join(fixture.appHome, "provider-activation", transactionId, "manifest.json");
+      const v2 = JSON.parse(await readFile(manifestPath, "utf8")) as ProviderActivationJournalV2;
+      const legacy: Record<string, unknown> = {
+        version: 1,
+        transactionId,
+        expectedRevision: v2.expectedRevision,
+        phase: v2.phase,
+        backendId: "openrouter",
+        candidateSlot: { version: 1, kind: "inference", id: v2.candidateSlot.id },
+        previousSlot: v2.previousSlot,
+        candidateConnectionId: v2.candidateConnectionId,
+        candidateRoute: structuredClone(v2.candidateRoute),
+        expectedProviderSetupSha256: v2.expectedProviderSetupSha256,
+        candidateProviderSetupSha256: v2.candidateProviderSetupSha256,
+      };
+      mutate(legacy);
+      const configBefore = await readFile(fixture.path, "utf8");
+      const slotsBefore = new Map(fixture.credentials.slots);
+      await writeFile(manifestPath, `${JSON.stringify(legacy)}\n`, "utf8");
+
+      await assert.rejects(fixture.restartAndRecover(false));
+
+      assert.equal(await readFile(fixture.path, "utf8"), configBefore);
+      assert.deepEqual(fixture.credentials.slots, slotsBefore);
+    });
+  }
 });
 
 test("strict manifest carries only lowercase complete-state SHA-256 snapshots", async () => {
@@ -3184,6 +3318,90 @@ test("activation deadline settles despite a runtime guard that ignores its signa
   assert.equal(fixture.credentials.calls.includes("reserveSlot"), false);
 });
 
+test("late runtime-guard acquisition after deadline is released and never begins activation", async () => {
+  const fixture = await activationFixture();
+  let resolveLateLease!: (lease: RuntimeLease) => void;
+  let releases = 0;
+  const coordinator = new fixture.api.ProviderActivationCoordinator({
+    appHome: fixture.appHome,
+    configPath: fixture.path,
+    privateStore: fixture.privateStore,
+    credentials: fixture.credentials,
+    adapterResolver: () => fixture.adapter,
+    stateStore: fixture.stateStore,
+    runtimeGuard: {
+      acquire: async () => new Promise<RuntimeLease>((resolve) => { resolveLateLease = resolve; }),
+    },
+    now: () => 10_000,
+    createUuid: sequentialUuid(),
+    leaseDurationMs: 100,
+  });
+
+  await assert.rejects(coordinator.activate({ ...fixture.request, deadlineAt: 10_020 }));
+  resolveLateLease({
+    assertHeld() {},
+    async release() { releases += 1; },
+  });
+  await new Promise<void>((resolve) => setImmediate(resolve));
+
+  assert.equal(releases, 1);
+  assert.equal(fixture.adapter.calls.length, 0);
+  assert.equal(fixture.credentials.calls.includes("reserveSlot"), false);
+});
+
+test("late slot write retains journal ownership until settlement and cannot orphan a credential", async () => {
+  const fixture = await activationFixture();
+  let releaseWrite!: () => void;
+  let reachedWrite!: () => void;
+  fixture.credentials.writePause = new Promise<void>((resolve) => { releaseWrite = resolve; });
+  const writeStarted = new Promise<void>((resolve) => { reachedWrite = resolve; });
+  fixture.credentials.writeReached = reachedWrite;
+  let settled = false;
+  const activation = fixture.coordinator().activate({ ...fixture.request, deadlineAt: 10_200 })
+    .finally(() => { settled = true; });
+  void activation.catch(() => undefined);
+
+  await writeStarted;
+  await new Promise<void>((resolve) => setTimeout(resolve, 230));
+  assert.equal(settled, false, "an irreversible slot write must remain owned through settlement");
+  assert.equal((await journalDirectories(fixture.appHome)).length, 1);
+  assert.equal(fixture.credentials.slots.has(NEW_SLOT_ID), false);
+
+  releaseWrite();
+  await assert.rejects(activation);
+  assert.equal(fixture.credentials.slots.has(NEW_SLOT_ID), false);
+  assert.deepEqual(await journalDirectories(fixture.appHome), []);
+  assert.equal((await readTuple(fixture.path, fixture.credentials)).slotId, OLD_SLOT.id);
+});
+
+test("a stalled config-written observer cannot prevent post-durable tuple adoption", async () => {
+  const fixture = await activationFixture();
+  let releaseObserver!: () => void;
+  let observerReached!: () => void;
+  const observer = new Promise<void>((resolve) => { releaseObserver = resolve; });
+  const reached = new Promise<void>((resolve) => { observerReached = resolve; });
+  const coordinator = fixture.coordinatorWith({
+    onBoundary: async (boundary: Boundary) => {
+      if (boundary !== "config-written") return;
+      observerReached();
+      await observer;
+    },
+  });
+  const activation = coordinator.activate({ ...fixture.request, deadlineAt: 10_200 });
+  await reached;
+  await new Promise<void>((resolve) => setTimeout(resolve, 230));
+
+  const tuple = await readTuple(fixture.path, fixture.credentials);
+  assert.equal(tuple.secret, NEW_SECRET);
+  assert.equal(tuple.state.revision, fixture.oldState.revision + 1);
+  assert.equal(fixture.stateStore.read().revision, fixture.oldState.revision + 1);
+  assert.equal(fixture.adapter.runtimeSecret, NEW_SECRET);
+  assert.equal((await journalDirectories(fixture.appHome)).length, 0);
+
+  releaseObserver();
+  assert.equal((await activation).persisted, true);
+});
+
 test("Kimi persisted activation writes and publishes one exact v2 Kimi tuple through a Kimi resolver", async () => {
   const appHome = await mkdtemp(join(tmpdir(), "orcode-kimi-activation-"));
   const configPath = join(appHome, "config.json");
@@ -3231,4 +3449,114 @@ test("Kimi persisted activation writes and publishes one exact v2 Kimi tuple thr
   assert.equal(adapter.calls.includes("activate"), true);
   const loaded = await loadConfigDetailed(configPath);
   assert.equal((loaded.config.providerSetup as ProviderSetupStateV2).connections[0]?.backendId, "kimi-code");
+});
+
+for (const boundary of boundaries) {
+  test(`Kimi activation crash after ${boundary} recovers one complete Kimi tuple`, async () => {
+    const fixture = await kimiActivationFixture({ crashAfter: boundary });
+    await assert.rejects(fixture.activate(), new RegExp(`simulated-crash:${boundary}`));
+    const journalIds = await journalDirectories(fixture.appHome);
+    if (journalIds.length > 0) {
+      assert.equal(journalIds.length, 1);
+      const manifest = JSON.parse(await readFile(
+        join(fixture.appHome, "provider-activation", journalIds[0]!, "manifest.json"),
+        "utf8",
+      )) as ProviderActivationJournalV2;
+      assert.equal(manifest.version, 2);
+      assert.equal(manifest.backendId, "kimi-code");
+      assert.equal(manifest.credentialSlotKind, "kimi-code");
+      assert.equal(manifest.candidateRoute.backendId, "kimi-code");
+      assert.equal(manifest.candidateRoute.billingRealm, KIMI_REALM);
+    }
+
+    const recovered = await fixture.restartAndRecover();
+    assert.deepEqual(await journalDirectories(fixture.appHome), []);
+    assert.ok(fixture.resolverArguments.length >= 1);
+    assert.deepEqual(fixture.resolverArguments, fixture.resolverArguments.map(() => "kimi-code"));
+    const route = recovered.state.defaultRoute;
+    const connection = recovered.connection;
+    assert.ok(route);
+    assert.ok(connection);
+    assert.equal(route.backendId, "kimi-code");
+    assert.equal(route.billingRealm, KIMI_REALM);
+    assert.equal(connection.backendId, "kimi-code");
+    assert.equal(connection.billingRealm, KIMI_REALM);
+    assert.equal(connection.credentialSlot.startsWith("v1:kimi-code:"), true);
+    assert.equal(
+      (connection.credentialSlot === KIMI_OLD_SLOT.id && recovered.secret === OLD_SECRET)
+        || (connection.credentialSlot !== KIMI_OLD_SLOT.id && recovered.secret === KIMI_SECRET),
+      true,
+    );
+  });
+}
+
+test("Kimi v2 journal mutations and resolver mismatches fail closed before credential or config publication", async (t) => {
+  const invalidManifestMutations: Readonly<Record<string, (manifest: Record<string, unknown>) => void>> = {
+    "wrong credential slot kind": (manifest) => { manifest.credentialSlotKind = "inference"; },
+    "wrong candidate realm": (manifest) => {
+      (manifest.candidateRoute as Record<string, unknown>).billingRealm = "openrouter-payg";
+    },
+    "extra manifest field": (manifest) => { manifest.future = true; },
+  };
+  for (const [name, mutate] of Object.entries(invalidManifestMutations)) {
+    await t.test(name, async () => {
+      const fixture = await kimiActivationFixture({ crashAfter: "journal-written" });
+      await assert.rejects(fixture.activate());
+      const [transactionId] = await journalDirectories(fixture.appHome);
+      assert.ok(transactionId);
+      const manifestPath = join(fixture.appHome, "provider-activation", transactionId, "manifest.json");
+      const manifest = JSON.parse(await readFile(manifestPath, "utf8")) as Record<string, unknown>;
+      mutate(manifest);
+      const configBefore = await readFile(fixture.path, "utf8");
+      const slotsBefore = new Map(fixture.credentials.slots);
+      await writeFile(manifestPath, `${JSON.stringify(manifest)}\n`, "utf8");
+
+      await assert.rejects(fixture.restartAndRecover(false));
+      assert.equal(await readFile(fixture.path, "utf8"), configBefore);
+      assert.deepEqual(fixture.credentials.slots, slotsBefore);
+    });
+  }
+
+  await t.test("resolver returns OpenRouter instance", async () => {
+    const fixture = await kimiActivationFixture();
+    const configBefore = await readFile(fixture.path, "utf8");
+    const slotsBefore = new Map(fixture.credentials.slots);
+    await assert.rejects(fixture.coordinatorWith({ adapterResolver: () => new FakeAdapter() }).activate(fixture.request));
+    assert.equal(await readFile(fixture.path, "utf8"), configBefore);
+    assert.deepEqual(fixture.credentials.slots, slotsBefore);
+    assert.equal(fixture.credentials.calls.includes("reserveSlot"), false);
+  });
+
+  await t.test("candidate reports the wrong backend", async () => {
+    const fixture = await kimiActivationFixture();
+    const connect = fixture.adapter.connect.bind(fixture.adapter);
+    fixture.adapter.connect = async (request) => ({
+      ...await connect(request),
+      backendId: "openrouter",
+    });
+    const configBefore = await readFile(fixture.path, "utf8");
+    const slotsBefore = new Map(fixture.credentials.slots);
+    await assert.rejects(fixture.activate());
+    assert.equal(await readFile(fixture.path, "utf8"), configBefore);
+    assert.deepEqual(fixture.credentials.slots, slotsBefore);
+    assert.equal(fixture.credentials.calls.includes("reserveSlot"), false);
+  });
+});
+
+test("Kimi generation supersession by aborting at models-loaded publishes nothing", async () => {
+  const fixture = await kimiActivationFixture();
+  const controller = new AbortController();
+  const configBefore = await readFile(fixture.path, "utf8");
+  const slotsBefore = new Map(fixture.credentials.slots);
+  const coordinator = fixture.coordinatorWith({
+    onBoundary: async (boundary: Boundary) => {
+      if (boundary === "models-loaded") controller.abort(new Error("superseded-kimi-generation"));
+    },
+  });
+
+  await assert.rejects(coordinator.activate({ ...fixture.request, signal: controller.signal }));
+  assert.equal(await readFile(fixture.path, "utf8"), configBefore);
+  assert.deepEqual(fixture.credentials.slots, slotsBefore);
+  assert.equal(fixture.credentials.calls.includes("reserveSlot"), false);
+  assert.equal(fixture.adapter.calls.includes("activate"), false);
 });

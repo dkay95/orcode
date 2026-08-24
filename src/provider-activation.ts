@@ -322,10 +322,7 @@ export class ProviderActivationCoordinator {
     }
     let runtimeLease: ProviderActivationRuntimeLease;
     try {
-      runtimeLease = await this.#awaitActivation(
-        request,
-        () => this.#options.runtimeGuard.acquire(request.signal),
-      );
+      runtimeLease = await this.#awaitRuntimeLease(request);
     } catch (error) {
       deadline.dispose();
       if (isAbort(error, request.signal)) throw abortFrom(request.signal);
@@ -485,10 +482,11 @@ export class ProviderActivationCoordinator {
 
       try {
         await this.#assertMutationAllowed(providerLease, runtimeLease, true, request.signal);
-        await this.#awaitActivation(
-          request,
-          () => this.#options.credentials.writeSlot(candidateSlot, normalized),
-        );
+        // Slot writes are irreversible until the journal proves cleanup. Do
+        // not race this promise with deadline/abort; retain ownership and the
+        // journal through its actual settlement.
+        await this.#assertMutationAllowed(providerLease, runtimeLease, true, request.signal);
+        await this.#options.credentials.writeSlot(candidateSlot, normalized);
         await this.#assertFence(providerLease);
         await this.#awaitActivation(request, () => this.#boundary("slot-written"));
         await this.#assertFence(providerLease);
@@ -635,12 +633,9 @@ export class ProviderActivationCoordinator {
             await this.#assertFence(providerLease!);
             await assertRuntimeLease(runtimeLease);
             await ownership.assertHeld();
-            // A callback here may observe the just-published file. Do not let
-            // caller cancellation detach that durable tuple before readback.
-            await this.#boundary("config-written");
-            await ownership.assertHeld();
-            await this.#assertFence(providerLease!);
-            await ownership.assertHeld();
+            // Read the durable file while we still own all fences. The
+            // config-written observer runs only after the full tuple is
+            // adopted below, so it cannot strand a published config half-way.
             const afterSave = await readConfigFacts(ownership.canonicalPath);
             await ownership.assertHeld();
             await this.#assertFence(providerLease!);
@@ -702,6 +697,9 @@ export class ProviderActivationCoordinator {
         signal: committedSignal,
         deadlineAt: Number.MAX_SAFE_INTEGER,
       };
+      // Config readback remains a recovery checkpoint while all ownership is
+      // held. It runs on the committed signal because the durable tuple must
+      // be reconciled even after the original caller cancels.
       await this.#awaitActivation(committedRequest, () => this.#boundary("config-readback"));
       manifest.phase = "config-committed";
       await this.#assertMutationAllowed(providerLease, runtimeLease, true, committedSignal);
@@ -743,6 +741,9 @@ export class ProviderActivationCoordinator {
         await this.#removeJournal(transaction, providerLease);
         transaction = null;
       }
+      // The config-written observer is deliberately last: its direct hook
+      // cannot strand an already durable tuple half-adopted.
+      await this.#awaitActivation(committedRequest, () => this.#boundary("config-written"));
       return {
         persisted: true,
         route: structuredClone(candidateRoute),
@@ -1515,6 +1516,19 @@ export class ProviderActivationCoordinator {
     const value = await abortableDependency(operation, request.signal);
     this.#assertActivationAttemptCurrent(request);
     return value;
+  }
+
+  async #awaitRuntimeLease(
+    request: ProviderActivationRequest,
+  ): Promise<ProviderActivationRuntimeLease> {
+    this.#assertActivationAttemptCurrent(request);
+    const lease = await abortableDependency(
+      () => this.#options.runtimeGuard.acquire(request.signal),
+      request.signal,
+      (lateLease) => Promise.resolve(lateLease.release()).catch(() => undefined),
+    );
+    this.#assertActivationAttemptCurrent(request);
+    return lease;
   }
 
   async #waitForLease(signal: AbortSignal): Promise<void> {
@@ -2310,9 +2324,9 @@ function parseFrozenOpenRouterRouteV1(value: unknown): RouteIdentityV1 | null {
     || value.backendId !== "openrouter"
     || value.billingRealm !== "openrouter-payg"
     || value.resolutionState !== "resolved"
-    || typeof value.accountFingerprint !== "string" || value.accountFingerprint.length > 512
-    || typeof value.requestedModelId !== "string" || value.requestedModelId.length > 512
-    || typeof value.canonicalModelId !== "string" || value.canonicalModelId.length > 512) return null;
+    || typeof value.accountFingerprint !== "string" || value.accountFingerprint.length === 0 || value.accountFingerprint.length > 512
+    || typeof value.requestedModelId !== "string" || value.requestedModelId.length === 0 || value.requestedModelId.length > 512
+    || typeof value.canonicalModelId !== "string" || value.canonicalModelId.length === 0 || value.canonicalModelId.length > 512) return null;
   return {
     version: 1,
     backendId: "openrouter",
