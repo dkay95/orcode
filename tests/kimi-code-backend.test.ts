@@ -553,6 +553,132 @@ test("expired prior catalog cannot turn a later entitlement failure into a ready
   }));
 });
 
+test("prior catalog equality at entitlement classification is expired and cannot publish models", async () => {
+  let mode: "catalog" | "entitlement" = "catalog";
+  let now = 100;
+  const adapter = new KimiCodeBackendAdapter({
+    service: new KimiCodeService({
+      now: () => now,
+      fetchImpl: async () => mode === "catalog"
+        ? catalogResponse(["k3", "k3-256k", "kimi-for-coding"])
+        : errorResponse(
+            401,
+            "Your current subscription does not have access to k3. Upgrade to an Moderato plan or above. Upgrade: https://www.kimi.com/membership/pricing?from=server_k3_error",
+          ),
+    }),
+    credentials: {
+      async getOrCreateAccountHmacKey() { return new Uint8Array(HMAC_KEY); },
+    },
+    credentialAuthority: authority([]),
+    now: () => now,
+  });
+
+  const first = await adapter.inspect(inspectionRequest({
+    generation: 8,
+    deadlineAt: 200,
+  }));
+  assert.equal(first.routeEligible, true);
+
+  mode = "entitlement";
+  now = 200;
+  const second = await adapter.inspect(inspectionRequest({
+    generation: 9,
+    deadlineAt: 400,
+  }));
+  assert.equal(second.health.credential, "valid");
+  assert.equal(second.accountFingerprint, FINGERPRINT);
+  assert.equal(second.explanationCode, "kimi-code-model-unavailable");
+  assert.equal(second.routeEligible, false);
+  assert.notEqual(second.headline, "ready");
+  await assert.rejects(adapter.listModels({
+    connectionId: CONNECTION_ID,
+    signal: new AbortController().signal,
+  }));
+});
+
+test("entitlement snapshot expiring inside authority publication returns and publishes only non-ready state", async () => {
+  let mode: "catalog" | "entitlement" = "catalog";
+  let now = 100;
+  let publicationCount = 0;
+  let probePublishedMetadata = false;
+  let publicationProbe: Promise<"published" | "absent"> | null = null;
+  let adapter: KimiCodeBackendAdapter;
+  const credentialAuthority: ProviderCredentialAuthorityLike = {
+    async withCredential(request, use) {
+      const context = bindingContext(request);
+      return {
+        kind: "available",
+        value: await use(KEY, {
+          ...context,
+          async publishIfCurrent(publish) {
+            publicationCount += 1;
+            if (publicationCount === 2) now = 200;
+            publish();
+            if (publicationCount === 2) {
+              probePublishedMetadata = true;
+              publicationProbe = adapter.listModels({
+                connectionId: CONNECTION_ID,
+                signal: new AbortController().signal,
+              }).then(
+                () => "published" as const,
+                () => "absent" as const,
+              );
+              probePublishedMetadata = false;
+            }
+          },
+        }),
+      };
+    },
+  };
+  adapter = new KimiCodeBackendAdapter({
+    service: new KimiCodeService({
+      now: () => now,
+      fetchImpl: async () => mode === "catalog"
+        ? catalogResponse(["k3", "k3-256k", "kimi-for-coding"])
+        : errorResponse(
+            401,
+            "Your current subscription does not have access to k3. Upgrade to an Moderato plan or above. Upgrade: https://www.kimi.com/membership/pricing?from=server_k3_error",
+          ),
+    }),
+    credentials: {
+      async getOrCreateAccountHmacKey() { return new Uint8Array(HMAC_KEY); },
+    },
+    credentialAuthority,
+    now: () => probePublishedMetadata ? 199 : now,
+  });
+
+  const first = await adapter.inspect(inspectionRequest({
+    generation: 8,
+    deadlineAt: 200,
+  }));
+  assert.equal(first.routeEligible, true);
+
+  mode = "entitlement";
+  now = 150;
+  const second = await adapter.inspect(inspectionRequest({
+    generation: 9,
+    deadlineAt: 400,
+  }));
+  assert.ok(publicationProbe);
+  assert.deepEqual({
+    publication: await publicationProbe,
+    credential: second.health.credential,
+    accountFingerprint: second.accountFingerprint,
+    routeEligible: second.routeEligible,
+    headline: second.headline,
+  }, {
+    publication: "absent",
+    credential: "valid",
+    accountFingerprint: FINGERPRINT,
+    routeEligible: false,
+    headline: "policy-unavailable",
+  });
+  await assert.rejects(adapter.listModels({
+    connectionId: CONNECTION_ID,
+    signal: new AbortController().signal,
+  }));
+});
+
 test("invalid-key inspection rejects only the credential dimension and exposes no body, header, request, or key canary", async () => {
   const privateValues = [
     "private-body-canary",

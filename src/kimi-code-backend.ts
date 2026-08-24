@@ -254,16 +254,31 @@ export class KimiCodeBackendAdapter implements BackendAdapter {
         attempt.previous,
       );
       await this.#assertLeaseCurrent(lease, request.deadlineAt, request.signal);
+      let publicationDecision: InspectedMetadata | null = null;
       if (this.#isInspectionCurrent(request.connectionId, request.generation, attempt.token)) {
         await this.#awaitDependency(() => context.publishIfCurrent(() => {
+          const publicationObservedAt = this.#readNow();
+          throwIfAborted(request.signal);
           if (!this.#isInspectionCurrent(
             request.connectionId,
             request.generation,
             attempt.token,
           )) return;
-          try {
-            this.#assertCurrent(request.deadlineAt, request.signal);
-          } catch {
+          if (
+            !Number.isFinite(request.deadlineAt)
+            || request.deadlineAt <= publicationObservedAt
+          ) {
+            throw new KimiCodeRequestError(offlineFailure());
+          }
+          if (
+            inspected.metadata
+            && inspected.metadata.deadlineAt <= publicationObservedAt
+          ) {
+            publicationDecision = this.#withoutExpiredReusedMetadata(
+              inspected,
+              publicationObservedAt,
+            );
+            this.#activeInspections.delete(request.connectionId);
             return;
           }
           if (inspected.metadata) {
@@ -271,9 +286,17 @@ export class KimiCodeBackendAdapter implements BackendAdapter {
           } else {
             this.#activeInspections.delete(request.connectionId);
           }
+          publicationDecision = inspected;
         }), request.deadlineAt, request.signal);
       }
-      return inspected;
+      return publicationDecision ?? {
+        inspection: this.#emptyInspection(
+          request.connectionId,
+          request.generation,
+          "kimi-code-inspection-stale",
+        ),
+        metadata: null,
+      };
     }), request.deadlineAt, request.signal);
     if (selected.kind !== "available") {
       if (!this.#isInspectionCurrent(request.connectionId, request.generation, attempt.token)) {
@@ -698,6 +721,29 @@ export class KimiCodeBackendAdapter implements BackendAdapter {
         routeEligible: false,
         retryable: failure.retryable,
         explanationCode: failure.code,
+      },
+      metadata: null,
+    };
+  }
+
+  #withoutExpiredReusedMetadata(
+    inspected: InspectedMetadata,
+    observedAt: number,
+  ): InspectedMetadata {
+    const health: ProviderHealth = Object.freeze({
+      credential: "valid",
+      connectivity: "connected",
+      spend: "unknown",
+      runtime: "policy-unavailable",
+      observedAt,
+      generation: inspected.inspection.health.generation,
+    });
+    return {
+      inspection: {
+        ...inspected.inspection,
+        health,
+        headline: deriveProviderHeadline(health),
+        routeEligible: false,
       },
       metadata: null,
     };
