@@ -1496,7 +1496,7 @@ async function settleProviderCredentialForget(input: {
     && connection.backendId === "openrouter"
     && connectionReferencesForgetTarget(connection, target);
 
-  if (targetMatches && (state.defaultRoute !== null || state.cross.enabled)) {
+  if (targetMatches) {
     state = await input.stateStore.commit(state.revision, (current) => {
       assertProviderForgetAuthoritative(
         current,
@@ -1789,11 +1789,23 @@ export function createProviderCredentialController(input: {
                       kind: "versioned",
                       slot: {
                         version: 1,
-                        kind: "inference",
-                        id: connection.credentialSlot,
-                      },
+                      kind: "inference",
+                      id: connection.credentialSlot,
+                    },
                     }
                   : { kind: "legacy" };
+              const sharedReference = !intent.targetConnectionId
+                && state.connections.some((candidate) =>
+                  candidate.backendId === "openrouter"
+                  && candidate.id !== connection?.id
+                );
+              if (sharedReference) {
+                return {
+                  kind: "unchanged" as const,
+                  credentialKind: "inference" as const,
+                  reason: "shared-reference" as const,
+                };
+              }
               await lease.assertHeld();
               const forgetTransaction = await input.forgetJournal.begin({
                 connectionId: connection?.id ?? null,

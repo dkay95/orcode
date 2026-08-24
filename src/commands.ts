@@ -136,6 +136,7 @@ export interface ProviderCredentialIntentPort {
     persisted?: boolean;
     removed?: boolean;
     retained?: boolean;
+    reason?: "shared-reference";
     balance?: BalanceReport;
     credits?: CreditInfo;
   }>;
@@ -782,13 +783,15 @@ async function keyCommand(args: string[], context: CommandContext): Promise<void
     return;
   }
   if (action === "forget") {
+    const forgetPrompt =
+      `API-Key aus ${context.credentials.location} und Prozessspeicher entfernen? Bei mehreren Provider-Verbindungen bleibt er unverändert.`;
     const accepted = context.confirmCredentialForget
       ? await context.confirmCredentialForget(
         "inference",
-        `Der API-Key wird zuerst aus ${context.credentials.location} und danach aus dem Prozessspeicher entfernt.`,
+        forgetPrompt,
       )
       : await confirm({
-        message: `API-Key aus ${context.credentials.location} und Prozessspeicher entfernen?`,
+        message: forgetPrompt,
         default: false,
       });
     if (!accepted) {
@@ -801,6 +804,12 @@ async function keyCommand(args: string[], context: CommandContext): Promise<void
           credentialKind: "inference",
         })
       : null;
+    if (delegated?.kind === "unchanged" && delegated.reason === "shared-reference") {
+      context.out.text(
+        "API-Key unverändert: Mehrere OpenRouter-Verbindungen sind eingerichtet. Entferne sie einzeln mit /provider logout.",
+      );
+      return;
+    }
     const removed = delegated
       ? delegated.removed === true
       : await context.credentials.delete("inference");
