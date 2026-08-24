@@ -77,6 +77,7 @@ import {
 import { renderPanel } from "./ui/panel-view.js";
 import type { SetupSurface } from "./setup-ui.js";
 import { ProviderSetupRequiredError, type RouteIdentityV1 } from "./backends.js";
+import { KIMI_CODE_MODELS } from "./kimi-code.js";
 import { renderLines } from "./ui/compose.js";
 import { createTheme } from "./ui/theme.js";
 import {
@@ -202,6 +203,11 @@ export interface ProviderCommandStatusEntry {
     runtime: string;
   } | null;
   isDefault: boolean;
+  selectedModel?: {
+    requestedModelId: string;
+    canonicalModelId: string;
+    displayName: string;
+  } | null;
 }
 
 export type ProviderCommandResult =
@@ -478,6 +484,27 @@ export async function handleSlashCommand(
   // Model-dependent handlers are dispatched only after the CLI route gate;
   // local handlers below use nullable-aware helpers when no agent exists.
   const dispatchContext = context as CommandContext;
+  const kimiOnlyUnsupported = [
+    "key",
+    "balance",
+    "reconnect",
+    "image",
+    "whisper",
+    "panel",
+    "web",
+    "fallback",
+  ].includes(command) || (
+    command === "compress"
+    && (args[0] ?? "").toLowerCase() === "model"
+  );
+  if (
+    kimiOnlyUnsupported
+    && currentCommandBackend(dispatchContext) === "kimi-code"
+  ) {
+    throw new Error(
+      `${command === "image" ? "Bilder" : command === "whisper" ? "Sprache und Transkription" : command === "panel" ? "Panel" : command === "web" ? "Web" : command === "compress" ? "Kompressor-Modellwahl" : command === "fallback" ? "Fallback-Modelle" : "Diese OpenRouter-Funktion"} ist mit Kimi Code Abo in Orcode noch nicht verfügbar.`,
+    );
+  }
 
   switch (command) {
     case "help":
@@ -611,6 +638,21 @@ export async function handleSlashCommand(
   }
 
   return unreachableSlashHandler(command);
+}
+
+function currentCommandBackend(
+  context: CommandContext,
+): RouteIdentityV1["backendId"] | null {
+  try {
+    return context.providerRoutes?.currentSessionRoute?.().backendId ?? null;
+  } catch (error) {
+    if (
+      error instanceof ProviderSetupRequiredError
+      || (typeof error === "object" && error !== null && "code" in error
+        && error.code === "provider-setup-required")
+    ) return null;
+    throw error;
+  }
 }
 
 function unreachableSlashHandler(handlerId: never): never {
@@ -1172,6 +1214,36 @@ export async function validateAndStoreManagementKey(
 
 async function modelCommand(args: string[], context: CommandContext): Promise<void> {
   const id = args.join(" ").trim();
+  const kimiRoute = currentCommandBackend(context) === "kimi-code";
+  if (kimiRoute) {
+    if (!context.providerCommands) throw new Error("Kimi-Code-Providersteuerung ist nicht verfügbar.");
+    if (!id) {
+      const result = await context.providerCommands.execute(
+        { kind: "models", backendId: "kimi-code" },
+        context.providerRouteSurface ?? "plain",
+      );
+      if (result.kind !== "models") throw new Error("Kimi-Code-Modelle sind nicht verfügbar.");
+      context.out.text(result.models.length
+        ? result.models.map((model) => `${model.displayName} · ${model.canonicalModelId}`).join("\n")
+        : "Keine nutzbaren Kimi-Code-Modelle verfügbar.");
+      return;
+    }
+    if (id.toLowerCase() === "current") {
+      context.out.text(`Aktive Modellroute: ${context.config.mainModel}`);
+      return;
+    }
+    await context.providerRoutes?.transitionModel(id, id, context.providerRouteSurface);
+    context.config.mainModel = id;
+    context.session.setPreferences(
+      context.config.mainModel,
+      getReasoningSetting(context.config),
+      context.providerRoutes?.currentSessionRoute?.(),
+    );
+    await saveContextConfig(context);
+    await context.session.save();
+    context.out.text(chalk.green(`Main-Modell: ${id}`));
+    return;
+  }
   if (!id) {
     const models = mainModelCandidates(
       await runTransitionCatalog(context, () => context.openRouter.listModels("", false)),
@@ -1222,6 +1294,24 @@ function runTransitionCatalog<T>(
 
 async function modelsCommand(args: string[], context: CommandContext): Promise<void> {
   const query = args.join(" ");
+  if (currentCommandBackend(context) === "kimi-code") {
+    if (!context.providerCommands) throw new Error("Kimi-Code-Providersteuerung ist nicht verfügbar.");
+    const result = await context.providerCommands.execute(
+      { kind: "models", backendId: "kimi-code" },
+      context.providerRouteSurface ?? "plain",
+    );
+    if (result.kind !== "models") throw new Error("Kimi-Code-Modelle sind nicht verfügbar.");
+    const wanted = query.trim().toLowerCase();
+    const models = result.models.filter((model) => !wanted
+      || `${model.displayName} ${model.requestedModelId} ${model.canonicalModelId}`
+        .toLowerCase().includes(wanted));
+    context.out.text(models.length
+      ? models.map((model) =>
+          `${model.displayName} · ${model.requestedModelId} · ${model.canonicalModelId}`
+        ).join("\n")
+      : "Keine nutzbaren Kimi-Code-Modelle verfügbar.");
+    return;
+  }
   const models = mainModelCandidates(
     await context.openRouter.listModels(query, false),
   );
@@ -1593,7 +1683,9 @@ async function reasoningCommand(
   args: string[],
   context: CommandContext,
 ): Promise<void> {
-  const model = await findCurrentModel(context.openRouter, context.config.mainModel);
+  const model = currentCommandBackend(context) === "kimi-code"
+    ? kimiCommandModel(context.config.mainModel)
+    : await findCurrentModel(context.openRouter, context.config.mainModel);
   const current = getReasoningSetting(context.config);
   const action = (args[0] ?? "").toLowerCase();
   if (!action) {
@@ -1654,6 +1746,30 @@ async function reasoningCommand(
       `Thinking für ${context.config.mainModel}: ${reasoningLabel(setting)}`,
     ),
   );
+}
+
+function kimiCommandModel(modelId: string): ModelInfo | null {
+  const model = KIMI_CODE_MODELS.find((candidate) => candidate.id === modelId);
+  if (!model) return null;
+  return {
+    id: model.id,
+    canonicalSlug: model.id,
+    name: model.displayName,
+    description: "Kimi-Code-Membership-Modell",
+    contextLength: model.effectiveContextDefault,
+    promptPrice: -1,
+    completionPrice: -1,
+    supportedParameters: ["tools", "reasoning"],
+    inputModalities: ["text"],
+    outputModalities: ["text"],
+    reasoning: {
+      defaultEffort: "high",
+      defaultEnabled: true,
+      mandatory: true,
+      supportedEfforts: model.reasoningEfforts === null ? null : [...model.reasoningEfforts],
+      supportsMaxTokens: false,
+    },
+  };
 }
 
 async function approvalCommand(args: string[], context: CommandContext): Promise<void> {
@@ -2681,13 +2797,20 @@ function renderProviderCommandResult(
         : provider.maturity === "preview"
           ? `Preview · ${provider.configuration}`
           : provider.configuration;
+      const selectedModel = provider.backendId === "kimi-code" && provider.selectedModel
+        ? ` · Modell=${provider.selectedModel.displayName} (${provider.selectedModel.canonicalModelId})`
+        : "";
+      const providerManagedLimits = provider.backendId === "kimi-code"
+        ? " · Limits=providerverwaltet · Extra Usage kann kostenpflichtig sein"
+        : "";
       // Privacy contract: rendered status must never include account
       // fingerprints or fingerprint suffixes, key fragments, account IDs,
       // emails, raw quota, or fabricated numeric zeros.
       out.text(
         `${provider.displayName} · ${availability}`
         + ` · ${provider.headline ?? "nicht geprüft"} · ${provider.billingRealm}`
-        + `${provider.isDefault ? " · Standard" : ""}${details}`,
+        + `${provider.isDefault ? " · Standard" : ""}${selectedModel}`
+        + `${providerManagedLimits}${details}`,
       );
     }
     out.text(`Cross: ${result.crossEnabled ? "an" : "aus"}`);

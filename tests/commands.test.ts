@@ -377,6 +377,35 @@ function lifecycleContext(
   };
 }
 
+test("setup-required routes do not block legacy OpenRouter key repair, balance, or models", async () => {
+  const credentials = lifecycleCredentials();
+  const openRouter = lifecycleService(`${KEY_PREFIX}no-route-openrouter-fixture`);
+  const routeGate = {
+    currentSessionRoute() {
+      throw Object.assign(new Error("setup required"), {
+        code: "provider-setup-required",
+      });
+    },
+  };
+  const key = lifecycleContext(openRouter, credentials.store, {
+    providerRoutes: routeGate,
+  } as unknown as Partial<CommandContext>);
+  await assert.doesNotReject(handleSlashCommand("/key status", key.context));
+  assert.match(key.output.join("\n"), /Key|OpenRouter|Umgebung|gültig|ungeprüft/i);
+
+  const balance = lifecycleContext(openRouter, credentials.store, {
+    providerRoutes: routeGate,
+  } as unknown as Partial<CommandContext>);
+  await assert.doesNotReject(handleSlashCommand("/balance", balance.context));
+  assert.match(balance.output.join("\n"), /99|Limit|Guthaben|USD/i);
+
+  const models = lifecycleContext(openRouter, credentials.store, {
+    providerRoutes: routeGate,
+  } as unknown as Partial<CommandContext>);
+  await assert.doesNotReject(handleSlashCommand("/models", models.context));
+  assert.match(models.output.join("\n"), /Tool-fähige Modelle|Keine passenden tool-fähigen Modelle/i);
+});
+
 test("slash help renders every shared catalog usage and catalog aliases dispatch", async () => {
   const catalogModule = await import("../src/command-catalog.js") as unknown as {
     COMMAND_CATALOG: ReadonlyArray<{ usage: string }>;
@@ -687,7 +716,7 @@ const PRIVATE_STATUS_CANARIES: ReadonlyArray<{ name: string; pattern: RegExp; sa
   },
   {
     name: "raw quota label",
-    pattern: /\bquota\b|\bkontingent\b|\bremaining\b|\bbalance\b|\bguthaben\b|\busage\b/i,
+    pattern: /\bquota\b|\bkontingent\b|\bremaining\b|\bbalance\b|\bguthaben\b|(?<!extra )\busage\b/i,
     samples: ["quota: none", "Guthaben", "remaining"],
   },
   {
@@ -809,6 +838,7 @@ test("provider status renders kimi as preview on its own realm without private d
               spend: "unknown",
               runtime: "not-applicable",
             },
+            selectedModel: null,
             isDefault: false,
           }, {
             backendId: "kimi-code",
@@ -824,6 +854,11 @@ test("provider status renders kimi as preview on its own realm without private d
               connectivity: "connected",
               spend: "unknown",
               runtime: "not-applicable",
+            },
+            selectedModel: {
+              requestedModelId: "k3",
+              canonicalModelId: "k3",
+              displayName: "Kimi K3",
             },
             isDefault: true,
           }],
@@ -844,6 +879,7 @@ test("provider status renders kimi as preview on its own realm without private d
   assert.ok(kimiLine, "status must render the kimi provider entry");
   assert.match(kimiLine, /Kimi Code.*Preview.*enabled.*ready.*kimi-code-membership-provider-managed-overage.*Standard/s);
   assert.match(kimiLine, /credential=valid.*connectivity=connected.*spend=unknown.*runtime=not-applicable/s);
+  assert.match(kimiLine, /Modell=Kimi K3 \(k3\).*Limits=providerverwaltet.*Extra Usage kann kostenpflichtig sein/s);
   assert.equal(kimiLine.toLowerCase().includes("openrouter"), false);
   assert.match(rendered, /OpenRouter.*enabled.*ready.*openrouter-payg/s);
   for (const canary of PRIVATE_STATUS_CANARIES) {

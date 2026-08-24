@@ -13,9 +13,12 @@ import {
   AgentRunError,
   OrcodeAgent,
   assertSpendAvailable,
+  bindModelRuntimeIdentity,
   isAbortError,
+  readModelRuntimeIdentity,
   type AgentRunOutcome,
   type AgentRunResult,
+  type ModelRuntimeBindingIdentityV1,
 } from "./agent.js";
 import {
   attachmentPromptSummary,
@@ -76,7 +79,10 @@ import {
   type CredentialSlotRef,
   type CredentialStoreLike,
 } from "./credentials.js";
-import { OpenRouterService } from "./openrouter.js";
+import {
+  OpenRouterService,
+  createOpenRouterModelRuntime,
+} from "./openrouter.js";
 import type { PanelJudgment, PanelResult } from "./panel.js";
 import {
   buildResumePrompt,
@@ -154,6 +160,12 @@ import {
   ProviderSetupRequiredError,
   deriveProviderHeadline,
   sameRoute,
+  type BackendAdapter,
+  type BackendDescriptor,
+  type BackendModelDescriptor,
+  type CandidateProviderState,
+  type ProviderCandidate,
+  type ProviderInspection,
   type RouteIdentityV1,
 } from "./backends.js";
 import {
@@ -161,6 +173,19 @@ import {
   OPENROUTER_DESCRIPTOR,
   OpenRouterBackendAdapter,
 } from "./openrouter-backend.js";
+import {
+  KIMI_CODE_DESCRIPTOR,
+  KimiCodeBackendAdapter,
+} from "./kimi-code-backend.js";
+import {
+  KIMI_CODE_MODELS,
+  KimiCodeService,
+  issuedKimiCodeFailure,
+} from "./kimi-code.js";
+import {
+  createKimiCodeModelRuntime,
+  type ModelRuntime,
+} from "./model-runtime.js";
 import {
   PROVIDER_CREDENTIAL_FORGET_DIRECTORY,
   ProviderActivationCoordinator,
@@ -182,6 +207,7 @@ import {
 import {
   SetupOrchestrator,
   runProviderStartupAttempt,
+  type ProviderExecutionMode,
   type ProviderStartupStepContext,
   type StartupSetupResult,
 } from "./setup.js";
@@ -189,6 +215,7 @@ import {
   ProviderCredentialAuthority,
   ProviderAuthoritySnapshot,
   parseOpenRouterCredentialPointer,
+  selectProviderBinding,
   selectOpenRouterBinding,
   type ProviderCandidateAuthorityLease,
   type ProviderCandidateAuthorityResult,
@@ -240,6 +267,34 @@ export interface CliOptions {
   resume: boolean;
   /** Never mention an interrupted run this start. */
   noResume: boolean;
+}
+
+const TRUSTED_EXECUTION_MODE_DOWNGRADES: ReadonlySet<ProviderExecutionMode> = new Set([
+  "scheduled",
+  "relay",
+  "multi-user",
+  "collaborator",
+  "shared-service",
+  "unenrolled-device",
+]);
+
+export function deriveProviderExecutionMode(
+  options: Pick<CliOptions, "json" | "prompt">,
+  launcherMode?: ProviderExecutionMode,
+): ProviderExecutionMode {
+  const locallyDerived: ProviderExecutionMode = options.json
+    ? "json"
+    : options.prompt !== undefined
+      ? "batch"
+      : !process.stdin.isTTY || !process.stdout.isTTY
+        ? "piped"
+        : "local-interactive-owner";
+  if (
+    locallyDerived === "local-interactive-owner"
+    && launcherMode
+    && TRUSTED_EXECUTION_MODE_DOWNGRADES.has(launcherMode)
+  ) return launcherMode;
+  return locallyDerived;
 }
 
 export interface StartupStorageDependencies {
@@ -450,12 +505,14 @@ export interface ProviderRuntimeInput {
   startup: StartupStorageResult;
   environment: Readonly<Record<string, string | undefined>>;
   requestedModel?: string;
+  executionMode: ProviderExecutionMode;
 }
 
 export interface ProviderRuntime extends ProviderRouteIntentPort, ProviderCommandIntentPort {
   readonly openRouter: OpenRouterService;
   readonly credentials: CredentialStore;
   readonly preparedRoles: SetupPreparedRoles | null;
+  modelRuntime(route: RouteIdentityV1): ModelRuntime;
   migratedSessionConnection(): ProviderConnectionStateV1 | undefined;
   inspectStartup(): Promise<StartupSetupResult>;
   resolveLegacyDefaultRoute(): Promise<StartupSetupResult>;
@@ -472,6 +529,52 @@ export interface ProviderRuntime extends ProviderRouteIntentPort, ProviderComman
     run: (route: RouteIdentityV1) => Promise<T>,
     surface?: SetupSurface | "plain" | "fullscreen",
   ): Promise<T>;
+}
+
+export class KimiOwnerInteractiveRequiredError extends Error {
+  readonly code = "kimi-code-owner-interactive-required" as const;
+  readonly exitCode = 1 as const;
+
+  constructor() {
+    super("Kimi Code Abo ist nur in einer lokalen, interaktiven Owner-Sitzung verfügbar.");
+    this.name = "KimiOwnerInteractiveRequiredError";
+  }
+}
+
+class KimiExecutionPolicyAdapter implements BackendAdapter {
+  readonly backendId = "kimi-code" as const;
+
+  async inspect(request: Parameters<BackendAdapter["inspect"]>[0]): Promise<ProviderInspection> {
+    const health = {
+      credential: "valid" as const,
+      connectivity: "connected" as const,
+      spend: "unknown" as const,
+      runtime: "policy-unavailable" as const,
+      observedAt: Date.now(),
+      generation: request.generation,
+    };
+    return {
+      backendId: "kimi-code",
+      connectionId: request.connectionId,
+      health,
+      headline: deriveProviderHeadline(health),
+      accountFingerprint: null,
+      billingRealm: "kimi-code-membership-provider-managed-overage",
+      routeEligible: false,
+      retryable: false,
+      explanationCode: "kimi-code-owner-interactive-required",
+    };
+  }
+
+  async reconnect(request: Parameters<BackendAdapter["reconnect"]>[0]): Promise<ProviderInspection> {
+    return this.inspect(request);
+  }
+
+  async connect(): Promise<ProviderCandidate> { throw new KimiOwnerInteractiveRequiredError(); }
+  async listModels(): Promise<readonly BackendModelDescriptor[]> { throw new KimiOwnerInteractiveRequiredError(); }
+  async activate(): Promise<CandidateProviderState> { throw new KimiOwnerInteractiveRequiredError(); }
+  async logout(): Promise<void> { throw new KimiOwnerInteractiveRequiredError(); }
+  async discardCandidate(): Promise<void> {}
 }
 
 export async function executeProviderModelAction<T>(input: {
@@ -579,6 +682,7 @@ type ProviderConfirmationResult = Extract<
 
 interface ProviderConfirmationBinding {
   operation: ProviderDestructiveOperation;
+  backendId: "openrouter" | "kimi-code";
   providerRevision: number;
   connection: {
     id: string;
@@ -622,6 +726,7 @@ export class DefaultProviderRuntime implements ProviderRuntime {
   #setupPublicationGeneration = 0;
   readonly #providerConfirmations = new Map<string, ProviderConfirmationBinding>();
   #startupAttemptGeneration = 0;
+  #modelRuntimeCache: { key: string; runtime: ModelRuntime } | null = null;
 
   constructor(
     readonly openRouter: OpenRouterService,
@@ -640,12 +745,142 @@ export class DefaultProviderRuntime implements ProviderRuntime {
     private readonly authorityOptions?: {
       credentialAuthority: ProviderCredentialAuthority;
       adapter: OpenRouterBackendAdapter;
+      kimiAdapter?: KimiCodeBackendAdapter;
+      forgetJournal: ProviderCredentialForgetJournal;
       recover(context: ProviderStartupStepContext): Promise<void>;
     },
+    private readonly executionMode: ProviderExecutionMode = "local-interactive-owner",
   ) {}
 
   get preparedRoles(): SetupPreparedRoles | null {
     return this.#preparedRoles ? structuredClone(this.#preparedRoles) : null;
+  }
+
+  modelRuntime(route: RouteIdentityV1): ModelRuntime {
+    if ((route as Partial<RouteIdentityV1> | null | undefined)?.backendId === "kimi-code") {
+      this.#assertKimiOwnerMode();
+    }
+    const validated = validateRouteIdentityV1(route);
+    if (
+      !validated
+      || validated.resolutionState !== "resolved"
+      || !validated.canonicalModelId
+    ) throw new ProviderSetupRequiredError();
+    const state = this.stateStore.read();
+    const selected = selectProviderBinding(state, { kind: "route", route: validated });
+    if (
+      selected.kind !== "exact"
+      || selected.binding.stateRevision !== state.revision
+      || selected.binding.backendId !== validated.backendId
+      || selected.binding.accountFingerprint !== validated.accountFingerprint
+      || selected.binding.billingRealm !== validated.billingRealm
+    ) throw new ProviderSetupRequiredError();
+    const connection = state.connections.find((candidate) =>
+      candidate.id === selected.binding.connectionId,
+    );
+    if (validated.backendId === "openrouter") {
+      const key = JSON.stringify({
+        backendId: "openrouter",
+        stateRevision: state.revision,
+        connectionId: selected.binding.connectionId,
+        route: validated,
+        mainModel: this.config.mainModel,
+        fallbackModels: this.config.fallbackModels,
+        provider: this.config.provider,
+      });
+      if (this.#modelRuntimeCache?.key === key) return this.#modelRuntimeCache.runtime;
+      const observedGeneration = connection?.lastHealth?.generation;
+      const runtime = bindModelRuntimeIdentity(
+        createOpenRouterModelRuntime(this.openRouter, this.config, validated),
+        {
+          version: 1,
+          stateRevision: state.revision,
+          generation: Number.isSafeInteger(observedGeneration) && (observedGeneration ?? -1) >= 0
+            ? observedGeneration as number
+            : state.revision,
+          connectionId: selected.binding.connectionId,
+          backendId: "openrouter",
+          route: validated,
+        },
+      );
+      this.#modelRuntimeCache = { key, runtime };
+      return runtime;
+    }
+    if (validated.backendId !== "kimi-code") throw new ProviderSetupRequiredError();
+    if (
+      validated.requestedModelId !== validated.canonicalModelId
+      || !KIMI_CODE_MODELS.some((model) => model.id === validated.requestedModelId)
+    ) throw new ProviderSetupRequiredError();
+    const health = connection?.lastHealth;
+    if (
+      !connection
+      || !connection.enabled
+      || connection.backendId !== "kimi-code"
+      || connection.accountFingerprint !== validated.accountFingerprint
+      || connection.billingRealm !== "kimi-code-membership-provider-managed-overage"
+      || !health
+      || !Number.isSafeInteger(health.generation)
+      || health.generation < 0
+      || health.credential !== "valid"
+      || health.connectivity !== "connected"
+      || health.spend === "limit-reached"
+      || health.runtime !== "not-applicable"
+    ) throw new ProviderSetupRequiredError();
+    const key = JSON.stringify({
+      backendId: "kimi-code",
+      stateRevision: state.revision,
+      generation: health.generation,
+      connectionId: connection.id,
+      route: validated,
+    });
+    if (this.#modelRuntimeCache?.key === key) return this.#modelRuntimeCache.runtime;
+    const runtime = bindModelRuntimeIdentity(
+      createKimiCodeModelRuntime({
+        route: validated,
+        binding: Object.freeze({
+          version: 1,
+          stateRevision: state.revision,
+          generation: health.generation,
+          connectionId: connection.id,
+          backendId: "kimi-code",
+          accountFingerprint: connection.accountFingerprint,
+          billingRealm: "kimi-code-membership-provider-managed-overage",
+          canonicalModelId: validated.canonicalModelId as (typeof KIMI_CODE_MODELS)[number]["id"],
+        }),
+        credentialAuthority: this.authorityOptions?.credentialAuthority
+          ?? (() => { throw new ProviderSetupRequiredError(); })(),
+        fetch: (request, init) => globalThis.fetch(request, init),
+        now: Date.now,
+        createRequestDeadlineAt: () => Date.now() + 300_000,
+      }),
+      {
+        version: 1,
+        stateRevision: state.revision,
+        generation: health.generation,
+        connectionId: connection.id,
+        backendId: "kimi-code",
+        route: validated,
+      },
+    );
+    this.#modelRuntimeCache = { key, runtime };
+    return runtime;
+  }
+
+  #assertKimiOwnerMode(): void {
+    if (this.executionMode !== "local-interactive-owner") {
+      throw new KimiOwnerInteractiveRequiredError();
+    }
+  }
+
+  #assertDesiredKimiPolicy(): void {
+    if (this.executionMode === "local-interactive-owner") return;
+    const state = this.stateStore.read();
+    const sessionRoute = validateRouteIdentityV1(this.session?.data?.route);
+    if (
+      this.#sessionRoute?.backendId === "kimi-code"
+      || sessionRoute?.backendId === "kimi-code"
+      || state.defaultRoute?.backendId === "kimi-code"
+    ) this.#assertKimiOwnerMode();
   }
 
   #adoptExactSessionRoute(
@@ -710,6 +945,7 @@ export class DefaultProviderRuntime implements ProviderRuntime {
   }
 
   async inspectStartup(): Promise<StartupSetupResult> {
+    this.#assertDesiredKimiPolicy();
     const generation = typeof this.orchestrator.nextStartupGeneration === "function"
       ? this.orchestrator.nextStartupGeneration()
       : ++this.#startupAttemptGeneration;
@@ -778,16 +1014,17 @@ export class DefaultProviderRuntime implements ProviderRuntime {
           ? persistedSessionRoute
           : result.defaultRoute;
         const provedRoute = this.orchestrator.ensureRunnableRoute(desiredRoute);
-        const selected = selectOpenRouterBinding(
+        const selected = selectProviderBinding(
           this.stateStore.read(),
           { kind: "route", route: provedRoute },
         );
         if (selected.kind !== "exact") throw new ProviderSetupRequiredError();
+        const routeAdapter = this.registry.adapter(provedRoute.backendId);
         if (
           persistedSessionRoute?.resolutionState === "resolved"
           && !sameExactRoute(persistedSessionRoute, result.defaultRoute)
         ) {
-          const models = await this.authorityOptions.adapter.listModels({
+          const models = await routeAdapter.listModels({
             connectionId: selected.binding.connectionId,
             signal: context.signal,
           });
@@ -801,12 +1038,17 @@ export class DefaultProviderRuntime implements ProviderRuntime {
           );
           if (exact.length !== 1) throw new ProviderSetupRequiredError();
         }
-        await this.authorityOptions.adapter.bindRuntime({
-          connectionId: selected.binding.connectionId,
-          generation: result.generation,
-          deadlineAt: context.deadlineAt,
-          signal: context.signal,
-        });
+        if (provedRoute.backendId === "kimi-code") {
+          this.modelRuntime(provedRoute);
+        } else {
+          if (!routeAdapter.bindRuntime) throw new ProviderSetupRequiredError();
+          await routeAdapter.bindRuntime({
+            connectionId: selected.binding.connectionId,
+            generation: result.generation,
+            deadlineAt: context.deadlineAt,
+            signal: context.signal,
+          });
+        }
         context.assertCurrent();
         this.#adoptExactSessionRoute(provedRoute, true);
       },
@@ -830,6 +1072,7 @@ export class DefaultProviderRuntime implements ProviderRuntime {
   async runSetup(
     surface: SetupSurface | "plain" | "fullscreen",
     startupAttempt?: ProviderStartupStepContext,
+    initialBackendId?: "openrouter" | "kimi-code",
   ): Promise<SetupHubResult> {
     if (surface === "fullscreen") {
       throw new ProviderSetupRequiredError();
@@ -862,6 +1105,7 @@ export class DefaultProviderRuntime implements ProviderRuntime {
     let activationSettledAfterInterruption = false;
     let cancellationCommitted = false;
     const setupOrchestrator = {
+      nextStartupGeneration: () => this.orchestrator.nextStartupGeneration(),
       activateCandidate: async (
         request: Parameters<SetupOrchestrator["activateCandidate"]>[0],
       ) => {
@@ -925,6 +1169,18 @@ export class DefaultProviderRuntime implements ProviderRuntime {
           use,
         )
       : undefined;
+    const guardManualKimiCandidate = this.authorityOptions?.credentialAuthority
+      .withManualKimiCandidateAuthority
+      ? this.authorityOptions.credentialAuthority.withManualKimiCandidateAuthority.bind(
+          this.authorityOptions.credentialAuthority,
+        )
+      : undefined;
+    const releaseManualKimiCandidatePermit = this.authorityOptions?.credentialAuthority
+      .releaseManualKimiCandidatePermit
+      ? this.authorityOptions.credentialAuthority.releaseManualKimiCandidatePermit.bind(
+          this.authorityOptions.credentialAuthority,
+        )
+      : undefined;
     let terminalHub: Promise<SetupHubResult> | null = null;
     const executeHub = (
       savedSecret: string | null,
@@ -937,6 +1193,8 @@ export class DefaultProviderRuntime implements ProviderRuntime {
         orchestrator: setupOrchestrator,
         registry: this.registry,
         stateStore: this.stateStore,
+        executionMode: this.executionMode,
+        initialBackendId,
         savedSecret,
         environmentSecret: this.environmentSecret,
         signal,
@@ -949,6 +1207,8 @@ export class DefaultProviderRuntime implements ProviderRuntime {
         environmentCandidatePermit,
         preflightCandidate: this.authorityOptions ? preflightCandidate : undefined,
         withCandidateAuthority: guardCandidate,
+        withManualKimiCandidateAuthority: guardManualKimiCandidate,
+        releaseManualKimiCandidatePermit,
         isCurrent: setupAttemptIsCurrent,
       });
       terminalHub = pending;
@@ -967,7 +1227,9 @@ export class DefaultProviderRuntime implements ProviderRuntime {
           ? selectOpenRouterBinding(state, { kind: "default" })
           : selectOpenRouterBinding(state, { kind: "backend", backendId: "openrouter" });
       let result: SetupHubResult;
-      if (this.authorityOptions && savedBinding.kind === "exact") {
+      if (initialBackendId === "kimi-code") {
+        result = await executeHub(null);
+      } else if (this.authorityOptions && savedBinding.kind === "exact") {
         const access = await this.authorityOptions.credentialAuthority.withCredential(
           {
             backendId: savedBinding.binding.backendId,
@@ -1079,7 +1341,7 @@ export class DefaultProviderRuntime implements ProviderRuntime {
       ) {
         throw new ProviderSetupRequiredError();
       }
-      const selected = selectOpenRouterBinding(
+      const selected = selectProviderBinding(
         this.stateStore.read(),
         { kind: "route", route: pending.route },
       );
@@ -1133,7 +1395,8 @@ export class DefaultProviderRuntime implements ProviderRuntime {
     ) {
       throw new ProviderSetupRequiredError();
     }
-    const initial = selectOpenRouterBinding(
+    if (validated.backendId === "kimi-code") this.#assertKimiOwnerMode();
+    const initial = selectProviderBinding(
       this.stateStore.read(),
       { kind: "route", route: validated },
     );
@@ -1151,14 +1414,14 @@ export class DefaultProviderRuntime implements ProviderRuntime {
     let primaryFailed = false;
     try {
       await runtimeLease.assertHeld();
-      const result = await this.orchestrator.reconnect("openrouter", {
+      const result = await this.orchestrator.reconnect(validated.backendId, {
         connectionId: initial.binding.connectionId,
         signal: controller.signal,
       });
       await runtimeLease.assertHeld();
       const proved = this.orchestrator.ensureRunnableRoute(validated);
       if (!sameExactRoute(proved, validated)) throw new ProviderSetupRequiredError();
-      const current = selectOpenRouterBinding(
+      const current = selectProviderBinding(
         this.stateStore.read(),
         { kind: "route", route: proved },
       );
@@ -1181,7 +1444,7 @@ export class DefaultProviderRuntime implements ProviderRuntime {
         && model.capabilities.textInput
         && model.capabilities.textOutput
       );
-      if (exact.length !== 1 || !adapter.bindRuntime) {
+      if (exact.length !== 1 || (validated.backendId === "openrouter" && !adapter.bindRuntime)) {
         throw new ProviderSetupRequiredError();
       }
       this.#processRouteGeneration += 1;
@@ -1192,14 +1455,18 @@ export class DefaultProviderRuntime implements ProviderRuntime {
         generation: pendingGeneration,
         ready: false,
       };
-      await adapter.bindRuntime({
-        connectionId: current.binding.connectionId,
-        generation: result.generation,
-        deadlineAt: Date.now() + 5_000,
-        signal: controller.signal,
-      });
+      if (validated.backendId === "kimi-code") {
+        this.modelRuntime(proved);
+      } else {
+        await adapter.bindRuntime!({
+          connectionId: current.binding.connectionId,
+          generation: result.generation,
+          deadlineAt: Date.now() + 5_000,
+          signal: controller.signal,
+        });
+      }
       await runtimeLease.assertHeld();
-      const rebound = selectOpenRouterBinding(
+      const rebound = selectProviderBinding(
         this.stateStore.read(),
         { kind: "route", route: proved },
       );
@@ -1232,6 +1499,7 @@ export class DefaultProviderRuntime implements ProviderRuntime {
   }
 
   ensureRunnableRoute(): RouteIdentityV1 {
+    this.#assertDesiredKimiPolicy();
     if (this.#pendingSessionBinding) throw new ProviderSetupRequiredError();
     const requiredSessionRoute = validateRouteIdentityV1(this.session?.data.route);
     if (
@@ -1251,7 +1519,7 @@ export class DefaultProviderRuntime implements ProviderRuntime {
         return structuredClone(this.#sessionRoute);
       }
       const state = this.stateStore.read();
-      const selected = selectOpenRouterBinding(
+      const selected = selectProviderBinding(
         state,
         { kind: "route", route: this.#sessionRoute },
       );
@@ -1285,6 +1553,10 @@ export class DefaultProviderRuntime implements ProviderRuntime {
     surface?: SetupSurface | "plain" | "fullscreen",
   ): Promise<void> {
     const current = this.ensureRunnableRoute();
+    if (current.backendId === "kimi-code") {
+      await this.#transitionKimiModel(current, modelId, canonicalModelId);
+      return;
+    }
     const resolved = canonicalModelId === undefined
       ? await this.runModelCatalog(
           () => resolveMainModelCandidate(this.openRouter, modelId),
@@ -1402,22 +1674,197 @@ export class DefaultProviderRuntime implements ProviderRuntime {
     }
   }
 
+  async #transitionKimiModel(
+    current: RouteIdentityV1,
+    modelId: string,
+    canonicalModelId?: string,
+  ): Promise<void> {
+    this.#assertKimiOwnerMode();
+    const selectedCanonicalModelId = canonicalModelId ?? modelId;
+    if (
+      selectedCanonicalModelId !== modelId
+      || !KIMI_CODE_MODELS.some((model) => model.id === modelId)
+    ) throw new ProviderSetupRequiredError();
+    if (
+      current.requestedModelId === modelId
+      && current.canonicalModelId === selectedCanonicalModelId
+    ) return;
+    const adapter = this.authorityOptions?.kimiAdapter;
+    if (!adapter) throw new ProviderSetupRequiredError();
+    const controller = new AbortController();
+    const deadlineAt = Date.now() + 15_000;
+    let committedTuple: { state: ProviderSetupStateV2; route: RouteIdentityV1 } | null = null;
+    let committedAdopted = false;
+    const adoptCommittedTuple = (): boolean => {
+      const tuple = committedTuple;
+      if (!tuple) return false;
+      if (committedAdopted) return true;
+      this.config.providerSetup = requirePersistableProviderState(tuple.state);
+      this.modelRuntime(tuple.route);
+      this.#adoptExactSessionRoute(tuple.route, true, true, true, true);
+      committedAdopted = true;
+      return true;
+    };
+    try {
+      await this.activationCoordinator.runExclusive(
+        { signal: controller.signal, inspectCommitted: false },
+        async (lease) => {
+          try {
+            await lease.assertHeld();
+            const state = this.stateStore.read();
+            const selected = selectProviderBinding(state, { kind: "route", route: current });
+            if (selected.kind !== "exact" || selected.binding.backendId !== "kimi-code") {
+              throw new ProviderSetupRequiredError();
+            }
+            const connection = state.connections.find((candidate) =>
+              candidate.id === selected.binding.connectionId,
+            );
+            if (!connection) throw new ProviderSetupRequiredError();
+            const generation = Math.max(
+              state.revision,
+              connection.lastHealth?.generation ?? 0,
+            ) + 1;
+            const inspection = await adapter.inspectUnderAuthorityLease({
+              connectionId: connection.id,
+              generation,
+              deadlineAt,
+              signal: controller.signal,
+              purpose: "runtime-bind",
+              environmentEligibility: "forbidden",
+            }, lease);
+            await lease.assertHeld();
+            if (
+              !inspection.routeEligible
+              || inspection.accountFingerprint !== connection.accountFingerprint
+              || inspection.billingRealm !== connection.billingRealm
+            ) throw new ProviderSetupRequiredError();
+            const models = await adapter.listModels({
+              connectionId: connection.id,
+              signal: controller.signal,
+            });
+            await lease.assertHeld();
+            const exact = models.filter((model) =>
+              model.backendId === "kimi-code"
+              && model.requestedModelId === modelId
+              && model.canonicalModelId === selectedCanonicalModelId
+              && model.capabilities.textInput
+              && model.capabilities.textOutput
+              && model.capabilities.tools,
+            );
+            if (exact.length !== 1) throw new ProviderSetupRequiredError();
+            const route: RouteIdentityV1 = {
+              version: 1,
+              backendId: "kimi-code",
+              accountFingerprint: connection.accountFingerprint,
+              billingRealm: "kimi-code-membership-provider-managed-overage",
+              requestedModelId: modelId,
+              canonicalModelId: selectedCanonicalModelId,
+              resolutionState: "resolved",
+            };
+            const expectedCommittedState: ProviderSetupStateV2 = {
+              ...state,
+              revision: state.revision + 1,
+              lifecycle: "configured",
+              connections: state.connections.map((candidate) =>
+                candidate.id === connection.id
+                  ? { ...candidate, lastHealth: structuredClone(inspection.health) }
+                  : candidate,
+              ),
+              defaultRoute: route,
+              cross: { enabled: false, preferredLead: null, preferredChallenger: null },
+            };
+            let committed: ProviderSetupStateV2;
+            try {
+              committed = await this.stateStore.commit(state.revision, (authoritative) => {
+                const binding = selectProviderBinding(authoritative, {
+                  kind: "connection",
+                  connectionId: connection.id,
+                });
+                if (
+                  binding.kind !== "exact"
+                  || binding.binding.backendId !== "kimi-code"
+                  || binding.binding.accountFingerprint !== current.accountFingerprint
+                  || binding.binding.billingRealm !== current.billingRealm
+                ) throw new ProviderSetupRequiredError();
+                return {
+                  ...authoritative,
+                  lifecycle: "configured",
+                  connections: authoritative.connections.map((candidate) =>
+                    candidate.id === connection.id
+                      ? { ...candidate, lastHealth: structuredClone(inspection.health) }
+                      : candidate,
+                  ),
+                  defaultRoute: route,
+                  cross: { enabled: false, preferredLead: null, preferredChallenger: null },
+                };
+              });
+            } catch (error) {
+              const adopted = readProviderStateCommitAdoption(error);
+              if (adopted) committed = adopted;
+              else {
+                const exactReadback = this.stateStore.read();
+                if (JSON.stringify(exactReadback) !== JSON.stringify(expectedCommittedState)) throw error;
+                committed = exactReadback;
+              }
+            }
+            committedTuple = { state: committed, route };
+            await lease.assertHeld();
+            if (!adoptCommittedTuple()) throw new ProviderSetupRequiredError();
+          } catch (error) {
+            if (adoptCommittedTuple()) return;
+            throw error;
+          }
+        },
+      );
+    } catch (error) {
+      if (adoptCommittedTuple()) return;
+      throw error;
+    }
+  }
+
   async runWithReadyRoute<T>(
     run: (route: RouteIdentityV1) => Promise<T>,
     surface?: SetupSurface | "plain" | "fullscreen",
   ): Promise<T> {
+    let attemptedBackend: "openrouter" | "kimi-code" = "openrouter";
     return executeProviderModelAction({
-      ensureRunnableRoute: () => this.ensureRunnableRoute(),
+      ensureRunnableRoute: () => {
+        const route = this.ensureRunnableRoute();
+        if (route.backendId === "kimi-code") attemptedBackend = "kimi-code";
+        return route;
+      },
       beginRun: () => this.runtimeGuard.beginRun(),
       run,
-      isAuthenticationFailure: (error) => shouldReplaceCredential(error, this.openRouter),
+      isAuthenticationFailure: (error) => attemptedBackend === "kimi-code"
+        ? ["kimi-code-auth-rejected", "kimi-code-access-terminated"].includes(
+            issuedKimiCodeFailure(error)?.code ?? "",
+          )
+        : shouldReplaceCredential(error, this.openRouter),
       invalidateAndInspect: async () => {
-        this.#processRouteGeneration += 1;
-        this.#sessionRoute = null;
-        this.#sessionRoutePersisted = false;
-        this.#pendingSessionBinding = null;
-        this.#preparedRoles = null;
-        await this.orchestrator.reconnect("openrouter");
+        const controller = new AbortController();
+        const runtimeLease = await this.runtimeGuard.acquire(controller.signal);
+        let primaryFailed = false;
+        try {
+          await runtimeLease.assertHeld();
+          this.#processRouteGeneration += 1;
+          this.#sessionRoute = null;
+          this.#sessionRoutePersisted = false;
+          this.#pendingSessionBinding = null;
+          this.#preparedRoles = null;
+          await this.orchestrator.reconnect(attemptedBackend, {
+            signal: controller.signal,
+          });
+          await runtimeLease.assertHeld();
+        } catch (error) {
+          primaryFailed = true;
+          throw error;
+        } finally {
+          try {
+            await Promise.resolve(runtimeLease.release());
+          } catch (error) {
+            if (!primaryFailed) throw error;
+          }
+        }
       },
       runSetup: (requestedSurface) => this.runSetup(requestedSurface),
       surface,
@@ -1439,12 +1886,20 @@ export class DefaultProviderRuntime implements ProviderRuntime {
   }
 
   #selectedOpenRouterConnection(state: ProviderSetupStateV2) {
+    return this.#selectedProviderConnection(state, "openrouter");
+  }
+
+  #selectedProviderConnection(
+    state: ProviderSetupStateV2,
+    backendId: "openrouter" | "kimi-code",
+    allowDisabled = false,
+  ) {
     const desiredRoute = this.#desiredSessionRoute(state);
-    const selected = desiredRoute
-      ? selectOpenRouterBinding(state, { kind: "route", route: desiredRoute })
-      : state.defaultRoute
-        ? selectOpenRouterBinding(state, { kind: "default" })
-        : selectOpenRouterBinding(state, { kind: "backend", backendId: "openrouter" });
+    const selected = desiredRoute?.backendId === backendId
+      ? selectProviderBinding(state, { kind: "route", route: desiredRoute }, allowDisabled)
+      : state.defaultRoute?.backendId === backendId
+        ? selectProviderBinding(state, { kind: "default" }, allowDisabled)
+        : selectProviderBinding(state, { kind: "backend", backendId }, allowDisabled);
     return selected.kind === "exact"
       ? state.connections.find((connection) => connection.id === selected.binding.connectionId)
       : undefined;
@@ -1453,12 +1908,13 @@ export class DefaultProviderRuntime implements ProviderRuntime {
   #confirmationBinding(
     operation: ProviderDestructiveOperation,
     state: ProviderSetupStateV2,
+    backendId: "openrouter" | "kimi-code" = "openrouter",
   ): ProviderConfirmationBinding {
-    let connection = this.#selectedOpenRouterConnection(state);
+    let connection = this.#selectedProviderConnection(state, backendId);
     if (!connection && operation === "logout") {
-      const retained = selectOpenRouterBinding(
+      const retained = selectProviderBinding(
         state,
-        { kind: "backend", backendId: "openrouter" },
+        { kind: "backend", backendId },
         true,
       );
       if (retained.kind === "exact") {
@@ -1469,6 +1925,7 @@ export class DefaultProviderRuntime implements ProviderRuntime {
     }
     return {
       operation,
+      backendId,
       providerRevision: state.revision,
       connection: connection
         ? {
@@ -1488,11 +1945,12 @@ export class DefaultProviderRuntime implements ProviderRuntime {
   #confirmationRequired(
     operation: ProviderDestructiveOperation,
     state = this.stateStore.read(),
+    backendId: "openrouter" | "kimi-code" = "openrouter",
   ): ProviderConfirmationResult {
     const confirmationToken = randomUUID();
     this.#providerConfirmations.set(
       confirmationToken,
-      this.#confirmationBinding(operation, state),
+      this.#confirmationBinding(operation, state, backendId),
     );
     while (this.#providerConfirmations.size > 64) {
       const oldest = this.#providerConfirmations.keys().next().value;
@@ -1502,10 +1960,10 @@ export class DefaultProviderRuntime implements ProviderRuntime {
     return {
       kind: "confirmation-required",
       operation,
-      backendId: "openrouter",
+      backendId,
       message: operation === "logout"
-        ? "OpenRouter-Zugang wirklich abmelden und nur seinen aktuellen versionierten Schlüssel entfernen?"
-        : "Letzten nutzbaren OpenRouter-Zugang deaktivieren? Modellläufe stoppen, die Unterhaltung bleibt geöffnet.",
+        ? `${backendId === "kimi-code" ? "Kimi-Code" : "OpenRouter"}-Zugang wirklich abmelden und nur seinen aktuellen versionierten Schlüssel entfernen?`
+        : `Letzten nutzbaren ${backendId === "kimi-code" ? "Kimi-Code" : "OpenRouter"}-Zugang deaktivieren? Modellläufe stoppen, die Unterhaltung bleibt geöffnet.`,
       confirmationToken,
     };
   }
@@ -1514,31 +1972,49 @@ export class DefaultProviderRuntime implements ProviderRuntime {
     token: string,
     operation: ProviderDestructiveOperation,
     state: ProviderSetupStateV2,
+    backendId: "openrouter" | "kimi-code" = "openrouter",
   ): ProviderConfirmationBinding | null {
     const expected = this.#providerConfirmations.get(token);
     this.#providerConfirmations.delete(token);
     if (!expected) return null;
-    return this.#confirmationMatches(expected, operation, state) ? expected : null;
+    return this.#confirmationMatches(expected, operation, state, backendId) ? expected : null;
   }
 
   #confirmationMatches(
     expected: ProviderConfirmationBinding,
     operation: ProviderDestructiveOperation,
     state: ProviderSetupStateV2,
+    backendId: "openrouter" | "kimi-code" = "openrouter",
   ): boolean {
     return JSON.stringify(expected) === JSON.stringify(
-      this.#confirmationBinding(operation, state),
+      this.#confirmationBinding(operation, state, backendId),
     );
   }
 
   async #enableRetainedOpenRouter(): Promise<boolean | null> {
     if (!this.authorityOptions) return null;
+    const retainedState = this.stateStore.read();
     const retained = selectOpenRouterBinding(
-      this.stateStore.read(),
+      retainedState,
       { kind: "backend", backendId: "openrouter" },
       true,
     );
-    if (retained.kind !== "exact" || retained.binding.enabled) return null;
+    if (retained.kind !== "exact") return null;
+    const wasEnabled = retained.binding.enabled;
+    if (wasEnabled) {
+      const route = this.#desiredSessionRoute(retainedState);
+      const selected = route?.backendId === "openrouter"
+        ? selectOpenRouterBinding(retainedState, { kind: "route", route })
+        : null;
+      if (
+        route
+        && selected?.kind === "exact"
+        && selected.binding.connectionId === retained.binding.connectionId
+      ) {
+        this.#adoptExactSessionRoute(route, true, true, false, true);
+        return true;
+      }
+    }
 
     const controller = new AbortController();
     const deadlineAt = Date.now() + 5_000;
@@ -1587,7 +2063,7 @@ export class DefaultProviderRuntime implements ProviderRuntime {
             );
             if (
               selected.kind !== "exact"
-              || selected.binding.enabled
+              || selected.binding.enabled !== wasEnabled
               || selected.binding.accountFingerprint !== retained.binding.accountFingerprint
               || selected.binding.billingRealm !== retained.binding.billingRealm
               || selected.binding.credentialPointer.kind !== retained.binding.credentialPointer.kind
@@ -1627,15 +2103,28 @@ export class DefaultProviderRuntime implements ProviderRuntime {
               controller.signal,
             );
             await lease.assertHeld();
-            const exact = models.filter((model) =>
-              model.backendId === "openrouter"
-              && model.requestedModelId === this.requestedModel
-              && model.capabilities.textInput
-              && model.capabilities.textOutput
-            );
-            const canonical = new Set(exact.map((model) => model.canonicalModelId));
-            if (exact.length === 0 || canonical.size !== 1) return false;
-            const model = exact[0]!;
+            const desired = this.#desiredSessionRoute(current);
+            const requestedCandidates = [
+              desired?.backendId === "openrouter" ? desired.requestedModelId : null,
+              KIMI_CODE_MODELS.some((candidate) => candidate.id === this.requestedModel)
+                ? null
+                : this.requestedModel,
+              DEFAULT_CONFIG.mainModel,
+            ].filter((candidate): candidate is string => Boolean(candidate));
+            let model: BackendModelDescriptor | null = null;
+            for (const requestedModelId of new Set(requestedCandidates)) {
+              const exact = models.filter((candidate) =>
+                candidate.backendId === "openrouter"
+                && candidate.requestedModelId === requestedModelId
+                && candidate.capabilities.textInput
+                && candidate.capabilities.textOutput
+              );
+              if (exact.length > 0 && new Set(exact.map((candidate) => candidate.canonicalModelId)).size === 1) {
+                model = exact[0]!;
+                break;
+              }
+            }
+            if (!model) return false;
             const route: RouteIdentityV1 = {
               version: 1,
               backendId: "openrouter",
@@ -1654,6 +2143,29 @@ export class DefaultProviderRuntime implements ProviderRuntime {
               allowDisabled: true,
             }, lease);
             await lease.assertHeld();
+            if (wasEnabled) {
+              const readback = this.stateStore.read();
+              const rebound = selectOpenRouterBinding(
+                readback,
+                { kind: "connection", connectionId },
+              );
+              if (
+                readback.revision !== current.revision
+                || rebound.kind !== "exact"
+                || rebound.binding.connectionId !== connectionId
+                || rebound.binding.accountFingerprint !== connection.accountFingerprint
+                || rebound.binding.billingRealm !== connection.billingRealm
+                || rebound.binding.credentialPointer.kind !== selected.binding.credentialPointer.kind
+                || (rebound.binding.credentialPointer.kind === "legacy"
+                  ? selected.binding.credentialPointer.kind !== "legacy"
+                  : selected.binding.credentialPointer.kind !== "versioned"
+                    || rebound.binding.credentialPointer.slot.id
+                      !== selected.binding.credentialPointer.slot.id)
+              ) return false;
+              this.config.providerSetup = requirePersistableProviderState(readback);
+              this.#adoptExactSessionRoute(route, true, true, true, true);
+              return true;
+            }
             const expectedCommittedState: ProviderSetupStateV2 = {
               ...current,
               revision: current.revision + 1,
@@ -1732,6 +2244,223 @@ export class DefaultProviderRuntime implements ProviderRuntime {
     }
   }
 
+  async #enableRetainedKimi(): Promise<boolean | null> {
+    this.#assertKimiOwnerMode();
+    const kimiAdapter = this.authorityOptions?.kimiAdapter;
+    if (!kimiAdapter) throw new KimiOwnerInteractiveRequiredError();
+    const retainedState = this.stateStore.read();
+    const retained = selectProviderBinding(
+      retainedState,
+      { kind: "backend", backendId: "kimi-code" },
+      true,
+    );
+    if (retained.kind !== "exact") return null;
+    const wasEnabled = retained.binding.enabled;
+    if (wasEnabled) {
+      const route = this.#desiredSessionRoute(retainedState);
+      const selected = route?.backendId === "kimi-code"
+        ? selectProviderBinding(retainedState, { kind: "route", route })
+        : null;
+      if (
+        route
+        && selected?.kind === "exact"
+        && selected.binding.connectionId === retained.binding.connectionId
+      ) {
+        this.modelRuntime(route);
+        this.#adoptExactSessionRoute(route, true, true, false, true);
+        return true;
+      }
+    }
+    const controller = new AbortController();
+    const deadlineAt = Date.now() + 15_000;
+    const deadlineError = new Error("Kimi enable deadline expired.");
+    deadlineError.name = "TimeoutError";
+    const deadlineTimer = setTimeout(() => controller.abort(deadlineError), 15_000);
+    const assertRetainedAttemptCurrent = (): void => {
+      if (!controller.signal.aborted && Date.now() >= deadlineAt) controller.abort(deadlineError);
+      if (controller.signal.aborted) {
+        throw controller.signal.reason instanceof Error
+          ? controller.signal.reason
+          : deadlineError;
+      }
+    };
+    const connectionId = retained.binding.connectionId;
+    let committedTuple: { state: ProviderSetupStateV2; route: RouteIdentityV1 } | null = null;
+    let committedAdopted = false;
+    const adoptCommittedTuple = (): boolean => {
+      const tuple = committedTuple;
+      if (!tuple) return false;
+      if (committedAdopted) return true;
+      this.config.providerSetup = requirePersistableProviderState(tuple.state);
+      this.modelRuntime(tuple.route);
+      this.#adoptExactSessionRoute(tuple.route, true, true, true, true);
+      committedAdopted = true;
+      return true;
+    };
+    try {
+      return await this.activationCoordinator.runExclusive(
+        { signal: controller.signal, inspectCommitted: false },
+        async (lease) => {
+          try {
+            await lease.assertHeld();
+            const current = this.stateStore.read();
+            const selected = selectProviderBinding(
+              current,
+              { kind: "connection", connectionId },
+              true,
+            );
+            if (
+              selected.kind !== "exact"
+              || selected.binding.backendId !== "kimi-code"
+              || selected.binding.enabled !== wasEnabled
+              || selected.binding.accountFingerprint !== retained.binding.accountFingerprint
+              || selected.binding.billingRealm !== retained.binding.billingRealm
+              || selected.binding.credentialPointer.kind !== "versioned"
+              || retained.binding.credentialPointer.kind !== "versioned"
+              || selected.binding.credentialPointer.slot.id
+                !== retained.binding.credentialPointer.slot.id
+            ) return false;
+            const connection = current.connections.find((candidate) => candidate.id === connectionId);
+            if (!connection) return false;
+            const generation = Math.max(
+              current.revision,
+              connection.lastHealth?.generation ?? 0,
+            ) + 1;
+            const inspection = await kimiAdapter.inspectUnderAuthorityLease({
+              connectionId,
+              generation,
+              deadlineAt,
+              signal: controller.signal,
+              purpose: "explicit-enable",
+              environmentEligibility: "forbidden",
+              allowDisabled: true,
+            }, lease);
+            await lease.assertHeld();
+            if (
+              !inspection.routeEligible
+              || inspection.accountFingerprint !== connection.accountFingerprint
+              || inspection.billingRealm !== connection.billingRealm
+            ) return false;
+            const models = await kimiAdapter.listModels({
+              connectionId,
+              signal: controller.signal,
+            });
+            await lease.assertHeld();
+            const desired = this.#desiredSessionRoute(current);
+            const requestedModelId = desired?.backendId === "kimi-code"
+              ? desired.requestedModelId
+              : KIMI_CODE_MODELS.some((model) => model.id === this.requestedModel)
+                ? this.requestedModel
+                : "k3";
+            const exact = models.filter((model) =>
+              model.backendId === "kimi-code"
+              && model.requestedModelId === requestedModelId
+              && model.canonicalModelId === requestedModelId
+              && model.capabilities.textInput
+              && model.capabilities.textOutput
+              && model.capabilities.tools,
+            );
+            if (exact.length !== 1) return false;
+            const route: RouteIdentityV1 = {
+              version: 1,
+              backendId: "kimi-code",
+              accountFingerprint: connection.accountFingerprint,
+              billingRealm: "kimi-code-membership-provider-managed-overage",
+              requestedModelId,
+              canonicalModelId: requestedModelId,
+              resolutionState: "resolved",
+            };
+            if (wasEnabled) {
+              const readback = this.stateStore.read();
+              const rebound = selectProviderBinding(
+                readback,
+                { kind: "connection", connectionId },
+              );
+              if (
+                readback.revision !== current.revision
+                || rebound.kind !== "exact"
+                || rebound.binding.backendId !== "kimi-code"
+                || rebound.binding.connectionId !== connectionId
+                || rebound.binding.accountFingerprint !== connection.accountFingerprint
+                || rebound.binding.billingRealm !== connection.billingRealm
+                || rebound.binding.credentialPointer.kind !== "versioned"
+                || selected.binding.credentialPointer.kind !== "versioned"
+                || rebound.binding.credentialPointer.slot.id
+                  !== selected.binding.credentialPointer.slot.id
+              ) return false;
+              this.config.providerSetup = requirePersistableProviderState(readback);
+              this.modelRuntime(route);
+              this.#adoptExactSessionRoute(route, true, true, true, true);
+              return true;
+            }
+            const expectedCommittedState: ProviderSetupStateV2 = {
+              ...current,
+              revision: current.revision + 1,
+              lifecycle: "configured",
+              connections: current.connections.map((candidate) =>
+                candidate.id === connectionId
+                  ? { ...candidate, enabled: true, lastHealth: structuredClone(inspection.health) }
+                  : candidate,
+              ),
+              defaultRoute: route,
+              cross: { enabled: false, preferredLead: null, preferredChallenger: null },
+            };
+            let committed: ProviderSetupStateV2;
+            try {
+              committed = await this.stateStore.commit(current.revision, (authoritative) => {
+                const authoritativeBinding = selectProviderBinding(
+                  authoritative,
+                  { kind: "connection", connectionId },
+                  true,
+                );
+                const authoritativeConnection = authoritative.connections.find(
+                  (candidate) => candidate.id === connectionId,
+                );
+                if (
+                  authoritativeBinding.kind !== "exact"
+                  || authoritativeBinding.binding.backendId !== "kimi-code"
+                  || authoritativeBinding.binding.enabled
+                  || !authoritativeConnection
+                  || authoritativeConnection.credentialSlot !== connection.credentialSlot
+                  || authoritativeConnection.accountFingerprint !== connection.accountFingerprint
+                  || authoritativeConnection.billingRealm !== connection.billingRealm
+                ) throw new ProviderSetupRequiredError();
+                return {
+                  ...authoritative,
+                  lifecycle: "configured",
+                  connections: authoritative.connections.map((candidate) =>
+                    candidate.id === connectionId
+                      ? { ...candidate, enabled: true, lastHealth: structuredClone(inspection.health) }
+                      : candidate,
+                  ),
+                  defaultRoute: route,
+                  cross: { enabled: false, preferredLead: null, preferredChallenger: null },
+                };
+              }, assertRetainedAttemptCurrent);
+            } catch (error) {
+              const adopted = readProviderStateCommitAdoption(error);
+              if (adopted) committed = adopted;
+              else {
+                const exactReadback = this.stateStore.read();
+                if (JSON.stringify(exactReadback) !== JSON.stringify(expectedCommittedState)) throw error;
+                committed = exactReadback;
+              }
+            }
+            committedTuple = { state: committed, route };
+            await lease.assertHeld();
+            return adoptCommittedTuple();
+          } catch {
+            return adoptCommittedTuple();
+          }
+        },
+      );
+    } catch {
+      return adoptCommittedTuple();
+    } finally {
+      clearTimeout(deadlineTimer);
+    }
+  }
+
   async execute(
     intent: ProviderCommandIntent,
     surface: SetupSurface | "plain" | "fullscreen",
@@ -1746,24 +2475,36 @@ export class DefaultProviderRuntime implements ProviderRuntime {
           explanation: "Coming soon · Claude-Modelle sind heute über OpenRouter verfügbar.",
         };
       }
+      if (intent.backendId === "kimi-code") this.#assertKimiOwnerMode();
     }
 
     if (intent.kind === "enable") {
-      const retained = await this.#enableRetainedOpenRouter();
+      const retained = intent.backendId === "kimi-code"
+        ? await this.#enableRetainedKimi()
+        : await this.#enableRetainedOpenRouter();
       if (retained !== null) {
         return {
           kind: "setup",
-          backendId: "openrouter",
+          backendId: intent.backendId === "kimi-code" ? "kimi-code" : "openrouter",
           outcome: retained ? "ready" : "cancelled",
         };
       }
     }
 
     if (intent.kind === "setup" || intent.kind === "connect" || intent.kind === "enable") {
-      const result = await this.runSetup(surface);
+      const backendId = intent.kind === "setup"
+        ? "openrouter"
+        : intent.backendId === "kimi-code"
+          ? "kimi-code"
+          : "openrouter";
+      const result = await this.runSetup(
+        surface,
+        undefined,
+        intent.kind === "setup" ? undefined : backendId,
+      );
       return {
         kind: "setup",
-        backendId: "openrouter",
+        backendId,
         outcome: result.kind === "ready" ? "ready" : "cancelled",
       };
     }
@@ -1773,46 +2514,139 @@ export class DefaultProviderRuntime implements ProviderRuntime {
     }
 
     if (intent.kind === "models") {
-      const models = await this.runModelCatalog(
-        async () => mainModelCandidates(await this.openRouter.listModels()),
-        surface,
-      );
+      if (intent.backendId === "kimi-code") {
+        const state = this.stateStore.read();
+        const selected = this.#selectedProviderConnection(state, "kimi-code");
+        const adapter = this.authorityOptions?.kimiAdapter;
+        if (!selected || !adapter) {
+          return { kind: "models", backendId: "kimi-code", models: [] };
+        }
+        const controller = new AbortController();
+        const runtimeLease = await this.runtimeGuard.acquire(controller.signal);
+        try {
+          await runtimeLease.assertHeld();
+          const generation = selected.lastHealth?.generation;
+          if (!Number.isSafeInteger(generation) || generation! < 0) {
+            return { kind: "models", backendId: "kimi-code", models: [] };
+          }
+          const inspection = await adapter.inspect({
+            connectionId: selected.id,
+            generation: generation!,
+            deadlineAt: Date.now() + 15_000,
+            signal: controller.signal,
+            purpose: "explicit-repair",
+            environmentEligibility: "forbidden",
+          });
+          await runtimeLease.assertHeld();
+          if (!inspection.routeEligible) return { kind: "models", backendId: "kimi-code", models: [] };
+          const models = await adapter.listModels({
+            connectionId: selected.id,
+            signal: controller.signal,
+          });
+          await runtimeLease.assertHeld();
+          return {
+            kind: "models",
+            backendId: "kimi-code",
+            models: models.map((model) => ({
+              requestedModelId: model.requestedModelId,
+              canonicalModelId: model.canonicalModelId,
+              displayName: model.displayName,
+            })),
+          };
+        } finally {
+          await Promise.resolve(runtimeLease.release());
+        }
+      }
+      const selected = this.#selectedProviderConnection(this.stateStore.read(), "openrouter");
+      const models = this.authorityOptions && selected
+        ? await (async () => {
+            const controller = new AbortController();
+            const deadlineAt = Date.now() + 15_000;
+            const timer = setTimeout(
+              () => controller.abort(new DOMException("Provider catalog deadline expired.", "TimeoutError")),
+              15_000,
+            );
+            try {
+              return await this.activationCoordinator.readAuthority(
+                { signal: controller.signal, backendId: "openrouter" },
+                async (lease) => {
+                  await lease.assertHeld();
+                  const generation = Number.isSafeInteger(selected.lastHealth?.generation)
+                    ? selected.lastHealth!.generation
+                    : this.stateStore.read().revision;
+                  const inspection = await this.authorityOptions!.adapter.inspectUnderAuthorityLease({
+                    connectionId: selected.id,
+                    generation,
+                    deadlineAt,
+                    signal: controller.signal,
+                    purpose: "explicit-repair",
+                    environmentEligibility: "forbidden",
+                  }, lease);
+                  await lease.assertHeld();
+                  if (
+                    !inspection.routeEligible
+                    || inspection.accountFingerprint !== selected.accountFingerprint
+                    || inspection.billingRealm !== selected.billingRealm
+                  ) return [];
+                  const catalog = await this.authorityOptions!.adapter.listModels({
+                    connectionId: selected.id,
+                    signal: controller.signal,
+                  });
+                  await lease.assertHeld();
+                  return catalog.filter((model) =>
+                    model.backendId === "openrouter"
+                    && model.capabilities.textInput
+                    && model.capabilities.textOutput
+                  );
+                },
+              );
+            } finally {
+              clearTimeout(timer);
+            }
+          })()
+        : await this.runModelCatalog(
+            async () => mainModelCandidates(await this.openRouter.listModels()),
+            surface,
+          );
       return {
         kind: "models",
         backendId: "openrouter",
         models: models.map((model) => ({
-          requestedModelId: model.id,
-          canonicalModelId: model.canonicalSlug ?? model.id,
-          displayName: model.name,
+          requestedModelId: "requestedModelId" in model ? model.requestedModelId : model.id,
+          canonicalModelId: "canonicalModelId" in model
+            ? model.canonicalModelId
+            : model.canonicalSlug ?? model.id,
+          displayName: "displayName" in model ? model.displayName : model.name,
         })),
       };
     }
 
     if (intent.kind === "reconnect") {
+      const backendId = intent.backendId === "kimi-code" ? "kimi-code" : "openrouter";
       const reconnectState = this.stateStore.read();
-      const selected = this.#selectedOpenRouterConnection(reconnectState);
+      const selected = this.#selectedProviderConnection(reconnectState, backendId);
       if (!selected) {
         return {
           kind: "reconnected",
-          backendId: "openrouter",
+          backendId,
           headline: "setup-required",
           generation: 0,
         };
       }
       const controller = new AbortController();
-      const reconnectRoute = this.#desiredSessionRoute(reconnectState);
+      const desiredRoute = this.#desiredSessionRoute(reconnectState);
+      const reconnectRoute = desiredRoute?.backendId === backendId ? desiredRoute : null;
       const runtimeLease = await this.runtimeGuard.acquire(controller.signal);
       let result: StartupSetupResult;
-      let routeReady = false;
       let primaryFailed = false;
       try {
         await runtimeLease.assertHeld();
-        result = await this.orchestrator.reconnect("openrouter", {
+        result = await this.orchestrator.reconnect(backendId, {
           connectionId: selected.id,
           signal: controller.signal,
         });
         await runtimeLease.assertHeld();
-        const adapter = this.registry.adapter("openrouter");
+        const adapter = this.registry.adapter(backendId);
         let provedRoute: RouteIdentityV1 | null = null;
         if (reconnectRoute?.resolutionState === "resolved") {
           try {
@@ -1823,7 +2657,7 @@ export class DefaultProviderRuntime implements ProviderRuntime {
           }
         }
         const rebound = provedRoute
-          ? selectOpenRouterBinding(
+          ? selectProviderBinding(
               this.stateStore.read(),
               { kind: "route", route: provedRoute },
             )
@@ -1853,15 +2687,19 @@ export class DefaultProviderRuntime implements ProviderRuntime {
         } else {
           provedRoute = null;
         }
-        if (adapter.bindRuntime && provedRoute) {
-          await adapter.bindRuntime({
-            connectionId: selected.id,
-            generation: result.generation,
-            deadlineAt: Date.now() + 5_000,
-            signal: controller.signal,
-          });
+        if ((adapter.bindRuntime || backendId === "kimi-code") && provedRoute) {
+          if (backendId === "kimi-code") {
+            this.modelRuntime(provedRoute);
+          } else if (adapter.bindRuntime) {
+            await adapter.bindRuntime({
+              connectionId: selected.id,
+              generation: result.generation,
+              deadlineAt: Date.now() + 5_000,
+              signal: controller.signal,
+            });
+          }
           await runtimeLease.assertHeld();
-          const bound = selectOpenRouterBinding(
+          const bound = selectProviderBinding(
             this.stateStore.read(),
             { kind: "route", route: provedRoute },
           );
@@ -1870,7 +2708,6 @@ export class DefaultProviderRuntime implements ProviderRuntime {
           }
           this.#synchronizeAuthoritativeProviderState();
           this.#adoptExactSessionRoute(provedRoute, true);
-          routeReady = true;
         } else {
           if (
             reconnectRoute
@@ -1895,14 +2732,12 @@ export class DefaultProviderRuntime implements ProviderRuntime {
         }
       }
       const connection = this.stateStore.read().connections.find((candidate) =>
-        candidate.id === selected.id && candidate.backendId === "openrouter"
+        candidate.id === selected.id && candidate.backendId === backendId
       );
       return {
         kind: "reconnected",
-        backendId: "openrouter",
-        headline: !routeReady
-          ? "setup-required"
-          : connection?.lastHealth
+        backendId,
+        headline: connection?.lastHealth
           ? deriveProviderHeadline(connection.lastHealth)
           : result.mode,
         generation: result.generation,
@@ -1910,7 +2745,9 @@ export class DefaultProviderRuntime implements ProviderRuntime {
     }
 
     if (intent.kind === "logout") {
-      return this.#logoutProvider(intent.confirmationToken);
+      return intent.backendId === "kimi-code"
+        ? this.#logoutKimiProvider(intent.confirmationToken)
+        : this.#logoutProvider(intent.confirmationToken);
     }
 
     if (intent.kind !== "disable" && intent.kind !== "disconnect") {
@@ -1918,14 +2755,22 @@ export class DefaultProviderRuntime implements ProviderRuntime {
     }
     return this.#disableProvider({
       kind: intent.kind,
-      backendId: "openrouter",
+      backendId: intent.backendId === "kimi-code" ? "kimi-code" : "openrouter",
       ...(intent.confirmationToken ? { confirmationToken: intent.confirmationToken } : {}),
     });
   }
 
   #providerStatus(): ProviderCommandResult {
     const state = this.stateStore.read();
-    const providers: ProviderCommandStatusEntry[] = this.registry.entries().map((descriptor) => {
+    const desiredSessionRoute = this.#desiredSessionRoute(state);
+    const descriptors = this.registry.entries().filter(
+      (descriptor): descriptor is BackendDescriptor & {
+        id: "openrouter" | "kimi-code" | "anthropic";
+      } => descriptor.id === "openrouter"
+        || descriptor.id === "kimi-code"
+        || descriptor.id === "anthropic",
+    );
+    const providers: ProviderCommandStatusEntry[] = descriptors.map((descriptor) => {
       if (descriptor.id === "anthropic") {
         return {
           backendId: "anthropic",
@@ -1938,24 +2783,54 @@ export class DefaultProviderRuntime implements ProviderRuntime {
           headline: null,
           health: null,
           isDefault: false,
+          selectedModel: null,
         };
       }
       const processRoute = !this.#sessionRoutePersisted
-          && this.#sessionRoute?.backendId === "openrouter"
+          && this.#sessionRoute?.backendId === descriptor.id
         ? this.#sessionRoute
         : null;
+      const persistedSessionRoute = this.#sessionRoutePersisted
+        && desiredSessionRoute?.backendId === descriptor.id
+        ? desiredSessionRoute
+        : null;
+      const routeForDescriptor = persistedSessionRoute
+        ?? (state.defaultRoute?.backendId === descriptor.id ? state.defaultRoute : null);
       const connection = processRoute
         ? undefined
-        : this.#selectedOpenRouterConnection(state);
+        : (() => {
+            const selected = routeForDescriptor
+              ? selectProviderBinding(state, { kind: "route", route: routeForDescriptor })
+              : selectProviderBinding(state, { kind: "backend", backendId: descriptor.id });
+            return selected.kind === "exact"
+              ? state.connections.find((candidate) => candidate.id === selected.binding.connectionId)
+              : undefined;
+          })();
       const health = connection?.lastHealth ?? null;
+      const selectedRoute = processRoute
+        ?? routeForDescriptor;
+      const selectedModel = selectedRoute?.resolutionState === "resolved"
+        && selectedRoute.canonicalModelId
+        ? {
+            requestedModelId: selectedRoute.requestedModelId,
+            canonicalModelId: selectedRoute.canonicalModelId,
+            displayName: descriptor.id === "kimi-code"
+              ? KIMI_CODE_MODELS.find((model) => model.id === selectedRoute.canonicalModelId)?.displayName
+                ?? selectedRoute.canonicalModelId
+              : selectedRoute.canonicalModelId,
+          }
+        : null;
       return {
-        backendId: "openrouter",
+        backendId: descriptor.id,
         displayName: descriptor.displayName,
         availability: "connectable",
         configuration: connection?.enabled || processRoute ? "enabled" : "disabled",
-        maturity: "stable",
-        billingRealm: "openrouter-payg",
-        accountFingerprintSuffix: connection?.accountFingerprint || processRoute?.accountFingerprint
+        maturity: descriptor.maturity,
+        billingRealm: descriptor.id === "kimi-code"
+          ? "kimi-code-membership-provider-managed-overage"
+          : "openrouter-payg",
+        accountFingerprintSuffix: descriptor.id === "openrouter"
+          && (connection?.accountFingerprint || processRoute?.accountFingerprint)
           ? `…${(connection?.accountFingerprint ?? processRoute!.accountFingerprint).slice(-6)}`
           : null,
         headline: health ? deriveProviderHeadline(health) : processRoute ? "ready" : null,
@@ -1982,6 +2857,7 @@ export class DefaultProviderRuntime implements ProviderRuntime {
             && connection.accountFingerprint === state.defaultRoute.accountFingerprint
             && connection.billingRealm === state.defaultRoute.billingRealm)
         ),
+        selectedModel,
       };
     });
     return { kind: "status", providers, crossEnabled: false };
@@ -1990,18 +2866,19 @@ export class DefaultProviderRuntime implements ProviderRuntime {
   async #disableProvider(
     intent: {
       kind: "disable" | "disconnect";
-      backendId: "openrouter";
+      backendId: "openrouter" | "kimi-code";
       confirmationToken?: string;
     },
   ): Promise<ProviderCommandResult> {
+    if (intent.backendId === "kimi-code") this.#assertKimiOwnerMode();
     const before = this.stateStore.read();
-    const connection = this.#selectedOpenRouterConnection(before);
+    const connection = this.#selectedProviderConnection(before, intent.backendId);
     const processRoute = !this.#sessionRoutePersisted
-        && this.#sessionRoute?.backendId === "openrouter"
+        && this.#sessionRoute?.backendId === intent.backendId
       ? this.#sessionRoute
       : null;
     if (!intent.confirmationToken && !connection && !processRoute) {
-      return { kind: "unchanged", backendId: "openrouter", reason: "bereits deaktiviert" };
+      return { kind: "unchanged", backendId: intent.backendId, reason: "bereits deaktiviert" };
     }
     const affectsDefault = Boolean(connection
       &&
@@ -2012,7 +2889,7 @@ export class DefaultProviderRuntime implements ProviderRuntime {
     );
     const isFinalEnabled = before.connections.filter((candidate) => candidate.enabled).length === 1;
     if (!intent.confirmationToken && (processRoute || affectsDefault || isFinalEnabled)) {
-      return this.#confirmationRequired(intent.kind, before);
+      return this.#confirmationRequired(intent.kind, before, intent.backendId);
     }
 
     try {
@@ -2022,17 +2899,17 @@ export class DefaultProviderRuntime implements ProviderRuntime {
           await lease.assertHeld();
           const current = this.stateStore.read();
           const authorization = intent.confirmationToken
-            ? this.#consumeConfirmation(intent.confirmationToken, intent.kind, current)
+            ? this.#consumeConfirmation(intent.confirmationToken, intent.kind, current, intent.backendId)
             : null;
           if (intent.confirmationToken && !authorization) {
-            return this.#confirmationRequired(intent.kind, current);
+            return this.#confirmationRequired(intent.kind, current, intent.backendId);
           }
           const mutationAuthority = authorization
-            ?? this.#confirmationBinding(intent.kind, current);
+            ?? this.#confirmationBinding(intent.kind, current, intent.backendId);
           const selected = mutationAuthority.connection
             ? current.connections.find((candidate) =>
                 candidate.id === mutationAuthority.connection!.id
-                && candidate.backendId === "openrouter"
+                && candidate.backendId === intent.backendId
                 && candidate.enabled
                 && candidate.credentialSlot === mutationAuthority.connection!.credentialSlot
                 && candidate.accountFingerprint === mutationAuthority.connection!.accountFingerprint
@@ -2040,17 +2917,17 @@ export class DefaultProviderRuntime implements ProviderRuntime {
               )
             : undefined;
           const activeProcessRoute = !this.#sessionRoutePersisted
-              && this.#sessionRoute?.backendId === "openrouter"
+              && this.#sessionRoute?.backendId === intent.backendId
             ? this.#sessionRoute
             : null;
           if (!selected && !activeProcessRoute) {
-            return { kind: "unchanged", backendId: "openrouter", reason: "bereits deaktiviert" };
+            return { kind: "unchanged", backendId: intent.backendId, reason: "bereits deaktiviert" };
           }
           const next = selected
             ? await this.stateStore.commit(current.revision, (authoritative) => {
-                if (!this.#confirmationMatches(mutationAuthority, intent.kind, authoritative)) {
+                if (!this.#confirmationMatches(mutationAuthority, intent.kind, authoritative, intent.backendId)) {
                   throw new ProviderConfirmationStaleError(
-                    this.#confirmationRequired(intent.kind, authoritative),
+                    this.#confirmationRequired(intent.kind, authoritative, intent.backendId),
                   );
                 }
                 return {
@@ -2070,15 +2947,35 @@ export class DefaultProviderRuntime implements ProviderRuntime {
               })
             : current;
           await lease.assertHeld();
+          const persistedSessionRoute = validateRouteIdentityV1(this.session?.data.route);
+          const persistedSessionBinding = persistedSessionRoute
+            ? selectProviderBinding(current, { kind: "route", route: persistedSessionRoute }, true)
+            : null;
+          const sessionRouteToClear = selected
+            && persistedSessionRoute?.resolutionState === "resolved"
+            && persistedSessionBinding?.kind === "exact"
+            && persistedSessionBinding.binding.connectionId === selected.id
+            ? persistedSessionRoute
+            : null;
           this.config.providerSetup = requirePersistableProviderState(next);
+          if (sessionRouteToClear && this.session) {
+            await this.session.clearRouteIfExact(sessionRouteToClear);
+          }
           const defaultCleared = current.defaultRoute !== null && next.defaultRoute === null;
-          if (defaultCleared || activeProcessRoute) {
+          const matchingSessionRoute = Boolean(
+            selected
+            && this.#sessionRoute?.backendId === selected.backendId
+            && this.#sessionRoute.accountFingerprint === selected.accountFingerprint
+            && this.#sessionRoute.billingRealm === selected.billingRealm,
+          );
+          if (defaultCleared || activeProcessRoute || matchingSessionRoute) {
             this.#processRouteGeneration += 1;
             this.#sessionRoute = null;
             this.#sessionRoutePersisted = false;
+            this.#pendingSessionBinding = null;
             this.#preparedRoles = null;
           }
-          if (activeProcessRoute) {
+          if (activeProcessRoute && intent.backendId === "openrouter") {
             this.environmentSecret = null;
             this.authorityOptions?.credentialAuthority.revokeAutomaticEnvironment();
           }
@@ -2086,7 +2983,7 @@ export class DefaultProviderRuntime implements ProviderRuntime {
           return {
             kind: "changed",
             operation: intent.kind,
-            backendId: "openrouter",
+            backendId: intent.backendId,
             setupRequired: next.defaultRoute === null,
             defaultCleared,
           };
@@ -2161,6 +3058,138 @@ export class DefaultProviderRuntime implements ProviderRuntime {
       expected?.operation === "logout" ? expected.connection?.id ?? null : null,
       confirmationToken,
     );
+  }
+
+  async #logoutKimiProvider(confirmationToken?: string): Promise<ProviderCommandResult> {
+    this.#assertKimiOwnerMode();
+    const currentBinding = this.#confirmationBinding(
+      "logout",
+      this.stateStore.read(),
+      "kimi-code",
+    );
+    if (!currentBinding.connection) {
+      if (confirmationToken) this.#providerConfirmations.delete(confirmationToken);
+      return { kind: "unchanged", backendId: "kimi-code", reason: "bereits abgemeldet" };
+    }
+    if (!confirmationToken) {
+      return this.#confirmationRequired("logout", this.stateStore.read(), "kimi-code");
+    }
+    const expected = this.#providerConfirmations.get(confirmationToken);
+    if (expected?.operation !== "logout" || expected.backendId !== "kimi-code") {
+      this.#providerConfirmations.delete(confirmationToken);
+      return this.#confirmationRequired("logout", this.stateStore.read(), "kimi-code");
+    }
+    const journal = this.authorityOptions?.forgetJournal;
+    const adapter = this.authorityOptions?.kimiAdapter;
+    if (!journal || !adapter) throw new KimiOwnerInteractiveRequiredError();
+    try {
+      const settled = await this.activationCoordinator.recoverAndRun(
+        { signal: new AbortController().signal, inspectCommitted: false },
+        async (lease) => {
+          await lease.assertHeld();
+          const state = this.stateStore.read();
+          const authorization = this.#consumeConfirmation(
+            confirmationToken,
+            "logout",
+            state,
+            "kimi-code",
+          );
+          if (!authorization?.connection) {
+            throw new ProviderConfirmationStaleError(
+              this.#confirmationRequired("logout", state, "kimi-code"),
+            );
+          }
+          const connection = state.connections.find((candidate) =>
+            candidate.id === authorization.connection!.id
+            && candidate.backendId === "kimi-code"
+            && candidate.enabled === authorization.connection!.enabled
+            && candidate.credentialSlot === authorization.connection!.credentialSlot
+            && candidate.accountFingerprint === authorization.connection!.accountFingerprint
+            && candidate.billingRealm === authorization.connection!.billingRealm,
+          );
+          if (
+            !connection
+            || !/^v1:kimi-code:[0-9a-f-]{36}$/.test(connection.credentialSlot)
+          ) {
+            throw new ProviderConfirmationStaleError(
+              this.#confirmationRequired("logout", state, "kimi-code"),
+            );
+          }
+          const persistedSessionRoute = validateRouteIdentityV1(this.session?.data.route);
+          const persistedSessionBinding = persistedSessionRoute
+            ? selectProviderBinding(state, { kind: "route", route: persistedSessionRoute }, true)
+            : null;
+          const sessionRouteToClear = persistedSessionRoute?.resolutionState === "resolved"
+            && persistedSessionBinding?.kind === "exact"
+            && persistedSessionBinding.binding.connectionId === connection.id
+            ? persistedSessionRoute
+            : null;
+          const sessionRouteCleared = sessionRouteToClear && this.session
+            ? await this.session.clearRouteIfExact(sessionRouteToClear)
+            : false;
+          await lease.assertHeld();
+          const transaction = await journal.begin({
+            backendId: "kimi-code",
+            connectionId: connection.id,
+            target: {
+              kind: "versioned",
+              slot: {
+                version: 1,
+                kind: "kimi-code",
+                id: connection.credentialSlot,
+              },
+            },
+          });
+          const outcome = await settleProviderCredentialForget({
+            transaction,
+            journal,
+            stateStore: this.stateStore,
+            credentials: this.credentials,
+            assertHeld: () => lease.assertHeld(),
+            initialAuthoritativeState: state,
+            onStatePublished: (published) => {
+              this.config.providerSetup = requirePersistableProviderState(published);
+            },
+            onAuthoritativeMismatch: (authoritative) => {
+              throw new ProviderConfirmationStaleError(
+                this.#confirmationRequired("logout", authoritative, "kimi-code"),
+              );
+            },
+          });
+          if (outcome.cleanupPending) throw new Error("cleanup-pending");
+          await adapter.logout({ signal: new AbortController().signal });
+          await lease.assertHeld();
+          const after = this.stateStore.read();
+          const routedToForgotten = this.#sessionRoute?.backendId === "kimi-code"
+            && this.#sessionRoute.accountFingerprint === connection.accountFingerprint
+            && this.#sessionRoute.billingRealm === connection.billingRealm
+            || sessionRouteCleared;
+          if (routedToForgotten) {
+            this.#processRouteGeneration += 1;
+            this.#sessionRoute = null;
+            this.#sessionRoutePersisted = false;
+            this.#pendingSessionBinding = null;
+            this.#preparedRoles = null;
+          }
+          return {
+            before: state,
+            after,
+            connectionId: connection.id,
+          };
+        },
+      );
+      return {
+        kind: "changed",
+        operation: "logout",
+        backendId: "kimi-code",
+        setupRequired: settled.value.after.defaultRoute === null,
+        defaultCleared: settled.value.before.defaultRoute !== null
+          && settled.value.after.defaultRoute === null,
+      };
+    } catch (error) {
+      if (error instanceof ProviderConfirmationStaleError) return error.confirmation;
+      throw new Error("Provider credential cleanup is pending and will resume on restart.");
+    }
   }
 
   async #logoutWithoutVersionedCredential(
@@ -2342,10 +3371,22 @@ interface ProviderCredentialForgetManifestV1 {
   target: ProviderCredentialForgetTarget;
 }
 
+interface ProviderCredentialForgetManifestV2 {
+  version: 2;
+  phase: "prepared" | "credential-deleted";
+  backendId: "kimi-code";
+  connectionId: string;
+  target: { kind: "versioned"; slot: CredentialSlotRef & { kind: "kimi-code" } };
+}
+
+type ProviderCredentialForgetManifest =
+  | ProviderCredentialForgetManifestV1
+  | ProviderCredentialForgetManifestV2;
+
 interface ProviderCredentialForgetTransaction {
   claim: PrivateDirectoryClaim;
   rawManifest: string;
-  manifest: ProviderCredentialForgetManifestV1;
+  manifest: ProviderCredentialForgetManifest;
 }
 
 export class ProviderCredentialForgetJournal {
@@ -2361,18 +3402,28 @@ export class ProviderCredentialForgetJournal {
   async begin(input: {
     connectionId: string | null;
     target: ProviderCredentialForgetTarget;
+    backendId?: "openrouter" | "kimi-code";
   }): Promise<ProviderCredentialForgetTransaction> {
-    const manifest = validateProviderForgetManifest({
-      version: 1,
-      phase: "prepared",
-      connectionId: input.connectionId,
-      target: input.target,
-    });
+    const manifest = validateProviderForgetManifest(input.backendId === "kimi-code"
+      ? {
+          version: 2,
+          phase: "prepared",
+          backendId: "kimi-code",
+          connectionId: input.connectionId,
+          target: input.target,
+        }
+      : {
+          version: 1,
+          phase: "prepared",
+          connectionId: input.connectionId,
+          target: input.target,
+        });
     const acquired = await this.input.privateStore.createDirectoryExclusive(this.#path);
     if (!acquired) {
       const existing = await this.resume();
       if (
         existing
+        && providerForgetBackend(existing.manifest) === providerForgetBackend(manifest)
         && existing.manifest.connectionId === manifest.connectionId
         && sameProviderForgetTarget(existing.manifest.target, manifest.target)
       ) {
@@ -2451,7 +3502,7 @@ export class ProviderCredentialForgetJournal {
 
   async #write(
     transaction: ProviderCredentialForgetTransaction,
-    manifest: ProviderCredentialForgetManifestV1,
+    manifest: ProviderCredentialForgetManifest,
   ): Promise<void> {
     const validated = validateProviderForgetManifest(manifest);
     const serialized = `${JSON.stringify(validated)}\n`;
@@ -2469,9 +3520,38 @@ export class ProviderCredentialForgetJournal {
   }
 }
 
-function validateProviderForgetManifest(value: unknown): ProviderCredentialForgetManifestV1 {
+function validateProviderForgetManifest(value: unknown): ProviderCredentialForgetManifest {
   if (!isRecord(value)) throw new Error("Provider credential cleanup journal is invalid.");
   const keys = Object.keys(value).sort();
+  if (value.version === 2) {
+    if (
+      keys.join(",") !== "backendId,connectionId,phase,target,version"
+      || value.backendId !== "kimi-code"
+      || (value.phase !== "prepared" && value.phase !== "credential-deleted")
+      || typeof value.connectionId !== "string"
+      || value.connectionId.length === 0
+      || value.connectionId.length > 512
+      || !isRecord(value.target)
+      || value.target.kind !== "versioned"
+      || Object.keys(value.target).sort().join(",") !== "kind,slot"
+      || !isRecord(value.target.slot)
+      || Object.keys(value.target.slot).sort().join(",") !== "id,kind,version"
+      || value.target.slot.version !== 1
+      || value.target.slot.kind !== "kimi-code"
+      || typeof value.target.slot.id !== "string"
+      || !/^v1:kimi-code:[0-9a-f-]{36}$/.test(value.target.slot.id)
+    ) throw new Error("Provider credential cleanup journal is invalid.");
+    return {
+      version: 2,
+      phase: value.phase,
+      backendId: "kimi-code",
+      connectionId: value.connectionId,
+      target: {
+        kind: "versioned",
+        slot: { version: 1, kind: "kimi-code", id: value.target.slot.id },
+      },
+    };
+  }
   if (keys.join(",") !== "connectionId,phase,target,version"
     || value.version !== 1
     || (value.phase !== "prepared" && value.phase !== "credential-deleted")
@@ -2510,6 +3590,12 @@ function validateProviderForgetManifest(value: unknown): ProviderCredentialForge
   };
 }
 
+function providerForgetBackend(
+  manifest: ProviderCredentialForgetManifest,
+): "openrouter" | "kimi-code" {
+  return manifest.version === 2 ? manifest.backendId : "openrouter";
+}
+
 function sameProviderForgetTarget(
   left: ProviderCredentialForgetTarget,
   right: ProviderCredentialForgetTarget,
@@ -2528,12 +3614,17 @@ export async function recoverProviderCredentialForget(input: {
   };
   assertHeld?(): void | Promise<void>;
   onStatePublished?(state: ProviderSetupStateV2): void;
+  allowedBackendIds?: readonly ("openrouter" | "kimi-code")[];
 }): Promise<{ cleanupPending: boolean }> {
   try {
     await input.assertHeld?.();
     const transaction = await input.journal.resume();
     await input.assertHeld?.();
     if (!transaction) return { cleanupPending: false };
+    if (
+      input.allowedBackendIds
+      && !input.allowedBackendIds.includes(providerForgetBackend(transaction.manifest))
+    ) return { cleanupPending: true };
     const result = await settleProviderCredentialForget({
       ...input,
       transaction,
@@ -2559,6 +3650,7 @@ async function settleProviderCredentialForget(input: {
 }): Promise<{ cleanupPending: boolean; removed: boolean; retained: boolean }> {
   await input.assertHeld?.();
   const { connectionId, target } = input.transaction.manifest;
+  const backendId = providerForgetBackend(input.transaction.manifest);
   let state = input.initialAuthoritativeState
     ? structuredClone(input.initialAuthoritativeState)
     : input.stateStore.read();
@@ -2567,7 +3659,7 @@ async function settleProviderCredentialForget(input: {
     ? undefined
     : state.connections.find((candidate) => candidate.id === connectionId);
   const targetMatches = connection !== undefined
-    && connection.backendId === "openrouter"
+    && connection.backendId === backendId
     && connectionReferencesForgetTarget(connection, target);
 
   if (targetMatches) {
@@ -3324,8 +4416,17 @@ export async function createDefaultProviderRuntime(
     credentials,
     credentialAuthority,
   });
+  const kimiAdapter: KimiCodeBackendAdapter | KimiExecutionPolicyAdapter =
+    input.executionMode === "local-interactive-owner"
+      ? new KimiCodeBackendAdapter({
+          service: new KimiCodeService(),
+          credentials,
+          credentialAuthority,
+        })
+      : new KimiExecutionPolicyAdapter();
   const registry = new BackendRegistry([
     { descriptor: OPENROUTER_DESCRIPTOR, adapter },
+    { descriptor: KIMI_CODE_DESCRIPTOR, adapter: kimiAdapter },
     { descriptor: ANTHROPIC_COMING_SOON_DESCRIPTOR },
   ]);
   activationCoordinator = new ProviderActivationCoordinator({
@@ -3384,9 +4485,18 @@ export async function createDefaultProviderRuntime(
     {
       credentialAuthority,
       adapter,
+      forgetJournal,
+      ...(kimiAdapter instanceof KimiCodeBackendAdapter ? { kimiAdapter } : {}),
       recover: async (context) => {
+        const allowedBackendIds = input.executionMode === "local-interactive-owner"
+          ? undefined
+          : (["openrouter"] as const);
         await activationCoordinator!.recoverAndRun(
-          { signal: context.signal, inspectCommitted: true },
+          {
+            signal: context.signal,
+            inspectCommitted: true,
+            ...(allowedBackendIds ? { allowedBackendIds } : {}),
+          },
           async (lease) => {
             await recoverProviderCredentialForget({
               journal: forgetJournal,
@@ -3396,11 +4506,13 @@ export async function createDefaultProviderRuntime(
               onStatePublished: (state) => {
                 startup.config.providerSetup = requirePersistableProviderState(state);
               },
+              ...(allowedBackendIds ? { allowedBackendIds } : {}),
             });
           },
         );
       },
     },
+    input.executionMode,
   );
   return runtimeOwner;
 }
@@ -3426,6 +4538,8 @@ export interface CliBootstrapDeps {
   stdout: Pick<NodeJS.WriteStream, "write">;
   stderr: Pick<NodeJS.WriteStream, "write">;
   environment?: Readonly<Record<string, string | undefined>>;
+  /** Trusted launchers may only downgrade a local interactive owner process. */
+  executionMode?: ProviderExecutionMode;
 }
 
 const defaultCliBootstrapDeps: CliBootstrapDeps = {
@@ -3484,6 +4598,8 @@ export async function runCli(
     return 0;
   }
 
+  const executionMode = deriveProviderExecutionMode(options, dependencies.executionMode);
+
   const workspace = resolve(options.workspace);
   const startup = await dependencies.initializeStorage({
     workspace,
@@ -3519,6 +4635,7 @@ export async function runCli(
     startup,
     environment: dependencies.environment ?? process.env,
     requestedModel: options.model ?? config.mainModel,
+    executionMode,
   });
   let startupSetup = await providerRuntime.inspectStartup();
   if (startupSetup.defaultRoute?.resolutionState === "legacy-unverified") {
@@ -3538,6 +4655,41 @@ export async function runCli(
   const nonInteractive = options.prompt !== undefined || options.json;
   const out = options.json ? createStderrCommandOutput() : createPlainCommandOutput();
   let agent: OrcodeAgent | null = null;
+  let agentRuntime: ModelRuntime | null = null;
+  let agentSession: SessionStore | null = null;
+
+  const bindAgentForRoute = async (route: RouteIdentityV1): Promise<OrcodeAgent> => {
+    const routeRuntime = typeof providerRuntime.modelRuntime === "function"
+      ? providerRuntime.modelRuntime(route)
+      : null;
+    const runtimeBinding: ModelRuntimeBindingIdentityV1 | undefined = routeRuntime
+      ? readModelRuntimeIdentity(routeRuntime) ?? undefined
+      : undefined;
+    if (!agent) {
+      agent = await dependencies.createAgent({
+        ...(routeRuntime
+          ? { runtime: routeRuntime, runtimeBinding, route }
+          : { openRouter: providerRuntime.openRouter }),
+        approvals,
+        session: currentSession,
+        config,
+        workspace,
+        sshSession,
+      });
+      agentRuntime = routeRuntime;
+      agentSession = currentSession;
+    } else if (
+      routeRuntime
+      && typeof agent.rebind === "function"
+      && (agentRuntime !== routeRuntime || agentSession !== currentSession)
+    ) {
+      if (!runtimeBinding) throw new ProviderSetupRequiredError();
+      agent.rebind({ session: currentSession, route, runtime: routeRuntime, runtimeBinding });
+      agentRuntime = routeRuntime;
+      agentSession = currentSession;
+    }
+    return agent;
+  };
 
   const ensureAgentForPrompt = async (surface?: SetupSurface): Promise<OrcodeAgent> => {
     let route: RouteIdentityV1;
@@ -3573,17 +4725,7 @@ export async function runCli(
     }
     config.mainModel = route.requestedModelId;
     currentSession.setPreferences(config.mainModel, getReasoningSetting(config), route);
-    if (!agent) {
-      agent = await dependencies.createAgent({
-        openRouter: providerRuntime.openRouter,
-        approvals,
-        session: currentSession,
-        config,
-        workspace,
-        sshSession,
-      });
-    }
-    return agent;
+    return bindAgentForRoute(route);
   };
 
   if (nonInteractive) {
@@ -3591,7 +4733,6 @@ export async function runCli(
       // Non-interactive starts prove readiness before entering the helper that
       // is allowed to open an interactive setup surface.
       providerRuntime.ensureRunnableRoute();
-      agent = await ensureAgentForPrompt();
     } catch (error) {
       if (error instanceof ProviderSetupRequiredError ||
         (typeof error === "object" && error !== null && "code" in error && error.code === "provider-setup-required")) {
@@ -3612,15 +4753,27 @@ export async function runCli(
       out,
       prompt,
     );
-    const execute = () => runNonInteractive(agent!, effectivePrompt, { json: options.json });
+    const execute = (boundAgent: OrcodeAgent) =>
+      runNonInteractive(boundAgent, effectivePrompt, { json: options.json });
     if (typeof providerRuntime.runWithReadyRoute === "function") {
-      return providerRuntime.runWithReadyRoute((route) => {
+      return providerRuntime.runWithReadyRoute(async (route) => {
+        if (
+          options.model
+          && options.model !== route.requestedModelId
+          && options.model !== route.canonicalModelId
+        ) throw new ProviderSetupRequiredError();
+        if (!options.model && currentSession.data.reasoning) {
+          setReasoningSetting(config, currentSession.data.reasoning);
+        }
+        config.mainModel = route.requestedModelId;
+        currentSession.setPreferences(config.mainModel, getReasoningSetting(config), route);
         assertModelBoundToRoute(config.mainModel, route);
-        return execute();
+        const boundAgent = await bindAgentForRoute(route);
+        return execute(boundAgent);
       });
     }
     providerRuntime.ensureRunnableRoute();
-    return execute();
+    return execute(await ensureAgentForPrompt());
   }
 
   let interactiveSetupReady = true;
@@ -3631,17 +4784,6 @@ export async function runCli(
       interactiveSetupReady = false;
     }
   }
-  if (interactiveSetupReady) {
-    try {
-      agent = await ensureAgentForPrompt();
-    } catch (error) {
-      if (!(error instanceof ProviderSetupRequiredError) &&
-        (typeof error !== "object" || error === null || !("code" in error) || error.code !== "provider-setup-required")) {
-        throw error;
-      }
-    }
-  }
-
   const localRuntime: CommandLocalRuntime = {
     guard: await WorkspaceGuard.create(workspace),
     journal: new ChangeJournal({
@@ -3673,10 +4815,25 @@ export async function runCli(
     sshSession,
     providerRuntime,
     commitSessionHandoff(next: SessionStore) {
+      const previousRoute = validateRouteIdentityV1(currentSession.data.route);
+      const nextRoute = validateRouteIdentityV1(next.data.route);
       providerRuntime.adoptSession(next);
       currentSession = next;
       this.session = next;
-      this.agent?.setSession(next);
+      if (
+        this.agent
+        && previousRoute
+        && nextRoute
+        && sameExactRoute(previousRoute, nextRoute)
+      ) {
+        this.agent.setSession(next);
+        agentSession = next;
+      } else if (this.agent) {
+        this.agent = null;
+        agent = null;
+        agentRuntime = null;
+        agentSession = null;
+      }
       this.localRuntime.setSession(next);
     },
     ensureAgentForPrompt,
@@ -3686,7 +4843,7 @@ export async function runCli(
   if (useTui) {
     await dependencies.runDashboard({
       ...common,
-      setupRequired: agent === null,
+      setupRequired: !interactiveSetupReady,
       showChatPickerOnStart:
         !options.newChat && !options.continueChat && !options.chatId,
     });
@@ -3782,14 +4939,11 @@ async function runPlainLoop(
           commandName,
           commandArguments(trimmed),
         );
-        if (requiresRoute || transitionsRoute) {
-          const agent = await context.ensureAgentForPrompt();
-          context.agent = agent;
-        }
         const executeCommand = () => handleSlashCommand(trimmed, context as RuntimeContext);
         const outcome = requiresRoute && !transitionsRoute
-          ? await context.providerRuntime.runWithReadyRoute((route) => {
+          ? await context.providerRuntime.runWithReadyRoute(async (route) => {
               assertModelBoundToRoute(context.config.mainModel, route);
+              context.agent = await context.ensureAgentForPrompt();
               return executeCommand();
             }, "plain")
           : await executeCommand();
@@ -3798,14 +4952,16 @@ async function runPlainLoop(
         }
         continue;
       }
-      const agent = await context.ensureAgentForPrompt();
-      context.agent = agent;
-      await ensureRunnableModelConfiguration(context.openRouter, context.config);
       const effective = pendingSeed ? `${pendingSeed}\n\n${trimmed}` : trimmed;
       pendingSeed = undefined;
-      const result = await context.providerRuntime.runWithReadyRoute((route) => {
+      const result = await context.providerRuntime.runWithReadyRoute(async (route) => {
         assertModelBoundToRoute(context.config.mainModel, route);
-        return agent.run(effective);
+        if (route.backendId === "openrouter") {
+          await ensureRunnableModelConfiguration(context.openRouter, context.config);
+        }
+        const boundAgent = await context.ensureAgentForPrompt();
+        context.agent = boundAgent;
+        return boundAgent.run(effective);
       }, "plain");
       printRunFooter(result);
     } catch (error) {
@@ -4143,14 +5299,7 @@ async function runDashboard(
     const setupSurface = createTuiSetupSurface(ui);
     context.providerRouteSurface = setupSurface;
     if (context.setupRequired) {
-      const setup = await context.providerRuntime.runSetup(setupSurface);
-      if (setup.kind === "ready") {
-        try {
-          context.agent = await context.ensureAgentForPrompt(setupSurface);
-        } catch (error) {
-          if (!(error instanceof ProviderSetupRequiredError)) throw error;
-        }
-      }
+      await context.providerRuntime.runSetup(setupSurface);
     }
     if (context.showChatPickerOnStart) {
       const switched = await pickDashboardChat(ui, context as RuntimeContext, true);
@@ -4163,10 +5312,17 @@ async function runDashboard(
       }
     }
     const startupModel = context.config.mainModel;
-    if (context.agent) {
+    let startupRouteReady = false;
+    try {
+      context.providerRuntime.currentSessionRoute();
+      startupRouteReady = true;
+    } catch (error) {
+      if (!(error instanceof ProviderSetupRequiredError)) throw error;
+    }
+    if (startupRouteReady) {
       void Promise.all([
         inspectWorkspace(context.workspace),
-        loadModelSnapshot(context.openRouter, startupModel),
+        loadProviderModelSnapshot(context as RuntimeContext, startupModel),
       ]).then(([nextProjectStatus, nextModel]) => {
         projectStatus = nextProjectStatus;
         if (context.config.mainModel === startupModel) {
@@ -4198,7 +5354,7 @@ async function runDashboard(
       }
     }
 
-    balanceLabel = context.agent ? "Provider bereit" : "Setup erforderlich";
+    balanceLabel = startupRouteReady ? "Provider bereit" : "Setup erforderlich";
 
     // Checked here (after a possible startup chat switch above, so it looks
     // at whichever chat is actually open) rather than before `runDashboard`
@@ -4242,9 +5398,11 @@ async function runDashboard(
           const commandArgs = commandArguments(trimmed);
           const sessionBefore = context.session;
 
-          if (commandRequiresRunnableRoute(completedCommand, commandArgs, "dashboard")) {
-            context.agent = await context.ensureAgentForPrompt(setupSurface);
-          }
+          const dashboardRoute = currentDashboardRoute(context as RuntimeContext);
+          const unsupported = dashboardRoute
+            ? dashboardKimiUnsupportedMessage(dashboardRoute, completedCommand, commandArgs)
+            : null;
+          if (unsupported) throw new Error(unsupported);
 
           if (completedCommand === "image") {
             const action = commandTail(trimmed);
@@ -4305,7 +5463,6 @@ async function runDashboard(
           }
 
           if (completedCommand === "model" && commandArgs.length === 0) {
-            context.agent = await context.ensureAgentForPrompt(setupSurface);
             const selected = await pickDashboardModel(
               ui,
               context as RuntimeContext,
@@ -4369,8 +5526,8 @@ async function runDashboard(
             commandArgs.length === 0
           ) {
             if (!currentModelInfo) {
-              const snapshot = await loadModelSnapshot(
-                context.openRouter,
+              const snapshot = await loadProviderModelSnapshot(
+                context as RuntimeContext,
                 context.config.mainModel,
               );
               currentModelInfo = snapshot.model;
@@ -4464,11 +5621,11 @@ async function runDashboard(
             commandArgs.length === 0
           ) {
             const switched = await pickDashboardChat(ui, context as RuntimeContext, false);
-            if (switched && context.agent) {
+            if (switched) {
               startingSessionCost = context.session.data.costs.totalUsd;
               resolvedModel = "";
-              const snapshot = await loadModelSnapshot(
-                context.openRouter,
+              const snapshot = await loadProviderModelSnapshot(
+                context as RuntimeContext,
                 context.config.mainModel,
               );
               modelDetails = snapshot.details;
@@ -4530,13 +5687,11 @@ async function runDashboard(
             commandArgs,
             "dashboard",
           );
-          if (commandTransitionsRunnableRoute(completedCommand, commandArgs)) {
-            context.agent = await context.ensureAgentForPrompt(setupSurface);
-          }
           const outcome = requiresRoute
             && !commandTransitionsRunnableRoute(completedCommand, commandArgs)
-            ? await context.providerRuntime.runWithReadyRoute((route) => {
+            ? await context.providerRuntime.runWithReadyRoute(async (route) => {
                 assertModelBoundToRoute(context.config.mainModel, route);
+                context.agent = await context.ensureAgentForPrompt(setupSurface);
                 return executeCommand();
               }, setupSurface)
             : await executeCommand();
@@ -4573,8 +5728,8 @@ async function runDashboard(
             || context.session !== sessionBefore
           )) {
             resolvedModel = "";
-            const snapshot = await loadModelSnapshot(
-              context.openRouter,
+            const snapshot = await loadProviderModelSnapshot(
+              context as RuntimeContext,
               context.config.mainModel,
             );
             modelDetails = snapshot.details;
@@ -4597,57 +5752,54 @@ async function runDashboard(
           continue;
         }
 
-        const agent = await context.ensureAgentForPrompt(setupSurface);
-        context.agent = agent;
-        const runnableModels = await ensureRunnableModelConfiguration(
-          context.openRouter,
-          context.config,
-        );
-        if (runnableModels.main) {
-          currentModelInfo = runnableModels.main;
-          modelDetails = summarizeModel(runnableModels.main);
-        }
-        if (pendingImages.length) {
-          if (!currentModelInfo) {
-            const snapshot = await loadModelSnapshot(
-              context.openRouter,
-              context.config.mainModel,
-            );
-            currentModelInfo = snapshot.model;
-            modelDetails = snapshot.details;
-          }
-          if (
-            currentModelInfo &&
-            !currentModelInfo.inputModalities.includes("image")
-          ) {
-            ui.addMessage(
-              "error",
-              `Das aktive Modell ${context.config.mainModel} unterstützt laut OpenRouter keine Bilder. Wähle mit /model ein Modell mit „Bilder“-Fähigkeit; die Anhänge bleiben erhalten.`,
-              "Bilder",
-            );
-            ui.setStatus("Bereit", false);
-            continue;
-          }
-        }
-        submittedImages = pendingImages.map((attachment) => ({
-          ...attachment,
-        }));
-        pendingImages = [];
-        ui.setImageAttachments([]);
-        const imageSummary = attachmentPromptSummary(submittedImages);
-        ui.addMessage(
-          "user",
-          imageSummary ? `${trimmed}\n\n🖼 ${imageSummary}` : trimmed,
-        );
-        ui.beginAssistant(context.config.mainModel);
         const controller = new AbortController();
         runController = controller;
         ui.setCancelHandler(() => {
           runController?.abort(new Error("Der aktuelle Lauf wurde vom Benutzer abgebrochen."));
         });
-        const result = await context.providerRuntime.runWithReadyRoute((route) => {
+        const result = await context.providerRuntime.runWithReadyRoute(async (route) => {
           assertModelBoundToRoute(context.config.mainModel, route);
-          return agent.run(
+          if (route.backendId === "openrouter") {
+            const runnableModels = await ensureRunnableModelConfiguration(
+              context.openRouter,
+              context.config,
+            );
+            if (runnableModels.main) {
+              currentModelInfo = runnableModels.main;
+              modelDetails = summarizeModel(runnableModels.main);
+            }
+            if (pendingImages.length && !currentModelInfo) {
+              const snapshot = await loadModelSnapshot(
+                context.openRouter,
+                context.config.mainModel,
+              );
+              currentModelInfo = snapshot.model;
+              modelDetails = snapshot.details;
+            }
+            if (
+              pendingImages.length
+              && currentModelInfo
+              && !currentModelInfo.inputModalities.includes("image")
+            ) {
+              throw new Error(
+                `Das aktive Modell ${context.config.mainModel} unterstützt laut OpenRouter keine Bilder. Wähle mit /model ein Modell mit „Bilder“-Fähigkeit; die Anhänge bleiben erhalten.`,
+              );
+            }
+          } else if (pendingImages.length > 0) {
+            throw new Error("Bilder sind mit Kimi Code Abo in Orcode noch nicht verfügbar.");
+          }
+          submittedImages = pendingImages.map((attachment) => ({ ...attachment }));
+          pendingImages = [];
+          ui.setImageAttachments([]);
+          const imageSummary = attachmentPromptSummary(submittedImages);
+          ui.addMessage(
+            "user",
+            imageSummary ? `${trimmed}\n\n🖼 ${imageSummary}` : trimmed,
+          );
+          ui.beginAssistant(context.config.mainModel);
+          const boundAgent = await context.ensureAgentForPrompt(setupSurface);
+          context.agent = boundAgent;
+          return boundAgent.run(
             trimmed,
             {
               onStatus: (status) => ui.setStatus(status),
@@ -5252,7 +6404,7 @@ export function commandRequiresRunnableRoute(
   args: readonly string[],
   mode: "plain" | "dashboard" = "plain",
 ): boolean {
-  if (command === "model" || command === "models" || command === "think") {
+  if (command === "model" || command === "think") {
     return true;
   }
   if (command === "compress") {
@@ -5407,19 +6559,24 @@ export async function transcribeAndInsert(
   ui.setStatus("Aufnahme wird erkannt …");
   try {
     const result = await context.providerRuntime.runWithReadyRoute(
-      () => dependencies.transcribe
-        ? dependencies.transcribe({
-            client: undefined as never,
-            openRouter: context.openRouter,
-            modelId: context.config.transcriptionModel,
-            audio,
-          })
-        : transcribeAudio({
-            client: context.openRouter.client({ scope: "voice" }),
-            openRouter: context.openRouter,
-            modelId: context.config.transcriptionModel,
-            audio,
-          }),
+      (route) => {
+        if ((route as RouteIdentityV1 | undefined)?.backendId === "kimi-code") {
+          throw new Error("Sprache und Transkription sind mit Kimi Code Abo in Orcode noch nicht verfügbar.");
+        }
+        return dependencies.transcribe
+          ? dependencies.transcribe({
+              client: undefined as never,
+              openRouter: context.openRouter,
+              modelId: context.config.transcriptionModel,
+              audio,
+            })
+          : transcribeAudio({
+              client: context.openRouter.client({ scope: "voice" }),
+              openRouter: context.openRouter,
+              modelId: context.config.transcriptionModel,
+              audio,
+            });
+      },
       dependencies.surface,
     );
     if (!result.text) {
@@ -5513,24 +6670,115 @@ export async function initializeDashboardKey(
   return promptDashboardInferenceKey(ui, context);
 }
 
+function currentDashboardRoute(context: RuntimeContext): RouteIdentityV1 | null {
+  if (typeof context.providerRuntime?.currentSessionRoute !== "function") return null;
+  try {
+    return context.providerRuntime.currentSessionRoute();
+  } catch (error) {
+    if (
+      error instanceof ProviderSetupRequiredError
+      || (typeof error === "object" && error !== null && "code" in error
+        && error.code === "provider-setup-required")
+    ) return null;
+    throw error;
+  }
+}
+
+export function dashboardKimiUnsupportedMessage(
+  route: RouteIdentityV1,
+  command: string,
+  args: readonly string[],
+): string | null {
+  if (route.backendId !== "kimi-code") return null;
+  if (command === "image") return "Bilder sind mit Kimi Code Abo in Orcode noch nicht verfügbar.";
+  if (command === "whisper") {
+    return "Sprache und Transkription sind mit Kimi Code Abo in Orcode noch nicht verfügbar.";
+  }
+  if (command === "compress" && (args[0] ?? "").toLowerCase() === "model") {
+    return "Kompressor-Modellwahl ist mit Kimi Code Abo in Orcode noch nicht verfügbar.";
+  }
+  return null;
+}
+
+function kimiDashboardModelInfo(modelId: string): ModelInfo | null {
+  const model = KIMI_CODE_MODELS.find((candidate) => candidate.id === modelId);
+  if (!model) return null;
+  return {
+    id: model.id,
+    canonicalSlug: model.id,
+    name: model.displayName,
+    description: "Kimi-Code-Membership-Modell",
+    contextLength: model.effectiveContextDefault,
+    promptPrice: -1,
+    completionPrice: -1,
+    supportedParameters: ["tools", "reasoning"],
+    inputModalities: ["text"],
+    outputModalities: ["text"],
+    reasoning: {
+      defaultEffort: "high",
+      defaultEnabled: true,
+      mandatory: true,
+      supportedEfforts: model.reasoningEfforts === null ? null : [...model.reasoningEfforts],
+      supportsMaxTokens: false,
+    },
+  };
+}
+
+export async function loadProviderModelSnapshot(
+  context: Pick<RuntimeContext, "openRouter" | "providerRuntime">,
+  modelId: string,
+): Promise<ModelSnapshot> {
+  const route = currentDashboardRoute(context as RuntimeContext);
+  if (route?.backendId !== "kimi-code") {
+    return loadModelSnapshot(context.openRouter, modelId);
+  }
+  const model = kimiDashboardModelInfo(modelId);
+  return model
+    ? {
+        model,
+        details: `Kontext ${compactTokens(model.contextLength)} · Kosten providerverwaltet / unbekannt · Tools, Reasoning`,
+        status: "available",
+      }
+    : {
+        model: null,
+        details: `Aktives Kimi-Code-Modell ist nicht verfügbar: ${modelId}`,
+        status: "missing",
+      };
+}
+
 export async function pickDashboardModel(
   ui: TerminalUi,
   context: RuntimeContext,
   setupSurface?: SetupSurface,
 ): Promise<ModelInfo | null> {
   const controller = new AbortController();
-  ui.setStatus("Tool-fähige OpenRouter-Modelle werden geladen");
+  const route = currentDashboardRoute(context);
+  ui.setStatus(route?.backendId === "kimi-code"
+    ? "Kimi-Code-Modelle werden geladen"
+    : "Tool-fähige OpenRouter-Modelle werden geladen");
   ui.setCancelHandler(() => {
     controller.abort(new Error("Das Laden der Modellliste wurde abgebrochen."));
   });
   let models: ModelInfo[];
   try {
-    const loadModels = () => context.openRouter.listModels("", false, controller.signal);
-    models = mainModelCandidates(
-      context.providerRuntime?.runModelCatalog
-        ? await context.providerRuntime.runModelCatalog(loadModels, setupSurface)
-        : await loadModels(),
-    );
+    if (route?.backendId === "kimi-code") {
+      const result = await context.providerCommands.execute(
+        { kind: "models", backendId: "kimi-code" },
+        setupSurface ?? "fullscreen",
+      );
+      if (result.kind !== "models") throw new ProviderSetupRequiredError();
+      models = result.models.flatMap((entry) => {
+        const model = kimiDashboardModelInfo(entry.canonicalModelId);
+        return model && model.id === entry.requestedModelId ? [model] : [];
+      });
+    } else {
+      const loadModels = () => context.openRouter.listModels("", false, controller.signal);
+      models = mainModelCandidates(
+        context.providerRuntime?.runModelCatalog
+          ? await context.providerRuntime.runModelCatalog(loadModels, setupSurface)
+          : await loadModels(),
+      );
+    }
   } finally {
     ui.setCancelHandler();
   }
@@ -5555,6 +6803,9 @@ export async function pickDashboardCompressorModel(
   ui: TerminalUi,
   context: RuntimeContext,
 ): Promise<ModelInfo | null> {
+  if (currentDashboardRoute(context)?.backendId === "kimi-code") {
+    throw new Error("Kompressor-Modellwahl ist mit Kimi Code Abo in Orcode noch nicht verfügbar.");
+  }
   const controller = new AbortController();
   ui.setStatus("Textmodelle für den Kompressor werden geladen");
   ui.setCancelHandler(() => {

@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { lstat, mkdir, mkdtemp, readFile, readdir, rename, symlink, writeFile } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, readFile, readdir, rename, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -14,6 +14,7 @@ import {
 } from "../src/config.js";
 import { PrivateStore } from "../src/private-store.js";
 import {
+  createNeverConfiguredProviderState,
   ProviderStateStore,
   type ProviderSetupStateV2,
 } from "../src/provider-state.js";
@@ -30,7 +31,10 @@ import type {
   VersionedCredentialStoreLike,
 } from "../src/credentials.js";
 import { ProviderCredentialAuthority } from "../src/provider-authority.js";
-import type { ProviderActivationJournalV2 } from "../src/provider-activation.js";
+import {
+  ProviderActivationCoordinator,
+  type ProviderActivationJournalV2,
+} from "../src/provider-activation.js";
 
 const OLD_SLOT: CredentialSlotRef = Object.freeze({
   version: 1,
@@ -79,6 +83,7 @@ const KIMI_SECRET = "fixture-kimi-membership-key-not-a-real-secret";
 const KIMI_CONNECTION_ID = "kimi-main";
 const KIMI_FINGERPRINT = "acct_local_kimi";
 const KIMI_REALM = "kimi-code-membership-provider-managed-overage" as const;
+const KIMI_TEST_PERMIT = Object.freeze({ version: 1 as const });
 
 const boundaries = [
   "candidate-validated",
@@ -375,6 +380,106 @@ class FakeKimiAdapter {
   }
 }
 
+test("real activation coordinator retains OpenRouter and Kimi in either activation order", async (t) => {
+  for (const order of [
+    ["openrouter", "kimi-code"],
+    ["kimi-code", "openrouter"],
+  ] as const) {
+    await t.test(order.join(" -> "), async (t) => {
+      const appHome = await mkdtemp(join(tmpdir(), "orcode-two-provider-activation-"));
+      t.after(() => rm(appHome, { recursive: true, force: true }));
+      const configPath = join(appHome, "config.json");
+      const initial = createNeverConfiguredProviderState();
+      await saveConfig({
+        ...structuredClone(DEFAULT_CONFIG),
+        providerSetup: initial,
+      }, configPath);
+      const stateStore = new ProviderStateStore(initial);
+      const credentials = new FakeCredentials(null);
+      const openRouter = new FakeAdapter();
+      const kimi = new FakeKimiAdapter();
+      const runtimeGuard = new FakeRuntimeGuard();
+      let uuid = 0;
+      const coordinator = new ProviderActivationCoordinator({
+        appHome,
+        configPath,
+        privateStore: new PrivateStore({ root: appHome }),
+        credentials,
+        adapterResolver: (backendId) => backendId === "kimi-code" ? kimi : openRouter,
+        stateStore,
+        runtimeGuard,
+        candidateAuthority: {
+          async validateCandidatePermitUnderLease() { return { kind: "ready" as const }; },
+          async validateCandidatePermitAgainstSnapshotUnderLease() { return { kind: "ready" as const }; },
+        },
+        now: () => 10_000,
+        createUuid: () => `20000000-0000-4000-8000-${String(++uuid).padStart(12, "0")}`,
+        leaseDurationMs: 10_000,
+      });
+
+      for (const backendId of order) {
+        const before = stateStore.read();
+        const request = backendId === "kimi-code"
+          ? {
+              backendId,
+              expectedRevision: before.revision,
+              candidate: KIMI_SECRET,
+              expectedRequestedModelId: KIMI_MODEL.requestedModelId,
+              selectedCanonicalModelId: KIMI_MODEL.canonicalModelId,
+              generation: 4,
+              signal: new AbortController().signal,
+              deadlineAt: 20_000,
+              persistence: "persisted" as const,
+              environmentEligibility: "forbidden" as const,
+              targetConnectionId: KIMI_CONNECTION_ID,
+              candidatePermit: KIMI_TEST_PERMIT,
+              requireCandidatePermit: true as const,
+              candidateAuthorityPurpose: "initial-setup" as const,
+            }
+          : {
+              backendId,
+              expectedRevision: before.revision,
+              candidate: NEW_SECRET,
+              expectedRequestedModelId: MODEL.requestedModelId,
+              selectedCanonicalModelId: MODEL.canonicalModelId,
+              generation: 4,
+              signal: new AbortController().signal,
+              deadlineAt: 20_000,
+              persistence: "persisted" as const,
+              environmentEligibility: "forbidden" as const,
+              targetConnectionId: CONNECTION_ID,
+            };
+        const result = await coordinator.activate(request);
+        const after = stateStore.read();
+
+        assert.equal(result.persisted, true);
+        assert.equal(result.route.backendId, backendId);
+        assert.equal(after.revision, before.revision + 1);
+        assert.equal(after.connections.length, before.connections.length + 1);
+        assert.deepEqual(after.defaultRoute, result.route);
+        assert.equal(after.cross.enabled, false);
+        for (const retained of before.connections) {
+          assert.deepEqual(
+            after.connections.find((connection) => connection.id === retained.id),
+            retained,
+          );
+        }
+      }
+
+      const final = stateStore.read();
+      assert.deepEqual(final.connections.map((connection) => connection.backendId), order);
+      assert.equal(final.defaultRoute?.backendId, order[1]);
+      assert.equal(final.connections.find((connection) => connection.backendId === "openrouter")
+        ?.credentialSlot.startsWith("v1:inference:"), true);
+      assert.equal(final.connections.find((connection) => connection.backendId === "kimi-code")
+        ?.credentialSlot.startsWith("v1:kimi-code:"), true);
+      assert.deepEqual(await journalDirectories(appHome), []);
+      const loaded = await loadConfigDetailed(configPath);
+      assert.deepEqual(loaded.config.providerSetup, final);
+    });
+  }
+});
+
 interface ActivationFixtureOptions {
   crashAfter?: Boundary;
   oldSlot?: CredentialSlotRef | "legacy:inference" | null;
@@ -544,6 +649,10 @@ async function kimiActivationFixture(options: KimiActivationFixtureOptions = {})
     },
     stateStore,
     runtimeGuard,
+    candidateAuthority: {
+      async validateCandidatePermitUnderLease() { return { kind: "ready" as const }; },
+      async validateCandidatePermitAgainstSnapshotUnderLease() { return { kind: "ready" as const }; },
+    },
     now: () => now,
     createUuid: sequentialUuid(),
     leaseDurationMs: 100,
@@ -566,6 +675,11 @@ async function kimiActivationFixture(options: KimiActivationFixtureOptions = {})
     signal: new AbortController().signal,
     deadlineAt: Number.MAX_SAFE_INTEGER,
     persistence: "persisted" as const,
+    environmentEligibility: "forbidden" as const,
+    targetConnectionId: KIMI_CONNECTION_ID,
+    candidatePermit: KIMI_TEST_PERMIT,
+    requireCandidatePermit: true as const,
+    candidateAuthorityPurpose: "initial-setup" as const,
   };
   return {
     api,
@@ -3467,6 +3581,10 @@ test("Kimi persisted activation writes and publishes one exact v2 Kimi tuple thr
     },
     stateStore: new ProviderStateStore(oldState),
     runtimeGuard: new FakeRuntimeGuard(),
+    candidateAuthority: {
+      async validateCandidatePermitUnderLease() { return { kind: "ready" as const }; },
+      async validateCandidatePermitAgainstSnapshotUnderLease() { return { kind: "ready" as const }; },
+    },
     now: () => 10_000,
     createUuid: sequentialUuid(),
     leaseDurationMs: 100,
@@ -3482,6 +3600,11 @@ test("Kimi persisted activation writes and publishes one exact v2 Kimi tuple thr
     signal: new AbortController().signal,
     deadlineAt: Number.MAX_SAFE_INTEGER,
     persistence: "persisted",
+    environmentEligibility: "forbidden",
+    targetConnectionId: KIMI_CONNECTION_ID,
+    candidatePermit: KIMI_TEST_PERMIT,
+    requireCandidatePermit: true,
+    candidateAuthorityPurpose: "initial-setup",
   });
 
   assert.equal(result.persisted, true);
@@ -3504,6 +3627,217 @@ test("Kimi initial and post-slot revalidation receive the exact activation deadl
   });
 
   assert.deepEqual(fixture.adapter.deadlines, [exactDeadline, exactDeadline]);
+});
+
+test("Kimi activation without the mandatory manual permit fails before every adapter and mutation effect", async () => {
+  const fixture = await kimiActivationFixture();
+  const configBefore = await readFile(fixture.path, "utf8");
+  const stateBefore = fixture.stateStore.read();
+  const slotsBefore = new Map(fixture.credentials.slots);
+  const request = { ...fixture.request } as Record<string, unknown>;
+  delete request.candidatePermit;
+  delete request.requireCandidatePermit;
+
+  await assert.rejects(
+    fixture.coordinator().activate(request as never),
+    /candidate|permit|authority|stale/i,
+  );
+
+  assert.deepEqual(fixture.adapter.calls, []);
+  assert.equal(fixture.credentials.calls.includes("reserveSlot"), false);
+  assert.equal(await readFile(fixture.path, "utf8"), configBefore);
+  assert.deepEqual(fixture.stateStore.read(), stateBefore);
+  assert.deepEqual(fixture.credentials.slots, slotsBefore);
+  assert.deepEqual(await journalDirectories(fixture.appHome), []);
+  assert.equal(fixture.runtimeGuard.acquisitions, 0);
+});
+
+test("non-owner OpenRouter startup skips an untouched pre-commit Kimi journal without Kimi effects", async () => {
+  const fixture = await kimiActivationFixture({ crashAfter: "journal-written" });
+  await assert.rejects(fixture.activate());
+  fixture.adapter.calls.length = 0;
+  fixture.credentials.calls.length = 0;
+  const slotsBefore = new Map(fixture.credentials.slots);
+  const journalsBefore = await journalDirectories(fixture.appHome);
+  let startupOperations = 0;
+  const coordinator = fixture.coordinatorWith({
+    runtimeGuard: new FakeRuntimeGuard(),
+    now: () => 20_000,
+    onBoundary: async () => undefined,
+  });
+
+  const recovered = await coordinator.recoverAndRun({
+    signal: new AbortController().signal,
+    inspectCommitted: true,
+    allowedBackendIds: ["openrouter"],
+  } as never, async (lease) => {
+    await lease.assertHeld();
+    startupOperations += 1;
+    return "openrouter-started";
+  });
+  const authorityRead = await coordinator.readAuthority({
+    signal: new AbortController().signal,
+    backendId: "openrouter",
+  } as never, async (lease) => {
+    await lease.assertHeld();
+    return "openrouter-authority";
+  });
+
+  assert.deepEqual(recovered, {
+    warnings: ["provider-activation-policy-skipped"],
+    value: "openrouter-started",
+  });
+  assert.equal(authorityRead, "openrouter-authority");
+  assert.equal(startupOperations, 1);
+  assert.deepEqual(fixture.adapter.calls, []);
+  assert.deepEqual(fixture.credentials.calls, []);
+  assert.deepEqual(fixture.credentials.slots, slotsBefore);
+  assert.deepEqual(await journalDirectories(fixture.appHome), journalsBefore);
+});
+
+test("non-owner OpenRouter startup fails closed when the pending Kimi candidate state was adopted", async () => {
+  const fixture = await kimiActivationFixture({ crashAfter: "config-readback" });
+  await assert.rejects(fixture.activate());
+  fixture.adapter.calls.length = 0;
+  fixture.credentials.calls.length = 0;
+  const slotsBefore = new Map(fixture.credentials.slots);
+  const journalsBefore = await journalDirectories(fixture.appHome);
+  let startupOperations = 0;
+  const coordinator = fixture.coordinatorWith({
+    runtimeGuard: new FakeRuntimeGuard(),
+    now: () => 20_000,
+    onBoundary: async () => undefined,
+  });
+
+  await assert.rejects(
+    coordinator.recoverAndRun({
+      signal: new AbortController().signal,
+      inspectCommitted: true,
+      allowedBackendIds: ["openrouter"],
+    } as never, async () => {
+      startupOperations += 1;
+      return "must-not-start";
+    }),
+    /policy|recovery|owner|pending/i,
+  );
+
+  assert.equal(startupOperations, 0);
+  assert.deepEqual(fixture.adapter.calls, []);
+  assert.deepEqual(fixture.credentials.calls, []);
+  assert.deepEqual(fixture.credentials.slots, slotsBefore);
+  assert.deepEqual(await journalDirectories(fixture.appHome), journalsBefore);
+});
+
+test("Kimi persistence failure cannot downgrade into a process-only activation", async () => {
+  const fixture = await kimiActivationFixture();
+  fixture.credentials.failWrite = "before";
+  await assert.rejects(
+    fixture.coordinator().activate({
+      ...fixture.request,
+      onPersistenceFailure: async () => "process-only",
+    }),
+    /persistence|candidate|authority|invalid/i,
+  );
+  assert.equal(fixture.adapter.calls.includes("activate"), false);
+  assert.equal(fixture.stateStore.read().revision, fixture.oldState.revision);
+});
+
+test("Kimi activation claims one frozen attempt token and verifies the observed tuple before model listing", async () => {
+  const fixture = await kimiActivationFixture();
+  const owner = new AbortController();
+  const permit = Object.freeze({ version: 1 as const });
+  const events: string[] = [];
+  const validationRequests: Array<Record<string, unknown>> = [];
+  const connect = fixture.adapter.connect.bind(fixture.adapter);
+  fixture.adapter.connect = async (request) => {
+    events.push("connect");
+    return connect(request);
+  };
+  const listModels = fixture.adapter.listModels.bind(fixture.adapter);
+  fixture.adapter.listModels = async (request) => {
+    events.push("listModels");
+    return listModels(request);
+  };
+  let attemptToken: unknown = null;
+  const validate = async (
+    request: Record<string, unknown>,
+    lease: { assertHeld(): Promise<void> },
+  ) => {
+    await lease.assertHeld();
+    validationRequests.push(request);
+    assert.equal(request.backendId, "kimi-code");
+    assert.equal(request.candidate, KIMI_SECRET);
+    assert.equal(request.expectedRevision, fixture.oldState.revision);
+    assert.equal(request.generation, fixture.request.generation);
+    assert.equal(request.targetConnectionId, KIMI_CONNECTION_ID);
+    assert.equal(request.purpose, "initial-setup");
+    assert.equal(request.originalOwnerSignal, owner.signal);
+    assert.equal(request.credentialPermit, permit);
+    assert.equal(request.requireCredentialPermit, true);
+    assert.equal(typeof request.activationAttemptToken, "object");
+    assert.equal(Object.isFrozen(request.activationAttemptToken), true);
+    if (attemptToken === null) attemptToken = request.activationAttemptToken;
+    else assert.equal(request.activationAttemptToken, attemptToken);
+    const observed = request.observedCandidate as ProviderCandidate | undefined;
+    if (observed) {
+      events.push("permit:observed");
+      assert.equal(observed.backendId, "kimi-code");
+      assert.equal(observed.connectionId, KIMI_CONNECTION_ID);
+      assert.equal(observed.accountFingerprint, KIMI_FINGERPRINT);
+      assert.equal(observed.billingRealm, KIMI_REALM);
+      assert.equal(observed.health.generation, fixture.request.generation);
+    } else {
+      events.push("permit:static");
+    }
+    return { kind: "ready" as const };
+  };
+  const coordinator = fixture.coordinatorWith({
+    candidateAuthority: {
+      validateCandidatePermitUnderLease: validate,
+      validateCandidatePermitAgainstSnapshotUnderLease: validate,
+    },
+  });
+
+  const result = await coordinator.activate({
+    ...fixture.request,
+    signal: owner.signal,
+    candidateAuthorityPurpose: "initial-setup",
+    targetConnectionId: KIMI_CONNECTION_ID,
+    candidatePermit: permit,
+    requireCandidatePermit: true,
+  } as never);
+
+  assert.equal(result.persisted, true);
+  assert.deepEqual(events.slice(0, 4), [
+    "permit:static",
+    "connect",
+    "permit:observed",
+    "listModels",
+  ]);
+  assert.ok(validationRequests.length >= 4, "every later fence must reuse the same attempt token");
+});
+
+test("Kimi runtime activation rejects foreign top-level candidate backend and connection tuple fields", async (t) => {
+  const mutations: ReadonlyArray<readonly [string, (value: CandidateProviderState) => CandidateProviderState]> = [
+    ["candidate id", (value) => ({ ...value, candidateId: "foreign-candidate" })],
+    ["backend", (value) => ({ ...value, backendId: "openrouter" })],
+    ["connection", (value) => ({ ...value, connectionId: "foreign-connection" })],
+  ];
+  for (const [name, mutate] of mutations) {
+    await t.test(name, async () => {
+      const fixture = await kimiActivationFixture();
+      const stateBefore = fixture.stateStore.read();
+      const original = fixture.adapter.activate.bind(fixture.adapter);
+      fixture.adapter.activate = async (request) => mutate(await original(request));
+
+      await assert.rejects(fixture.activate(), /activation|route|binding|candidate|connection|backend/i);
+
+      assert.equal(fixture.stateStore.read().revision, stateBefore.revision + 1);
+      assert.equal(fixture.stateStore.read().defaultRoute?.backendId, "kimi-code");
+      assert.equal((await journalDirectories(fixture.appHome)).length, 1);
+      assert.equal(fixture.adapter.candidates.size, 0);
+    });
+  }
 });
 
 for (const boundary of boundaries) {

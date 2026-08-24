@@ -46,6 +46,30 @@ const ANTHROPIC: BackendDescriptor = {
   capabilities: { models: false, tools: false, reasoning: false },
 };
 
+const KIMI: BackendDescriptor = {
+  id: "kimi-code",
+  displayName: "Kimi Code",
+  maturity: "preview",
+  connectable: true,
+  kind: "raw-model",
+  credentialOwner: "orcode-keychain",
+  billingRealmKind: "provider-managed",
+  capabilities: { models: true, tools: true, reasoning: true },
+};
+
+const KIMI_MODELS: readonly BackendModelDescriptor[] = [
+  ["k3", "Kimi K3"],
+  ["k3-256k", "Kimi K3 256K"],
+  ["kimi-for-coding", "Kimi K2.7 Code"],
+  ["kimi-for-coding-highspeed", "Kimi K2.7 Code HighSpeed"],
+].map(([id, displayName]) => ({
+  backendId: "kimi-code" as const,
+  requestedModelId: id!,
+  canonicalModelId: id!,
+  displayName: displayName!,
+  capabilities: { textInput: true, textOutput: true, tools: true, reasoning: true },
+}));
+
 const MODEL: BackendModelDescriptor = {
   backendId: "openrouter",
   requestedModelId: "openai/gpt-5",
@@ -65,6 +89,14 @@ class ScriptedSurface implements SetupSurface {
   readonly entries: SetupHubEntry[][] = [];
   readonly events: Array<SetupEvent | { version: 1; type: "notice"; message: string }> = [];
   readonly calls: string[] = [];
+  readonly authenticationRequests: Array<{
+    backendId: "kimi-code";
+    methods: readonly { id: string; label: string; description: string; disabled: boolean }[];
+  }> = [];
+  readonly modelRequests: Array<{
+    backendId: BackendDescriptor["id"];
+    models: readonly BackendModelDescriptor[];
+  }> = [];
   activePrompts = 0;
   maxActivePrompts = 0;
 
@@ -73,6 +105,7 @@ class ScriptedSurface implements SetupSurface {
     private readonly secrets: Array<string | null> = [],
     private readonly models: Array<string | null> = [],
     private readonly confirms: boolean[] = [],
+    private readonly authenticationMethods: Array<string | null> = [],
   ) {}
 
   async chooseHub(entries: readonly SetupHubEntry[]): Promise<string | null> {
@@ -81,13 +114,26 @@ class ScriptedSurface implements SetupSurface {
     return this.prompt(this.hub.shift() ?? null);
   }
 
+  async chooseAuthenticationMethod(request: {
+    backendId: "kimi-code";
+    methods: readonly { id: string; label: string; description: string; disabled: boolean }[];
+  }): Promise<string | null> {
+    this.calls.push("authentication");
+    this.authenticationRequests.push(structuredClone(request));
+    return this.prompt(this.authenticationMethods.shift() ?? "membership-key");
+  }
+
   async readSecret(): Promise<string | null> {
     this.calls.push("secret");
     return this.prompt(this.secrets.shift() ?? null);
   }
 
-  async chooseModel(): Promise<string | null> {
+  async chooseModel(request: {
+    backendId: BackendDescriptor["id"];
+    models: readonly BackendModelDescriptor[];
+  }): Promise<string | null> {
     this.calls.push("model");
+    this.modelRequests.push(structuredClone(request));
     return this.prompt(this.models.shift() ?? null);
   }
 
@@ -188,7 +234,175 @@ function fixture(surface: SetupSurface, options: { processOnlyNullState?: boolea
     },
   };
   const orchestrator = new SetupOrchestrator({ registry, stateStore, activationCoordinator });
-  return { adapter, stateStore, registry, orchestrator, activations, surface };
+  return {
+    adapter,
+    stateStore,
+    registry,
+    orchestrator,
+    activations,
+    surface,
+    executionMode: "local-interactive-owner" as const,
+  };
+}
+
+class KimiSetupAdapter implements BackendAdapter {
+  readonly backendId = "kimi-code" as const;
+  readonly calls: string[] = [];
+  readonly candidates: string[] = [];
+  readonly connectRequests: Array<Parameters<BackendAdapter["connect"]>[0]> = [];
+  models: readonly BackendModelDescriptor[] = KIMI_MODELS;
+  rejectNext = false;
+
+  async inspect(): Promise<ProviderInspection> { throw new Error("not used"); }
+  async reconnect(): Promise<ProviderInspection> { throw new Error("not used"); }
+  async logout(): Promise<void> { this.calls.push("logout"); }
+  async discardCandidate(): Promise<void> { this.calls.push("discard"); }
+  async connect(request: Parameters<BackendAdapter["connect"]>[0]): Promise<ProviderCandidate> {
+    this.calls.push("connect");
+    this.candidates.push(String(request.candidate));
+    this.connectRequests.push(request);
+    return {
+      candidateId: "candidate-kimi-setup",
+      backendId: "kimi-code",
+      connectionId: request.connectionId ?? "kimi-setup-connection",
+      accountFingerprint: "acct_kimi_setup",
+      billingRealm: "kimi-code-membership-provider-managed-overage",
+      health: {
+        credential: this.rejectNext ? "rejected" : "valid",
+        connectivity: "connected",
+        spend: "unknown",
+        runtime: "not-applicable",
+        observedAt: 1,
+        generation: request.generation,
+      },
+    };
+  }
+  async listModels(): Promise<readonly BackendModelDescriptor[]> {
+    this.calls.push("models");
+    return structuredClone(this.models);
+  }
+  async activate(): Promise<CandidateProviderState> { throw new Error("not used"); }
+}
+
+function kimiSetupFixture(
+  surface: SetupSurface,
+  options: { existing?: boolean } = {},
+) {
+  const openRouter = new Adapter();
+  const kimi = new KimiSetupAdapter();
+  const stateStore = new ProviderStateStore(createNeverConfiguredProviderState());
+  if (options.existing) {
+    const current = stateStore.read();
+    stateStore.replace({
+      ...current,
+      lifecycle: "configured",
+      connections: [{
+        id: "kimi-existing",
+        backendId: "kimi-code",
+        enabled: true,
+        maturity: "preview",
+        credentialSlot: "v1:kimi-code:018f8d77-2d52-7cc0-8f6a-9fb1f3fc0711",
+        accountFingerprint: "acct_kimi_existing",
+        accountFingerprintState: "verified",
+        billingRealm: "kimi-code-membership-provider-managed-overage",
+        lastHealth: null,
+      }],
+      defaultRoute: {
+        version: 1,
+        backendId: "kimi-code",
+        accountFingerprint: "acct_kimi_existing",
+        billingRealm: "kimi-code-membership-provider-managed-overage",
+        requestedModelId: "k3",
+        canonicalModelId: "k3",
+        resolutionState: "resolved",
+      },
+      cross: { enabled: false, preferredLead: null, preferredChallenger: null },
+    }, current.revision);
+  }
+  const registry = new BackendRegistry([
+    { descriptor: OPENROUTER, adapter: openRouter },
+    { descriptor: KIMI, adapter: kimi },
+    { descriptor: ANTHROPIC },
+  ]);
+  const activations: ProviderActivationRequest[] = [];
+  const activationCoordinator = {
+    async activate(request: ProviderActivationRequest): Promise<ProviderActivationResult> {
+      activations.push(request);
+      const route = {
+        version: 1 as const,
+        backendId: "kimi-code" as const,
+        accountFingerprint: "acct_kimi_setup",
+        billingRealm: "kimi-code-membership-provider-managed-overage" as const,
+        requestedModelId: request.expectedRequestedModelId,
+        canonicalModelId: request.selectedCanonicalModelId,
+        resolutionState: "resolved" as const,
+      };
+      const previous = stateStore.read();
+      const state = stateStore.replace({
+        ...previous,
+        lifecycle: "configured",
+        connections: [{
+          id: request.targetConnectionId ?? "kimi-setup-connection",
+          backendId: "kimi-code",
+          enabled: true,
+          maturity: "preview",
+          credentialSlot: "v1:kimi-code:018f8d77-2d52-7cc0-8f6a-9fb1f3fc0712",
+          accountFingerprint: route.accountFingerprint,
+          accountFingerprintState: "verified",
+          billingRealm: route.billingRealm,
+          lastHealth: null,
+        }],
+        defaultRoute: route,
+        cross: { enabled: false, preferredLead: null, preferredChallenger: null },
+      }, previous.revision);
+      return { persisted: true, warnings: [], state, route };
+    },
+  };
+  const orchestrator = new SetupOrchestrator({ registry, stateStore, activationCoordinator });
+  const permits: object[] = [];
+  const released: object[] = [];
+  const authorityCalls: Array<Record<string, unknown>> = [];
+  const withManualKimiCandidateAuthority = async <T>(
+    request: Record<string, unknown>,
+    use: (
+      candidate: string,
+      lease: { assertHeld(): Promise<void>; assertCurrent(): Promise<void> },
+    ) => Promise<{ candidate: ProviderCandidate; value: T }>,
+  ) => {
+    authorityCalls.push(request);
+    if (request.expectedRevision !== stateStore.read().revision) {
+      return { kind: "stale" as const };
+    }
+    const normalized = String(request.candidate).trim();
+    const observed = await use(normalized, {
+      async assertHeld() {},
+      async assertCurrent() {},
+    });
+    if (
+      observed.candidate.backendId !== "kimi-code"
+      || observed.candidate.health.credential !== "valid"
+      || observed.candidate.health.connectivity !== "connected"
+    ) return { kind: "stale" as const };
+    const permit = Object.freeze({ version: 1 as const });
+    permits.push(permit);
+    return { kind: "ready" as const, value: { value: observed.value, candidatePermit: permit } };
+  };
+  const releaseManualKimiCandidatePermit = (permit: object) => { released.push(permit); };
+  return {
+    surface,
+    openRouter,
+    kimi,
+    stateStore,
+    registry,
+    orchestrator,
+    activations,
+    authorityCalls,
+    permits,
+    released,
+    executionMode: "local-interactive-owner" as const,
+    withManualKimiCandidateAuthority,
+    releaseManualKimiCandidatePermit,
+  };
 }
 
 interface ObservedSetupCancellation {
@@ -222,6 +436,246 @@ function assertOneInteractiveCancellation(
   });
   assert.equal(observed[0]?.expectedRevision, 0);
 }
+
+test("setup hub exposes exactly the three approved provider rows in their normative order", async () => {
+  const surface = new ScriptedSurface([null]);
+  const context = kimiSetupFixture(surface);
+
+  await runSetupHub({ ...context, surface } as never);
+
+  assert.deepEqual(surface.entries[0]?.map(({ id, label, description, disabled }) => ({
+    id,
+    label,
+    description,
+    disabled,
+  })), [
+    {
+      id: "openrouter",
+      label: "OpenRouter",
+      description: "Stable · API-Guthaben · viele Modelle",
+      disabled: false,
+    },
+    {
+      id: "kimi-code",
+      label: "Kimi Code Abo",
+      description: "Preview · Membership-Key · Coding-Modelle",
+      disabled: false,
+    },
+    {
+      id: "anthropic",
+      label: "Anthropic / Claude-Abo",
+      description: "Coming soon",
+      disabled: true,
+    },
+  ]);
+});
+
+test("Kimi OAuth Coming-soon authentication returns with zero credential, adapter, network, or state effects", async () => {
+  const surface = new ScriptedSurface(
+    ["kimi-code", null],
+    [],
+    [],
+    [],
+    ["oauth-coming-soon"],
+  );
+  const context = kimiSetupFixture(surface);
+  const before = context.stateStore.read();
+
+  const result = await runSetupHub({ ...context, surface } as never);
+
+  assert.deepEqual(result, { kind: "cancelled", mode: "setup-required" });
+  assert.deepEqual(surface.calls, ["hub", "authentication", "hub"]);
+  assert.deepEqual(surface.authenticationRequests[0], {
+    backendId: "kimi-code",
+    methods: [
+      {
+        id: "membership-key",
+        label: "Membership-Key verwenden",
+        description: "Im Kimi-Code-Konto erstellen",
+        disabled: false,
+      },
+      {
+        id: "oauth-coming-soon",
+        label: "Mit Kimi anmelden",
+        description: "Coming soon",
+        disabled: false,
+      },
+    ],
+  });
+  assert.match(
+    surface.events.map((event) => "message" in event ? event.message : "").join("\n"),
+    /Mit Kimi anmelden.*Coming soon/i,
+  );
+  assert.deepEqual(context.kimi.calls, []);
+  assert.deepEqual(context.openRouter.calls, []);
+  assert.deepEqual(context.authorityCalls, []);
+  assert.deepEqual(context.activations, []);
+  assert.deepEqual(context.stateStore.read(), before);
+});
+
+test("Kimi membership setup explains third-party billing, normalizes inside authority, shows four models, and keeps Cross off", async () => {
+  const selected = "kimi-for-coding-highspeed";
+  const raw = "\r\n  fixture-kimi-membership-key-not-real  \n";
+  const surface = new ScriptedSurface(
+    ["kimi-code", "cross-later"],
+    [raw],
+    [selected],
+  );
+  const context = kimiSetupFixture(surface);
+
+  const result = await runSetupHub({ ...context, surface } as never);
+
+  assert.deepEqual(result, { kind: "ready" });
+  assert.deepEqual(surface.calls, ["hub", "authentication", "secret", "model", "hub"]);
+  assert.match(
+    surface.events.map((event) => "message" in event ? event.message : "").join("\n"),
+    /Drittanbieter.*Membership-Key.*providerverwaltet.*Extra Usage.*kostenpflichtig/is,
+  );
+  assert.deepEqual(context.authorityCalls.map((request) => ({
+    backendId: request.backendId,
+    candidate: request.candidate,
+    expectedRevision: request.expectedRevision,
+    generation: request.generation,
+    purpose: request.purpose,
+  })), [{
+    backendId: "kimi-code",
+    candidate: raw,
+    expectedRevision: 0,
+    generation: 1,
+    purpose: "initial-setup",
+  }]);
+  assert.deepEqual(context.kimi.candidates, ["fixture-kimi-membership-key-not-real"]);
+  assert.deepEqual(surface.modelRequests[0], {
+    backendId: "kimi-code",
+    models: KIMI_MODELS,
+  });
+  assert.equal(context.activations.length, 1);
+  const activation = context.activations[0] as ProviderActivationRequest & Record<string, unknown>;
+  assert.equal(activation.backendId, "kimi-code");
+  assert.equal(activation.persistence, "persisted");
+  assert.equal(activation.environmentEligibility, "forbidden");
+  assert.equal(activation.requireCandidatePermit, true);
+  assert.equal(activation.candidatePermit, context.permits[0]);
+  assert.equal(activation.targetConnectionId, "kimi-setup-connection");
+  assert.equal(activation.selectedCanonicalModelId, selected);
+  assert.equal(activation.candidateAuthorityPurpose, "initial-setup");
+  assert.equal(context.released.length, 1);
+  assert.equal(context.released[0], context.permits[0]);
+  assert.equal(context.stateStore.read().cross.enabled, false);
+  assert.equal(context.stateStore.read().defaultRoute?.backendId, "kimi-code");
+  assert.equal(context.stateStore.read().defaultRoute?.canonicalModelId, selected);
+});
+
+test("Kimi replacement confirmation happens before secret input and every authority or adapter effect", async () => {
+  const surface = new ScriptedSurface(["kimi-code"], ["must-not-be-read"], [], [false]);
+  const context = kimiSetupFixture(surface, { existing: true });
+  const before = context.stateStore.read();
+
+  const result = await runSetupHub({ ...context, surface } as never);
+
+  assert.deepEqual(result, { kind: "cancelled", mode: "setup-required" });
+  assert.deepEqual(surface.calls, ["hub", "confirm"]);
+  assert.deepEqual(context.authorityCalls, []);
+  assert.deepEqual(context.kimi.calls, []);
+  assert.deepEqual(context.activations, []);
+  assert.deepEqual(context.stateStore.read(), before);
+});
+
+test("confirmed Kimi replacement binds authority, connect, and activation to the one existing connection", async () => {
+  const surface = new ScriptedSurface(
+    ["kimi-code", "cross-later"],
+    ["replacement-membership-key"],
+    ["k3"],
+    [true],
+  );
+  const context = kimiSetupFixture(surface, { existing: true });
+
+  const result = await runSetupHub({ ...context, surface } as never);
+
+  assert.deepEqual(result, { kind: "ready" });
+  assert.equal(context.authorityCalls[0]?.targetConnectionId, "kimi-existing");
+  assert.equal(context.kimi.connectRequests[0]?.connectionId, "kimi-existing");
+  assert.equal(context.activations[0]?.targetConnectionId, "kimi-existing");
+  assert.equal(context.stateStore.read().connections.length, 1);
+  assert.equal(context.stateStore.read().connections[0]?.id, "kimi-existing");
+});
+
+test("Kimi replacement confirmation is revision-bound before secret or authority effects", async () => {
+  const surface = new ScriptedSurface(
+    ["kimi-code"],
+    ["replacement-must-stale"],
+    ["k3"],
+    [true],
+  );
+  const context = kimiSetupFixture(surface, { existing: true });
+  const originalReadSecret = surface.readSecret.bind(surface);
+  surface.readSecret = async () => {
+    const current = context.stateStore.read();
+    context.stateStore.replace({
+      ...current,
+      connections: current.connections.map((connection) => connection.id === "kimi-existing"
+        ? {
+            ...connection,
+            credentialSlot: "v1:kimi-code:018f8d77-2d52-7cc0-8f6a-9fb1f3fc0798",
+            accountFingerprint: "acct_kimi_concurrent_replacement",
+          }
+        : connection),
+      defaultRoute: current.defaultRoute
+        ? { ...current.defaultRoute, accountFingerprint: "acct_kimi_concurrent_replacement" }
+        : null,
+    }, current.revision);
+    return originalReadSecret();
+  };
+
+  const result = await runSetupHub({ ...context, surface } as never);
+  const foreign = context.stateStore.read();
+
+  assert.deepEqual(result, { kind: "cancelled", mode: "setup-required" });
+  assert.equal(context.authorityCalls[0]?.expectedRevision, 1);
+  assert.deepEqual(context.kimi.calls, []);
+  assert.deepEqual(context.activations, []);
+  assert.equal(foreign.revision, 2);
+  assert.equal(foreign.connections[0]?.accountFingerprint, "acct_kimi_concurrent_replacement");
+  assert.equal(foreign.connections[0]?.credentialSlot, "v1:kimi-code:018f8d77-2d52-7cc0-8f6a-9fb1f3fc0798");
+});
+
+test("ambiguous retained Kimi connections fail closed before replacement confirmation or provider effects", async () => {
+  const surface = new ScriptedSurface(
+    ["kimi-code", null],
+    ["must-not-be-read"],
+    ["k3"],
+    [true],
+  );
+  const context = kimiSetupFixture(surface, { existing: true });
+  const state = context.stateStore.read();
+  const existing = state.connections[0]!;
+  context.stateStore.replace({
+    ...state,
+    connections: [
+      existing,
+      {
+        ...existing,
+        id: "kimi-existing-ambiguous",
+        credentialSlot: "v1:kimi-code:018f8d77-2d52-7cc0-8f6a-9fb1f3fc0799",
+        accountFingerprint: "acct_kimi_existing_ambiguous",
+      },
+    ],
+  }, state.revision);
+  const before = context.stateStore.read();
+
+  const result = await runSetupHub({ ...context, surface } as never);
+
+  assert.deepEqual(result, { kind: "cancelled", mode: "setup-required" });
+  assert.deepEqual(surface.calls, ["hub"]);
+  assert.match(
+    surface.events.map((event) => "message" in event ? event.message : "").join("\n"),
+    /mehrere|eindeutig|reparieren/i,
+  );
+  assert.deepEqual(context.authorityCalls, []);
+  assert.deepEqual(context.kimi.calls, []);
+  assert.deepEqual(context.activations, []);
+  assert.deepEqual(context.stateStore.read(), before);
+});
 
 test("hub connects OpenRouter in secret, model, and explicit persistence order", async () => {
   const surface = new ScriptedSurface(["openrouter", "cross-later"], ["sk-or-v1-test-key"], [MODEL.canonicalModelId], [true]);

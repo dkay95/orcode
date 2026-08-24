@@ -6,6 +6,7 @@ import {
   BackendRegistry,
   type BackendAdapter,
   type BackendModelDescriptor,
+  type ProviderCandidate,
   type ProviderHealth,
   type ProviderInspection,
   type RouteIdentityV1,
@@ -52,6 +53,71 @@ const FINGERPRINT_A = openRouterAccountFingerprint(HMAC_KEY, CREATOR_A);
 const FINGERPRINT_B = openRouterAccountFingerprint(HMAC_KEY, CREATOR_B);
 const SLOT_A = "v1:inference:10000000-0000-4000-8000-000000000001";
 const SLOT_B = "v1:inference:20000000-0000-4000-8000-000000000002";
+const KIMI_MANUAL_SECRET = "fixture-kimi-manual-membership-key-not-real";
+const KIMI_MANUAL_FOREIGN_SECRET = "fixture-kimi-manual-membership-key-foreign";
+const KIMI_MANUAL_CONNECTION = "kimi-manual-main";
+const KIMI_MANUAL_FINGERPRINT = "acct_kimi_manual_fixture";
+
+type ManualKimiPermit = { readonly version: 1 };
+type ManualKimiAttemptToken = { readonly version: 1 };
+type ManualKimiAuthorityApi = {
+  withManualKimiCandidateAuthority<T>(
+    request: {
+      backendId: "kimi-code";
+      candidate: string;
+      expectedRevision: number;
+      generation: number;
+      targetConnectionId?: string;
+      purpose: "initial-setup";
+      deadlineAt: number;
+      signal: AbortSignal;
+    },
+    inspect: (
+      normalizedCandidate: string,
+      lease: { assertHeld(): Promise<void>; assertCurrent(): Promise<void> },
+    ) => Promise<{ candidate: ProviderCandidate; value: T }>,
+  ): Promise<
+    | { kind: "ready"; value: { value: T; candidatePermit: ManualKimiPermit } }
+    | { kind: "forget-pending" | "recovery-required" | "stale" }
+  >;
+  validateCandidatePermitUnderLease(
+    request: {
+      backendId: "kimi-code";
+      candidate: string;
+      expectedRevision: number;
+      generation: number;
+      targetConnectionId?: string;
+      purpose: "initial-setup";
+      deadlineAt: number;
+      signal: AbortSignal;
+      originalOwnerSignal: AbortSignal;
+      credentialPermit: ManualKimiPermit;
+      requireCredentialPermit: true;
+      activationAttemptToken: ManualKimiAttemptToken;
+      observedCandidate?: ProviderCandidate;
+    },
+    lease: { assertHeld(): Promise<void> },
+  ): Promise<{ kind: "ready" | "forget-pending" | "recovery-required" | "stale" }>;
+  releaseManualKimiCandidatePermit(permit: ManualKimiPermit): void;
+};
+
+function manualKimiCandidate(generation = 7): ProviderCandidate {
+  return {
+    candidateId: "candidate-kimi-manual",
+    backendId: "kimi-code",
+    connectionId: KIMI_MANUAL_CONNECTION,
+    accountFingerprint: KIMI_MANUAL_FINGERPRINT,
+    billingRealm: "kimi-code-membership-provider-managed-overage",
+    health: {
+      credential: "valid",
+      connectivity: "connected",
+      spend: "unknown",
+      runtime: "not-applicable",
+      observedAt: NOW,
+      generation,
+    },
+  };
+}
 
 async function withCappedProviderTimers<T>(
   run: (realDelay: (milliseconds: number) => Promise<void>) => Promise<T>,
@@ -3912,6 +3978,371 @@ test("Kimi exact authority tuple mutations fence publication", async (t) => {
       assert.equal(published, false);
     });
   }
+});
+
+test("manual Kimi candidate authority issues one callback-scoped observed permit and releases before model choice", async () => {
+  const stateStore = new ProviderStateStore(createNeverConfiguredProviderState());
+  const credentials = new AuthorityCredentials();
+  let authorityOwned = false;
+  let callbackObservedOwned = false;
+  const coordinator: ProviderAuthorityCoordinator = {
+    async readAuthority(_request, operation) {
+      assert.equal(authorityOwned, false);
+      authorityOwned = true;
+      try {
+        return await operation({
+          async assertHeld() {
+            assert.equal(authorityOwned, true);
+          },
+        });
+      } finally {
+        authorityOwned = false;
+      }
+    },
+  };
+  const authority = realAuthority({ stateStore, credentials, coordinator });
+  const api = authority as unknown as ManualKimiAuthorityApi;
+  assert.equal(
+    typeof api.withManualKimiCandidateAuthority,
+    "function",
+    "manual Kimi authority must be an explicit seam rather than reusing OpenRouter environment authority",
+  );
+  const owner = new AbortController();
+  const result = await api.withManualKimiCandidateAuthority({
+    backendId: "kimi-code",
+    candidate: `\r\n  ${KIMI_MANUAL_SECRET}  \n`,
+    expectedRevision: 0,
+    generation: 7,
+    targetConnectionId: KIMI_MANUAL_CONNECTION,
+    purpose: "initial-setup",
+    deadlineAt: NOW + 5_000,
+    signal: owner.signal,
+  }, async (normalizedCandidate, lease) => {
+    callbackObservedOwned = authorityOwned;
+    assert.equal(normalizedCandidate, KIMI_MANUAL_SECRET);
+    await lease.assertCurrent();
+    return {
+      candidate: manualKimiCandidate(),
+      value: Object.freeze(["k3", "kimi-for-coding"]),
+    };
+  });
+
+  assert.equal(callbackObservedOwned, true);
+  assert.equal(authorityOwned, false, "human model choice must happen after authority release");
+  assert.deepEqual(credentials.effects, [], "first manual Kimi paste must not read a credential slot");
+  assert.equal(result.kind, "ready");
+  if (result.kind !== "ready") throw new Error("manual Kimi candidate authority was unavailable");
+  assert.deepEqual(result.value.value, ["k3", "kimi-for-coding"]);
+  assert.deepEqual(result.value.candidatePermit, { version: 1 });
+  assert.equal(Object.isFrozen(result.value.candidatePermit), true);
+});
+
+test("manual Kimi observation derives a first connection id and rejects incomplete or stale observations", async (t) => {
+  const validRequest = {
+    backendId: "kimi-code" as const,
+    candidate: KIMI_MANUAL_SECRET,
+    expectedRevision: 0,
+    generation: 7,
+    purpose: "initial-setup" as const,
+    deadlineAt: NOW + 5_000,
+    signal: new AbortController().signal,
+  };
+  const invalid: ReadonlyArray<readonly [string, (candidate: ProviderCandidate) => ProviderCandidate]> = [
+    ["backend", (candidate) => ({ ...candidate, backendId: "openrouter" })],
+    ["connection", (candidate) => ({ ...candidate, connectionId: "" })],
+    ["fingerprint", (candidate) => ({ ...candidate, accountFingerprint: "" })],
+    ["realm", (candidate) => ({ ...candidate, billingRealm: "openrouter-payg" })],
+    ["generation", (candidate) => ({
+      ...candidate,
+      health: { ...candidate.health, generation: validRequest.generation + 1 },
+    })],
+    ["credential health", (candidate) => ({
+      ...candidate,
+      health: { ...candidate.health, credential: "rejected" },
+    })],
+    ["connectivity health", (candidate) => ({
+      ...candidate,
+      health: { ...candidate.health, connectivity: "offline" },
+    })],
+  ];
+
+  for (const [name, mutate] of invalid) {
+    await t.test(name, async () => {
+      const authority = realAuthority({
+        stateStore: new ProviderStateStore(createNeverConfiguredProviderState()),
+        credentials: new AuthorityCredentials(),
+      }) as unknown as ManualKimiAuthorityApi;
+      const result = await authority.withManualKimiCandidateAuthority(
+        validRequest,
+        async () => ({ candidate: mutate(manualKimiCandidate()), value: null }),
+      );
+      assert.deepEqual(result, { kind: "stale" });
+    });
+  }
+
+  const authority = realAuthority({
+    stateStore: new ProviderStateStore(createNeverConfiguredProviderState()),
+    credentials: new AuthorityCredentials(),
+  }) as unknown as ManualKimiAuthorityApi;
+  const issued = await authority.withManualKimiCandidateAuthority(
+    validRequest,
+    async () => ({
+      candidate: manualKimiCandidate(),
+      value: { targetConnectionId: KIMI_MANUAL_CONNECTION },
+    }),
+  );
+  assert.equal(issued.kind, "ready");
+  if (issued.kind !== "ready") throw new Error("manual permit was not issued");
+  assert.deepEqual(issued.value.value, { targetConnectionId: KIMI_MANUAL_CONNECTION });
+
+  const lease = { async assertHeld() {} };
+  const token = Object.freeze({ version: 1 as const });
+  assert.deepEqual(await authority.validateCandidatePermitUnderLease({
+    ...validRequest,
+    targetConnectionId: KIMI_MANUAL_CONNECTION,
+    originalOwnerSignal: validRequest.signal,
+    credentialPermit: issued.value.candidatePermit,
+    requireCredentialPermit: true,
+    activationAttemptToken: token,
+    observedCandidate: manualKimiCandidate(),
+  }, lease), { kind: "ready" });
+});
+
+test("manual Kimi authority rejects equality deadlines, revision drift, and owner abort before issuing a permit", async () => {
+  const stateStore = new ProviderStateStore(createNeverConfiguredProviderState());
+  const authority = realAuthority({
+    stateStore,
+    credentials: new AuthorityCredentials(),
+  }) as unknown as ManualKimiAuthorityApi;
+  const owner = new AbortController();
+  const request = {
+    backendId: "kimi-code" as const,
+    candidate: KIMI_MANUAL_SECRET,
+    expectedRevision: 0,
+    generation: 7,
+    purpose: "initial-setup" as const,
+    deadlineAt: NOW + 5_000,
+    signal: owner.signal,
+  };
+
+  assert.deepEqual(await authority.withManualKimiCandidateAuthority(
+    { ...request, deadlineAt: NOW },
+    async () => { throw new Error("expired authority must not inspect"); },
+  ), { kind: "stale" });
+
+  const current = stateStore.read();
+  stateStore.replace({ ...current, lifecycle: "cancelled" }, current.revision);
+  assert.deepEqual(await authority.withManualKimiCandidateAuthority(
+    request,
+    async () => { throw new Error("stale revision must not inspect"); },
+  ), { kind: "stale" });
+
+  const aborted = new AbortController();
+  aborted.abort(new DOMException("owner stopped", "AbortError"));
+  await assert.rejects(
+    authority.withManualKimiCandidateAuthority(
+      { ...request, expectedRevision: 1, signal: aborted.signal },
+      async () => { throw new Error("aborted authority must not inspect"); },
+    ),
+    (error: unknown) => error === aborted.signal.reason,
+  );
+});
+
+test("manual Kimi permit binds the full observation, claims one activation token, and rejects replay or release", async (t) => {
+  const stateStore = new ProviderStateStore(createNeverConfiguredProviderState());
+  const credentials = new AuthorityCredentials();
+  const authority = realAuthority({ stateStore, credentials });
+  const api = authority as unknown as ManualKimiAuthorityApi;
+  assert.equal(typeof api.withManualKimiCandidateAuthority, "function");
+  assert.equal(typeof api.releaseManualKimiCandidatePermit, "function");
+  const owner = new AbortController();
+  const observed = manualKimiCandidate();
+  const issued = await api.withManualKimiCandidateAuthority({
+    backendId: "kimi-code",
+    candidate: KIMI_MANUAL_SECRET,
+    expectedRevision: 0,
+    generation: 7,
+    targetConnectionId: KIMI_MANUAL_CONNECTION,
+    purpose: "initial-setup",
+    deadlineAt: NOW + 5_000,
+    signal: owner.signal,
+  }, async (_candidate, lease) => {
+    await lease.assertCurrent();
+    return { candidate: observed, value: null };
+  });
+  assert.equal(issued.kind, "ready");
+  if (issued.kind !== "ready") throw new Error("manual Kimi permit was not issued");
+  const permit = issued.value.candidatePermit;
+  const tokenA = Object.freeze({ version: 1 as const });
+  const tokenB = Object.freeze({ version: 1 as const });
+  const base = {
+    backendId: "kimi-code" as const,
+    candidate: KIMI_MANUAL_SECRET,
+    expectedRevision: 0,
+    generation: 7,
+    targetConnectionId: KIMI_MANUAL_CONNECTION,
+    purpose: "initial-setup" as const,
+    deadlineAt: NOW + 5_000,
+    signal: owner.signal,
+    originalOwnerSignal: owner.signal,
+    credentialPermit: permit,
+    requireCredentialPermit: true as const,
+    activationAttemptToken: tokenA,
+    observedCandidate: observed,
+  };
+  const lease = { async assertHeld() {} };
+
+  assert.deepEqual(await api.validateCandidatePermitUnderLease(base, lease), { kind: "ready" });
+  assert.deepEqual(
+    await api.validateCandidatePermitUnderLease(base, lease),
+    { kind: "ready" },
+    "revalidation in the same activation attempt must remain valid",
+  );
+  assert.deepEqual(
+    await api.validateCandidatePermitUnderLease({ ...base, activationAttemptToken: tokenB }, lease),
+    { kind: "stale" },
+    "a second activation token must not replay a claimed manual permit",
+  );
+
+  const mutations: ReadonlyArray<readonly [string, Record<string, unknown>]> = [
+    ["backend", { backendId: "openrouter" }],
+    ["candidate", { candidate: KIMI_MANUAL_FOREIGN_SECRET }],
+    ["revision", { expectedRevision: 1 }],
+    ["generation", { generation: 8 }],
+    ["connection", { targetConnectionId: "kimi-manual-foreign" }],
+    ["purpose", { purpose: "runtime-bind" }],
+    ["deadline equality", { deadlineAt: NOW }],
+    ["owner signal", { originalOwnerSignal: new AbortController().signal }],
+    ["observed connection", {
+      observedCandidate: { ...observed, connectionId: "kimi-manual-foreign" },
+    }],
+    ["observed generation", {
+      observedCandidate: { ...observed, health: { ...observed.health, generation: 8 } },
+    }],
+    ["observed health", {
+      observedCandidate: {
+        ...observed,
+        health: { ...observed.health, connectivity: "offline" },
+      },
+    }],
+    ["observed fingerprint", {
+      observedCandidate: { ...observed, accountFingerprint: "acct_kimi_manual_foreign" },
+    }],
+    ["observed realm", {
+      observedCandidate: { ...observed, billingRealm: "openrouter-payg" },
+    }],
+  ];
+  for (const [name, mutation] of mutations) {
+    await t.test(name, async () => {
+      assert.deepEqual(
+        await api.validateCandidatePermitUnderLease({ ...base, ...mutation } as never, lease),
+        { kind: "stale" },
+      );
+    });
+  }
+
+  assert.deepEqual(await api.validateCandidatePermitUnderLease({
+    ...base,
+    credentialPermit: Object.freeze({ version: 1 }),
+  }, lease), { kind: "stale" });
+  api.releaseManualKimiCandidatePermit(permit);
+  assert.deepEqual(await api.validateCandidatePermitUnderLease(base, lease), { kind: "stale" });
+});
+
+test("manual Kimi issuance rechecks revision after observation and owner abort revokes validation", async () => {
+  const stateStore = new ProviderStateStore(createNeverConfiguredProviderState());
+  const authority = realAuthority({
+    stateStore,
+    credentials: new AuthorityCredentials(),
+  }) as unknown as ManualKimiAuthorityApi;
+  const owner = new AbortController();
+  const request = {
+    backendId: "kimi-code" as const,
+    candidate: KIMI_MANUAL_SECRET,
+    expectedRevision: 0,
+    generation: 7,
+    targetConnectionId: KIMI_MANUAL_CONNECTION,
+    purpose: "initial-setup" as const,
+    deadlineAt: NOW + 5_000,
+    signal: owner.signal,
+  };
+  const drifted = await authority.withManualKimiCandidateAuthority(request, async () => {
+    const current = stateStore.read();
+    stateStore.replace({ ...current, lifecycle: "cancelled" }, current.revision);
+    return { candidate: manualKimiCandidate(), value: null };
+  });
+  assert.deepEqual(drifted, { kind: "stale" });
+
+  const freshStore = new ProviderStateStore(createNeverConfiguredProviderState());
+  const freshAuthority = realAuthority({
+    stateStore: freshStore,
+    credentials: new AuthorityCredentials(),
+  }) as unknown as ManualKimiAuthorityApi;
+  const issued = await freshAuthority.withManualKimiCandidateAuthority(
+    request,
+    async () => ({ candidate: manualKimiCandidate(), value: null }),
+  );
+  assert.equal(issued.kind, "ready");
+  if (issued.kind !== "ready") throw new Error("manual permit was not issued");
+  owner.abort(new DOMException("owner cancelled after model choice", "AbortError"));
+  let leaseEffects = 0;
+  await assert.rejects(
+    freshAuthority.validateCandidatePermitUnderLease({
+      ...request,
+      originalOwnerSignal: owner.signal,
+      credentialPermit: issued.value.candidatePermit,
+      requireCredentialPermit: true,
+      activationAttemptToken: Object.freeze({ version: 1 }),
+    }, { async assertHeld() { leaseEffects += 1; } }),
+    (error: unknown) => error === owner.signal.reason,
+  );
+  assert.equal(leaseEffects, 0);
+});
+
+test("two concurrent Kimi activation tokens can claim a manual permit only once", async () => {
+  const authority = realAuthority({
+    stateStore: new ProviderStateStore(createNeverConfiguredProviderState()),
+    credentials: new AuthorityCredentials(),
+  }) as unknown as ManualKimiAuthorityApi;
+  const owner = new AbortController();
+  const issued = await authority.withManualKimiCandidateAuthority({
+    backendId: "kimi-code",
+    candidate: KIMI_MANUAL_SECRET,
+    expectedRevision: 0,
+    generation: 7,
+    targetConnectionId: KIMI_MANUAL_CONNECTION,
+    purpose: "initial-setup",
+    deadlineAt: NOW + 5_000,
+    signal: owner.signal,
+  }, async () => ({ candidate: manualKimiCandidate(), value: null }));
+  assert.equal(issued.kind, "ready");
+  if (issued.kind !== "ready") throw new Error("manual permit was not issued");
+  const common = {
+    backendId: "kimi-code" as const,
+    candidate: KIMI_MANUAL_SECRET,
+    expectedRevision: 0,
+    generation: 7,
+    targetConnectionId: KIMI_MANUAL_CONNECTION,
+    purpose: "initial-setup" as const,
+    deadlineAt: NOW + 5_000,
+    signal: owner.signal,
+    originalOwnerSignal: owner.signal,
+    credentialPermit: issued.value.candidatePermit,
+    requireCredentialPermit: true as const,
+  };
+  const lease = { async assertHeld() { await Promise.resolve(); } };
+  const [a, b] = await Promise.all([
+    authority.validateCandidatePermitUnderLease({
+      ...common,
+      activationAttemptToken: Object.freeze({ version: 1 as const }),
+    }, lease),
+    authority.validateCandidatePermitUnderLease({
+      ...common,
+      activationAttemptToken: Object.freeze({ version: 1 as const }),
+    }, lease),
+  ]);
+
+  assert.deepEqual([a.kind, b.kind].sort(), ["ready", "stale"]);
 });
 
 // Kimi requests must never be able to opt into an environment credential at

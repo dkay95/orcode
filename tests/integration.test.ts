@@ -906,6 +906,11 @@ test("/chat list with a migrated connection stays read-only and does not persist
 
 test("later /chat open keeps using the verified migrated OpenRouter connection for historical routes", async () => {
   const { context } = await harness();
+  const nullableContext = context as unknown as CommandContext<OrcodeAgent | null>;
+  nullableContext.commitSessionHandoff = (next) => {
+    nullableContext.session = next;
+    nullableContext.agent = null;
+  };
   const connection: ProviderConnectionStateV1 = {
     id: "task-ten-migrated-chat-connection",
     backendId: "openrouter",
@@ -959,10 +964,11 @@ test("later /chat open keeps using the verified migrated OpenRouter connection f
     },
   };
 
-  await handleSlashCommand("/chat open Historischer migrierter Chat", context);
+  await handleSlashCommand("/chat open Historischer migrierter Chat", nullableContext);
 
   assert.deepEqual(transitions, ["synthetic/historical-chat-model"]);
   assert.equal(context.session.data.id, historical.data.id);
+  assert.equal(nullableContext.agent, null, "a route-changing handoff must discard the old agent owner");
   assert.deepEqual(context.session.data.route, {
     version: 1,
     backendId: "openrouter",

@@ -57,6 +57,18 @@ export interface SetupClock {
   clearTimeout(handle: unknown): void;
 }
 
+export type ProviderExecutionMode =
+  | "local-interactive-owner"
+  | "json"
+  | "piped"
+  | "scheduled"
+  | "batch"
+  | "relay"
+  | "multi-user"
+  | "collaborator"
+  | "shared-service"
+  | "unenrolled-device";
+
 export type StartupSetupMode =
   | "ready"
   | "ready-with-warning"

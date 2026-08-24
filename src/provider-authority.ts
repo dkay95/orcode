@@ -11,7 +11,7 @@ import type {
   ProviderSetupStateV2,
   ProviderStateStore,
 } from "./provider-state.js";
-import type { BackendId, RouteIdentityV1 } from "./backends.js";
+import type { BackendId, ProviderCandidate, RouteIdentityV1 } from "./backends.js";
 
 const CANONICAL_UUID =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
@@ -116,7 +116,10 @@ export interface ProviderAuthorityReadLease {
 
 export interface ProviderAuthorityCoordinator {
   readAuthority<T>(
-    request: { signal: AbortSignal },
+    request: {
+      signal: AbortSignal;
+      backendId?: "openrouter" | "kimi-code";
+    },
     operation: (lease: ProviderAuthorityReadLease) => Promise<T>,
   ): Promise<T>;
 }
@@ -153,6 +156,10 @@ export interface ProviderCandidateCredentialPermit {
   readonly version: 1;
 }
 
+export interface ProviderCandidateActivationAttemptToken {
+  readonly version: 1;
+}
+
 export interface ProviderCandidatePreflightRequest {
   deadlineAt: number;
   signal: AbortSignal;
@@ -166,6 +173,31 @@ export interface ProviderCandidateAuthorityRequest extends ProviderCandidatePref
 export interface ProviderCandidateSnapshotAuthorityRequest
   extends ProviderCandidateAuthorityRequest {
   candidate: string;
+  authoritativeState: ProviderSetupStateV2;
+}
+
+export interface ProviderManualKimiCandidateAuthorityRequest
+  extends ProviderCandidatePreflightRequest {
+  backendId: "kimi-code";
+  candidate: string;
+  expectedRevision: number;
+  generation: number;
+  targetConnectionId?: string;
+  purpose: "initial-setup";
+}
+
+export interface ProviderManualKimiCandidateValidationRequest
+  extends ProviderManualKimiCandidateAuthorityRequest {
+  targetConnectionId: string;
+  originalOwnerSignal: AbortSignal;
+  credentialPermit: ProviderCandidateCredentialPermit;
+  requireCredentialPermit: true;
+  activationAttemptToken: ProviderCandidateActivationAttemptToken;
+  observedCandidate?: ProviderCandidate;
+}
+
+export interface ProviderManualKimiCandidateSnapshotValidationRequest
+  extends ProviderManualKimiCandidateValidationRequest {
   authoritativeState: ProviderSetupStateV2;
 }
 
@@ -192,12 +224,25 @@ export interface ProviderCredentialAuthorityLike {
     request: ProviderCandidateAuthorityRequest,
     use: (lease: ProviderCandidateAuthorityLease) => Promise<T>,
   ): Promise<ProviderCandidateAuthorityResult<T>>;
+  withManualKimiCandidateAuthority?<T>(
+    request: ProviderManualKimiCandidateAuthorityRequest,
+    inspect: (
+      normalizedCandidate: string,
+      lease: ProviderCandidateAuthorityLease,
+    ) => Promise<{ candidate: ProviderCandidate; value: T }>,
+  ): Promise<ProviderCandidateAuthorityResult<{
+    value: T;
+    candidatePermit: ProviderCandidateCredentialPermit;
+  }>>;
+  releaseManualKimiCandidatePermit?(
+    permit: ProviderCandidateCredentialPermit,
+  ): void;
   validateCandidatePermitUnderLease?(
-    request: ProviderCandidateAuthorityRequest,
+    request: ProviderCandidateAuthorityRequest | ProviderManualKimiCandidateValidationRequest,
     lease: ProviderAuthorityReadLease,
   ): Promise<ProviderCandidatePreflightResult>;
   validateCandidatePermitAgainstSnapshotUnderLease?(
-    request: ProviderCandidateSnapshotAuthorityRequest,
+    request: ProviderCandidateSnapshotAuthorityRequest | ProviderManualKimiCandidateSnapshotValidationRequest,
     lease: ProviderAuthorityReadLease,
   ): Promise<ProviderCandidatePreflightResult>;
   withCredential<T>(
@@ -231,12 +276,31 @@ interface CredentialPermit {
   source: "saved" | "environment";
 }
 
-interface CandidateCredentialProof {
+interface BoundCandidateCredentialProof {
+  kind: "bound";
   source: "saved" | "environment";
   binding: ProviderConnectionBindingV2 | null;
   stateRevision: number;
   fingerprint: string;
 }
+
+interface ManualKimiCandidateProof {
+  kind: "manual-kimi";
+  backendId: "kimi-code";
+  slotKind: "kimi-code";
+  expectedRevision: number;
+  generation: number;
+  targetConnectionId: string;
+  accountFingerprint: string;
+  billingRealm: "kimi-code-membership-provider-managed-overage";
+  purpose: "initial-setup";
+  deadlineAt: number;
+  originalOwnerSignal: AbortSignal;
+  candidateHmac: string;
+  claimedBy: ProviderCandidateActivationAttemptToken | null;
+}
+
+type CandidateCredentialProof = BoundCandidateCredentialProof | ManualKimiCandidateProof;
 
 /**
  * Single process authority for mapping durable provider bindings to callback-
@@ -278,11 +342,93 @@ export class ProviderCredentialAuthority implements ProviderCredentialAuthorityL
     }
     if (expected !== current) return null;
     return this.#issueCandidatePermit({
+      kind: "bound",
       source: "environment",
       binding: null,
       stateRevision: this.#stateStore.read().revision,
       fingerprint: this.#candidateFingerprint(expected),
     });
+  }
+
+  async withManualKimiCandidateAuthority<T>(
+    request: ProviderManualKimiCandidateAuthorityRequest,
+    inspect: (
+      normalizedCandidate: string,
+      lease: ProviderCandidateAuthorityLease,
+    ) => Promise<{ candidate: ProviderCandidate; value: T }>,
+  ): Promise<ProviderCandidateAuthorityResult<{
+    value: T;
+    candidatePermit: ProviderCandidateCredentialPermit;
+  }>> {
+    throwIfAborted(request.signal);
+    if (!this.#validManualKimiAuthorityRequest(request)) return { kind: "stale" };
+    let normalizedCandidate: string;
+    try {
+      normalizedCandidate = normalizeProviderSecret(request.candidate);
+    } catch {
+      return { kind: "stale" };
+    }
+    try {
+      const value = await this.#coordinator().readAuthority(
+        { signal: request.signal, backendId: "kimi-code" },
+        async (providerLease) => {
+          let candidateAuthorityOpen = true;
+          const assertCurrent = async (): Promise<void> => {
+            if (!candidateAuthorityOpen) throw new ProviderAuthorityDeadlineError();
+            await this.#bounded(request, () => providerLease.assertHeld());
+            const current = await this.#readAuthoritativeState(request);
+            if (current.revision !== request.expectedRevision) {
+              throw new ProviderAuthorityStaleError();
+            }
+            if (!candidateAuthorityOpen) throw new ProviderAuthorityDeadlineError();
+          };
+          const lease: ProviderCandidateAuthorityLease = {
+            assertHeld: assertCurrent,
+            assertCurrent,
+          };
+          try {
+            await lease.assertCurrent();
+            const observed = await this.#bounded(
+              request,
+              () => inspect(normalizedCandidate, lease),
+            );
+            await lease.assertCurrent();
+            const tuple = this.#manualKimiObservedTuple(request, observed.candidate);
+            if (!tuple) throw new ProviderAuthorityStaleError();
+            const permit = this.#issueManualKimiCandidatePermit({
+              kind: "manual-kimi",
+              backendId: "kimi-code",
+              slotKind: "kimi-code",
+              expectedRevision: request.expectedRevision,
+              generation: request.generation,
+              targetConnectionId: tuple.targetConnectionId,
+              accountFingerprint: tuple.accountFingerprint,
+              billingRealm: "kimi-code-membership-provider-managed-overage",
+              purpose: "initial-setup",
+              deadlineAt: request.deadlineAt,
+              originalOwnerSignal: request.signal,
+              candidateHmac: this.#manualKimiCandidateHmac(normalizedCandidate, tuple),
+              claimedBy: null,
+            });
+            return { value: observed.value, candidatePermit: permit };
+          } finally {
+            candidateAuthorityOpen = false;
+          }
+        },
+      );
+      return { kind: "ready", value };
+    } catch (error) {
+      return this.#preflightFailure(request, error);
+    } finally {
+      normalizedCandidate = "";
+    }
+  }
+
+  releaseManualKimiCandidatePermit(
+    permit: ProviderCandidateCredentialPermit,
+  ): void {
+    const proof = this.#candidatePermits.get(permit);
+    if (proof?.kind === "manual-kimi") this.#candidatePermits.delete(permit);
   }
 
   select(
@@ -304,9 +450,12 @@ export class ProviderCredentialAuthority implements ProviderCredentialAuthorityL
       return { kind: "stale" };
     }
     try {
-      await this.#coordinator().readAuthority({ signal: request.signal }, async (lease) => {
-        await this.#bounded(request, () => lease.assertHeld());
-      });
+      await this.#coordinator().readAuthority(
+        { signal: request.signal, backendId: "openrouter" },
+        async (lease) => {
+          await this.#bounded(request, () => lease.assertHeld());
+        },
+      );
       return { kind: "ready" };
     } catch (error) {
       return this.#preflightFailure(request, error);
@@ -327,15 +476,16 @@ export class ProviderCredentialAuthority implements ProviderCredentialAuthorityL
     if ((request.requireCredentialPermit || request.credentialPermit) && !credentialProof) {
       return { kind: "stale" };
     }
+    if (credentialProof?.kind === "manual-kimi") return { kind: "stale" };
     try {
       const value = await this.#coordinator().readAuthority(
-        { signal: request.signal },
+        { signal: request.signal, backendId: "openrouter" },
         async (providerLease) => {
           let candidateAuthorityOpen = true;
           const assertCurrent = async () => {
             if (!candidateAuthorityOpen) throw new ProviderAuthorityDeadlineError();
             await this.#bounded(request, () => providerLease.assertHeld());
-            if (credentialProof) {
+            if (credentialProof?.kind === "bound") {
               await this.#assertCandidateCredentialCurrent(
                 request,
                 providerLease,
@@ -369,7 +519,7 @@ export class ProviderCredentialAuthority implements ProviderCredentialAuthorityL
    * provider lease. This deliberately never reacquires provider authority.
    */
   async validateCandidatePermitUnderLease(
-    request: ProviderCandidateAuthorityRequest,
+    request: ProviderCandidateAuthorityRequest | ProviderManualKimiCandidateValidationRequest,
     lease: ProviderAuthorityReadLease,
   ): Promise<ProviderCandidatePreflightResult> {
     throwIfAborted(request.signal);
@@ -382,9 +532,15 @@ export class ProviderCredentialAuthority implements ProviderCredentialAuthorityL
     if ((request.requireCredentialPermit || request.credentialPermit) && !credentialProof) {
       return { kind: "stale" };
     }
+    if (credentialProof?.kind === "manual-kimi") {
+      return this.#validateManualKimiCandidatePermit(
+        request,
+        lease,
+      );
+    }
     try {
       await this.#bounded(request, () => lease.assertHeld());
-      if (credentialProof) {
+      if (credentialProof?.kind === "bound") {
         await this.#assertCandidateCredentialCurrent(request, lease, credentialProof);
       }
       await this.#bounded(request, () => lease.assertHeld());
@@ -400,7 +556,7 @@ export class ProviderCredentialAuthority implements ProviderCredentialAuthorityL
    * This path must never reacquire provider or config ownership.
    */
   async validateCandidatePermitAgainstSnapshotUnderLease(
-    request: ProviderCandidateSnapshotAuthorityRequest,
+    request: ProviderCandidateSnapshotAuthorityRequest | ProviderManualKimiCandidateSnapshotValidationRequest,
     lease: ProviderAuthorityReadLease,
   ): Promise<ProviderCandidatePreflightResult> {
     throwIfAborted(request.signal);
@@ -413,9 +569,16 @@ export class ProviderCredentialAuthority implements ProviderCredentialAuthorityL
     if ((request.requireCredentialPermit || request.credentialPermit) && !credentialProof) {
       return { kind: "stale" };
     }
+    if (credentialProof?.kind === "manual-kimi") {
+      return this.#validateManualKimiCandidatePermit(
+        request,
+        lease,
+        "authoritativeState" in request ? request.authoritativeState : undefined,
+      );
+    }
     try {
       await this.#bounded(request, () => lease.assertHeld());
-      if (credentialProof) {
+      if (credentialProof?.kind === "bound") {
         await this.#assertCandidateCredentialMatchesSnapshot(request, credentialProof);
       }
       await this.#bounded(request, () => lease.assertHeld());
@@ -435,7 +598,10 @@ export class ProviderCredentialAuthority implements ProviderCredentialAuthorityL
     }
     let permit: CredentialPermit | ProviderCredentialAccessResult<never> | null = null;
     try {
-      await this.#coordinator().readAuthority({ signal: request.signal }, async (lease) => {
+      await this.#coordinator().readAuthority({
+        signal: request.signal,
+        backendId: request.backendId,
+      }, async (lease) => {
         permit = await this.#readPermitUnderLease(request, lease);
       });
     } catch (error) {
@@ -520,6 +686,7 @@ export class ProviderCredentialAuthority implements ProviderCredentialAuthorityL
     let secret: string | null = resolvedPermit.secret;
     if (secret === null) return { kind: "stale" };
     const candidatePermit = this.#issueCandidatePermit({
+      kind: "bound",
       source,
       binding: structuredClone(binding),
       stateRevision: binding.stateRevision,
@@ -597,7 +764,7 @@ export class ProviderCredentialAuthority implements ProviderCredentialAuthorityL
       return;
     }
     await this.#coordinator().readAuthority(
-      { signal: request.signal },
+      { signal: request.signal, backendId: request.backendId },
       publishUnderLease,
     );
   }
@@ -605,7 +772,7 @@ export class ProviderCredentialAuthority implements ProviderCredentialAuthorityL
   async #assertCandidateCredentialCurrent(
     request: ProviderCandidateAuthorityRequest,
     lease: ProviderAuthorityReadLease,
-    expected: CandidateCredentialProof,
+    expected: BoundCandidateCredentialProof,
   ): Promise<void> {
     if (!expected.binding) {
       const state = await this.#readAuthoritativeState(request);
@@ -642,7 +809,7 @@ export class ProviderCredentialAuthority implements ProviderCredentialAuthorityL
 
   async #assertCandidateCredentialMatchesSnapshot(
     request: ProviderCandidateSnapshotAuthorityRequest,
-    expected: CandidateCredentialProof,
+    expected: BoundCandidateCredentialProof,
   ): Promise<void> {
     let candidate: string;
     try {
@@ -698,7 +865,7 @@ export class ProviderCredentialAuthority implements ProviderCredentialAuthorityL
   }
 
   #issueCandidatePermit(
-    proof: CandidateCredentialProof,
+    proof: BoundCandidateCredentialProof,
   ): ProviderCandidateCredentialPermit {
     const permit = Object.freeze({ version: 1 as const });
     this.#candidatePermits.set(permit, {
@@ -708,8 +875,171 @@ export class ProviderCredentialAuthority implements ProviderCredentialAuthorityL
     return permit;
   }
 
+  #issueManualKimiCandidatePermit(
+    proof: ManualKimiCandidateProof,
+  ): ProviderCandidateCredentialPermit {
+    const permit = Object.freeze({ version: 1 as const });
+    this.#candidatePermits.set(permit, proof);
+    return permit;
+  }
+
+  async #validateManualKimiCandidatePermit(
+    request: ProviderCandidateAuthorityRequest | ProviderManualKimiCandidateValidationRequest,
+    lease: ProviderAuthorityReadLease,
+    authoritativeState?: ProviderSetupStateV2,
+  ): Promise<ProviderCandidatePreflightResult> {
+    const permit = request.credentialPermit;
+    const proof = permit ? this.#candidatePermits.get(permit) : undefined;
+    if (
+      proof?.kind !== "manual-kimi"
+      || !this.#isManualKimiValidationRequest(request)
+      || request.originalOwnerSignal !== proof.originalOwnerSignal
+    ) return { kind: "stale" };
+    if (request.originalOwnerSignal.aborted) throw abortFrom(request.originalOwnerSignal);
+    const tuple = {
+      targetConnectionId: request.targetConnectionId,
+      accountFingerprint: proof.accountFingerprint,
+      billingRealm: proof.billingRealm,
+      generation: request.generation,
+    } as const;
+    let candidate: string;
+    try {
+      candidate = normalizeProviderSecret(request.candidate);
+    } catch {
+      return { kind: "stale" };
+    }
+    if (
+      request.backendId !== proof.backendId
+      || request.expectedRevision !== proof.expectedRevision
+      || request.generation !== proof.generation
+      || request.targetConnectionId !== proof.targetConnectionId
+      || request.purpose !== proof.purpose
+      || request.deadlineAt !== proof.deadlineAt
+      || this.#manualKimiCandidateHmac(candidate, tuple) !== proof.candidateHmac
+      || !this.#validActivationAttemptToken(request.activationAttemptToken)
+      || (request.observedCandidate !== undefined
+        && !this.#sameManualKimiObservedCandidate(request.observedCandidate, proof))
+    ) return { kind: "stale" };
+    // This assignment is intentionally synchronous and occurs before the
+    // first await: two concurrent activations cannot both claim one permit.
+    if (proof.claimedBy === null) proof.claimedBy = request.activationAttemptToken;
+    else if (proof.claimedBy !== request.activationAttemptToken) return { kind: "stale" };
+    try {
+      await this.#bounded(request, () => lease.assertHeld());
+      const current = authoritativeState ?? await this.#readAuthoritativeState(request);
+      if (current.revision !== proof.expectedRevision) {
+        throw new ProviderAuthorityStaleError();
+      }
+      await this.#bounded(request, () => lease.assertHeld());
+      return { kind: "ready" };
+    } catch (error) {
+      return this.#preflightFailure(request, error);
+    } finally {
+      candidate = "";
+    }
+  }
+
+  #validManualKimiAuthorityRequest(
+    request: ProviderManualKimiCandidateAuthorityRequest,
+  ): boolean {
+    return request.backendId === "kimi-code"
+      && request.purpose === "initial-setup"
+      && Number.isSafeInteger(request.expectedRevision)
+      && request.expectedRevision >= 0
+      && Number.isSafeInteger(request.generation)
+      && request.generation >= 0
+      && (request.targetConnectionId === undefined || request.targetConnectionId.length > 0)
+      && Number.isFinite(request.deadlineAt)
+      && request.deadlineAt > this.#now()
+      && this.#stateStore.read().revision === request.expectedRevision;
+  }
+
+  #isManualKimiValidationRequest(
+    request: ProviderCandidateAuthorityRequest | ProviderManualKimiCandidateValidationRequest,
+  ): request is ProviderManualKimiCandidateValidationRequest {
+    const value = request as Partial<ProviderManualKimiCandidateValidationRequest>;
+    return value.backendId === "kimi-code"
+      && value.requireCredentialPermit === true
+      && typeof value.candidate === "string"
+      && Number.isSafeInteger(value.expectedRevision)
+      && Number.isSafeInteger(value.generation)
+      && typeof value.targetConnectionId === "string"
+      && value.targetConnectionId.length > 0
+      && value.purpose === "initial-setup"
+      && value.originalOwnerSignal instanceof AbortSignal
+      && typeof value.activationAttemptToken === "object"
+      && value.activationAttemptToken !== null;
+  }
+
+  #validActivationAttemptToken(
+    token: ProviderCandidateActivationAttemptToken,
+  ): boolean {
+    return token.version === 1 && Object.isFrozen(token);
+  }
+
+  #manualKimiObservedTuple(
+    request: ProviderManualKimiCandidateAuthorityRequest,
+    candidate: ProviderCandidate,
+  ): {
+    targetConnectionId: string;
+    accountFingerprint: string;
+    billingRealm: "kimi-code-membership-provider-managed-overage";
+    generation: number;
+  } | null {
+    if (
+      candidate.backendId !== "kimi-code"
+      || candidate.connectionId.length === 0
+      || typeof candidate.accountFingerprint !== "string"
+      || candidate.accountFingerprint.length === 0
+      || candidate.billingRealm !== "kimi-code-membership-provider-managed-overage"
+      || candidate.health.generation !== request.generation
+      || candidate.health.credential !== "valid"
+      || candidate.health.connectivity !== "connected"
+      || candidate.health.spend === "limit-reached"
+      || (request.targetConnectionId !== undefined
+        && request.targetConnectionId !== candidate.connectionId)
+    ) return null;
+    return {
+      targetConnectionId: candidate.connectionId,
+      accountFingerprint: candidate.accountFingerprint,
+      billingRealm: candidate.billingRealm,
+      generation: request.generation,
+    };
+  }
+
+  #sameManualKimiObservedCandidate(
+    candidate: ProviderCandidate,
+    proof: ManualKimiCandidateProof,
+  ): boolean {
+    return candidate.backendId === proof.backendId
+      && candidate.connectionId === proof.targetConnectionId
+      && candidate.accountFingerprint === proof.accountFingerprint
+      && candidate.billingRealm === proof.billingRealm
+      && candidate.health.generation === proof.generation
+      && candidate.health.credential === "valid"
+      && candidate.health.connectivity === "connected"
+      && candidate.health.spend !== "limit-reached";
+  }
+
+  #manualKimiCandidateHmac(
+    normalizedCandidate: string,
+    tuple: {
+      targetConnectionId: string;
+      accountFingerprint: string;
+      billingRealm: "kimi-code-membership-provider-managed-overage";
+      generation: number;
+    },
+  ): string {
+    return createHmac("sha256", this.#candidateFingerprintKey)
+      .update("orcode-manual-kimi-candidate/v1\0", "utf8")
+      .update(JSON.stringify(tuple), "utf8")
+      .update("\0", "utf8")
+      .update(normalizedCandidate, "utf8")
+      .digest("hex");
+  }
+
   #revalidationRequest(
-    expected: CandidateCredentialProof & { binding: ProviderConnectionBindingV2 },
+    expected: BoundCandidateCredentialProof & { binding: ProviderConnectionBindingV2 },
     request: ProviderCandidatePreflightRequest,
   ): ProviderCredentialRequest {
     const base = {
@@ -741,7 +1071,10 @@ export class ProviderCredentialAuthority implements ProviderCredentialAuthorityL
     request: ProviderCandidatePreflightRequest,
     error: unknown,
   ): Exclude<ProviderCandidatePreflightResult, { kind: "ready" }> {
-    if (error instanceof ProviderAuthorityDeadlineError) return { kind: "stale" };
+    if (
+      error instanceof ProviderAuthorityDeadlineError
+      || error instanceof ProviderAuthorityStaleError
+    ) return { kind: "stale" };
     const code = errorCode(error);
     if (code === "provider-credential-cleanup-pending") {
       return { kind: "forget-pending" };

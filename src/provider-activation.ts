@@ -28,6 +28,7 @@ import {
   type VersionedCredentialStoreLike,
 } from "./credentials.js";
 import type {
+  ProviderCandidateActivationAttemptToken,
   ProviderCandidateCredentialPermit,
   ProviderCredentialAuthorityLike,
   ProviderCredentialPolicy,
@@ -134,15 +135,25 @@ export interface ProviderActivationRequest {
   signal: AbortSignal;
   deadlineAt: number;
   persistence: "persisted" | "process-only";
+  environmentEligibility?: "forbidden" | "automatic-if-no-saved" | "explicit-repair";
   candidatePermit?: ProviderCandidateCredentialPermit | null;
   requireCandidatePermit?: boolean;
+  candidateAuthorityPurpose?: "initial-setup";
   targetConnectionId?: string;
   onPersistenceFailure?: () => Promise<"process-only" | "decline">;
+}
+
+interface CandidateActivationAuthorityContext {
+  readonly originalOwnerSignal: AbortSignal;
+  readonly activationAttemptToken: ProviderCandidateActivationAttemptToken;
+  observedCandidate?: ProviderCandidate;
 }
 
 export interface ProviderActivationRecoveryRequest {
   signal: AbortSignal;
   inspectCommitted?: boolean;
+  /** Secretless recovery policy. Omitted means every registered backend. */
+  allowedBackendIds?: readonly BackendId[];
 }
 
 export interface ProviderCoordinatorLease {
@@ -309,6 +320,29 @@ export class ProviderActivationCoordinator {
   }
 
   async activate(request: ProviderActivationRequest): Promise<ProviderActivationResult> {
+    const originalOwnerSignal = request.signal;
+    const activationAttemptToken = Object.freeze({ version: 1 as const });
+    const authorityContext: CandidateActivationAuthorityContext = {
+      originalOwnerSignal,
+      activationAttemptToken,
+    };
+    if (request.backendId === "kimi-code") {
+      if (
+        !request.candidatePermit
+        || request.requireCandidatePermit !== true
+        || request.candidateAuthorityPurpose !== "initial-setup"
+        || typeof request.targetConnectionId !== "string"
+        || request.targetConnectionId.length === 0
+        || request.persistence !== "persisted"
+        || request.environmentEligibility !== "forbidden"
+        || request.onPersistenceFailure !== undefined
+      ) {
+        throw new ProviderActivationError(
+          "provider-candidate-authority-stale",
+          "Provider candidate authority is unavailable.",
+        );
+      }
+    }
     const deadline = this.#activationDeadline(request);
     request = { ...request, signal: deadline.signal };
     this.#assertActivationAttemptCurrent(request);
@@ -342,6 +376,14 @@ export class ProviderActivationCoordinator {
       await assertRuntimeLease(runtimeLease);
       providerLease = await this.#acquireProviderLease(request.signal);
       await this.#assertFence(providerLease);
+      if (request.backendId === "kimi-code") {
+        await this.#validateCandidatePermit(
+          request,
+          providerLease,
+          runtimeLease,
+          authorityContext,
+        );
+      }
       const recovery = await this.#recoverDisposition({
         signal: request.signal,
         inspectCommitted: false,
@@ -366,7 +408,9 @@ export class ProviderActivationCoordinator {
         throw new StaleProviderGenerationError();
       }
       await this.#assertMutationAllowed(providerLease, runtimeLease, true, request.signal);
-      await this.#validateCandidatePermit(request, providerLease, runtimeLease);
+      if (request.backendId === "openrouter") {
+        await this.#validateCandidatePermit(request, providerLease, runtimeLease, authorityContext);
+      }
       const normalized = normalizeProviderSecret(request.candidate);
       const policy = requireActivationPolicy(request.backendId);
       const candidate = await this.#connectCandidate(
@@ -381,6 +425,13 @@ export class ProviderActivationCoordinator {
         throw new ProviderActivationError("provider-candidate-backend-mismatch", "Provider candidate backend is invalid.");
       }
       initialCandidateId = candidate.candidateId;
+      authorityContext.observedCandidate = candidate;
+      await this.#validateCandidatePermit(
+        request,
+        providerLease,
+        runtimeLease,
+        authorityContext,
+      );
       await this.#awaitActivation(request, () => this.#boundary("candidate-validated"));
       await this.#assertMutationAllowed(providerLease, runtimeLease, true, request.signal);
       assertNoRetainedIdentityCollision(preflight.state, candidate);
@@ -397,7 +448,7 @@ export class ProviderActivationCoordinator {
 
       if (request.persistence === "process-only") {
         await this.#assertMutationAllowed(providerLease, runtimeLease, true, request.signal);
-        await this.#validateCandidatePermit(request, providerLease, runtimeLease);
+        await this.#validateCandidatePermit(request, providerLease, runtimeLease, authorityContext);
         const activated = await this.#activateRuntime(
           candidate.candidateId,
           selectedModel,
@@ -406,7 +457,7 @@ export class ProviderActivationCoordinator {
         );
         await assertRuntimeLease(runtimeLease);
         await this.#assertFence(providerLease);
-        assertActivatedRoute(candidateRoute, activated);
+        assertActivatedRoute(candidate, candidate.candidateId, candidateRoute, activated);
         // Runtime activation may already have published process state. Preserve
         // the exact completion path if caller cancellation arrives after it.
         await this.#boundary("runtime-activated");
@@ -440,7 +491,7 @@ export class ProviderActivationCoordinator {
       }
       await this.#assertFence(providerLease);
       assertNoRetainedIdentityCollision(current, candidate);
-      await this.#validateCandidatePermit(request, providerLease, runtimeLease);
+      await this.#validateCandidatePermit(request, providerLease, runtimeLease, authorityContext);
       let candidateSlot: CredentialSlotRef;
       try {
         candidateSlot = this.#options.credentials.reserveSlot(policy.savedSlotKinds[0]!);
@@ -540,7 +591,7 @@ export class ProviderActivationCoordinator {
           );
         }
         await this.#assertMutationAllowed(providerLease, runtimeLease, true, request.signal);
-        await this.#validateCandidatePermit(request, providerLease, runtimeLease);
+        await this.#validateCandidatePermit(request, providerLease, runtimeLease, authorityContext);
         const activated = await this.#activateRuntime(
           candidate.candidateId,
           selectedModel,
@@ -549,7 +600,7 @@ export class ProviderActivationCoordinator {
         );
         await assertRuntimeLease(runtimeLease);
         await this.#assertFence(providerLease);
-        assertActivatedRoute(candidateRoute, activated);
+        assertActivatedRoute(candidate, candidate.candidateId, candidateRoute, activated);
         await this.#boundary("runtime-activated");
         return {
           persisted: false,
@@ -616,6 +667,7 @@ export class ProviderActivationCoordinator {
                     beforeSave.state,
                     providerLease!,
                     runtimeLease,
+                    authorityContext,
                   );
                   await assertConfigFileSnapshot(
                     ownership.canonicalPath,
@@ -727,15 +779,16 @@ export class ProviderActivationCoordinator {
       await this.#assertMutationAllowed(providerLease, runtimeLease, true, committedSignal);
       let activated: CandidateProviderState;
       try {
+        const runtimeCandidateId = revalidatedCandidateId ?? candidate.candidateId;
         activated = await this.#activateRuntime(
-          revalidatedCandidateId ?? candidate.candidateId,
+          runtimeCandidateId,
           selectedModel,
           committedSignal,
           adapter,
         );
         await assertRuntimeLease(runtimeLease);
         await this.#assertFence(providerLease);
-        assertActivatedRoute(candidateRoute, activated);
+        assertActivatedRoute(candidate, runtimeCandidateId, candidateRoute, activated);
       } catch (error) {
         if (error instanceof ProviderActivationRecoveryRequiredError) throw error;
         throw new ProviderActivationRecoveryRequiredError("provider-runtime-bind-ambiguous");
@@ -801,6 +854,7 @@ export class ProviderActivationCoordinator {
 
   async recover(request: ProviderActivationRecoveryRequest): Promise<readonly string[]> {
     throwIfAborted(request.signal);
+    await this.#assertRecoveryPolicyPreflight(request);
     let runtimeLease: ProviderActivationRuntimeLease;
     try {
       runtimeLease = await this.#options.runtimeGuard.acquire(request.signal);
@@ -847,6 +901,57 @@ export class ProviderActivationCoordinator {
     }
   }
 
+  async #assertRecoveryPolicyPreflight(
+    request: ProviderActivationRecoveryRequest,
+  ): Promise<void> {
+    if (!request.allowedBackendIds) return;
+    const pending = await this.#readAllJournals();
+    const disallowed = pending.filter(({ manifest }) =>
+      !request.allowedBackendIds!.includes(manifest.backendId)
+    );
+    if (disallowed.length === 0) return;
+    if (pending.length !== 1 || disallowed.length !== 1) {
+      throw new ProviderActivationRecoveryRequiredError(
+        "provider-activation-recovery-policy-blocked",
+      );
+    }
+    const facts = await readConfigFacts(this.#options.configPath);
+    if (
+      (facts.kind === "valid" || facts.kind === "absent")
+      && exactOldState(facts, disallowed[0]!.manifest)
+    ) return;
+    throw new ProviderActivationRecoveryRequiredError(
+      "provider-activation-recovery-policy-blocked",
+    );
+  }
+
+  async #assertAuthorityJournalCompatible(
+    backendId: "openrouter" | "kimi-code" | undefined,
+    lease: HeldProviderLease,
+  ): Promise<void> {
+    const pending = await this.#readAllJournals();
+    await this.#assertFence(lease);
+    if (pending.length === 0) return;
+    if (
+      pending.length !== 1
+      || backendId !== "openrouter"
+      || pending[0]!.manifest.backendId !== "kimi-code"
+    ) {
+      throw new ProviderActivationRecoveryRequiredError(
+        "provider-activation-journal-pending",
+      );
+    }
+    const facts = await readConfigFacts(this.#options.configPath);
+    await this.#assertFence(lease);
+    if (
+      (facts.kind === "valid" || facts.kind === "absent")
+      && exactOldState(facts, pending[0]!.manifest)
+    ) return;
+    throw new ProviderActivationRecoveryRequiredError(
+      "provider-activation-recovery-policy-blocked",
+    );
+  }
+
   async runExclusive<T>(
     request: ProviderActivationRecoveryRequest,
     operation: (lease: ProviderCoordinatorLease) => Promise<T>,
@@ -868,7 +973,7 @@ export class ProviderActivationCoordinator {
    * mutation ordering.
    */
   async readAuthority<T>(
-    request: { signal: AbortSignal },
+    request: { signal: AbortSignal; backendId?: "openrouter" | "kimi-code" },
     operation: (lease: ProviderAuthorityReadLease) => Promise<T>,
   ): Promise<T> {
     throwIfAborted(request.signal);
@@ -883,11 +988,7 @@ export class ProviderActivationCoordinator {
         await this.#assertNoPendingCredentialForget(providerLease!);
         throwIfAborted(request.signal);
         await this.#assertFence(providerLease!);
-        if ((await this.#readAllJournals()).length !== 0) {
-          throw new ProviderActivationRecoveryRequiredError(
-            "provider-activation-journal-pending",
-          );
-        }
+        await this.#assertAuthorityJournalCompatible(request.backendId, providerLease!);
         await this.#assertFence(providerLease!);
         throwIfAborted(request.signal);
       };
@@ -921,6 +1022,10 @@ export class ProviderActivationCoordinator {
     operation: (lease: ProviderCoordinatorLease) => Promise<T>,
   ): Promise<{ warnings: readonly string[]; value: T }> {
     throwIfAborted(request.signal);
+    // Execution-mode policy must fence a foreign backend before waiting for a
+    // crashed provider lease or acquiring the runtime mutation guard. The same
+    // manifest is checked again under the provider lease below to close races.
+    await this.#assertRecoveryPolicyPreflight(request);
     let runtimeLease: ProviderActivationRuntimeLease;
     try {
       runtimeLease = await this.#options.runtimeGuard.acquire(request.signal);
@@ -1016,14 +1121,25 @@ export class ProviderActivationCoordinator {
     }
     const transaction = journals[0]!;
     const manifest = transaction.manifest;
-    // Recovery has the same adapter-instance boundary as a new activation:
-    // resolve once before reading or changing a journal tuple.
-    const adapter = this.#adapterFor(manifest.backendId);
     const facts = await readConfigFacts(this.#options.configPath);
     await this.#assertFence(lease);
     if (facts.kind !== "valid" && facts.kind !== "absent") {
       throw new ProviderActivationRecoveryRequiredError("provider-config-unreadable");
     }
+    if (
+      request.allowedBackendIds
+      && !request.allowedBackendIds.includes(manifest.backendId)
+    ) {
+      if (exactOldState(facts, manifest)) {
+        return Object.freeze(["provider-activation-policy-skipped"]);
+      }
+      throw new ProviderActivationRecoveryRequiredError(
+        "provider-activation-recovery-policy-blocked",
+      );
+    }
+    // Recovery has the same adapter-instance boundary as a new activation:
+    // resolve once before reading or changing a journal tuple.
+    const adapter = this.#adapterFor(manifest.backendId);
     const current = facts.state;
     let candidateSecret: string | null;
     try {
@@ -1112,7 +1228,12 @@ export class ProviderActivationCoordinator {
       try {
         const activated = await this.#activateRuntime(candidate.candidateId, model, request.signal, adapter);
         await assertRuntimeLease(runtimeLease);
-        assertActivatedRoute(manifest.candidateRoute, activated);
+        assertActivatedRoute(
+          candidate,
+          candidate.candidateId,
+          manifest.candidateRoute,
+          activated,
+        );
       } catch {
         throw new ProviderActivationRecoveryRequiredError("provider-runtime-bind-ambiguous");
       }
@@ -1385,6 +1506,7 @@ export class ProviderActivationCoordinator {
     request: ProviderActivationRequest,
     lease: HeldProviderLease,
     runtimeLease: ProviderActivationRuntimeLease,
+    authorityContext: CandidateActivationAuthorityContext,
   ): Promise<void> {
     this.#assertActivationAttemptCurrent(request);
     if (!request.candidatePermit && !request.requireCandidatePermit) return;
@@ -1395,14 +1517,33 @@ export class ProviderActivationCoordinator {
         "Provider candidate authority is unavailable.",
       );
     }
+    const authorityRequest = request.backendId === "kimi-code"
+      ? {
+          backendId: "kimi-code" as const,
+          candidate: request.candidate,
+          expectedRevision: request.expectedRevision,
+          generation: request.generation,
+          targetConnectionId: request.targetConnectionId!,
+          purpose: request.candidateAuthorityPurpose!,
+          deadlineAt: request.deadlineAt,
+          signal: request.signal,
+          originalOwnerSignal: authorityContext.originalOwnerSignal,
+          credentialPermit: request.candidatePermit!,
+          requireCredentialPermit: true as const,
+          activationAttemptToken: authorityContext.activationAttemptToken,
+          ...(authorityContext.observedCandidate
+            ? { observedCandidate: authorityContext.observedCandidate }
+            : {}),
+        }
+      : {
+          deadlineAt: request.deadlineAt,
+          signal: request.signal,
+          credentialPermit: request.candidatePermit,
+          requireCredentialPermit: request.requireCandidatePermit,
+        };
     const result = await this.#awaitActivation(request, () => validate.call(
       this.#options.candidateAuthority,
-      {
-        deadlineAt: request.deadlineAt,
-        signal: request.signal,
-        credentialPermit: request.candidatePermit,
-        requireCredentialPermit: request.requireCandidatePermit,
-      },
+      authorityRequest,
       {
         assertHeld: () => this.#assertMutationAllowed(
           lease,
@@ -1425,6 +1566,7 @@ export class ProviderActivationCoordinator {
     authoritativeState: ProviderSetupStateV2,
     lease: HeldProviderLease,
     runtimeLease: ProviderActivationRuntimeLease,
+    authorityContext: CandidateActivationAuthorityContext,
   ): Promise<void> {
     this.#assertActivationAttemptCurrent(request);
     if (!request.candidatePermit && !request.requireCandidatePermit) return;
@@ -1436,16 +1578,36 @@ export class ProviderActivationCoordinator {
         "Provider candidate authority is unavailable.",
       );
     }
+    const authorityRequest = request.backendId === "kimi-code"
+      ? {
+          backendId: "kimi-code" as const,
+          candidate: request.candidate,
+          expectedRevision: request.expectedRevision,
+          generation: request.generation,
+          targetConnectionId: request.targetConnectionId!,
+          purpose: request.candidateAuthorityPurpose!,
+          deadlineAt: request.deadlineAt,
+          signal: request.signal,
+          originalOwnerSignal: authorityContext.originalOwnerSignal,
+          credentialPermit: request.candidatePermit!,
+          requireCredentialPermit: true as const,
+          activationAttemptToken: authorityContext.activationAttemptToken,
+          ...(authorityContext.observedCandidate
+            ? { observedCandidate: authorityContext.observedCandidate }
+            : {}),
+          authoritativeState,
+        }
+      : {
+          deadlineAt: request.deadlineAt,
+          signal: request.signal,
+          credentialPermit: request.candidatePermit,
+          requireCredentialPermit: request.requireCandidatePermit,
+          candidate: request.candidate,
+          authoritativeState,
+        };
     const result = await this.#awaitActivation(request, () => validate.call(
       this.#options.candidateAuthority,
-      {
-        deadlineAt: request.deadlineAt,
-        signal: request.signal,
-        credentialPermit: request.candidatePermit,
-        requireCredentialPermit: request.requireCandidatePermit,
-        candidate: request.candidate,
-        authoritativeState,
-      },
+      authorityRequest,
       {
         assertHeld: () => this.#assertMutationAllowed(
           lease,
@@ -1969,13 +2131,17 @@ function assertSameCandidate(
 }
 
 function assertActivatedRoute(
+  expectedCandidate: ProviderCandidate,
+  expectedCandidateId: string,
   expected: RouteIdentityV1,
   activated: CandidateProviderState,
 ): void {
-  if (!exactRoute(activated.route, expected)
-    || activated.connectionId.length === 0
-    || activated.accountFingerprint !== expected.accountFingerprint
-    || activated.billingRealm !== expected.billingRealm) {
+  if (activated.candidateId !== expectedCandidateId
+    || activated.backendId !== expectedCandidate.backendId
+    || activated.connectionId !== expectedCandidate.connectionId
+    || activated.accountFingerprint !== expectedCandidate.accountFingerprint
+    || activated.billingRealm !== expectedCandidate.billingRealm
+    || !exactRoute(activated.route, expected)) {
     throw new ProviderActivationRecoveryRequiredError("provider-runtime-route-mismatch");
   }
 }

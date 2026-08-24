@@ -5,6 +5,7 @@ import type {
   BackendId,
   BackendModelDescriptor,
   BackendRegistry,
+  ProviderCandidate,
   RouteIdentityV1,
 } from "./backends.js";
 import { validateRouteIdentityV1, type ProviderStateStore } from "./provider-state.js";
@@ -12,8 +13,14 @@ import type {
   ProviderCandidateAuthorityLease,
   ProviderCandidateAuthorityResult,
   ProviderCandidateCredentialPermit,
+  ProviderManualKimiCandidateAuthorityRequest,
 } from "./provider-authority.js";
-import type { SetupEvent, SetupOrchestrator } from "./setup.js";
+import type {
+  ProviderExecutionMode,
+  SetupEvent,
+  SetupOrchestrator,
+} from "./setup.js";
+import { KIMI_CODE_MODELS } from "./kimi-code.js";
 import type { ModelInfo } from "./types.js";
 
 export interface SetupHubEntry {
@@ -27,6 +34,15 @@ export interface SetupHubEntry {
 
 export interface SetupSurface {
   chooseHub(entries: readonly SetupHubEntry[]): Promise<string | null>;
+  chooseAuthenticationMethod?(request: {
+    backendId: "kimi-code";
+    methods: readonly {
+      id: "membership-key" | "oauth-coming-soon";
+      label: string;
+      description: string;
+      disabled: boolean;
+    }[];
+  }): Promise<string | null>;
   readSecret(request: { backendId: BackendId; message: string }): Promise<string | null>;
   chooseModel(request: { backendId: BackendId; models: readonly BackendModelDescriptor[] }): Promise<string | null>;
   confirm(request: { id: string; message: string; defaultValue: boolean }): Promise<boolean>;
@@ -53,11 +69,24 @@ export type SetupHubResult =
   | { kind: "cancelled"; mode: "setup-required" }
   | { kind: "ready"; preparedRoles?: SetupPreparedRoles };
 
+export interface SetupExecutionContext {
+  readonly signal: AbortSignal;
+  readonly deadlineAt: number;
+  readonly generation: number;
+  readonly expectedRevision: number;
+  readonly targetConnectionId?: string;
+  readonly candidatePermit: ProviderCandidateCredentialPermit | null;
+  readonly requireCandidatePermit: boolean;
+  readonly executionMode: ProviderExecutionMode;
+}
+
 export interface SetupHubOptions {
   surface: SetupSurface;
   orchestrator: SetupOrchestrator;
   registry: BackendRegistry;
   stateStore: ProviderStateStore;
+  executionMode?: ProviderExecutionMode;
+  initialBackendId?: "openrouter" | "kimi-code";
   /** A saved credential, if one was authoritatively loaded for this startup. */
   savedSecret?: string | null;
   /** Process-only candidate used automatically only when no saved key exists. */
@@ -81,6 +110,20 @@ export interface SetupHubOptions {
     requireCredentialPermit: boolean,
     use: (lease: ProviderCandidateAuthorityLease) => Promise<T>,
   ) => Promise<ProviderCandidateAuthorityResult<T>>;
+  /** Observes one first Kimi paste and returns only metadata plus an opaque permit. */
+  withManualKimiCandidateAuthority?: <T>(
+    request: ProviderManualKimiCandidateAuthorityRequest,
+    inspect: (
+      normalizedCandidate: string,
+      lease: ProviderCandidateAuthorityLease,
+    ) => Promise<{ candidate: ProviderCandidate; value: T }>,
+  ) => Promise<ProviderCandidateAuthorityResult<{
+    value: T;
+    candidatePermit: ProviderCandidateCredentialPermit;
+  }>>;
+  releaseManualKimiCandidatePermit?: (
+    permit: ProviderCandidateCredentialPermit,
+  ) => void;
   /** Exact runtime setup attempt; false fences every post-activation Cross effect. */
   isCurrent?: () => boolean;
 }
@@ -151,13 +194,16 @@ async function runSetupHubAttempt(options: SetupHubOptions): Promise<SetupHubRes
   let pendingEnvironment = savedSecret ? null : nonEmpty(options.environmentSecret);
   let savedAvailable = savedSecret !== null;
   let environmentOffered = false;
+  let passiveKimiChoice = false;
+  let initialBackendId = options.initialBackendId;
 
   while (true) {
     if (options.signal?.aborted) return cancelOnce("hub", options.signal.reason);
     if (pendingEnvironment) {
       const secret = pendingEnvironment;
       pendingEnvironment = null;
-      const outcome = await activateOpenRouter(
+      const outcome = await activateProvider(
+        "openrouter",
         secret,
         "process-only",
         false,
@@ -176,17 +222,24 @@ async function runSetupHubAttempt(options: SetupHubOptions): Promise<SetupHubRes
     }
 
     const entries = hubEntries(registry, stateStore, environmentOffered);
-    const selected = await awaitSetupInput(surface.chooseHub(entries), options.signal);
+    const selected = initialBackendId
+      ?? await awaitSetupInput(surface.chooseHub(entries), options.signal);
+    initialBackendId = undefined;
     if (selected === SETUP_CALLER_ABORTED) {
       return cancelOnce("hub", options.signal?.reason);
     }
     if (options.signal?.aborted) return cancelOnce("hub", options.signal.reason);
-    if (selected === null) return cancelOnce("hub");
+    if (selected === null) {
+      return passiveKimiChoice
+        ? { kind: "cancelled", mode: "setup-required" }
+        : cancelOnce("hub");
+    }
 
     if (selected === "openrouter:environment" && environmentOffered) {
       const environment = nonEmpty(options.environmentSecret);
       if (!environment) continue;
-      const outcome = await activateOpenRouter(
+      const outcome = await activateProvider(
+        "openrouter",
         environment,
         "process-only",
         false,
@@ -211,6 +264,103 @@ async function runSetupHubAttempt(options: SetupHubOptions): Promise<SetupHubRes
     }
     if (!descriptor.connectable) {
       surface.present(notice(`${descriptor.displayName} ist Coming soon und kann noch nicht verbunden werden.`));
+      continue;
+    }
+
+    if (descriptor.id === "kimi-code") {
+      if (options.executionMode !== "local-interactive-owner") {
+        surface.present(notice("Kimi Code Abo ist nur in einer lokalen, interaktiven Owner-Sitzung verfügbar."));
+        continue;
+      }
+      const selectedState = stateStore.read();
+      const selectedRevision = selectedState.revision;
+      const existingConnections = selectedState.connections.filter((connection) =>
+        connection.backendId === "kimi-code",
+      );
+      if (existingConnections.length > 1) {
+        surface.present(notice(
+          "Mehrere Kimi-Code-Zugänge sind vorhanden; die zu ersetzende Verbindung ist nicht eindeutig. Bitte Provider-Setup reparieren.",
+        ));
+        return { kind: "cancelled", mode: "setup-required" };
+      }
+      if (existingConnections.length > 0) {
+        const replace = await awaitSetupInput(surface.confirm({
+          id: "replace-kimi-membership-key",
+          message: "Vorhandenen Kimi-Code-Membership-Key ersetzen?",
+          defaultValue: false,
+        }), options.signal);
+        if (replace === SETUP_CALLER_ABORTED || options.signal?.aborted) {
+          return cancelOnce("hub", options.signal?.reason);
+        }
+        if (!replace) return { kind: "cancelled", mode: "setup-required" };
+      }
+      const authentication = await awaitSetupInput(
+        options.surface.chooseAuthenticationMethod?.({
+          backendId: "kimi-code",
+          methods: [
+            {
+              id: "membership-key",
+              label: "Membership-Key verwenden",
+              description: "Im Kimi-Code-Konto erstellen",
+              disabled: false,
+            },
+            {
+              id: "oauth-coming-soon",
+              label: "Mit Kimi anmelden",
+              description: "Coming soon",
+              disabled: false,
+            },
+          ],
+        }) ?? Promise.resolve("membership-key"),
+        options.signal,
+      );
+      if (authentication === SETUP_CALLER_ABORTED || options.signal?.aborted) {
+        return cancelOnce("hub", options.signal?.reason);
+      }
+      if (authentication === null) return cancelOnce("hub");
+      if (authentication === "oauth-coming-soon") {
+        surface.present(notice("Mit Kimi anmelden ist Coming soon."));
+        passiveKimiChoice = true;
+        continue;
+      }
+      if (authentication !== "membership-key") {
+        surface.present(notice("Diese Auswahl ist nicht verfügbar."));
+        continue;
+      }
+      surface.present(notice(
+        "Orcode ist ein Drittanbieter. Der Membership-Key nutzt providerverwaltete Limits; Extra Usage kann kostenpflichtig sein.",
+      ));
+      const secretInput = await awaitSetupInput(surface.readSecret({
+        backendId: "kimi-code",
+        message: "Kimi Code Abo Membership-Key",
+      }), options.signal);
+      if (secretInput === SETUP_CALLER_ABORTED || options.signal?.aborted) {
+        return cancelOnce("secret", options.signal?.reason);
+      }
+      if (secretInput === null) return cancelOnce("secret");
+      const targetConnectionId = existingConnections.length === 1
+        ? existingConnections[0]!.id
+        : options.targetConnectionId;
+      const outcome = await activateProvider(
+        "kimi-code",
+        secretInput,
+        "persisted",
+        false,
+        null,
+        true,
+        {
+          ...options,
+          targetConnectionId,
+          expectedRevision: options.expectedRevision ?? selectedRevision,
+        },
+      );
+      if (outcome.kind === "ready") {
+        return completeCrossSetup(surface, registry, stateStore, outcome, options);
+      }
+      if (outcome.kind === "cancelled") {
+        return cancelOnce(outcome.phase, outcome.reason);
+      }
+      if (outcome.kind === "blocked") return { kind: "cancelled", mode: "setup-required" };
       continue;
     }
 
@@ -239,7 +389,8 @@ async function runSetupHubAttempt(options: SetupHubOptions): Promise<SetupHubRes
       if (candidate === null) return cancelOnce("secret");
     }
 
-    const outcome = await activateOpenRouter(
+    const outcome = await activateProvider(
+      "openrouter",
       candidate!,
       persistence,
       askPersistence,
@@ -277,7 +428,8 @@ type ActivationFlow =
     models: readonly BackendModelDescriptor[];
   };
 
-async function activateOpenRouter(
+async function activateProvider(
+  backendId: "openrouter" | "kimi-code",
   rawSecret: string,
   persistence: "persisted" | "process-only",
   askPersistence: boolean,
@@ -285,6 +437,9 @@ async function activateOpenRouter(
   requireCredentialPermit: boolean,
   options: SetupHubOptions,
 ): Promise<ActivationFlow> {
+  if (backendId === "kimi-code") {
+    return activateKimiProvider(rawSecret, options);
+  }
   const { surface, registry, orchestrator, stateStore } = options;
   const signal = options.signal ?? new AbortController().signal;
   let adapter: BackendAdapter | null = null;
@@ -379,10 +534,13 @@ async function activateOpenRouter(
       if (authorityLease) {
         await assertCandidateAuthority();
       }
-      const models = compatibleMainModels(await abortableSetupAction(
-        () => activeAdapter.listModels({ candidateId: candidate.candidateId, signal }),
-        signal,
-      ));
+      const models = compatibleMainModels(
+        "openrouter",
+        await abortableSetupAction(
+          () => activeAdapter.listModels({ candidateId: candidate.candidateId, signal }),
+          signal,
+        ),
+      );
       if (authorityLease) {
         await assertCandidateAuthority();
       }
@@ -497,6 +655,180 @@ async function activateOpenRouter(
     return { kind: "retry" };
   } finally {
     signal.removeEventListener("abort", onAbort);
+    await discardCandidate();
+  }
+}
+
+async function activateKimiProvider(
+  rawSecret: string,
+  options: SetupHubOptions,
+): Promise<ActivationFlow> {
+  const { surface, registry, orchestrator, stateStore } = options;
+  const signal = options.signal ?? new AbortController().signal;
+  const authority = options.withManualKimiCandidateAuthority;
+  const executionMode = options.executionMode ?? "unenrolled-device";
+  if (
+    executionMode !== "local-interactive-owner"
+    || !authority
+    || !options.releaseManualKimiCandidatePermit
+  ) return { kind: "blocked" };
+
+  let adapter: BackendAdapter | null = null;
+  let candidateId: string | null = null;
+  let candidatePermit: ProviderCandidateCredentialPermit | null = null;
+  const discardCandidate = async (): Promise<void> => {
+    const ownedCandidateId = candidateId;
+    if (!ownedCandidateId || !adapter) return;
+    candidateId = null;
+    try {
+      await adapter.discardCandidate(ownedCandidateId);
+    } catch {
+      // Candidate cleanup is best effort; the permit is revoked separately.
+    }
+  };
+  const onAbort = () => { void discardCandidate(); };
+  signal.addEventListener("abort", onAbort, { once: true });
+  try {
+    assertSetupAttemptCurrent(signal);
+    const deadlineAt = options.deadlineAt
+      ?? options.resolveProviderDeadline?.()
+      ?? Date.now() + MANUAL_PROVIDER_CONTACT_MAX_MS;
+    const generation = options.generation ?? orchestrator.nextStartupGeneration();
+    const context: SetupExecutionContext = Object.freeze({
+      signal,
+      deadlineAt,
+      generation,
+      expectedRevision: options.expectedRevision ?? stateStore.read().revision,
+      ...(options.targetConnectionId === undefined
+        ? {}
+        : { targetConnectionId: options.targetConnectionId }),
+      candidatePermit: null,
+      requireCandidatePermit: true,
+      executionMode,
+    });
+    const activeAdapter = registry.adapter("kimi-code");
+    if (activeAdapter.backendId !== "kimi-code") return { kind: "blocked" };
+    adapter = activeAdapter;
+
+    const guarded = await abortableSetupAction(
+      () => authority({
+        backendId: "kimi-code",
+        candidate: rawSecret,
+        expectedRevision: context.expectedRevision,
+        generation: context.generation,
+        ...(context.targetConnectionId === undefined
+          ? {}
+          : { targetConnectionId: context.targetConnectionId }),
+        purpose: "initial-setup",
+        deadlineAt: context.deadlineAt,
+        signal: context.signal,
+      }, async (normalizedCandidate, lease) => {
+        await lease.assertCurrent();
+        const connect = activeAdapter.connectUnderAuthorityLease
+          ? (request: Parameters<BackendAdapter["connect"]>[0]) =>
+              activeAdapter.connectUnderAuthorityLease!(request, lease)
+          : (request: Parameters<BackendAdapter["connect"]>[0]) =>
+              activeAdapter.connect(request);
+        const candidate = await abortableSetupAction(() => connect({
+          connectionId: context.targetConnectionId,
+          candidate: normalizedCandidate,
+          generation: context.generation,
+          deadlineAt: context.deadlineAt,
+          signal: context.signal,
+        }), context.signal);
+        candidateId = candidate.candidateId;
+        await lease.assertCurrent();
+        const models = compatibleMainModels(
+          "kimi-code",
+          await abortableSetupAction(
+            () => activeAdapter.listModels({
+              candidateId: candidate.candidateId,
+              connectionId: candidate.connectionId,
+              signal: context.signal,
+            }),
+            context.signal,
+          ),
+        );
+        await lease.assertCurrent();
+        return {
+          candidate,
+          value: {
+            models,
+            connectionId: candidate.connectionId,
+          },
+        };
+      }),
+      signal,
+    );
+    if (guarded.kind !== "ready") {
+      if (signal.aborted) {
+        return { kind: "cancelled", phase: "model", reason: signal.reason };
+      }
+      return { kind: "blocked" };
+    }
+    candidatePermit = guarded.value.candidatePermit;
+    const { models, connectionId } = guarded.value.value;
+    if (models.length === 0) {
+      assertSetupAttemptCurrent(signal);
+      surface.present(notice("Kimi Code stellt keine kompatiblen Coding-Modelle bereit."));
+      return { kind: "retry" };
+    }
+    const selectedCanonicalModelId = await awaitSetupInput(
+      surface.chooseModel({ backendId: "kimi-code", models }),
+      signal,
+    );
+    if (selectedCanonicalModelId === SETUP_CALLER_ABORTED || signal.aborted) {
+      return { kind: "cancelled", phase: "model", reason: signal.reason };
+    }
+    if (selectedCanonicalModelId === null) {
+      return { kind: "cancelled", phase: "model" };
+    }
+    const selectedModels = models.filter((model) =>
+      model.requestedModelId === selectedCanonicalModelId
+      && model.canonicalModelId === selectedCanonicalModelId,
+    );
+    if (selectedModels.length !== 1) {
+      surface.present(notice("Die gewählte Modellroute ist nicht verfügbar."));
+      return { kind: "retry" };
+    }
+    const selectedModel = selectedModels[0]!;
+    const activation = await orchestrator.activateCandidate({
+      backendId: "kimi-code",
+      expectedRevision: context.expectedRevision,
+      candidate: rawSecret,
+      expectedRequestedModelId: selectedModel.requestedModelId,
+      selectedCanonicalModelId: selectedModel.canonicalModelId,
+      signal: context.signal,
+      deadlineAt: context.deadlineAt,
+      persistence: "persisted",
+      environmentEligibility: "forbidden",
+      candidatePermit,
+      requireCandidatePermit: true,
+      candidateAuthorityPurpose: "initial-setup",
+      targetConnectionId: connectionId,
+      startupGeneration: context.generation,
+    });
+    if (!signal.aborted && options.isCurrent?.() !== false) {
+      surface.present(notice("Kimi Code Abo ist eingerichtet."));
+    }
+    return {
+      kind: "ready",
+      route: activation.route,
+      state: activation.state,
+      models,
+    };
+  } catch {
+    if (signal.aborted) {
+      return { kind: "cancelled", phase: "model", reason: signal.reason };
+    }
+    surface.present(notice("Kimi Code konnte nicht eingerichtet werden. Bitte erneut versuchen."));
+    return { kind: "retry" };
+  } finally {
+    signal.removeEventListener("abort", onAbort);
+    if (candidatePermit) {
+      options.releaseManualKimiCandidatePermit(candidatePermit);
+      candidatePermit = null;
+    }
     await discardCandidate();
   }
 }
@@ -693,14 +1025,24 @@ async function completeCrossSetup(
   return { kind: "ready" };
 }
 
-function compatibleMainModels(models: readonly BackendModelDescriptor[]): BackendModelDescriptor[] {
+const KIMI_SETUP_MODEL_IDS: ReadonlySet<string> = new Set(
+  KIMI_CODE_MODELS.map((model) => model.id),
+);
+
+function compatibleMainModels(
+  backendId: "openrouter" | "kimi-code",
+  models: readonly BackendModelDescriptor[],
+): BackendModelDescriptor[] {
   return models.filter((model) =>
-    model.backendId === "openrouter"
+    model.backendId === backendId
     && model.capabilities.textInput
     && model.capabilities.textOutput
     && model.capabilities.tools
     && Boolean(model.canonicalModelId),
-  );
+  ).filter((model) => backendId !== "kimi-code" || (
+    KIMI_SETUP_MODEL_IDS.has(model.requestedModelId)
+    && model.requestedModelId === model.canonicalModelId
+  ));
 }
 
 function hubEntries(
@@ -710,14 +1052,21 @@ function hubEntries(
   currentRoute?: RouteIdentityV1,
 ): SetupHubEntry[] {
   const state = stateStore.read();
-  const entries: SetupHubEntry[] = registry.entries().map((descriptor) => ({
-    id: descriptor.id,
-    label: descriptor.displayName,
-    description: descriptor.maturity === "coming-soon" ? "Coming soon" : "Connect provider",
-    disabled: !descriptor.connectable,
-    current: (currentRoute ?? state.defaultRoute)?.backendId === descriptor.id,
-    generation: state.revision,
-  }));
+  const entries: SetupHubEntry[] = registry.entries().map((descriptor) => {
+    const presentation = descriptor.id === "openrouter"
+      ? { label: "OpenRouter", description: "Stable · API-Guthaben · viele Modelle" }
+      : descriptor.id === "kimi-code"
+        ? { label: "Kimi Code Abo", description: "Preview · Membership-Key · Coding-Modelle" }
+        : { label: descriptor.displayName, description: "Coming soon" };
+    return {
+      id: descriptor.id,
+      label: presentation.label,
+      description: presentation.description,
+      disabled: !descriptor.connectable,
+      current: (currentRoute ?? state.defaultRoute)?.backendId === descriptor.id,
+      generation: state.revision,
+    };
+  });
   if (environmentOffered) {
     entries.push({
       id: "openrouter:environment",
@@ -798,6 +1147,15 @@ export function createPlainSetupSurface(io: PlainSetupPromptIo): SetupSurface {
         choices: entries.map((entry) => ({ name: `${providerEntryLabel(entry)} · ${entry.description}`, value: entry.id })),
       }).catch(() => null);
     },
+    async chooseAuthenticationMethod(request) {
+      return io.select({
+        message: "Kimi-Zugang auswählen",
+        choices: request.methods.map((method) => ({
+          name: `${method.label} · ${method.description}`,
+          value: method.id,
+        })),
+      }).catch(() => null);
+    },
     async readSecret(request) {
       return io.password({ message: request.message, mask: "•" }).catch(() => null);
     },
@@ -850,6 +1208,19 @@ export function createTuiSetupSurface(ui: TuiSetupPromptUi): SetupSurface {
         description: entry.description,
       }));
       return (await ui.pickChoice("Provider-Setup", items, current, current || (items[0]?.value ?? "")))?.value ?? null;
+    },
+    async chooseAuthenticationMethod(request) {
+      const items = request.methods.map((method) => ({
+        value: method.id,
+        label: method.label,
+        description: method.description,
+      }));
+      return (await ui.pickChoice(
+        "Kimi-Zugang",
+        items,
+        "membership-key",
+        "membership-key",
+      ))?.value ?? null;
     },
     readSecret(request) {
       return ui.readSecret(request.message);

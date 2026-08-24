@@ -297,6 +297,63 @@ export class SessionStore {
     this.#data.updatedAt = new Date().toISOString();
   }
 
+  /** Atomically clears only the exact resolved durable route named by a provider lifecycle action. */
+  async clearRouteIfExact(expectedRoute: RouteIdentityV1): Promise<boolean> {
+    const expected = validateRouteIdentityV1(expectedRoute);
+    if (!expected || !sameExactResolvedRoute(this.#data.route, expected)) return false;
+    return enqueueWrite(this.path, () => this.#clearRouteIfExactNow(expected));
+  }
+
+  async #clearRouteIfExactNow(expected: RouteIdentityV1): Promise<boolean> {
+    if (!sameExactResolvedRoute(this.#data.route, expected)) return false;
+    await ensureSecureDirectory(this.appHome);
+    await ensureSecureDirectory(dirname(this.path));
+    const release = await acquireChatLock(this.path);
+    try {
+      if (!sameExactResolvedRoute(this.#data.route, expected)) return false;
+      const foreign = await readForeign(
+        this.path,
+        this.#data.workspace,
+        this.#data.id,
+      );
+      if (!sameExactResolvedRoute(this.#data.route, expected)) return false;
+      if (foreign.kind === "unreadable") return false;
+      if (foreign.kind === "missing") {
+        delete this.#data.route;
+        this.#pendingLegacyRouteProjection = false;
+        return true;
+      }
+      if (!sameExactResolvedRoute(foreign.data.route, expected)) {
+        const reconciled = sameValue(foreign.data, this.#base)
+          ? structuredClone(this.#data)
+          : mergeSessions(this.#base, this.#data, foreign.data);
+        if (foreign.data.route === undefined) delete reconciled.route;
+        else reconciled.route = structuredClone(foreign.data.route);
+        reconciled.revision = Math.max(reconciled.revision, foreign.revision);
+        this.#data = reconciled;
+        this.#base = structuredClone(foreign.data);
+        this.#pendingLegacyRouteProjection = false;
+        return false;
+      }
+
+      const next = sameValue(foreign.data, this.#base)
+        ? structuredClone(this.#data)
+        : mergeSessions(this.#base, this.#data, foreign.data);
+      delete next.route;
+      next.revision = Math.max(next.revision, foreign.revision) + 1;
+      await writeFileAtomicSecure(
+        this.path,
+        `${JSON.stringify(redactValue(next), null, 2)}\n`,
+      );
+      this.#data = next;
+      this.#base = structuredClone(next);
+      this.#pendingLegacyRouteProjection = false;
+      return true;
+    } finally {
+      await release();
+    }
+  }
+
   /** Rebinds only a route that was projected lazily and is still unpersisted. */
   rebindPendingLegacyRoute(providerConnection?: ProviderConnectionStateV1): void {
     if (!this.#pendingLegacyRouteProjection) return;
@@ -1546,6 +1603,23 @@ function pickField<T>(base: T, mine: T, theirs: T): T {
     return mine;
   }
   return sameRedactedProjection(theirs, base) ? mine : theirs;
+}
+
+function sameExactResolvedRoute(
+  candidate: unknown,
+  expected: RouteIdentityV1,
+): boolean {
+  const current = validateRouteIdentityV1(candidate);
+  return current?.resolutionState === "resolved"
+    && current.canonicalModelId !== null
+    && expected.resolutionState === "resolved"
+    && expected.canonicalModelId !== null
+    && current.version === expected.version
+    && current.backendId === expected.backendId
+    && current.accountFingerprint === expected.accountFingerprint
+    && current.billingRealm === expected.billingRealm
+    && current.requestedModelId === expected.requestedModelId
+    && current.canonicalModelId === expected.canonicalModelId;
 }
 
 function sameValue(left: unknown, right: unknown): boolean {

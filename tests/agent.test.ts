@@ -9,10 +9,13 @@ import {
   OrcodeAgent,
   SuggestedReplyStreamFilter,
   assertSpendAvailable,
+  bindModelRuntimeIdentity,
   buildInstructions,
   parseSuggestedReplies,
   projectNotesBlock,
+  readModelRuntimeIdentity,
   shouldCutContext,
+  type ModelRuntimeBindingIdentityV1,
 } from "../src/agent.js";
 import type { RouteIdentityV1 } from "../src/backends.js";
 import { ApprovalManager } from "../src/approval.js";
@@ -57,6 +60,21 @@ const KIMI_RUNTIME_ROUTE: RouteIdentityV1 = Object.freeze({
   canonicalModelId: "k3",
   resolutionState: "resolved",
 });
+
+function kimiRuntimeIdentity(
+  route: RouteIdentityV1,
+  overrides: Partial<ModelRuntimeBindingIdentityV1> = {},
+): ModelRuntimeBindingIdentityV1 {
+  return {
+    version: 1,
+    stateRevision: 7,
+    generation: 11,
+    connectionId: "kimi-agent-connection",
+    backendId: "kimi-code",
+    route,
+    ...overrides,
+  };
+}
 
 test("spend gate accepts available balance", () => {
   assert.doesNotThrow(() => assertSpendAvailable(healthy));
@@ -272,7 +290,8 @@ test("a Kimi runtime owns the exact route, skips unknown compressor spend, and n
     response: { model: "k3", usage: {} },
   }));
   const scopes: string[] = [];
-  const runtime: ModelRuntime = {
+  const dispatchWebFlags: boolean[] = [];
+  const runtime = bindModelRuntimeIdentity({
     backendId: "kimi-code",
     onConnectionEvent: () => () => {},
     createClient(request) {
@@ -301,15 +320,18 @@ test("a Kimi runtime owns the exact route, skips unknown compressor spend, and n
     },
     dispatchFields({ route, allowWeb }) {
       assert.deepEqual(route, KIMI_RUNTIME_ROUTE);
-      assert.equal(allowWeb, true);
+      dispatchWebFlags.push(allowWeb);
       return { backendId: "kimi-code", model: "k3" };
     },
     safeMessage() {
       return "Kimi-Anfrage fehlgeschlagen.";
     },
-  };
+  }, kimiRuntimeIdentity(KIMI_RUNTIME_ROUTE));
+  const runtimeBinding = readModelRuntimeIdentity(runtime);
+  assert.ok(runtimeBinding);
   const agent = await OrcodeAgent.create({
     runtime,
+    runtimeBinding,
     route: KIMI_RUNTIME_ROUTE,
     approvals: new ApprovalManager("read-only"),
     session: setup.session,
@@ -324,6 +346,7 @@ test("a Kimi runtime owns the exact route, skips unknown compressor spend, and n
   });
 
   assert.deepEqual(scopes, ["main"], "unknown Kimi compressor cost must skip before client creation");
+  assert.deepEqual(dispatchWebFlags, [true], "binding validation must not call the runtime dispatcher");
   assert.equal(fake.requests.length, 1);
   const request = fake.requests[0]!;
   assert.equal(request.model, "k3");
@@ -347,7 +370,7 @@ test("a Kimi runtime owns the exact route, skips unknown compressor spend, and n
   assert.equal(setup.session.data.costs.totalUsd, 0);
 });
 
-test("a session route change clears route-scoped caches and fails closed before foreign runtime spend", async () => {
+test("setSession refuses a route change and preserves the exact runtime owner", async () => {
   const setup = await createAgent({ mainModel: "k3", compressorModel: "k3" });
   setup.session.setPreferences("k3", { mode: "auto" }, KIMI_RUNTIME_ROUTE);
   await setup.session.save();
@@ -360,7 +383,7 @@ test("a session route change clears route-scoped caches and fails closed before 
   let modelListCalls = 0;
   const sameRoute = (route: RouteIdentityV1): boolean =>
     JSON.stringify(route) === JSON.stringify(KIMI_RUNTIME_ROUTE);
-  const runtime: ModelRuntime = {
+  const runtime = bindModelRuntimeIdentity({
     backendId: "kimi-code",
     onConnectionEvent: () => () => {},
     createClient({ route }) {
@@ -392,9 +415,12 @@ test("a session route change clears route-scoped caches and fails closed before 
       return { backendId: "kimi-code", model: "k3" };
     },
     safeMessage: () => "safe",
-  };
+  }, kimiRuntimeIdentity(KIMI_RUNTIME_ROUTE));
+  const runtimeBinding = readModelRuntimeIdentity(runtime);
+  assert.ok(runtimeBinding);
   const agent = await OrcodeAgent.create({
     runtime,
+    runtimeBinding,
     route: KIMI_RUNTIME_ROUTE,
     approvals: new ApprovalManager("read-only"),
     session: setup.session,
@@ -410,15 +436,185 @@ test("a session route change clears route-scoped caches and fails closed before 
     ...KIMI_RUNTIME_ROUTE,
     accountFingerprint: "acct_kimi_foreign",
   });
-  agent.setSession(foreign);
-  await assert.rejects(agent.run("must not dispatch", { onText: () => {} }), /route binding changed/);
+  assert.throws(
+    () => agent.setSession(foreign),
+    /runtime|route|rebind|binding/i,
+  );
   assert.equal(spendCalls, 1, "foreign route must fail before provider spend inspection");
 
   const rebound = SessionStore.create(setup.workspace, setup.appHome, "Original route again");
   rebound.setPreferences("k3", { mode: "auto" }, KIMI_RUNTIME_ROUTE);
   agent.setSession(rebound);
   await agent.run("third", { onText: () => {} });
-  assert.equal(modelListCalls, 2, "an intervening route change must evict model metadata");
+  assert.equal(modelListCalls, 1, "an exact-route session switch may retain route-owned metadata");
+});
+
+test("agent route runtime and session rebind atomically and an invalid tuple preserves the previous owner", async () => {
+  const setup = await createAgent({ mainModel: "k3", compressorModel: "k3", compressionMode: "off" });
+  const routeA = { ...KIMI_RUNTIME_ROUTE, accountFingerprint: "acct_kimi_rebind_a" };
+  const routeB = { ...KIMI_RUNTIME_ROUTE, accountFingerprint: "acct_kimi_rebind_b" };
+  setup.session.setPreferences("k3", { mode: "auto" }, routeA);
+  const sessionB = SessionStore.create(setup.workspace, setup.appHome, "Route B");
+  sessionB.setPreferences("k3", { mode: "auto" }, routeB);
+  const calls: string[] = [];
+  const runtimeFor = (
+    name: string,
+    route: RouteIdentityV1,
+    binding: ModelRuntimeBindingIdentityV1,
+  ): ModelRuntime => {
+    const fake = fakeClient(() => ({
+      text: [`${name} fertig`],
+      before: async (emit) => emit.modelCall(0, 0),
+      response: { model: "k3", usage: {} },
+    }));
+    return bindModelRuntimeIdentity({
+      backendId: "kimi-code",
+      createClient(request) {
+        assert.deepEqual(request.route, route);
+        calls.push(`${name}:client`);
+        return fake.client as never;
+      },
+      async inspectSpend() { calls.push(`${name}:spend`); return { kind: "unknown" }; },
+      async listModels() {
+        calls.push(`${name}:models`);
+        return [{
+          id: "k3",
+          name: "Kimi K3",
+          contextLength: 262_144,
+          reasoning: {
+            defaultEffort: "high",
+            defaultEnabled: true,
+            mandatory: true,
+            supportedEfforts: ["low", "high", "max"],
+            supportsMaxTokens: false,
+          },
+          price: { kind: "unknown" },
+        }];
+      },
+      dispatchFields(request) {
+        assert.deepEqual(request.route, route);
+        return { backendId: "kimi-code", model: "k3" };
+      },
+      onConnectionEvent: () => () => {},
+      safeMessage: () => "safe",
+    }, binding);
+  };
+  const bindingA = kimiRuntimeIdentity(routeA, {
+    stateRevision: 21,
+    generation: 31,
+    connectionId: "kimi-rebind-a",
+  });
+  const bindingB = kimiRuntimeIdentity(routeB, {
+    stateRevision: 22,
+    generation: 32,
+    connectionId: "kimi-rebind-b",
+  });
+  const runtimeA = runtimeFor("A", routeA, bindingA);
+  const runtimeB = runtimeFor("B", routeB, bindingB);
+  const agent = await OrcodeAgent.create({
+    runtime: runtimeA,
+    runtimeBinding: bindingA,
+    route: routeA,
+    approvals: new ApprovalManager("read-only"),
+    session: setup.session,
+    config: setup.config,
+    workspace: setup.workspace,
+  });
+  const rebound = agent as unknown as {
+    rebind(input: {
+      session: SessionStore;
+      route: RouteIdentityV1;
+      runtime: ModelRuntime;
+      runtimeBinding: ModelRuntimeBindingIdentityV1;
+    }): void;
+  };
+  assert.equal(typeof rebound.rebind, "function");
+
+  await agent.run("A", { onText: () => {} });
+  assert.throws(
+    () => rebound.rebind({
+      session: sessionB,
+      route: routeB,
+      runtime: runtimeA,
+      runtimeBinding: bindingB,
+    }),
+    /runtime|route|binding|deep-equal/i,
+  );
+  assert.equal(agent.session, setup.session);
+  await agent.run("A remains", { onText: () => {} });
+  rebound.rebind({
+    session: sessionB,
+    route: routeB,
+    runtime: runtimeB,
+    runtimeBinding: bindingB,
+  });
+  await agent.run("B", { onText: () => {} });
+
+  assert.throws(() => rebound.rebind({
+    session: setup.session,
+    route: routeA,
+    runtime: { ...runtimeA, backendId: "openrouter" },
+    runtimeBinding: bindingA,
+  }), /runtime|route|binding/i);
+  await agent.run("B remains", { onText: () => {} });
+  assert.equal(agent.session, sessionB);
+  assert.deepEqual(calls.filter((call) => call.endsWith(":client")), [
+    "A:client",
+    "A:client",
+    "B:client",
+    "B:client",
+  ]);
+});
+
+test("agent rejects connection revision and generation binding drift before dispatcher or owner mutation", async (t) => {
+  const setup = await createAgent({ mainModel: "k3", compressorModel: "k3" });
+  setup.session.setPreferences("k3", { mode: "auto" }, KIMI_RUNTIME_ROUTE);
+  const authoritative = kimiRuntimeIdentity(KIMI_RUNTIME_ROUTE, {
+    stateRevision: 41,
+    generation: 51,
+    connectionId: "kimi-binding-authoritative",
+  });
+  let dispatchCalls = 0;
+  const runtimeFor = (binding: ModelRuntimeBindingIdentityV1): ModelRuntime =>
+    bindModelRuntimeIdentity({
+      backendId: "kimi-code",
+      createClient() { throw new Error("model bytes forbidden in binding test"); },
+      async inspectSpend() { return { kind: "unknown" }; },
+      async listModels() { return []; },
+      dispatchFields() {
+        dispatchCalls += 1;
+        return { backendId: "kimi-code", model: "k3" };
+      },
+      onConnectionEvent: () => () => {},
+      safeMessage: () => "safe",
+    }, binding);
+  const agent = await OrcodeAgent.create({
+    runtime: runtimeFor(authoritative),
+    runtimeBinding: authoritative,
+    route: KIMI_RUNTIME_ROUTE,
+    approvals: new ApprovalManager("read-only"),
+    session: setup.session,
+    config: setup.config,
+    workspace: setup.workspace,
+  });
+  assert.equal(dispatchCalls, 0);
+
+  for (const drift of [
+    { field: "connection", binding: { ...authoritative, connectionId: "kimi-binding-stale" } },
+    { field: "revision", binding: { ...authoritative, stateRevision: 40 } },
+    { field: "generation", binding: { ...authoritative, generation: 50 } },
+  ] as const) {
+    await t.test(drift.field, () => {
+      assert.throws(() => agent.rebind({
+        session: setup.session,
+        route: KIMI_RUNTIME_ROUTE,
+        runtime: runtimeFor(drift.binding),
+        runtimeBinding: authoritative,
+      }), /runtime|binding|route/i);
+      assert.equal(agent.session, setup.session);
+      assert.equal(dispatchCalls, 0, "rejected validation must not touch the runtime dispatcher");
+    });
+  }
 });
 
 test("the main model call binds routing, reasoning, web search, identifiers, and cost once", async () => {

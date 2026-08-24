@@ -26,7 +26,10 @@ import {
   resolveCliCommandName,
   runOutcomeExitCode,
 } from "../src/cli.js";
-import type { AgentRunResult } from "../src/agent.js";
+import {
+  readModelRuntimeIdentity,
+  type AgentRunResult,
+} from "../src/agent.js";
 import * as cliModule from "../src/cli.js";
 import { createPlainSetupSurface } from "../src/setup-ui.js";
 import type { SetupSurface } from "../src/setup-ui.js";
@@ -35,6 +38,7 @@ import {
   type BackendAdapter,
   type BackendDescriptor,
   type BackendModelDescriptor,
+  type RouteIdentityV1,
 } from "../src/backends.js";
 import { COMMAND_CATALOG } from "../src/command-catalog.js";
 import {
@@ -495,6 +499,7 @@ test("startup verification rebinds current and later historical sessions before 
     startup,
     environment: {},
     requestedModel: modelId,
+    executionMode: "local-interactive-owner",
   });
   const inspected = await runtime.inspectStartup();
   assert.equal(inspected.defaultRoute?.accountFingerprint, verifiedFingerprint);
@@ -927,10 +932,15 @@ test("runCli orders storage, activation recovery, bounded inspection, route proo
     initializeStorage: async () => { calls.push("storage"); return bootstrapStorage(); },
     createProviderRuntime: async () => { calls.push("provider:load+recover"); return runtime; },
     createAgent: async () => { calls.push("agent:create"); return {} as never; },
-    runPlain: async (input: { providerRuntime: unknown; agent: unknown }) => {
+    runPlain: async (input: {
+      providerRuntime: unknown;
+      agent: unknown;
+      ensureAgentForPrompt(): Promise<unknown>;
+    }) => {
       calls.push("plain");
       assert.equal(input.providerRuntime, runtime);
-      assert.ok(input.agent);
+      assert.equal(input.agent, null);
+      assert.ok(await input.ensureAgentForPrompt());
     },
     runDashboard: async () => { calls.push("dashboard"); },
     stdout: { write: () => true },
@@ -942,10 +952,1421 @@ test("runCli orders storage, activation recovery, bounded inspection, route proo
     "storage",
     "provider:load+recover",
     "provider:inspect",
+    "plain",
     "provider:ensure",
     "agent:create",
-    "plain",
   ]);
+});
+
+test("runCli derives the exact execution mode before provider construction and startup inspection", async (t) => {
+  const deniedLaunchModes = [
+    "scheduled",
+    "relay",
+    "multi-user",
+    "collaborator",
+    "shared-service",
+    "unenrolled-device",
+  ] as const;
+  const cases: ReadonlyArray<{
+    name: string;
+    argv: readonly string[];
+    stdinTty: boolean;
+    stdoutTty: boolean;
+    launcherMode?: string;
+    expected: string;
+  }> = [
+    { name: "local owner", argv: ["--plain"], stdinTty: true, stdoutTty: true, expected: "local-interactive-owner" },
+    { name: "json wins over prompt", argv: ["--json", "-p", "hello"], stdinTty: true, stdoutTty: true, expected: "json" },
+    { name: "piped", argv: ["--plain"], stdinTty: false, stdoutTty: false, expected: "piped" },
+    { name: "batch", argv: ["-p", "hello"], stdinTty: true, stdoutTty: true, expected: "batch" },
+    ...deniedLaunchModes.map((mode) => ({
+      name: mode,
+      argv: ["--plain"] as readonly string[],
+      stdinTty: true,
+      stdoutTty: true,
+      launcherMode: mode,
+      expected: mode,
+    })),
+    {
+      name: "launcher cannot upgrade batch",
+      argv: ["-p", "hello"],
+      stdinTty: true,
+      stdoutTty: true,
+      launcherMode: "local-interactive-owner",
+      expected: "batch",
+    },
+  ];
+
+  for (const entry of cases) {
+    await t.test(entry.name, async () => {
+      const stdinDescriptor = Object.getOwnPropertyDescriptor(process.stdin, "isTTY");
+      const stdoutDescriptor = Object.getOwnPropertyDescriptor(process.stdout, "isTTY");
+      Object.defineProperty(process.stdin, "isTTY", { configurable: true, value: entry.stdinTty });
+      Object.defineProperty(process.stdout, "isTTY", { configurable: true, value: entry.stdoutTty });
+      const observed: string[] = [];
+      try {
+        const runtime = bootstrapRuntime({
+          mode: "setup-required",
+          route: null,
+          setup: { kind: "cancelled", mode: "setup-required" },
+        });
+        const inspect = runtime.inspectStartup.bind(runtime);
+        runtime.inspectStartup = async () => {
+          observed.push(`inspect:${observed[0] ?? "missing"}`);
+          return inspect();
+        };
+        await invokeRunCli(entry.argv, {
+          initializeStorage: async () => bootstrapStorage(),
+          createProviderRuntime: async (input: { executionMode?: string }) => {
+            observed.push(input.executionMode ?? "missing");
+            return runtime;
+          },
+          createAgent: async () => { throw new Error("setup-required mode must not create agent"); },
+          runPlain: async () => undefined,
+          runDashboard: async () => undefined,
+          stdout: { write: () => true },
+          stderr: { write: () => true },
+          ...(entry.launcherMode ? { executionMode: entry.launcherMode } : {}),
+        });
+      } finally {
+        if (stdinDescriptor) Object.defineProperty(process.stdin, "isTTY", stdinDescriptor);
+        if (stdoutDescriptor) Object.defineProperty(process.stdout, "isTTY", stdoutDescriptor);
+      }
+      assert.deepEqual(observed.slice(0, 2), [entry.expected, `inspect:${entry.expected}`]);
+    });
+  }
+});
+
+test("every non-owner runtime denies an exact Kimi default before provider fetch", async () => {
+  const denied = [
+    "json",
+    "piped",
+    "scheduled",
+    "batch",
+    "relay",
+    "multi-user",
+    "collaborator",
+    "shared-service",
+    "unenrolled-device",
+  ] as const;
+  const route = {
+    version: 1 as const,
+    backendId: "kimi-code" as const,
+    accountFingerprint: "acct_kimi_policy_fixture",
+    billingRealm: "kimi-code-membership-provider-managed-overage" as const,
+    requestedModelId: "k3",
+    canonicalModelId: "k3",
+    resolutionState: "resolved" as const,
+  };
+  let fetchCalls = 0;
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => {
+    fetchCalls += 1;
+    throw new Error("policy test must not fetch");
+  };
+  try {
+    for (const executionMode of denied) {
+      const startup = bootstrapStorage();
+      startup.config.mainModel = "k3";
+      startup.config.providerSetup = {
+        schemaVersion: 2,
+        revision: 7,
+        lifecycle: "configured",
+        connections: [{
+          id: `kimi-policy-${executionMode}`,
+          backendId: "kimi-code",
+          enabled: true,
+          maturity: "preview",
+          credentialSlot: "v1:kimi-code:018f8d77-2d52-7cc0-8f6a-9fb1f3fc0711",
+          accountFingerprint: route.accountFingerprint,
+          accountFingerprintState: "verified",
+          billingRealm: route.billingRealm,
+          lastHealth: {
+            credential: "valid",
+            connectivity: "connected",
+            spend: "unknown",
+            runtime: "not-applicable",
+            observedAt: 1,
+            generation: 3,
+          },
+        }],
+        defaultRoute: route,
+        cross: { enabled: false, preferredLead: null, preferredChallenger: null },
+      };
+      const runtime = await createDefaultProviderRuntime({
+        startup,
+        environment: {},
+        requestedModel: "k3",
+        executionMode,
+      });
+      await assert.rejects(runtime.inspectStartup(), (error: unknown) =>
+        error instanceof Error
+        && (error as Error & { code?: unknown }).code === "kimi-code-owner-interactive-required"
+        && error.message === "Kimi Code Abo ist nur in einer lokalen, interaktiven Owner-Sitzung verfügbar."
+      );
+    }
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+  assert.equal(fetchCalls, 0);
+});
+
+test("owner runtime composes only the exact healthy Kimi route into a secretless model runtime", async () => {
+  const route = {
+    version: 1 as const,
+    backendId: "kimi-code" as const,
+    accountFingerprint: "acct_kimi_runtime_composition",
+    billingRealm: "kimi-code-membership-provider-managed-overage" as const,
+    requestedModelId: "k3-256k",
+    canonicalModelId: "k3-256k",
+    resolutionState: "resolved" as const,
+  };
+  const startup = bootstrapStorage();
+  startup.config.mainModel = route.requestedModelId;
+  startup.config.providerSetup = {
+    schemaVersion: 2,
+    revision: 11,
+    lifecycle: "configured",
+    connections: [{
+      id: "kimi-runtime-composition",
+      backendId: "kimi-code",
+      enabled: true,
+      maturity: "preview",
+      credentialSlot: "v1:kimi-code:018f8d77-2d52-7cc0-8f6a-9fb1f3fc0711",
+      accountFingerprint: route.accountFingerprint,
+      accountFingerprintState: "verified",
+      billingRealm: route.billingRealm,
+      lastHealth: {
+        credential: "valid",
+        connectivity: "connected",
+        spend: "unknown",
+        runtime: "not-applicable",
+        observedAt: 1,
+        generation: 19,
+      },
+    }],
+    defaultRoute: route,
+    cross: { enabled: false, preferredLead: null, preferredChallenger: null },
+  };
+  const runtime = await createDefaultProviderRuntime({
+    startup,
+    environment: {},
+    requestedModel: route.requestedModelId,
+    executionMode: "local-interactive-owner",
+  });
+  const modelRuntime = runtime.modelRuntime(route);
+  assert.equal(modelRuntime.backendId, "kimi-code");
+  const runtimeIdentity = readModelRuntimeIdentity(modelRuntime);
+  assert.deepEqual(runtimeIdentity, {
+    version: 1,
+    stateRevision: 11,
+    generation: 19,
+    connectionId: "kimi-runtime-composition",
+    backendId: "kimi-code",
+    route,
+  });
+  assert.equal(Object.isFrozen(runtimeIdentity), true);
+  assert.equal(Object.isFrozen(runtimeIdentity?.route), true);
+  assert.equal(
+    runtime.modelRuntime(route),
+    modelRuntime,
+    "the same exact authority binding must retain its secretless runtime and conversation cache",
+  );
+  assert.deepEqual(modelRuntime.dispatchFields({ route, allowWeb: false }), {
+    backendId: "kimi-code",
+    model: "k3-256k",
+  });
+  assert.throws(() => runtime.modelRuntime({
+    ...route,
+    accountFingerprint: "acct_kimi_runtime_foreign",
+  }), /setup|binding|route/i);
+  assert.throws(() => runtime.modelRuntime({
+    ...route,
+    requestedModelId: "foreign/k3-alias",
+  }), /setup|binding|route/i);
+
+  for (const runtimeHealth of [null, "missing", "incompatible", "policy-unavailable", "ready"] as const) {
+    const unhealthyStartup = bootstrapStorage();
+    unhealthyStartup.config.mainModel = route.requestedModelId;
+    unhealthyStartup.config.providerSetup = structuredClone(startup.config.providerSetup);
+    const connection = (unhealthyStartup.config.providerSetup as ProviderSetupStateV2).connections[0]!;
+    connection.lastHealth = runtimeHealth === null
+      ? null
+      : { ...connection.lastHealth!, runtime: runtimeHealth };
+    const unhealthy = await createDefaultProviderRuntime({
+      startup: unhealthyStartup,
+      environment: {},
+      requestedModel: route.requestedModelId,
+      executionMode: "local-interactive-owner",
+    });
+    assert.throws(
+      () => unhealthy.modelRuntime(route),
+      /setup|required/i,
+      `Kimi runtime health ${runtimeHealth ?? "null"} must fail closed`,
+    );
+  }
+});
+
+test("Kimi policy is route-owned and never inferred from an OpenRouter model string", () => {
+  const Runtime = (cliModule as unknown as {
+    DefaultProviderRuntime: new (...args: unknown[]) => {
+      adoptCredentialActivation(route: Record<string, unknown>, persisted: boolean, secret: string): void;
+      ensureRunnableRoute(): Record<string, unknown>;
+    };
+  }).DefaultProviderRuntime;
+  const route = {
+    version: 1,
+    backendId: "openrouter",
+    accountFingerprint: "acct_openrouter_named_k3",
+    billingRealm: "openrouter-payg",
+    requestedModelId: "k3",
+    canonicalModelId: "openrouter/k3",
+    resolutionState: "resolved",
+  } as const;
+  const stateStore = new ProviderStateStore({
+    schemaVersion: 2,
+    revision: 4,
+    lifecycle: "configured",
+    connections: [{
+      id: "openrouter-k3-name",
+      backendId: "openrouter",
+      enabled: true,
+      maturity: "stable",
+      credentialSlot: "v1:inference:11111111-1111-4111-8111-111111111111",
+      accountFingerprint: route.accountFingerprint,
+      accountFingerprintState: "verified",
+      billingRealm: "openrouter-payg",
+      lastHealth: null,
+    }],
+    defaultRoute: route,
+    cross: { enabled: false, preferredLead: null, preferredChallenger: null },
+  });
+  const config = structuredClone(DEFAULT_CONFIG);
+  config.mainModel = "k3";
+  config.providerSetup = stateStore.read();
+  const runtime = new Runtime(
+    {},
+    {},
+    {
+      descriptor() {
+        return { id: "kimi-code", displayName: "Kimi Code Abo", maturity: "preview" };
+      },
+    },
+    stateStore,
+    { ensureRunnableRoute: (candidate: unknown) => candidate },
+    {},
+    {},
+    {},
+    null,
+    null,
+    "k3",
+    config,
+    undefined,
+    undefined,
+    "batch",
+  );
+  runtime.adoptCredentialActivation(route, true, "");
+  assert.deepEqual(runtime.ensureRunnableRoute(), route);
+});
+
+test("modelRuntime rejects non-owner Kimi before provider state or authority work", () => {
+  const Runtime = (cliModule as unknown as {
+    DefaultProviderRuntime: new (...args: unknown[]) => {
+      modelRuntime(route: Record<string, unknown>): unknown;
+    };
+  }).DefaultProviderRuntime;
+  let stateReads = 0;
+  const runtime = new Runtime(
+    {},
+    {},
+    {},
+    { read() { stateReads += 1; throw new Error("state must remain unread"); } },
+    {},
+    {},
+    {},
+    {},
+    null,
+    null,
+    "k3",
+    structuredClone(DEFAULT_CONFIG),
+    undefined,
+    undefined,
+    "batch",
+  );
+  for (const candidate of [{
+      version: 1,
+      backendId: "kimi-code",
+      accountFingerprint: "acct_kimi_policy_first",
+      billingRealm: "kimi-code-membership-provider-managed-overage",
+      requestedModelId: "k3",
+      canonicalModelId: "k3",
+      resolutionState: "resolved",
+    }, {
+      backendId: "kimi-code",
+      malformed: true,
+    }]) {
+    assert.throws(
+      () => runtime.modelRuntime(candidate),
+      (error: unknown) => error instanceof Error
+        && (error as Error & { code?: string }).code === "kimi-code-owner-interactive-required",
+    );
+  }
+  assert.equal(stateReads, 0);
+});
+
+test("mixed-provider status follows the persisted Kimi session route instead of the OpenRouter default", async () => {
+  const Runtime = (cliModule as unknown as {
+    DefaultProviderRuntime: new (...args: unknown[]) => {
+      adoptCredentialActivation(route: Record<string, unknown>, persisted: boolean, secret: string): void;
+      execute(intent: Record<string, unknown>, surface: "plain"): Promise<Record<string, unknown>>;
+    };
+  }).DefaultProviderRuntime;
+  const openRouterRoute = {
+    version: 1,
+    backendId: "openrouter",
+    accountFingerprint: "acct_status_openrouter",
+    billingRealm: "openrouter-payg",
+    requestedModelId: "openrouter/auto",
+    canonicalModelId: "openrouter/auto",
+    resolutionState: "resolved",
+  } as const;
+  const kimiRoute = {
+    version: 1,
+    backendId: "kimi-code",
+    accountFingerprint: "acct_status_kimi",
+    billingRealm: "kimi-code-membership-provider-managed-overage",
+    requestedModelId: "k3-256k",
+    canonicalModelId: "k3-256k",
+    resolutionState: "resolved",
+  } as const;
+  const stateStore = new ProviderStateStore({
+    schemaVersion: 2,
+    revision: 8,
+    lifecycle: "configured",
+    connections: [
+      {
+        id: "status-openrouter",
+        backendId: "openrouter",
+        enabled: true,
+        maturity: "stable",
+        credentialSlot: "v1:inference:22222222-2222-4222-8222-222222222222",
+        accountFingerprint: openRouterRoute.accountFingerprint,
+        accountFingerprintState: "verified",
+        billingRealm: "openrouter-payg",
+        lastHealth: null,
+      },
+      {
+        id: "status-kimi",
+        backendId: "kimi-code",
+        enabled: true,
+        maturity: "preview",
+        credentialSlot: "v1:kimi-code:33333333-3333-4333-8333-333333333333",
+        accountFingerprint: kimiRoute.accountFingerprint,
+        accountFingerprintState: "verified",
+        billingRealm: "kimi-code-membership-provider-managed-overage",
+        lastHealth: {
+          credential: "valid",
+          connectivity: "connected",
+          spend: "unknown",
+          runtime: "not-applicable",
+          observedAt: 1,
+          generation: 12,
+        },
+      },
+    ],
+    defaultRoute: openRouterRoute,
+    cross: { enabled: false, preferredLead: null, preferredChallenger: null },
+  });
+  const config = structuredClone(DEFAULT_CONFIG);
+  config.providerSetup = stateStore.read();
+  const runtime = new Runtime(
+    {},
+    {},
+    {
+      entries: () => [
+        { id: "openrouter", displayName: "OpenRouter", maturity: "stable", connectable: true },
+        { id: "kimi-code", displayName: "Kimi Code Abo", maturity: "preview", connectable: true },
+        { id: "anthropic", displayName: "Anthropic", maturity: "coming-soon", connectable: false },
+      ],
+    },
+    stateStore,
+    {},
+    {},
+    {},
+    {},
+    null,
+    null,
+    kimiRoute.requestedModelId,
+    config,
+  );
+  runtime.adoptCredentialActivation(kimiRoute, true, "");
+  const status = await runtime.execute({ kind: "status" }, "plain") as {
+    providers: Array<Record<string, unknown>>;
+  };
+  const kimi = status.providers.find((entry) => entry.backendId === "kimi-code");
+  assert.equal(kimi?.configuration, "enabled");
+  assert.deepEqual(kimi?.selectedModel, {
+    requestedModelId: "k3-256k",
+    canonicalModelId: "k3-256k",
+    displayName: "Kimi K3 256K",
+  });
+  assert.equal(kimi?.accountFingerprintSuffix, null);
+});
+
+test("Kimi models inspection keeps the exact persisted health generation", async () => {
+  const Runtime = (cliModule as unknown as {
+    DefaultProviderRuntime: new (...args: unknown[]) => {
+      adoptCredentialActivation(route: Record<string, unknown>, persisted: boolean, secret: string): void;
+      execute(intent: Record<string, unknown>, surface: "plain"): Promise<Record<string, unknown>>;
+    };
+  }).DefaultProviderRuntime;
+  const route = {
+    version: 1,
+    backendId: "kimi-code",
+    accountFingerprint: "acct_models_generation",
+    billingRealm: "kimi-code-membership-provider-managed-overage",
+    requestedModelId: "k3",
+    canonicalModelId: "k3",
+    resolutionState: "resolved",
+  } as const;
+  const stateStore = new ProviderStateStore({
+    schemaVersion: 2,
+    revision: 9,
+    lifecycle: "configured",
+    connections: [{
+      id: "models-generation",
+      backendId: "kimi-code",
+      enabled: true,
+      maturity: "preview",
+      credentialSlot: "v1:kimi-code:44444444-4444-4444-8444-444444444444",
+      accountFingerprint: route.accountFingerprint,
+      accountFingerprintState: "verified",
+      billingRealm: "kimi-code-membership-provider-managed-overage",
+      lastHealth: {
+        credential: "valid",
+        connectivity: "connected",
+        spend: "unknown",
+        runtime: "not-applicable",
+        observedAt: 1,
+        generation: 27,
+      },
+    }],
+    defaultRoute: route,
+    cross: { enabled: false, preferredLead: null, preferredChallenger: null },
+  });
+  const generations: number[] = [];
+  const kimiAdapter = {
+    async inspect(request: { generation: number }) {
+      generations.push(request.generation);
+      return {
+        routeEligible: true,
+        accountFingerprint: route.accountFingerprint,
+        billingRealm: route.billingRealm,
+      };
+    },
+    async listModels() {
+      return [{
+        backendId: "kimi-code",
+        requestedModelId: "k3",
+        canonicalModelId: "k3",
+        displayName: "Kimi K3",
+        capabilities: { textInput: true, textOutput: true, tools: true, reasoning: true },
+      }];
+    },
+  };
+  const config = structuredClone(DEFAULT_CONFIG);
+  config.providerSetup = stateStore.read();
+  const runtime = new Runtime(
+    {},
+    {},
+    {
+      descriptor() {
+        return { id: "kimi-code", displayName: "Kimi Code Abo", maturity: "preview" };
+      },
+    },
+    stateStore,
+    {},
+    {},
+    { async acquire() { return { async assertHeld() {}, release() {} }; } },
+    {},
+    null,
+    null,
+    "k3",
+    config,
+    undefined,
+    { credentialAuthority: {}, adapter: {}, kimiAdapter },
+  );
+  runtime.adoptCredentialActivation(route, true, "");
+  const result = await runtime.execute({ kind: "models", backendId: "kimi-code" }, "plain");
+  assert.equal(result.kind, "models");
+  assert.deepEqual(generations, [27]);
+  assert.equal(stateStore.read().connections[0]?.lastHealth?.generation, 27);
+});
+
+const KIMI_LIFECYCLE_ROUTE = {
+  version: 1,
+  backendId: "kimi-code",
+  accountFingerprint: "acct_kimi_lifecycle",
+  billingRealm: "kimi-code-membership-provider-managed-overage",
+  requestedModelId: "k3",
+  canonicalModelId: "k3",
+  resolutionState: "resolved",
+} as const;
+
+const OPENROUTER_LIFECYCLE_ROUTE = {
+  version: 1,
+  backendId: "openrouter",
+  accountFingerprint: "acct_openrouter_lifecycle",
+  billingRealm: "openrouter-payg",
+  requestedModelId: "openrouter/auto",
+  canonicalModelId: "openrouter/auto",
+  resolutionState: "resolved",
+} as const;
+
+function kimiLifecycleState(options: {
+  kimiEnabled?: boolean;
+  includeOpenRouter?: boolean;
+  openRouterEnabled?: boolean;
+  defaultBackend?: "kimi-code" | "openrouter";
+} = {}): ProviderSetupStateV2 {
+  const openRouterRoute = OPENROUTER_LIFECYCLE_ROUTE;
+  const connections: ProviderConnectionStateV1[] = [{
+    id: "kimi-lifecycle-connection",
+    backendId: "kimi-code",
+    enabled: options.kimiEnabled ?? true,
+    maturity: "preview",
+    credentialSlot: "v1:kimi-code:77777777-7777-4777-8777-777777777777",
+    accountFingerprint: KIMI_LIFECYCLE_ROUTE.accountFingerprint,
+    accountFingerprintState: "verified",
+    billingRealm: KIMI_LIFECYCLE_ROUTE.billingRealm,
+    lastHealth: {
+      credential: "valid",
+      connectivity: "connected",
+      spend: "unknown",
+      runtime: "not-applicable",
+      observedAt: 1,
+      generation: 17,
+    },
+  }];
+  if (options.includeOpenRouter) {
+    connections.push({
+      id: "openrouter-lifecycle-connection",
+      backendId: "openrouter",
+      enabled: options.openRouterEnabled ?? true,
+      maturity: "stable",
+      credentialSlot: "v1:inference:88888888-8888-4888-8888-888888888888",
+      accountFingerprint: openRouterRoute.accountFingerprint,
+      accountFingerprintState: "verified",
+      billingRealm: "openrouter-payg",
+      lastHealth: {
+        credential: "valid",
+        connectivity: "connected",
+        spend: "available",
+        runtime: "ready",
+        observedAt: 1,
+        generation: 18,
+      },
+    });
+  }
+  const defaultBackend = options.defaultBackend ?? "kimi-code";
+  return {
+    schemaVersion: 2,
+    revision: 9,
+    lifecycle: "configured",
+    connections,
+    defaultRoute: defaultBackend === "openrouter" ? openRouterRoute : KIMI_LIFECYCLE_ROUTE,
+    cross: { enabled: false, preferredLead: null, preferredChallenger: null },
+  };
+}
+
+function kimiLifecycleRuntimeFixture(options: {
+  state?: ProviderSetupStateV2;
+  session?: SessionStore;
+  requestedModel?: string;
+  persist?: (request: ProviderStateCommitRequest) => Promise<ProviderSetupStateV2>;
+  reconnect?: (backendId: string, input: { connectionId?: string }) => Promise<Record<string, unknown>>;
+  loseLeaseAfterCommit?: boolean;
+  credentials?: unknown;
+  forgetJournal?: unknown;
+} = {}) {
+  const Runtime = (cliModule as unknown as {
+    DefaultProviderRuntime: new (...args: unknown[]) => {
+      execute(intent: Record<string, unknown>, surface: "plain"): Promise<Record<string, unknown>>;
+      ensureRunnableRoute(): Record<string, unknown>;
+      adoptCredentialActivation(route: Record<string, unknown>, persisted: boolean, secret: string): void;
+      transitionModel(modelId: string, canonicalModelId?: string, surface?: "plain"): Promise<void>;
+      runSetup: (...args: unknown[]) => Promise<Record<string, unknown>>;
+    };
+  }).DefaultProviderRuntime;
+  const initial = options.state ?? kimiLifecycleState();
+  const stateStore = new ProviderStateStore(initial, options.persist ? { persist: options.persist } : undefined);
+  const calls: string[] = [];
+  const openRouterModels: BackendModelDescriptor[] = [{
+    backendId: "openrouter",
+    requestedModelId: "openrouter/auto",
+    canonicalModelId: "openrouter/auto",
+    displayName: "OpenRouter Auto",
+    capabilities: { textInput: true, textOutput: true, tools: true, reasoning: true },
+  }];
+  const kimiModels: BackendModelDescriptor[] = [{
+    backendId: "kimi-code",
+    requestedModelId: "k3",
+    canonicalModelId: "k3",
+    displayName: "Kimi K3",
+    capabilities: { textInput: true, textOutput: true, tools: true, reasoning: true },
+  }, {
+    backendId: "kimi-code",
+    requestedModelId: "k3-256k",
+    canonicalModelId: "k3-256k",
+    displayName: "Kimi K3 256K",
+    capabilities: { textInput: true, textOutput: true, tools: true, reasoning: true },
+  }];
+  const openRouterAdapter = {
+    backendId: "openrouter",
+    async inspectUnderAuthorityLease(request: { connectionId: string; generation: number }) {
+      calls.push(`openrouter:inspect:${request.connectionId}:${request.generation}`);
+      return {
+        routeEligible: true,
+        accountFingerprint: "acct_openrouter_lifecycle",
+        billingRealm: "openrouter-payg",
+        health: initial.connections.find((entry) => entry.backendId === "openrouter")?.lastHealth,
+      };
+    },
+    async listModels(request: { connectionId?: string }) {
+      calls.push(`openrouter:models:${request.connectionId ?? "none"}`);
+      return openRouterModels;
+    },
+    async bindRuntimeUnderAuthorityLease(request: { connectionId: string }) {
+      calls.push(`openrouter:bind:${request.connectionId}`);
+    },
+    async bindRuntime(request: { connectionId: string }) {
+      calls.push(`openrouter:bind:${request.connectionId}`);
+    },
+  };
+  const kimiAdapter = {
+    backendId: "kimi-code",
+    async inspectUnderAuthorityLease(request: { connectionId: string; generation: number }) {
+      calls.push(`kimi:inspect-authority:${request.connectionId}:${request.generation}`);
+      return {
+        routeEligible: true,
+        accountFingerprint: KIMI_LIFECYCLE_ROUTE.accountFingerprint,
+        billingRealm: KIMI_LIFECYCLE_ROUTE.billingRealm,
+        health: {
+          credential: "valid",
+          connectivity: "connected",
+          spend: "unknown",
+          runtime: "not-applicable",
+          observedAt: 2,
+          generation: request.generation,
+        },
+      };
+    },
+    async inspect(request: { connectionId: string; generation: number }) {
+      calls.push(`kimi:inspect:${request.connectionId}:${request.generation}`);
+      return {
+        routeEligible: true,
+        accountFingerprint: KIMI_LIFECYCLE_ROUTE.accountFingerprint,
+        billingRealm: KIMI_LIFECYCLE_ROUTE.billingRealm,
+        health: initial.connections.find((entry) => entry.backendId === "kimi-code")?.lastHealth,
+      };
+    },
+    async listModels(request: { connectionId?: string }) {
+      calls.push(`kimi:models:${request.connectionId ?? "none"}`);
+      return kimiModels;
+    },
+    async logout() { calls.push("kimi:logout"); },
+  };
+  const runtimeGuard = providerRuntimeGuardFixture();
+  const coordinatorBase = providerCoordinatorMutationFixture(runtimeGuard);
+  const coordinator = {
+    ...coordinatorBase,
+    ...(options.loseLeaseAfterCommit
+      ? {
+          async runExclusive<T>(
+            _request: { signal: AbortSignal },
+            operation: (lease: { assertHeld(): Promise<void> }) => Promise<T>,
+          ): Promise<T> {
+            return operation({
+              async assertHeld() {
+                if (stateStore.read().revision > initial.revision) {
+                  throw new Error("fixed post-commit provider lease loss");
+                }
+              },
+            });
+          },
+        }
+      : {}),
+    async readAuthority<T>(
+      _request: { signal: AbortSignal },
+      operation: (lease: { assertHeld(): Promise<void> }) => Promise<T>,
+    ): Promise<T> {
+      calls.push("authority:read");
+      return operation({ async assertHeld() {} });
+    },
+  };
+  const config = structuredClone(DEFAULT_CONFIG);
+  config.mainModel = options.requestedModel ?? initial.defaultRoute?.requestedModelId ?? "k3";
+  config.providerSetup = stateStore.read();
+  const registry = {
+    descriptor(id: string) {
+      return id === "kimi-code"
+        ? { id, displayName: "Kimi Code Abo", maturity: "preview", connectable: true }
+        : id === "openrouter"
+          ? { id, displayName: "OpenRouter", maturity: "stable", connectable: true }
+          : { id: "anthropic", displayName: "Anthropic", maturity: "coming-soon", connectable: false };
+    },
+    entries() {
+      return [this.descriptor("openrouter"), this.descriptor("kimi-code"), this.descriptor("anthropic")];
+    },
+    adapter(id: string) { return id === "kimi-code" ? kimiAdapter : openRouterAdapter; },
+  };
+  const orchestrator = {
+    async reconnect(backendId: string, input: { connectionId?: string }) {
+      calls.push(`reconnect:${backendId}:${input.connectionId ?? "none"}`);
+      return options.reconnect
+        ? options.reconnect(backendId, input)
+        : {
+            mode: "ready",
+            generation: stateStore.read().connections.find((entry) => entry.backendId === backendId)?.lastHealth?.generation ?? 0,
+            defaultRoute: stateStore.read().defaultRoute,
+            readyRoutes: stateStore.read().defaultRoute ? [stateStore.read().defaultRoute] : [],
+            warnings: [],
+            crossEnabled: false,
+          };
+    },
+    ensureRunnableRoute(requested?: Record<string, unknown>) {
+      const route = requested ?? stateStore.read().defaultRoute;
+      if (!route) throw new Error("provider-setup-required");
+      return structuredClone(route);
+    },
+    nextStartupGeneration() { return 1; },
+  };
+  const runtime = new Runtime(
+    { async listModels() { calls.push("openrouter:legacy-models"); return []; } },
+    options.credentials ?? {},
+    registry,
+    stateStore,
+    orchestrator,
+    coordinator,
+    { ...runtimeGuard, beginRun() { throw new Error("nested runtime run guard"); } },
+    {},
+    null,
+    null,
+    options.requestedModel ?? config.mainModel,
+    config,
+    options.session,
+    {
+      credentialAuthority: {},
+      adapter: openRouterAdapter,
+      kimiAdapter,
+      forgetJournal: options.forgetJournal ?? {},
+      async recover() {},
+    },
+    "local-interactive-owner",
+  );
+  return { runtime, stateStore, config, calls, openRouterAdapter, kimiAdapter };
+}
+
+test("slash provider connect kimi-code reaches the runtime's backend-targeted setup", async () => {
+  const fixture = kimiLifecycleRuntimeFixture();
+  const setupCalls: unknown[][] = [];
+  fixture.runtime.runSetup = async (...args: unknown[]) => {
+    setupCalls.push(args);
+    return { kind: "ready" };
+  };
+  const output: string[] = [];
+  const context = {
+    config: fixture.config,
+    providerCommands: fixture.runtime,
+    out: {
+      text(value: string) { output.push(value); },
+      error(value: string) { output.push(value); },
+    },
+  } as unknown as CommandContext;
+
+  await handleSlashCommand("/provider connect kimi-code", context);
+
+  assert.deepEqual(setupCalls, [["plain", undefined, "kimi-code"]]);
+  assert.deepEqual(output, ["Kimi Code · Provider-Setup: ready"]);
+});
+
+test("Kimi enable is idempotent for an already enabled exact route and never re-enters setup", async () => {
+  const fixture = kimiLifecycleRuntimeFixture();
+  let setupCalls = 0;
+  fixture.runtime.runSetup = async () => {
+    setupCalls += 1;
+    return { kind: "cancelled", mode: "setup-required" };
+  };
+
+  const result = await fixture.runtime.execute({ kind: "enable", backendId: "kimi-code" }, "plain");
+
+  assert.deepEqual(result, { kind: "setup", backendId: "kimi-code", outcome: "ready" });
+  assert.equal(setupCalls, 0);
+  assert.deepEqual(fixture.runtime.ensureRunnableRoute(), KIMI_LIFECYCLE_ROUTE);
+  assert.deepEqual(fixture.calls, []);
+});
+
+test("enabled retained Kimi adopts its exact route from an OpenRouter current route without replacement setup", async () => {
+  const initial = kimiLifecycleState({
+    includeOpenRouter: true,
+    openRouterEnabled: true,
+    defaultBackend: "openrouter",
+  });
+  const fixture = kimiLifecycleRuntimeFixture({
+    state: initial,
+    requestedModel: "openrouter/auto",
+  });
+  let setupCalls = 0;
+  fixture.runtime.runSetup = async () => {
+    setupCalls += 1;
+    return { kind: "cancelled", mode: "setup-required" };
+  };
+
+  const result = await fixture.runtime.execute({ kind: "enable", backendId: "kimi-code" }, "plain");
+
+  assert.deepEqual(result, { kind: "setup", backendId: "kimi-code", outcome: "ready" });
+  assert.equal(setupCalls, 0);
+  assert.equal(fixture.stateStore.read().revision, initial.revision);
+  assert.deepEqual(fixture.stateStore.read(), initial);
+  assert.deepEqual(fixture.runtime.ensureRunnableRoute(), KIMI_LIFECYCLE_ROUTE);
+  assert.deepEqual(fixture.calls, [
+    "kimi:inspect-authority:kimi-lifecycle-connection:18",
+    "kimi:models:kimi-lifecycle-connection",
+  ]);
+});
+
+test("enabled retained OpenRouter adopts its exact route from a Kimi current route without replacement setup", async () => {
+  const initial = kimiLifecycleState({
+    includeOpenRouter: true,
+    openRouterEnabled: true,
+    defaultBackend: "kimi-code",
+  });
+  const fixture = kimiLifecycleRuntimeFixture({ state: initial, requestedModel: "k3" });
+  let setupCalls = 0;
+  fixture.runtime.runSetup = async () => {
+    setupCalls += 1;
+    return { kind: "cancelled", mode: "setup-required" };
+  };
+
+  const result = await fixture.runtime.execute({ kind: "enable", backendId: "openrouter" }, "plain");
+
+  assert.deepEqual(result, { kind: "setup", backendId: "openrouter", outcome: "ready" });
+  assert.equal(setupCalls, 0);
+  assert.equal(fixture.stateStore.read().revision, initial.revision);
+  assert.deepEqual(fixture.stateStore.read(), initial);
+  assert.equal(fixture.runtime.ensureRunnableRoute().backendId, "openrouter");
+  assert.equal(fixture.runtime.ensureRunnableRoute().requestedModelId, "openrouter/auto");
+  assert.deepEqual(fixture.calls, [
+    "openrouter:inspect:openrouter-lifecycle-connection:19",
+    "openrouter:models:openrouter-lifecycle-connection",
+    "openrouter:bind:openrouter-lifecycle-connection",
+  ]);
+});
+
+test("Kimi enable adopts an exact durably published tuple when persistence reports failure after publication", async () => {
+  const initial = kimiLifecycleState({ kimiEnabled: false });
+  initial.defaultRoute = null;
+  let durable = structuredClone(initial);
+  const fixture = kimiLifecycleRuntimeFixture({
+    state: initial,
+    persist: async (request) => {
+      const next = request.build(structuredClone(durable));
+      durable = structuredClone(next);
+      request.adopt(next);
+      throw new Error("fixed publish-then-throw boundary");
+    },
+  });
+
+  const result = await fixture.runtime.execute({ kind: "enable", backendId: "kimi-code" }, "plain");
+
+  assert.deepEqual(result, { kind: "setup", backendId: "kimi-code", outcome: "ready" });
+  assert.deepEqual(fixture.stateStore.read(), durable);
+  assert.deepEqual(fixture.config.providerSetup, durable);
+  assert.equal(durable.connections[0]?.enabled, true);
+  assert.deepEqual(fixture.runtime.ensureRunnableRoute(), KIMI_LIFECYCLE_ROUTE);
+  assert.equal(durable.cross.enabled, false);
+});
+
+test("Kimi enable adopts the exact committed tuple after a post-commit provider lease loss", async () => {
+  const initial = kimiLifecycleState({ kimiEnabled: false });
+  initial.defaultRoute = null;
+  const fixture = kimiLifecycleRuntimeFixture({ state: initial, loseLeaseAfterCommit: true });
+
+  const result = await fixture.runtime.execute({ kind: "enable", backendId: "kimi-code" }, "plain");
+
+  assert.deepEqual(result, { kind: "setup", backendId: "kimi-code", outcome: "ready" });
+  assert.equal(fixture.stateStore.read().revision, initial.revision + 1);
+  assert.equal(fixture.stateStore.read().connections[0]?.enabled, true);
+  assert.deepEqual(fixture.runtime.ensureRunnableRoute(), KIMI_LIFECYCLE_ROUTE);
+  assert.deepEqual(fixture.config.providerSetup, fixture.stateStore.read());
+});
+
+for (const boundary of ["publish-then-throw", "post-commit-lease-loss"] as const) {
+  test(`Kimi model change adopts the one exact committed tuple after ${boundary}`, async () => {
+    const initial = kimiLifecycleState();
+    let durable = structuredClone(initial);
+    const fixture = kimiLifecycleRuntimeFixture({
+      state: initial,
+      ...(boundary === "publish-then-throw"
+        ? {
+            persist: async (request: ProviderStateCommitRequest) => {
+              const next = request.build(structuredClone(durable));
+              durable = structuredClone(next);
+              request.adopt(next);
+              throw new Error("fixed model publish-then-throw boundary");
+            },
+          }
+        : { loseLeaseAfterCommit: true }),
+    });
+
+    await fixture.runtime.transitionModel("k3-256k", "k3-256k", "plain");
+
+    if (boundary === "post-commit-lease-loss") durable = fixture.stateStore.read();
+    assert.equal(durable.revision, initial.revision + 1);
+    assert.equal(durable.defaultRoute?.requestedModelId, "k3-256k");
+    assert.equal(durable.defaultRoute?.canonicalModelId, "k3-256k");
+    assert.equal(durable.cross.enabled, false);
+    assert.deepEqual(fixture.stateStore.read(), durable);
+    assert.deepEqual(fixture.config.providerSetup, durable);
+    assert.deepEqual(fixture.runtime.ensureRunnableRoute(), durable.defaultRoute);
+  });
+}
+
+test("mixed-provider OpenRouter enable chooses an OpenRouter route instead of the current Kimi model", async () => {
+  const fixture = kimiLifecycleRuntimeFixture({
+    state: kimiLifecycleState({ includeOpenRouter: true, openRouterEnabled: false }),
+    requestedModel: "k3",
+  });
+
+  const result = await fixture.runtime.execute({ kind: "enable", backendId: "openrouter" }, "plain");
+
+  assert.deepEqual(result, { kind: "setup", backendId: "openrouter", outcome: "ready" });
+  assert.equal(fixture.stateStore.read().connections.find((entry) => entry.backendId === "openrouter")?.enabled, true);
+  assert.equal(fixture.stateStore.read().defaultRoute?.backendId, "openrouter");
+  assert.equal(fixture.stateStore.read().defaultRoute?.requestedModelId, "openrouter/auto");
+  assert.equal(fixture.calls.some((call) => call.startsWith("kimi:")), false);
+});
+
+test("explicit OpenRouter models inspect the exact OpenRouter connection while the chat route is Kimi", async () => {
+  const fixture = kimiLifecycleRuntimeFixture({
+    state: kimiLifecycleState({ includeOpenRouter: true, openRouterEnabled: true }),
+  });
+
+  const result = await fixture.runtime.execute({ kind: "models", backendId: "openrouter" }, "plain");
+
+  assert.equal(result.kind, "models");
+  assert.deepEqual(result.models, [{
+    requestedModelId: "openrouter/auto",
+    canonicalModelId: "openrouter/auto",
+    displayName: "OpenRouter Auto",
+  }]);
+  assert.deepEqual(fixture.calls, [
+    "authority:read",
+    "openrouter:inspect:openrouter-lifecycle-connection:18",
+    "openrouter:models:openrouter-lifecycle-connection",
+  ]);
+});
+
+test("reconnecting Kimi leaves an unrelated exact OpenRouter chat route bound", async () => {
+  const state = kimiLifecycleState({
+    includeOpenRouter: true,
+    openRouterEnabled: true,
+    defaultBackend: "openrouter",
+  });
+  const openRouterRoute = state.defaultRoute!;
+  const session = SessionStore.create("/synthetic/mixed-reconnect", "/synthetic/.orcode");
+  session.setPreferences(openRouterRoute.requestedModelId, { mode: "auto" }, openRouterRoute);
+  const fixture = kimiLifecycleRuntimeFixture({ state, session, requestedModel: openRouterRoute.requestedModelId });
+  fixture.runtime.adoptCredentialActivation(openRouterRoute as unknown as Record<string, unknown>, true, "");
+
+  const result = await fixture.runtime.execute({ kind: "reconnect", backendId: "kimi-code" }, "plain");
+
+  assert.equal(result.kind, "reconnected");
+  assert.deepEqual(fixture.runtime.ensureRunnableRoute(), openRouterRoute);
+  assert.deepEqual(session.data.route, openRouterRoute);
+  assert.equal(fixture.config.mainModel, openRouterRoute.requestedModelId);
+  assert.deepEqual(fixture.calls, ["reconnect:kimi-code:kimi-lifecycle-connection"]);
+});
+
+test("Kimi disable clears and durably saves only the matching persisted session route", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "orcode-kimi-disable-session-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const workspace = join(root, "workspace");
+  const appHome = join(root, ".orcode");
+  const session = SessionStore.create(workspace, appHome, "Kimi disable");
+  session.setPreferences("k3", { mode: "effort", effort: "high" }, KIMI_LIFECYCLE_ROUTE);
+  session.addTurn("user", "bleibt erhalten");
+  session.addCost("main", 0.5, "unknown");
+  await session.save();
+  const before = structuredClone(session.data);
+  const fixture = kimiLifecycleRuntimeFixture({ session });
+
+  const prompt = await fixture.runtime.execute({ kind: "disable", backendId: "kimi-code" }, "plain");
+  const result = await fixture.runtime.execute({
+    kind: "disable",
+    backendId: "kimi-code",
+    confirmationToken: prompt.confirmationToken,
+  }, "plain");
+
+  assert.equal(result.kind, "changed");
+  assert.equal(session.data.route, undefined);
+  assert.deepEqual({ ...session.data, route: before.route, revision: before.revision }, before);
+  const reopened = await SessionStore.openById(workspace, session.data.id, appHome);
+  assert.equal(reopened.data.route, undefined);
+  assert.equal(reopened.data.model, "k3");
+  assert.deepEqual(reopened.data.reasoning, before.reasoning);
+  assert.deepEqual(reopened.data.turns, before.turns);
+  assert.equal(reopened.data.costs.costKnowledge, "unknown");
+});
+
+test("Kimi disable preserves a concurrently persisted OpenRouter session route", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "orcode-kimi-disable-route-race-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const workspace = join(root, "workspace");
+  const appHome = join(root, ".orcode");
+  const seed = SessionStore.create(workspace, appHome, "Disable route race");
+  seed.setPreferences("k3", { mode: "auto" }, KIMI_LIFECYCLE_ROUTE);
+  await seed.save();
+  const lifecycleOwner = await SessionStore.openById(workspace, seed.data.id, appHome);
+  const concurrentOwner = await SessionStore.openById(workspace, seed.data.id, appHome);
+  concurrentOwner.setPreferences("openrouter/auto", { mode: "auto" }, OPENROUTER_LIFECYCLE_ROUTE);
+  await concurrentOwner.save();
+  const fixture = kimiLifecycleRuntimeFixture({
+    state: kimiLifecycleState({ includeOpenRouter: true }),
+    session: lifecycleOwner,
+  });
+
+  const prompt = await fixture.runtime.execute({ kind: "disable", backendId: "kimi-code" }, "plain");
+  const result = await fixture.runtime.execute({
+    kind: "disable",
+    backendId: "kimi-code",
+    confirmationToken: prompt.confirmationToken,
+  }, "plain");
+
+  assert.equal(result.kind, "changed");
+  assert.deepEqual(lifecycleOwner.data.route, OPENROUTER_LIFECYCLE_ROUTE);
+  assert.deepEqual(
+    (await SessionStore.openById(workspace, seed.data.id, appHome)).data.route,
+    OPENROUTER_LIFECYCLE_ROUTE,
+  );
+});
+
+test("Kimi logout without any retained connection is idempotent and creates no confirmation", async () => {
+  const empty: ProviderSetupStateV2 = {
+    schemaVersion: 2,
+    revision: 0,
+    lifecycle: "never-configured",
+    connections: [],
+    defaultRoute: null,
+    cross: { enabled: false, preferredLead: null, preferredChallenger: null },
+  };
+  const fixture = kimiLifecycleRuntimeFixture({ state: empty });
+
+  const result = await fixture.runtime.execute({ kind: "logout", backendId: "kimi-code" }, "plain");
+
+  assert.deepEqual(result, {
+    kind: "unchanged",
+    backendId: "kimi-code",
+    reason: "bereits abgemeldet",
+  });
+  assert.deepEqual(fixture.calls, []);
+});
+
+test("Kimi logout becomes idempotent when the exact connection disappears after confirmation", async () => {
+  const fixture = kimiLifecycleRuntimeFixture();
+  const prompt = await fixture.runtime.execute({ kind: "logout", backendId: "kimi-code" }, "plain");
+  const current = fixture.stateStore.read();
+  fixture.stateStore.replace({
+    ...current,
+    connections: [],
+    defaultRoute: null,
+  }, current.revision);
+
+  const result = await fixture.runtime.execute({
+    kind: "logout",
+    backendId: "kimi-code",
+    confirmationToken: prompt.confirmationToken,
+  }, "plain");
+
+  assert.deepEqual(result, {
+    kind: "unchanged",
+    backendId: "kimi-code",
+    reason: "bereits abgemeldet",
+  });
+  assert.deepEqual(fixture.calls, []);
+});
+
+test("Kimi logout deletes only its exact slot and durably clears the matching session route", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "orcode-kimi-logout-session-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const workspace = join(root, "workspace");
+  const appHome = join(root, ".orcode");
+  const session = SessionStore.create(workspace, appHome, "Kimi logout");
+  session.setPreferences("k3", { mode: "auto" }, KIMI_LIFECYCLE_ROUTE);
+  session.addTurn("user", "history survives logout");
+  await session.save();
+  const deletedSlots: string[] = [];
+  const credentials = {
+    async deleteSlot(slot: CredentialSlotRef) {
+      deletedSlots.push(slot.id);
+      return true;
+    },
+  };
+  const Journal = (cliModule as typeof cliModule & {
+    ProviderCredentialForgetJournal: new (input: {
+      appHome: string;
+      privateStore: PrivateStore;
+    }) => {
+      begin(input: Record<string, unknown>): Promise<unknown>;
+      markDeleted(transaction: unknown): Promise<void>;
+      complete(transaction: unknown): Promise<void>;
+      readPending(): Promise<unknown>;
+    };
+  }).ProviderCredentialForgetJournal;
+  const forgetJournal = new Journal({ appHome, privateStore: new PrivateStore({ root: appHome }) });
+  const fixture = kimiLifecycleRuntimeFixture({
+    session,
+    credentials,
+    forgetJournal,
+  });
+
+  const prompt = await fixture.runtime.execute({ kind: "logout", backendId: "kimi-code" }, "plain");
+  const result = await fixture.runtime.execute({
+    kind: "logout",
+    backendId: "kimi-code",
+    confirmationToken: prompt.confirmationToken,
+  }, "plain");
+
+  assert.equal(result.kind, "changed");
+  assert.deepEqual(deletedSlots, ["v1:kimi-code:77777777-7777-4777-8777-777777777777"]);
+  assert.deepEqual(fixture.stateStore.read().connections, []);
+  assert.equal(fixture.stateStore.read().defaultRoute, null);
+  assert.equal(fixture.stateStore.read().cross.enabled, false);
+  assert.equal(session.data.route, undefined);
+  const reopened = await SessionStore.openById(workspace, session.data.id, appHome);
+  assert.equal(reopened.data.route, undefined);
+  assert.deepEqual(reopened.data.turns, session.data.turns);
+  assert.equal(await forgetJournal.readPending(), null);
+  assert.equal(fixture.calls.includes("kimi:logout"), true);
+});
+
+test("Kimi logout leaves provider cleanup retryable when durable session route clearing rejects", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "orcode-kimi-logout-route-clear-reject-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const workspace = join(root, "workspace");
+  const appHome = join(root, ".orcode");
+  const session = SessionStore.create(workspace, appHome, "Kimi logout retry");
+  session.setPreferences("k3", { mode: "auto" }, KIMI_LIFECYCLE_ROUTE);
+  session.addTurn("user", "history survives a failed logout attempt");
+  await session.save();
+  const initialState = kimiLifecycleState();
+  const deletedSlots: string[] = [];
+  const credentials = {
+    async deleteSlot(slot: CredentialSlotRef) {
+      deletedSlots.push(slot.id);
+      return true;
+    },
+  };
+  const Journal = (cliModule as typeof cliModule & {
+    ProviderCredentialForgetJournal: new (input: {
+      appHome: string;
+      privateStore: PrivateStore;
+    }) => {
+      readPending(): Promise<unknown>;
+    };
+  }).ProviderCredentialForgetJournal;
+  const forgetJournal = new Journal({ appHome, privateStore: new PrivateStore({ root: appHome }) });
+  const fixture = kimiLifecycleRuntimeFixture({
+    state: initialState,
+    session,
+    credentials,
+    forgetJournal,
+  });
+  const clearRouteIfExact = session.clearRouteIfExact.bind(session);
+  let rejectClear = true;
+  session.clearRouteIfExact = async (route) => {
+    if (rejectClear) throw new Error("fixed durable session clear rejection");
+    return clearRouteIfExact(route);
+  };
+
+  const firstPrompt = await fixture.runtime.execute({ kind: "logout", backendId: "kimi-code" }, "plain");
+  await assert.rejects(
+    fixture.runtime.execute({
+      kind: "logout",
+      backendId: "kimi-code",
+      confirmationToken: firstPrompt.confirmationToken,
+    }, "plain"),
+    /Provider credential cleanup is pending and will resume on restart/,
+  );
+  assert.deepEqual(fixture.stateStore.read(), initialState);
+  assert.deepEqual(deletedSlots, []);
+  assert.deepEqual(await forgetJournal.readPending(), null);
+  assert.deepEqual(session.data.route, KIMI_LIFECYCLE_ROUTE);
+
+  rejectClear = false;
+  const retryPrompt = await fixture.runtime.execute({ kind: "logout", backendId: "kimi-code" }, "plain");
+  const retry = await fixture.runtime.execute({
+    kind: "logout",
+    backendId: "kimi-code",
+    confirmationToken: retryPrompt.confirmationToken,
+  }, "plain");
+  assert.equal(retry.kind, "changed");
+  assert.deepEqual(fixture.stateStore.read().connections, []);
+  assert.deepEqual(deletedSlots, ["v1:kimi-code:77777777-7777-4777-8777-777777777777"]);
+  assert.equal(session.data.route, undefined);
+  assert.deepEqual(await forgetJournal.readPending(), null);
+});
+
+test("Kimi logout preserves a concurrently persisted OpenRouter session route", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "orcode-kimi-logout-route-race-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const workspace = join(root, "workspace");
+  const appHome = join(root, ".orcode");
+  const seed = SessionStore.create(workspace, appHome, "Logout route race");
+  seed.setPreferences("k3", { mode: "auto" }, KIMI_LIFECYCLE_ROUTE);
+  await seed.save();
+  const lifecycleOwner = await SessionStore.openById(workspace, seed.data.id, appHome);
+  const concurrentOwner = await SessionStore.openById(workspace, seed.data.id, appHome);
+  concurrentOwner.setPreferences("openrouter/auto", { mode: "auto" }, OPENROUTER_LIFECYCLE_ROUTE);
+  await concurrentOwner.save();
+  const credentials = { async deleteSlot() { return true; } };
+  const Journal = (cliModule as typeof cliModule & {
+    ProviderCredentialForgetJournal: new (input: {
+      appHome: string;
+      privateStore: PrivateStore;
+    }) => unknown;
+  }).ProviderCredentialForgetJournal;
+  const fixture = kimiLifecycleRuntimeFixture({
+    state: kimiLifecycleState({ includeOpenRouter: true }),
+    session: lifecycleOwner,
+    credentials,
+    forgetJournal: new Journal({ appHome, privateStore: new PrivateStore({ root: appHome }) }),
+  });
+
+  const prompt = await fixture.runtime.execute({ kind: "logout", backendId: "kimi-code" }, "plain");
+  const result = await fixture.runtime.execute({
+    kind: "logout",
+    backendId: "kimi-code",
+    confirmationToken: prompt.confirmationToken,
+  }, "plain");
+
+  assert.equal(result.kind, "changed");
+  assert.deepEqual(lifecycleOwner.data.route, OPENROUTER_LIFECYCLE_ROUTE);
+  assert.deepEqual(
+    (await SessionStore.openById(workspace, seed.data.id, appHome)).data.route,
+    OPENROUTER_LIFECYCLE_ROUTE,
+  );
+});
+
+test("noninteractive agent creation and run stay inside the complete ready-route guard", async () => {
+  const events: string[] = [];
+  const route = bootstrapRoute("vendor/guarded-main");
+  const runtime = bootstrapRuntime({ route, events }) as BootstrapRuntimeDouble & Record<string, unknown>;
+  runtime.modelRuntime = () => {
+    events.push("runtime:bind");
+    return { backendId: "openrouter" };
+  };
+  runtime.runWithReadyRoute = async (run: (candidate: Record<string, unknown>) => Promise<number>) => {
+    events.push("guard:begin");
+    const result = await run(route);
+    events.push("guard:end");
+    return result;
+  };
+  runtime.currentSessionRoute = () => route;
+  runtime.providerCredentials = { async apply() { return { kind: "unchanged" }; } };
+  runtime.execute = async () => ({ kind: "unchanged" });
+  runtime.adoptSession = () => undefined;
+  runtime.migratedSessionConnection = () => undefined;
+  const exitCode = await invokeRunCli(["--json", "-p", "guarded"], {
+    initializeStorage: async () => bootstrapStorage(),
+    createProviderRuntime: async () => runtime,
+    createAgent: async () => {
+      events.push("agent:create");
+      return {
+        async run() {
+          events.push("agent:run");
+          return { outcome: "completed" };
+        },
+      } as never;
+    },
+    runPlain: async () => undefined,
+    runDashboard: async () => undefined,
+    stdout: { write: () => true },
+    stderr: { write: () => true },
+  });
+  assert.equal(exitCode, 0);
+  assert.ok(events.indexOf("guard:begin") < events.indexOf("agent:create"));
+  assert.ok(events.indexOf("agent:create") < events.indexOf("agent:run"));
+  assert.ok(events.indexOf("agent:run") < events.indexOf("guard:end"));
+});
+
+test("dashboard Kimi model helpers never touch OpenRouter and classify unsupported shortcuts", async (t) => {
+  const api = cliModule as unknown as {
+    loadProviderModelSnapshot(context: Record<string, unknown>, modelId: string): Promise<{
+      model: ModelInfo | null;
+      details: string;
+    }>;
+    dashboardKimiUnsupportedMessage(
+      route: Record<string, unknown>,
+      command: string,
+      args: readonly string[],
+    ): string | null;
+    pickDashboardModel(ui: Record<string, unknown>, context: Record<string, unknown>): Promise<ModelInfo | null>;
+  };
+  assert.equal(typeof api.loadProviderModelSnapshot, "function");
+  assert.equal(typeof api.dashboardKimiUnsupportedMessage, "function");
+  const route = {
+    version: 1,
+    backendId: "kimi-code",
+    accountFingerprint: "acct_dashboard_kimi",
+    billingRealm: "kimi-code-membership-provider-managed-overage",
+    requestedModelId: "k3",
+    canonicalModelId: "k3",
+    resolutionState: "resolved",
+  } as const;
+  let openRouterCalls = 0;
+  const root = await mkdtemp(join(tmpdir(), "orcode-kimi-dashboard-model-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const openRouter = {
+    async listModels() { openRouterCalls += 1; throw new Error("OpenRouter forbidden"); },
+  };
+  const transitions: string[] = [];
+  const context = {
+    openRouter,
+    config: { ...structuredClone(DEFAULT_CONFIG), mainModel: "k3" },
+    configPath: join(root, "config.json"),
+    providerRuntime: {
+      currentSessionRoute: () => route,
+      async transitionModel(id: string) { transitions.push(id); },
+    },
+    providerCommands: {
+      async execute() {
+        return {
+          kind: "models",
+          backendId: "kimi-code",
+          models: [
+            { requestedModelId: "k3", canonicalModelId: "k3", displayName: "Kimi K3" },
+            { requestedModelId: "k3-256k", canonicalModelId: "k3-256k", displayName: "Kimi K3 256K" },
+          ],
+        };
+      },
+    },
+  };
+  const snapshot = await api.loadProviderModelSnapshot(context, "k3");
+  assert.equal(snapshot.model?.id, "k3");
+  assert.match(snapshot.details, /providerverwaltet|unbekannt/i);
+  const selected = await api.pickDashboardModel({
+    setStatus() {},
+    setCancelHandler() {},
+    async pickModel() { return snapshot.model ? { ...snapshot.model, id: "k3-256k", canonicalSlug: "k3-256k" } : null; },
+  }, context);
+  assert.equal(selected?.id, "k3-256k");
+  assert.deepEqual(transitions, ["k3-256k"]);
+  assert.equal(openRouterCalls, 0);
+  assert.match(api.dashboardKimiUnsupportedMessage(route, "image", []) ?? "", /Bilder.*nicht verfügbar/);
+  assert.match(api.dashboardKimiUnsupportedMessage(route, "whisper", []) ?? "", /Sprache.*nicht verfügbar/);
+  assert.match(api.dashboardKimiUnsupportedMessage(route, "compress", ["model"]) ?? "", /Kompressor.*nicht verfügbar/);
+  assert.equal(api.dashboardKimiUnsupportedMessage(route, "model", []), null);
 });
 
 test("runCli synchronizes the exact startup route into the current session before agent creation", async () => {
@@ -971,7 +2392,9 @@ test("runCli synchronizes the exact startup route into the current session befor
       sessionRouteAtAgentCreation = preferences.at(-1)?.[2];
       return {} as never;
     },
-    runPlain: async () => undefined,
+    runPlain: async (input: { ensureAgentForPrompt(): Promise<unknown> }) => {
+      await input.ensureAgentForPrompt();
+    },
     runDashboard: async () => undefined,
     stdout: { write: () => true },
     stderr: { write: () => true },
@@ -1160,9 +2583,16 @@ test("a healthy saved route cannot dispatch a different --model without an expli
       calls.push("agent:create");
       return {} as never;
     },
-    runPlain: async (input: { agent: unknown }) => {
+    runPlain: async (input: { agent: unknown; ensureAgentForPrompt(): Promise<unknown> }) => {
       plainAgent = input.agent;
       calls.push("plain");
+      await assert.rejects(
+        input.ensureAgentForPrompt(),
+        (error: unknown) => Boolean(
+          error && typeof error === "object" && "code" in error
+          && error.code === "provider-setup-required"
+        ),
+      );
     },
     runDashboard: async () => undefined,
     stdout: { write: () => true },
@@ -1173,9 +2603,9 @@ test("a healthy saved route cannot dispatch a different --model without an expli
   assert.equal(plainAgent, null);
   assert.deepEqual(calls, [
     "provider:inspect",
+    "plain",
     "provider:ensure",
     "provider:setup:plain",
-    "plain",
   ]);
 });
 
@@ -1208,7 +2638,10 @@ test("a setup-selected route becomes the authoritative main model before agent c
       calls.push("agent:create");
       return {} as never;
     },
-    runPlain: async () => calls.push("plain"),
+    runPlain: async (input: { ensureAgentForPrompt(): Promise<unknown> }) => {
+      await input.ensureAgentForPrompt();
+      calls.push("plain");
+    },
     runDashboard: async () => undefined,
     stdout: { write: () => true },
     stderr: { write: () => true },
@@ -1389,7 +2822,9 @@ test("plain setup cancellation keeps commands alive and the next model input reo
 
 test("model-dependent slash commands recheck the route while local command variants stay available", () => {
   assert.equal(commandRequiresRunnableRoute("model", []), true);
-  assert.equal(commandRequiresRunnableRoute("models", ["coder"]), true);
+  // `/models` owns its provider runtime guard internally. Wrapping it in the
+  // generic model-action guard would recursively acquire the same lease.
+  assert.equal(commandRequiresRunnableRoute("models", ["coder"]), false);
   assert.equal(commandRequiresRunnableRoute("think", ["high"]), true);
   assert.equal(commandRequiresRunnableRoute("compress", ["model", "vendor/small"]), true);
   assert.equal(commandRequiresRunnableRoute("fallback", ["+vendor/backup"]), true);
@@ -1458,6 +2893,117 @@ test("fullscreen model authentication failure invalidates proof and opens shared
     "route:invalidate+inspect",
     "setup:fullscreen",
   ]);
+});
+
+test("authentication recovery cannot invalidate a route while another full model run is active", async () => {
+  const Runtime = (cliModule as unknown as {
+    DefaultProviderRuntime: new (...args: unknown[]) => {
+      adoptCredentialActivation(route: RouteIdentityV1, persisted: boolean, secret: string): void;
+      currentSessionRoute(): RouteIdentityV1;
+      runWithReadyRoute<T>(run: (route: RouteIdentityV1) => Promise<T>): Promise<T>;
+    };
+  }).DefaultProviderRuntime;
+  const route = bootstrapRoute("vendor/concurrent-auth-recovery") as unknown as RouteIdentityV1;
+  const stateStore = new ProviderStateStore({
+    schemaVersion: 2,
+    revision: 0,
+    lifecycle: "configured",
+    connections: [{
+      id: "concurrent-auth-connection",
+      backendId: "openrouter",
+      enabled: true,
+      maturity: "stable",
+      credentialSlot: "v1:inference:76767676-7676-4767-8767-767676767676",
+      accountFingerprint: route.accountFingerprint,
+      accountFingerprintState: "verified",
+      billingRealm: "openrouter-payg",
+      lastHealth: null,
+    }],
+    defaultRoute: route,
+    cross: { enabled: false, preferredLead: null, preferredChallenger: null },
+  });
+  let activeRuns = 0;
+  let activationHeld = false;
+  const runtimeGuard = {
+    async acquire(signal: AbortSignal) {
+      if (signal.aborted) throw signal.reason;
+      if (activationHeld || activeRuns > 0) {
+        throw Object.assign(new Error("provider runtime busy"), {
+          code: "provider-runtime-not-idle",
+        });
+      }
+      activationHeld = true;
+      let held = true;
+      const assertHeld = () => {
+        if (!held || !activationHeld || activeRuns > 0) throw new Error("provider runtime lease lost");
+      };
+      return {
+        assertHeld,
+        release() {
+          if (!held) return;
+          held = false;
+          activationHeld = false;
+        },
+      };
+    },
+    beginRun() {
+      if (activationHeld) throw new Error("provider runtime activation held");
+      activeRuns += 1;
+      let active = true;
+      return () => {
+        if (!active) return;
+        active = false;
+        activeRuns -= 1;
+      };
+    },
+  };
+  let reconnects = 0;
+  const runtime = new Runtime(
+    { runtimeState: { inferenceValidity: "valid" } },
+    {},
+    {},
+    stateStore,
+    {
+      async reconnect() { reconnects += 1; },
+      ensureRunnableRoute() { return route; },
+    },
+    {},
+    runtimeGuard,
+    {},
+    "saved-secret",
+    null,
+    route.requestedModelId,
+    structuredClone(DEFAULT_CONFIG),
+  );
+  runtime.adoptCredentialActivation(route, true, "saved-secret");
+
+  let releaseSecondRun!: () => void;
+  let announceSecondRun!: () => void;
+  const secondRunEntered = new Promise<void>((resolve) => { announceSecondRun = resolve; });
+  const secondRun = runtime.runWithReadyRoute(async () => {
+    announceSecondRun();
+    await new Promise<void>((resolve) => { releaseSecondRun = resolve; });
+  });
+  await secondRunEntered;
+
+  const rejected = Object.assign(new Error("fixed authentication rejection"), {
+    code: "provider-authentication-rejected",
+  });
+  await assert.rejects(
+    runtime.runWithReadyRoute(async () => { throw rejected; }),
+    (error: unknown) => error === rejected,
+  );
+  assert.equal(reconnects, 0, "busy recovery must not inspect or reconnect");
+  assert.deepEqual(runtime.currentSessionRoute(), route, "busy recovery must not clear the route");
+
+  releaseSecondRun();
+  await secondRun;
+  await assert.rejects(
+    runtime.runWithReadyRoute(async () => { throw rejected; }),
+    (error: unknown) => error === rejected,
+  );
+  assert.equal(reconnects, 1, "idle recovery may reconnect under exclusive ownership");
+  assert.deepEqual(runtime.currentSessionRoute(), route);
 });
 
 test("a real panel authentication rejection settles every call then reaches shared route invalidation and setup without raw leakage", async () => {
@@ -1984,8 +3530,8 @@ test("a valid no-saved-key process-only route reaches a noninteractive run witho
     "provider:inspect",
     "provider:ensure",
     "provider:ensure",
-    "agent:create",
     "provider:ensure",
+    "agent:create",
     "agent:run:hello",
   ]);
 });

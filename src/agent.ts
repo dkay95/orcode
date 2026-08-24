@@ -102,6 +102,42 @@ export interface AgentRunResult {
   modelSteps: number;
 }
 
+export interface ModelRuntimeBindingIdentityV1 {
+  readonly version: 1;
+  readonly stateRevision: number;
+  readonly generation: number;
+  readonly connectionId: string;
+  readonly backendId: ModelRuntime["backendId"];
+  readonly route: RouteIdentityV1;
+}
+
+const MODEL_RUNTIME_BINDINGS = new WeakMap<ModelRuntime, ModelRuntimeBindingIdentityV1>();
+
+export function bindModelRuntimeIdentity<T extends ModelRuntime>(
+  runtime: T,
+  binding: ModelRuntimeBindingIdentityV1,
+): T {
+  const immutable = immutableModelRuntimeIdentity(binding);
+  if (
+    runtime.backendId !== immutable.backendId
+    || immutable.route.backendId !== immutable.backendId
+    || immutable.route.resolutionState !== "resolved"
+    || !immutable.route.canonicalModelId
+  ) throw new Error("Model runtime binding identity is invalid.");
+  const existing = MODEL_RUNTIME_BINDINGS.get(runtime);
+  if (existing && !exactModelRuntimeIdentity(existing, immutable)) {
+    throw new Error("Model runtime binding identity changed.");
+  }
+  MODEL_RUNTIME_BINDINGS.set(runtime, immutable);
+  return runtime;
+}
+
+export function readModelRuntimeIdentity(
+  runtime: ModelRuntime,
+): ModelRuntimeBindingIdentityV1 | null {
+  return MODEL_RUNTIME_BINDINGS.get(runtime) ?? null;
+}
+
 /**
  * Thrown when a run cannot be completed. Keeps name and message of the
  * original error so existing cancellation detection keeps working, and carries
@@ -137,6 +173,7 @@ interface LocalToolInvocation {
 
 export class OrcodeAgent {
   readonly guard: WorkspaceGuard;
+  #runtimeBinding: ModelRuntimeBindingIdentityV1 | null;
   #binding: {
     session: SessionStore;
     journal: ChangeJournal;
@@ -162,8 +199,9 @@ export class OrcodeAgent {
   readonly #readRegistry = new ReadRegistry();
 
   private constructor(
-    private readonly runtime: ModelRuntime,
+    private runtime: ModelRuntime,
     private route: RouteIdentityV1,
+    runtimeBinding: ModelRuntimeBindingIdentityV1 | null,
     private readonly approvals: ApprovalManager,
     session: SessionStore,
     private readonly config: OrcodeConfigWithBudget,
@@ -178,6 +216,7 @@ export class OrcodeAgent {
     private readonly codingToolsFactory: typeof createCodingTools,
   ) {
     this.guard = guard;
+    this.#runtimeBinding = runtimeBinding;
     this.#binding = createChatBinding(session);
   }
 
@@ -185,6 +224,7 @@ export class OrcodeAgent {
     /** Temporary compatibility path until Task 6 resolves provider runtimes. */
     openRouter?: OpenRouterService;
     runtime?: ModelRuntime;
+    runtimeBinding?: ModelRuntimeBindingIdentityV1;
     route?: RouteIdentityV1;
     approvals: ApprovalManager;
     session: SessionStore;
@@ -208,12 +248,23 @@ export class OrcodeAgent {
         ? createOpenRouterModelRuntime(options.openRouter, options.config, route)
         : null);
     if (!runtime) throw new Error("Model runtime is required.");
-    if (runtime.backendId !== route.backendId) {
-      throw new Error("Model runtime does not match the selected route.");
-    }
+    const sessionRoute = options.session.data.route
+      ? immutableRuntimeRoute(options.session.data.route)
+      : route;
+    const runtimeBinding = options.runtimeBinding
+      ? immutableModelRuntimeIdentity(options.runtimeBinding)
+      : null;
+    assertExactRuntimeBinding(
+      runtime,
+      route,
+      sessionRoute,
+      runtimeBinding,
+      options.runtime !== undefined,
+    );
     return new OrcodeAgent(
       runtime,
       route,
+      runtimeBinding,
       options.approvals,
       options.session,
       options.config,
@@ -244,21 +295,50 @@ export class OrcodeAgent {
     return this.#binding.artifacts;
   }
 
+  /** Atomically moves one agent owner to an exact session/route/runtime tuple. */
+  rebind(input: {
+    session: SessionStore;
+    route: RouteIdentityV1;
+    runtime: ModelRuntime;
+    runtimeBinding: ModelRuntimeBindingIdentityV1;
+  }): void {
+    const route = immutableRuntimeRoute(input.route);
+    const runtimeBinding = immutableModelRuntimeIdentity(input.runtimeBinding);
+    const sessionRoute = input.session.data.route
+      ? immutableRuntimeRoute(input.session.data.route)
+      : null;
+    if (!sessionRoute) throw new Error("Model runtime, route, and session binding do not match.");
+    assertExactRuntimeBinding(input.runtime, route, sessionRoute, runtimeBinding, true);
+    const binding = createChatBinding(input.session);
+    this.runtime = input.runtime;
+    this.route = route;
+    this.#runtimeBinding = runtimeBinding;
+    this.#binding = binding;
+    this.#lastUsage = null;
+    this.#mainModelInfo = null;
+    this.#compressorPrice = null;
+    this.#lastResolvedModel = null;
+  }
+
   /** Swap chat-scoped writers atomically and retain only exact-route caches. */
   setSession(session: SessionStore): void {
-    const next = createChatBinding(session);
     const sessionRoute = session.data.route
       ? immutableRuntimeRoute(session.data.route)
       : this.route;
     const routeChanged = !exactRuntimeRoute(sessionRoute, this.route);
+    if (routeChanged) {
+      throw new Error("A route-changing session requires an atomic runtime rebind.");
+    }
+    assertExactRuntimeBinding(
+      this.runtime,
+      this.route,
+      sessionRoute,
+      this.#runtimeBinding,
+      this.#runtimeBinding !== null,
+    );
+    const next = createChatBinding(session);
     this.#binding = next;
     this.#lastUsage = null;
-    if (routeChanged) {
-      this.route = sessionRoute;
-      this.#mainModelInfo = null;
-      this.#compressorPrice = null;
-      this.#lastResolvedModel = null;
-    }
   }
 
   /**
@@ -1355,6 +1435,42 @@ function immutableRuntimeRoute(route: RouteIdentityV1): RouteIdentityV1 {
   });
 }
 
+function immutableModelRuntimeIdentity(
+  binding: ModelRuntimeBindingIdentityV1,
+): ModelRuntimeBindingIdentityV1 {
+  const route = immutableRuntimeRoute(binding.route);
+  if (
+    binding.version !== 1
+    || !Number.isSafeInteger(binding.stateRevision)
+    || binding.stateRevision < 0
+    || !Number.isSafeInteger(binding.generation)
+    || binding.generation < 0
+    || typeof binding.connectionId !== "string"
+    || binding.connectionId.length < 1
+    || binding.connectionId.length > 256
+    || /[\u0000-\u001f\u007f]/u.test(binding.connectionId)
+    || route.version !== 1
+    || route.backendId !== binding.backendId
+    || typeof route.accountFingerprint !== "string"
+    || route.accountFingerprint.length < 1
+    || typeof route.billingRealm !== "string"
+    || route.billingRealm.length < 1
+    || typeof route.requestedModelId !== "string"
+    || route.requestedModelId.length < 1
+    || route.resolutionState !== "resolved"
+    || typeof route.canonicalModelId !== "string"
+    || route.canonicalModelId.length < 1
+  ) throw new Error("Model runtime binding identity is invalid.");
+  return Object.freeze({
+    version: 1,
+    stateRevision: binding.stateRevision,
+    generation: binding.generation,
+    connectionId: binding.connectionId,
+    backendId: binding.backendId,
+    route,
+  });
+}
+
 function exactRuntimeRoute(left: RouteIdentityV1, right: RouteIdentityV1): boolean {
   return left.version === right.version
     && left.backendId === right.backendId
@@ -1363,6 +1479,37 @@ function exactRuntimeRoute(left: RouteIdentityV1, right: RouteIdentityV1): boole
     && left.requestedModelId === right.requestedModelId
     && left.canonicalModelId === right.canonicalModelId
     && left.resolutionState === right.resolutionState;
+}
+
+function exactModelRuntimeIdentity(
+  left: ModelRuntimeBindingIdentityV1,
+  right: ModelRuntimeBindingIdentityV1,
+): boolean {
+  return left.version === right.version
+    && left.stateRevision === right.stateRevision
+    && left.generation === right.generation
+    && left.connectionId === right.connectionId
+    && left.backendId === right.backendId
+    && exactRuntimeRoute(left.route, right.route);
+}
+
+function assertExactRuntimeBinding(
+  runtime: ModelRuntime,
+  route: RouteIdentityV1,
+  sessionRoute: RouteIdentityV1,
+  expected: ModelRuntimeBindingIdentityV1 | null,
+  requireRegisteredIdentity: boolean,
+): void {
+  if (runtime.backendId !== route.backendId || !exactRuntimeRoute(sessionRoute, route)) {
+    throw new Error("Model runtime, route, and session binding do not match.");
+  }
+  const registered = MODEL_RUNTIME_BINDINGS.get(runtime) ?? null;
+  if (
+    (requireRegisteredIdentity && (!expected || !registered))
+    || (expected && !exactRuntimeRoute(expected.route, route))
+    || (expected && expected.backendId !== route.backendId)
+    || (expected && registered && !exactModelRuntimeIdentity(expected, registered))
+  ) throw new Error("Model runtime, route, and session binding do not match.");
 }
 
 function createChatBinding(session: SessionStore): {
