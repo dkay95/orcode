@@ -119,7 +119,14 @@ export type ProviderCredentialIntent =
       allowProcessOnly?: (kind: "inference" | "management", reason: string) => Promise<boolean>;
     }
   | { kind: "save"; credentialKind: "inference" | "management" }
-  | { kind: "forget"; credentialKind: "inference" | "management" };
+  | {
+      kind: "forget";
+      credentialKind: "inference" | "management";
+      targetConnectionId?: string;
+      targetCredentialSlot?: string;
+      authorize?: () => boolean;
+      onForgotten?: () => void;
+    };
 
 export interface ProviderCredentialIntentPort {
   apply(intent: ProviderCredentialIntent): Promise<{
@@ -152,7 +159,7 @@ export type ProviderCommandIntent =
   | {
       kind: "connect" | "enable" | "disable" | "disconnect" | "reconnect" | "models" | "logout";
       backendId: ProviderCommandBackendId;
-      confirmed?: true;
+      confirmationToken?: string;
     };
 
 export interface ProviderCommandStatusEntry {
@@ -197,6 +204,7 @@ export type ProviderCommandResult =
       operation: "disable" | "disconnect" | "logout";
       backendId: "openrouter";
       message: string;
+      confirmationToken: string;
     }
   | {
       kind: "changed";
@@ -2469,7 +2477,7 @@ async function providerAccountCommand(
     result = await providerCommands.execute({
       kind: result.operation,
       backendId: result.backendId,
-      confirmed: true,
+      confirmationToken: result.confirmationToken,
     }, surface);
   }
   renderProviderCommandResult(result, context.out);

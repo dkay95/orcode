@@ -569,12 +569,13 @@ test("provider disable and logout confirmations are exact, never YOLO-bypassed, 
     providerCommands: {
       async execute(intent: Record<string, unknown>) {
         intents.push(intent);
-        if (intent.confirmed !== true) {
+        if (intent.confirmationToken !== "opaque-confirmation-token") {
           return {
             kind: "confirmation-required",
             operation: intent.kind,
             backendId: intent.backendId,
             message: `Bestätige ${String(intent.kind)}.`,
+            confirmationToken: "opaque-confirmation-token",
           };
         }
         return {
@@ -602,7 +603,11 @@ test("provider disable and logout confirmations are exact, never YOLO-bypassed, 
   assert.equal(confirmations.length, 2);
   assert.deepEqual(intents.slice(1), [
     { kind: "logout", backendId: "openrouter" },
-    { kind: "logout", backendId: "openrouter", confirmed: true },
+    {
+      kind: "logout",
+      backendId: "openrouter",
+      confirmationToken: "opaque-confirmation-token",
+    },
   ]);
 });
 

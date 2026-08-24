@@ -1275,11 +1275,19 @@ test("the real provider runtime command port fences active runs and keeps Coming
     route.requestedModelId,
     config,
   );
+  const disablePrompt = await runtime.execute(
+    { kind: "disable", backendId: "openrouter" },
+    "plain",
+  );
   const active = runtime.runWithReadyRoute(async () => new Promise<void>((resolve) => {
     releaseRun = resolve;
   }));
   await assert.rejects(
-    runtime.execute({ kind: "disable", backendId: "openrouter", confirmed: true }, "plain"),
+    runtime.execute({
+      kind: "disable",
+      backendId: "openrouter",
+      confirmationToken: disablePrompt.confirmationToken,
+    }, "plain"),
     (error: unknown) => Boolean(error && typeof error === "object" && "code" in error
       && error.code === "provider-runtime-not-idle"),
   );
@@ -1289,7 +1297,11 @@ test("the real provider runtime command port fences active runs and keeps Coming
   releaseRun();
   await active;
   const disabled = await runtime.execute(
-    { kind: "disable", backendId: "openrouter", confirmed: true },
+    {
+      kind: "disable",
+      backendId: "openrouter",
+      confirmationToken: disablePrompt.confirmationToken,
+    },
     "plain",
   );
   assert.equal(disabled.kind, "changed");
@@ -1332,8 +1344,16 @@ test("the real provider runtime command port fences active runs and keeps Coming
   assert.equal(processProvider?.isDefault, true);
   assert.equal(processProvider?.accountFingerprintSuffix, "…123456");
   assert.notEqual(processProvider?.accountFingerprintSuffix, route.accountFingerprint);
+  const processDisablePrompt = await processRuntime.execute(
+    { kind: "disable", backendId: "openrouter" },
+    "plain",
+  );
   const processDisabled = await processRuntime.execute(
-    { kind: "disable", backendId: "openrouter", confirmed: true },
+    {
+      kind: "disable",
+      backendId: "openrouter",
+      confirmationToken: processDisablePrompt.confirmationToken,
+    },
     "plain",
   );
   assert.equal(processDisabled.kind, "changed");
@@ -1371,8 +1391,16 @@ test("the real provider runtime command port fences active runs and keeps Coming
     route.requestedModelId,
     structuredClone(DEFAULT_CONFIG),
   );
+  const legacyLogoutPrompt = await legacyRuntime.execute(
+    { kind: "logout", backendId: "openrouter" },
+    "plain",
+  );
   const legacyLogout = await legacyRuntime.execute(
-    { kind: "logout", backendId: "openrouter", confirmed: true },
+    {
+      kind: "logout",
+      backendId: "openrouter",
+      confirmationToken: legacyLogoutPrompt.confirmationToken,
+    },
     "plain",
   );
   assert.equal(legacyLogout.kind, "changed");
@@ -1380,6 +1408,393 @@ test("the real provider runtime command port fences active runs and keeps Coming
   assert.equal(legacyState.read().connections[0]?.credentialSlot, "legacy:inference");
   assert.equal(legacyState.read().connections[0]?.enabled, false);
   assert.equal(legacyState.read().defaultRoute, null);
+});
+
+function providerCommandReviewFixture(options: {
+  state?: ProviderSetupStateV1;
+  route?: NonNullable<ProviderSetupStateV1["defaultRoute"]>;
+} = {}) {
+  const Runtime = (cliModule as unknown as {
+    DefaultProviderRuntime: new (...args: unknown[]) => {
+      execute(intent: Record<string, unknown>, surface: "plain"): Promise<Record<string, unknown>>;
+      adoptCredentialActivation(route: Record<string, unknown>, persisted: boolean, secret: string): void;
+      ensureRunnableRoute(): Record<string, unknown>;
+    };
+  }).DefaultProviderRuntime;
+  const route = options.route ?? {
+    ...bootstrapRoute("vendor/review"),
+    accountFingerprint: "acct_review_fixture_111111",
+  } as NonNullable<ProviderSetupStateV1["defaultRoute"]>;
+  const slot = "v1:inference:11111111-1111-4111-8111-111111111119";
+  const initial = options.state ?? {
+    schemaVersion: 1,
+    revision: 0,
+    lifecycle: "configured",
+    connections: [{
+      id: "review-connection-1",
+      backendId: "openrouter",
+      enabled: true,
+      maturity: "stable",
+      credentialSlot: slot,
+      accountFingerprint: route.accountFingerprint,
+      accountFingerprintState: "verified",
+      billingRealm: "openrouter-payg",
+      lastHealth: null,
+    }],
+    defaultRoute: route,
+    cross: { enabled: false, preferredLead: null, preferredChallenger: null },
+  } satisfies ProviderSetupStateV1;
+  let stateEffects = 0;
+  let credentialEffects = 0;
+  let runtimeEffects = 0;
+  const stateStore = new ProviderStateStore(initial, {
+    persist: async (request) => {
+      stateEffects += 1;
+      const current = stateStore.read();
+      request.assertCurrent();
+      const next = request.build(current);
+      request.adopt(next);
+      return next;
+    },
+  });
+  const runtimeGuard = providerRuntimeGuardFixture();
+  const coordinator = providerCoordinatorMutationFixture(runtimeGuard);
+  const config = structuredClone(DEFAULT_CONFIG);
+  config.providerSetup = structuredClone(initial);
+  const runtime = new Runtime(
+    { forgetKey() { runtimeEffects += 1; } },
+    {},
+    {
+      descriptor() { return { id: "openrouter", displayName: "OpenRouter", maturity: "stable" }; },
+      entries() {
+        return [{
+          id: "openrouter",
+          displayName: "OpenRouter",
+          maturity: "stable",
+          connectable: true,
+        }];
+      },
+    },
+    stateStore,
+    { ensureRunnableRoute: () => route },
+    coordinator,
+    { beginRun() { return () => undefined; } },
+    {
+      async apply(intent: { authorize?: () => boolean; onForgotten?: () => void }) {
+        if (intent.authorize && !intent.authorize()) return { kind: "unchanged" };
+        credentialEffects += 1;
+        intent.onForgotten?.();
+        return { kind: "forgotten" };
+      },
+    },
+    "saved-secret",
+    null,
+    route.requestedModelId,
+    config,
+  );
+  return {
+    runtime,
+    stateStore,
+    route,
+    slot,
+    effects: () => ({ stateEffects, credentialEffects, runtimeEffects }),
+  };
+}
+
+test("provider confirmation tokens bind every destructive intent to the exact fenced provider identity", async () => {
+  for (const operation of ["disable", "disconnect", "logout"] as const) {
+    const fixture = providerCommandReviewFixture();
+    const requested = await fixture.runtime.execute(
+      { kind: operation, backendId: "openrouter" },
+      "plain",
+    );
+    assert.equal(requested.kind, "confirmation-required");
+    const token = requested.confirmationToken;
+    assert.equal(typeof token, "string");
+    if (typeof token !== "string") throw new Error("confirmation token missing");
+    assert.ok(token.length >= 16);
+    assert.doesNotMatch(token, /review|connection|inference|acct|vendor|111111/i);
+
+    const replacementRoute = {
+      ...fixture.route,
+      accountFingerprint: "acct_replacement_fixture_222222",
+      requestedModelId: "vendor/replacement",
+      canonicalModelId: "vendor/replacement",
+    };
+    fixture.stateStore.replace({
+      ...fixture.stateStore.read(),
+      connections: [{
+        ...fixture.stateStore.read().connections[0]!,
+        id: "replacement-connection",
+        credentialSlot: "v1:inference:22222222-2222-4222-8222-222222222222",
+        accountFingerprint: replacementRoute.accountFingerprint,
+      }],
+      defaultRoute: replacementRoute,
+    }, 0);
+    const beforeAccept = fixture.stateStore.read();
+    const stale = await fixture.runtime.execute(
+      { kind: operation, backendId: "openrouter", confirmationToken: token },
+      "plain",
+    );
+    assert.equal(stale.kind, "confirmation-required");
+    assert.equal(typeof stale.confirmationToken, "string");
+    assert.notEqual(stale.confirmationToken, token);
+    assert.deepEqual(fixture.stateStore.read(), beforeAccept);
+    assert.deepEqual(fixture.effects(), {
+      stateEffects: 0,
+      credentialEffects: 0,
+      runtimeEffects: 0,
+    });
+  }
+
+  const replayFixture = providerCommandReviewFixture();
+  const replayPrompt = await replayFixture.runtime.execute(
+    { kind: "disable", backendId: "openrouter" },
+    "plain",
+  );
+  assert.equal(replayPrompt.kind, "confirmation-required");
+  const replayToken = replayPrompt.confirmationToken;
+  const changed = await replayFixture.runtime.execute(
+    { kind: "disable", backendId: "openrouter", confirmationToken: replayToken },
+    "plain",
+  );
+  assert.equal(changed.kind, "changed");
+  const effectsAfterChange = replayFixture.effects();
+  const replayed = await replayFixture.runtime.execute(
+    { kind: "disable", backendId: "openrouter", confirmationToken: replayToken },
+    "plain",
+  );
+  assert.equal(replayed.kind, "confirmation-required");
+  assert.notEqual(replayed.confirmationToken, replayToken);
+  assert.deepEqual(replayFixture.effects(), effectsAfterChange);
+
+  const crossOperationFixture = providerCommandReviewFixture();
+  const crossPrompt = await crossOperationFixture.runtime.execute(
+    { kind: "disable", backendId: "openrouter" },
+    "plain",
+  );
+  const crossOperation = await crossOperationFixture.runtime.execute(
+    {
+      kind: "disconnect",
+      backendId: "openrouter",
+      confirmationToken: crossPrompt.confirmationToken,
+    },
+    "plain",
+  );
+  assert.equal(crossOperation.kind, "confirmation-required");
+  assert.deepEqual(crossOperationFixture.effects(), {
+    stateEffects: 0,
+    credentialEffects: 0,
+    runtimeEffects: 0,
+  });
+
+  const processFixture = providerCommandReviewFixture({
+    state: structuredClone(DEFAULT_CONFIG.providerSetup) as ProviderSetupStateV1,
+  });
+  processFixture.runtime.adoptCredentialActivation(
+    processFixture.route as unknown as Record<string, unknown>,
+    false,
+    "process-secret",
+  );
+  const processPrompt = await processFixture.runtime.execute(
+    { kind: "disable", backendId: "openrouter" },
+    "plain",
+  );
+  processFixture.runtime.adoptCredentialActivation(
+    processFixture.route as unknown as Record<string, unknown>,
+    false,
+    "replacement-process-secret",
+  );
+  const staleProcess = await processFixture.runtime.execute(
+    {
+      kind: "disable",
+      backendId: "openrouter",
+      confirmationToken: processPrompt.confirmationToken,
+    },
+    "plain",
+  );
+  assert.equal(staleProcess.kind, "confirmation-required");
+  assert.deepEqual(processFixture.runtime.ensureRunnableRoute(), processFixture.route);
+  assert.deepEqual(processFixture.effects(), {
+    stateEffects: 0,
+    credentialEffects: 0,
+    runtimeEffects: 0,
+  });
+});
+
+test("logout forgets a disabled versioned connection through the restart-safe journal without touching preserved slots", async () => {
+  const fixture = await providerForgetActivationFixture();
+  const Runtime = (cliModule as unknown as {
+    DefaultProviderRuntime: new (...args: unknown[]) => {
+      execute(intent: Record<string, unknown>, surface: "plain"): Promise<Record<string, unknown>>;
+    };
+  }).DefaultProviderRuntime;
+  const registry = {
+    descriptor() { return { id: "openrouter", displayName: "OpenRouter", maturity: "stable" }; },
+    entries() { return []; },
+  };
+  const config = structuredClone(DEFAULT_CONFIG);
+  config.providerSetup = fixture.stateStore.read();
+  const runtime = new Runtime(
+    fixture.openRouter,
+    fixture.credentials,
+    registry,
+    fixture.stateStore,
+    { ensureRunnableRoute: () => fixture.route },
+    fixture.coordinator,
+    { beginRun() { return () => undefined; } },
+    fixture.controller,
+    fixture.oldSecret,
+    null,
+    fixture.route.requestedModelId,
+    config,
+  );
+
+  const disablePrompt = await runtime.execute({ kind: "disable", backendId: "openrouter" }, "plain");
+  const disabled = await runtime.execute({
+    kind: "disable",
+    backendId: "openrouter",
+    confirmationToken: disablePrompt.confirmationToken,
+  }, "plain");
+  assert.equal(disabled.kind, "changed");
+  assert.equal(fixture.stateStore.read().connections[0]?.enabled, false);
+
+  const logoutPrompt = await runtime.execute({ kind: "logout", backendId: "openrouter" }, "plain");
+  await assert.rejects(
+    runtime.execute({
+      kind: "logout",
+      backendId: "openrouter",
+      confirmationToken: logoutPrompt.confirmationToken,
+    }, "plain"),
+    /cleanup is pending/i,
+  );
+  assert.deepEqual(await fixture.journal.readPending(), {
+    phase: "prepared",
+    target: {
+      kind: "versioned",
+      slot: { version: 1, kind: "inference", id: fixture.oldSlotId },
+    },
+  });
+  assert.equal(fixture.slots.has(fixture.oldSlotId), true);
+
+  fixture.allowOldSlotDelete();
+  const durable = (JSON.parse(await readFile(fixture.configPath, "utf8")) as {
+    providerSetup: ProviderSetupStateV1;
+  }).providerSetup;
+  const restartedStore = new ProviderStateStore(durable, {
+    persist: (request) => fixture.api.persistProviderSetupState(fixture.configPath, request),
+  });
+  const restartedGuard = providerRuntimeGuardFixture();
+  const restartedCoordinator = new ProviderActivationCoordinator({
+    appHome: fixture.root,
+    configPath: fixture.configPath,
+    privateStore: new PrivateStore({ root: fixture.root }),
+    credentials: fixture.credentials as never,
+    adapter: fixture.adapter as never,
+    stateStore: restartedStore,
+    runtimeGuard: restartedGuard,
+  });
+  const restartedJournal = new fixture.api.ProviderCredentialForgetJournal({
+    appHome: fixture.root,
+    privateStore: new PrivateStore({ root: fixture.root }),
+  });
+  const restartedOpenRouter = new OpenRouterService(fixture.oldSecret);
+  const restartedController = fixture.api.createProviderCredentialController({
+    stateStore: restartedStore,
+    openRouter: restartedOpenRouter,
+    credentials: fixture.credentials,
+    activationCoordinator: restartedCoordinator,
+    forgetJournal: restartedJournal,
+  });
+  const restartedConfig = structuredClone(DEFAULT_CONFIG);
+  restartedConfig.providerSetup = restartedStore.read();
+  const restartedRuntime = new Runtime(
+    restartedOpenRouter,
+    fixture.credentials,
+    registry,
+    restartedStore,
+    { ensureRunnableRoute() { throw new Error("disabled route is not runnable"); } },
+    restartedCoordinator,
+    { beginRun() { return () => undefined; } },
+    restartedController,
+    fixture.oldSecret,
+    null,
+    fixture.route.requestedModelId,
+    restartedConfig,
+  );
+  const retryPrompt = await restartedRuntime.execute({ kind: "logout", backendId: "openrouter" }, "plain");
+  const loggedOut = await restartedRuntime.execute({
+    kind: "logout",
+    backendId: "openrouter",
+    confirmationToken: retryPrompt.confirmationToken,
+  }, "plain");
+  assert.equal(loggedOut.kind, "changed");
+  assert.equal(loggedOut.defaultCleared, false);
+  assert.equal(fixture.slots.has(fixture.oldSlotId), false);
+  assert.deepEqual(restartedStore.read().connections, []);
+  assert.equal(await restartedJournal.readPending(), null);
+  assert.equal(restartedOpenRouter.hasKey, false);
+});
+
+test("provider status treats disabled health as historical and prefers the active process route", async () => {
+  const route = {
+    ...bootstrapRoute("vendor/status"),
+    accountFingerprint: "acct_status_old_111111",
+  } as NonNullable<ProviderSetupStateV1["defaultRoute"]>;
+  const staleState: ProviderSetupStateV1 = {
+    schemaVersion: 1,
+    revision: 3,
+    lifecycle: "configured",
+    connections: [{
+      id: "disabled-status-connection",
+      backendId: "openrouter",
+      enabled: false,
+      maturity: "stable",
+      credentialSlot: "v1:inference:33333333-3333-4333-8333-333333333333",
+      accountFingerprint: route.accountFingerprint,
+      accountFingerprintState: "verified",
+      billingRealm: "openrouter-payg",
+      lastHealth: {
+        credential: "valid",
+        connectivity: "connected",
+        spend: "available",
+        runtime: "ready",
+        observedAt: 1,
+        generation: 1,
+      },
+    }],
+    defaultRoute: null,
+    cross: { enabled: false, preferredLead: null, preferredChallenger: null },
+  };
+  const disabledFixture = providerCommandReviewFixture({ state: staleState, route });
+  const disabledStatus = await disabledFixture.runtime.execute({ kind: "status" }, "plain");
+  const disabledProvider = (disabledStatus.providers as Array<Record<string, unknown>>)[0];
+  assert.equal(disabledProvider?.configuration, "disabled");
+  assert.equal(disabledProvider?.headline, null);
+  assert.equal(disabledProvider?.health, null);
+  assert.equal(disabledProvider?.accountFingerprintSuffix, null);
+  assert.equal(disabledProvider?.isDefault, false);
+
+  const processRoute = {
+    ...route,
+    accountFingerprint: "acct_status_process_222222",
+    requestedModelId: "vendor/process-status",
+    canonicalModelId: "vendor/process-status",
+  };
+  const processFixture = providerCommandReviewFixture({ state: staleState, route: processRoute });
+  processFixture.runtime.adoptCredentialActivation(processRoute, false, "process-secret");
+  const processStatus = await processFixture.runtime.execute({ kind: "status" }, "plain");
+  const processProvider = (processStatus.providers as Array<Record<string, unknown>>)[0];
+  assert.equal(processProvider?.configuration, "enabled");
+  assert.equal(processProvider?.headline, "ready");
+  assert.deepEqual(processProvider?.health, {
+    credential: "valid",
+    connectivity: "connected",
+    spend: "unknown",
+    runtime: "not-applicable",
+  });
+  assert.equal(processProvider?.accountFingerprintSuffix, "…222222");
+  assert.equal(processProvider?.isDefault, true);
 });
 
 const STARTUP_KEY_PREFIX = `${["sk", "or", "v1"].join("-")}-`;
@@ -1613,6 +2028,7 @@ async function providerForgetActivationFixture() {
     runtimeGuard,
     coordinator,
     controller,
+    openRouter,
     allowOldSlotDelete() { failOldSlotDelete = false; },
   };
 }

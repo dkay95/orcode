@@ -513,10 +513,40 @@ class SessionProviderRuntimeGuard implements ProviderActivationRuntimeGuard {
   }
 }
 
+type ProviderDestructiveOperation = "disable" | "disconnect" | "logout";
+type ProviderConfirmationResult = Extract<
+  ProviderCommandResult,
+  { kind: "confirmation-required" }
+>;
+
+interface ProviderConfirmationBinding {
+  operation: ProviderDestructiveOperation;
+  providerRevision: number;
+  connection: {
+    id: string;
+    enabled: boolean;
+    credentialSlot: string;
+    accountFingerprint: string;
+    billingRealm: string;
+  } | null;
+  defaultRoute: RouteIdentityV1 | null;
+  sessionRoute: RouteIdentityV1 | null;
+  processRouteGeneration: number;
+}
+
+class ProviderConfirmationStaleError extends Error {
+  constructor(readonly confirmation: ProviderConfirmationResult) {
+    super("Provider confirmation is stale.");
+    this.name = "ProviderConfirmationStaleError";
+  }
+}
+
 export class DefaultProviderRuntime implements ProviderRuntime {
   #preparedRoles: SetupPreparedRoles | null = null;
   #sessionRoute: RouteIdentityV1 | null = null;
   #sessionRoutePersisted = false;
+  #processRouteGeneration = 0;
+  readonly #providerConfirmations = new Map<string, ProviderConfirmationBinding>();
 
   constructor(
     readonly openRouter: OpenRouterService,
@@ -542,6 +572,7 @@ export class DefaultProviderRuntime implements ProviderRuntime {
     persisted: boolean,
     secret: string,
   ): void {
+    this.#processRouteGeneration += 1;
     this.#sessionRoute = structuredClone(route);
     this.#sessionRoutePersisted = persisted;
     this.#preparedRoles = null;
@@ -553,6 +584,7 @@ export class DefaultProviderRuntime implements ProviderRuntime {
   }
 
   adoptCredentialForget(): void {
+    this.#processRouteGeneration += 1;
     this.#sessionRoute = null;
     this.#sessionRoutePersisted = false;
     this.#preparedRoles = null;
@@ -624,9 +656,13 @@ export class DefaultProviderRuntime implements ProviderRuntime {
       this.#preparedRoles = result.preparedRoles
         ? structuredClone(result.preparedRoles)
         : null;
-      this.#sessionRoute = activatedRoute
+      const nextSessionRoute = activatedRoute
         ?? result.preparedRoles?.lead
         ?? this.#sessionRoute;
+      if (JSON.stringify(nextSessionRoute) !== JSON.stringify(this.#sessionRoute)) {
+        this.#processRouteGeneration += 1;
+      }
+      this.#sessionRoute = nextSessionRoute;
       if (activatedRoute) this.#sessionRoutePersisted = activatedPersisted;
     }
     return result;
@@ -656,6 +692,7 @@ export class DefaultProviderRuntime implements ProviderRuntime {
       }
       this.#sessionRoute = null;
       this.#sessionRoutePersisted = false;
+      this.#processRouteGeneration += 1;
     }
     return this.orchestrator.ensureRunnableRoute();
   }
@@ -733,6 +770,7 @@ export class DefaultProviderRuntime implements ProviderRuntime {
       run,
       isAuthenticationFailure: (error) => shouldReplaceCredential(error, this.openRouter),
       invalidateAndInspect: async () => {
+        this.#processRouteGeneration += 1;
         this.#sessionRoute = null;
         this.#sessionRoutePersisted = false;
         this.#preparedRoles = null;
@@ -741,6 +779,82 @@ export class DefaultProviderRuntime implements ProviderRuntime {
       runSetup: (requestedSurface) => this.runSetup(requestedSurface),
       surface,
     });
+  }
+
+  #selectedOpenRouterConnection(state: ProviderSetupStateV1) {
+    const matchesRoute = (route: RouteIdentityV1 | null) => route
+      ? state.connections.find((candidate) =>
+          candidate.backendId === "openrouter"
+          && candidate.accountFingerprint === route.accountFingerprint
+          && candidate.billingRealm === route.billingRealm
+        )
+      : undefined;
+    return matchesRoute(this.#sessionRoute)
+      ?? matchesRoute(state.defaultRoute)
+      ?? state.connections.find((candidate) =>
+        candidate.backendId === "openrouter" && candidate.enabled
+      )
+      ?? state.connections.find((candidate) => candidate.backendId === "openrouter");
+  }
+
+  #confirmationBinding(
+    operation: ProviderDestructiveOperation,
+    state: ProviderSetupStateV1,
+  ): ProviderConfirmationBinding {
+    const connection = this.#selectedOpenRouterConnection(state);
+    return {
+      operation,
+      providerRevision: state.revision,
+      connection: connection
+        ? {
+            id: connection.id,
+            enabled: connection.enabled,
+            credentialSlot: connection.credentialSlot,
+            accountFingerprint: connection.accountFingerprint,
+            billingRealm: connection.billingRealm,
+          }
+        : null,
+      defaultRoute: state.defaultRoute ? structuredClone(state.defaultRoute) : null,
+      sessionRoute: this.#sessionRoute ? structuredClone(this.#sessionRoute) : null,
+      processRouteGeneration: this.#processRouteGeneration,
+    };
+  }
+
+  #confirmationRequired(
+    operation: ProviderDestructiveOperation,
+    state = this.stateStore.read(),
+  ): ProviderConfirmationResult {
+    const confirmationToken = randomUUID();
+    this.#providerConfirmations.set(
+      confirmationToken,
+      this.#confirmationBinding(operation, state),
+    );
+    while (this.#providerConfirmations.size > 64) {
+      const oldest = this.#providerConfirmations.keys().next().value;
+      if (typeof oldest !== "string") break;
+      this.#providerConfirmations.delete(oldest);
+    }
+    return {
+      kind: "confirmation-required",
+      operation,
+      backendId: "openrouter",
+      message: operation === "logout"
+        ? "OpenRouter-Zugang wirklich abmelden und nur seinen aktuellen versionierten Schlüssel entfernen?"
+        : "Letzten nutzbaren OpenRouter-Zugang deaktivieren? Modellläufe stoppen, die Unterhaltung bleibt geöffnet.",
+      confirmationToken,
+    };
+  }
+
+  #consumeConfirmation(
+    token: string,
+    operation: ProviderDestructiveOperation,
+    state: ProviderSetupStateV1,
+  ): ProviderConfirmationBinding | null {
+    const expected = this.#providerConfirmations.get(token);
+    this.#providerConfirmations.delete(token);
+    if (!expected) return null;
+    const current = this.#confirmationBinding(operation, state);
+    return JSON.stringify(expected) === JSON.stringify(current) ? expected : null;
   }
 
   async execute(
@@ -812,29 +926,7 @@ export class DefaultProviderRuntime implements ProviderRuntime {
     }
 
     if (intent.kind === "logout") {
-      if (!intent.confirmed) {
-        return {
-          kind: "confirmation-required",
-          operation: "logout",
-          backendId: "openrouter",
-          message: "OpenRouter-Zugang wirklich abmelden und nur seinen aktuellen versionierten Schlüssel entfernen?",
-        };
-      }
-      const connection = this.stateStore.read().connections.find((candidate) =>
-        candidate.backendId === "openrouter" && candidate.enabled
-      );
-      if (connection?.credentialSlot.startsWith("v1:inference:")) {
-        await this.providerCredentials.apply({ kind: "forget", credentialKind: "inference" });
-      } else {
-        await this.#logoutWithoutVersionedCredential(connection?.id ?? null);
-      }
-      return {
-        kind: "changed",
-        operation: "logout",
-        backendId: "openrouter",
-        setupRequired: true,
-        defaultCleared: true,
-      };
+      return this.#logoutProvider(intent.confirmationToken);
     }
 
     if (intent.kind !== "disable" && intent.kind !== "disconnect") {
@@ -843,7 +935,7 @@ export class DefaultProviderRuntime implements ProviderRuntime {
     return this.#disableProvider({
       kind: intent.kind,
       backendId: "openrouter",
-      ...(intent.confirmed ? { confirmed: true as const } : {}),
+      ...(intent.confirmationToken ? { confirmationToken: intent.confirmationToken } : {}),
     });
   }
 
@@ -864,12 +956,15 @@ export class DefaultProviderRuntime implements ProviderRuntime {
           isDefault: false,
         };
       }
-      const connection = state.connections.find((candidate) =>
-        candidate.backendId === "openrouter" && candidate.enabled
-      ) ?? state.connections.find((candidate) => candidate.backendId === "openrouter");
-      const processRoute = !connection && this.#sessionRoute?.backendId === "openrouter"
+      const processRoute = !this.#sessionRoutePersisted
+          && this.#sessionRoute?.backendId === "openrouter"
         ? this.#sessionRoute
         : null;
+      const connection = processRoute
+        ? undefined
+        : state.connections.find((candidate) =>
+            candidate.backendId === "openrouter" && candidate.enabled
+          );
       const health = connection?.lastHealth ?? null;
       return {
         backendId: "openrouter",
@@ -914,107 +1009,155 @@ export class DefaultProviderRuntime implements ProviderRuntime {
     intent: {
       kind: "disable" | "disconnect";
       backendId: "openrouter";
-      confirmed?: true;
+      confirmationToken?: string;
     },
   ): Promise<ProviderCommandResult> {
     const before = this.stateStore.read();
     const connection = before.connections.find((candidate) =>
       candidate.backendId === "openrouter" && candidate.enabled
     );
-    if (!connection) {
-      if (this.#sessionRoute?.backendId === "openrouter") {
-        if (!intent.confirmed) {
-          return {
-            kind: "confirmation-required",
-            operation: intent.kind,
-            backendId: "openrouter",
-            message: "Letzten nutzbaren OpenRouter-Zugang deaktivieren? Modellläufe stoppen, die Unterhaltung bleibt geöffnet.",
-          };
-        }
-        await this.activationCoordinator.runExclusive(
-          { signal: new AbortController().signal, inspectCommitted: false },
-          async (lease) => {
-            await lease.assertHeld();
-            this.#sessionRoute = null;
-            this.#sessionRoutePersisted = false;
-            this.#preparedRoles = null;
-            await lease.assertHeld();
-          },
-        );
-        return {
-          kind: "changed",
-          operation: intent.kind,
-          backendId: "openrouter",
-          setupRequired: true,
-          defaultCleared: false,
-        };
-      }
+    const processRoute = !this.#sessionRoutePersisted
+        && this.#sessionRoute?.backendId === "openrouter"
+      ? this.#sessionRoute
+      : null;
+    if (!intent.confirmationToken && !connection && !processRoute) {
       return { kind: "unchanged", backendId: "openrouter", reason: "bereits deaktiviert" };
     }
-    const affectsDefault = Boolean(
+    const affectsDefault = Boolean(connection
+      &&
       before.defaultRoute
       && before.defaultRoute.backendId === connection.backendId
       && before.defaultRoute.accountFingerprint === connection.accountFingerprint
       && before.defaultRoute.billingRealm === connection.billingRealm
     );
     const isFinalEnabled = before.connections.filter((candidate) => candidate.enabled).length === 1;
-    if ((affectsDefault || isFinalEnabled) && !intent.confirmed) {
-      return {
-        kind: "confirmation-required",
-        operation: intent.kind,
-        backendId: "openrouter",
-        message: "Letzten nutzbaren OpenRouter-Zugang deaktivieren? Modellläufe stoppen, die Unterhaltung bleibt geöffnet.",
-      };
+    if (!intent.confirmationToken && (processRoute || affectsDefault || isFinalEnabled)) {
+      return this.#confirmationRequired(intent.kind, before);
     }
 
-    const committed = await this.activationCoordinator.runExclusive(
+    return this.activationCoordinator.runExclusive(
       { signal: new AbortController().signal, inspectCommitted: false },
       async (lease) => {
         await lease.assertHeld();
         const current = this.stateStore.read();
-        const selected = current.connections.find((candidate) => candidate.id === connection.id);
-        if (!selected?.enabled) return current;
-        const next = await this.stateStore.commit(current.revision, (authoritative) => ({
-          ...authoritative,
-          lifecycle: "configured",
-          connections: authoritative.connections.map((candidate) =>
-            candidate.id === connection.id ? { ...candidate, enabled: false } : candidate
-          ),
-          defaultRoute: authoritative.defaultRoute
-            && authoritative.defaultRoute.backendId === selected.backendId
-            && authoritative.defaultRoute.accountFingerprint === selected.accountFingerprint
-            && authoritative.defaultRoute.billingRealm === selected.billingRealm
-            ? null
-            : authoritative.defaultRoute,
-          cross: { enabled: false, preferredLead: null, preferredChallenger: null },
-        }));
+        const authorization = intent.confirmationToken
+          ? this.#consumeConfirmation(intent.confirmationToken, intent.kind, current)
+          : null;
+        if (intent.confirmationToken && !authorization) {
+          return this.#confirmationRequired(intent.kind, current);
+        }
+        const selected = authorization?.connection
+          ? current.connections.find((candidate) =>
+              candidate.id === authorization.connection!.id
+              && candidate.backendId === "openrouter"
+              && candidate.enabled
+            )
+          : current.connections.find((candidate) =>
+              candidate.backendId === "openrouter" && candidate.enabled
+            );
+        const activeProcessRoute = !this.#sessionRoutePersisted
+            && this.#sessionRoute?.backendId === "openrouter"
+          ? this.#sessionRoute
+          : null;
+        if (!selected && !activeProcessRoute) {
+          return { kind: "unchanged", backendId: "openrouter", reason: "bereits deaktiviert" };
+        }
+        const next = selected
+          ? await this.stateStore.commit(current.revision, (authoritative) => ({
+              ...authoritative,
+              lifecycle: "configured",
+              connections: authoritative.connections.map((candidate) =>
+                candidate.id === selected.id ? { ...candidate, enabled: false } : candidate
+              ),
+              defaultRoute: authoritative.defaultRoute
+                && authoritative.defaultRoute.backendId === selected.backendId
+                && authoritative.defaultRoute.accountFingerprint === selected.accountFingerprint
+                && authoritative.defaultRoute.billingRealm === selected.billingRealm
+                ? null
+                : authoritative.defaultRoute,
+              cross: { enabled: false, preferredLead: null, preferredChallenger: null },
+            }))
+          : current;
         await lease.assertHeld();
         this.config.providerSetup = requirePersistableProviderState(next);
+        const defaultCleared = current.defaultRoute !== null && next.defaultRoute === null;
+        if (defaultCleared || activeProcessRoute) {
+          this.#processRouteGeneration += 1;
+          this.#sessionRoute = null;
+          this.#sessionRoutePersisted = false;
+          this.#preparedRoles = null;
+        }
         await lease.assertHeld();
-        return next;
+        return {
+          kind: "changed",
+          operation: intent.kind,
+          backendId: "openrouter",
+          setupRequired: next.defaultRoute === null,
+          defaultCleared,
+        };
       },
     );
-    const defaultCleared = before.defaultRoute !== null && committed.defaultRoute === null;
-    if (defaultCleared) {
-      this.#sessionRoute = null;
-      this.#sessionRoutePersisted = false;
-      this.#preparedRoles = null;
-    }
-    return {
-      kind: "changed",
-      operation: intent.kind,
-      backendId: "openrouter",
-      setupRequired: committed.defaultRoute === null,
-      defaultCleared,
-    };
   }
 
-  async #logoutWithoutVersionedCredential(connectionId: string | null): Promise<void> {
-    await this.activationCoordinator.runExclusive(
+  async #logoutProvider(confirmationToken?: string): Promise<ProviderCommandResult> {
+    if (!confirmationToken) return this.#confirmationRequired("logout");
+    const expected = this.#providerConfirmations.get(confirmationToken);
+    if (
+      expected?.operation === "logout"
+      && expected.connection?.credentialSlot.startsWith("v1:inference:")
+    ) {
+      try {
+        await this.providerCredentials.apply({
+          kind: "forget",
+          credentialKind: "inference",
+          targetConnectionId: expected.connection.id,
+          targetCredentialSlot: expected.connection.credentialSlot,
+          authorize: () => {
+            const current = this.stateStore.read();
+            if (this.#consumeConfirmation(confirmationToken, "logout", current)) return true;
+            throw new ProviderConfirmationStaleError(
+              this.#confirmationRequired("logout", current),
+            );
+          },
+          onForgotten: () => this.adoptCredentialForget(),
+        });
+      } catch (error) {
+        if (error instanceof ProviderConfirmationStaleError) return error.confirmation;
+        throw error;
+      }
+      const after = this.stateStore.read();
+      const selectedStillExists = after.connections.some((candidate) =>
+        candidate.id === expected.connection!.id
+      );
+      if (selectedStillExists) {
+        return { kind: "unchanged", backendId: "openrouter", reason: "Zugang blieb erhalten" };
+      }
+      return {
+        kind: "changed",
+        operation: "logout",
+        backendId: "openrouter",
+        setupRequired: after.defaultRoute === null,
+        defaultCleared: expected.defaultRoute !== null && after.defaultRoute === null,
+      };
+    }
+    return this.#logoutWithoutVersionedCredential(
+      expected?.operation === "logout" ? expected.connection?.id ?? null : null,
+      confirmationToken,
+    );
+  }
+
+  async #logoutWithoutVersionedCredential(
+    connectionId: string | null,
+    confirmationToken: string,
+  ): Promise<ProviderCommandResult> {
+    return this.activationCoordinator.runExclusive(
       { signal: new AbortController().signal, inspectCommitted: false },
       async (lease) => {
         await lease.assertHeld();
         const current = this.stateStore.read();
+        if (!this.#consumeConfirmation(confirmationToken, "logout", current)) {
+          return this.#confirmationRequired("logout", current);
+        }
         const selected = connectionId === null
           ? undefined
           : current.connections.find((candidate) => candidate.id === connectionId);
@@ -1038,15 +1181,22 @@ export class DefaultProviderRuntime implements ProviderRuntime {
         this.config.providerSetup = requirePersistableProviderState(next);
         await lease.assertHeld();
         this.openRouter.forgetKey();
+        this.#processRouteGeneration += 1;
+        this.#sessionRoute = null;
+        this.#sessionRoutePersisted = false;
+        this.#preparedRoles = null;
+        this.savedSecret = null;
+        this.environmentSecret = null;
         await lease.assertHeld();
-        return next;
+        return {
+          kind: "changed",
+          operation: "logout",
+          backendId: "openrouter",
+          setupRequired: next.defaultRoute === null,
+          defaultCleared: current.defaultRoute !== null && next.defaultRoute === null,
+        };
       },
     );
-    this.#sessionRoute = null;
-    this.#sessionRoutePersisted = false;
-    this.#preparedRoles = null;
-    this.savedSecret = null;
-    this.environmentSecret = null;
   }
 }
 
@@ -1546,6 +1696,9 @@ export function createProviderCredentialController(input: {
 
       const signal = new AbortController().signal;
       if (intent.credentialKind === "inference") {
+        if (intent.kind !== "forget") {
+          throw new Error("Unsupported inference credential intent.");
+        }
         try {
           const result = await input.activationCoordinator.recoverAndRun(
             { signal, inspectCommitted: false },
@@ -1553,10 +1706,22 @@ export function createProviderCredentialController(input: {
               if (!input.forgetJournal) {
                 throw new Error("Provider credential cleanup journal is unavailable.");
               }
+              if (intent.authorize && !intent.authorize()) {
+                throw new Error("Provider confirmation authorization was rejected.");
+              }
               const state = input.stateStore.read();
-              const connection = state.connections.find((candidate) =>
-                candidate.backendId === "openrouter" && candidate.enabled
-              );
+              const connection = intent.targetConnectionId
+                ? state.connections.find((candidate) =>
+                    candidate.backendId === "openrouter"
+                    && candidate.id === intent.targetConnectionId
+                    && candidate.credentialSlot === intent.targetCredentialSlot
+                  )
+                : state.connections.find((candidate) =>
+                    candidate.backendId === "openrouter" && candidate.enabled
+                  );
+              if (intent.targetConnectionId && !connection) {
+                throw new Error("Provider confirmation target changed.");
+              }
               const target: ProviderCredentialForgetTarget =
                 connection?.credentialSlot?.startsWith("v1:inference:")
                   ? {
@@ -1585,7 +1750,8 @@ export function createProviderCredentialController(input: {
               await lease.assertHeld();
               input.openRouter.forgetKey();
               await lease.assertHeld();
-              input.onInferenceForgotten?.();
+              if (intent.onForgotten) intent.onForgotten();
+              else input.onInferenceForgotten?.();
               return {
                 kind: "forgotten" as const,
                 credentialKind: "inference" as const,
@@ -1594,7 +1760,8 @@ export function createProviderCredentialController(input: {
             },
           );
           return result.value;
-        } catch {
+        } catch (error) {
+          if (error instanceof ProviderConfirmationStaleError) throw error;
           throw new Error(
             "Provider credential cleanup is pending and will resume on restart.",
           );
