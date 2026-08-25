@@ -9,6 +9,7 @@ import { fileURLToPath } from "node:url";
 import {
   CliUsageError,
   commandRequiresRunnableRoute,
+  createModelPreferenceRouteAuthority,
   createDefaultProviderRuntime,
   createCliPlainSetupSurface,
   createSettingsRuntimeSnapshotPort,
@@ -27,6 +28,8 @@ import {
   resolveCliCommandName,
   runOutcomeExitCode,
   SessionProviderRuntimeGuard,
+  DefaultProviderRuntime,
+  persistProviderSetupState,
 } from "../src/cli.js";
 import {
   readModelRuntimeIdentity,
@@ -50,7 +53,13 @@ import {
   shouldReplaceCredential,
   type CommandContext,
 } from "../src/commands.js";
-import { DEFAULT_CONFIG, migrateAppHome, saveConfig } from "../src/config.js";
+import {
+  DEFAULT_CONFIG,
+  loadConfigDetailed,
+  migrateAppHome,
+  readConfigEditSnapshot,
+  saveConfig,
+} from "../src/config.js";
 import { createPanelCall, OpenRouterHttpError, OpenRouterService } from "../src/openrouter.js";
 import { askPanel } from "../src/panel.js";
 import * as panelModule from "../src/panel.js";
@@ -69,9 +78,20 @@ import {
   type ProviderStateCommitRequest,
 } from "../src/provider-state.js";
 import { PrivateStore } from "../src/private-store.js";
-import { SessionStore } from "../src/session.js";
+import {
+  prepareSessionPreferenceEdit,
+  readSessionEditSnapshot,
+  SessionStore,
+} from "../src/session.js";
 import { SetupOrchestrator } from "../src/setup.js";
 import type { ModelInfo } from "../src/types.js";
+import {
+  ModelPreferenceCrashError,
+  ModelPreferenceRecoveryRequiredError,
+  recoverModelPreferenceTransactions,
+  runModelPreferenceTransaction,
+  type ModelPreferenceFailpoint,
+} from "../src/model-preference-transaction.js";
 
 test("Provider-Backend-Matrix ist die unveränderliche Authority für Parser und Projektion", () => {
   assert.deepEqual(providerBackendActions("openrouter"), [
@@ -223,6 +243,73 @@ test("cached Settings snapshot mappt ausschließlich secretless Felder und führ
   assert.equal(Object.isFrozen(snapshot), true);
 });
 
+test("cached Settings model projection prefers the exact provider-aware authority over a mixed backend cache", () => {
+  const config = structuredClone(DEFAULT_CONFIG);
+  config.mainModel = "k3";
+  const kimiModel: ModelInfo = {
+    id: "k3",
+    canonicalSlug: "k3",
+    name: "Kimi K3",
+    description: "Kimi membership model",
+    contextLength: 262_144,
+    promptPrice: -1,
+    completionPrice: -1,
+    supportedParameters: ["tools", "reasoning"],
+    inputModalities: ["text"],
+    outputModalities: ["text"],
+  };
+  const wrongBackendModel: ModelInfo = {
+    id: "openai/gpt-cross-backend",
+    canonicalSlug: "openai/gpt-cross-backend-canonical",
+    name: "Wrong OpenRouter cache entry",
+    description: "must never enter a Kimi Settings route",
+    contextLength: 128_000,
+    promptPrice: 1,
+    completionPrice: 2,
+    supportedParameters: ["tools"],
+    inputModalities: ["text", "audio"],
+    outputModalities: ["text"],
+  };
+  let exactReads = 0;
+  const port = createSettingsRuntimeSnapshotPort({
+    config,
+    runtime: {
+      activity: () => ({ runActive: false, activationHeld: false }),
+      readCachedSettingsRoute: () => ({
+        backendId: "kimi-code",
+        providerLabel: "Kimi Code",
+        requestedModelId: "k3",
+        canonicalModelId: "k3",
+        modelLabel: "Kimi K3",
+        billingRealm: "kimi-code-membership-provider-managed-overage",
+      }),
+      readCachedProviderStatus: () => [],
+      readCachedSettingsModels: () => {
+        exactReads += 1;
+        return [kimiModel];
+      },
+      readCachedModels: () => [kimiModel, wrongBackendModel],
+    },
+    session: {
+      data: {
+        costs: { totalUsd: 0, costKnowledge: "unknown" },
+        dailySpendUsd: {},
+      },
+    },
+    ruleStore: { list: () => [] },
+    workspace: "/synthetic/provider-aware-settings",
+  });
+
+  const snapshot = port.readCached();
+  assert.equal(exactReads, 1);
+  assert.deepEqual(snapshot.cachedModels.map((model) => model.id), ["k3"]);
+  assert.equal(
+    snapshot.cachedModels.some((model) => model.id === wrongBackendModel.id),
+    false,
+    "a Kimi route must not expose an OpenRouter model for any Settings editor",
+  );
+});
+
 test("default runtime exposes and populates a synchronous secretless model cache without provider effects", async () => {
   const Runtime = (cliModule as unknown as {
     DefaultProviderRuntime: new (...args: unknown[]) => {
@@ -296,6 +383,215 @@ test("default runtime exposes and populates a synchronous secretless model cache
   assert.equal(forbiddenEffects, 0);
 });
 
+test("default runtime Settings cache is bound to the exact active backend and rejects cross-backend grafts", () => {
+  const Runtime = (cliModule as unknown as {
+    DefaultProviderRuntime: new (...args: unknown[]) => {
+      readCachedSettingsModels?: () => readonly ModelInfo[];
+    };
+  }).DefaultProviderRuntime;
+  const openRouterModel: ModelInfo = {
+    id: "openai/provider-aware-main",
+    canonicalSlug: "openai/provider-aware-main-canonical",
+    name: "Provider-aware OpenRouter main",
+    description: "synthetic cached model",
+    contextLength: 128_000,
+    promptPrice: 0,
+    completionPrice: 0,
+    supportedParameters: ["tools"],
+    inputModalities: ["text"],
+    outputModalities: ["text"],
+  };
+  const kimiRoute: RouteIdentityV1 = {
+    version: 1,
+    backendId: "kimi-code",
+    accountFingerprint: "acct_provider_aware_kimi",
+    billingRealm: "kimi-code-membership-provider-managed-overage",
+    requestedModelId: "k3",
+    canonicalModelId: "k3",
+    resolutionState: "resolved",
+  };
+  const state: ProviderSetupStateV2 = {
+    schemaVersion: 2,
+    revision: 3,
+    lifecycle: "configured",
+    connections: [{
+      id: "provider-aware-kimi",
+      backendId: "kimi-code",
+      enabled: true,
+      maturity: "preview",
+      credentialSlot: "v1:kimi-code:73737373-7373-4373-8373-737373737373",
+      accountFingerprint: kimiRoute.accountFingerprint,
+      accountFingerprintState: "verified",
+      billingRealm: kimiRoute.billingRealm,
+      lastHealth: null,
+    }],
+    defaultRoute: kimiRoute,
+    cross: { enabled: false, preferredLead: null, preferredChallenger: null },
+  };
+  const config = structuredClone(DEFAULT_CONFIG);
+  config.mainModel = kimiRoute.requestedModelId;
+  config.providerSetup = structuredClone(state);
+  const runtime = new Runtime(
+    { readCachedModels: () => [openRouterModel] },
+    {},
+    {},
+    new ProviderStateStore(state),
+    { ensureRunnableRoute: () => structuredClone(kimiRoute) },
+    {},
+    new SessionProviderRuntimeGuard(),
+    {},
+    null,
+    null,
+    kimiRoute.requestedModelId,
+    config,
+  );
+
+  assert.equal(typeof runtime.readCachedSettingsModels, "function");
+  const models = runtime.readCachedSettingsModels!();
+  assert.equal(models.some((model) => model.id === openRouterModel.id), false);
+  assert.deepEqual(models.map((model) => model.id), [
+    "k3",
+    "k3-256k",
+    "kimi-for-coding",
+    "kimi-for-coding-highspeed",
+  ]);
+});
+
+test("production Settings resolver uses the exact registry adapter catalogue for every enabled model family", async () => {
+  const createResolver = (cliModule as unknown as {
+    createSettingsEditorResolver?: (context: unknown) => {
+      searchModels(request: Record<string, unknown>, query: string): readonly ModelInfo[];
+    };
+  }).createSettingsEditorResolver;
+  assert.equal(typeof createResolver, "function");
+
+  const descriptors: BackendModelDescriptor[] = [{
+    backendId: "openrouter",
+    requestedModelId: "openai/exact-main",
+    canonicalModelId: "openai/exact-main-canonical",
+    displayName: "Exact main",
+    capabilities: { textInput: true, textOutput: true, tools: true, reasoning: true },
+  }, {
+    backendId: "openrouter",
+    requestedModelId: "vendor/exact-compressor",
+    canonicalModelId: "vendor/exact-compressor",
+    displayName: "Exact compressor",
+    capabilities: { textInput: false, textOutput: true, tools: false, reasoning: false },
+  }, {
+    backendId: "openrouter",
+    requestedModelId: "vendor/exact-audio",
+    canonicalModelId: "vendor/exact-audio",
+    displayName: "Exact audio",
+    capabilities: { textInput: false, textOutput: true, tools: false, reasoning: false },
+  }];
+  const descriptor: BackendDescriptor = {
+    id: "openrouter",
+    displayName: "OpenRouter",
+    maturity: "stable",
+    connectable: true,
+    kind: "raw-model",
+    credentialOwner: "orcode-keychain",
+    billingRealmKind: "api-payg",
+    capabilities: { models: true, tools: true, reasoning: true },
+  };
+  const adapter: BackendAdapter = {
+    backendId: "openrouter" as const,
+    async inspect() { throw new Error("unused registry inspection"); },
+    async connect() { throw new Error("unused registry connection"); },
+    async listModels() { return descriptors; },
+    async activate() { throw new Error("unused registry activation"); },
+    async reconnect() { throw new Error("unused registry reconnect"); },
+    async logout() {},
+    async discardCandidate() {},
+  };
+  const registry = new BackendRegistry([{ descriptor, adapter }]);
+  const listed = await registry.adapter("openrouter").listModels({
+    connectionId: "exact-owner-connection",
+    signal: new AbortController().signal,
+  });
+  const exactModels: ModelInfo[] = listed.map((entry) => ({
+    id: entry.requestedModelId,
+    canonicalSlug: entry.canonicalModelId,
+    name: entry.displayName,
+    description: "real registry adapter fixture",
+    contextLength: 128_000,
+    promptPrice: 0,
+    completionPrice: 0,
+    supportedParameters: [
+      ...(entry.capabilities.tools ? ["tools"] : []),
+      ...(entry.capabilities.reasoning ? ["reasoning"] : []),
+    ],
+    inputModalities: [
+      ...(entry.capabilities.textInput ? ["text"] : []),
+      ...(entry.requestedModelId.endsWith("audio") ? ["audio"] : []),
+    ],
+    outputModalities: entry.capabilities.textOutput ? ["text"] : [],
+  }));
+  const wrongKimiGraft: ModelInfo = {
+    id: "k3",
+    canonicalSlug: "k3",
+    name: "Wrong Kimi cache on OpenRouter",
+    description: "cross-backend negative fixture",
+    contextLength: 262_144,
+    promptPrice: -1,
+    completionPrice: -1,
+    supportedParameters: ["tools", "reasoning"],
+    inputModalities: ["text"],
+    outputModalities: ["text"],
+  };
+  const config = structuredClone(DEFAULT_CONFIG);
+  config.mainModel = "openai/exact-main";
+  const routeProjection = {
+    backendId: "openrouter" as const,
+    providerLabel: "OpenRouter",
+    requestedModelId: "openai/exact-main",
+    canonicalModelId: "openai/exact-main-canonical",
+    modelLabel: "Exact main",
+    billingRealm: "openrouter-payg" as const,
+  };
+  const resolver = createResolver!({
+    config,
+    providerRuntime: {
+      readCachedSettingsRoute: () => routeProjection,
+      readCachedSettingsModels: () => exactModels,
+      readCachedModels: () => [...exactModels, wrongKimiGraft],
+    },
+    openRouter: { readCachedModels: () => [wrongKimiGraft] },
+  });
+  const search = (filter: "main" | "compressor" | "panel" | "audio-input") =>
+    resolver.searchModels({ editor: { kind: "model", filter } }, "").map((model) => model.id);
+
+  assert.ok(search("main").includes("openai/exact-main"));
+  assert.ok(search("compressor").includes("vendor/exact-compressor"));
+  assert.ok(search("panel").includes("openai/exact-main"));
+  assert.ok(search("audio-input").includes("vendor/exact-audio"));
+  assert.equal(search("main").includes("k3"), false, "wrong backend IDs must not be grafted onto OpenRouter");
+
+  const kimiResolver = createResolver!({
+    config: { ...config, mainModel: "k3" },
+    providerRuntime: {
+      readCachedSettingsRoute: () => ({
+        ...routeProjection,
+        backendId: "kimi-code" as const,
+        providerLabel: "Kimi Code",
+        requestedModelId: "k3",
+        canonicalModelId: "k3",
+        modelLabel: "Kimi K3",
+        billingRealm: "kimi-code-membership-provider-managed-overage" as const,
+      }),
+      readCachedSettingsModels: () => [wrongKimiGraft],
+      readCachedModels: () => [wrongKimiGraft, ...exactModels],
+    },
+    openRouter: { readCachedModels: () => exactModels },
+  });
+  const kimiSearch = (filter: "main" | "compressor" | "panel" | "audio-input") =>
+    kimiResolver.searchModels({ editor: { kind: "model", filter } }, "").map((model) => model.id);
+  assert.deepEqual(kimiSearch("main"), ["k3"]);
+  assert.deepEqual(kimiSearch("compressor"), []);
+  assert.deepEqual(kimiSearch("panel"), []);
+  assert.deepEqual(kimiSearch("audio-input"), []);
+});
+
 test("Settings-Setup-Surface nutzt Picker und Notices ohne Chat- oder Config-Mutation", async () => {
   const chatMessages: string[] = [];
   const notices: string[] = [];
@@ -362,6 +658,422 @@ test("Settings-Setup-Surface stellt Settings auch nach synchronen UI-Fehlern wie
     /sync-notice-failure/,
   );
   assert.equal(restores, 2);
+});
+
+test("Settings main-model canonical transition uses shared auth recovery and returns to the keyboard-only Settings surface", async () => {
+  const Runtime = (cliModule as unknown as {
+    DefaultProviderRuntime: new (...args: unknown[]) => {
+      adoptCredentialActivation(route: RouteIdentityV1, persisted: boolean, secret: string): void;
+      transitionSessionModel(
+        candidate: { requestedModelId: string; canonicalModelId: string },
+        publication: unknown,
+        surface: SetupSurface,
+      ): Promise<RouteIdentityV1>;
+      runSetup(surface: SetupSurface | "plain" | "fullscreen"): Promise<Record<string, unknown>>;
+    };
+  }).DefaultProviderRuntime;
+  const oldRoute: RouteIdentityV1 = {
+    version: 1,
+    backendId: "openrouter",
+    accountFingerprint: "acct_settings_auth_owner",
+    billingRealm: "openrouter-payg",
+    requestedModelId: "vendor/old",
+    canonicalModelId: "vendor/old-canonical",
+    resolutionState: "resolved",
+  };
+  const connection: ProviderConnectionStateV1 = {
+    id: "settings-auth-connection",
+    backendId: "openrouter",
+    enabled: true,
+    maturity: "stable",
+    credentialSlot: "v1:inference:71717171-7171-4171-8171-717171717171",
+    accountFingerprint: oldRoute.accountFingerprint,
+    accountFingerprintState: "verified",
+    billingRealm: "openrouter-payg",
+    lastHealth: null,
+  };
+  const state: ProviderSetupStateV2 = {
+    schemaVersion: 2,
+    revision: 5,
+    lifecycle: "configured",
+    connections: [connection],
+    defaultRoute: oldRoute,
+    cross: { enabled: false, preferredLead: null, preferredChallenger: null },
+  };
+  const stateStore = new ProviderStateStore(state);
+  const config = structuredClone(DEFAULT_CONFIG);
+  config.mainModel = oldRoute.requestedModelId;
+  config.providerSetup = stateStore.read();
+  const secret = "synthetic-settings-auth-secret";
+  const openRouter = new OpenRouterService(secret);
+  const authFailure = Object.assign(new Error("synthetic Settings authentication rejection"), {
+    code: "provider-authentication-rejected" as const,
+  });
+  const recoveryEvents: string[] = [];
+  const orchestrator = {
+    ensureRunnableRoute: () => structuredClone(oldRoute),
+    async activateCandidate() {
+      recoveryEvents.push("activation-auth-rejected");
+      throw authFailure;
+    },
+    async reconnect(backendId: string) {
+      recoveryEvents.push(`reconnect:${backendId}`);
+      return { mode: "setup-required" };
+    },
+  };
+  const credentialAuthority = {
+    async withCredential<T>(
+      _request: unknown,
+      use: (candidate: string, context: Record<string, unknown>) => Promise<T>,
+    ) {
+      const value = await use(secret, {
+        binding: {
+          stateRevision: state.revision,
+          connectionId: connection.id,
+          accountFingerprint: connection.accountFingerprint,
+          billingRealm: connection.billingRealm,
+        },
+        candidatePermit: Object.freeze({ version: 1 }),
+      });
+      return { kind: "available" as const, value };
+    },
+  };
+  const runtime = new Runtime(
+    openRouter,
+    {},
+    {
+      descriptor() { return { id: "openrouter", displayName: "OpenRouter", maturity: "stable" }; },
+      entries() { return []; },
+    },
+    stateStore,
+    orchestrator,
+    {},
+    new SessionProviderRuntimeGuard(),
+    {},
+    secret,
+    null,
+    oldRoute.requestedModelId,
+    config,
+    undefined,
+    { credentialAuthority, adapter: {}, async recover() {} },
+    "local-interactive-owner",
+  );
+  runtime.adoptCredentialActivation(oldRoute, true, secret);
+
+  const chatMessages: string[] = [];
+  const settingsNotices: string[] = [];
+  let settingsRestores = 0;
+  const settingsUi = {
+    async pickChoice() { return null; },
+    async readSecret() { return null; },
+    async pickModel() { return null; },
+    async confirmAction() { return { accepted: false }; },
+    addMessage(_role: string, message: string) { chatMessages.push(message); },
+    showSettingsNotice(message: string) { settingsNotices.push(message); },
+    restoreSettings() { settingsRestores += 1; },
+  };
+  const settingsSurface = createSettingsSetupSurface(settingsUi);
+  const setupSurfaces: Array<SetupSurface | "plain" | "fullscreen"> = [];
+  runtime.runSetup = async (surface) => {
+    setupSurfaces.push(surface);
+    if (typeof surface !== "string") {
+      surface.present({ version: 1, type: "notice", message: "Settings auth recovery" });
+    }
+    return { kind: "cancelled", mode: "setup-required" };
+  };
+
+  await assert.rejects(
+    runtime.transitionSessionModel(
+      { requestedModelId: "vendor/new", canonicalModelId: "vendor/new-canonical" },
+      {} as never,
+      settingsSurface,
+    ),
+    (error: unknown) => error === authFailure,
+  );
+
+  assert.deepEqual(recoveryEvents, [
+    "activation-auth-rejected",
+    "reconnect:openrouter",
+  ]);
+  assert.deepEqual(setupSurfaces, [settingsSurface]);
+  assert.deepEqual(chatMessages, []);
+  assert.deepEqual(settingsNotices, ["Settings auth recovery"]);
+  assert.equal(settingsRestores, 1);
+});
+
+test("fresh production runtime recovery converges representative model-preference crashes to one OLD or FINAL tuple", async (t) => {
+  for (const [failpoint, expectedModel] of [
+    ["before-provider-preparation", "vendor/restart-old"],
+    ["after-provider-commit", "vendor/restart-final"],
+  ] as const satisfies ReadonlyArray<readonly [ModelPreferenceFailpoint, string]>) {
+    await t.test(failpoint, async () => {
+      const root = await mkdtemp(join(tmpdir(), "orcode-real-runtime-recovery-"));
+      t.after(() => rm(root, { recursive: true, force: true }));
+      const appHome = join(root, ".orcode");
+      const workspace = join(root, "workspace");
+      const configPath = join(appHome, "config.json");
+      await mkdir(workspace, { recursive: true });
+
+      const oldModel = "vendor/restart-old";
+      const finalModel = "vendor/restart-final";
+      const accountFingerprint = "acct_restart_runtime_owner";
+      const connectionId = "restart-runtime-connection";
+      const oldSlotId = "v1:inference:92929292-9292-4292-8292-929292929292";
+      const secret = "synthetic-restart-runtime-provider-secret";
+      const routeFor = (model: string): RouteIdentityV1 => ({
+        version: 1,
+        backendId: "openrouter",
+        accountFingerprint,
+        billingRealm: "openrouter-payg",
+        requestedModelId: model,
+        canonicalModelId: model,
+        resolutionState: "resolved",
+      });
+      const oldRoute = routeFor(oldModel);
+      const finalRoute = routeFor(finalModel);
+      const models: readonly BackendModelDescriptor[] = [oldModel, finalModel].map((model) => ({
+        backendId: "openrouter",
+        requestedModelId: model,
+        canonicalModelId: model,
+        displayName: model,
+        capabilities: { textInput: true, textOutput: true, tools: true, reasoning: true },
+      }));
+      const healthy = (generation: number) => ({
+        credential: "valid" as const,
+        connectivity: "connected" as const,
+        spend: "available" as const,
+        runtime: "ready" as const,
+        observedAt: 1,
+        generation,
+      });
+      const initialState: ProviderSetupStateV2 = {
+        schemaVersion: 2,
+        revision: 4,
+        lifecycle: "configured",
+        connections: [{
+          id: connectionId,
+          backendId: "openrouter",
+          enabled: true,
+          maturity: "stable",
+          credentialSlot: oldSlotId,
+          accountFingerprint,
+          accountFingerprintState: "verified",
+          billingRealm: "openrouter-payg",
+          lastHealth: healthy(1),
+        }],
+        defaultRoute: oldRoute,
+        cross: { enabled: false, preferredLead: null, preferredChallenger: null },
+      };
+      const initialConfig = structuredClone(DEFAULT_CONFIG);
+      initialConfig.mainModel = oldModel;
+      initialConfig.providerSetup = structuredClone(initialState);
+      await saveConfig(initialConfig, configPath);
+      const initialSession = SessionStore.create(workspace, appHome, "Real restart runtime");
+      initialSession.setPreferences(oldModel, { mode: "auto" }, oldRoute);
+      await initialSession.save();
+
+      const slots = new Map<string, string>([[oldSlotId, secret]]);
+      let slotSequence = 1;
+      const credentials = {
+        location: "synthetic-versioned-store",
+        async get() { return null; },
+        async set() {},
+        async delete() { return false; },
+        async has() { return false; },
+        reserveSlot(kind: CredentialSlotRef["kind"]) {
+          const id = `v1:${kind}:93939393-9393-4393-8393-${String(slotSequence++).padStart(12, "0")}`;
+          return Object.freeze({ version: 1 as const, kind, id });
+        },
+        async writeSlot(slot: CredentialSlotRef, value: string) { slots.set(slot.id, value); },
+        async readSlot(slot: CredentialSlotRef) { return slots.get(slot.id) ?? null; },
+        async deleteSlot(slot: CredentialSlotRef) { return slots.delete(slot.id); },
+        async getOrCreateAccountHmacKey() { return new Uint8Array(32).fill(9); },
+      };
+      const descriptor: BackendDescriptor = {
+        id: "openrouter",
+        displayName: "OpenRouter",
+        maturity: "stable",
+        connectable: true,
+        kind: "raw-model",
+        credentialOwner: "orcode-keychain",
+        billingRealmKind: "api-payg",
+        capabilities: { models: true, tools: true, reasoning: true },
+      };
+      let candidateSequence = 1;
+      const makeAdapter = (): BackendAdapter => ({
+        backendId: "openrouter",
+        async inspect(request) {
+          return {
+            backendId: "openrouter",
+            connectionId: request.connectionId,
+            health: healthy(request.generation),
+            headline: "ready",
+            accountFingerprint,
+            billingRealm: "openrouter-payg",
+            routeEligible: true,
+            retryable: false,
+            explanationCode: "restart-runtime-ready",
+          };
+        },
+        async reconnect(request) { return this.inspect(request); },
+        async bindRuntime() {},
+        async logout() {},
+        async connect(request) {
+          assert.equal(request.candidate, secret);
+          return {
+            candidateId: `restart-candidate-${candidateSequence++}`,
+            backendId: "openrouter",
+            connectionId,
+            accountFingerprint,
+            billingRealm: "openrouter-payg",
+            health: healthy(request.generation),
+          };
+        },
+        async listModels() { return models; },
+        async activate(request) {
+          return {
+            candidateId: request.candidateId,
+            backendId: "openrouter",
+            connectionId,
+            accountFingerprint,
+            billingRealm: "openrouter-payg",
+            route: routeFor(request.model.requestedModelId),
+          };
+        },
+        async discardCandidate() {},
+      });
+
+      let uuidSequence = 1;
+      const reconstruct = async (recover: boolean) => {
+        const loaded = await loadConfigDetailed(configPath);
+        const session = await SessionStore.openById(workspace, initialSession.data.id, appHome);
+        const state = loaded.config.providerSetup as ProviderSetupStateV2;
+        const stateStore = new ProviderStateStore(state, {
+          persist: (request) => persistProviderSetupState(configPath, request),
+        });
+        const adapter = makeAdapter();
+        const registry = new BackendRegistry([{ descriptor, adapter }]);
+        const runtimeGuard = new SessionProviderRuntimeGuard();
+        let coordinator!: ProviderActivationCoordinator;
+        const credentialAuthority = new ProviderCredentialAuthority({
+          stateStore,
+          credentials,
+          environment: {},
+          coordinator: () => coordinator,
+        });
+        coordinator = new ProviderActivationCoordinator({
+          appHome,
+          configPath,
+          privateStore: new PrivateStore({ root: appHome }),
+          credentials,
+          adapterResolver: () => adapter,
+          stateStore,
+          runtimeGuard,
+          candidateAuthority: credentialAuthority,
+          createUuid: () => `94949494-9494-4494-8494-${String(uuidSequence++).padStart(12, "0")}`,
+        });
+        const orchestrator = new SetupOrchestrator({
+          registry,
+          stateStore,
+          activationCoordinator: coordinator,
+        });
+        let runtime!: DefaultProviderRuntime;
+        runtime = new DefaultProviderRuntime(
+          new OpenRouterService(secret),
+          credentials as never,
+          registry,
+          stateStore,
+          orchestrator,
+          coordinator,
+          runtimeGuard,
+          { async apply() { throw new Error("unused credential intent"); } },
+          null,
+          null,
+          loaded.config.mainModel,
+          loaded.config,
+          session,
+          {
+            credentialAuthority,
+            adapter: adapter as never,
+            forgetJournal: {} as never,
+            async recover(context) {
+              if (!recover) return;
+              await coordinator.recoverAndRun({
+                signal: context.signal,
+                inspectCommitted: true,
+                allowedBackendIds: ["openrouter"],
+              }, async (lease) => {
+                await recoverModelPreferenceTransactions({
+                  appHome,
+                  allowedBackendIds: ["openrouter"],
+                  routeAuthority: {
+                    assertHeld: () => lease.assertHeld(),
+                    async read() { return runtime.readModelPreferenceAuthority(); },
+                  },
+                });
+              });
+            },
+          },
+          "local-interactive-owner",
+        );
+        return { runtime, coordinator, stateStore, session, config: loaded.config };
+      };
+
+      const owner = await reconstruct(false);
+      const startup = await owner.runtime.inspectStartup();
+      assert.equal(startup.mode, "ready");
+      assert.deepEqual(owner.runtime.currentSessionRoute(), oldRoute);
+      const expectedConfig = await readConfigEditSnapshot(configPath);
+      const expectedSession = await readSessionEditSnapshot(owner.session.path);
+      const nextSession = prepareSessionPreferenceEdit(expectedSession, {
+        requestedModelId: finalModel,
+        reasoning: { mode: "auto" },
+        route: finalRoute,
+      });
+      const runtimePublication = owner.runtime.prepareSettingsModelPublication(finalRoute);
+
+      await assert.rejects(runModelPreferenceTransaction({
+        appHome,
+        configPath,
+        sessionPath: owner.session.path,
+        expectedConfig,
+        nextConfig: (nextProviderState) => ({
+          ...structuredClone(expectedConfig.config),
+          mainModel: finalModel,
+          providerSetup: structuredClone(nextProviderState),
+        }),
+        expectedSession,
+        nextSession,
+        beforeRoute: oldRoute,
+        afterRoute: finalRoute,
+        routeAuthority: createModelPreferenceRouteAuthority({
+          runtime: owner.runtime,
+          candidate: { requestedModelId: finalModel, canonicalModelId: finalModel },
+        }),
+        publish() { runtimePublication.publish(); },
+        failpoint,
+      }), failpoint === "before-provider-preparation"
+        ? ModelPreferenceCrashError
+        : ModelPreferenceRecoveryRequiredError);
+
+      const recovering = await reconstruct(true);
+      await recovering.runtime.inspectStartup();
+      const recovered = await reconstruct(false);
+      const recoveredStartup = await recovered.runtime.inspectStartup();
+      assert.equal(recoveredStartup.mode, "ready");
+      const diskConfig = await loadConfigDetailed(configPath);
+      const diskSession = await SessionStore.openById(workspace, initialSession.data.id, appHome);
+      const expectedRoute = routeFor(expectedModel);
+      const authority = recovered.runtime.readModelPreferenceAuthority();
+      assert.equal(diskConfig.config.mainModel, expectedModel);
+      assert.deepEqual((diskConfig.config.providerSetup as ProviderSetupStateV2).defaultRoute, expectedRoute);
+      assert.equal(diskSession.data.model, expectedModel);
+      assert.deepEqual(diskSession.data.route, expectedRoute);
+      assert.deepEqual(authority.route, expectedRoute);
+      assert.deepEqual(recovered.stateStore.read().defaultRoute, expectedRoute);
+      assert.deepEqual(recovered.runtime.currentSessionRoute(), expectedRoute);
+    });
+  }
 });
 
 function collectObjectKeys(value: unknown): string[] {

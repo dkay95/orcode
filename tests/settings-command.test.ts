@@ -1,19 +1,35 @@
 import assert from "node:assert/strict";
+import { EventEmitter } from "node:events";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
+import type { ReadStream, WriteStream } from "node:tty";
+import { ApprovalManager } from "../src/approval.js";
+import type { RouteIdentityV1 } from "../src/backends.js";
 import {
   handleSlashCommand,
   type CommandContext,
   type SettingsCommandPort,
 } from "../src/commands.js";
+import { DEFAULT_CONFIG, saveConfig } from "../src/config.js";
 import {
   createSettingsCommandPort,
+  runPlainLoop,
   runSettingsProviderAction,
   runSettingsVerifySuggestion,
   runSettingsTerminalOwner,
 } from "../src/cli.js";
+import * as cliModule from "../src/cli.js";
 import { SessionProviderRuntimeGuard } from "../src/cli.js";
+import { OpenRouterService } from "../src/openrouter.js";
+import { RuleStore } from "../src/rules.js";
+import { SessionStore } from "../src/session.js";
 import type { ProviderExecutionMode } from "../src/setup.js";
 import { describeOpenRouterFailure, formatFailure } from "../src/openrouter.js";
+import { TerminalUi } from "../src/tui.js";
+import { plainText } from "../src/ui/spans.js";
+import { createTheme } from "../src/ui/theme.js";
 import { errorMessage } from "../src/utils.js";
 
 const SETTINGS_INTERACTIVE_REQUIRED_CODE = "settings-interactive-required";
@@ -117,6 +133,325 @@ test("Plain besitzt temporär Raw/Alternate, Dashboard nutzt den aktiven Owner u
   });
   assert.deepEqual(calls, ["start", "plain-settings", "stop", "dashboard-settings"]);
   assert.equal(draft, "unveränderter chat-draft");
+});
+
+class OwnerTtyInput extends EventEmitter {
+  readonly isTTY = true;
+  isRaw = false;
+  readonly rawTransitions: boolean[] = [];
+
+  setRawMode(value: boolean): this {
+    this.isRaw = value;
+    this.rawTransitions.push(value);
+    return this;
+  }
+
+  resume(): this { return this; }
+  pause(): this { return this; }
+}
+
+class OwnerTtyOutput extends EventEmitter {
+  readonly isTTY = true;
+  readonly columns = 100;
+  readonly rows = 30;
+  output = "";
+
+  write(value: string | Uint8Array): boolean {
+    this.output += value.toString();
+    return true;
+  }
+}
+
+function pressOwnerKey(stdin: OwnerTtyInput, name: string, character = ""): void {
+  stdin.emit("keypress", character, { name, ctrl: false, meta: false, shift: false });
+}
+
+async function waitForOwnerState(predicate: () => boolean): Promise<void> {
+  const deadline = Date.now() + 10_000;
+  while (Date.now() < deadline) {
+    if (predicate()) return;
+    await new Promise((resolve) => setTimeout(resolve, 1));
+  }
+  assert.fail("scripted owner Settings state did not settle");
+}
+
+function ownerFrameText(terminal: TerminalUi): string {
+  return terminal.frame().lines.map(plainText).join("\n");
+}
+
+function ownerFrameSelects(terminal: TerminalUi, value: string): boolean {
+  return terminal.frame().lines.some((line) => line.spans.some((span) =>
+    (span.role === "active" || span.role === "accent")
+    && span.text.trim() === value));
+}
+
+test("Plain /settings dispatch drives the real TerminalUi and applies appearance before restoring the next prompt", async () => {
+  const root = await mkdtemp(join(tmpdir(), "orcode-settings-owner-lifecycle-"));
+  try {
+    const workspace = join(root, "workspace");
+    const appHome = join(root, ".orcode");
+    const configPath = join(appHome, "config.json");
+    const config = structuredClone(DEFAULT_CONFIG);
+    config.appearance.showLargeLogo = true;
+    await saveConfig(config, configPath);
+    const route: RouteIdentityV1 = {
+      version: 1,
+      backendId: "openrouter",
+      accountFingerprint: "acct_settings_owner_lifecycle",
+      billingRealm: "openrouter-payg",
+      requestedModelId: config.mainModel,
+      canonicalModelId: config.mainModel,
+      resolutionState: "resolved",
+    };
+    const session = SessionStore.create(workspace, appHome, "Owner lifecycle");
+    session.setPreferences(config.mainModel, { mode: "auto" }, route);
+    await session.save();
+    const sessionBefore = structuredClone(session.data);
+    const rules = await RuleStore.load(appHome);
+    const approvals = new ApprovalManager("ask", { workspace, ruleStore: rules });
+    const guard = new SessionProviderRuntimeGuard();
+    const stdin = new OwnerTtyInput();
+    const stdout = new OwnerTtyOutput();
+    let terminal: TerminalUi | null = null;
+    let script: Promise<void> | null = null;
+    let promptReads = 0;
+    const context = {
+      executionMode: "local-interactive-owner",
+      workspace,
+      configPath,
+      config,
+      approvals,
+      openRouter: new OpenRouterService(undefined),
+      session,
+      agent: null,
+      localRuntime: {} as never,
+      providerCredentials: {} as never,
+      providerCommands: {} as never,
+      providerRoutes: {} as never,
+      providerRouteSurface: "plain",
+      providerRuntime: {
+        activity: () => guard.activity(),
+        currentSessionRoute: () => structuredClone(route),
+        readCachedSettingsRoute: () => ({
+          backendId: "openrouter" as const,
+          providerLabel: "OpenRouter",
+          requestedModelId: route.requestedModelId,
+          canonicalModelId: route.canonicalModelId!,
+          modelLabel: route.requestedModelId,
+          billingRealm: "openrouter-payg" as const,
+        }),
+        readCachedProviderStatus: () => [],
+        readCachedModels: () => [],
+        async runSettingsConfigMutation<T>(task: () => Promise<T>): Promise<T> {
+          const lease = await guard.acquire(new AbortController().signal);
+          try { return await task(); } finally { lease.release(); }
+        },
+      } as never,
+      credentials: {} as never,
+      out: { text() {}, error() {} },
+      ruleStore: rules,
+      sshSession: { active: null },
+      async ensureAgentForPrompt() { throw new Error("agent must not be constructed"); },
+      createTemporarySettingsUi() {
+        terminal = new TerminalUi(
+          () => ({
+            workspace,
+            projectStatus: "Settings lifecycle",
+            model: config.mainModel,
+            approval: approvals.mode,
+            compressor: config.compressionMode,
+            compressorModel: config.compressorModel,
+            reasoning: "auto",
+            balance: "cached",
+            sessionCost: "$0.00",
+            maxCost: "$1.00",
+            maxSteps: config.maxSteps,
+            keyStatus: "not-read",
+          }),
+          stdin as unknown as ReadStream,
+          stdout as unknown as WriteStream,
+          createTheme({ level: 0 }),
+        );
+        script = (async () => {
+          await waitForOwnerState(() => ownerFrameText(terminal!).includes("Einstellungen"));
+          assert.match(ownerFrameText(terminal!), /╭────────╮/u);
+          pressOwnerKey(stdin, "6", "6");
+          await waitForOwnerState(() => ownerFrameText(terminal!).includes("Einstellungen · Darstellung"));
+          pressOwnerKey(stdin, "return");
+          await waitForOwnerState(() => ownerFrameText(terminal!).includes("Großes Route-Core-Logo auswählen"));
+          pressOwnerKey(stdin, "down");
+          await waitForOwnerState(() => ownerFrameSelects(terminal!, "Aus"));
+          pressOwnerKey(stdin, "return");
+          await waitForOwnerState(() => config.appearance.showLargeLogo === false
+            && ownerFrameText(terminal!).includes("Einstellungen · Darstellung"));
+          assert.doesNotMatch(
+            ownerFrameText(terminal!),
+            /╭────────╮/u,
+            "the live owner surface must adopt the durable appearance before Escape",
+          );
+          pressOwnerKey(stdin, "escape");
+        })();
+        return terminal;
+      },
+      async readPlainInput() {
+        promptReads += 1;
+        if (promptReads === 1) return "/settings";
+        assert.equal(stdin.isRaw, false, "Plain must release raw mode before the next prompt");
+        assert.match(stdout.output, /\u001b\[\?1049l/u, "Plain must leave alternate screen before the next prompt");
+        return "/exit";
+      },
+      stdinIsTty: true,
+      stdoutIsTty: true,
+    } as never;
+
+    await runPlainLoop(context, { resume: false, noResume: true });
+    await script;
+
+    assert.deepEqual(stdin.rawTransitions, [true, false]);
+    assert.equal(promptReads, 2);
+    assert.deepEqual(session.data, sessionBefore);
+    const stored = JSON.parse(await readFile(configPath, "utf8")) as typeof config;
+    assert.equal(stored.appearance.showLargeLogo, false);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("Dashboard /settings dispatch keeps the active TerminalUi owner and restores its real pending draft", async () => {
+  const createProductionSettingsSession = (cliModule as unknown as {
+    createSettingsSession?: (
+      context: unknown,
+      surface: TerminalUi,
+      ownsTerminal: boolean,
+    ) => { open(): Promise<void> };
+  }).createSettingsSession;
+  assert.equal(
+    typeof createProductionSettingsSession,
+    "function",
+    "the dashboard lifecycle proof must exercise the production Settings session adapter",
+  );
+
+  const root = await mkdtemp(join(tmpdir(), "orcode-settings-dashboard-lifecycle-"));
+  try {
+    const workspace = join(root, "workspace");
+    const appHome = join(root, ".orcode");
+    const configPath = join(appHome, "config.json");
+    const config = structuredClone(DEFAULT_CONFIG);
+    await saveConfig(config, configPath);
+    const route: RouteIdentityV1 = {
+      version: 1,
+      backendId: "openrouter",
+      accountFingerprint: "acct_settings_dashboard_owner",
+      billingRealm: "openrouter-payg",
+      requestedModelId: config.mainModel,
+      canonicalModelId: config.mainModel,
+      resolutionState: "resolved",
+    };
+    const session = SessionStore.create(workspace, appHome, "Dashboard lifecycle");
+    session.setPreferences(config.mainModel, { mode: "auto" }, route);
+    await session.save();
+    const sessionBefore = structuredClone(session.data);
+    const rules = await RuleStore.load(appHome);
+    const approvals = new ApprovalManager("ask", { workspace, ruleStore: rules });
+    const guard = new SessionProviderRuntimeGuard();
+    const stdin = new OwnerTtyInput();
+    const stdout = new OwnerTtyOutput();
+    const terminal = new TerminalUi(
+      () => ({
+        workspace,
+        projectStatus: "Dashboard lifecycle",
+        model: config.mainModel,
+        approval: approvals.mode,
+        compressor: config.compressionMode,
+        compressorModel: config.compressorModel,
+        reasoning: "auto",
+        balance: "cached",
+        sessionCost: "$0.00",
+        maxCost: "$1.00",
+        maxSteps: config.maxSteps,
+        keyStatus: "not-read",
+      }),
+      stdin as unknown as ReadStream,
+      stdout as unknown as WriteStream,
+      createTheme({ level: 0 }),
+    );
+    const context = {
+      executionMode: "local-interactive-owner",
+      workspace,
+      configPath,
+      config,
+      approvals,
+      openRouter: new OpenRouterService(undefined),
+      session,
+      agent: null,
+      localRuntime: {} as never,
+      providerCredentials: {} as never,
+      providerCommands: {} as never,
+      providerRoutes: {} as never,
+      providerRouteSurface: "fullscreen",
+      providerRuntime: {
+        activity: () => guard.activity(),
+        currentSessionRoute: () => structuredClone(route),
+        readCachedSettingsRoute: () => ({
+          backendId: "openrouter" as const,
+          providerLabel: "OpenRouter",
+          requestedModelId: route.requestedModelId,
+          canonicalModelId: route.canonicalModelId!,
+          modelLabel: route.requestedModelId,
+          billingRealm: "openrouter-payg" as const,
+        }),
+        readCachedProviderStatus: () => [],
+        readCachedModels: () => [],
+        async runSettingsConfigMutation<T>(task: () => Promise<T>): Promise<T> {
+          const lease = await guard.acquire(new AbortController().signal);
+          try { return await task(); } finally { lease.release(); }
+        },
+      } as never,
+      credentials: {} as never,
+      out: { text() {}, error() {} },
+      ruleStore: rules,
+      sshSession: { active: null },
+      settings: undefined as SettingsCommandPort | undefined,
+    };
+    context.settings = createSettingsCommandPort({
+      executionMode: "local-interactive-owner",
+      stdinIsTty: true,
+      stdoutIsTty: true,
+      createSession: async () => createProductionSettingsSession!(context, terminal, false),
+    });
+
+    terminal.start();
+    try {
+      const pendingDraft = terminal.readInput();
+      for (const character of "unveränderter dashboard-draft") {
+        pressOwnerKey(stdin, character, character);
+      }
+      const dispatched = handleSlashCommand("/settings", context as unknown as CommandContext);
+      await waitForOwnerState(() => ownerFrameText(terminal).includes("Einstellungen"));
+      pressOwnerKey(stdin, "6", "6");
+      await waitForOwnerState(() => ownerFrameText(terminal).includes("Einstellungen · Darstellung"));
+      pressOwnerKey(stdin, "return");
+      await waitForOwnerState(() => ownerFrameText(terminal).includes("Großes Route-Core-Logo auswählen"));
+      pressOwnerKey(stdin, "down");
+      await waitForOwnerState(() => ownerFrameSelects(terminal, "Aus"));
+      pressOwnerKey(stdin, "return");
+      await waitForOwnerState(() => config.appearance.showLargeLogo === false
+        && ownerFrameText(terminal).includes("Einstellungen · Darstellung"));
+      pressOwnerKey(stdin, "escape");
+      assert.equal(await dispatched, "continue");
+      assert.equal(stdin.isRaw, true, "Dashboard keeps ownership after Settings closes");
+      assert.equal(stdout.output.includes("\u001b[?1049l"), false, "Dashboard must not leave alternate screen for Settings");
+      pressOwnerKey(stdin, "return");
+      assert.equal(await pendingDraft, "unveränderter dashboard-draft");
+      assert.deepEqual(session.data, sessionBefore);
+      assert.deepEqual(route, session.data.route);
+    } finally {
+      terminal.stop();
+    }
+    assert.equal(stdin.isRaw, false);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 test("Verify-Suggest übernimmt echte Skripte typisiert und lässt bestehende Kommandos bei Cancel/Fehler unverändert", async () => {

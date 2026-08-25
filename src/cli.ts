@@ -561,6 +561,7 @@ export interface ProviderRuntime extends ProviderRouteIntentPort, ProviderComman
   /** A cached counter projection; this never acquires a runtime lease. */
   settingsActivity?(): ProviderRuntimeActivity;
   activity?(): ProviderRuntimeActivity;
+  readCachedSettingsModels?(): readonly ModelInfo[];
   readCachedModels?(): readonly ModelInfo[];
   readCachedProviderStatus?(): readonly ProviderCommandStatusEntry[];
   readCachedSettingsRoute?(): SettingsRouteProjection | null;
@@ -650,17 +651,33 @@ export async function executeProviderModelAction<T>(input: {
   } finally {
     release();
   }
-  if (input.isAuthenticationFailure(failure)) {
-    try {
-      await input.invalidateAndInspect();
-      if (input.surface) await input.runSetup(input.surface);
-    } catch {
-      // The original provider rejection is the only error safe and relevant
-      // to the attempted action; recovery remains best effort and the proof
-      // was invalidated before inspection began.
-    }
-  }
+  await recoverProviderAuthenticationFailure({
+    failure,
+    isAuthenticationFailure: input.isAuthenticationFailure,
+    invalidateAndInspect: input.invalidateAndInspect,
+    runSetup: input.runSetup,
+    surface: input.surface,
+  });
   throw failure;
+}
+
+/** Shared best-effort recovery used by model calls and Settings model transitions. */
+export async function recoverProviderAuthenticationFailure(input: {
+  readonly failure: unknown;
+  readonly isAuthenticationFailure: (error: unknown) => boolean;
+  readonly invalidateAndInspect: () => Promise<void>;
+  readonly runSetup: (surface: SetupSurface | "plain" | "fullscreen") => Promise<unknown>;
+  readonly surface?: SetupSurface | "plain" | "fullscreen";
+}): Promise<void> {
+  if (!input.isAuthenticationFailure(input.failure)) return;
+  try {
+    await input.invalidateAndInspect();
+    if (input.surface) await input.runSetup(input.surface);
+  } catch {
+    // The original provider rejection is the only error safe and relevant
+    // to the attempted action; recovery remains best effort and the proof
+    // was invalidated before inspection began.
+  }
 }
 
 function assertModelBoundToRoute(modelId: string, route: RouteIdentityV1): void {
@@ -677,6 +694,12 @@ function sameExactRoute(left: RouteIdentityV1, right: RouteIdentityV1): boolean 
     && left.requestedModelId === right.requestedModelId
     && left.canonicalModelId === right.canonicalModelId
     && left.resolutionState === right.resolutionState;
+}
+
+function sameRouteOwner(left: RouteIdentityV1, right: RouteIdentityV1): boolean {
+  return left.backendId === right.backendId
+    && left.accountFingerprint === right.accountFingerprint
+    && left.billingRealm === right.billingRealm;
 }
 
 function isProviderSetupRequired(error: unknown): boolean {
@@ -752,6 +775,8 @@ export interface SettingsCachedRuntimeSource {
   activity(): ProviderRuntimeActivity;
   readCachedSettingsRoute(): SettingsRouteProjection | null;
   readCachedProviderStatus(): readonly ProviderCommandStatusEntry[];
+  /** Exact current route/account-owned cache; preferred over legacy mixed caches. */
+  readCachedSettingsModels?(): readonly ModelInfo[];
   readCachedModels?(): readonly ModelInfo[];
   /** Additional runtime methods are deliberately ignored by the cached mapper. */
   readonly [key: string]: unknown;
@@ -810,6 +835,7 @@ export function createSettingsRuntimeSnapshotPort(
         },
         cachedModels: projectSettingsModelInfos(
           input.readCachedModels?.()
+            ?? input.runtime.readCachedSettingsModels?.()
             ?? input.runtime.readCachedModels?.()
             ?? [],
         ),
@@ -1138,6 +1164,10 @@ export class DefaultProviderRuntime implements ProviderRuntime {
       return [projected.id, deepFreezeSettingsProjection(projected)] as const;
     }),
   );
+  readonly #providerOwnedSettingsModels = new Map<
+    string,
+    { readonly route: RouteIdentityV1; readonly model: ModelInfo }
+  >();
 
   constructor(
     readonly openRouter: OpenRouterService,
@@ -1194,6 +1224,33 @@ export class DefaultProviderRuntime implements ProviderRuntime {
       && route.canonicalModelId
       && !models.some((model) =>
         model.id === route.requestedModelId || model.canonicalSlug === route.canonicalModelId)) {
+      models.push(cachedModelInfoFromRoute(route));
+    }
+    return deepFreezeSettingsProjection(
+      projectSettingsModelInfos(models).map((model) => structuredClone(model)),
+    );
+  }
+
+  /**
+   * Exact Settings catalogue for the current backend/account owner. Kimi uses
+   * its pinned membership catalogue; OpenRouter entries are admitted only
+   * after a catalogue call completed under this exact route.
+   */
+  readCachedSettingsModels(): readonly ModelInfo[] {
+    const route = this.#desiredSessionRoute(this.stateStore.read());
+    if (!route || route.resolutionState !== "resolved" || !route.canonicalModelId) return [];
+    const models = route.backendId === "kimi-code"
+      ? KIMI_CODE_MODELS.flatMap((candidate) => {
+          const model = kimiDashboardModelInfo(candidate.id);
+          return model ? [model] : [];
+        })
+      : route.backendId === "openrouter"
+        ? [...this.#providerOwnedSettingsModels.values()]
+            .filter((entry) => sameRouteOwner(entry.route, route))
+            .map((entry) => entry.model)
+        : [];
+    if (!models.some((model) =>
+      model.id === route.requestedModelId || model.canonicalSlug === route.canonicalModelId)) {
       models.push(cachedModelInfoFromRoute(route));
     }
     return deepFreezeSettingsProjection(
@@ -2135,17 +2192,26 @@ export class DefaultProviderRuntime implements ProviderRuntime {
     run: () => Promise<T>,
     surface?: SetupSurface | "plain" | "fullscreen",
   ): Promise<T> {
-    const result = await this.runWithReadyRoute(() => run(), surface);
-    this.#rememberCachedModels(result);
+    let owner: RouteIdentityV1 | null = null;
+    const result = await this.runWithReadyRoute(async (route) => {
+      owner = structuredClone(route);
+      return run();
+    }, surface);
+    this.#rememberCachedModels(result, owner);
     return result;
   }
 
-  #rememberCachedModels(value: unknown): void {
-    if (!Array.isArray(value)) return;
+  #rememberCachedModels(value: unknown, owner: RouteIdentityV1 | null): void {
+    if (!Array.isArray(value) || !owner) return;
     for (const candidate of value) {
       const model = projectSettingsModelInfo(candidate as ModelInfo);
       if (!model) continue;
-      this.#cachedSettingsModels.set(model.id, deepFreezeSettingsProjection(model));
+      const projected = deepFreezeSettingsProjection(model);
+      this.#cachedSettingsModels.set(model.id, projected);
+      this.#providerOwnedSettingsModels.set(
+        `${owner.backendId}\u0000${owner.accountFingerprint}\u0000${owner.billingRealm}\u0000${model.id}`,
+        Object.freeze({ route: structuredClone(owner), model: projected }),
+      );
     }
   }
 
@@ -2165,12 +2231,27 @@ export class DefaultProviderRuntime implements ProviderRuntime {
     publication: ProviderPreferenceCommitPort,
     surface?: SetupSurface | "plain" | "fullscreen",
   ): Promise<RouteIdentityV1> {
-    return this.#transitionModel(
-      candidate.requestedModelId,
-      candidate.canonicalModelId,
-      surface,
-      publication,
-    );
+    const attemptedBackend = this.ensureRunnableRoute().backendId;
+    if (attemptedBackend !== "openrouter" && attemptedBackend !== "kimi-code") {
+      throw new ProviderSetupRequiredError();
+    }
+    try {
+      return await this.#transitionModel(
+        candidate.requestedModelId,
+        candidate.canonicalModelId,
+        surface,
+        publication,
+      );
+    } catch (failure) {
+      await recoverProviderAuthenticationFailure({
+        failure,
+        isAuthenticationFailure: (error) => this.#isAuthenticationFailure(attemptedBackend, error),
+        invalidateAndInspect: () => this.#invalidateAuthenticationFailure(attemptedBackend),
+        runSetup: (requestedSurface) => this.runSetup(requestedSurface),
+        surface,
+      });
+      throw failure;
+    }
   }
 
   async #transitionModel(
@@ -2569,40 +2650,51 @@ export class DefaultProviderRuntime implements ProviderRuntime {
       },
       beginRun: () => this.runtimeGuard.beginRun(),
       run,
-      isAuthenticationFailure: (error) => attemptedBackend === "kimi-code"
-        ? ["kimi-code-auth-rejected", "kimi-code-access-terminated"].includes(
-            issuedKimiCodeFailure(error)?.code ?? "",
-          )
-        : shouldReplaceCredential(error, this.openRouter),
-      invalidateAndInspect: async () => {
-        const controller = new AbortController();
-        const runtimeLease = await this.runtimeGuard.acquire(controller.signal);
-        let primaryFailed = false;
-        try {
-          await runtimeLease.assertHeld();
-          this.#processRouteGeneration += 1;
-          this.#sessionRoute = null;
-          this.#sessionRoutePersisted = false;
-          this.#pendingSessionBinding = null;
-          this.#preparedRoles = null;
-          await this.orchestrator.reconnect(attemptedBackend, {
-            signal: controller.signal,
-          });
-          await runtimeLease.assertHeld();
-        } catch (error) {
-          primaryFailed = true;
-          throw error;
-        } finally {
-          try {
-            await Promise.resolve(runtimeLease.release());
-          } catch (error) {
-            if (!primaryFailed) throw error;
-          }
-        }
-      },
+      isAuthenticationFailure: (error) => this.#isAuthenticationFailure(attemptedBackend, error),
+      invalidateAndInspect: () => this.#invalidateAuthenticationFailure(attemptedBackend),
       runSetup: (requestedSurface) => this.runSetup(requestedSurface),
       surface,
     });
+  }
+
+  #isAuthenticationFailure(
+    backendId: "openrouter" | "kimi-code",
+    error: unknown,
+  ): boolean {
+    return backendId === "kimi-code"
+      ? ["kimi-code-auth-rejected", "kimi-code-access-terminated"].includes(
+          issuedKimiCodeFailure(error)?.code ?? "",
+        )
+      : shouldReplaceCredential(error, this.openRouter);
+  }
+
+  async #invalidateAuthenticationFailure(
+    backendId: "openrouter" | "kimi-code",
+  ): Promise<void> {
+    const controller = new AbortController();
+    const runtimeLease = await this.runtimeGuard.acquire(controller.signal);
+    let primaryFailed = false;
+    try {
+      await runtimeLease.assertHeld();
+      this.#processRouteGeneration += 1;
+      this.#sessionRoute = null;
+      this.#sessionRoutePersisted = false;
+      this.#pendingSessionBinding = null;
+      this.#preparedRoles = null;
+      await this.orchestrator.reconnect(backendId, {
+        signal: controller.signal,
+      });
+      await runtimeLease.assertHeld();
+    } catch (error) {
+      primaryFailed = true;
+      throw error;
+    } finally {
+      try {
+        await Promise.resolve(runtimeLease.release());
+      } catch (error) {
+        if (!primaryFailed) throw error;
+      }
+    }
   }
 
   #desiredSessionRoute(state: ProviderSetupStateV2): RouteIdentityV1 | null {
@@ -5363,7 +5455,7 @@ export async function runSettingsTerminalOwner(
   }
 }
 
-function createSettingsSession(
+export function createSettingsSession(
   context: RuntimeContext,
   surface: TerminalUi,
   ownsTerminal: boolean,
@@ -5382,10 +5474,7 @@ function createSettingsSession(
               ?? null,
             readCachedProviderStatus: () => context.providerRuntime.readCachedProviderStatus?.()
               ?? [],
-            readCachedModels: () => [
-              ...(context.providerRuntime.readCachedModels?.() ?? []),
-              ...context.openRouter.readCachedModels(),
-            ],
+            readCachedSettingsModels: () => readProviderAwareSettingsModels(context),
           },
           session: context.session,
           ruleStore: context.ruleStore,
@@ -5431,7 +5520,12 @@ function createSettingsSession(
           },
           liveConfig: {
             prepare(next) {
-              return { publish: () => Object.assign(context.config, next) };
+              return {
+                publish: () => {
+                  Object.assign(context.config, next);
+                  surface.applyAppearance(next.appearance);
+                },
+              };
             },
           },
           readConfig: readConfigEditSnapshot,
@@ -6134,13 +6228,14 @@ function plainSettingsDashboardState(context: RuntimeContext): DashboardState {
   };
 }
 
-function createSettingsEditorResolver(context: RuntimeContext): SettingsEditorResolver {
+export function createSettingsEditorResolver(context: RuntimeContext): SettingsEditorResolver {
   return {
     searchModels(request, query) {
-      const cached = [
-        ...(context.providerRuntime.readCachedModels?.() ?? []),
-        ...context.openRouter.readCachedModels(),
-      ].filter((model, index, models) => models.findIndex((candidate) =>
+      const route = context.providerRuntime.readCachedSettingsRoute?.();
+      if (route?.backendId === "kimi-code"
+        && request.editor.kind === "model"
+        && request.editor.filter !== "main") return [];
+      const cached = readProviderAwareSettingsModels(context).filter((model, index, models) => models.findIndex((candidate) =>
         candidate.id === model.id
         && candidate.canonicalSlug === model.canonicalSlug) === index);
       const eligible = request.editor.kind !== "model"
@@ -6155,6 +6250,24 @@ function createSettingsEditorResolver(context: RuntimeContext): SettingsEditorRe
       return rankModels(eligible, query, context.config.mainModel);
     },
   };
+}
+
+function readProviderAwareSettingsModels(context: Pick<
+  RuntimeContext,
+  "providerRuntime" | "openRouter"
+>): readonly ModelInfo[] {
+  const exact = context.providerRuntime.readCachedSettingsModels?.();
+  if (exact) return exact;
+  const route = context.providerRuntime.readCachedSettingsRoute?.();
+  const legacyRuntime = context.providerRuntime.readCachedModels?.() ?? [];
+  if (route?.backendId === "kimi-code") {
+    const kimiIds = new Set<string>(KIMI_CODE_MODELS.map((model) => model.id));
+    return legacyRuntime.filter((model) => kimiIds.has(model.id));
+  }
+  return [
+    ...legacyRuntime,
+    ...context.openRouter.readCachedModels(),
+  ];
 }
 
 // ---------------------------------------------------------------------------

@@ -310,6 +310,8 @@ const GLYPH_MODE_CHOICES = [
 ] as const satisfies readonly SettingsChoice[];
 
 const READONLY_EDITOR = Object.freeze({ kind: "readonly" } as const);
+const KIMI_EXTERNAL_MODEL_ROLE_UNSUPPORTED =
+  "Kimi Code unterstützt diese externe Modellrolle nicht; OpenRouter-Route erforderlich";
 
 interface ItemInput {
   readonly id: SettingsItemId;
@@ -472,6 +474,9 @@ function modelItems(snapshot: SettingsAuthoritativeSnapshot): SettingsItem[] {
       displayValue: modelDisplay(snapshot.cachedModels, config.compressorModel),
       editor: { kind: "model", actionId: "compressor-model", filter: "compressor" },
       affectsActiveRun: true,
+      ...(snapshot.route?.backendId === "kimi-code"
+        ? { disabledReason: KIMI_EXTERNAL_MODEL_ROLE_UNSUPPORTED }
+        : {}),
     }),
     item(snapshot, {
       id: "max-steps",
@@ -812,6 +817,9 @@ function toolItems(snapshot: SettingsAuthoritativeSnapshot): SettingsItem[] {
         : "Nicht gesetzt",
       editor: { kind: "model", actionId: "panel-models", filter: "panel", multiple: true },
       affectsActiveRun: true,
+      ...(snapshot.route?.backendId === "kimi-code"
+        ? { disabledReason: KIMI_EXTERNAL_MODEL_ROLE_UNSUPPORTED }
+        : {}),
     }),
     item(snapshot, {
       id: "panel-judge",
@@ -832,6 +840,9 @@ function toolItems(snapshot: SettingsAuthoritativeSnapshot): SettingsItem[] {
       displayValue: modelDisplay(snapshot.cachedModels, config.transcriptionModel),
       editor: { kind: "model", actionId: "transcription-model", filter: "audio-input" },
       affectsActiveRun: true,
+      ...(snapshot.route?.backendId === "kimi-code"
+        ? { disabledReason: KIMI_EXTERNAL_MODEL_ROLE_UNSUPPORTED }
+        : {}),
     }),
     item(snapshot, {
       id: "voice-consent-status",

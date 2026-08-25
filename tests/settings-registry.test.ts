@@ -661,6 +661,34 @@ test("jede Editorfamilie sowie Modell- und Zahlgrenzen sind konkret verdrahtet",
   );
 });
 
+test("Kimi route keeps main selection available but disables unsupported compressor panel and audio rows truthfully", () => {
+  const base = snapshot();
+  base.config.mainModel = "k3";
+  const current: SettingsAuthoritativeSnapshot = {
+    ...base,
+    route: {
+      backendId: "kimi-code",
+      providerLabel: "Kimi Code",
+      requestedModelId: "k3",
+      canonicalModelId: "k3",
+      modelLabel: "Kimi K3",
+      billingRealm: "kimi-code-membership-provider-managed-overage",
+    },
+    cachedModels: [model("k3")],
+  };
+
+  const registry = buildSettingsRegistry(current);
+
+  assert.equal(item(registry, "main-model").disabledReason, undefined);
+  for (const id of ["compressor-model", "panel-models", "transcription-model"] as const) {
+    assert.equal(
+      item(registry, id).disabledReason,
+      "Kimi Code unterstützt diese externe Modellrolle nicht; OpenRouter-Route erforderlich",
+      id,
+    );
+  }
+});
+
 test("alle Text-Editoren besitzen exakt ihre stabile ID, Action und Werteart", () => {
   const registry = buildSettingsRegistry(snapshot());
   assert.deepEqual(
