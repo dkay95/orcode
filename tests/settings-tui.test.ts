@@ -6,6 +6,7 @@ import type { ReadStream, WriteStream } from "node:tty";
 import { routeCoreCompact, routeCoreLarge } from "../src/branding.js";
 import type {
   SettingsEditorRequest,
+  SettingsIntent,
   SettingsViewModel,
 } from "../src/settings-controller.js";
 import {
@@ -349,6 +350,117 @@ test("Kategorie und Suche liefern sequenzielle Intents ohne Chat-Puffer zu benut
   terminal.stop();
 });
 
+test("ein gebatchter Settings-Datenblock bleibt geordnet bis zum nächsten Intent erhalten", async () => {
+  const { terminal, stdin } = settingsUi();
+  terminal.start();
+  terminal.begin(view({ search: { active: true, query: "" } }));
+  const observed: SettingsIntent[] = [];
+  try {
+    const first = terminal.nextIntent(view({ search: { active: true, query: "" } }));
+    stdin.emit("data", Buffer.from("abc"));
+    observed.push(await first);
+
+    for (const query of ["a", "ab"] as const) {
+      const pending = terminal.nextIntent(view({ search: { active: true, query } }));
+      const result = await Promise.race([
+        pending.then((intent) => ({ settled: true as const, intent })),
+        new Promise<{ settled: false }>((resolve) => setImmediate(() => resolve({ settled: false }))),
+      ]);
+      if (!result.settled) {
+        terminal.end();
+        await pending.catch(() => undefined);
+        break;
+      }
+      observed.push(result.intent);
+    }
+  } finally {
+    terminal.end();
+    terminal.stop();
+  }
+  assert.deepEqual(observed, [
+    { kind: "search-change", query: "a" },
+    { kind: "search-change", query: "ab" },
+    { kind: "search-change", query: "abc" },
+  ]);
+});
+
+test("Settings-Eingabepuffer ist deterministisch auf 128 Folgeereignisse begrenzt", async () => {
+  const { terminal, stdin } = settingsUi();
+  terminal.start();
+  terminal.begin(view());
+  const first = terminal.nextIntent(view());
+  for (let index = 0; index < 141; index += 1) pressSettings(stdin, "down");
+  let delivered = 0;
+  try {
+    assert.deepEqual(await first, { kind: "move", delta: 1 });
+    delivered += 1;
+    for (let index = 0; index < 128; index += 1) {
+      assert.deepEqual(await terminal.nextIntent(view()), { kind: "move", delta: 1 });
+      delivered += 1;
+    }
+    const overflow = terminal.nextIntent(view());
+    const settled = await Promise.race([
+      overflow.then(() => true),
+      new Promise<false>((resolve) => setImmediate(() => resolve(false))),
+    ]);
+    assert.equal(settled, false);
+    terminal.end();
+    await overflow.catch(() => undefined);
+  } finally {
+    terminal.end();
+    terminal.stop();
+  }
+  assert.equal(delivered, 129);
+});
+
+test("ein lokaler Cursor-Key blockiert dahinter gepufferte Settings-Zeichen nicht", async () => {
+  const initial = view({ search: { active: true, query: "a" } });
+  const { terminal, stdin } = settingsUi();
+  terminal.start();
+  terminal.begin(initial);
+  try {
+    const first = terminal.nextIntent(initial);
+    stdin.emit("data", Buffer.from("b\u001b[Dx"));
+    assert.deepEqual(await first, { kind: "search-change", query: "ab" });
+
+    const second = terminal.nextIntent(view({ search: { active: true, query: "ab" } }));
+    const result = await Promise.race([
+      second.then((intent) => ({ settled: true as const, intent })),
+      new Promise<{ settled: false }>((resolve) => setImmediate(() => resolve({ settled: false }))),
+    ]);
+    assert.deepEqual(result, {
+      settled: true,
+      intent: { kind: "search-change", query: "axb" },
+    });
+  } finally {
+    terminal.end();
+    terminal.stop();
+  }
+});
+
+test("Settings-Suchpaste zwischen zwei Intents wird als ein begrenztes Folgeereignis erhalten", async () => {
+  const initial = view({ search: { active: true, query: "a" } });
+  const { terminal, stdin } = settingsUi();
+  terminal.start();
+  terminal.begin(initial);
+  try {
+    const first = terminal.nextIntent(initial);
+    pressSettings(stdin, "b", "b");
+    pressSettings(stdin, "paste-start");
+    pressSettings(stdin, "c", "c");
+    pressSettings(stdin, "d", "d");
+    pressSettings(stdin, "paste-end");
+    assert.deepEqual(await first, { kind: "search-change", query: "ab" });
+    assert.deepEqual(
+      await terminal.nextIntent(view({ search: { active: true, query: "ab" } })),
+      { kind: "search-change", query: "abcd" },
+    );
+  } finally {
+    terminal.end();
+    terminal.stop();
+  }
+});
+
 test("Settings-Maus nutzt ausschließlich den letzten inklusiven Hit-Target", async () => {
   const { terminal, stdin, stdout } = settingsUi();
   terminal.start();
@@ -468,6 +580,81 @@ test("Model-Resolver liest nur Cache synchron und Panel-Multi toggelt mit Space"
   assert.deepEqual(queries, ["", ""]);
   terminal.end();
   terminal.stop();
+});
+
+test("Picker-Cachefehler bleibt begrenzt neben der letzten nutzbaren Liste und wird danach gelöscht", async () => {
+  const models = Array.from({ length: 6 }, (_, index) => cachedModel(`model/${index + 1}`));
+  const { terminal, stdin, stdout } = settingsUi({
+    settingsEditorResolver: {
+      searchModels(_request, query) {
+        if (query === "x") throw new Error("cache offline");
+        return models;
+      },
+    },
+  });
+  terminal.start();
+  terminal.begin(view());
+  const editor = terminal.edit(editorRequest({
+    kind: "model",
+    actionId: "main-model",
+    filter: "main",
+  }, { itemId: "main-model", initialValue: "model/1" }));
+  try {
+    pressSettings(stdin, "x", "x");
+    const failed = terminal.frame();
+    const failedText = failed.lines.map(plainText).join("\n");
+    assert.match(failedText, /Modellcache konnte nicht gelesen werden/u);
+    assert.match(failedText, /model\/1/u);
+    assert.equal(failed.lines.length, stdout.rows);
+    for (const line of failed.lines) assert.ok(lineWidth(line) <= stdout.columns - 1);
+
+    pressSettings(stdin, "backspace");
+    const recoveredText = terminal.frame().lines.map(plainText).join("\n");
+    assert.doesNotMatch(recoveredText, /Modellcache konnte nicht gelesen werden/u);
+    assert.match(recoveredText, /model\/1/u);
+  } finally {
+    pressSettings(stdin, "escape");
+    await editor;
+    terminal.end();
+    terminal.stop();
+  }
+});
+
+test("sechstes Panel-Modell zeigt den Pickerfehler und ein erfolgreicher Deselect löscht ihn", async () => {
+  const models = Array.from({ length: 6 }, (_, index) => cachedModel(`model/${index + 1}`));
+  const { terminal, stdin } = settingsUi({
+    settingsEditorResolver: { searchModels: () => models },
+  });
+  terminal.start();
+  terminal.begin(view());
+  const editor = terminal.edit(editorRequest({
+    kind: "model",
+    actionId: "panel-models",
+    filter: "panel",
+    multiple: true,
+  }, {
+    itemId: "panel-models",
+    initialValue: models.slice(0, 5).map(({ id }) => id),
+  }));
+  try {
+    for (let index = 0; index < 5; index += 1) pressSettings(stdin, "down");
+    pressSettings(stdin, "space", " ");
+    const blocked = terminal.frame().lines.map(plainText).join("\n");
+    assert.match(blocked, /Höchstens fünf Panel-Modelle/u);
+    assert.match(blocked, /model\/6/u);
+
+    pressSettings(stdin, "up");
+    pressSettings(stdin, "space", " ");
+    assert.doesNotMatch(
+      terminal.frame().lines.map(plainText).join("\n"),
+      /Höchstens fünf Panel-Modelle/u,
+    );
+  } finally {
+    pressSettings(stdin, "escape");
+    await editor;
+    terminal.end();
+    terminal.stop();
+  }
 });
 
 test("validierter Zahl- und Texteditor behalten Fehleingabe lokal", async () => {
@@ -702,6 +889,39 @@ test("Settings-Rundreise bewahrt Draft-Cursor, Anhänge, Viewport und externen R
   terminal.stop();
 });
 
+test("end im Editor stellt Chat-Status exakt wieder her und aktiviert die Settings-Maus nicht erneut", async () => {
+  const enable = "\u001b[?1000h\u001b[?1006h";
+  const disable = "\u001b[?1000l\u001b[?1006l";
+  const originalNow = Date.now;
+  let now = 1_000;
+  Date.now = () => now;
+  const { terminal, stdin, stdout } = settingsUi();
+  terminal.start();
+  const pendingChat = terminal.readInput();
+  for (const character of "status-draft") pressSettings(stdin, character, character);
+  now = 8_000;
+  const before = terminal.frame();
+  stdout.output = "";
+  terminal.begin(view());
+  const editor = terminal.edit(editorRequest({
+    kind: "text",
+    actionId: "browser-path",
+    valueKind: "path",
+  }));
+  try {
+    terminal.end();
+    assert.deepEqual(await editor, { kind: "cancel" });
+    assert.deepEqual(terminal.frame(), before);
+    assert.equal(stdout.output.split(enable).length - 1, 1, stdout.output);
+    assert.equal(stdout.output.split(disable).length - 1, 1, stdout.output);
+    pressSettings(stdin, "return");
+    assert.equal(await pendingChat, "status-draft");
+  } finally {
+    Date.now = originalNow;
+    terminal.stop();
+  }
+});
+
 test("split und fehlerhafte SGR-Frames lecken keine Bytes in Settings-Suche", async () => {
   const { terminal, stdin } = settingsUi();
   terminal.start();
@@ -724,6 +944,71 @@ test("split und fehlerhafte SGR-Frames lecken keine Bytes in Settings-Suche", as
   assert.deepEqual(await changed, { kind: "search-change", query: "x" });
   terminal.end();
   terminal.stop();
+});
+
+test("SGR verarbeitet mehrere Frames und liefert den normalen Suffix exakt einmal", async () => {
+  const searchView = view({ search: { active: true, query: "" } });
+  const target = build(80, 24, { search: { active: true, query: "" } }).hitTargets.find(
+    ({ intent }) => intent.kind === "select-item" && intent.itemId === "main-model",
+  );
+  assert.ok(target);
+  const { terminal, stdin } = settingsUi();
+  terminal.start();
+  terminal.begin(searchView);
+  const observed: SettingsIntent[] = [];
+  try {
+    terminal.frame();
+    const click = terminal.nextIntent(searchView);
+    stdin.emit(
+      "data",
+      Buffer.from(`\u001b[<2;${target.columnStart};${target.row}M`
+        + `\u001b[<0;${target.columnStart};${target.row}M`
+        + "z"),
+    );
+    const clickResult = await Promise.race([
+      click.then((intent) => ({ settled: true as const, intent })),
+      new Promise<{ settled: false }>((resolve) => setImmediate(() => resolve({ settled: false }))),
+    ]);
+    if (clickResult.settled) observed.push(clickResult.intent);
+    else {
+      terminal.end();
+      await click.catch(() => undefined);
+    }
+    if (clickResult.settled) {
+      const suffix = terminal.nextIntent(searchView);
+      const suffixResult = await Promise.race([
+        suffix.then((intent) => ({ settled: true as const, intent })),
+        new Promise<{ settled: false }>((resolve) => setImmediate(() => resolve({ settled: false }))),
+      ]);
+      if (suffixResult.settled) observed.push(suffixResult.intent);
+      else {
+        terminal.end();
+        await suffix.catch(() => undefined);
+      }
+    }
+  } finally {
+    terminal.end();
+    terminal.stop();
+  }
+  assert.deepEqual(observed, [
+    { kind: "select-item", itemId: "main-model" },
+    { kind: "search-change", query: "z" },
+  ]);
+});
+
+test("ein fehlerhaftes SGR-Frame verschluckt seine Bytes, aber nicht den Suffix", async () => {
+  const searchView = view({ search: { active: true, query: "" } });
+  const { terminal, stdin } = settingsUi();
+  terminal.start();
+  terminal.begin(searchView);
+  try {
+    const changed = terminal.nextIntent(searchView);
+    stdin.emit("data", Buffer.from("\u001b[<x;2;3Mz"));
+    assert.deepEqual(await changed, { kind: "search-change", query: "z" });
+  } finally {
+    terminal.end();
+    terminal.stop();
+  }
 });
 
 test("bestehende Picker, Secret und Approval kehren aus Settings zur selben Zeile zurück", async () => {

@@ -288,8 +288,19 @@ export function buildDashboardFrame(input: DashboardFrameInput): Frame {
           : []),
       ]
     : [];
+  const listValidation: Line[] = input.list && input.editorPrompt?.validationMessage
+    ? [{ spans: [span(input.editorPrompt.validationMessage, "warn")] }]
+    : [];
   const expansion: Line[] = input.list
-    ? buildListLines(input.list, Math.max(1, width - 1), expansionLimit, theme)
+    ? [
+        ...listValidation,
+        ...buildListLines(
+          input.list,
+          Math.max(1, width - 1),
+          Math.max(0, expansionLimit - listValidation.length),
+          theme,
+        ),
+      ]
     : editorExpansion.length
       ? editorExpansion
     : input.blocks.length === 0

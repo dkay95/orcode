@@ -92,7 +92,13 @@ const STATUS_FRESH_MS = 6_000;
 const TERMINAL_PROCESS_CAPACITY = 512;
 const MAX_MOUSE_SEQUENCE_LENGTH = 32;
 const MAX_SETTINGS_SEARCH_CODEPOINTS = 120;
+const MAX_BUFFERED_SETTINGS_INPUTS = 128;
 const SIGNALS: readonly NodeJS.Signals[] = ["SIGINT", "SIGTERM", "SIGHUP"];
+
+interface BufferedSettingsKey {
+  readonly character: string;
+  readonly key: Key;
+}
 
 export interface ChoicePickerItem {
   value: string;
@@ -245,6 +251,7 @@ export class TerminalUi implements SettingsSurface {
   #settingsView: SettingsViewModel | null = null;
   #settingsIntentResolve: ((intent: SettingsIntent) => void) | null = null;
   #settingsIntentReject: ((error: Error) => void) | null = null;
+  #settingsKeyQueue: BufferedSettingsKey[] = [];
   #settingsSearchChars: string[] = [];
   #settingsSearchCursor = 0;
   #lastSettingsHitTargets: readonly SettingsHitTarget[] = [];
@@ -255,6 +262,8 @@ export class TerminalUi implements SettingsSurface {
   #editorValidationMessage = "";
   #returnSurface: UiSurface | null = null;
   #returnMode: UiMode | null = null;
+  #settingsChatStatus: { readonly value: string; readonly at: number } | null = null;
+  #closingSettings = false;
   #inputChars: string[] = [];
   #cursor = 0;
   #status = "Bereit";
@@ -359,8 +368,12 @@ export class TerminalUi implements SettingsSurface {
     if (this.#settingsIntentResolve || this.#settingsIntentReject) {
       throw new Error("Settings warten bereits auf eine Eingabe.");
     }
+    if (this.#surface !== "settings") {
+      this.#settingsChatStatus = { value: this.#status, at: this.#statusAt };
+    }
     this.#surface = "settings";
     this.#settingsView = view;
+    this.#settingsKeyQueue = [];
     this.#settingsSearchChars = settingsSearchChars(view.search.query);
     this.#settingsSearchCursor = this.#settingsSearchChars.length;
     this.#lastSettingsHitTargets = [];
@@ -386,10 +399,12 @@ export class TerminalUi implements SettingsSurface {
     this.#settingsSearchCursor = this.#settingsSearchChars.length;
     this.#lastSettingsHitTargets = [];
     this.scheduleRender(true);
-    return new Promise<SettingsIntent>((resolve, reject) => {
+    const pending = new Promise<SettingsIntent>((resolve, reject) => {
       this.#settingsIntentResolve = resolve;
       this.#settingsIntentReject = reject;
     });
+    this.#drainSettingsInput();
+    return pending;
   }
 
   edit(request: SettingsEditorRequest): Promise<SettingsEditorResult> {
@@ -472,22 +487,27 @@ export class TerminalUi implements SettingsSurface {
   }
 
   end(): void {
-    if (this.#editorResolve && this.#returnSurface === "settings") {
-      this.#resolveSettingsEditor({ kind: "cancel" });
+    this.#closingSettings = true;
+    try {
+      if (this.#editorResolve && this.#returnSurface === "settings") {
+        this.#resolveSettingsEditor({ kind: "cancel" });
+      }
+      if (this.#returnSurface === "settings") {
+        if (this.#pickerResolve || this.#choiceResolve) this.#resolveSelection(null);
+        else if (this.#secretResolve) this.#resolveSecret(null);
+        else if (this.#confirmResolve) this.#resolveConfirm({ accepted: false });
+        else if (this.#recordingResolve) this.#resolveRecording("cancel");
+      }
+      if (this.#settingsIntentReject) {
+        const reject = this.#settingsIntentReject;
+        this.#settingsIntentResolve = null;
+        this.#settingsIntentReject = null;
+        reject(new UiExitError());
+      }
+      this.#closeSettingsSurface();
+    } finally {
+      this.#closingSettings = false;
     }
-    if (this.#returnSurface === "settings") {
-      if (this.#pickerResolve || this.#choiceResolve) this.#resolveSelection(null);
-      else if (this.#secretResolve) this.#resolveSecret(null);
-      else if (this.#confirmResolve) this.#resolveConfirm({ accepted: false });
-      else if (this.#recordingResolve) this.#resolveRecording("cancel");
-    }
-    if (this.#settingsIntentReject) {
-      const reject = this.#settingsIntentReject;
-      this.#settingsIntentResolve = null;
-      this.#settingsIntentReject = null;
-      reject(new UiExitError());
-    }
-    this.#closeSettingsSurface();
   }
 
   applyAppearance(appearance: AppearanceConfig): void {
@@ -1179,9 +1199,15 @@ export class TerminalUi implements SettingsSurface {
   #closeSettingsSurface(): void {
     this.#surface = "chat";
     this.#settingsView = null;
+    this.#settingsKeyQueue = [];
     this.#settingsSearchChars = [];
     this.#settingsSearchCursor = 0;
     this.#lastSettingsHitTargets = [];
+    if (this.#settingsChatStatus) {
+      this.#status = this.#settingsChatStatus.value;
+      this.#statusAt = this.#settingsChatStatus.at;
+      this.#settingsChatStatus = null;
+    }
     this.#syncMouseReporting();
     this.#forgetGeometry();
     this.scheduleRender(true);
@@ -1200,12 +1226,18 @@ export class TerminalUi implements SettingsSurface {
       this.#enterMode(fallbackMode, status);
       return;
     }
-    this.#surface = this.#returnSurface;
+    const returnSurface = this.#returnSurface;
+    this.#surface = this.#closingSettings && returnSurface === "settings"
+      ? "chat"
+      : returnSurface;
     this.#mode = this.#returnMode ?? fallbackMode;
     this.#returnSurface = null;
     this.#returnMode = null;
-    this.#status = status;
-    this.#statusAt = Date.now();
+    if (returnSurface !== "settings") {
+      this.#status = status;
+      this.#statusAt = Date.now();
+    }
+    if (this.#closingSettings) return;
     this.#syncMouseReporting();
     this.#forgetGeometry();
     this.scheduleRender(true);
@@ -1213,7 +1245,8 @@ export class TerminalUi implements SettingsSurface {
 
   #emitSettingsIntent(intent: SettingsIntent): void {
     const resolve = this.#settingsIntentResolve;
-    if (!resolve || this.#surface !== "settings") return;
+    if (this.#surface !== "settings") return;
+    if (!resolve) return;
     this.#settingsIntentResolve = null;
     this.#settingsIntentReject = null;
     this.#lastSettingsHitTargets = [];
@@ -1221,7 +1254,11 @@ export class TerminalUi implements SettingsSurface {
   }
 
   #handleSettingsKey(character: string, key: Key): void {
-    if (!this.#settingsIntentResolve || !this.#settingsView) return;
+    if (!this.#settingsView) return;
+    if (!this.#settingsIntentResolve) {
+      this.#enqueueSettingsKey({ character, key: { ...key } });
+      return;
+    }
     if (key.name === "up" || key.name === "down") {
       this.#emitSettingsIntent({ kind: "move", delta: key.name === "up" ? -1 : 1 });
       return;
@@ -1298,6 +1335,19 @@ export class TerminalUi implements SettingsSurface {
         kind: "search-change",
         query: this.#settingsSearchChars.join(""),
       });
+    }
+  }
+
+  #enqueueSettingsKey(input: BufferedSettingsKey): void {
+    if (this.#settingsKeyQueue.length >= MAX_BUFFERED_SETTINGS_INPUTS) return;
+    this.#settingsKeyQueue.push(input);
+  }
+
+  #drainSettingsInput(): void {
+    while (this.#settingsIntentResolve && this.#settingsView) {
+      const input = this.#settingsKeyQueue.shift();
+      if (!input) return;
+      this.#handleSettingsKey(input.character, input.key);
     }
   }
 
@@ -1424,6 +1474,7 @@ export class TerminalUi implements SettingsSurface {
   #resolveSettingsEditor(result: SettingsEditorResult): void {
     const resolve = this.#editorResolve;
     if (!resolve) return;
+    const returnSurface = this.#returnSurface;
     this.#editorResolve = null;
     this.#editorRequest = null;
     this.#editorValidationMessage = "";
@@ -1440,11 +1491,14 @@ export class TerminalUi implements SettingsSurface {
     this.#selectedIndex = 0;
     this.#pasting = false;
     this.#pasteBuffer = "";
-    this.#surface = this.#returnSurface ?? "chat";
+    this.#surface = this.#closingSettings && returnSurface === "settings"
+      ? "chat"
+      : returnSurface ?? "chat";
     this.#mode = this.#returnMode ?? "busy";
     this.#returnSurface = null;
     this.#returnMode = null;
     resolve(result);
+    if (this.#closingSettings) return;
     this.#syncMouseReporting();
     this.#forgetGeometry();
     this.scheduleRender(true);
@@ -1646,6 +1700,7 @@ export class TerminalUi implements SettingsSurface {
     this.#recordingResolve = null;
     this.#settingsIntentResolve = null;
     this.#settingsIntentReject = null;
+    this.#settingsKeyQueue = [];
     this.#pickerSearch = null;
     this.#pickerModels = [];
     this.#choiceAll = [];
@@ -1673,6 +1728,8 @@ export class TerminalUi implements SettingsSurface {
     }
     this.#returnSurface = null;
     this.#returnMode = null;
+    this.#settingsChatStatus = null;
+    this.#closingSettings = false;
     if (!this.#inputResolve) this.#mode = "idle";
     this.#status = "Eingabe abgebrochen";
     this.#statusAt = Date.now();
@@ -1794,7 +1851,9 @@ export class TerminalUi implements SettingsSurface {
       } else if (key.name === "return" || key.name === "enter") this.#submitValidatedEditor();
       else if (key.name === "escape") this.#resolveSettingsEditor({ kind: "cancel" });
       else {
+        const previous = this.#editorChars.join("");
         this.#editEditor(character, key);
+        if (this.#editorChars.join("") !== previous) this.#editorValidationMessage = "";
         this.scheduleRender(true);
       }
       return;
@@ -1937,44 +1996,78 @@ export class TerminalUi implements SettingsSurface {
   #onTerminalData = (chunk: string | Buffer): void => {
     if (!this.#active) return;
     const text = typeof chunk === "string" ? chunk : chunk.toString("utf8");
-    const sequence = `${this.#mouseProtocolBuffer}${text}`;
-    if (!"\u001b[<".startsWith(sequence) && !sequence.startsWith("\u001b[<")) {
-      if (this.#mouseProtocolBuffer) {
-        this.#rememberMouseKeypresses(text);
-        this.#mouseProtocolBuffer = "";
-      }
-      return;
+    const buffered = this.#mouseProtocolBuffer;
+    let sequence = `${buffered}${text}`;
+    let priorLength = buffered.length;
+    this.#mouseProtocolBuffer = "";
+
+    // A buffered ESC/CSI prefix that diverges from SGR mouse belongs to the
+    // terminal decoder, not to this parser. Its already-marked prefix remains
+    // suppressed, while the new bytes are scanned afresh for another frame.
+    if (
+      buffered
+      && !"\u001b[<".startsWith(sequence)
+      && !sequence.startsWith("\u001b[<")
+    ) {
+      sequence = text;
+      priorLength = 0;
     }
 
-    this.#rememberMouseKeypresses(text);
-    if ("\u001b[<".startsWith(sequence)) {
-      this.#mouseProtocolBuffer = sequence;
-      return;
-    }
-    if (sequence.length > MAX_MOUSE_SEQUENCE_LENGTH) {
-      this.#finishMouseSequence();
-      return;
-    }
-    if (/^\u001b\[<\d{0,3}(?:;\d{0,5}(?:;\d{0,5})?)?$/.test(sequence)) {
-      this.#mouseProtocolBuffer = sequence;
-      return;
-    }
-    this.#mouseProtocolBuffer = "";
-    const match = /^\u001b\[<(\d{1,3});(\d{1,5});(\d{1,5})([Mm])$/.exec(sequence);
-    if (match) {
-      const button = Number(match[1]);
-      const column = Number(match[2]);
-      const row = Number(match[3]);
-      if (match[4] === "M" && button === 0 && Number.isSafeInteger(column) && Number.isSafeInteger(row)) {
-        this.#selectMouseRow(column, row);
+    const rememberRange = (start: number, end: number): void => {
+      const freshStart = Math.max(start, priorLength);
+      if (end > freshStart) this.#rememberMouseKeypresses(sequence.slice(freshStart, end));
+    };
+
+    let cursor = 0;
+    while (cursor < sequence.length) {
+      const rest = sequence.slice(cursor);
+
+      if ("\u001b[<".startsWith(rest)) {
+        rememberRange(cursor, sequence.length);
+        this.#mouseProtocolBuffer = rest;
+        break;
       }
+      if (!rest.startsWith("\u001b[<")) break;
+
+      const match = /^\u001b\[<(\d{1,3});(\d{1,5});(\d{1,5})([Mm])/.exec(rest);
+      if (match) {
+        const end = cursor + match[0].length;
+        rememberRange(cursor, end);
+        const button = Number(match[1]);
+        const column = Number(match[2]);
+        const row = Number(match[3]);
+        if (
+          match[4] === "M"
+          && button === 0
+          && Number.isSafeInteger(column)
+          && Number.isSafeInteger(row)
+        ) {
+          this.#selectMouseRow(column, row);
+        }
+        cursor = end;
+        continue;
+      }
+
+      if (
+        rest.length <= MAX_MOUSE_SEQUENCE_LENGTH
+        && /^\u001b\[<\d{0,3}(?:;\d{0,5}(?:;\d{0,5})?)?$/.test(rest)
+      ) {
+        rememberRange(cursor, sequence.length);
+        this.#mouseProtocolBuffer = rest;
+        break;
+      }
+
+      // A malformed SGR candidate is terminal control input, never user text.
+      // Consume through its terminator when present so a printable suffix in
+      // the same chunk can still reach readline exactly once.
+      const terminator = rest.slice(3, MAX_MOUSE_SEQUENCE_LENGTH).search(/[Mm]/u);
+      const malformedEnd = terminator >= 0
+        ? cursor + 3 + terminator + 1
+        : sequence.length;
+      rememberRange(cursor, malformedEnd);
+      cursor = malformedEnd;
     }
-    this.#finishMouseSequence();
   };
-
-  #finishMouseSequence(): void {
-    this.#mouseProtocolBuffer = "";
-  }
 
   #clearMouseProtocol(): void {
     this.#mouseProtocolBuffer = "";
@@ -2072,7 +2165,15 @@ export class TerminalUi implements SettingsSurface {
     const items: Array<ModelInfo | ChoicePickerItem> = models
       ? this.#pickerModels
       : this.#choiceItems;
-    const visibleRows = Math.min((this.stdout.rows || 24) >= 20 ? 6 : 4, items.length);
+    const expansionLimit = (this.stdout.rows || 24) >= 20 ? 6 : 4;
+    const validationRows = this.#returnSurface === "settings"
+      && this.#editorValidationMessage
+      ? 1
+      : 0;
+    const visibleRows = Math.min(
+      Math.max(0, expansionLimit - validationRows),
+      items.length,
+    );
     if (!visibleRows) return;
     const visibleStart = clamp(
       this.#selectedIndex - Math.floor(visibleRows / 2),
@@ -2091,8 +2192,15 @@ export class TerminalUi implements SettingsSurface {
       this.#selectedIndex = visibleStart + offset;
       if (models && this.#pickerMultiple) {
         const id = (item as ModelInfo).id;
-        if (this.#pickerSelected.has(id)) this.#pickerSelected.delete(id);
-        else if (this.#pickerSelected.size < 5) this.#pickerSelected.add(id);
+        if (this.#pickerSelected.has(id)) {
+          this.#pickerSelected.delete(id);
+          this.#editorValidationMessage = "";
+        }
+        else if (this.#pickerSelected.size < 5) {
+          this.#pickerSelected.add(id);
+          this.#editorValidationMessage = "";
+        }
+        else this.#editorValidationMessage = "Höchstens fünf Panel-Modelle sind zulässig";
         this.scheduleRender(true);
       } else {
         this.#resolveSettingsEditor({
@@ -2317,8 +2425,14 @@ export class TerminalUi implements SettingsSurface {
     if (models && this.#pickerMultiple && key.name === "space") {
       const selected = this.#pickerModels[this.#selectedIndex];
       if (selected) {
-        if (this.#pickerSelected.has(selected.id)) this.#pickerSelected.delete(selected.id);
-        else if (this.#pickerSelected.size < 5) this.#pickerSelected.add(selected.id);
+        if (this.#pickerSelected.has(selected.id)) {
+          this.#pickerSelected.delete(selected.id);
+          this.#editorValidationMessage = "";
+        }
+        else if (this.#pickerSelected.size < 5) {
+          this.#pickerSelected.add(selected.id);
+          this.#editorValidationMessage = "";
+        }
         else this.#editorValidationMessage = "Höchstens fünf Panel-Modelle sind zulässig";
       }
       this.scheduleRender(true);
@@ -2362,13 +2476,16 @@ export class TerminalUi implements SettingsSurface {
         if (models) {
           try {
             this.#refreshPicker();
+            this.#editorValidationMessage = "";
           } catch {
-            this.#pickerModels = [];
             this.#selectedIndex = 0;
             this.#editorValidationMessage = "Modellcache konnte nicht gelesen werden";
           }
         }
-        else this.#refreshChoices();
+        else {
+          this.#refreshChoices();
+          this.#editorValidationMessage = "";
+        }
       }
     }
     this.scheduleRender(true);
@@ -2526,13 +2643,24 @@ export class TerminalUi implements SettingsSurface {
       if (this.#mode === "model-picker") {
         try {
           this.#refreshPicker();
+          this.#editorValidationMessage = "";
         } catch {
-          this.#pickerModels = [];
           this.#editorValidationMessage = "Modellcache konnte nicht gelesen werden";
         }
-      } else if (this.#mode === "choice-picker") this.#refreshChoices();
+      } else if (this.#mode === "choice-picker") {
+        this.#refreshChoices();
+        this.#editorValidationMessage = "";
+      } else this.#editorValidationMessage = "";
     } else if (this.#surface === "settings") {
-      if (!this.#settingsView?.search.active || !this.#settingsIntentResolve) {
+      if (!this.#settingsView?.search.active) {
+        this.scheduleRender(true);
+        return;
+      }
+      if (!this.#settingsIntentResolve) {
+        this.#enqueueSettingsKey({
+          character: clean,
+          key: { name: undefined, sequence: clean, ctrl: false, meta: false },
+        });
         this.scheduleRender(true);
         return;
       }
