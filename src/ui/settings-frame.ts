@@ -150,6 +150,21 @@ function categorySpans(
   ];
 }
 
+function compactContextSpans(
+  input: SettingsFrameInput,
+  indexed: IndexedCategory,
+  marker: string,
+): Span[] {
+  if (!input.view.search.active) return categorySpans(input, indexed, marker);
+  const selected = indexed.category.id === input.view.selectedCategoryId;
+  return [
+    span(`${selected ? marker : " "} Suche · \"`, selected ? "active" : "muted"),
+    span(safeText(input.view.search.query), selected ? "active" : "text", { bold: true }),
+    span(`\" · ${indexed.ordinal} `, "structure"),
+    span(safeText(indexed.category.label), selected ? "active" : "text", selected ? { bold: true } : undefined),
+  ];
+}
+
 function itemPrimarySpans(
   input: SettingsFrameInput,
   item: SettingsItem,
@@ -328,7 +343,7 @@ function renderStackedBody(
   if (availableRows < 5) {
     const selectedCategory = windowAround(indexed, selectedCategoryIndex, 1)[0];
     if (selectedCategory) {
-      const content = categorySpans(input, selectedCategory, marker);
+      const content = compactContextSpans(input, selectedCategory, marker);
       const fitted = fitSpans(content, usableWidth, ellipsis);
       lines.push(line(...fitted));
       addHitTarget(

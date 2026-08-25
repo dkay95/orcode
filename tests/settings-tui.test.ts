@@ -478,3 +478,24 @@ test("50x16 zeigt den globalen Schreibschutz auch ohne Farbe im Titel", () => {
   assert.match(rendered, /Schreibgeschützt/u);
   assertBounded(result, 50, 16);
 });
+
+test("40x8 Suche behält Query, selektiertes Ergebnis und Disabled-Grund", () => {
+  const result = build(40, 8, {
+    items: [ITEMS[1]],
+    allItems: [ITEMS[1]],
+    selectedItemId: "reasoning",
+    search: { active: true, query: "denk" },
+  });
+  assertBounded(result, 40, 8);
+  assert.deepEqual(semanticSnapshot(result), [
+    "1:⬡─┤●○ ORCODE · Einstellungen",
+    "2:<divider:39>",
+    "3:› Suche · \"denk\" · 1 Modelle & Denken",
+    "4:› Denkstufe · Hoch",
+    "5:Gesperrt · Lauf aktiv",
+    "6:✓ Gespeichert",
+    "8:Suche · ↑↓ · Enter · Esc zurück",
+  ]);
+  assert.deepEqual(result.frame.cursor, { row: 4, col: 1 });
+  assert.equal(result.hitTargets.length, 2);
+});
