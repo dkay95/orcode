@@ -304,6 +304,20 @@ export function buildDashboardFrame(input: DashboardFrameInput): Frame {
   const listValidation: Line[] = input.list && input.editorPrompt?.validationMessage
     ? [{ spans: [span(input.editorPrompt.validationMessage, "warn")] }]
     : [];
+  const emptyWelcome = { spans: [span("  ", "text"), span(WELCOME, "muted")] };
+  const emptyBrand: Line[] = input.brand?.showLargeLogo
+    ? height >= 20
+      ? [
+          ...input.brand.largeLines.map((value) => ({ spans: [span(value, "muted")] })),
+          emptyWelcome,
+        ]
+      : height >= 12
+        ? [
+            { spans: [span(`${input.brand.compactMark} ORCODE`, "muted")] },
+            emptyWelcome,
+          ]
+        : [emptyWelcome]
+    : [emptyWelcome];
   const expansion: Line[] = input.list
     ? [
         ...listValidation,
@@ -317,12 +331,7 @@ export function buildDashboardFrame(input: DashboardFrameInput): Frame {
     : editorExpansion.length
       ? editorExpansion
     : input.blocks.length === 0
-      ? [
-          ...(input.brand?.showLargeLogo
-            ? input.brand.largeLines.map((value) => ({ spans: [span(value, "muted")] }))
-            : []),
-          { spans: [span("  ", "text"), span(WELCOME, "muted")] },
-        ]
+      ? emptyBrand
       : [];
 
   const frameInput: FrameInput = {

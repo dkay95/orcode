@@ -98,6 +98,27 @@ test("empty dashboard and normal header consume the canonical Route Core brandin
   assert.match(plainText(populated.lines[0]!), /<>-\+\*o/);
 });
 
+test("empty Route Core degrades from complete large art to compact wordmark then welcome", () => {
+  const brand = {
+    showLargeLogo: true,
+    showHeaderMark: true,
+    largeLines: routeCoreLarge("ascii"),
+    compactMark: routeCoreCompact("ascii"),
+  };
+  const tall = text(buildDashboardFrame(input({ height: 24, brand })).lines);
+  assert.match(tall, /\/--------\\/);
+  assert.match(tall, /Schreib eine Aufgabe/);
+
+  const short = text(buildDashboardFrame(input({ height: 14, brand })).lines);
+  assert.doesNotMatch(short, /\/--------\\/);
+  assert.match(short, /<>-\+\*o ORCODE/);
+  assert.match(short, /Schreib eine Aufgabe/);
+
+  const minimum = text(buildDashboardFrame(input({ height: 8, brand })).lines);
+  assert.doesNotMatch(minimum, /\/--------\\|<>-\+\*o|ORCODE/);
+  assert.match(minimum, /Schreib eine Aufgabe/);
+});
+
 function chat(count: number): ChatBlock[] {
   const model = new RunViewModel();
   for (let index = 0; index < count; index += 1) {

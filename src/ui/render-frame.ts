@@ -300,7 +300,7 @@ export function buildFrame(input: FrameInput): Frame {
   const inputRows = wrapInputText(input.inputText, inputWrapWidth);
   const inputTotalRows = Math.max(1, inputRows.length);
   const inputHeight = Math.min(MAX_INPUT_LINES, inputTotalRows);
-  const expansionLimit = height >= 20 ? 6 : 4;
+  const expansionLimit = height >= 20 ? 7 : 4;
   let expansion = (input.expansion ?? []).slice(0, expansionLimit);
   let help = input.help && input.help.length > 0 ? input.help : undefined;
   let showHeader = height >= 12;
