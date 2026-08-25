@@ -329,18 +329,28 @@ export class RuleStore {
 
   async forget(id: string): Promise<boolean> {
     const before = this.#rules.length;
-    this.#rules = this.#rules.filter((rule) => rule.id !== id);
-    if (this.#rules.length === before) return false;
-    await this.#persist();
+    const candidate = this.#rules.filter((rule) => rule.id !== id);
+    if (candidate.length === before) return false;
+    await this.#persist(candidate);
+    this.#rules = candidate;
     return true;
+  }
+
+  async forgetAll(workspace: string): Promise<number> {
+    const candidate = this.#rules.filter((rule) => rule.workspace !== workspace);
+    const removed = this.#rules.length - candidate.length;
+    if (removed === 0) return 0;
+    await this.#persist(candidate);
+    this.#rules = candidate;
+    return removed;
   }
 
   list(workspace: string): PermissionRule[] {
     return this.#rules.filter((rule) => rule.workspace === workspace);
   }
 
-  async #persist(): Promise<void> {
-    const file: RuleFileV2 = { version: RULE_FILE_VERSION, rules: this.#rules };
+  async #persist(rules = this.#rules): Promise<void> {
+    const file: RuleFileV2 = { version: RULE_FILE_VERSION, rules };
     await this.#privateStore.writeTextAtomic(
       rulesPath(this.#appHome),
       `${JSON.stringify(file, null, 2)}\n`,

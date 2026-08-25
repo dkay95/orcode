@@ -6,6 +6,7 @@ import {
   type SettingsCommandPort,
 } from "../src/commands.js";
 import { createSettingsCommandPort } from "../src/cli.js";
+import { SessionProviderRuntimeGuard } from "../src/cli.js";
 import type { ProviderExecutionMode } from "../src/setup.js";
 import { describeOpenRouterFailure, formatFailure } from "../src/openrouter.js";
 import { errorMessage } from "../src/utils.js";
@@ -46,6 +47,15 @@ test("Settings command factory fails closed before creating a session outside an
       assert.equal(created, accepted ? 1 : 0, `${executionMode}/${stdinIsTty}/${stdoutIsTty}`);
     }
   }
+});
+
+test("cached runtime activity reflects a run without acquiring a lease", () => {
+  const guard = new SessionProviderRuntimeGuard();
+  assert.deepEqual(guard.activity(), { runActive: false, activationHeld: false });
+  const release = guard.beginRun();
+  assert.deepEqual(guard.activity(), { runActive: true, activationHeld: false });
+  release();
+  assert.deepEqual(guard.activity(), { runActive: false, activationHeld: false });
 });
 
 test("/settings opens the installed command port exactly once and stays in chat", async () => {

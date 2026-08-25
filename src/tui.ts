@@ -539,6 +539,21 @@ export class TerminalUi implements SettingsSurface {
     }
   }
 
+  /** Settings setup bridge: never writes an event into the chat transcript. */
+  showSettingsNotice(message: string): void {
+    this.#settingsChatStatus = { value: oneLine(message), at: Date.now() };
+    this.scheduleRender(true);
+  }
+
+  /** Restores the Settings frame after a nested picker/secret/confirmation. */
+  restoreSettings(): void {
+    if (this.#settingsView) {
+      this.#surface = "settings";
+      this.#syncMouseReporting();
+      this.scheduleRender(true);
+    }
+  }
+
   applyAppearance(appearance: AppearanceConfig): void {
     this.#appearance = { ...appearance };
     const glyphMode = resolveGlyphMode(appearance.glyphMode, this.#glyphEnvironment);

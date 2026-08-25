@@ -1062,6 +1062,11 @@ export class OpenRouterService {
     return [...models];
   }
 
+  /** Synchronous cache read for UI projections; it never fetches or reads a key. */
+  readCachedModels(): readonly ModelInfo[] {
+    return this.#modelCache ? this.#modelCache.models.map((model) => ({ ...model })) : [];
+  }
+
   /** Candidate/setup catalogue read that cannot populate the active cache. */
   async inspectModels(signal?: AbortSignal): Promise<ModelInfo[]> {
     return this.#fetchModels(signal);

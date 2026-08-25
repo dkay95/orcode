@@ -123,6 +123,7 @@ import {
   runOutcomeLabel,
   sanitizeTerminalText,
   type DashboardState,
+  type SettingsEditorResolver,
 } from "./tui.js";
 import type {
   AgentRunEvent,
@@ -156,6 +157,7 @@ import { RunLog } from "./runlog.js";
 import { collectRetentionErrors } from "./storage.js";
 import {
   createPlainSetupSurface,
+  createSettingsSetupSurface,
   createTuiSetupSurface,
   runSetupHub,
   type SetupHubOptions,
@@ -525,6 +527,8 @@ export interface ProviderRuntime extends ProviderRouteIntentPort, ProviderComman
   inspectStartup(): Promise<StartupSetupResult>;
   resolveLegacyDefaultRoute(): Promise<StartupSetupResult>;
   runSetup(surface: SetupSurface | "plain" | "fullscreen"): Promise<SetupHubResult>;
+  /** A cached counter projection; this never acquires a runtime lease. */
+  settingsActivity?(): ProviderRuntimeActivity;
   ensureRunnableRoute(): RouteIdentityV1;
   currentSessionRoute(): RouteIdentityV1;
   selectSessionRoute(
@@ -643,7 +647,12 @@ function isProviderSetupRequired(error: unknown): boolean {
     );
 }
 
-class SessionProviderRuntimeGuard implements ProviderActivationRuntimeGuard {
+export interface ProviderRuntimeActivity {
+  readonly runActive: boolean;
+  readonly activationHeld: boolean;
+}
+
+export class SessionProviderRuntimeGuard implements ProviderActivationRuntimeGuard {
   #activationHeld = false;
   #activeRuns = 0;
 
@@ -679,6 +688,13 @@ class SessionProviderRuntimeGuard implements ProviderActivationRuntimeGuard {
       active = false;
       this.#activeRuns -= 1;
     };
+  }
+
+  activity(): ProviderRuntimeActivity {
+    return Object.freeze({
+      runActive: this.#activeRuns > 0,
+      activationHeld: this.#activationHeld,
+    });
   }
 }
 
@@ -762,6 +778,10 @@ export class DefaultProviderRuntime implements ProviderRuntime {
 
   get preparedRoles(): SetupPreparedRoles | null {
     return this.#preparedRoles ? structuredClone(this.#preparedRoles) : null;
+  }
+
+  settingsActivity(): ProviderRuntimeActivity {
+    return this.runtimeGuard.activity();
   }
 
   modelRuntime(route: RouteIdentityV1): ModelRuntime {
@@ -4610,7 +4630,10 @@ function createSettingsSession(
             // provider command or inspect a credential.
             read: async () => ({
               config: context.config,
-              runActive: false,
+              runActive: (() => {
+                const activity = context.providerRuntime.settingsActivity?.();
+                return activity?.runActive === true || activity?.activationHeld === true;
+              })(),
               route: null,
               providers: [],
               approvalRules: context.ruleStore.list(context.workspace).map((rule) => ({
@@ -4623,18 +4646,43 @@ function createSettingsSession(
                 dayUsd: 0,
                 totalUsd: context.session.data.costs.totalUsd,
               },
-              cachedModels: [],
+              cachedModels: context.openRouter.readCachedModels(),
             }),
           },
           externalActions: {
             async execute(action: SettingsExternalAction): Promise<void> {
+              assertSettingsIdle(context);
               if (action.kind === "provider") {
-                await context.providerCommands.execute(action.intent, context.providerRouteSurface);
+                await context.providerCommands.execute(
+                  action.intent,
+                  action.intent.kind === "setup"
+                    ? createSettingsSetupSurface(surface)
+                    : context.providerRouteSurface,
+                );
                 return;
               }
-              // Model and catalogue actions stay disabled until Task 5's
-              // transactional publication adapter provides their authority.
-              throw new Error("Settings action is not available.");
+              if (action.kind === "approval-forget") {
+                await context.ruleStore.forget(action.ruleId);
+                return;
+              }
+              if (action.kind === "approval-forget-all") {
+                await context.ruleStore.forgetAll(context.workspace);
+                return;
+              }
+              if (action.kind === "main-model") {
+                await context.providerRuntime.transitionModel(
+                  action.requestedModelId,
+                  action.canonicalModelId,
+                  "fullscreen",
+                );
+                return;
+              }
+              await persistSettingsExternalConfig(context, (next) => {
+                if (action.kind === "compressor-model") next.compressorModel = action.modelId;
+                else if (action.kind === "panel-models") next.panelModels = [...action.modelIds];
+                else if (action.kind === "transcription-model") next.transcriptionModel = action.modelId;
+                else if (action.kind === "verify-suggest") next.verify.commands = [];
+              });
             },
           },
           liveConfig: {
@@ -4651,6 +4699,23 @@ function createSettingsSession(
       }
     },
   };
+}
+
+function assertSettingsIdle(context: RuntimeContext): void {
+  const activity = context.providerRuntime.settingsActivity?.();
+  if (activity?.runActive || activity?.activationHeld) throw new Error("Lauf aktiv");
+}
+
+async function persistSettingsExternalConfig(
+  context: RuntimeContext,
+  edit: (candidate: OrcodeConfigWithBudget) => void,
+): Promise<void> {
+  assertSettingsIdle(context);
+  const expected = await readConfigEditSnapshot(context.configPath);
+  const candidate = structuredClone(expected.config);
+  edit(candidate);
+  const saved = await saveConfigEdit(expected, candidate, context.configPath);
+  Object.assign(context.config, saved);
 }
 
 export interface DashboardRunInput extends PlainRunInput {
@@ -5048,7 +5113,9 @@ async function runPlainLoop(
     stdinIsTty: process.stdin.isTTY === true,
     stdoutIsTty: process.stdout.isTTY === true,
     createSession: async () => {
-      const ui = new TerminalUi(() => plainSettingsDashboardState(context));
+      const ui = new TerminalUi(() => plainSettingsDashboardState(context), process.stdin, process.stdout, undefined, {
+        settingsEditorResolver: createSettingsEditorResolver(context),
+      });
       return createSettingsSession(context, ui, true);
     },
   });
@@ -5134,6 +5201,18 @@ function plainSettingsDashboardState(context: RuntimeContext): DashboardState {
     maxCost: formatUsd(context.config.maxCostUsd),
     maxSteps: context.config.maxSteps,
     keyStatus: "nicht geprüft",
+  };
+}
+
+function createSettingsEditorResolver(context: RuntimeContext): SettingsEditorResolver {
+  return {
+    searchModels(request, query) {
+      const cached = [...context.openRouter.readCachedModels()];
+      const eligible = request.itemId === "compressor-model"
+        ? compressorModelCandidates(cached)
+        : mainModelCandidates(cached);
+      return rankModels(eligible, query, context.config.mainModel);
+    },
   };
 }
 
@@ -5413,6 +5492,8 @@ async function runDashboard(
       keyStatus: dashboardKeyStatus(context.openRouter),
       sshHost: context.sshSession.active ?? undefined,
     };
+  }, process.stdin, process.stdout, undefined, {
+    settingsEditorResolver: createSettingsEditorResolver(context),
   });
   const dashboardOut = new BufferedCommandOutput();
   context.out = dashboardOut;

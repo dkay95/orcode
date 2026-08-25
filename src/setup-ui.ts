@@ -1197,6 +1197,63 @@ export interface TuiSetupPromptUi {
   setStatus(status: string, busy?: boolean): void;
 }
 
+/** Keyboard-only setup bridge used while the Settings surface owns the terminal. */
+export interface SettingsSetupPromptUi {
+  pickChoice(
+    title: string,
+    items: readonly { label: string; value: string; description: string }[],
+    currentValue: string,
+    initialValue?: string,
+  ): Promise<{ value: string } | null>;
+  readSecret(label: string): Promise<string | null>;
+  pickModel(
+    search: (query: string) => readonly ModelInfo[],
+    currentModel: string,
+    title?: string,
+  ): Promise<{ id: string } | null>;
+  confirmAction(title: string, details: string, rememberAvailable?: boolean): Promise<{ accepted: boolean }>;
+  showSettingsNotice(message: string): void;
+  restoreSettings(): void;
+}
+
+export function createSettingsSetupSurface(ui: SettingsSetupPromptUi): SetupSurface {
+  const restore = async <T>(operation: () => Promise<T>): Promise<T> => {
+    try { return await operation(); } finally { ui.restoreSettings(); }
+  };
+  return {
+    chooseHub(entries) {
+      const current = entries.find((entry) => entry.current)?.id ?? "";
+      const items = entries.map((entry) => ({
+        value: entry.id, label: providerEntryLabel(entry), description: entry.description,
+      }));
+      return restore(() => ui.pickChoice("Provider-Setup", items, current, current || (items[0]?.value ?? ""))
+        .then((picked) => picked?.value ?? null));
+    },
+    chooseAuthenticationMethod(request) {
+      const items = request.methods.map((method) => ({
+        value: method.id, label: method.label, description: method.description,
+      }));
+      return restore(() => ui.pickChoice("Kimi-Zugang", items, "membership-key", "membership-key")
+        .then((picked) => picked?.value ?? null));
+    },
+    readSecret(request) { return restore(() => ui.readSecret(request.message)); },
+    chooseModel(request) {
+      const models = request.models.map(modelInfo);
+      return restore(() => ui.pickModel(() => models, "", "Modell auswählen")
+        .then((picked) => picked?.id ?? null));
+    },
+    confirm(request) {
+      return restore(() => ui.confirmAction(request.message, "", false)
+        .then((result) => result.accepted));
+    },
+    present(event) {
+      if (event.type === "provider-state") ui.showSettingsNotice(providerStateLabel(event.entries));
+      else if (event.type === "notice") ui.showSettingsNotice(event.message);
+      ui.restoreSettings();
+    },
+  };
+}
+
 /** The fullscreen UI supplies its existing picker and secret primitives. */
 export function createTuiSetupSurface(ui: TuiSetupPromptUi): SetupSurface {
   return {
