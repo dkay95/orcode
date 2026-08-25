@@ -240,12 +240,20 @@ export class SettingsController {
     initialCategory: SettingsCategoryId = "models-reasoning",
   ): Promise<SettingsController> {
     const runtime = await dependencies.snapshots.read();
+    let controllerSnapshot = runtime;
     let configEditState: SettingsConfigEditState;
     try {
-      configEditState = {
-        kind: "editable",
-        snapshot: await dependencies.readConfig(dependencies.configPath),
-      };
+      const exact = await dependencies.readConfig(dependencies.configPath);
+      if (sameConfig(runtime.config, exact.config)) {
+        configEditState = { kind: "editable", snapshot: exact };
+      } else {
+        controllerSnapshot = { ...runtime, config: exact.config };
+        configEditState = {
+          kind: "read-only",
+          config: freezeClone(exact.config),
+          reason: READ_ONLY_REASON,
+        };
+      }
     } catch {
       configEditState = {
         kind: "read-only",
@@ -255,7 +263,7 @@ export class SettingsController {
     }
     return new SettingsController(
       dependencies,
-      runtime,
+      controllerSnapshot,
       configEditState,
       initialCategory,
     );
@@ -588,13 +596,30 @@ export class SettingsController {
       return { kind: "render" };
     }
 
-    this.#configEditState = { kind: "editable", snapshot: exact };
     publication.publish();
+    let runtime: SettingsControllerSnapshot;
     try {
-      this.#snapshot = freezeClone(await this.#dependencies.snapshots.read());
+      runtime = await this.#dependencies.snapshots.read();
     } catch {
-      this.#snapshot = freezeClone({ ...activity, config: validated });
+      this.#enterReadOnly(
+        focusItemId,
+        { ...activity, config: validated },
+        validated,
+      );
+      this.#notice = Object.freeze({ kind: "success", message: SAVED_REFRESH_NOTICE });
+      return { kind: "render" };
     }
+    if (!sameConfig(runtime.config, exact.config)) {
+      this.#enterReadOnly(
+        focusItemId,
+        { ...runtime, config: exact.config },
+        exact.config,
+      );
+      this.#notice = Object.freeze({ kind: "success", message: SAVED_REFRESH_NOTICE });
+      return { kind: "render" };
+    }
+    this.#snapshot = freezeClone(runtime);
+    this.#configEditState = { kind: "editable", snapshot: exact };
     this.#rebuildRegistry();
     this.#restoreFocus(focusItemId);
     this.#notice = Object.freeze({ kind: "success", message: "Gespeichert" });
@@ -627,13 +652,15 @@ export class SettingsController {
     return { kind: "edit", request };
   }
 
-  async #refresh(focusItemId: SettingsItemId): Promise<void> {
+  async #refresh(focusItemId: SettingsItemId): Promise<boolean> {
     const runtime = await this.#dependencies.snapshots.read();
     this.#snapshot = freezeClone(runtime);
+    let editable = false;
     try {
       const exact = await this.#dependencies.readConfig(this.#dependencies.configPath);
       if (sameConfig(runtime.config, exact.config)) {
         this.#configEditState = { kind: "editable", snapshot: exact };
+        editable = true;
       } else {
         this.#snapshot = freezeClone({ ...runtime, config: exact.config });
         this.#configEditState = {
@@ -651,6 +678,7 @@ export class SettingsController {
     }
     this.#rebuildRegistry();
     this.#restoreFocus(focusItemId);
+    return editable;
   }
 
   async #refreshOrReadOnly(
@@ -659,8 +687,7 @@ export class SettingsController {
     fallbackConfig: OrcodeConfigWithBudget,
   ): Promise<boolean> {
     try {
-      await this.#refresh(focusItemId);
-      return true;
+      return await this.#refresh(focusItemId);
     } catch {
       this.#enterReadOnly(focusItemId, fallbackSnapshot, fallbackConfig);
       return false;

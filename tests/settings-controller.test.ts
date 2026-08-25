@@ -179,6 +179,7 @@ function harness(
   const published: OrcodeConfigWithBudget[] = [];
   const externalActions: SettingsExternalAction[] = [];
   let snapshotReads = 0;
+  let defaultEditSnapshot: ConfigEditSnapshot | null = null;
   let current = options.initialSnapshot
     ? structuredClone(options.initialSnapshot)
     : runtimeSnapshot(
@@ -226,13 +227,27 @@ function harness(
           };
         }),
       },
-      readConfig: options.readConfig ?? readConfigEditSnapshot,
-      saveConfig: options.saveConfig ?? (async (_expected, candidate, _path) => {
-        events.push("persist-start");
-        const saved = validateConfig(candidate);
-        events.push("persist-done");
-        return saved;
+      readConfig: options.readConfig ?? (async (configPath) => {
+        defaultEditSnapshot ??= await readConfigEditSnapshot(configPath);
+        return defaultEditSnapshot;
       }),
+      saveConfig: async (expected, candidate, configPath) => {
+        const saved = options.saveConfig
+          ? await options.saveConfig(expected, candidate, configPath)
+          : await (async () => {
+              events.push("persist-start");
+              const validated = validateConfig(candidate);
+              events.push("persist-done");
+              return validated;
+            })();
+        if (!options.readConfig && defaultEditSnapshot) {
+          defaultEditSnapshot = {
+            file: defaultEditSnapshot.file,
+            config: structuredClone(saved),
+          };
+        }
+        return saved;
+      },
     },
   };
 }
@@ -282,6 +297,29 @@ test("ein unsicherer Config-Snapshot hält Settings lesbar und sperrt ausnahmslo
     }
     assert.equal((await controller.dispatch({ kind: "activate" })).kind, "render");
     assert.equal(setup.events.includes("external-action"), false);
+  });
+});
+
+test("Open mit unterschiedlicher Runtime- und Disk-Config zeigt Disk read-only statt gemischter Editoren", async () => {
+  await withTempConfig(async (path) => {
+    const exact = await readConfigEditSnapshot(path);
+    const disk = structuredClone(DEFAULT_CONFIG);
+    disk.appearance.showLargeLogo = false;
+    const setup = harness(path, {
+      readConfig: async () => ({ file: exact.file, config: disk }),
+    });
+
+    const controller = await SettingsController.open(setup.dependencies);
+
+    assert.equal(controller.view.readOnlyReason, "Konfiguration schreibgeschützt");
+    assert.equal(
+      controller.view.allItems.find(({ id }) => id === "appearance-large-logo")?.displayValue,
+      "Aus",
+    );
+    await controller.dispatch({ kind: "select-item", itemId: "appearance-large-logo" });
+    assert.equal((await controller.dispatch({ kind: "activate" })).kind, "render");
+    assert.equal(setup.events.includes("persist-start"), false);
+    assert.equal(setup.published.length, 0);
   });
 });
 
@@ -346,6 +384,38 @@ test("ein Refreshfehler nach durable Save und Live-Publikation settled sicher oh
 
     await controller.completeEditor(opened.request, { kind: "value", value: "on" });
     assert.equal(writes, 1, "der durable Editor darf nach fehlgeschlagenem Refresh nie erneut schreiben");
+    assert.equal((await controller.dispatch({ kind: "activate" })).kind, "render");
+  });
+});
+
+test("fehlender exakter Readback nach durable Save meldet ehrliches Refresh-Settlement", async () => {
+  await withTempConfig(async (path) => {
+    const initial = await readConfigEditSnapshot(path);
+    let configReads = 0;
+    let writes = 0;
+    const setup = harness(path, {
+      readConfig: async () => {
+        configReads += 1;
+        if (configReads === 1) return initial;
+        throw new Error("private-readback-failure");
+      },
+      saveConfig: async (_expected, candidate) => {
+        writes += 1;
+        return validateConfig(candidate);
+      },
+    });
+    const controller = await SettingsController.open(setup.dependencies);
+    await controller.dispatch({ kind: "select-item", itemId: "appearance-large-logo" });
+    const opened = await controller.dispatch({ kind: "activate" });
+    assert.equal(opened.kind, "edit");
+    if (opened.kind !== "edit") return;
+
+    await controller.completeEditor(opened.request, { kind: "value", value: "off" });
+
+    assert.equal(writes, 1);
+    assert.equal(setup.published.length, 1);
+    assert.equal(controller.view.notice?.message, "Gespeichert; Ansicht konnte nicht aktualisiert werden");
+    assert.equal(controller.view.readOnlyReason, "Konfiguration schreibgeschützt");
     assert.equal((await controller.dispatch({ kind: "activate" })).kind, "render");
   });
 });
@@ -662,6 +732,89 @@ test("typed-unverified wird exakt neu gelesen, bei bestätigtem Kandidaten recon
   });
 });
 
+test("typed-unverified bestätigter Kandidat mit fehlendem Runtime-Refresh settled read-only", async () => {
+  await withTempConfig(async (path) => {
+    const initial = await readConfigEditSnapshot(path);
+    let durable: OrcodeConfigWithBudget | null = null;
+    let configReads = 0;
+    let writes = 0;
+    const setup = harness(path, {
+      failSnapshotReadAt: 3,
+      readConfig: async () => {
+        configReads += 1;
+        if (configReads === 1) return initial;
+        if (!durable) throw new Error("unexpected missing durable config");
+        return { file: initial.file, config: durable };
+      },
+      saveConfig: async (_expected, candidate) => {
+        writes += 1;
+        durable = validateConfig(candidate);
+        throw new ConfigEditUnverifiedError();
+      },
+    });
+    const controller = await SettingsController.open(setup.dependencies);
+    await controller.dispatch({ kind: "select-item", itemId: "appearance-large-logo" });
+    const opened = await controller.dispatch({ kind: "activate" });
+    assert.equal(opened.kind, "edit");
+    if (opened.kind !== "edit") return;
+
+    await controller.completeEditor(opened.request, { kind: "value", value: "off" });
+
+    assert.equal(writes, 1);
+    assert.equal(setup.published.length, 1);
+    assert.equal(controller.view.notice?.message, "Gespeichert; Ansicht konnte nicht aktualisiert werden");
+    assert.equal(controller.view.readOnlyReason, "Konfiguration schreibgeschützt");
+    assert.equal(
+      controller.view.allItems.find(({ id }) => id === "appearance-large-logo")?.displayValue,
+      "Aus",
+    );
+    assert.equal((await controller.dispatch({ kind: "activate" })).kind, "render");
+    await controller.completeEditor(opened.request, { kind: "value", value: "on" });
+    assert.equal(writes, 1);
+  });
+});
+
+test("typed-unverified bestätigter Disk-Kandidat bleibt bei abweichender Runtime read-only", async () => {
+  await withTempConfig(async (path) => {
+    const initial = await readConfigEditSnapshot(path);
+    let durable: OrcodeConfigWithBudget | null = null;
+    let configReads = 0;
+    let writes = 0;
+    const staleRuntime = runtimeSnapshot(structuredClone(DEFAULT_CONFIG));
+    const setup = harness(path, {
+      snapshotForRead: (snapshot, readCount) => readCount === 3 ? staleRuntime : snapshot,
+      readConfig: async () => {
+        configReads += 1;
+        if (configReads === 1) return initial;
+        if (!durable) throw new Error("unexpected missing durable config");
+        return { file: initial.file, config: durable };
+      },
+      saveConfig: async (_expected, candidate) => {
+        writes += 1;
+        durable = validateConfig(candidate);
+        throw new ConfigEditUnverifiedError();
+      },
+    });
+    const controller = await SettingsController.open(setup.dependencies);
+    await controller.dispatch({ kind: "select-item", itemId: "appearance-large-logo" });
+    const opened = await controller.dispatch({ kind: "activate" });
+    assert.equal(opened.kind, "edit");
+    if (opened.kind !== "edit") return;
+
+    await controller.completeEditor(opened.request, { kind: "value", value: "off" });
+
+    assert.equal(writes, 1);
+    assert.equal(setup.published.length, 1);
+    assert.equal(controller.view.notice?.message, "Gespeichert; Ansicht konnte nicht aktualisiert werden");
+    assert.equal(controller.view.readOnlyReason, "Konfiguration schreibgeschützt");
+    assert.equal(
+      controller.view.allItems.find(({ id }) => id === "appearance-large-logo")?.displayValue,
+      "Aus",
+    );
+    assert.equal((await controller.dispatch({ kind: "activate" })).kind, "render");
+  });
+});
+
 test("typed-unverified Mismatch mit fehlendem Runtime-Refresh bleibt fail-closed und verwendet keinen alten Snapshot", async () => {
   await withTempConfig(async (path) => {
     const initial = await readConfigEditSnapshot(path);
@@ -789,6 +942,35 @@ test("ein Refreshfehler nach erfolgreicher externer Action meldet Settlement und
     assert.equal(controller.view.selectedItemId, "provider-setup");
     await controller.completeEditor(opened.request, { kind: "value", value: true });
     assert.equal(setup.externalActions.length, 1, "eine ausgeführte Action darf nie wiederholt werden");
+    assert.equal((await controller.dispatch({ kind: "activate" })).kind, "render");
+  });
+});
+
+test("fehlender exakter Readback nach externer Action meldet ehrliches Refresh-Settlement", async () => {
+  await withTempConfig(async (path) => {
+    const initial = await readConfigEditSnapshot(path);
+    let configReads = 0;
+    const setup = harness(path, {
+      readConfig: async () => {
+        configReads += 1;
+        if (configReads === 1) return initial;
+        throw new Error("private-readback-failure");
+      },
+    });
+    const controller = await SettingsController.open(setup.dependencies);
+    await controller.dispatch({ kind: "select-item", itemId: "provider-setup" });
+    const opened = await controller.dispatch({ kind: "activate" });
+    assert.equal(opened.kind, "edit");
+    if (opened.kind !== "edit") return;
+
+    await controller.completeEditor(opened.request, { kind: "value", value: true });
+
+    assert.equal(setup.externalActions.length, 1);
+    assert.equal(
+      controller.view.notice?.message,
+      "Aktion ausgeführt; Ansicht konnte nicht aktualisiert werden",
+    );
+    assert.equal(controller.view.readOnlyReason, "Konfiguration schreibgeschützt");
     assert.equal((await controller.dispatch({ kind: "activate" })).kind, "render");
   });
 });
