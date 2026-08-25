@@ -42,6 +42,7 @@ import {
 } from "./config-write-lock.js";
 import {
   assertConfigFileSnapshot,
+  configBytesDigest,
   readConfigFileSnapshot,
   sameConfigFileSnapshot,
   type ConfigFileSnapshot,
@@ -298,7 +299,7 @@ export async function loadConfigDetailed(
     };
   }
 
-  const parsed = parseStoredConfig(raw, dependencies);
+  const parsed = parseStoredConfig(raw, dependencies, { legacyProvider: "migrate" });
   switch (parsed.outcome) {
     case "config":
       return { config: parsed.config, warning: null, source: "file" };
@@ -336,6 +337,15 @@ type StoredConfigParse =
   | { readonly outcome: "future-version"; readonly version: number }
   | { readonly outcome: "invalid"; readonly detail: string };
 
+interface StoredConfigParseOptions {
+  /**
+   * `"migrate"` allocates one fresh legacy connection identity in memory (the
+   * startup contract); `"refuse"` treats bytes without `providerSetup` as
+   * invalid so an edit can never allocate or persist an incidental identity.
+   */
+  readonly legacyProvider: "migrate" | "refuse";
+}
+
 /**
  * One pure parser for exact stored bytes, shared by the tolerant startup load
  * and the fail-closed edit snapshot so neither reads the file twice.
@@ -343,6 +353,7 @@ type StoredConfigParse =
 function parseStoredConfig(
   raw: string,
   dependencies: ConfigLoadDependencies,
+  options: StoredConfigParseOptions,
 ): StoredConfigParse {
   let parsed: unknown;
   try {
@@ -358,6 +369,9 @@ function parseStoredConfig(
     parsed.schemaVersion > CONFIG_SCHEMA_VERSION
   ) {
     return { outcome: "future-version", version: parsed.schemaVersion };
+  }
+  if (!("providerSetup" in parsed) && options.legacyProvider === "refuse") {
+    return { outcome: "invalid", detail: "legacy provider state requires startup migration" };
   }
   try {
     const providerSetup = "providerSetup" in parsed
@@ -470,9 +484,26 @@ export class ConfigEditUnavailableError extends Error {
 }
 
 /**
+ * Publication was reached, so the candidate may be durable, but exact readback
+ * could not confirm it. `expected` is no longer authoritative: re-read before
+ * any further edit instead of retrying from the stale snapshot.
+ */
+export class ConfigEditUnverifiedError extends Error {
+  readonly code = "config-edit-unverified" as const;
+
+  constructor() {
+    super("Config publication could not be verified after it was reached.");
+    this.name = "ConfigEditUnverifiedError";
+  }
+}
+
+/**
  * Fail-closed editor load: parses exactly the bytes captured in `file`. Never
  * writes, backs up, migrates, or normalizes; unlike `loadConfigDetailed` an
- * unsafe stored state throws instead of yielding tolerant defaults.
+ * unsafe stored state throws instead of yielding tolerant defaults. Stored
+ * bytes without `providerSetup` are unavailable until the authoritative
+ * startup migration has persisted stable provider identity, so identical bytes
+ * always yield identical configs. The snapshot is deeply frozen.
  */
 export async function readConfigEditSnapshot(
   path = CONFIG_PATH,
@@ -486,7 +517,7 @@ export async function readConfigEditSnapshot(
   if (file.kind === "absent") {
     return freezeEditSnapshot(defaults(), file);
   }
-  const parsed = parseStoredConfig(file.raw, {});
+  const parsed = parseStoredConfig(file.raw, {}, { legacyProvider: "refuse" });
   if (parsed.outcome !== "config" || isProviderStateIssue(parsed.config.providerSetup)) {
     throw new ConfigEditUnavailableError();
   }
@@ -508,9 +539,13 @@ export async function saveConfigEdit(
 /**
  * Exact compare-and-swap under an already held writer ownership. The current
  * target must equal `expected.file` in kind, parent identity, file identity
- * and raw bytes; an expected-absent target is published create-only so a
- * concurrent creator is never replaced. Never acquires a nested lock and never
- * mutates caller-owned objects.
+ * and exact bytes; an expected-absent target is published create-only so a
+ * concurrent creator is never replaced, and an expected-absent parent is
+ * created exclusively so a foreign directory is never adopted or touched.
+ * Once publication is reached, only exact readback decides: a confirmed commit
+ * is adopted, anything else is `ConfigEditUnverifiedError`. Never acquires a
+ * nested lock and never mutates caller-owned objects; returns a deeply frozen
+ * value.
  */
 export async function saveConfigEditUnderLock(
   ownership: ConfigWriteOwnership,
@@ -528,14 +563,17 @@ export async function saveConfigEditUnderLock(
   }
   refuseUnsafeStoredConfig(path, current);
   const content = `${JSON.stringify(validated, null, 2)}\n`;
-  let writeError: unknown;
+  const digest = configBytesDigest(content);
   try {
     if (expected.file.kind === "absent") {
-      await ensureSecureDirectory(dirname(path));
+      if (expected.file.parent.kind === "absent") {
+        await createExclusiveConfigParent(dirname(path));
+      }
       await ownership.assertHeld();
       const publishTarget = await readExactEditTarget(path);
       if (
         publishTarget.kind !== "absent"
+        || publishTarget.parent.kind !== "directory"
         || (expected.file.parent.kind === "directory"
           && !sameConfigFileSnapshot(publishTarget, expected.file))
       ) {
@@ -555,29 +593,67 @@ export async function saveConfigEditUnderLock(
       });
     }
   } catch (error) {
+    // Ordinary rejection proves publication did not happen: `expected` stays authoritative.
     if (hasCode(error, "EEXIST")) throw new ConfigEditConflictError();
     if (!isAtomicFilePostPublicationError(error)) throw error;
-    writeError = error;
   }
-  await ownership.assertHeld();
-  let readback: string | null = null;
+  // Publication was reached, so `expected` is no longer authoritative. Ownership
+  // cannot un-publish durable bytes, so its outcome is not consulted here; only
+  // exact readback distinguishes a confirmed commit from an unverifiable one.
+  await ownership.assertHeld().catch(() => undefined);
+  if (await confirmExactPublication(path, digest)) return deepFreeze(validated);
+  throw new ConfigEditUnverifiedError();
+}
+
+/** Exact readback proof; never throws and never exposes the underlying path or bytes. */
+async function confirmExactPublication(path: string, digest: string): Promise<boolean> {
   try {
     const snapshot = await readConfigFileSnapshot(path);
-    readback = snapshot.kind === "file" ? snapshot.raw : null;
+    return snapshot.kind === "file" && snapshot.digest === digest;
   } catch {
-    // Classified below without exposing the underlying path or bytes.
+    return false;
   }
-  await ownership.assertHeld();
-  if (readback === content) return Object.freeze(validated);
-  if (writeError !== undefined) throw writeError;
-  throw new Error("Config publication could not be verified.");
+}
+
+/**
+ * Exclusive, identity-bearing creation of a config parent that was absent in
+ * the edit snapshot. An existing directory belongs to a concurrent creator: it
+ * is a conflict and is never entered, chmod-ed, or published into. Missing
+ * ancestors are not identity-bearing and may be created non-exclusively.
+ */
+async function createExclusiveConfigParent(directory: string): Promise<void> {
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      await mkdir(directory, { mode: SECURE_DIRECTORY_MODE });
+      break;
+    } catch (error) {
+      if (hasCode(error, "EEXIST")) throw new ConfigEditConflictError();
+      if (!hasCode(error, "ENOENT") || attempt > 0) throw error;
+      await mkdir(dirname(directory), { recursive: true, mode: SECURE_DIRECTORY_MODE });
+    }
+  }
+  try {
+    await chmod(directory, SECURE_DIRECTORY_MODE);
+  } catch (error) {
+    if (!hasCode(error, "EPERM") && !hasCode(error, "ENOENT")) throw error;
+  }
 }
 
 function freezeEditSnapshot(
   config: OrcodeConfigWithBudget,
   file: ConfigFileSnapshot,
 ): ConfigEditSnapshot {
-  return Object.freeze({ config: Object.freeze(config), file });
+  return deepFreeze({ config, file });
+}
+
+/** Recursive freeze of validator-owned data; never applied to caller-owned objects. */
+function deepFreeze<T>(value: T): T {
+  if (typeof value !== "object" || value === null) return value;
+  Object.freeze(value);
+  for (const child of Object.values(value)) {
+    deepFreeze(child);
+  }
+  return value;
 }
 
 async function readExactEditTarget(path: string): Promise<ConfigFileSnapshot> {

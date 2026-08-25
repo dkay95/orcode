@@ -26,10 +26,12 @@ import {
 } from "@openrouter/agent";
 import { initializeStartupStorage } from "../src/cli.js";
 import {
+  ConfigEditUnavailableError,
   DEFAULT_APPEARANCE,
   loadConfigDetailed,
   migrateAppHome,
   readConfigEditSnapshot,
+  sameConfigFileSnapshot,
   withConfigWriteLock,
 } from "../src/config.js";
 import { CredentialStore } from "../src/credentials.js";
@@ -2200,4 +2202,44 @@ test("current v1 config without appearance keeps additive defaults through migra
   assert.equal(legacyStored.mainModel, "legacy/model");
   assert.deepEqual(legacyStored.appearance, DEFAULT_APPEARANCE);
   assert.deepEqual((await loadConfigDetailed(join(legacyTarget, "config.json"))).config.appearance, DEFAULT_APPEARANCE);
+});
+
+test("a legacy home is config-edit-unavailable until migrateAppHome persisted stable provider state, after which edit reads are identical", async () => {
+  const root = await mkdtemp(join(tmpdir(), "orcode-edit-legacy-stable-"));
+  const legacyHome = join(root, ".routercode");
+  const target = join(root, ".orcode");
+  await seedHome(legacyHome, { model: "legacy/model" });
+  const legacyConfig = join(legacyHome, "config.json");
+  const legacyBytes = await readFile(legacyConfig, "utf8");
+  const before = await readConfigEditSnapshot(legacyConfig).catch((reason: unknown) => reason);
+  assert.ok(before instanceof ConfigEditUnavailableError);
+  assert.equal(before.code, "config-edit-unavailable");
+  assert.equal(await readFile(legacyConfig, "utf8"), legacyBytes);
+
+  let uuidCalls = 0;
+  const result = await migrateAppHome(target, legacyHome, {
+    randomUUID: () => {
+      uuidCalls += 1;
+      return "edit-stable-legacy-id";
+    },
+  });
+  assert.equal(result.status, "ready");
+  assert.ok(uuidCalls >= 1);
+
+  const configFile = join(target, "config.json");
+  const first = await readConfigEditSnapshot(configFile);
+  const second = await readConfigEditSnapshot(configFile);
+  assert.deepEqual(first.config, second.config);
+  assert.equal(sameConfigFileSnapshot(first.file, second.file), true);
+  if ("kind" in first.config.providerSetup) assert.fail("expected persistable provider state");
+  assert.equal(first.config.providerSetup.lifecycle, "migrated");
+  assert.equal(first.config.providerSetup.connections[0]?.id, "edit-stable-legacy-id");
+  assert.equal(first.config.mainModel, "legacy/model");
+  assert.deepEqual(first.config.appearance, DEFAULT_APPEARANCE);
+  const reloaded = await loadConfigDetailed(configFile, {
+    randomUUID: () => {
+      throw new Error("persisted provider state must not allocate");
+    },
+  });
+  assert.deepEqual(first.config, reloaded.config);
 });

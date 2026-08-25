@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import { chmod, lstat, mkdir, mkdtemp, open, readdir, readFile, rename, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
@@ -7,6 +8,7 @@ import test from "node:test";
 import {
   ConfigEditConflictError,
   ConfigEditUnavailableError,
+  ConfigEditUnverifiedError,
   consumeConfigWarning,
   DEFAULT_APPEARANCE,
   DEFAULT_CONFIG,
@@ -32,6 +34,7 @@ import {
   validateVerify,
   writeFileAtomicCreateSecure,
   writeFileAtomicSecure,
+  type AppearanceConfig,
   type ConfigInput,
   type ConfigWriteOwnership,
 } from "../src/config.js";
@@ -1460,4 +1463,363 @@ test("saveConfigEdit returns the exact frozen validated value and mutates no cal
   assert.equal(await readFile(path, "utf8"), `${JSON.stringify(saved, null, 2)}\n`);
   assert.deepEqual((await readConfigEditSnapshot(path)).config, saved);
   assert.deepEqual((await loadConfigDetailed(path)).config, saved);
+});
+
+test("a same-inode edit of invalid UTF-8 bytes that decode identically is still a config-edit-conflict", async () => {
+  const path = await configPath("edit-invalid-utf8");
+  const head = Buffer.from('{"schemaVersion":1,"mainModel":"vendor/', "utf8");
+  const tail = Buffer.from(`","providerSetup":${JSON.stringify(createNeverConfiguredProviderState())}}\n`, "utf8");
+  const original = Buffer.concat([head, Buffer.from([0x80]), tail]);
+  const mutated = Buffer.concat([head, Buffer.from([0x81]), tail]);
+  assert.equal(original.equals(mutated), false);
+  assert.equal(original.toString("utf8"), mutated.toString("utf8"));
+  await writeFile(path, original, { mode: 0o600 });
+
+  const expected = await readConfigEditSnapshot(path);
+  if (expected.file.kind !== "file") assert.fail("expected file snapshot");
+  assert.equal(expected.file.raw, original.toString("utf8"));
+  assert.equal(expected.file.digest, createHash("sha256").update(original).digest("hex"));
+  assert.equal(expected.config.mainModel, "vendor/�");
+  const before = await lstat(path, { bigint: true });
+
+  const handle = await open(path, "r+");
+  try {
+    await handle.write(mutated, 0, mutated.length, 0);
+  } finally {
+    await handle.close();
+  }
+  const after = await lstat(path, { bigint: true });
+  assert.equal(after.ino, before.ino);
+  assert.equal(after.dev, before.dev);
+  assert.deepEqual(await readFile(path), mutated);
+  // Identity-only and decoded-text comparisons cannot see this edit; only the byte proof can.
+  await assertConfigFileSnapshot(path, expected.file);
+  const current = await readConfigFileSnapshot(path);
+  if (current.kind !== "file") assert.fail("expected file snapshot");
+  assert.equal(current.raw, expected.file.raw);
+  assert.notEqual(current.digest, expected.file.digest);
+  assert.equal(sameConfigFileSnapshot(expected.file, current), false);
+  assert.equal(sameConfigFileSnapshot(current, await readConfigFileSnapshot(path)), true);
+
+  const error = await saveConfigEdit(
+    expected,
+    { ...expected.config, appearance: { ...expected.config.appearance, glyphMode: "ascii" } },
+    path,
+  ).catch((reason: unknown) => reason);
+  assert.ok(error instanceof ConfigEditConflictError);
+  assert.equal(error.code, "config-edit-conflict");
+  assert.deepEqual(await readFile(path), mutated);
+  assert.deepEqual(await readdir(dirname(path)), ["config.json"]);
+});
+
+test("readConfigEditSnapshot never allocates a legacy provider identity and is unavailable until startup migration persisted providerSetup", async () => {
+  const path = await configPath("edit-legacy-provider");
+  const raw = `${JSON.stringify({ schemaVersion: 1, mainModel: "openrouter/auto", provider: { dataCollection: "allow" } }, null, 2)}\n`;
+  await writeFile(path, raw, { encoding: "utf8", mode: 0o600 });
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const error = await readConfigEditSnapshot(path).catch((reason: unknown) => reason);
+    assert.ok(error instanceof ConfigEditUnavailableError, `attempt ${attempt}`);
+    assert.equal(error.code, "config-edit-unavailable");
+    assert.doesNotMatch(String(error), /openrouter|legacy/);
+  }
+  assert.equal(await readFile(path, "utf8"), raw);
+  assert.deepEqual(await readdir(dirname(path)), ["config.json"]);
+
+  const v0Path = await configPath("edit-legacy-v0");
+  const v0Raw = JSON.stringify({ mainModel: "legacy/model" });
+  await writeFile(v0Path, v0Raw, { encoding: "utf8", mode: 0o600 });
+  const v0Error = await readConfigEditSnapshot(v0Path).catch((reason: unknown) => reason);
+  assert.ok(v0Error instanceof ConfigEditUnavailableError);
+  assert.equal(await readFile(v0Path, "utf8"), v0Raw);
+
+  // Tolerant startup is unchanged: it still migrates in memory with the injected id and writes nothing.
+  const startup = await loadConfigDetailed(path, { randomUUID: () => "startup-legacy-id" });
+  assert.equal(startup.source, "file");
+  assert.equal(startup.warning, null);
+  if ("kind" in startup.config.providerSetup) assert.fail("expected persistable provider state");
+  assert.equal(startup.config.providerSetup.lifecycle, "migrated");
+  assert.equal(startup.config.providerSetup.connections[0]?.id, "startup-legacy-id");
+  assert.equal(await readFile(path, "utf8"), raw);
+
+  // Once the authoritative migration persisted stable provider state, identical bytes yield identical configs.
+  await saveConfig(startup.config, path);
+  const first = await readConfigEditSnapshot(path);
+  const second = await readConfigEditSnapshot(path);
+  assert.deepEqual(first.config, second.config);
+  assert.equal(sameConfigFileSnapshot(first.file, second.file), true);
+  if ("kind" in first.config.providerSetup) assert.fail("expected persistable provider state");
+  assert.equal(first.config.providerSetup.connections[0]?.id, "startup-legacy-id");
+  const reloaded = await loadConfigDetailed(path, {
+    randomUUID: () => {
+      throw new Error("persisted provider state must not allocate");
+    },
+  });
+  assert.deepEqual(first.config, reloaded.config);
+
+  const saved = await saveConfigEdit(
+    first,
+    { ...first.config, appearance: { ...first.config.appearance, glyphMode: "ascii" } },
+    path,
+  );
+  assert.deepEqual(saved.providerSetup, first.config.providerSetup);
+  assert.equal(saved.appearance.glyphMode, "ascii");
+  const stored = JSON.parse(await readFile(path, "utf8")) as { providerSetup: { connections: { id: string }[] } };
+  assert.equal(stored.providerSetup.connections[0]?.id, "startup-legacy-id");
+});
+
+test("a foreign parent directory created after the absent snapshot is never adopted, published into, or touched", async () => {
+  const root = dirname(await configPath("edit-foreign-parent"));
+  const parent = join(root, "nested");
+  const path = join(parent, "config.json");
+  const expected = await readConfigEditSnapshot(path);
+  assert.equal(expected.file.kind, "absent");
+  assert.equal(expected.file.parent.kind, "absent");
+
+  let fenceCalls = 0;
+  let planted = false;
+  const error = await withConfigWriteLock(path, (ownership) => saveConfigEditUnderLock(
+    {
+      canonicalPath: ownership.canonicalPath,
+      assertHeld: async () => {
+        await ownership.assertHeld();
+        fenceCalls += 1;
+        // A competing process creates the parent after the first exact recheck.
+        if (fenceCalls >= 2 && !planted && !(await pathExists(parent))) {
+          planted = true;
+          await mkdir(parent);
+          await chmod(parent, 0o755);
+          await writeFile(join(parent, "sentinel"), "foreign-sentinel", { encoding: "utf8", mode: 0o644 });
+        }
+      },
+    },
+    expected,
+    { ...expected.config, mainModel: "vendor/stale-editor" },
+  ).catch((reason: unknown) => reason));
+  assert.equal(planted, true);
+  assert.ok(error instanceof ConfigEditConflictError);
+  assert.equal(error.code, "config-edit-conflict");
+  assert.doesNotMatch(String(error), /stale-editor|sentinel|nested/);
+  assert.deepEqual(await readdir(parent), ["sentinel"]);
+  assert.equal(await readFile(join(parent, "sentinel"), "utf8"), "foreign-sentinel");
+  if (process.platform !== "win32") {
+    assert.equal((await stat(parent)).mode & 0o777, 0o755);
+  }
+  assert.equal(await pathExists(path), false);
+
+  // A foreign creator that already published its own config inside the new parent keeps it byte-exact.
+  const otherRoot = dirname(await configPath("edit-foreign-parent-config"));
+  const otherParent = join(otherRoot, "nested");
+  const otherPath = join(otherParent, "config.json");
+  const otherExpected = await readConfigEditSnapshot(otherPath);
+  const foreignBytes = `${JSON.stringify({ ...DEFAULT_CONFIG, mainModel: "vendor/foreign-creator" }, null, 2)}\n`;
+  let otherCalls = 0;
+  const otherError = await withConfigWriteLock(otherPath, (ownership) => saveConfigEditUnderLock(
+    {
+      canonicalPath: ownership.canonicalPath,
+      assertHeld: async () => {
+        await ownership.assertHeld();
+        otherCalls += 1;
+        if (otherCalls >= 2 && !(await pathExists(otherParent))) {
+          await mkdir(otherParent);
+          await chmod(otherParent, 0o755);
+          await writeFile(otherPath, foreignBytes, { encoding: "utf8", mode: 0o600 });
+        }
+      },
+    },
+    otherExpected,
+    { ...otherExpected.config, mainModel: "vendor/stale-editor" },
+  ).catch((reason: unknown) => reason));
+  assert.ok(otherError instanceof ConfigEditConflictError);
+  assert.equal(await readFile(otherPath, "utf8"), foreignBytes);
+  assert.deepEqual(await readdir(otherParent), ["config.json"]);
+  if (process.platform !== "win32") {
+    assert.equal((await stat(otherParent)).mode & 0o777, 0o755);
+  }
+});
+
+test("post-publication ownership loss adopts a confirmed commit and an unverifiable publication is config-edit-unverified", async () => {
+  const path = await configPath("edit-post-publication");
+  await saveConfig({ ...DEFAULT_CONFIG, mainModel: "vendor/old" }, path);
+  const fenceReason = new Error("fixed post-publication ownership rejection");
+  const bytesOf = (candidate: ConfigInput): string => `${JSON.stringify(validateConfig(candidate), null, 2)}\n`;
+  const currentBytes = async (target: string): Promise<string | null> =>
+    readFile(target, "utf8").catch(() => null);
+
+  // Ownership is lost only after the candidate bytes are durable: the commit is confirmed and adopted.
+  const expected = await readConfigEditSnapshot(path);
+  const candidate = { ...expected.config, mainModel: "vendor/new" };
+  let rejections = 0;
+  const adopted = await withConfigWriteLock(path, (ownership) => saveConfigEditUnderLock(
+    {
+      canonicalPath: ownership.canonicalPath,
+      assertHeld: async () => {
+        await ownership.assertHeld();
+        if ((await currentBytes(path)) === bytesOf(candidate)) {
+          rejections += 1;
+          throw fenceReason;
+        }
+      },
+    },
+    expected,
+    candidate,
+  ));
+  assert.deepEqual(adopted, validateConfig(candidate));
+  assert.ok(rejections >= 1);
+  assert.equal(await readFile(path, "utf8"), bytesOf(candidate));
+  assert.deepEqual(await readdir(dirname(path)), ["config.json"]);
+  assert.deepEqual((await readConfigEditSnapshot(path)).config, adopted);
+
+  // Ownership is lost and a foreign writer replaces the durable candidate before readback.
+  const second = await readConfigEditSnapshot(path);
+  const secondCandidate = { ...second.config, mainModel: "vendor/second" };
+  const foreign = `${JSON.stringify({ ...DEFAULT_CONFIG, mainModel: "vendor/foreign-after-publish" }, null, 2)}\n`;
+  let replaced = false;
+  const unverified = await withConfigWriteLock(path, (ownership) => saveConfigEditUnderLock(
+    {
+      canonicalPath: ownership.canonicalPath,
+      assertHeld: async () => {
+        await ownership.assertHeld();
+        if (!replaced && (await currentBytes(path)) === bytesOf(secondCandidate)) {
+          replaced = true;
+          await writeFile(path, foreign, "utf8");
+          throw fenceReason;
+        }
+      },
+    },
+    second,
+    secondCandidate,
+  ).catch((reason: unknown) => reason));
+  assert.equal(replaced, true);
+  assert.ok(unverified instanceof ConfigEditUnverifiedError);
+  assert.equal(unverified.code, "config-edit-unverified");
+  assert.equal(unverified instanceof ConfigEditConflictError, false);
+  assert.notEqual(unverified, fenceReason);
+  assert.doesNotMatch(String(unverified), /vendor\/|foreign|second/);
+  assert.equal(await readFile(path, "utf8"), foreign);
+  assert.equal((await readConfigEditSnapshot(path)).config.mainModel, "vendor/foreign-after-publish");
+  // The stale snapshot is no longer authoritative: a retry from it conflicts instead of overwriting.
+  const retry = await saveConfigEdit(second, secondCandidate, path).catch((reason: unknown) => reason);
+  assert.ok(retry instanceof ConfigEditConflictError);
+  assert.equal(await readFile(path, "utf8"), foreign);
+
+  // Readback becomes impossible after publication: never a silent success, never a conflict.
+  const third = await readConfigEditSnapshot(path);
+  const thirdCandidate = { ...third.config, mainModel: "vendor/third" };
+  let broken = false;
+  const unreadable = await withConfigWriteLock(path, (ownership) => saveConfigEditUnderLock(
+    {
+      canonicalPath: ownership.canonicalPath,
+      assertHeld: async () => {
+        await ownership.assertHeld();
+        if (!broken && (await currentBytes(path)) === bytesOf(thirdCandidate)) {
+          broken = true;
+          await rename(path, `${path}.published`);
+          await mkdir(path);
+        }
+      },
+    },
+    third,
+    thirdCandidate,
+  ).catch((reason: unknown) => reason));
+  assert.equal(broken, true);
+  assert.ok(unreadable instanceof ConfigEditUnverifiedError);
+  assert.equal(unreadable.code, "config-edit-unverified");
+  assert.equal(await readFile(`${path}.published`, "utf8"), bytesOf(thirdCandidate));
+  const afterwards = await readConfigEditSnapshot(path).catch((reason: unknown) => reason);
+  assert.ok(afterwards instanceof ConfigEditUnavailableError);
+
+  // The create-only path adopts a confirmed commit the same way.
+  const createPath = await configPath("edit-post-publication-create");
+  const createExpected = await readConfigEditSnapshot(createPath);
+  const createCandidate = { ...createExpected.config, mainModel: "vendor/created" };
+  let createRejections = 0;
+  const created = await withConfigWriteLock(createPath, (ownership) => saveConfigEditUnderLock(
+    {
+      canonicalPath: ownership.canonicalPath,
+      assertHeld: async () => {
+        await ownership.assertHeld();
+        if ((await currentBytes(createPath)) === bytesOf(createCandidate)) {
+          createRejections += 1;
+          throw fenceReason;
+        }
+      },
+    },
+    createExpected,
+    createCandidate,
+  ));
+  assert.deepEqual(created, validateConfig(createCandidate));
+  assert.ok(createRejections >= 1);
+  assert.equal(await readFile(createPath, "utf8"), bytesOf(createCandidate));
+  assert.deepEqual(await readdir(dirname(createPath)), ["config.json"]);
+});
+
+function assertDeepFrozen(value: unknown, label: string, seen = new Set<object>()): void {
+  if (typeof value !== "object" || value === null || seen.has(value)) return;
+  seen.add(value);
+  assert.equal(Object.isFrozen(value), true, `${label} must be frozen`);
+  for (const [key, child] of Object.entries(value)) {
+    assertDeepFrozen(child, `${label}.${key}`, seen);
+  }
+}
+
+test("edit snapshots and saved configs are deeply frozen while caller-owned objects stay mutable", async () => {
+  const legacyPath = await configPath("edit-deep-freeze-legacy");
+  await writeFile(legacyPath, JSON.stringify({ mainModel: "vendor/main" }));
+  const migrated = (await loadConfigDetailed(legacyPath, { randomUUID: () => "deep-freeze-id" })).config;
+  const path = await configPath("edit-deep-freeze");
+  await saveConfig({
+    ...migrated,
+    fallbackModels: ["vendor/fallback"],
+    panelModels: ["vendor/a", "vendor/b"],
+    reasoningByModel: { "vendor/main": { mode: "effort", effort: "high" } },
+    verify: { commands: ["npm test"], mode: "on-edit", maxRepairRounds: 1 },
+  }, path);
+
+  const snapshot = await readConfigEditSnapshot(path);
+  assertDeepFrozen(snapshot, "snapshot");
+  if ("kind" in snapshot.config.providerSetup) assert.fail("expected persistable provider state");
+  assert.equal(snapshot.config.providerSetup.connections.length, 1);
+  const connection = snapshot.config.providerSetup.connections[0] as { enabled: boolean };
+  assert.throws(() => { (snapshot.config.appearance as { glyphMode: string }).glyphMode = "ascii"; }, TypeError);
+  assert.throws(() => { (snapshot.config.fallbackModels as string[]).push("vendor/extra"); }, TypeError);
+  assert.throws(() => { connection.enabled = false; }, TypeError);
+  assert.throws(() => { (snapshot.config.reasoningByModel["vendor/main"] as { mode: string }).mode = "auto"; }, TypeError);
+  assert.throws(() => { (snapshot.config.verify.commands as string[]).pop(); }, TypeError);
+  assert.equal(sameConfigFileSnapshot(snapshot.file, await readConfigFileSnapshot(path)), true);
+
+  const candidateAppearance: AppearanceConfig = { ...snapshot.config.appearance, glyphMode: "ascii" };
+  const candidate = {
+    ...snapshot.config,
+    appearance: candidateAppearance,
+    fallbackModels: [...snapshot.config.fallbackModels, "vendor/extra"],
+    providerSetup: structuredClone(snapshot.config.providerSetup),
+    reasoningByModel: structuredClone(snapshot.config.reasoningByModel),
+  };
+  const saved = await saveConfigEdit(snapshot, candidate, path);
+  assertDeepFrozen(saved, "saved");
+  assert.deepEqual(saved, validateConfig(candidate));
+  assert.throws(() => { (saved.appearance as { glyphMode: string }).glyphMode = "unicode"; }, TypeError);
+  assert.notEqual(saved.appearance, candidate.appearance);
+  assert.notEqual(saved.providerSetup, candidate.providerSetup);
+  assert.notEqual(saved.fallbackModels, candidate.fallbackModels);
+  assert.equal(Object.isFrozen(candidate), false);
+  assert.equal(Object.isFrozen(candidate.appearance), false);
+  assert.equal(Object.isFrozen(candidate.fallbackModels), false);
+  assert.equal(Object.isFrozen(candidate.providerSetup), false);
+  assert.equal(Object.isFrozen(candidate.providerSetup.connections[0]), false);
+  assert.equal(Object.isFrozen(candidate.reasoningByModel["vendor/main"]), false);
+  candidate.appearance.glyphMode = "unicode";
+  candidate.fallbackModels.push("vendor/later");
+  assert.equal(saved.appearance.glyphMode, "ascii");
+  assert.deepEqual(saved.fallbackModels, ["vendor/fallback", "vendor/extra"]);
+  assert.equal(Object.isFrozen(DEFAULT_CONFIG), false);
+  assert.equal(Object.isFrozen(DEFAULT_CONFIG.appearance), false);
+  assert.equal(Object.isFrozen(DEFAULT_APPEARANCE), false);
+  assert.equal(await readFile(path, "utf8"), `${JSON.stringify(saved, null, 2)}\n`);
+  assert.deepEqual((await readConfigEditSnapshot(path)).config, saved);
+
+  // The intended live-object pattern: copy, never adopt frozen references.
+  const live = structuredClone(saved);
+  live.appearance.glyphMode = "auto";
+  assert.equal(saved.appearance.glyphMode, "ascii");
 });

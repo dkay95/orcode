@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { constants as fsConstants } from "node:fs";
 import { lstat, open, realpath } from "node:fs/promises";
 import { basename, dirname, join, resolve } from "node:path";
@@ -16,7 +17,10 @@ export type ConfigFileSnapshot =
     readonly kind: "file";
     readonly dev: bigint;
     readonly ino: bigint;
+    /** Decoded UTF-8 text for parsing; never a byte proof (invalid sequences collapse). */
     readonly raw: string;
+    /** SHA-256 hex of the exact stored bytes: the collision-resistant CAS/readback proof. */
+    readonly digest: string;
     readonly parent: ConfigParentSnapshot & { readonly kind: "directory" };
   };
 
@@ -69,7 +73,9 @@ export async function readConfigFileSnapshot(
     handle = await open(path, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
     const opened = await handle.stat({ bigint: true });
     assertSameConfigIdentity(before, opened);
-    const raw = await handle.readFile("utf8");
+    const bytes = await handle.readFile();
+    const raw = bytes.toString("utf8");
+    const digest = configBytesDigest(bytes);
     const afterHandle = await handle.stat({ bigint: true });
     assertSameConfigIdentity(before, afterHandle);
     const afterPath = await lstat(path, { bigint: true });
@@ -80,6 +86,7 @@ export async function readConfigFileSnapshot(
       dev: before.dev,
       ino: before.ino,
       raw,
+      digest,
       parent,
     });
   } catch {
@@ -116,9 +123,11 @@ export async function assertConfigFileSnapshot(
 }
 
 /**
- * Exact raw-byte snapshot equality: absence with the same parent identity, or
- * the same regular file (dev/inode/parent) carrying byte-identical content.
- * Unlike `assertConfigFileSnapshot()` this also catches a same-inode edit.
+ * Exact byte snapshot equality: absence with the same parent identity, or the
+ * same regular file (dev/inode/parent) whose stored bytes share one digest.
+ * Unlike `assertConfigFileSnapshot()` this also catches a same-inode edit, and
+ * unlike comparing decoded `raw` text it cannot be fooled by distinct invalid
+ * UTF-8 sequences that decode to the same replacement characters.
  */
 export function sameConfigFileSnapshot(
   left: ConfigFileSnapshot,
@@ -130,7 +139,12 @@ export function sameConfigFileSnapshot(
   }
   return left.dev === right.dev
     && left.ino === right.ino
-    && left.raw === right.raw;
+    && left.digest === right.digest;
+}
+
+/** The same proof `readConfigFileSnapshot()` records, for comparing intended content with a readback. */
+export function configBytesDigest(bytes: Uint8Array | string): string {
+  return createHash("sha256").update(bytes).digest("hex");
 }
 
 function sameParentSnapshot(
