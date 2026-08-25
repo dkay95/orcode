@@ -28,6 +28,8 @@ export interface HeaderInfo {
   balance?: string;
   /** Active `/ssh` target alias, if any — the most dangerous state the header can show, see `headerSegments`. */
   sshHost?: string;
+  /** Decorative Route Core mark. It is deliberately the first header segment dropped. */
+  brandMark?: string;
 }
 
 export interface StatusInfo {
@@ -144,6 +146,13 @@ function headerSegments(theme: Theme, info: HeaderInfo): Segment[] {
       spans: [span(info.balance, "muted")],
       align: "right",
       priority: 50,
+    });
+  }
+  if (info.brandMark) {
+    segments.push({
+      spans: [span(info.brandMark, "muted")],
+      align: "right",
+      priority: 1,
     });
   }
   return segments;

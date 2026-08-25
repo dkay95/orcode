@@ -65,6 +65,7 @@ export {
   type ListView,
   type RunSnapshot,
   type UiMode,
+  type DashboardBranding,
 } from "./ui/dashboard-frame.js";
 
 const ENTER_ALTERNATE_SCREEN = "\u001b[?1049h";
@@ -1165,6 +1166,12 @@ export class TerminalUi implements SettingsSurface {
       helpRequested: this.#inputChars.join("").trim() === "?",
       tick: this.#tick,
       now: Date.now(),
+      brand: {
+        showLargeLogo: this.#appearance.showLargeLogo,
+        showHeaderMark: this.#appearance.showHeaderMark,
+        largeLines: routeCoreLarge(resolveGlyphMode(this.#appearance.glyphMode, this.#glyphEnvironment)),
+        compactMark: routeCoreCompact(resolveGlyphMode(this.#appearance.glyphMode, this.#glyphEnvironment)),
+      },
     };
     if (this.#contextPercent !== undefined) input.contextPercent = this.#contextPercent;
     if (this.#run) input.run = this.#run;

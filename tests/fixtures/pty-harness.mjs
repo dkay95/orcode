@@ -34,11 +34,36 @@ process.stdout.write(`ORCODE_PTY_READY:${JSON.stringify(ready)}\n`);
 const ui = new TerminalUi(() => state, process.stdin, process.stdout);
 let timeout;
 
+const categories = [
+  "Models & Reasoning", "Providers & Accounts", "Automation & Permissions",
+  "Voice & Browser", "Costs & Limits", "Appearance",
+].map((label, index) => ({ id: `category-${index + 1}`, label, description: label }));
+const settingsView = {
+  categories,
+  items: [],
+  allItems: [],
+  selectedCategoryId: categories[0].id,
+  selectedItemId: null,
+  search: { active: false, query: "" },
+  readOnlyReason: null,
+  runActive: false,
+  notice: null,
+};
+
 try {
   if (!ui.supported) {
     throw new Error("TerminalUi erkennt stdin/stdout nicht als unterstütztes TTY-Paar.");
   }
   ui.start();
+  await ui.suspend(async () => {});
+  process.stdout.write("ORCODE_PTY_RESUMED\n");
+  ui.begin(settingsView);
+  process.stdout.write("ORCODE_PTY_SETTINGS_READY\n");
+  await ui.nextIntent(settingsView);
+  process.stdout.write("ORCODE_PTY_SETTINGS_CATEGORY\n");
+  await ui.nextIntent({ ...settingsView, selectedCategoryId: categories[5].id });
+  ui.end();
+  process.stdout.write("ORCODE_PTY_SETTINGS_RESTORED\n");
   const input = await Promise.race([
     ui.readInput(),
     new Promise((_, reject) => {

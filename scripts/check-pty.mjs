@@ -14,6 +14,7 @@ const EXPECTED_INPUT = "Erste Zeile\nZweite Zeile";
 const ENABLE_BRACKETED_PASTE = "\u001b[?2004h";
 const DISABLE_BRACKETED_PASTE = "\u001b[?2004l";
 const LEAVE_ALTERNATE_SCREEN = "\u001b[?1049l";
+const ENABLE_SGR_MOUSE = "\u001b[?1000h";
 
 const PYTHON_CONTROLLER = String.raw`
 import base64
@@ -104,6 +105,12 @@ try:
     slave = -1
 
     wait_for(b"ORCODE_PTY_READY:")
+    wait_for(b"ORCODE_PTY_RESUMED")
+    wait_for(b"ORCODE_PTY_SETTINGS_READY")
+    write_all(b"6")
+    wait_for(b"ORCODE_PTY_SETTINGS_CATEGORY")
+    write_all(b"\x1b")
+    wait_for(b"ORCODE_PTY_SETTINGS_RESTORED")
     write_all(b"\x1b[200~Erste Zeile\nZweite Zeile\x1b[201~")
     wait_for(b"Enter sendet alles gemeinsam")
     paste_ready_seen = True
@@ -128,6 +135,8 @@ try:
         "outputBase64": base64.b64encode(bytes(captured)).decode("ascii"),
         "pasteReadySeen": paste_ready_seen,
         "resultBeforeEnter": result_before_enter,
+        "resumedSeen": b"ORCODE_PTY_RESUMED" in captured,
+        "settingsSeen": b"ORCODE_PTY_SETTINGS_RESTORED" in captured,
         "timedOut": False,
     }
     sys.stdout.write(json.dumps(result, separators=(",", ":")))
@@ -225,6 +234,12 @@ export function validateControllerResult(controller, request) {
   if (controller.pasteReadySeen !== true) {
     throw new Error("Der PTY-Smoke sah keinen abgeschlossenen mehrzeiligen Paste-Zustand.");
   }
+  if (controller.resumedSeen !== true) {
+    throw new Error("Der PTY-Smoke erreichte keinen suspend-resume Checkpoint.");
+  }
+  if (controller.settingsSeen !== true) {
+    throw new Error("Der PTY-Smoke erreichte keinen keyboard-only Settings Checkpoint.");
+  }
   if (controller.resultBeforeEnter === true) {
     throw new Error("Die Eingabe wurde vor dem separaten Enter abgeschickt.");
   }
@@ -243,6 +258,9 @@ export function validateControllerResult(controller, request) {
     throw new Error("Die PTY-Roh-Ausgabe ist leer oder überschreitet das feste Ausgabelimit.");
   }
   const output = bytes.toString("utf8");
+  if (output.includes(ENABLE_SGR_MOUSE)) {
+    throw new Error("Settings-PTY darf kein SGR mouse reporting aktivieren.");
+  }
   const ready = readMarker(output, "ORCODE_PTY_READY:");
   const result = readMarker(output, "ORCODE_PTY_RESULT:");
   if (

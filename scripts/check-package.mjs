@@ -24,6 +24,7 @@ const STATIC_PACKAGE_FILES = [
   "LICENSE",
   "NOTICE",
   "README.md",
+  "assets/route-core.svg",
   "package.json",
   "scripts/check-package.mjs",
   "scripts/install-user.mjs",

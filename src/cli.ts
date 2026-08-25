@@ -62,6 +62,7 @@ import {
 } from "./commands.js";
 import {
   APP_HOME,
+  DEFAULT_APPEARANCE,
   DEFAULT_CONFIG,
   assertConfigFileSnapshot,
   consumeConfigWarning,
@@ -80,7 +81,9 @@ import {
   writeFileAtomicCreateSecure,
   writeFileAtomicSecure,
   type OrcodeConfigWithBudget,
+  type AppearanceConfig,
 } from "./config.js";
+import { resolveGlyphMode, routeCoreLarge, type GlyphEnvironment } from "./branding.js";
 import {
   SettingsController,
   SettingsExternalActionCancelledError,
@@ -777,7 +780,6 @@ export interface SettingsCachedRuntimeSource {
   readCachedProviderStatus(): readonly ProviderCommandStatusEntry[];
   /** Exact current route/account-owned cache; preferred over legacy mixed caches. */
   readCachedSettingsModels?(): readonly ModelInfo[];
-  readCachedModels?(): readonly ModelInfo[];
   /** Additional runtime methods are deliberately ignored by the cached mapper. */
   readonly [key: string]: unknown;
 }
@@ -801,7 +803,6 @@ export interface SettingsRuntimeSnapshotInput {
     list(workspace: string): readonly { readonly id: string; readonly decision: "allow" | "deny" }[];
   };
   readonly workspace: string;
-  readonly readCachedModels?: () => readonly ModelInfo[];
   readonly readCachedWorkspaceTotalUsd?: () => number;
   readonly now?: () => Date;
 }
@@ -834,10 +835,7 @@ export function createSettingsRuntimeSnapshotPort(
           totalUsd,
         },
         cachedModels: projectSettingsModelInfos(
-          input.readCachedModels?.()
-            ?? input.runtime.readCachedSettingsModels?.()
-            ?? input.runtime.readCachedModels?.()
-            ?? [],
+          input.runtime.readCachedSettingsModels?.() ?? [],
         ),
       });
     },
@@ -6067,7 +6065,7 @@ export async function runCli(
     });
     return 0;
   }
-  if (!options.json) printBanner(workspace, config.mainModel);
+  if (!options.json) printBanner(workspace, config.mainModel, config.appearance);
   await dependencies.runPlain(common);
   return 0;
 }
@@ -6257,17 +6255,7 @@ function readProviderAwareSettingsModels(context: Pick<
   "providerRuntime" | "openRouter"
 >): readonly ModelInfo[] {
   const exact = context.providerRuntime.readCachedSettingsModels?.();
-  if (exact) return exact;
-  const route = context.providerRuntime.readCachedSettingsRoute?.();
-  const legacyRuntime = context.providerRuntime.readCachedModels?.() ?? [];
-  if (route?.backendId === "kimi-code") {
-    const kimiIds = new Set<string>(KIMI_CODE_MODELS.map((model) => model.id));
-    return legacyRuntime.filter((model) => kimiIds.has(model.id));
-  }
-  return [
-    ...legacyRuntime,
-    ...context.openRouter.readCachedModels(),
-  ];
+  return exact ?? [];
 }
 
 // ---------------------------------------------------------------------------
@@ -7485,20 +7473,22 @@ export function renderCliBanner(
   workspace: string,
   model: string,
   version: string = readPackageVersion(),
+  appearance: AppearanceConfig = DEFAULT_APPEARANCE,
+  glyphEnvironment: GlyphEnvironment = process.env,
 ): string {
   const parts = cliBannerParts(workspace, model, version);
   return [
+    ...(appearance.showLargeLogo
+      ? routeCoreLarge(resolveGlyphMode(appearance.glyphMode, glyphEnvironment))
+      : []),
     parts.headline,
     `Workspace ${parts.workspace}`,
     `Main      ${parts.model}`,
   ].join("\n");
 }
 
-function printBanner(workspace: string, model: string): void {
-  const parts = cliBannerParts(workspace, model);
-  console.log(chalk.bold.cyan(`\n${parts.headline}`));
-  console.log(`${chalk.dim("Workspace")} ${parts.workspace}`);
-  console.log(`${chalk.dim("Main")}      ${parts.model}`);
+function printBanner(workspace: string, model: string, appearance: AppearanceConfig): void {
+  console.log(`\n${renderCliBanner(workspace, model, readPackageVersion(), appearance)}`);
 }
 
 export function renderCliHelp(version: string = readPackageVersion()): string {

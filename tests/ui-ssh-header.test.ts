@@ -107,3 +107,40 @@ test("buildFrame keeps every line within the requested width even with the SSH s
     assert.ok(lineWidth(line) <= 50, `Zeile zu breit: ${plainText(line)}`);
   }
 });
+
+test("the compact Route Core mark is right-aligned and drops before route, approval, and SSH state", () => {
+  const wide = buildFrame({
+    width: 100,
+    height: 24,
+    theme,
+    blocks: [],
+    inputText: "",
+    inputCursor: 0,
+    header: {
+      workspace: "/home/user/project",
+      model: "vendor/model",
+      approvalMode: "ask",
+      sshHost: "vps",
+      brandMark: "<>-+*o",
+    },
+  });
+  assert.match(plainText(wide.lines[0]!), /<>-\+\*o\s*$/);
+  const narrow = buildFrame({
+    width: 40,
+    height: 24,
+    theme,
+    blocks: [],
+    inputText: "",
+    inputCursor: 0,
+    header: {
+      workspace: "/home/user/project",
+      model: "vendor/model",
+      approvalMode: "ask",
+      sshHost: "vps",
+      brandMark: "<>-+*o",
+    },
+  });
+  const header = plainText(narrow.lines[0]!);
+  assert.doesNotMatch(header, /<>-\+\*o/);
+  assert.match(header, /SSH: VPS/);
+});

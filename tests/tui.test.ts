@@ -16,6 +16,7 @@ import {
 import type { ChatBlock } from "../src/ui/blocks.js";
 import { lineWidth, plainText, type Line } from "../src/ui/spans.js";
 import { createTheme } from "../src/ui/theme.js";
+import { routeCoreCompact, routeCoreLarge } from "../src/branding.js";
 import { RunViewModel } from "../src/ui/view-model.js";
 import type { AgentRunEvent, ModelInfo } from "../src/types.js";
 import { handleSlashCommand, type CommandContext } from "../src/commands.js";
@@ -61,6 +62,41 @@ function input(overrides: Partial<DashboardFrameInput> = {}): DashboardFrameInpu
     ...overrides,
   };
 }
+
+test("empty dashboard and normal header consume the canonical Route Core branding", () => {
+  const branded = buildDashboardFrame(input({
+    brand: {
+      showLargeLogo: true,
+      showHeaderMark: true,
+      largeLines: routeCoreLarge("ascii"),
+      compactMark: routeCoreCompact("ascii"),
+    },
+  }));
+  const brandedText = text(branded.lines);
+  assert.match(brandedText, /\/--------\\/);
+  assert.match(brandedText, /ORCODE/);
+
+  const unbranded = buildDashboardFrame(input({
+    brand: {
+      showLargeLogo: false,
+      showHeaderMark: false,
+      largeLines: routeCoreLarge("ascii"),
+      compactMark: routeCoreCompact("ascii"),
+    },
+  }));
+  assert.doesNotMatch(text(unbranded.lines), /\/--------\\|ORCODE/);
+
+  const populated = buildDashboardFrame(input({
+    blocks: chat(1),
+    brand: {
+      showLargeLogo: true,
+      showHeaderMark: true,
+      largeLines: routeCoreLarge("ascii"),
+      compactMark: routeCoreCompact("ascii"),
+    },
+  }));
+  assert.match(plainText(populated.lines[0]!), /<>-\+\*o/);
+});
 
 function chat(count: number): ChatBlock[] {
   const model = new RunViewModel();

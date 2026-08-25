@@ -83,3 +83,21 @@ test("Route-Core-SVG ist eigenständig und verbindet den Ast mit beiden Endpunkt
   ]);
   assert.doesNotMatch(svg, /(?:href|<style|font-|<image|<script|data:|@import|url\()/i);
 });
+
+test("README begins with the canonical asset and documents the guided Settings boundary", async () => {
+  const readme = await readFile(new URL("../README.md", import.meta.url), "utf8");
+  const changelog = await readFile(new URL("../CHANGELOG.md", import.meta.url), "utf8");
+  assert.match(readme, /^!\[Route Core logo\]\(assets\/route-core\.svg\)\n\n# orcode/u);
+  assert.match(readme, /## Guided full-screen settings/u);
+  for (const category of [
+    "Models & Reasoning", "Providers & Accounts", "Automation & Permissions",
+    "Voice & Browser", "Costs & Limits", "Appearance",
+  ]) assert.match(readme, new RegExp(category, "u"));
+  for (const term of ["same terminal", "saved immediately", "owner-only", "ORCODE_ASCII", "ROUTERCODE_ASCII", "NO_COLOR"]) {
+    assert.match(readme, new RegExp(term, "u"));
+  }
+  const unreleased = changelog.slice(changelog.indexOf("## [Unreleased]"), changelog.indexOf("## [0.7.0]"));
+  assert.match(unreleased, /guided full-screen `\/settings`/u);
+  assert.match(unreleased, /Route Core/u);
+  assert.match(unreleased, /owner-only/u);
+});

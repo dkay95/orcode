@@ -1,3 +1,5 @@
+![Route Core logo](assets/route-core.svg)
+
 # orcode
 
 orcode is a local, terminal-based coding agent that runs against any
@@ -128,6 +130,35 @@ orcode
 orcode deliberately has no `--key` command-line flag, since arguments
 are visible in shell history and process listings. Use `/key set` inside
 the app, or the environment variable, instead.
+
+## Guided full-screen settings
+
+Run `/settings` from an owner-controlled interactive session to open the
+guided Settings screen in the same terminal. It has six categories:
+
+1. Models & Reasoning
+2. Providers & Accounts
+3. Automation & Permissions
+4. Voice & Browser
+5. Costs & Limits
+6. Appearance
+
+Use `1`–`6` or the arrow keys to move between categories, `Enter` to open or
+confirm the selected item, `/` to search, and `Esc` to go back. Confirmed
+changes are saved immediately; cancelling an editor leaves its value unchanged.
+Closing Settings restores the existing chat draft, attachments, history, route,
+and viewport instead of starting a second application window.
+
+Settings is an owner-only local surface. orcode never shares your subscriptions
+with another user, pools accounts, or silently moves a running task to another
+subscription. Credentials never enter the Settings view: secrets are collected
+only inside the existing provider setup boundary and are not displayed there.
+Provider and route changes are also rejected while a run is active.
+
+The saved Appearance choices control the large logo, compact header mark, and
+glyph mode. Set `ORCODE_ASCII=1` (or the legacy `ROUTERCODE_ASCII=1`) to force
+ASCII glyphs for the whole terminal UI. `NO_COLOR` disables styling without
+changing the selected logo geometry.
 
 ## Approval modes
 

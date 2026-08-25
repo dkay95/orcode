@@ -191,6 +191,20 @@ test("cached Settings snapshot mappt ausschließlich secretless Felder und führ
         networkCalls += 1;
         throw new Error("not reachable");
       },
+      readCachedSettingsModels: () => [{
+        id: "k3",
+        canonicalSlug: "k3",
+        name: "Kimi K3",
+        description: "safe cached model",
+        contextLength: 262_144,
+        promptPrice: -1,
+        completionPrice: -1,
+        supportedParameters: ["tools", "reasoning"],
+        inputModalities: ["text"],
+        outputModalities: ["text"],
+        credentialSlot: "SECRET_MODEL_SLOT_CANARY",
+        nested: { requestId: "SECRET_MODEL_REQUEST_CANARY" },
+      } as ModelInfo],
     },
     session: {
       data: {
@@ -202,20 +216,6 @@ test("cached Settings snapshot mappt ausschließlich secretless Felder und führ
       list: () => [{ id: "rule-safe", decision: "allow" as const, secret: "RULE_SECRET_CANARY" }],
     },
     workspace: "/owner/workspace",
-    readCachedModels: () => [{
-      id: "k3",
-      canonicalSlug: "k3",
-      name: "Kimi K3",
-      description: "safe cached model",
-      contextLength: 262_144,
-      promptPrice: -1,
-      completionPrice: -1,
-      supportedParameters: ["tools", "reasoning"],
-      inputModalities: ["text"],
-      outputModalities: ["text"],
-      credentialSlot: "SECRET_MODEL_SLOT_CANARY",
-      nested: { requestId: "SECRET_MODEL_REQUEST_CANARY" },
-    } as ModelInfo],
     readCachedWorkspaceTotalUsd: () => 2.5,
     now: () => new Date("2026-08-25T12:00:00.000Z"),
   });
@@ -308,6 +308,45 @@ test("cached Settings model projection prefers the exact provider-aware authorit
     false,
     "a Kimi route must not expose an OpenRouter model for any Settings editor",
   );
+});
+
+test("cached Settings model projection fails closed when its exact provider-owned authority is absent", () => {
+  let unsafeFallbackReads = 0;
+  const port = createSettingsRuntimeSnapshotPort({
+    config: structuredClone(DEFAULT_CONFIG),
+    runtime: {
+      activity: () => ({ runActive: false, activationHeld: false }),
+      readCachedSettingsRoute: () => ({
+        backendId: "kimi-code",
+        providerLabel: "Kimi Code",
+        requestedModelId: "k3",
+        canonicalModelId: "k3",
+        modelLabel: "Kimi K3",
+        billingRealm: "kimi-code-membership-provider-managed-overage",
+      }),
+      readCachedProviderStatus: () => [],
+      readCachedModels: () => {
+        unsafeFallbackReads += 1;
+        return [{
+          id: "openrouter/cross-account",
+          name: "Unsafe cross-account cache",
+          description: "must never be grafted into Settings",
+          contextLength: 1,
+          promptPrice: 0,
+          completionPrice: 0,
+          supportedParameters: [],
+          inputModalities: ["text"],
+          outputModalities: ["text"],
+        }];
+      },
+    },
+    session: { data: { costs: { totalUsd: 0 }, dailySpendUsd: {} } },
+    ruleStore: { list: () => [] },
+    workspace: "/synthetic/fail-closed-settings",
+  });
+
+  assert.deepEqual(port.readCached().cachedModels, []);
+  assert.equal(unsafeFallbackReads, 0);
 });
 
 test("default runtime exposes and populates a synchronous secretless model cache without provider effects", async () => {
@@ -1185,6 +1224,17 @@ test("homeWorkspaceWarning warnt nur bei Workspace === Home-Verzeichnis", () => 
   assert.match(homeWorkspaceWarning(home, home) ?? "", /Home-Verzeichnis/);
   assert.match(homeWorkspaceWarning(`${home}/`, home) ?? "", /Home-Verzeichnis/);
   assert.equal(homeWorkspaceWarning(`${home}/projekt`, home), null);
+});
+
+test("plain interactive banner consumes the canonical Route Core renderer", () => {
+  const banner = renderCliBanner("/tmp/workspace", "provider/model", "0.7.0", {
+    showLargeLogo: true,
+    showHeaderMark: true,
+    glyphMode: "ascii",
+  }, { ORCODE_ASCII: "1" });
+  assert.match(banner, /\/--------\\/);
+  assert.match(banner, /ORCODE/);
+  assert.doesNotMatch(banner, /\u001b/);
 });
 
 /**

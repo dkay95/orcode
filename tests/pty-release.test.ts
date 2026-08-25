@@ -23,6 +23,8 @@ interface PtyControllerResult {
   pasteReadySeen: boolean;
   resultBeforeEnter: boolean;
   timedOut: boolean;
+  resumedSeen: boolean;
+  settingsSeen: boolean;
 }
 
 interface PtyCheckModule {
@@ -58,6 +60,8 @@ function successfulControllerResult(overrides: Partial<PtyControllerResult> = {}
   const output = [
     `ORCODE_PTY_READY:${ready}\r\n`,
     "\u001b[?1049h\u001b[?2004h",
+    "ORCODE_PTY_RESUMED\r\n",
+    "ORCODE_PTY_SETTINGS_READY\r\nORCODE_PTY_SETTINGS_CATEGORY\r\nORCODE_PTY_SETTINGS_RESTORED\r\n",
     "Enter sendet alles gemeinsam",
     "\u001b[?2004l\u001b[?25h\u001b[?1049l",
     `\r\nORCODE_PTY_RESULT:${result}\r\n`,
@@ -69,6 +73,8 @@ function successfulControllerResult(overrides: Partial<PtyControllerResult> = {}
     pasteReadySeen: true,
     resultBeforeEnter: false,
     timedOut: false,
+    resumedSeen: true,
+    settingsSeen: true,
     ...overrides,
   };
 }
@@ -148,6 +154,33 @@ test("the PTY contract requires disable-paste and leave-screen cleanup before ex
       log: () => {},
     }),
     /Terminal-Cleanup.*Bracketed Paste.*Alternate Screen/i,
+  );
+});
+
+test("the PTY contract rejects mouse reporting and requires a suspend-resume checkpoint", async () => {
+  const { runPtySmoke } = await loadPtyCheck();
+  await assert.rejects(
+    runPtySmoke({
+      platform: "darwin",
+      projectRoot: "/virtual/orcode",
+      accessFile: async () => {},
+      runController: async () => successfulControllerResult({ resumedSeen: false }),
+      log: () => {},
+    }),
+    /suspend-resume/i,
+  );
+  const withMouse = successfulControllerResult();
+  const output = Buffer.from(withMouse.outputBase64, "base64").toString("utf8")
+    .replace("ORCODE_PTY_RESUMED", "\u001b[?1000hORCODE_PTY_RESUMED");
+  await assert.rejects(
+    runPtySmoke({
+      platform: "darwin",
+      projectRoot: "/virtual/orcode",
+      accessFile: async () => {},
+      runController: async () => ({ ...withMouse, outputBase64: Buffer.from(output).toString("base64") }),
+      log: () => {},
+    }),
+    /mouse reporting/i,
   );
 });
 

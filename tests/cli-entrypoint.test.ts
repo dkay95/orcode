@@ -219,6 +219,7 @@ test("release metadata packages both CLI names at version 0.7.0", async () => {
   assert.ok(packageJson.files.includes("CHANGELOG.md"));
   assert.ok(packageJson.files.includes("scripts/install-user.mjs"));
   assert.ok(packageJson.files.includes("scripts/check-package.mjs"));
+  assert.ok(packageJson.files.includes("assets"));
   assert.equal(packageLock.name, "orcode");
   assert.equal(packageLock.version, "0.7.0");
   assert.equal(packageLock.packages[""]?.name, "orcode");
@@ -464,6 +465,7 @@ test("the package checker derives an exact public allowlist and rejects drift", 
     "LICENSE",
     "NOTICE",
     "README.md",
+    "assets/route-core.svg",
     "dist/cli.d.ts",
     "dist/cli.js",
     "dist/cli.js.map",

@@ -9,6 +9,18 @@ breaking changes.
 
 ## [Unreleased]
 
+### Added
+
+- A guided full-screen `/settings` surface in the same terminal, with six
+  categories, immediate durable saves, nested validated editors, and the
+  Route Core logo with shared Unicode/ASCII rendering.
+
+### Security
+
+- Settings is owner-only, never exposes credential slots or account
+  fingerprints, and never shares or pools subscriptions between users or
+  accounts.
+
 ## [0.7.0] - 2026-08-25
 
 ### Added

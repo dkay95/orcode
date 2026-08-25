@@ -109,6 +109,14 @@ export interface DashboardFrameInput {
    * Filled in from outside — this module only decides how it is shown.
    */
   contextPercent?: number;
+  brand?: DashboardBranding;
+}
+
+export interface DashboardBranding {
+  readonly showLargeLogo: boolean;
+  readonly showHeaderMark: boolean;
+  readonly largeLines: readonly string[];
+  readonly compactMark: string;
 }
 
 export const WELCOME =
@@ -124,7 +132,11 @@ function clock(ms: number): string {
   return `${minutes}:${String(total % 60).padStart(2, "0")}`;
 }
 
-function headerInfo(state: DashboardState, contextPercent?: number): HeaderInfo {
+function headerInfo(
+  state: DashboardState,
+  contextPercent?: number,
+  brandMark?: string,
+): HeaderInfo {
   const info: HeaderInfo = {
     workspace: state.workspace,
     model:
@@ -136,6 +148,7 @@ function headerInfo(state: DashboardState, contextPercent?: number): HeaderInfo 
   };
   if (contextPercent !== undefined) info.contextPercent = contextPercent;
   if (state.sshHost) info.sshHost = state.sshHost;
+  if (brandMark) info.brandMark = brandMark;
   const git = (state.projectStatus ?? "")
     .split("·")
     .map((part) => part.trim())
@@ -304,8 +317,12 @@ export function buildDashboardFrame(input: DashboardFrameInput): Frame {
     : editorExpansion.length
       ? editorExpansion
     : input.blocks.length === 0
-      // R8: the welcome text sits directly above the divider, not below a header.
-      ? [{ spans: [span("  ", "text"), span(WELCOME, "muted")] }]
+      ? [
+          ...(input.brand?.showLargeLogo
+            ? input.brand.largeLines.map((value) => ({ spans: [span(value, "muted")] }))
+            : []),
+          { spans: [span("  ", "text"), span(WELCOME, "muted")] },
+        ]
       : [];
 
   const frameInput: FrameInput = {
@@ -315,7 +332,11 @@ export function buildDashboardFrame(input: DashboardFrameInput): Frame {
     blocks: input.blocks,
     inputText: text,
     inputCursor,
-    header: headerInfo(input.state, input.contextPercent),
+    header: headerInfo(
+      input.state,
+      input.contextPercent,
+      input.blocks.length > 0 && input.brand?.showHeaderMark ? input.brand.compactMark : undefined,
+    ),
     expansion,
     tick: input.tick ?? 0,
     now: input.now ?? Date.now(),
