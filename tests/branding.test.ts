@@ -35,6 +35,13 @@ test("Route-Core-Marke behält die geprüften Unicode- und ASCII-Geometrien", ()
   assert.equal(ROUTE_CORE_WORDMARK, "ORCODE");
 });
 
+test("Route-Core-Snapshots sind für Aufrufer unveränderlich", () => {
+  const unicode = routeCoreLarge("unicode");
+  assert.equal(Object.isFrozen(unicode), true);
+  assert.throws(() => (unicode as unknown as string[]).push("fremde Geometrie"), TypeError);
+  assert.deepEqual(routeCoreLarge("unicode"), UNICODE_LARGE);
+});
+
 test("ASCII-Umgebungsvariablen haben Vorrang vor gespeicherten Glyphen", () => {
   assert.equal(resolveGlyphMode("unicode", { ORCODE_ASCII: "1" }), "ascii");
   assert.equal(resolveGlyphMode("unicode", { ROUTERCODE_ASCII: "1" }), "ascii");
@@ -64,9 +71,15 @@ test("Route-Core-SVG ist eigenständig und verbindet den Ast mit beiden Endpunkt
   const svg = await readFile(new URL("../assets/route-core.svg", import.meta.url), "utf8");
   assert.match(svg, /xmlns="http:\/\/www\.w3\.org\/2000\/svg"/);
   assert.match(svg, /viewBox="0 0 48 48"/);
-  assert.match(svg, /<path d="M9 14h13l6 10-6 10H9L3 24l6-10Z"/);
-  assert.match(svg, /<path d="M25 24h4m0 0 3-6m-3 6 3 6"/);
-  assert.match(svg, /<circle cx="35" cy="14" r="5" fill="currentColor"\/>/);
-  assert.match(svg, /<circle cx="35" cy="34" r="5" fill="none" stroke="currentColor" stroke-width="3"\/>/);
-  assert.doesNotMatch(svg, /(?:href|<style|font-|<image|<script|data:)/i);
+  const paths = svg.match(/<path\b[^>]*\/>/g) ?? [];
+  const circles = svg.match(/<circle\b[^>]*\/>/g) ?? [];
+  assert.deepEqual(paths, [
+    '<path d="M9 14h13l6 10-6 10H9L3 24l6-10Z" fill="none" stroke="currentColor" stroke-width="3"/>',
+    '<path d="M25 24h4m0 0 3-6m-3 6 3 6" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round"/>',
+  ]);
+  assert.deepEqual(circles, [
+    '<circle cx="35" cy="14" r="5" fill="currentColor"/>',
+    '<circle cx="35" cy="34" r="5" fill="none" stroke="currentColor" stroke-width="3"/>',
+  ]);
+  assert.doesNotMatch(svg, /(?:href|<style|font-|<image|<script|data:|@import|url\()/i);
 });

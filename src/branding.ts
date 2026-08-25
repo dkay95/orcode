@@ -9,23 +9,23 @@ export interface GlyphEnvironment {
   readonly LC_ALL?: string;
 }
 
-const UNICODE_ROUTE_CORE_LARGE = [
+const UNICODE_ROUTE_CORE_LARGE = Object.freeze([
   "    ╭────────╮         ●",
   "  ╱            ╲      ╱",
   " ╱      ◇       ├────┤",
   "  ╲            ╱      ╲",
   "    ╰────────╯         ○",
   "          ORCODE",
-] as const;
+]);
 
-const ASCII_ROUTE_CORE_LARGE = [
+const ASCII_ROUTE_CORE_LARGE = Object.freeze([
   "    /--------\\         *",
   "  /            \\      /",
   " <       o       +----+",
   "  \\            /      \\",
   "    \\--------/         o",
   "          ORCODE",
-] as const;
+]);
 
 const UNICODE_ROUTE_CORE_COMPACT = "⬡─┤●○";
 const ASCII_ROUTE_CORE_COMPACT = "<>-+*o";
