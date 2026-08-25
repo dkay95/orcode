@@ -66,13 +66,20 @@ import {
   isCompressionMode,
   loadConfig,
   migrateAppHome,
+  readConfigEditSnapshot,
   readConfigFileSnapshot,
   saveConfig,
+  saveConfigEdit,
   withConfigWriteLock,
   writeFileAtomicCreateSecure,
   writeFileAtomicSecure,
   type OrcodeConfigWithBudget,
 } from "./config.js";
+import {
+  SettingsController,
+  type SettingsExternalAction,
+} from "./settings-controller.js";
+import { runSettingsSession } from "./settings-session.js";
 import {
   CredentialStore,
   normalizeProviderSecret,
@@ -4587,6 +4594,65 @@ export function createSettingsCommandPort(
   });
 }
 
+function createSettingsSession(
+  context: RuntimeContext,
+  surface: TerminalUi,
+  ownsTerminal: boolean,
+): SettingsSessionDependencies {
+  return {
+    async open(): Promise<void> {
+      if (ownsTerminal) surface.start();
+      try {
+        const controller = await SettingsController.open({
+          configPath: context.configPath,
+          snapshots: {
+            // Deliberately cached-only: opening Settings must not execute a
+            // provider command or inspect a credential.
+            read: async () => ({
+              config: context.config,
+              runActive: false,
+              route: null,
+              providers: [],
+              approvalRules: context.ruleStore.list(context.workspace).map((rule) => ({
+                id: rule.id,
+                decision: rule.decision,
+              })),
+              costs: {
+                costKnowledge: context.session.data.costs.costKnowledge ?? "unknown",
+                sessionUsd: context.session.data.costs.totalUsd,
+                dayUsd: 0,
+                totalUsd: context.session.data.costs.totalUsd,
+              },
+              cachedModels: [],
+            }),
+          },
+          externalActions: {
+            async execute(action: SettingsExternalAction): Promise<void> {
+              if (action.kind === "provider") {
+                await context.providerCommands.execute(action.intent, context.providerRouteSurface);
+                return;
+              }
+              // Model and catalogue actions stay disabled until Task 5's
+              // transactional publication adapter provides their authority.
+              throw new Error("Settings action is not available.");
+            },
+          },
+          liveConfig: {
+            prepare(next) {
+              return { publish: () => Object.assign(context.config, next) };
+            },
+          },
+          readConfig: readConfigEditSnapshot,
+          saveConfig: async (expected, candidate, path) => saveConfigEdit(expected, candidate, path),
+        });
+        await runSettingsSession(controller, surface);
+      } finally {
+        if (ownsTerminal) surface.stop();
+      }
+    },
+  };
+}
+
 export interface DashboardRunInput extends PlainRunInput {
   setupRequired: boolean;
   showChatPickerOnStart?: boolean;
@@ -4860,6 +4926,7 @@ export async function runCli(
   };
 
   const common = {
+    executionMode,
     workspace,
     configPath: runtimeConfigPath,
     config,
@@ -4922,6 +4989,7 @@ async function main(): Promise<void> {
 }
 
 interface RuntimeContext {
+  executionMode: ProviderExecutionMode;
   workspace: string;
   configPath: string;
   config: OrcodeConfigWithBudget;
@@ -4938,6 +5006,7 @@ interface RuntimeContext {
   providerRuntime: ProviderRuntime;
   credentials: CredentialStore;
   out: CommandOutput;
+  settings?: SettingsCommandPort;
   ruleStore: RuleStore;
   /** `/ssh`'s remembered target — read by the dashboard header, mutated by `sshCommand` in commands.ts. */
   sshSession: SshSession;
@@ -4974,6 +5043,15 @@ async function runPlainLoop(
   context.seedNextMessage = (text) => {
     pendingSeed = text;
   };
+  context.settings = createSettingsCommandPort({
+    executionMode: context.executionMode,
+    stdinIsTty: process.stdin.isTTY === true,
+    stdoutIsTty: process.stdout.isTTY === true,
+    createSession: async () => {
+      const ui = new TerminalUi(() => plainSettingsDashboardState(context));
+      return createSettingsSession(context, ui, true);
+    },
+  });
   while (true) {
     let value: string;
     try {
@@ -5038,6 +5116,25 @@ async function runPlainLoop(
 
   await context.session.save();
   console.log("Bis bald.");
+}
+
+function plainSettingsDashboardState(context: RuntimeContext): DashboardState {
+  return {
+    workspace: context.workspace,
+    projectStatus: "Settings",
+    model: context.config.mainModel,
+    approval: context.approvals.mode,
+    compressor: context.config.compressionMode,
+    compressorModel: context.config.compressorModel,
+    reasoning: reasoningLabel(getReasoningSetting(context.config)),
+    balance: "Providerstatus nicht geladen",
+    sessionCost: context.session.data.costs.costKnowledge === "unknown"
+      ? "providerverwaltet / unbekannt"
+      : formatUsd(context.session.data.costs.totalUsd),
+    maxCost: formatUsd(context.config.maxCostUsd),
+    maxSteps: context.config.maxSteps,
+    keyStatus: "nicht geprüft",
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -5350,6 +5447,12 @@ async function runDashboard(
   context.readCredentialSecret = (kind) => ui.readSecret(
     kind === "inference" ? "OpenRouter API-Key" : "OpenRouter Management-Key",
   );
+  context.settings = createSettingsCommandPort({
+    executionMode: context.executionMode,
+    stdinIsTty: process.stdin.isTTY === true,
+    stdoutIsTty: process.stdout.isTTY === true,
+    createSession: async () => createSettingsSession(context, ui, false),
+  });
   // Showing a transcript behind the chat chooser contradicts the question it
   // asks: the user is picking a chat while already looking at one. Load only
   // once the choice is settled.
