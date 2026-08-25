@@ -71,8 +71,9 @@ function successfulControllerResult(overrides: Partial<PtyControllerResult> = {}
     `ORCODE_PTY_READY:${ready}\r\n`,
     "\u001b[?1049h\u001b[?2004h",
     "    /--------\\         *\r\n<>-+*o",
-    "ORCODE_PTY_RESUMED\r\n",
-    "ORCODE_PTY_SETTINGS_READY\r\nORCODE_PTY_SETTINGS_CATEGORY\r\nORCODE_PTY_SETTINGS_RESTORED\r\n",
+    "\u001b[?2004l\u001b[?25h\u001b[?1049l",
+    "\u001b[?1049h\u001b[?2004h",
+    "ORCODE · Einstellungen\r\n",
     "Enter sendet alles gemeinsam",
     "\u001b[?2004l\u001b[?25h\u001b[?1049l",
     `\r\nORCODE_PTY_RESULT:${result}\r\n`,
@@ -135,6 +136,10 @@ test("the POSIX PTY smoke uses deterministic geometry and validates a later Ente
     stdoutTTY: true,
   });
   assert.match(logged.join("\n"), /echtes POSIX-PTY/i);
+  assert.doesNotMatch(
+    Buffer.from(successfulControllerResult().outputBase64, "base64").toString("utf8"),
+    /ORCODE_PTY_RESUMED/,
+  );
 });
 
 test("the PTY contract rejects submission before the separate Enter", async () => {
@@ -169,7 +174,7 @@ test("the PTY contract requires disable-paste and leave-screen cleanup before ex
       }),
       log: () => {},
     }),
-    /Terminal-Cleanup.*Bracketed Paste.*Alternate Screen/i,
+    /Suspend-resume Terminal-Cycle.*Bracketed Paste.*Alternate Screen/i,
   );
 });
 
@@ -187,7 +192,7 @@ test("the PTY contract rejects mouse reporting and requires a suspend-resume che
   );
   const withMouse = successfulControllerResult();
   const output = Buffer.from(withMouse.outputBase64, "base64").toString("utf8")
-    .replace("ORCODE_PTY_RESUMED", "\u001b[?1000hORCODE_PTY_RESUMED");
+    .replace("ORCODE_PTY_READY:", "\u001b[?1000hORCODE_PTY_READY:");
   await assert.rejects(
     runPtySmoke({
       platform: "darwin",
@@ -197,6 +202,25 @@ test("the PTY contract rejects mouse reporting and requires a suspend-resume che
       log: () => {},
     }),
     /mouse reporting/i,
+  );
+});
+
+test("the PTY contract rejects a fabricated resume marker without a terminal re-entry cycle", async () => {
+  const { runPtySmoke } = await loadPtyCheck();
+  const controller = successfulControllerResult();
+  const output = Buffer.from(controller.outputBase64, "base64")
+    .toString("utf8")
+    .replace("\u001b[?2004l\u001b[?25h\u001b[?1049l\u001b[?1049h\u001b[?2004h", "ORCODE_PTY_RESUMED");
+
+  await assert.rejects(
+    runPtySmoke({
+      platform: "darwin",
+      projectRoot: "/virtual/orcode",
+      accessFile: async () => {},
+      runController: async () => ({ ...controller, outputBase64: Buffer.from(output).toString("base64") }),
+      log: () => {},
+    }),
+    /resume.*marker/i,
   );
 });
 

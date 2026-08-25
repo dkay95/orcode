@@ -13,6 +13,7 @@ const DEFAULT_MAX_OUTPUT_BYTES = 256 * 1024;
 const EXPECTED_INPUT = "Erste Zeile\nZweite Zeile";
 const ENABLE_BRACKETED_PASTE = "\u001b[?2004h";
 const DISABLE_BRACKETED_PASTE = "\u001b[?2004l";
+const ENTER_ALTERNATE_SCREEN = "\u001b[?1049h";
 const LEAVE_ALTERNATE_SCREEN = "\u001b[?1049l";
 const ENABLE_SGR_MOUSE = "\u001b[?1000h";
 const ASCII_ROUTE_CORE_START = "/--------\\";
@@ -38,6 +39,8 @@ master = -1
 slave = -1
 process = None
 captured = bytearray()
+control_path = None
+control_created = False
 deadline = time.monotonic() + (config["timeoutMs"] / 1000.0)
 resumed_seen = False
 settings_seen = False
@@ -47,6 +50,7 @@ def stop_on_signal(number, _frame):
 
 signal.signal(signal.SIGINT, stop_on_signal)
 signal.signal(signal.SIGTERM, stop_on_signal)
+signal.signal(signal.SIGCHLD, signal.SIG_DFL)
 
 def append_output(chunk):
     if not chunk:
@@ -123,6 +127,17 @@ try:
     fixture_start = captured.index(b"ORCODE_PTY_FIXTURE:") + len(b"ORCODE_PTY_FIXTURE:")
     fixture_end = captured.index(b"\n", fixture_start)
     fixture = bytes(captured[fixture_start:fixture_end]).rstrip(b"\r")
+    wait_for(b"ORCODE_PTY_SUSPEND_CONTROL:")
+    control_start = captured.index(b"ORCODE_PTY_SUSPEND_CONTROL:") + len(b"ORCODE_PTY_SUSPEND_CONTROL:")
+    control_end = captured.index(b"\n", control_start)
+    control_path = bytes(captured[control_start:control_end]).rstrip(b"\r").decode("utf-8")
+    if (
+        not os.path.isabs(control_path)
+        or os.path.basename(control_path) != "suspend.trigger"
+        or "orcode-pty-lifecycle-" not in os.path.dirname(control_path)
+        or os.path.exists(control_path)
+    ):
+        raise RuntimeError("PTY-Suspend-Controlpfad ist nicht sicher oder bereits belegt")
     wait_for(b"/--------\\")
     write_all(b"/image " + fixture + b"\r")
     wait_for(b"wurde f")
@@ -148,13 +163,45 @@ try:
     wait_for(b"Gespeichert")
     size = struct.pack("HHHH", max(8, config["rows"] - 4), config["columns"], 0, 0)
     fcntl.ioctl(master, termios.TIOCSWINSZ, size)
-    # TerminalUi's suspend handler leaves and re-enters its terminal mode.
-    # SIGTSTP/SIGCONT exercises that production lifecycle in the child group.
-    os.killpg(process.pid, signal.SIGTSTP)
-    time.sleep(0.08)
+    # A bounded harness trigger invokes public production suspend() on the
+    # captured runDashboard TerminalUi; its callback stops this real child.
+    suspend_start = len(captured)
+    control_fd = os.open(control_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    os.close(control_fd)
+    control_created = True
+    wait_for_after(b"\x1b[?2004l", suspend_start)
+    wait_for_after(b"\x1b[?1049l", suspend_start)
+    stopped = False
+    stop_deadline = min(deadline, time.monotonic() + 1.0)
+    while time.monotonic() < stop_deadline:
+        waited_pid, waited_status = os.waitpid(process.pid, os.WNOHANG | os.WUNTRACED)
+        if waited_pid == process.pid and os.WIFSTOPPED(waited_status):
+            stopped = True
+            break
+        time.sleep(0.01)
+    if not stopped:
+        raise RuntimeError("PTY-Child erreichte keinen echten suspend-SIGSTOP")
+    if not os.WIFSTOPPED(waited_status) or os.WSTOPSIG(waited_status) != signal.SIGSTOP:
+        raise RuntimeError("PTY-Child stoppte nicht durch den erwarteten suspend-SIGSTOP")
     os.killpg(process.pid, signal.SIGCONT)
-    resumed_seen = process.poll() is None
-    read_once(0.1)
+    wait_for_after(b"\x1b[?1049h", suspend_start)
+    wait_for_after(b"\x1b[?2004h", suspend_start)
+    wait_for_after(b"ORCODE \xc2\xb7 Einstellungen", suspend_start)
+    resume = bytes(captured[suspend_start:])
+    suspend_disable = resume.find(b"\x1b[?2004l")
+    suspend_leave = resume.find(b"\x1b[?1049l", suspend_disable + 1)
+    resume_enter = resume.find(b"\x1b[?1049h", suspend_leave + 1)
+    resume_enable = resume.find(b"\x1b[?2004h", resume_enter + 1)
+    settings_frame = resume.find(b"ORCODE \xc2\xb7 Einstellungen", resume_enable + 1)
+    resumed_seen = (
+        suspend_disable >= 0 and
+        suspend_leave > suspend_disable and
+        resume_enter > suspend_leave and
+        resume_enable > resume_enter and
+        settings_frame > resume_enable
+    )
+    if not resumed_seen:
+        raise RuntimeError("PTY-Child zeigte keinen geordneten suspend-resume Terminal-Cycle")
     dashboard_return_start = len(captured)
     write_all(b"\x1b")
     wait_for_after(b"Erste Zeile", dashboard_return_start)
@@ -195,6 +242,11 @@ except Exception as error:
     sys.stdout.write(json.dumps(failure, separators=(",", ":")))
     sys.exit(1)
 finally:
+    if control_created and control_path is not None:
+        try:
+            os.unlink(control_path)
+        except FileNotFoundError:
+            pass
     if slave >= 0:
         os.close(slave)
     if process is not None and process.poll() is None:
@@ -324,6 +376,9 @@ export function validateControllerResult(controller, request) {
   if (output.includes(ENABLE_SGR_MOUSE)) {
     throw new Error("Settings-PTY darf kein SGR mouse reporting aktivieren.");
   }
+  if (output.includes("ORCODE_PTY_RESUMED")) {
+    throw new Error("Der PTY-Transcript darf keinen gefälschten Resume-Marker enthalten.");
+  }
   const ready = readMarker(output, "ORCODE_PTY_READY:");
   const result = readMarker(output, "ORCODE_PTY_RESULT:");
   if (
@@ -346,18 +401,28 @@ export function validateControllerResult(controller, request) {
     throw new Error(`Die bestätigte Appearance-Änderung wurde nicht sicher und dauerhaft gespeichert (mode ${String(result.configMode)}).`);
   }
 
-  const enabledAt = output.indexOf(ENABLE_BRACKETED_PASTE);
-  const disabledAt = output.lastIndexOf(DISABLE_BRACKETED_PASTE);
-  const leftAt = output.lastIndexOf(LEAVE_ALTERNATE_SCREEN);
+  const initialEnterAt = output.indexOf(ENTER_ALTERNATE_SCREEN);
+  const initialEnableAt = output.indexOf(ENABLE_BRACKETED_PASTE, initialEnterAt + ENTER_ALTERNATE_SCREEN.length);
+  const suspendDisableAt = output.indexOf(DISABLE_BRACKETED_PASTE, initialEnableAt + ENABLE_BRACKETED_PASTE.length);
+  const suspendLeaveAt = output.indexOf(LEAVE_ALTERNATE_SCREEN, suspendDisableAt + DISABLE_BRACKETED_PASTE.length);
+  const resumeEnterAt = output.indexOf(ENTER_ALTERNATE_SCREEN, suspendLeaveAt + LEAVE_ALTERNATE_SCREEN.length);
+  const resumeEnableAt = output.indexOf(ENABLE_BRACKETED_PASTE, resumeEnterAt + ENTER_ALTERNATE_SCREEN.length);
+  const finalDisableAt = output.lastIndexOf(DISABLE_BRACKETED_PASTE);
+  const finalLeaveAt = output.lastIndexOf(LEAVE_ALTERNATE_SCREEN);
   const resultAt = output.lastIndexOf("ORCODE_PTY_RESULT:");
   if (
-    enabledAt < 0 ||
-    disabledAt <= enabledAt ||
-    leftAt <= disabledAt ||
-    resultAt <= leftAt
+    initialEnterAt < 0 ||
+    initialEnableAt <= initialEnterAt ||
+    suspendDisableAt <= initialEnableAt ||
+    suspendLeaveAt <= suspendDisableAt ||
+    resumeEnterAt <= suspendLeaveAt ||
+    resumeEnableAt <= resumeEnterAt ||
+    finalDisableAt <= resumeEnableAt ||
+    finalLeaveAt <= finalDisableAt ||
+    resultAt <= finalLeaveAt
   ) {
     throw new Error(
-      "Terminal-Cleanup unvollständig: Bracketed Paste muss deaktiviert und der Alternate Screen vor dem Exit verlassen werden.",
+      "Suspend-resume Terminal-Cycle unvollständig: Bracketed Paste und Alternate Screen müssen geordnet verlassen und erneut betreten werden.",
     );
   }
 

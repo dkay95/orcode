@@ -1,13 +1,17 @@
 #!/usr/bin/env node
 
 import { mkdtemp, mkdir, readFile, stat, writeFile } from "node:fs/promises";
+import { existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 const cliModuleUrl = process.env.ORCODE_PTY_CLI_MODULE;
 if (!cliModuleUrl) throw new Error("ORCODE_PTY_CLI_MODULE fehlt.");
+const tuiModuleUrl = process.env.ORCODE_PTY_TUI_MODULE;
+if (!tuiModuleUrl) throw new Error("ORCODE_PTY_TUI_MODULE fehlt.");
 
 const cli = await import(cliModuleUrl);
+const tui = await import(tuiModuleUrl);
 const config = await import(new URL("./config.js", cliModuleUrl));
 const { SessionStore } = await import(new URL("./session.js", cliModuleUrl));
 const { RuleStore } = await import(new URL("./rules.js", cliModuleUrl));
@@ -19,6 +23,7 @@ const workspace = join(root, "workspace");
 const appHome = join(root, "app");
 const configPath = join(appHome, "config.json");
 const fixturePath = join(workspace, "fixture.png");
+const suspendTriggerPath = join(root, "suspend.trigger");
 await mkdir(workspace, { recursive: true });
 await mkdir(appHome, { recursive: true });
 await writeFile(join(workspace, "package.json"), JSON.stringify({ scripts: { check: "tsc --noEmit" } }));
@@ -81,32 +86,58 @@ const runtime = {
 
 process.stdout.write(`ORCODE_PTY_READY:${JSON.stringify({ stdinTTY: process.stdin.isTTY === true, stdoutTTY: process.stdout.isTTY === true, columns: process.stdout.columns ?? null, rows: process.stdout.rows ?? null })}\n`);
 process.stdout.write(`ORCODE_PTY_FIXTURE:${fixturePath}\n`);
+process.stdout.write(`ORCODE_PTY_SUSPEND_CONTROL:${suspendTriggerPath}\n`);
 process.chdir(workspace);
 
 let dashboardInput;
-let settingsOpening = false;
+let settingsRequested = false;
+let capturedUi;
+const startTerminalUi = tui.TerminalUi.prototype.start;
+tui.TerminalUi.prototype.start = function (...args) {
+  capturedUi = this;
+  return startTerminalUi.apply(this, args);
+};
 process.on("SIGUSR1", () => {
-  if (!dashboardInput || settingsOpening) return;
-  settingsOpening = true;
+  if (!dashboardInput) return;
+  if (settingsRequested) return;
+  settingsRequested = true;
   void handleSlashCommand("/settings", dashboardInput).catch((error) => {
     process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`);
     process.exitCode = 1;
   });
 });
 
-const exitCode = await cli.runCli(["--new"], {
-  initializeStorage: async () => ({ appHome, configPath, migrationWarning: null, retentionWarnings: [], config: persisted, ruleStore: rules, session }),
-  createProviderRuntime: async () => runtime,
-  createAgent: async () => ({ run: async () => { agentCalls += 1; return {}; } }),
-  runPlain: cli.runPlainLoop,
-  runDashboard: async (input) => {
-    dashboardInput = input;
-    await cli.runDashboard(input);
-  },
-  stdout: process.stdout,
-  stderr: process.stderr,
-  environment: { ...process.env, ORCODE_ASCII: "1" },
-});
+const suspendPoll = setInterval(() => {
+  const terminal = capturedUi;
+  if (!terminal || !existsSync(suspendTriggerPath)) return;
+  clearInterval(suspendPoll);
+  void terminal.suspend(async () => {
+    process.kill(process.pid, "SIGSTOP");
+  }).catch((error) => {
+    process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`);
+    process.exitCode = 1;
+  });
+}, 10);
+suspendPoll.unref();
+
+let exitCode;
+try {
+  exitCode = await cli.runCli(["--new"], {
+    initializeStorage: async () => ({ appHome, configPath, migrationWarning: null, retentionWarnings: [], config: persisted, ruleStore: rules, session }),
+    createProviderRuntime: async () => runtime,
+    createAgent: async () => ({ run: async () => { agentCalls += 1; return {}; } }),
+    runPlain: cli.runPlainLoop,
+    runDashboard: async (input) => {
+      dashboardInput = input;
+      await cli.runDashboard(input);
+    },
+    stdout: process.stdout,
+    stderr: process.stderr,
+    environment: { ...process.env, ORCODE_ASCII: "1" },
+  });
+} finally {
+  clearInterval(suspendPoll);
+}
 
 const configRaw = await readFile(configPath, "utf8");
 const configMode = (await stat(configPath)).mode & 0o777;
