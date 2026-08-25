@@ -34,7 +34,6 @@ import {
 import type { ChatSummary, SessionData } from "../src/types.js";
 import type { RouteIdentityV1 } from "../src/backends.js";
 import type { ProviderConnectionStateV1 } from "../src/provider-state.js";
-import type { RouteIdentityV1 } from "../src/backends.js";
 
 async function workspaceRoot(prefix: string): Promise<{
   workspace: string;
@@ -402,8 +401,12 @@ test("clearRouteIfExact durably removes only one complete exact route and reject
   assert.equal(await store.clearRouteIfExact(route), false);
 
   const legacy = SessionStore.create(workspace, appHome, "Legacy route");
-  legacy.setPreferences("k3", { mode: "auto" }, {
-    ...route,
+  legacy.setPreferences("openrouter/auto", { mode: "auto" }, {
+    version: 1,
+    backendId: "openrouter",
+    accountFingerprint: "acct_openrouter_legacy_clear",
+    billingRealm: "openrouter-payg",
+    requestedModelId: "openrouter/auto",
     resolutionState: "legacy-unverified",
     canonicalModelId: null,
   });
