@@ -617,6 +617,33 @@ test("Settings-Maus nutzt ausschließlich den letzten inklusiven Hit-Target", as
   terminal.stop();
 });
 
+test("SGR Press und Release bleiben nach dem Schließen eines Pickers vollständig unterdrückt", async () => {
+  const { terminal, stdin } = settingsUi();
+  terminal.start();
+  try {
+    const picked = terminal.pickChoice("Provider", [
+      { value: "a", label: "Alpha", description: "A" },
+      { value: "b", label: "Beta", description: "B" },
+    ], "a");
+    const row = terminal.frame().lines.findIndex(
+      (line) => plainText(line).includes("Beta"),
+    ) + 1;
+    assert.ok(row > 0);
+
+    stdin.emit(
+      "data",
+      Buffer.from(`\u001b[<0;1;${row}M\u001b[<0;1;${row}m`),
+    );
+    assert.equal((await picked)?.value, "b");
+
+    const chat = terminal.readInput();
+    pressSettings(stdin, "return");
+    assert.equal(await chat, "");
+  } finally {
+    terminal.stop();
+  }
+});
+
 test("zweites ausstehendes Settings-Intent scheitert geschlossen zurück zum Chat", async () => {
   const { terminal } = settingsUi();
   terminal.start();
@@ -1162,6 +1189,43 @@ test("normaler Raw-Präfix bleibt vor einem SGR-Klick geordnet und Mausbytes ble
     );
   } finally {
     terminal.end();
+    terminal.stop();
+  }
+});
+
+test("malformed SGR mit trailing ESC lässt ein split-valides Folgeframe anklicken", async () => {
+  const searchView = view({ search: { active: true, query: "" } });
+  const target = build(80, 24, { search: { active: true, query: "" } }).hitTargets.find(
+    ({ intent }) => intent.kind === "select-item" && intent.itemId === "main-model",
+  );
+  assert.ok(target);
+  const { terminal, stdin } = settingsUi();
+  terminal.start();
+  terminal.begin(searchView);
+  const selected = terminal.nextIntent(searchView);
+  let after: Promise<SettingsIntent> | null = null;
+  try {
+    terminal.frame();
+    stdin.emit("data", Buffer.from("\u001b[<x\u001b"));
+    stdin.emit(
+      "data",
+      Buffer.from(`[<0;${target.columnStart};${target.row}M`),
+    );
+    const result = await Promise.race([
+      selected,
+      new Promise<null>((resolve) => setImmediate(() => resolve(null))),
+    ]);
+    assert.deepEqual(result, { kind: "select-item", itemId: "main-model" });
+
+    after = terminal.nextIntent(searchView);
+    const leaked = await Promise.race([
+      after.then(() => true),
+      new Promise<false>((resolve) => setImmediate(() => resolve(false))),
+    ]);
+    assert.equal(leaked, false);
+  } finally {
+    terminal.end();
+    await Promise.allSettled([selected, ...(after ? [after] : [])]);
     terminal.stop();
   }
 });

@@ -114,6 +114,9 @@ interface MouseKeypressToken {
   consumed: number;
   complete: boolean;
   click: { readonly column: number; readonly row: number } | null;
+  passthroughSuffix: boolean;
+  readonly surface: UiSurface;
+  readonly mode: UiMode;
 }
 
 export interface ChoicePickerItem {
@@ -347,6 +350,7 @@ export class TerminalUi implements SettingsSurface {
   #tick = 0;
   #spinnerTimer: NodeJS.Timeout | null = null;
   #mouseProtocolBuffer = "";
+  #mouseProtocolBufferRecovery = false;
   #openMouseKeypressToken: MouseKeypressToken | null = null;
   #mouseKeypressTokens: MouseKeypressToken[] = [];
   #mouseReporting = false;
@@ -2083,8 +2087,20 @@ export class TerminalUi implements SettingsSurface {
     const buffered = this.#mouseProtocolBuffer;
     const sequence = `${buffered}${text}`;
     const openToken = this.#openMouseKeypressToken;
+    let recoverBufferedPrefix = this.#mouseProtocolBufferRecovery;
     this.#mouseProtocolBuffer = "";
+    this.#mouseProtocolBufferRecovery = false;
     this.#openMouseKeypressToken = null;
+
+    if (buffered && recoverBufferedPrefix) {
+      const confirmedMouse = sequence.startsWith("\u001b[<");
+      const stillAmbiguous = "\u001b[<".startsWith(sequence);
+      if (confirmedMouse) recoverBufferedPrefix = false;
+      else if (!stillAmbiguous) {
+        this.#createMouseRecoveryToken(buffered);
+        recoverBufferedPrefix = false;
+      }
+    }
 
     let cursor = 0;
     while (cursor < sequence.length) {
@@ -2096,6 +2112,7 @@ export class TerminalUi implements SettingsSurface {
       // them as mouse bytes: readline may complete them as a normal CSI key.
       if (rest.length < 3 && "\u001b[<".startsWith(rest)) {
         this.#mouseProtocolBuffer = rest;
+        this.#mouseProtocolBufferRecovery = recoverBufferedPrefix;
         break;
       }
       if (!rest.startsWith("\u001b[<")) {
@@ -2141,22 +2158,40 @@ export class TerminalUi implements SettingsSurface {
       // the same chunk can still reach readline exactly once.
       const terminator = rest.slice(3, MAX_MOUSE_SEQUENCE_LENGTH).search(/[Mm]/u);
       const nextEscape = rest.indexOf("\u001b", 1);
-      const trailingEscape = nextEscape >= 0 && nextEscape === rest.length - 1;
-      const malformedEnd = terminator >= 0
+      const terminatorEnd = terminator >= 0
         ? escape + 3 + terminator + 1
-        : nextEscape >= 0
-          ? escape + nextEscape + (trailingEscape ? 1 : 0)
-          : sequence.length;
+        : sequence.length;
+      const nextEscapeStart = nextEscape >= 0
+        ? escape + nextEscape
+        : sequence.length;
+      const malformedEnd = Math.min(terminatorEnd, nextEscapeStart);
       if (malformedEnd > freshStart) token.raw += sequence.slice(freshStart, malformedEnd);
       token.complete = true;
+      if (nextEscapeStart === malformedEnd) {
+        const nextPrefix = sequence.slice(nextEscapeStart);
+        recoverBufferedPrefix = nextPrefix.length < 3
+          && "\u001b[<".startsWith(nextPrefix);
+      }
       cursor = malformedEnd;
     }
   };
 
   #clearMouseProtocol(): void {
     this.#mouseProtocolBuffer = "";
+    this.#mouseProtocolBufferRecovery = false;
     this.#openMouseKeypressToken = null;
     this.#mouseKeypressTokens = [];
+  }
+
+  #retireMouseProtocol(): void {
+    this.#mouseProtocolBuffer = "";
+    this.#mouseProtocolBufferRecovery = false;
+    this.#openMouseKeypressToken = null;
+    this.#mouseKeypressTokens = this.#mouseKeypressTokens.filter((token) => {
+      if (!token.complete || token.consumed >= token.raw.length) return false;
+      token.click = null;
+      return true;
+    });
   }
 
   #createMouseKeypressToken(): MouseKeypressToken {
@@ -2165,9 +2200,20 @@ export class TerminalUi implements SettingsSurface {
       consumed: 0,
       complete: false,
       click: null,
+      passthroughSuffix: false,
+      surface: this.#surface,
+      mode: this.#mode,
     };
     this.#mouseKeypressTokens.push(token);
     return token;
+  }
+
+  #createMouseRecoveryToken(raw: string): void {
+    if (!raw) return;
+    const token = this.#createMouseKeypressToken();
+    token.raw = raw;
+    token.complete = true;
+    token.passthroughSuffix = true;
   }
 
   #finishConsumedMouseTokens(): void {
@@ -2176,7 +2222,13 @@ export class TerminalUi implements SettingsSurface {
       if (!token?.complete || token.consumed < token.raw.length) return;
       this.#mouseKeypressTokens.shift();
       if (this.#openMouseKeypressToken === token) this.#openMouseKeypressToken = null;
-      if (token.click) this.#selectMouseRow(token.click.column, token.click.row);
+      if (
+        token.click
+        && token.surface === this.#surface
+        && token.mode === this.#mode
+      ) {
+        this.#selectMouseRow(token.click.column, token.click.row);
+      }
     }
   }
 
@@ -2200,6 +2252,7 @@ export class TerminalUi implements SettingsSurface {
     if (!actual) return { character, key };
 
     let remainder = actual;
+    let passthroughSuffix = false;
     while (remainder) {
       this.#finishConsumedMouseTokens();
       const token = this.#mouseKeypressTokens[0];
@@ -2212,6 +2265,7 @@ export class TerminalUi implements SettingsSurface {
         return null;
       }
       if (remainder.startsWith(expected)) {
+        passthroughSuffix ||= token.passthroughSuffix;
         token.consumed += expected.length;
         remainder = remainder.slice(expected.length);
         this.#finishConsumedMouseTokens();
@@ -2236,6 +2290,12 @@ export class TerminalUi implements SettingsSurface {
         },
       };
     }
+    if (passthroughSuffix) {
+      return {
+        character: typeof character === "string" ? character : "",
+        key: { ...key, sequence: remainder, meta: false },
+      };
+    }
     return null;
   }
 
@@ -2257,7 +2317,7 @@ export class TerminalUi implements SettingsSurface {
   }
 
   #disableMouseReporting(): void {
-    this.#clearMouseProtocol();
+    this.#retireMouseProtocol();
     if (!this.#mouseReporting) return;
     this.#mouseReporting = false;
     this.stdout.write(DISABLE_SGR_MOUSE);
