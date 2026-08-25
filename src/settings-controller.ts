@@ -201,6 +201,8 @@ const SAVE_ERROR_NOTICE = "Einstellung konnte nicht gespeichert werden";
 const EXTERNAL_ERROR_NOTICE = "Aktion konnte nicht ausgeführt werden";
 const UNVERIFIED_NOTICE = "Speicherzustand konnte nicht sicher bestätigt werden";
 const ACTIVITY_ERROR_NOTICE = "Aktueller Laufstatus konnte nicht geprüft werden";
+const SAVED_REFRESH_NOTICE = "Gespeichert; Ansicht konnte nicht aktualisiert werden";
+const ACTION_REFRESH_NOTICE = "Aktion ausgeführt; Ansicht konnte nicht aktualisiert werden";
 const ALLOW_ALL_WARNING =
   "allow-all führt Dateiänderungen und Shell-Befehle ohne Nachfrage aus. Wirklich aktivieren?";
 
@@ -433,13 +435,21 @@ export class SettingsController {
   ): Promise<SettingsControllerEffect> {
     try {
       await this.#dependencies.externalActions.execute(action);
-      await this.#refresh(pending.item.id);
-      this.#notice = Object.freeze({ kind: "success", message: "Gespeichert" });
-      return { kind: "render" };
     } catch {
       this.#notice = Object.freeze({ kind: "error", message: EXTERNAL_ERROR_NOTICE });
       return { kind: "render" };
     }
+
+    if (!await this.#refreshOrReadOnly(
+      pending.item.id,
+      this.#snapshot,
+      this.#snapshot.config,
+    )) {
+      this.#notice = Object.freeze({ kind: "success", message: ACTION_REFRESH_NOTICE });
+      return { kind: "render" };
+    }
+    this.#notice = Object.freeze({ kind: "success", message: "Gespeichert" });
+    return { kind: "render" };
   }
 
   async #saveConfigAction(
@@ -475,24 +485,20 @@ export class SettingsController {
       return { kind: "render" };
     }
 
+    let saved: OrcodeConfigWithBudget;
     try {
-      const saved = await this.#dependencies.saveConfig(
+      saved = await this.#dependencies.saveConfig(
         pending.configSnapshot,
         validated,
         this.#dependencies.configPath,
       );
-      if (!sameConfig(saved, validated)) {
-        await this.#refresh(pending.item.id);
-        this.#notice = Object.freeze({ kind: "error", message: UNVERIFIED_NOTICE });
-        return { kind: "render" };
-      }
-      publication.publish();
-      await this.#refresh(pending.item.id);
-      this.#notice = Object.freeze({ kind: "success", message: "Gespeichert" });
-      return { kind: "render" };
     } catch (error) {
       if (error instanceof ConfigEditConflictError) {
-        await this.#refresh(pending.item.id);
+        await this.#refreshOrReadOnly(
+          pending.item.id,
+          activity,
+          activity.config,
+        );
         this.#notice = Object.freeze({ kind: "error", message: CONFLICT_NOTICE });
         return { kind: "render" };
       }
@@ -507,6 +513,28 @@ export class SettingsController {
       this.#notice = Object.freeze({ kind: "error", message: SAVE_ERROR_NOTICE });
       return { kind: "render" };
     }
+
+    if (!sameConfig(saved, validated)) {
+      await this.#refreshOrReadOnly(
+        pending.item.id,
+        { ...activity, config: saved },
+        saved,
+      );
+      this.#notice = Object.freeze({ kind: "error", message: UNVERIFIED_NOTICE });
+      return { kind: "render" };
+    }
+
+    publication.publish();
+    if (!await this.#refreshOrReadOnly(
+      pending.item.id,
+      { ...activity, config: saved },
+      saved,
+    )) {
+      this.#notice = Object.freeze({ kind: "success", message: SAVED_REFRESH_NOTICE });
+      return { kind: "render" };
+    }
+    this.#notice = Object.freeze({ kind: "success", message: "Gespeichert" });
+    return { kind: "render" };
   }
 
   async #reconcileUnverified(
@@ -531,12 +559,28 @@ export class SettingsController {
       return { kind: "render" };
     }
 
-    this.#configEditState = { kind: "editable", snapshot: exact };
     if (!sameConfig(exact.config, validated)) {
       try {
-        this.#snapshot = freezeClone(await this.#dependencies.snapshots.read());
+        const runtime = await this.#dependencies.snapshots.read();
+        if (!sameConfig(runtime.config, exact.config)) {
+          this.#enterReadOnly(
+            focusItemId,
+            { ...runtime, config: exact.config },
+            exact.config,
+          );
+          this.#notice = Object.freeze({ kind: "error", message: CONFLICT_NOTICE });
+          return { kind: "render" };
+        }
+        this.#snapshot = freezeClone(runtime);
+        this.#configEditState = { kind: "editable", snapshot: exact };
       } catch {
-        this.#snapshot = freezeClone(activity);
+        this.#enterReadOnly(
+          focusItemId,
+          { ...activity, config: exact.config },
+          exact.config,
+        );
+        this.#notice = Object.freeze({ kind: "error", message: CONFLICT_NOTICE });
+        return { kind: "render" };
       }
       this.#rebuildRegistry();
       this.#restoreFocus(focusItemId);
@@ -544,6 +588,7 @@ export class SettingsController {
       return { kind: "render" };
     }
 
+    this.#configEditState = { kind: "editable", snapshot: exact };
     publication.publish();
     try {
       this.#snapshot = freezeClone(await this.#dependencies.snapshots.read());
@@ -597,6 +642,35 @@ export class SettingsController {
         reason: READ_ONLY_REASON,
       };
     }
+    this.#rebuildRegistry();
+    this.#restoreFocus(focusItemId);
+  }
+
+  async #refreshOrReadOnly(
+    focusItemId: SettingsItemId,
+    fallbackSnapshot: SettingsControllerSnapshot,
+    fallbackConfig: OrcodeConfigWithBudget,
+  ): Promise<boolean> {
+    try {
+      await this.#refresh(focusItemId);
+      return true;
+    } catch {
+      this.#enterReadOnly(focusItemId, fallbackSnapshot, fallbackConfig);
+      return false;
+    }
+  }
+
+  #enterReadOnly(
+    focusItemId: SettingsItemId,
+    snapshot: SettingsControllerSnapshot,
+    config: OrcodeConfigWithBudget,
+  ): void {
+    this.#snapshot = freezeClone({ ...snapshot, config });
+    this.#configEditState = {
+      kind: "read-only",
+      config: freezeClone(config),
+      reason: READ_ONLY_REASON,
+    };
     this.#rebuildRegistry();
     this.#restoreFocus(focusItemId);
   }
@@ -1278,7 +1352,7 @@ function parseTextValue(
     return { kind: "invalid", retained: sanitizeEditorValue(value), message: "Liste ist ungültig" };
   }
   const retained = rawValues.map((entry) => sanitizeEditorString(entry, 512).trim());
-  if (rawValues.some((entry) => hasDisallowedControls(entry, true))
+  if (rawValues.some((entry) => hasDisallowedControls(entry, false))
     || rawValues.length > 20
     || rawValues.some((entry) => [...entry].length > 512)) {
     return { kind: "invalid", retained, message: "Liste ist ungültig" };

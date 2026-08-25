@@ -154,6 +154,11 @@ async function withTempConfig(
 interface HarnessOptions {
   readonly runActive?: boolean;
   readonly initialSnapshot?: SettingsControllerSnapshot;
+  readonly failSnapshotReadAt?: number;
+  readonly snapshotForRead?: (
+    snapshot: SettingsControllerSnapshot,
+    readCount: number,
+  ) => SettingsControllerSnapshot;
   readonly readConfig?: (path: string) => Promise<ConfigEditSnapshot>;
   readonly saveConfig?: SettingsControllerDependencies["saveConfig"];
   readonly executeExternal?: (action: SettingsExternalAction) => Promise<void>;
@@ -193,7 +198,13 @@ function harness(
         async read() {
           snapshotReads += 1;
           events.push(snapshotReads === 1 ? "open-snapshot" : snapshotReads === 2 ? "read-snapshot" : "refresh");
-          return current;
+          if (snapshotReads === options.failSnapshotReadAt) {
+            throw new Error("private-refresh-failure");
+          }
+          return options.snapshotForRead?.(
+            structuredClone(current),
+            snapshotReads,
+          ) ?? current;
         },
       },
       externalActions: {
@@ -305,6 +316,40 @@ test("eine gültige Config-Auswahl persistiert per CAS vor Live-Publikation und 
   });
 });
 
+test("ein Refreshfehler nach durable Save und Live-Publikation settled sicher ohne falschen Schreibfehler", async () => {
+  await withTempConfig(async (path) => {
+    let writes = 0;
+    const setup = harness(path, {
+      failSnapshotReadAt: 3,
+      saveConfig: async (_expected, candidate) => {
+        writes += 1;
+        return validateConfig(candidate);
+      },
+    });
+    const controller = await SettingsController.open(setup.dependencies);
+    await controller.dispatch({ kind: "select-item", itemId: "appearance-large-logo" });
+    const opened = await controller.dispatch({ kind: "activate" });
+    assert.equal(opened.kind, "edit");
+    if (opened.kind !== "edit") return;
+
+    await controller.completeEditor(opened.request, { kind: "value", value: "off" });
+
+    assert.equal(writes, 1);
+    assert.equal(setup.published.length, 1);
+    assert.equal(controller.view.notice?.message, "Gespeichert; Ansicht konnte nicht aktualisiert werden");
+    assert.equal(controller.view.readOnlyReason, "Konfiguration schreibgeschützt");
+    assert.equal(controller.view.selectedItemId, "appearance-large-logo");
+    assert.equal(
+      controller.view.allItems.find(({ id }) => id === "appearance-large-logo")?.displayValue,
+      "Aus",
+    );
+
+    await controller.completeEditor(opened.request, { kind: "value", value: "on" });
+    assert.equal(writes, 1, "der durable Editor darf nach fehlgeschlagenem Refresh nie erneut schreiben");
+    assert.equal((await controller.dispatch({ kind: "activate" })).kind, "render");
+  });
+});
+
 test("ein CAS-Konflikt publiziert nichts, lädt neu und verlangt einen frischen Editor", async () => {
   await withTempConfig(async (path) => {
     let writes = 0;
@@ -337,6 +382,35 @@ test("ein CAS-Konflikt publiziert nichts, lädt neu und verlangt einen frischen 
     if (fresh.kind === "edit") {
       assert.notEqual(fresh.request.generation, opened.request.generation);
     }
+  });
+});
+
+test("ein Refreshfehler nach CAS-Konflikt behält die Konfliktmeldung und sperrt den stale Editor", async () => {
+  await withTempConfig(async (path) => {
+    let writes = 0;
+    const setup = harness(path, {
+      failSnapshotReadAt: 3,
+      saveConfig: async () => {
+        writes += 1;
+        throw new ConfigEditConflictError();
+      },
+    });
+    const controller = await SettingsController.open(setup.dependencies);
+    await controller.dispatch({ kind: "select-item", itemId: "appearance-large-logo" });
+    const opened = await controller.dispatch({ kind: "activate" });
+    assert.equal(opened.kind, "edit");
+    if (opened.kind !== "edit") return;
+
+    await controller.completeEditor(opened.request, { kind: "value", value: "off" });
+
+    assert.equal(writes, 1);
+    assert.equal(setup.published.length, 0);
+    assert.equal(controller.view.notice?.message, "Einstellung wurde parallel geändert");
+    assert.equal(controller.view.readOnlyReason, "Konfiguration schreibgeschützt");
+    assert.equal(controller.view.selectedItemId, "appearance-large-logo");
+    await controller.completeEditor(opened.request, { kind: "value", value: "off" });
+    assert.equal(writes, 1, "der Konflikt-Editor darf trotz Refreshfehler nie erneut schreiben");
+    assert.equal((await controller.dispatch({ kind: "activate" })).kind, "render");
   });
 });
 
@@ -547,6 +621,88 @@ test("typed-unverified wird exakt neu gelesen, bei bestätigtem Kandidaten recon
   });
 });
 
+test("typed-unverified Mismatch mit fehlendem Runtime-Refresh bleibt fail-closed und verwendet keinen alten Snapshot", async () => {
+  await withTempConfig(async (path) => {
+    const initial = await readConfigEditSnapshot(path);
+    let reads = 0;
+    let writes = 0;
+    const setup = harness(path, {
+      failSnapshotReadAt: 3,
+      readConfig: async () => {
+        reads += 1;
+        return reads === 1
+          ? initial
+          : { file: initial.file, config: structuredClone(DEFAULT_CONFIG) };
+      },
+      saveConfig: async () => {
+        writes += 1;
+        throw new ConfigEditUnverifiedError();
+      },
+    });
+    const controller = await SettingsController.open(setup.dependencies);
+    await controller.dispatch({ kind: "select-item", itemId: "appearance-large-logo" });
+    const opened = await controller.dispatch({ kind: "activate" });
+    assert.equal(opened.kind, "edit");
+    if (opened.kind !== "edit") return;
+
+    await controller.completeEditor(opened.request, { kind: "value", value: "off" });
+
+    assert.equal(writes, 1);
+    assert.equal(setup.published.length, 0);
+    assert.equal(controller.view.notice?.message, "Einstellung wurde parallel geändert");
+    assert.equal(controller.view.readOnlyReason, "Konfiguration schreibgeschützt");
+    assert.equal(controller.view.selectedItemId, "appearance-large-logo");
+    assert.equal(
+      controller.view.allItems.find(({ id }) => id === "appearance-large-logo")?.displayValue,
+      "An",
+    );
+    await controller.completeEditor(opened.request, { kind: "value", value: "off" });
+    assert.equal(writes, 1, "ein unverified Ausgangssnapshot darf nie wiederverwendet werden");
+  });
+});
+
+test("typed-unverified Mismatch bleibt bei Runtime-Disk-Split trotz erfolgreichem Refresh read-only", async () => {
+  await withTempConfig(async (path) => {
+    const initial = await readConfigEditSnapshot(path);
+    let configReads = 0;
+    let writes = 0;
+    const splitRuntime = runtimeSnapshot(structuredClone(DEFAULT_CONFIG));
+    splitRuntime.config.appearance.showLargeLogo = false;
+    const setup = harness(path, {
+      snapshotForRead: (snapshot, readCount) => readCount === 3 ? splitRuntime : snapshot,
+      readConfig: async () => {
+        configReads += 1;
+        return configReads === 1
+          ? initial
+          : { file: initial.file, config: structuredClone(DEFAULT_CONFIG) };
+      },
+      saveConfig: async () => {
+        writes += 1;
+        throw new ConfigEditUnverifiedError();
+      },
+    });
+    const controller = await SettingsController.open(setup.dependencies);
+    await controller.dispatch({ kind: "select-item", itemId: "appearance-large-logo" });
+    const opened = await controller.dispatch({ kind: "activate" });
+    assert.equal(opened.kind, "edit");
+    if (opened.kind !== "edit") return;
+
+    await controller.completeEditor(opened.request, { kind: "value", value: "off" });
+
+    assert.equal(writes, 1);
+    assert.equal(setup.published.length, 0);
+    assert.equal(controller.view.notice?.message, "Einstellung wurde parallel geändert");
+    assert.equal(controller.view.readOnlyReason, "Konfiguration schreibgeschützt");
+    assert.equal(
+      controller.view.allItems.find(({ id }) => id === "appearance-large-logo")?.displayValue,
+      "An",
+    );
+    assert.equal((await controller.dispatch({ kind: "activate" })).kind, "render");
+    await controller.completeEditor(opened.request, { kind: "value", value: "off" });
+    assert.equal(writes, 1);
+  });
+});
+
 test("externe Fehler behalten die Projektion und zeigen nie fremden Fehlertext", async () => {
   await withTempConfig(async (path) => {
     const setup = harness(path, {
@@ -569,6 +725,30 @@ test("externe Fehler behalten die Projektion und zeigen nie fremden Fehlertext",
     assert.equal(controller.view.notice?.message, "Aktion konnte nicht ausgeführt werden");
     assert.doesNotMatch(controller.view.notice?.message ?? "", /request-id|private/i);
     assert.deepEqual(setup.externalActions, [{ kind: "provider", intent: { kind: "setup" } }]);
+  });
+});
+
+test("ein Refreshfehler nach erfolgreicher externer Action meldet Settlement und führt nie erneut aus", async () => {
+  await withTempConfig(async (path) => {
+    const setup = harness(path, { failSnapshotReadAt: 3 });
+    const controller = await SettingsController.open(setup.dependencies);
+    await controller.dispatch({ kind: "select-item", itemId: "provider-setup" });
+    const opened = await controller.dispatch({ kind: "activate" });
+    assert.equal(opened.kind, "edit");
+    if (opened.kind !== "edit") return;
+
+    await controller.completeEditor(opened.request, { kind: "value", value: true });
+
+    assert.equal(setup.externalActions.length, 1);
+    assert.equal(
+      controller.view.notice?.message,
+      "Aktion ausgeführt; Ansicht konnte nicht aktualisiert werden",
+    );
+    assert.equal(controller.view.readOnlyReason, "Konfiguration schreibgeschützt");
+    assert.equal(controller.view.selectedItemId, "provider-setup");
+    await controller.completeEditor(opened.request, { kind: "value", value: true });
+    assert.equal(setup.externalActions.length, 1, "eine ausgeführte Action darf nie wiederholt werden");
+    assert.equal((await controller.dispatch({ kind: "activate" })).kind, "render");
   });
 });
 
@@ -915,6 +1095,28 @@ test("kontrollierte oder überlange Zahlenstrings werden nie nach Bereinigung ge
       assert.equal(completed.kind, "edit");
       assert.equal(setup.published.length, 0);
       assert.equal(setup.events.includes("persist-start"), false);
+    }
+  });
+});
+
+test("strukturierte Kommando- und Provider-Arrays lehnen CR/LF vor Bereinigung ohne Mutation ab", async () => {
+  await withTempConfig(async (path) => {
+    for (const [itemId, value] of [
+      ["verify-commands", ["echo safe\n&& dangerous"]],
+      ["provider-only", ["openai\nanthropic"]],
+    ] as const) {
+      const setup = harness(path);
+      const controller = await SettingsController.open(setup.dependencies);
+      await controller.dispatch({ kind: "select-item", itemId });
+      const opened = await controller.dispatch({ kind: "activate" });
+      assert.equal(opened.kind, "edit", itemId);
+      if (opened.kind !== "edit") continue;
+
+      const completed = await controller.completeEditor(opened.request, { kind: "value", value });
+
+      assert.equal(completed.kind, "edit", itemId);
+      assert.equal(setup.published.length, 0, itemId);
+      assert.equal(setup.events.includes("persist-start"), false, itemId);
     }
   });
 });
