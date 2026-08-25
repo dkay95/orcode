@@ -917,7 +917,7 @@ export class TerminalUi implements SettingsSurface {
     this.#secretLabel = oneLine(label);
     this.#pasting = false;
     this.#pasteBuffer = "";
-    this.#clearMouseProtocol();
+    this.#retireMouseProtocol();
     this.#resetEditor();
     this.#enterMode("secret", `${this.#secretLabel} eingeben`);
     return new Promise<string | null>((resolve) => {
@@ -2184,14 +2184,30 @@ export class TerminalUi implements SettingsSurface {
   }
 
   #retireMouseProtocol(): void {
-    this.#mouseProtocolBuffer = "";
-    this.#mouseProtocolBufferRecovery = false;
-    this.#openMouseKeypressToken = null;
+    const openToken = this.#openMouseKeypressToken;
+    const keepOpenToken = Boolean(
+      openToken
+      && !openToken.complete
+      && openToken.raw.length <= MAX_MOUSE_SEQUENCE_LENGTH
+      && this.#mouseProtocolBuffer.length <= MAX_MOUSE_SEQUENCE_LENGTH,
+    );
+    const keepRecoveryBuffer = Boolean(
+      !keepOpenToken
+      && this.#mouseProtocolBufferRecovery
+      && this.#mouseProtocolBuffer.length <= MAX_MOUSE_SEQUENCE_LENGTH,
+    );
     this.#mouseKeypressTokens = this.#mouseKeypressTokens.filter((token) => {
-      if (!token.complete || token.consumed >= token.raw.length) return false;
+      const pendingComplete = token.complete && token.consumed < token.raw.length;
+      const pendingOpen = keepOpenToken && token === openToken;
+      if (!pendingComplete && !pendingOpen) return false;
       token.click = null;
       return true;
     });
+    if (!keepOpenToken) this.#openMouseKeypressToken = null;
+    if (!keepOpenToken && !keepRecoveryBuffer) {
+      this.#mouseProtocolBuffer = "";
+      this.#mouseProtocolBufferRecovery = false;
+    }
   }
 
   #createMouseKeypressToken(): MouseKeypressToken {
@@ -2277,6 +2293,25 @@ export class TerminalUi implements SettingsSurface {
     }
     if (remainder === actual) return { character, key };
     const chars = Array.from(remainder);
+    if (passthroughSuffix) {
+      if (key.meta && !key.ctrl && chars.length === 1 && chars[0]! >= " ") {
+        return {
+          character: chars[0]!,
+          key: {
+            ...key,
+            name: chars[0]!.toLowerCase(),
+            sequence: remainder,
+            ctrl: false,
+            meta: false,
+            shift: chars[0] !== chars[0]!.toLowerCase(),
+          },
+        };
+      }
+      return {
+        character: typeof character === "string" ? character : "",
+        key: { ...key, sequence: remainder },
+      };
+    }
     if (chars.length === 1 && chars[0]! >= " ") {
       return {
         character: chars[0]!,
@@ -2290,18 +2325,12 @@ export class TerminalUi implements SettingsSurface {
         },
       };
     }
-    if (passthroughSuffix) {
-      return {
-        character: typeof character === "string" ? character : "",
-        key: { ...key, sequence: remainder, meta: false },
-      };
-    }
     return null;
   }
 
   #enableMouseReporting(): void {
     if (!this.#active || this.#mouseReporting) return;
-    this.#clearMouseProtocol();
+    this.#retireMouseProtocol();
     this.#mouseReporting = true;
     this.stdout.write(ENABLE_SGR_MOUSE);
   }

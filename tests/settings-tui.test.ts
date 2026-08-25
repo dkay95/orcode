@@ -644,6 +644,34 @@ test("SGR Press und Release bleiben nach dem Schließen eines Pickers vollständ
   }
 });
 
+test("partielles SGR Release bleibt über Picker zu Secret vollständig unterdrückt", async () => {
+  const { terminal, stdin } = settingsUi();
+  terminal.start();
+  try {
+    const picked = terminal.pickChoice("Provider", [
+      { value: "a", label: "Alpha", description: "A" },
+      { value: "b", label: "Beta", description: "B" },
+    ], "a");
+    const row = terminal.frame().lines.findIndex(
+      (line) => plainText(line).includes("Beta"),
+    ) + 1;
+    assert.ok(row > 0);
+
+    stdin.emit(
+      "data",
+      Buffer.from(`\u001b[<0;1;${row}M\u001b[<0;1;`),
+    );
+    assert.equal((await picked)?.value, "b");
+
+    const secret = terminal.readSecret("Provider-Key");
+    stdin.emit("data", Buffer.from(`${row}m`));
+    pressSettings(stdin, "return");
+    assert.equal(await secret, "");
+  } finally {
+    terminal.stop();
+  }
+});
+
 test("zweites ausstehendes Settings-Intent scheitert geschlossen zurück zum Chat", async () => {
   const { terminal } = settingsUi();
   terminal.start();
@@ -1226,6 +1254,23 @@ test("malformed SGR mit trailing ESC lässt ein split-valides Folgeframe anklick
   } finally {
     terminal.end();
     await Promise.allSettled([selected, ...(after ? [after] : [])]);
+    terminal.stop();
+  }
+});
+
+test("malformed SGR mit Recovery-CSI bewahrt Readlines Left-Semantik", async () => {
+  const initial = view({ search: { active: true, query: "ab" } });
+  const { terminal, stdin } = settingsUi();
+  terminal.start();
+  terminal.begin(initial);
+  try {
+    const changed = terminal.nextIntent(initial);
+    stdin.emit("data", Buffer.from("\u001b[<x\u001b["));
+    stdin.emit("data", Buffer.from("D"));
+    stdin.emit("data", Buffer.from("x"));
+    assert.deepEqual(await changed, { kind: "search-change", query: "axb" });
+  } finally {
+    terminal.end();
     terminal.stop();
   }
 });
