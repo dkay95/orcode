@@ -119,6 +119,28 @@ test("empty Route Core degrades from complete large art to compact wordmark then
   assert.match(minimum, /Schreib eine Aufgabe/);
 });
 
+test("empty Route Core accounts for multiline input and chrome before selecting an expansion tier", () => {
+  const frame = buildDashboardFrame(input({
+    height: 20,
+    input: "one\ntwo\nthree\nfour\nfive\nsix",
+    cursor: 27,
+    status: "sichtbarer Status",
+    statusFresh: true,
+    helpRequested: true,
+    brand: {
+      showLargeLogo: true,
+      showHeaderMark: true,
+      largeLines: routeCoreLarge("ascii"),
+      compactMark: routeCoreCompact("ascii"),
+    },
+  }));
+  const rendered = text(frame.lines);
+  assert.doesNotMatch(rendered, /\/--------\\/);
+  assert.match(rendered, /<>-\+\*o ORCODE/);
+  assert.match(rendered, /Schreib eine Aufgabe/);
+  assert.equal(frame.lines.length <= 20, true);
+});
+
 function chat(count: number): ChatBlock[] {
   const model = new RunViewModel();
   for (let index = 0; index < count; index += 1) {
@@ -1432,6 +1454,20 @@ test("a paste without its end marker still lets Ctrl+C through", () => {
 
     assert.equal(cancellations, 1);
     assert.match(stdout.output, /Abbruch angefordert/);
+  } finally {
+    terminal.stop();
+  }
+});
+
+test("the raw Ctrl+C byte exits an interactive dashboard input", async () => {
+  const stdin = new FakeInput();
+  const stdout = new FakeOutput();
+  const terminal = ui(stdin, stdout);
+  terminal.start();
+  try {
+    const pending = terminal.readInput();
+    press(stdin, "\u0003", "\u0003");
+    await assert.rejects(pending, /orcode wurde beendet/i);
   } finally {
     terminal.stop();
   }

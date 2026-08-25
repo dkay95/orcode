@@ -12,6 +12,7 @@ interface PtyControllerRequest {
   projectRoot: string;
   pythonExecutable: string;
   rows: number;
+  cliModuleUrl: string;
   timeoutMs: number;
   tuiModuleUrl: string;
 }
@@ -25,6 +26,9 @@ interface PtyControllerResult {
   timedOut: boolean;
   resumedSeen: boolean;
   settingsSeen: boolean;
+  providerCalls: number;
+  configMode: number;
+  configRaw: string;
 }
 
 interface PtyCheckModule {
@@ -56,7 +60,12 @@ function successfulControllerResult(overrides: Partial<PtyControllerResult> = {}
     columns: 100,
     rows: 28,
   });
-  const result = JSON.stringify({ value: EXPECTED_INPUT });
+  const result = JSON.stringify({
+    value: EXPECTED_INPUT,
+    providerCalls: 0,
+    configMode: 0o600,
+    configRaw: '{"appearance":{"showHeaderMark":false}}',
+  });
   const output = [
     `ORCODE_PTY_READY:${ready}\r\n`,
     "\u001b[?1049h\u001b[?2004h",
@@ -76,6 +85,9 @@ function successfulControllerResult(overrides: Partial<PtyControllerResult> = {}
     timedOut: false,
     resumedSeen: true,
     settingsSeen: true,
+    providerCalls: 0,
+    configMode: 0o600,
+    configRaw: '{"appearance":{"showHeaderMark":false}}',
     ...overrides,
   };
 }
@@ -104,6 +116,7 @@ test("the POSIX PTY smoke uses deterministic geometry and validates a later Ente
   });
 
   assert.deepEqual(accessed, [
+    join(projectRoot, "dist", "cli.js"),
     join(projectRoot, "dist", "tui.js"),
     join(projectRoot, "tests", "fixtures", "pty-harness.mjs"),
   ]);
@@ -111,6 +124,7 @@ test("the POSIX PTY smoke uses deterministic geometry and validates a later Ente
   assert.equal(request?.rows, 28);
   assert.equal(request?.pythonExecutable, "/usr/bin/python3");
   assert.equal(request?.maxOutputBytes, 256 * 1024);
+  assert.match(request?.cliModuleUrl ?? "", /dist\/cli\.js$/);
   assert.ok((request?.timeoutMs ?? 0) > 0);
   assert.deepEqual(result, {
     columns: 100,

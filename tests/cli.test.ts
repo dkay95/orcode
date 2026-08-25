@@ -1237,6 +1237,17 @@ test("plain interactive banner consumes the canonical Route Core renderer", () =
   assert.doesNotMatch(banner, /\u001b/);
 });
 
+test("runDashboard is the production lifecycle adapter injectable into runCli", () => {
+  const productionDashboard = (cliModule as typeof cliModule & {
+    runDashboard?: unknown;
+  }).runDashboard;
+  assert.equal(
+    typeof productionDashboard,
+    "function",
+    "the PTY must inject the real dashboard lifecycle, not a TerminalUi-only substitute",
+  );
+});
+
 /**
  * K8: CLI usage parsing and the exit-code matrix. `main()` itself is guarded
  * behind an entrypoint check so importing this module for its pure helpers

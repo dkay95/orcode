@@ -6498,7 +6498,7 @@ class BufferedCommandOutput implements CommandOutput {
   }
 }
 
-async function runDashboard(
+export async function runDashboard(
   context: DashboardRunInput,
 ): Promise<void> {
   let balance: BalanceInfo | null = null;

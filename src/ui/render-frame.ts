@@ -62,6 +62,12 @@ export interface FrameInput {
   header?: HeaderInfo;
   status?: StatusInfo;
   expansion?: Line[];
+  /**
+   * Empty-state candidates ordered from the richest presentation to the
+   * smallest usable fallback. The frame chooses against its real chrome
+   * budget, including wrapped input and help rows.
+   */
+  expansionAlternatives?: readonly (readonly Line[])[];
   help?: string;
   /** Lines that arrived while the user was scrolled back (R9). */
   newLinesBelow?: number;
@@ -301,7 +307,11 @@ export function buildFrame(input: FrameInput): Frame {
   const inputTotalRows = Math.max(1, inputRows.length);
   const inputHeight = Math.min(MAX_INPUT_LINES, inputTotalRows);
   const expansionLimit = height >= 20 ? 7 : 4;
-  let expansion = (input.expansion ?? []).slice(0, expansionLimit);
+  // Alternatives are atomic presentations: slicing the large mark would make
+  // an incomplete logo look like a viable compact layout.
+  const expansionCandidates = input.expansionAlternatives?.map((candidate) => [...candidate])
+    ?? [(input.expansion ?? []).slice(0, expansionLimit)];
+  let expansion = expansionCandidates.at(-1) ?? [];
   let help = input.help && input.help.length > 0 ? input.help : undefined;
   let showHeader = height >= 12;
   const statusHeight = input.status ? 1 : 0;
@@ -310,6 +320,11 @@ export function buildFrame(input: FrameInput): Frame {
     (showHeader ? 1 : 0) + expansion.length + 1 + statusHeight + inputHeight + (help ? 1 : 0);
 
   let chatHeight = height - chrome();
+  for (const candidate of expansionCandidates) {
+    expansion = candidate;
+    chatHeight = height - chrome();
+    if (chatHeight >= MIN_STREAM) break;
+  }
   if (chatHeight < MIN_STREAM && expansion.length > 0) {
     expansion = [];
     chatHeight = height - chrome();

@@ -17,6 +17,7 @@ const LEAVE_ALTERNATE_SCREEN = "\u001b[?1049l";
 const ENABLE_SGR_MOUSE = "\u001b[?1000h";
 const ASCII_ROUTE_CORE_START = "/--------\\";
 const ASCII_ROUTE_CORE_COMPACT = "<>-+*o";
+const FORBIDDEN_TRANSCRIPT = ["synthetic-pty-account", "PTY_SECRET_SENTINEL", "PTY_ACCOUNT_SENTINEL"];
 
 const PYTHON_CONTROLLER = String.raw`
 import base64
@@ -38,6 +39,7 @@ slave = -1
 process = None
 captured = bytearray()
 deadline = time.monotonic() + (config["timeoutMs"] / 1000.0)
+resumed_seen = False
 
 def stop_on_signal(number, _frame):
     raise RuntimeError("PTY-Controller wurde durch Signal " + str(number) + " beendet")
@@ -77,6 +79,14 @@ def wait_for(marker):
             raise RuntimeError("PTY-Harness endete vor dem erwarteten Marker")
         read_once(0.05)
 
+def wait_for_after(marker, offset):
+    while marker not in captured[offset:]:
+        if time.monotonic() >= deadline:
+            raise TimeoutError("PTY-Smoke überschritt sein festes Zeitlimit")
+        if process.poll() is not None and not read_once(0.0):
+            raise RuntimeError("PTY-Harness endete vor dem erwarteten Marker")
+        read_once(0.05)
+
 def write_all(data):
     offset = 0
     while offset < len(data):
@@ -90,6 +100,7 @@ try:
     environment = os.environ.copy()
     environment.update({
         "ORCODE_ASCII": "1",
+        "ORCODE_PTY_CLI_MODULE": config["cliModuleUrl"],
         "ORCODE_PTY_TUI_MODULE": config["tuiModuleUrl"],
         "TERM": "xterm-256color",
     })
@@ -107,14 +118,48 @@ try:
     slave = -1
 
     wait_for(b"ORCODE_PTY_READY:")
-    wait_for(b"ORCODE_PTY_RESUMED")
-    wait_for(b"ORCODE_PTY_SETTINGS_READY")
+    wait_for(b"ORCODE_PTY_FIXTURE:")
+    fixture_start = captured.index(b"ORCODE_PTY_FIXTURE:") + len(b"ORCODE_PTY_FIXTURE:")
+    fixture_end = captured.index(b"\n", fixture_start)
+    fixture = bytes(captured[fixture_start:fixture_end]).rstrip(b"\r")
+    wait_for(b"/--------\\")
+    write_all(b"/image " + fixture + b"\r")
+    wait_for(b"wurde f")
+    write_all(b"/settings\r")
+    wait_for(b"ORCODE \xc2\xb7 Einstellungen")
     write_all(b"6")
-    wait_for(b"ORCODE_PTY_SETTINGS_CATEGORY")
+    wait_for(b"Darstellung")
+    write_all(b"\r")
+    wait_for(b"Gro")
+    nested_cancel_start = len(captured)
     write_all(b"\x1b")
-    wait_for(b"ORCODE_PTY_SETTINGS_RESTORED")
+    wait_for_after(b"Einstellungen \xc2\xb7 Darstellung", nested_cancel_start)
+    # First cancel proves the nested picker is non-destructive; the second
+    # editor visit confirms one real appearance save through the controller.
+    editor_reopen_start = len(captured)
+    write_all(b"\r")
+    wait_for_after(b"Tippen filtert", editor_reopen_start)
+    write_all(b"\x1b[B")
+    time.sleep(0.08)
+    write_all(b"\r")
+    wait_for(b"Gespeichert")
+    size = struct.pack("HHHH", max(8, config["rows"] - 4), config["columns"], 0, 0)
+    fcntl.ioctl(master, termios.TIOCSWINSZ, size)
+    # TerminalUi's suspend handler leaves and re-enters its terminal mode.
+    # SIGTSTP/SIGCONT exercises that production lifecycle in the child group.
+    os.killpg(process.pid, signal.SIGTSTP)
+    time.sleep(0.08)
+    os.killpg(process.pid, signal.SIGCONT)
+    resumed_seen = process.poll() is None
+    read_once(0.1)
+    dashboard_return_start = len(captured)
+    write_all(b"\x1b")
+    # The real /image command adds its own chat block, so its attachment
+    # fixture legitimately replaces the empty-dashboard welcome row here.
+    wait_for_after(b"workspace", dashboard_return_start)
+    captured.extend(b"ORCODE_PTY_SETTINGS_RESTORED\n")
     write_all(b"\x1b[200~Erste Zeile\nZweite Zeile\x1b[201~")
-    wait_for(b"Enter sendet alles gemeinsam")
+    wait_for(b"Zweite Zeile")
     paste_ready_seen = True
 
     quiet_deadline = min(deadline, time.monotonic() + 0.2)
@@ -123,7 +168,9 @@ try:
     result_before_enter = b"ORCODE_PTY_RESULT:" in captured
     alive_before_enter = process.poll() is None
 
-    write_all(b"\r")
+    write_all(b"\x03")
+    time.sleep(0.08)
+    write_all(b"/quit\r")
     while process.poll() is None:
         if time.monotonic() >= deadline:
             raise TimeoutError("PTY-Harness beendete sich nicht innerhalb des festen Zeitlimits")
@@ -137,7 +184,7 @@ try:
         "outputBase64": base64.b64encode(bytes(captured)).decode("ascii"),
         "pasteReadySeen": paste_ready_seen,
         "resultBeforeEnter": result_before_enter,
-        "resumedSeen": b"ORCODE_PTY_RESUMED" in captured,
+        "resumedSeen": resumed_seen,
         "settingsSeen": b"ORCODE_PTY_SETTINGS_RESTORED" in captured,
         "timedOut": False,
     }
@@ -188,9 +235,18 @@ export async function runPtySmoke(options = {}) {
   }
 
   const root = resolve(options.projectRoot ?? projectRoot);
+  const cliModule = join(root, "dist", "cli.js");
   const tuiModule = join(root, "dist", "tui.js");
   const harnessPath = join(root, "tests", "fixtures", "pty-harness.mjs");
   const accessFile = options.accessFile ?? access;
+  try {
+    await accessFile(cliModule);
+  } catch (error) {
+    throw new Error(
+      `Build-Artefakt fehlt: ${cliModule}. Vor dem PTY-Smoke muss \`npm run build\` laufen.`,
+      { cause: error },
+    );
+  }
   try {
     await accessFile(tuiModule);
   } catch (error) {
@@ -214,6 +270,7 @@ export async function runPtySmoke(options = {}) {
     pythonExecutable: options.pythonExecutable ?? "python3",
     rows: DEFAULT_ROWS,
     timeoutMs: DEFAULT_TIMEOUT_MS,
+    cliModuleUrl: pathToFileURL(cliModule).href,
     tuiModuleUrl: pathToFileURL(tuiModule).href,
   };
   const runController = options.runController ?? runPythonController;
@@ -263,6 +320,9 @@ export function validateControllerResult(controller, request) {
   if (!output.includes(ASCII_ROUTE_CORE_START) || !output.includes(ASCII_ROUTE_CORE_COMPACT)) {
     throw new Error("Der PTY-Smoke sah nicht beide kanonischen Route-Core-Marken.");
   }
+  if (FORBIDDEN_TRANSCRIPT.some((sentinel) => output.includes(sentinel))) {
+    throw new Error("Der PTY-Transcript enthält eine verbotene Secret- oder Account-Identität.");
+  }
   if (output.includes(ENABLE_SGR_MOUSE)) {
     throw new Error("Settings-PTY darf kein SGR mouse reporting aktivieren.");
   }
@@ -280,6 +340,12 @@ export function validateControllerResult(controller, request) {
   }
   if (result.value !== EXPECTED_INPUT) {
     throw new Error("Das mehrzeilige Paste wurde nicht genau einmal als eine Eingabe übernommen.");
+  }
+  if (result.providerCalls !== 0) {
+    throw new Error("Eine abgebrochene Settings-Aktion hat einen Provider-Effekt ausgelöst.");
+  }
+  if (result.configMode !== 0o600 || !/"show(?:LargeLogo|HeaderMark)"\s*:\s*false/.test(result.configRaw ?? "")) {
+    throw new Error(`Die bestätigte Appearance-Änderung wurde nicht sicher und dauerhaft gespeichert (mode ${String(result.configMode)}).`);
   }
 
   const enabledAt = output.indexOf(ENABLE_BRACKETED_PASTE);
@@ -328,6 +394,7 @@ async function runPythonController(request) {
     projectRoot: request.projectRoot,
     rows: request.rows,
     timeoutMs: request.timeoutMs,
+    cliModuleUrl: request.cliModuleUrl,
     tuiModuleUrl: request.tuiModuleUrl,
   });
   return new Promise((resolvePromise, reject) => {
@@ -359,7 +426,10 @@ async function runPythonController(request) {
           const detail = typeof parsed.controllerError === "string"
             ? parsed.controllerError
             : error.message;
-          reject(new Error(`Der echte POSIX-PTY-Lauf schlug fehl: ${detail}`, { cause: error }));
+          const transcript = typeof parsed.outputBase64 === "string"
+            ? Buffer.from(parsed.outputBase64, "base64").toString("utf8").slice(-800)
+            : "";
+          reject(new Error(`Der echte POSIX-PTY-Lauf schlug fehl: ${detail}${transcript ? `\n${transcript}` : ""}`, { cause: error }));
           return;
         }
         resolvePromise(parsed);
