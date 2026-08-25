@@ -243,6 +243,8 @@ interface PendingEditor {
 const READ_ONLY_REASON = "Konfiguration schreibgeschützt" as const;
 const CONFLICT_NOTICE = "Einstellung wurde parallel geändert";
 const SAVE_ERROR_NOTICE = "Einstellung konnte nicht gespeichert werden";
+const RECOVERY_REQUIRED_NOTICE =
+  "Wiederherstellung erforderlich · orcode neu starten, bevor Einstellungen erneut geändert werden";
 const EXTERNAL_ERROR_NOTICE = "Aktion konnte nicht ausgeführt werden";
 const UNVERIFIED_NOTICE = "Speicherzustand konnte nicht sicher bestätigt werden";
 const ACTIVITY_ERROR_NOTICE = "Aktueller Laufstatus konnte nicht geprüft werden";
@@ -253,6 +255,16 @@ const ALLOW_ALL_WARNING =
 
 export class SettingsRunActiveError extends Error {
   readonly code = "settings-run-active" as const;
+}
+
+/** A durable Settings owner could not be reconciled; callers must stop editing until restart recovery. */
+export class SettingsLiveConfigRecoveryRequiredError extends Error {
+  readonly code = "settings-live-config-recovery-required" as const;
+
+  constructor() {
+    super("Settings live config recovery is required before another edit.");
+    this.name = "SettingsLiveConfigRecoveryRequiredError";
+  }
 }
 
 export class SettingsExternalActionCancelledError extends Error {
@@ -597,6 +609,11 @@ export class SettingsController {
     } catch (error) {
       if (error instanceof SettingsRunActiveError) {
         await this.#showRunActive(pending.item.id);
+        return { kind: "render" };
+      }
+      if (error instanceof SettingsLiveConfigRecoveryRequiredError) {
+        this.#enterReadOnly(pending.item.id, activity, activity.config);
+        this.#notice = Object.freeze({ kind: "error", message: RECOVERY_REQUIRED_NOTICE });
         return { kind: "render" };
       }
       if (error instanceof ConfigEditConflictError) {

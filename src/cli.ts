@@ -62,6 +62,7 @@ import {
 } from "./commands.js";
 import {
   APP_HOME,
+  ConfigEditConflictError,
   DEFAULT_APPEARANCE,
   DEFAULT_CONFIG,
   assertConfigFileSnapshot,
@@ -78,6 +79,7 @@ import {
   saveConfigEdit,
   validateConfig,
   withConfigWriteLock,
+  withConfigWriteLocks,
   writeFileAtomicCreateSecure,
   writeFileAtomicSecure,
   type OrcodeConfigWithBudget,
@@ -87,6 +89,7 @@ import { resolveGlyphMode, routeCoreLarge, type GlyphEnvironment } from "./brand
 import {
   SettingsController,
   SettingsExternalActionCancelledError,
+  SettingsLiveConfigRecoveryRequiredError,
   SettingsRunActiveError,
   projectSettingsConfig,
   type SettingsConfigProjection,
@@ -138,6 +141,7 @@ import {
   migrateLegacySession,
   prepareSessionPreferenceEdit,
   readSessionEditSnapshot,
+  saveSessionEditUnderLock,
   type SaveOutcome,
 } from "./session.js";
 import {
@@ -5520,7 +5524,6 @@ export function createSettingsSession(
             prepare(next) {
               const previousConfig = structuredClone(context.config);
               const previousApprovalMode = context.approvals.mode;
-              const previousSessionModel = context.session.data.model ?? previousConfig.mainModel;
               const previousSessionReasoning = structuredClone(
                 context.session.data.reasoning ?? getReasoningSetting(previousConfig),
               );
@@ -5541,11 +5544,13 @@ export function createSettingsSession(
                     context.approvals.mode = next.approvalMode;
                   } catch (error) {
                     if (reasoningChanged) {
-                      context.session.setPreferences(
-                        previousSessionModel,
-                        previousSessionReasoning,
+                      const recovery = await recoverSettingsReasoningPublication(
+                        context,
+                        surface,
+                        next,
+                        previousConfig,
                       );
-                      await context.session.save().catch(() => undefined);
+                      throw recovery.rollbackLost ? new ConfigEditConflictError() : error;
                     }
                     Object.assign(context.config, previousConfig);
                     context.approvals.mode = previousApprovalMode;
@@ -5568,6 +5573,76 @@ export function createSettingsSession(
       });
     },
   };
+}
+
+async function recoverSettingsReasoningPublication(
+  context: RuntimeContext,
+  surface: TerminalUi,
+  attemptedConfig: OrcodeConfigWithBudget,
+  previousConfig: OrcodeConfigWithBudget,
+): Promise<{ readonly rollbackLost: boolean }> {
+  let rollbackLost = false;
+  try {
+    const committed = await readConfigEditSnapshot(context.configPath);
+    if (isDeepStrictEqual(committed.config, attemptedConfig)) {
+      try {
+        await saveConfigEdit(committed, previousConfig, context.configPath);
+      } catch {
+        rollbackLost = true;
+      }
+    } else {
+      rollbackLost = true;
+    }
+
+    const authoritative = await withConfigWriteLocks(
+      [context.configPath, context.session.path],
+      async (ownerships) => {
+        const configPath = resolve(context.configPath);
+        const sessionPath = resolve(context.session.path);
+        const configOwnership = ownerships.find((owner) => owner.canonicalPath === configPath);
+        const sessionOwnership = ownerships.find((owner) => owner.canonicalPath === sessionPath);
+        if (!configOwnership || !sessionOwnership) {
+          throw new SettingsLiveConfigRecoveryRequiredError();
+        }
+        const configSnapshot = await readConfigEditSnapshot(configPath);
+        const sessionSnapshot = await readSessionEditSnapshot(sessionPath);
+        const route = sessionSnapshot.data.route;
+        if (!route) throw new SettingsLiveConfigRecoveryRequiredError();
+        const nextSession = prepareSessionPreferenceEdit(sessionSnapshot, {
+          requestedModelId: configSnapshot.config.mainModel,
+          reasoning: getReasoningSetting(configSnapshot.config, configSnapshot.config.mainModel),
+          route,
+        });
+        const savedSession = await saveSessionEditUnderLock(
+          sessionOwnership,
+          sessionSnapshot,
+          nextSession,
+        );
+        await configOwnership.assertHeld();
+        const stableConfig = await readConfigEditSnapshot(configPath);
+        if (!isDeepStrictEqual(stableConfig.file, configSnapshot.file)
+          || !isDeepStrictEqual(stableConfig.config, configSnapshot.config)) {
+          throw new SettingsLiveConfigRecoveryRequiredError();
+        }
+        return { config: stableConfig.config, session: savedSession };
+      },
+    );
+
+    context.session.setPreferences(
+      authoritative.session.data.model!,
+      authoritative.session.data.reasoning!,
+      authoritative.session.data.route,
+    );
+    Object.assign(context.config, authoritative.config);
+    context.approvals.mode = authoritative.config.approvalMode;
+    if (!isDeepStrictEqual(previousConfig.appearance, authoritative.config.appearance)) {
+      surface.applyAppearance(authoritative.config.appearance);
+    }
+    return { rollbackLost };
+  } catch (error) {
+    if (error instanceof SettingsLiveConfigRecoveryRequiredError) throw error;
+    throw new SettingsLiveConfigRecoveryRequiredError();
+  }
 }
 
 function assertSettingsIdle(context: RuntimeContext): void {

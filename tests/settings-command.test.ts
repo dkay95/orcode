@@ -12,7 +12,12 @@ import {
   type CommandContext,
   type SettingsCommandPort,
 } from "../src/commands.js";
-import { DEFAULT_CONFIG, saveConfig } from "../src/config.js";
+import {
+  DEFAULT_CONFIG,
+  readConfigEditSnapshot,
+  saveConfig,
+  saveConfigEdit,
+} from "../src/config.js";
 import {
   createSettingsCommandPort,
   createSettingsSession,
@@ -471,6 +476,11 @@ async function withProductionSettingsConfigEdit(
     readonly session: SessionStore;
     readonly approvals: ApprovalManager;
   }) => Promise<void>,
+  arrange?: (fixture: {
+    readonly configPath: string;
+    readonly config: typeof DEFAULT_CONFIG;
+    readonly session: SessionStore;
+  }) => Promise<void> | void,
 ): Promise<void> {
   const root = await mkdtemp(join(tmpdir(), "orcode-settings-live-config-"));
   try {
@@ -547,6 +557,7 @@ async function withProductionSettingsConfigEdit(
       localRuntime: { guard: { async resolvePath(path: string) { return join(workspace, path); } } },
     } as never;
 
+    await arrange?.({ configPath, config, session });
     await createSettingsSession(context, surface, false).open();
     await verify({ appHome, configPath, config, session, approvals });
   } finally {
@@ -580,6 +591,62 @@ test("production Settings reasoning save persists the current session so the nex
     assert.deepEqual(config.reasoningByModel[config.mainModel], expected, "live config must expose the saved reasoning");
     assert.deepEqual(session.data.reasoning, expected, "ensureAgentForPrompt must read the new live session reasoning");
     assert.deepEqual(durableSession.data.reasoning, expected, "the next process must reopen the same reasoning from session storage");
+  });
+});
+
+test("production Settings reasoning recovery converges after a post-publication session save failure", async () => {
+  await withProductionSettingsConfigEdit("reasoning", "effort:high", async ({
+    configPath,
+    config,
+    session,
+  }) => {
+    const stored = JSON.parse(await readFile(configPath, "utf8")) as typeof config;
+    const durableSession = await readSessionEditSnapshot(session.path);
+    assert.equal(stored.reasoningByModel[config.mainModel], undefined);
+    assert.equal(config.reasoningByModel[config.mainModel], undefined);
+    assert.deepEqual(session.data.reasoning, { mode: "auto" });
+    assert.deepEqual(durableSession.data.reasoning, { mode: "auto" });
+  }, async ({ session }) => {
+    const productionSave = session.save.bind(session);
+    let calls = 0;
+    Object.defineProperty(session, "save", {
+      configurable: true,
+      async value() {
+        calls += 1;
+        if (calls === 1) {
+          await productionSave();
+          throw new Error("synthetic failure after session publication");
+        }
+        throw new Error("synthetic rollback save failure");
+      },
+    });
+  });
+});
+
+test("production Settings reasoning recovery follows authoritative config after a rollback CAS race", async () => {
+  await withProductionSettingsConfigEdit("reasoning", "effort:high", async ({
+    configPath,
+    config,
+    session,
+  }) => {
+    const expected = { mode: "effort" as const, effort: "low" as const };
+    const stored = JSON.parse(await readFile(configPath, "utf8")) as typeof config;
+    const durableSession = await readSessionEditSnapshot(session.path);
+    assert.deepEqual(stored.reasoningByModel[config.mainModel], expected);
+    assert.deepEqual(config.reasoningByModel[config.mainModel], expected);
+    assert.deepEqual(session.data.reasoning, expected);
+    assert.deepEqual(durableSession.data.reasoning, expected);
+  }, async ({ configPath, session }) => {
+    Object.defineProperty(session, "save", {
+      configurable: true,
+      async value() {
+        const current = await readConfigEditSnapshot(configPath);
+        const concurrent = structuredClone(current.config);
+        concurrent.reasoningByModel[concurrent.mainModel] = { mode: "effort", effort: "low" };
+        await saveConfigEdit(current, concurrent, configPath);
+        throw new Error("synthetic session failure after concurrent config publication");
+      },
+    });
   });
 });
 
