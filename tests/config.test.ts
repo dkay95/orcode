@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
+import { chmodSync, mkdirSync, renameSync, writeFileSync } from "node:fs";
 import { chmod, lstat, mkdir, mkdtemp, open, readdir, readFile, rename, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
@@ -2004,10 +2005,12 @@ test("saveConfigEdit re-reads exactly after a failed outer release and is typed-
   assert.equal(after.mainModel, "vendor/after-supersede");
 });
 
-test("the create-only edit path fences ownership and exact identity immediately before its post-link chmod and never chmod-s a replacement", async () => {
+test("the create-only edit path publishes 0600 from the secured temp handle under a restrictive umask and never chmod-s an after-fence replacement", async () => {
   if (process.platform === "win32") return;
   // The restrictive umask is applied only under the held lock (PrivateStore verifies exact modes while
-  // acquiring) and restored at the post-link fence, so the temp file is published as 0400 until chmod.
+  // acquiring) and restored at the first post-link fence. The temp file is created as 0400 by the umask;
+  // the writer must secure 0600 on the exact temp handle before linking, so no pathname chmod exists after
+  // publication. The replacement is planted deterministically in a microtask after that fence resolves.
   const previousUmask = process.umask();
   let umaskApplied = false;
   const restoreUmask = () => {
@@ -2017,7 +2020,7 @@ test("the create-only edit path fences ownership and exact identity immediately 
     }
   };
   try {
-    const root = dirname(await configPath("edit-pre-chmod-fence"));
+    const root = dirname(await configPath("edit-handle-secured-mode"));
     const parent = join(root, "nested");
     const moved = join(root, "nested.moved");
     const path = join(parent, "config.json");
@@ -2041,30 +2044,147 @@ test("the create-only edit path fences ownership and exact identity immediately 
             process.umask(0o277);
           }
           if ((await readFile(path, "utf8").catch(() => null)) !== content) return;
-          // First fence after the link: the published file must still carry its pre-chmod mode.
+          // First fence after the link: the published file is already 0600 (secured on the temp handle).
           observedMode = (await stat(path)).mode & 0o777;
           restoreUmask();
           replaced = true;
-          await rename(parent, moved);
-          await mkdir(parent);
-          await chmod(parent, 0o755);
-          await writeFile(join(parent, "config.json"), foreign, { encoding: "utf8", mode: 0o644 });
-          await chmod(join(parent, "config.json"), 0o644);
+          queueMicrotask(() => {
+            renameSync(parent, moved);
+            mkdirSync(parent);
+            chmodSync(parent, 0o755);
+            writeFileSync(join(parent, "config.json"), foreign, { encoding: "utf8", mode: 0o644 });
+            chmodSync(join(parent, "config.json"), 0o644);
+          });
         },
       },
       expected,
       candidate,
     ).catch((reason: unknown) => reason));
     assert.equal(replaced, true);
-    assert.equal(observedMode, 0o400, "the fence must run before the pathname chmod");
+    assert.equal(observedMode, 0o600, "the published file must already be 0600 at the first post-link fence");
     assert.ok(isConfigEditUnverified(error), String(error));
     assert.equal((await stat(join(parent, "config.json"))).mode & 0o777, 0o644, "replacement never chmod-ed");
     assert.equal(await readFile(join(parent, "config.json"), "utf8"), foreign);
     assert.equal((await stat(parent)).mode & 0o777, 0o755);
     assert.deepEqual(await readdir(moved), ["config.json"]);
     assert.equal(await readFile(join(moved, "config.json"), "utf8"), content);
+    assert.equal((await stat(join(moved, "config.json"))).mode & 0o777, 0o600, "secured on the handle before link");
     assert.equal((await stat(moved)).mode & 0o777, 0o700);
   } finally {
     restoreUmask();
   }
+});
+
+test("saveConfigEditUnderLock and saveConfigEdit fail closed on unsafe current bytes even with a structurally supplied exact snapshot", async () => {
+  const cases = [
+    { name: "corrupt-json", raw: "{broken-json" },
+    { name: "non-object", raw: "[1,2,3]\n" },
+    { name: "legacy-v0", raw: JSON.stringify({ mainModel: "legacy/model" }) },
+    { name: "legacy-v1-no-provider", raw: `${JSON.stringify({ schemaVersion: 1, mainModel: "vendor/main" }, null, 2)}\n` },
+    { name: "future-schema", raw: JSON.stringify({ schemaVersion: 2, mainModel: "future/model" }) },
+    { name: "future-provider", raw: JSON.stringify({ ...DEFAULT_CONFIG, providerSetup: { schemaVersion: 99, opaque: "keep-exactly" } }) },
+    { name: "corrupt-provider", raw: JSON.stringify({ ...DEFAULT_CONFIG, providerSetup: { schemaVersion: 2, connections: "wrong" } }) },
+  ] as const;
+  for (const entry of cases) {
+    for (const mode of ["under-lock", "wrapper"] as const) {
+      const label = `${entry.name}/${mode}`;
+      const path = await configPath(`edit-unsafe-${entry.name}-${mode}`);
+      await writeFile(path, entry.raw, { encoding: "utf8", mode: 0o600 });
+      const file = await readConfigFileSnapshot(path);
+      assert.equal(file.kind, "file", label);
+      const expected = { config: validateConfig({ ...DEFAULT_CONFIG } as ConfigInput), file };
+      const candidate = { ...expected.config, mainModel: "vendor/overwrite-attempt" };
+      const error = mode === "under-lock"
+        ? await withConfigWriteLock(path, (ownership) => saveConfigEditUnderLock(ownership, expected, candidate))
+          .catch((reason: unknown) => reason)
+        : await saveConfigEdit(expected, candidate, path).catch((reason: unknown) => reason);
+      assert.ok(error instanceof ConfigEditUnavailableError, `${label}: ${String(error)}`);
+      assert.equal(error.code, "config-edit-unavailable", label);
+      assert.equal(error.name, "ConfigEditUnavailableError", label);
+      assert.equal(error.message, "Config cannot be edited in its current stored state.", label);
+      assert.doesNotMatch(String(error), /keep-exactly|legacy|future|overwrite|broken|\.json/, label);
+      assert.equal(await readFile(path, "utf8"), entry.raw, label);
+      assert.deepEqual(await readdir(dirname(path)), ["config.json"], label);
+    }
+  }
+
+  // Tolerant `saveConfig()` semantics are unchanged: corrupt bytes are backed up, not refused.
+  const tolerantPath = await configPath("edit-unsafe-tolerant-save");
+  await writeFile(tolerantPath, "{broken-json", { encoding: "utf8", mode: 0o600 });
+  await saveConfig({ ...DEFAULT_CONFIG, mainModel: "vendor/tolerant" }, tolerantPath);
+  assert.deepEqual((await readdir(dirname(tolerantPath))).sort(), ["config.json", "config.json.beschaedigt"]);
+  assert.equal(await readFile(`${tolerantPath}.beschaedigt`, "utf8"), "{broken-json");
+});
+
+test("create-only temp cleanup after a parent replacement never unlinks a foreign entry at the temp pathname", async () => {
+  const root = dirname(await configPath("edit-foreign-temp"));
+  const parent = join(root, "nested");
+  const moved = join(root, "nested.moved");
+  const path = join(parent, "config.json");
+  const expected = await readConfigEditSnapshot(path);
+  assert.equal(expected.file.kind, "absent");
+  assert.equal(expected.file.parent.kind, "absent");
+  const candidate = { ...expected.config, mainModel: "vendor/created" };
+  const content = `${JSON.stringify(validateConfig(candidate), null, 2)}\n`;
+
+  let temporaryName: string | null = null;
+  const error = await withConfigWriteLock(path, (ownership) => saveConfigEditUnderLock(
+    {
+      canonicalPath: ownership.canonicalPath,
+      assertHeld: async () => {
+        await ownership.assertHeld();
+        if (temporaryName !== null || !(await pathExists(parent))) return;
+        const pending = await pendingTemporaryFiles(path);
+        if (pending.length === 0) return;
+        // Third post-create fence: the temp exists. Swap the parent and plant a foreign file under the
+        // observed temp basename; the exact fence must reject and cleanup must not touch that file.
+        temporaryName = pending[0]!;
+        await rename(parent, moved);
+        await mkdir(parent);
+        await chmod(parent, 0o755);
+        await writeFile(join(parent, temporaryName), "foreign-temp-sentinel", { encoding: "utf8", mode: 0o644 });
+        await chmod(join(parent, temporaryName), 0o644);
+      },
+    },
+    expected,
+    candidate,
+  ).catch((reason: unknown) => reason));
+  assert.notEqual(temporaryName, null);
+  const name = temporaryName as unknown as string;
+  assert.ok(error instanceof ConfigEditConflictError, String(error));
+  assert.deepEqual(await readdir(parent), [name]);
+  assert.equal(await readFile(join(parent, name), "utf8"), "foreign-temp-sentinel");
+  if (process.platform !== "win32") {
+    assert.equal((await stat(join(parent, name))).mode & 0o777, 0o644);
+    assert.equal((await stat(parent)).mode & 0o777, 0o755);
+  }
+  assert.equal(await pathExists(path), false);
+  // Bounded outcome: Node has no unlinkat, so the writer cannot reach its own temp through the moved
+  // parent by pathname; it stays there unpublished with the candidate bytes and secure mode.
+  assert.deepEqual(await readdir(moved), [name]);
+  assert.equal(await readFile(join(moved, name), "utf8"), content);
+  if (process.platform !== "win32") {
+    assert.equal((await stat(join(moved, name))).mode & 0o777, 0o600);
+  }
+
+  // An ordinary fence rejection with the parent intact still leaves no temp behind.
+  const plainRoot = dirname(await configPath("edit-foreign-temp-plain"));
+  const plainPath = join(plainRoot, "nested", "config.json");
+  const plainExpected = await readConfigEditSnapshot(plainPath);
+  const plainReason = new Error("fixed fence rejection with temp present");
+  const plainError = await withConfigWriteLock(plainPath, (ownership) => saveConfigEditUnderLock(
+    {
+      canonicalPath: ownership.canonicalPath,
+      assertHeld: async () => {
+        await ownership.assertHeld();
+        if ((await pathExists(dirname(plainPath))) && (await pendingTemporaryFiles(plainPath)).length > 0) {
+          throw plainReason;
+        }
+      },
+    },
+    plainExpected,
+    { ...plainExpected.config, mainModel: "vendor/plain" },
+  ).catch((reason: unknown) => reason));
+  assert.equal(plainError, plainReason);
+  assert.deepEqual(await readdir(dirname(plainPath)), []);
 });

@@ -1,8 +1,11 @@
 import { randomUUID } from "node:crypto";
+import { constants as fsConstants } from "node:fs";
 import {
   chmod,
   link,
+  lstat,
   mkdir,
+  open,
   readFile,
   rename,
   unlink,
@@ -618,7 +621,7 @@ async function saveConfigEditExact(
   if (!sameConfigFileSnapshot(current, expected.file)) {
     throw new ConfigEditConflictError();
   }
-  refuseUnsafeStoredConfig(path, current);
+  refuseUnsafeEditTarget(current);
   const content = `${JSON.stringify(validated, null, 2)}\n`;
   const digest = configBytesDigest(content);
   const publication = expected.file.kind === "absent"
@@ -638,15 +641,6 @@ async function saveConfigEditExact(
           await assertExactEditTarget(path, publishTarget);
           if (created === null) await ensureSecureDirectory(dirname(path));
           await assertExactEditTarget(path, publishTarget);
-        },
-        // Immediately before the post-link pathname chmod: ownership plus the
-        // exact published bytes inside the bound parent, or the chmod is skipped
-        // and the readback below decides.
-        beforeSecureMode: async () => {
-          await ownership.assertHeld();
-          if (!(await confirmExactPublication(path, digest, publication.parent))) {
-            throw new Error("Config publication fence lost before securing the mode.");
-          }
         },
       });
     } else {
@@ -706,6 +700,21 @@ async function prepareCreatePublication(
   }
   await ownership.assertHeld();
   return { kind: "create", publishTarget, created, parent: created ?? publishTarget.parent };
+}
+
+/**
+ * Edit-specific fail-closed classification of the exact current bytes, using
+ * the same pure parser and `legacyProvider: "refuse"` contract as
+ * `readConfigEditSnapshot`. Whatever a caller supplied as `expected`, the edit
+ * CAS never overwrites corrupt, non-object, future, legacy-without-provider,
+ * or non-persistable storage; tolerant `saveConfig()` semantics are untouched.
+ */
+function refuseUnsafeEditTarget(current: ConfigFileSnapshot): void {
+  if (current.kind === "absent") return;
+  const parsed = parseStoredConfig(current.raw, {}, { legacyProvider: "refuse" });
+  if (parsed.outcome !== "config" || isProviderStateIssue(parsed.config.providerSetup)) {
+    throw new ConfigEditUnavailableError();
+  }
 }
 
 /** Exact readback proof inside the exact parent; never throws and never exposes the underlying path or bytes. */
@@ -858,12 +867,6 @@ export interface AtomicCreateOptions {
    * parent identity revalidates it here instead of touching the pathname.
    */
   readonly prepareDirectory?: () => Promise<void>;
-  /**
-   * Runs immediately before the post-link pathname `chmod`; a rejection skips
-   * that chmod and surfaces as the post-publication brand, so a replacement
-   * that slipped in after the link is never chmod-ed.
-   */
-  readonly beforeSecureMode?: () => Promise<void>;
 }
 
 /**
@@ -873,6 +876,15 @@ export interface AtomicCreateOptions {
  * `EEXIST` and leaves those foreign bytes untouched. Ordinary rejection proves
  * link did not complete; only the non-forgeable post-publication brand permits
  * an exact-readback reconciliation.
+ *
+ * The temp file is created exclusively, written and secured to 0600 on its own
+ * handle before the link, so the published link inherits the secure mode and
+ * no pathname chmod ever follows publication. Its dev/inode identity is bound
+ * at creation: the temp pathname is revalidated against it immediately before
+ * the link, and cleanup unlinks the pathname only while it still resolves to
+ * that identity — a foreign entry at the temp pathname is never removed (Node
+ * has no unlinkat, so the original temp may then remain, unpublished, wherever
+ * its parent was moved).
  */
 export async function writeFileAtomicCreateSecure(
   path: string,
@@ -884,17 +896,26 @@ export async function writeFileAtomicCreateSecure(
 ): Promise<void> {
   await (options.prepareDirectory ?? (() => ensureSecureDirectory(dirname(path))))();
   const temporary = `${path}.${randomUUID()}.tmp`;
+  let handle: Awaited<ReturnType<typeof open>> | null = null;
+  let identity: FileIdentity | null = null;
   let published = false;
   try {
-    await writeFile(temporary, content, {
-      encoding: "utf8",
-      mode: SECURE_FILE_MODE,
-      flag: "wx",
-    });
+    handle = await open(
+      temporary,
+      fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_NOFOLLOW,
+      SECURE_FILE_MODE,
+    );
+    const created = await handle.stat({ bigint: true });
+    identity = Object.freeze({ dev: created.dev, ino: created.ino });
+    await handle.writeFile(content, "utf8");
+    await handle.chmod(SECURE_FILE_MODE);
     await beforePublish?.();
     const finalFenceResult: unknown = beforeLink?.();
     if (finalFenceResult !== undefined) {
       throw new Error("Atomic create beforeLink fence must be synchronous.");
+    }
+    if (!(await pathHasFileIdentity(temporary, identity))) {
+      throw new Error("Atomic create temp identity changed before publication.");
     }
     await link(temporary, path);
     published = true;
@@ -902,20 +923,40 @@ export async function writeFileAtomicCreateSecure(
     if (postPublishResult !== undefined) {
       throw new Error("Atomic create afterPublish hook must be synchronous.");
     }
-    await unlink(temporary);
+    await unlinkBoundTemporary(temporary, identity);
   } catch (error) {
-    await unlink(temporary).catch(() => {});
+    if (identity !== null) {
+      await unlinkBoundTemporary(temporary, identity).catch(() => {});
+    }
     if (published) {
       throw atomicFilePostPublicationError("create", error);
     }
     throw error;
+  } finally {
+    await handle?.close().catch(() => undefined);
   }
+}
+
+interface FileIdentity {
+  readonly dev: bigint;
+  readonly ino: bigint;
+}
+
+/** `true` only while `path` is a regular file (not a symlink) with exactly this identity. */
+async function pathHasFileIdentity(path: string, identity: FileIdentity): Promise<boolean> {
   try {
-    await options.beforeSecureMode?.();
-    await chmod(path, SECURE_FILE_MODE);
-  } catch (error) {
-    throw atomicFilePostPublicationError("create", error);
+    const current = await lstat(path, { bigint: true });
+    return current.isFile() && !current.isSymbolicLink()
+      && current.dev === identity.dev && current.ino === identity.ino;
+  } catch {
+    return false;
   }
+}
+
+/** Identity-bound cleanup: never unlinks a pathname that no longer resolves to the bound temp file. */
+async function unlinkBoundTemporary(temporary: string, identity: FileIdentity): Promise<void> {
+  if (!(await pathHasFileIdentity(temporary, identity))) return;
+  await unlink(temporary);
 }
 
 export async function migrateAppHome(
