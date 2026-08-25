@@ -488,11 +488,14 @@ test("production Settings session adapter dispatches every enabled external fami
       { id: "vendor/audio", name: "Audio", description: "audio", contextLength: 128_000, promptPrice: 0, completionPrice: 0, supportedParameters: [], inputModalities: ["text", "audio"], outputModalities: ["text"] },
     ];
     const providerIntents: string[] = [];
+    const providerStatePath = join(appHome, "synthetic-provider-state.json");
+    let providerConnected = false;
+    const providerStatus = () => [{ backendId: "openrouter", displayName: "OpenRouter", availability: "connectable", configuration: providerConnected ? "enabled" : "disabled", maturity: "stable", billingRealm: "openrouter-payg", headline: providerConnected ? "synthetic connected" : "synthetic ready", health: { credential: "valid", connectivity: providerConnected ? "connected" : "unknown", spend: "available", runtime: providerConnected ? "ready" : "not-applicable" }, isDefault: true, allowedActions: ["connect"], selectedModel: null }];
     let mainAuthorityCalls = 0;
     const intents: Array<{ kind: "select-item"; itemId: string } | { kind: "activate" } | { kind: "back" }> = [];
     const activate = (itemId: string) => intents.push({ kind: "select-item", itemId }, { kind: "activate" });
     activate("provider-action:openrouter:connect");
-    activate("main-model"); // cancellation must preserve the real transaction boundary.
+    activate("main-model"); // opaque provider publication requires the real coordinator.
     activate("compressor-model");
     activate(`approval-forget:${remembered[0]!.id}`);
     activate("approval-forget-all");
@@ -500,7 +503,7 @@ test("production Settings session adapter dispatches every enabled external fami
     activate("panel-models");
     activate("transcription-model");
     intents.push({ kind: "back" });
-    const livePublishes: string[] = [];
+    let appearancePublishes = 0;
     const surface = {
       begin() {},
       async nextIntent() {
@@ -516,7 +519,7 @@ test("production Settings session adapter dispatches every enabled external fami
         return { kind: "value" as const, value: true };
       },
       end() {},
-      applyAppearance() { livePublishes.push("live"); },
+      applyAppearance() { appearancePublishes += 1; },
       async confirmAction() { return { accepted: true }; },
       async pickChoice() { return null; }, async readSecret() { return null; }, async pickModel() { return null; },
       addMessage() {}, showSettingsNotice() {}, restoreSettings() {},
@@ -526,12 +529,14 @@ test("production Settings session adapter dispatches every enabled external fami
       openRouter: new OpenRouterService(undefined),
       providerCommands: { async execute(intent: { kind: string }) {
         providerIntents.push(intent.kind);
+        providerConnected = true;
+        await writeFile(providerStatePath, JSON.stringify({ connected: true }), "utf8");
         return { kind: "changed", operation: intent.kind, backendId: "openrouter" };
       } },
       providerRuntime: {
         activity: () => ({ runActive: false, activationHeld: false }), currentSessionRoute: () => structuredClone(route),
         readCachedSettingsRoute: () => ({ backendId: "openrouter" as const, providerLabel: "OpenRouter", requestedModelId: route.requestedModelId, canonicalModelId: route.canonicalModelId!, modelLabel: "Main", billingRealm: "openrouter-payg" as const }),
-        readCachedProviderStatus: () => [{ backendId: "openrouter", displayName: "OpenRouter", availability: "connectable", configuration: "enabled", maturity: "stable", billingRealm: "openrouter-payg", headline: "synthetic ready", health: { credential: "valid", connectivity: "connected", spend: "available", runtime: "ready" }, isDefault: true, allowedActions: ["connect"], selectedModel: null }],
+        readCachedProviderStatus: providerStatus,
         readCachedSettingsModels: () => models,
         async runSettingsConfigMutation<T>(task: () => Promise<T>) { return task(); },
         prepareSettingsModelPublication() { mainAuthorityCalls += 1; return { publish() {} }; },
@@ -545,13 +550,18 @@ test("production Settings session adapter dispatches every enabled external fami
 
     const stored = JSON.parse(await readFile(configPath, "utf8")) as typeof config;
     assert.deepEqual(providerIntents, ["connect"], "production provider adapter delegation");
+    assert.deepEqual(JSON.parse(await readFile(providerStatePath, "utf8")), { connected: true }, "provider connect durably updates its lower-level state");
+    assert.equal(providerStatus()[0].headline, "synthetic connected", "provider view refreshes from the durable mutation");
     assert.equal(mainAuthorityCalls, 0, "cancelled main-model editor must not enter transaction authority");
     assert.equal(stored.compressorModel, "vendor/compressor", "compressor external action reaches durable config");
     assert.deepEqual(stored.panelModels, ["vendor/main", "vendor/panel"], "panel external action reaches durable config");
     assert.equal(stored.transcriptionModel, "vendor/audio", "transcription external action reaches durable config");
     assert.deepEqual(stored.verify.commands, ["npm run check", "npm run test", "npm run build"], "verify suggestion confirms then persists");
     assert.deepEqual(rules.list(workspace), [], "approval forget and forget-all reach the real rule store");
-    assert.ok(livePublishes.length >= 3, "durable external model config changes publish to the live consumer");
+    assert.equal(config.compressorModel, "vendor/compressor", "compressor live consumer observes its own config field");
+    assert.deepEqual(config.panelModels, ["vendor/main", "vendor/panel"], "panel live consumer observes its own config field");
+    assert.equal(config.transcriptionModel, "vendor/audio", "transcription live consumer observes its own config field");
+    assert.equal(appearancePublishes, 0, "external model rows must not use appearance publication as a live-consumer proxy");
   } finally {
     await rm(root, { recursive: true, force: true });
   }
