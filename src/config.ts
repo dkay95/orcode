@@ -36,20 +36,26 @@ import {
   validateProviderSetupState,
   type ProviderSetupState,
 } from "./provider-state.js";
-import { withConfigWriteLock } from "./config-write-lock.js";
+import {
+  withConfigWriteLock,
+  type ConfigWriteOwnership,
+} from "./config-write-lock.js";
 import {
   assertConfigFileSnapshot,
   readConfigFileSnapshot,
+  sameConfigFileSnapshot,
   type ConfigFileSnapshot,
 } from "./config-file.js";
 
 export {
   withConfigWriteLock,
   withConfigWriteLocks,
+  type ConfigWriteOwnership,
 } from "./config-write-lock.js";
 export {
   assertConfigFileSnapshot,
   readConfigFileSnapshot,
+  sameConfigFileSnapshot,
   type ConfigFileSnapshot,
 } from "./config-file.js";
 
@@ -142,6 +148,22 @@ export interface VerifyConfig {
   maxRepairRounds: number;
 }
 
+export const GLYPH_MODES = ["auto", "unicode", "ascii"] as const;
+export type GlyphMode = (typeof GLYPH_MODES)[number];
+
+/** Presentation only: never affects stored chats, routes, or provider identity. */
+export interface AppearanceConfig {
+  showLargeLogo: boolean;
+  showHeaderMark: boolean;
+  glyphMode: GlyphMode;
+}
+
+export const DEFAULT_APPEARANCE: AppearanceConfig = {
+  showLargeLogo: true,
+  showHeaderMark: true,
+  glyphMode: "auto",
+};
+
 /**
  * The budget lives outside `OrcodeConfig` (types.ts) so the shared type
  * stays untouched; every consumer of `OrcodeConfig` keeps working and only
@@ -172,6 +194,8 @@ export interface OrcodeConfigWithBudget extends OrcodeConfig {
   browserTimeoutSeconds: number;
   /** Versioned, non-secret backend/account routing state. Independent of `provider`. */
   providerSetup: ProviderSetupState;
+  /** Additive schema-v1 field; missing or malformed parts fall back per field. */
+  appearance: AppearanceConfig;
 }
 
 /** Anything that may be handed to `validateConfig`/`saveConfig`. */
@@ -188,6 +212,7 @@ export type ConfigInput = OrcodeConfig & {
   browserPath?: unknown;
   browserTimeoutSeconds?: unknown;
   providerSetup?: unknown;
+  appearance?: unknown;
 };
 
 export const DEFAULT_BUDGET: BudgetConfig = {
@@ -235,6 +260,7 @@ export const DEFAULT_CONFIG: OrcodeConfigWithBudget = {
   browserPath: "",
   browserTimeoutSeconds: 30,
   providerSetup: createNeverConfiguredProviderState(),
+  appearance: { ...DEFAULT_APPEARANCE },
 };
 
 export interface ConfigLoadOutcome {
@@ -272,36 +298,67 @@ export async function loadConfigDetailed(
     };
   }
 
+  const parsed = parseStoredConfig(raw, dependencies);
+  switch (parsed.outcome) {
+    case "config":
+      return { config: parsed.config, warning: null, source: "file" };
+    case "corrupt":
+      return {
+        config: defaults(),
+        warning: `Konfiguration ${path} ist beschädigt (${parsed.detail}). orcode startet mit den Standardwerten; die defekte Datei wird beim nächsten Speichern als ${path}.beschaedigt gesichert.`,
+        source: "defaults",
+      };
+    case "not-object":
+      return {
+        config: defaults(),
+        warning: `Konfiguration ${path} enthält kein Objekt. orcode startet mit den Standardwerten; die defekte Datei wird beim nächsten Speichern als ${path}.beschaedigt gesichert.`,
+        source: "defaults",
+      };
+    case "future-version":
+      return {
+        config: defaults(),
+        warning: `Konfiguration ${path} hat die zukünftige schemaVersion ${parsed.version} und wurde nicht überschrieben.`,
+        source: "defaults",
+      };
+    case "invalid":
+      return {
+        config: defaults(),
+        warning: `Konfiguration ${path} konnte nicht ausgewertet werden (${parsed.detail}). orcode startet mit den Standardwerten.`,
+        source: "defaults",
+      };
+  }
+}
+
+type StoredConfigParse =
+  | { readonly outcome: "config"; readonly config: OrcodeConfigWithBudget }
+  | { readonly outcome: "corrupt"; readonly detail: string }
+  | { readonly outcome: "not-object" }
+  | { readonly outcome: "future-version"; readonly version: number }
+  | { readonly outcome: "invalid"; readonly detail: string };
+
+/**
+ * One pure parser for exact stored bytes, shared by the tolerant startup load
+ * and the fail-closed edit snapshot so neither reads the file twice.
+ */
+function parseStoredConfig(
+  raw: string,
+  dependencies: ConfigLoadDependencies,
+): StoredConfigParse {
   let parsed: unknown;
   try {
     parsed = JSON.parse(raw);
   } catch (error) {
-    return {
-      config: defaults(),
-      warning: `Konfiguration ${path} ist beschädigt (${errorMessage(error)}). orcode startet mit den Standardwerten; die defekte Datei wird beim nächsten Speichern als ${path}.beschaedigt gesichert.`,
-      source: "defaults",
-    };
+    return { outcome: "corrupt", detail: errorMessage(error) };
   }
-
   if (!isRecord(parsed)) {
-    return {
-      config: defaults(),
-      warning: `Konfiguration ${path} enthält kein Objekt. orcode startet mit den Standardwerten; die defekte Datei wird beim nächsten Speichern als ${path}.beschaedigt gesichert.`,
-      source: "defaults",
-    };
+    return { outcome: "not-object" };
   }
-
   if (
     typeof parsed.schemaVersion === "number" &&
     parsed.schemaVersion > CONFIG_SCHEMA_VERSION
   ) {
-    return {
-      config: defaults(),
-      warning: `Konfiguration ${path} hat die zukünftige schemaVersion ${parsed.schemaVersion} und wurde nicht überschrieben.`,
-      source: "defaults",
-    };
+    return { outcome: "future-version", version: parsed.schemaVersion };
   }
-
   try {
     const providerSetup = "providerSetup" in parsed
       ? validateProviderSetupState(parsed.providerSetup)
@@ -309,20 +366,15 @@ export async function loadConfigDetailed(
         connectionId: (dependencies.randomUUID ?? randomUUID)(),
       });
     return {
+      outcome: "config",
       config: validateConfig({
         ...DEFAULT_CONFIG,
         ...(parsed as Partial<OrcodeConfigWithBudget>),
         providerSetup,
       }),
-      warning: null,
-      source: "file",
     };
   } catch (error) {
-    return {
-      config: defaults(),
-      warning: `Konfiguration ${path} konnte nicht ausgewertet werden (${errorMessage(error)}). orcode startet mit den Standardwerten.`,
-      source: "defaults",
-    };
+    return { outcome: "invalid", detail: errorMessage(error) };
   }
 }
 
@@ -389,6 +441,162 @@ export async function saveConfig(
     if (writeError !== undefined) throw writeError;
     throw new Error("Config publication could not be verified.");
   });
+}
+
+/** The exact stored state one editor was opened on; `file` is the raw-byte CAS token. */
+export interface ConfigEditSnapshot {
+  readonly config: OrcodeConfigWithBudget;
+  readonly file: ConfigFileSnapshot;
+}
+
+/** The target no longer matches the edit snapshot; the caller must re-read and re-select. */
+export class ConfigEditConflictError extends Error {
+  readonly code = "config-edit-conflict" as const;
+
+  constructor() {
+    super("Config target changed since the edit snapshot was taken.");
+    this.name = "ConfigEditConflictError";
+  }
+}
+
+/** The stored config is corrupt, unreadable, future, or non-persistable and stays read-only. */
+export class ConfigEditUnavailableError extends Error {
+  readonly code = "config-edit-unavailable" as const;
+
+  constructor() {
+    super("Config cannot be edited in its current stored state.");
+    this.name = "ConfigEditUnavailableError";
+  }
+}
+
+/**
+ * Fail-closed editor load: parses exactly the bytes captured in `file`. Never
+ * writes, backs up, migrates, or normalizes; unlike `loadConfigDetailed` an
+ * unsafe stored state throws instead of yielding tolerant defaults.
+ */
+export async function readConfigEditSnapshot(
+  path = CONFIG_PATH,
+): Promise<ConfigEditSnapshot> {
+  let file: ConfigFileSnapshot;
+  try {
+    file = await readConfigFileSnapshot(path);
+  } catch {
+    throw new ConfigEditUnavailableError();
+  }
+  if (file.kind === "absent") {
+    return freezeEditSnapshot(defaults(), file);
+  }
+  const parsed = parseStoredConfig(file.raw, {});
+  if (parsed.outcome !== "config" || isProviderStateIssue(parsed.config.providerSetup)) {
+    throw new ConfigEditUnavailableError();
+  }
+  return freezeEditSnapshot(parsed.config, file);
+}
+
+/** Validates the complete candidate, acquires the config writer lock, then CAS-publishes. */
+export async function saveConfigEdit(
+  expected: ConfigEditSnapshot,
+  candidate: ConfigInput,
+  path = CONFIG_PATH,
+): Promise<OrcodeConfigWithBudget> {
+  const validated = validateConfig(candidate);
+  requirePersistableProviderState(validated.providerSetup);
+  return withConfigWriteLock(path, (ownership) =>
+    saveConfigEditUnderLock(ownership, expected, candidate));
+}
+
+/**
+ * Exact compare-and-swap under an already held writer ownership. The current
+ * target must equal `expected.file` in kind, parent identity, file identity
+ * and raw bytes; an expected-absent target is published create-only so a
+ * concurrent creator is never replaced. Never acquires a nested lock and never
+ * mutates caller-owned objects.
+ */
+export async function saveConfigEditUnderLock(
+  ownership: ConfigWriteOwnership,
+  expected: ConfigEditSnapshot,
+  candidate: ConfigInput,
+): Promise<OrcodeConfigWithBudget> {
+  const validated = validateConfig(candidate);
+  requirePersistableProviderState(validated.providerSetup);
+  const path = ownership.canonicalPath;
+  await ownership.assertHeld();
+  const current = await readExactEditTarget(path);
+  await ownership.assertHeld();
+  if (!sameConfigFileSnapshot(current, expected.file)) {
+    throw new ConfigEditConflictError();
+  }
+  refuseUnsafeStoredConfig(path, current);
+  const content = `${JSON.stringify(validated, null, 2)}\n`;
+  let writeError: unknown;
+  try {
+    if (expected.file.kind === "absent") {
+      await ensureSecureDirectory(dirname(path));
+      await ownership.assertHeld();
+      const publishTarget = await readExactEditTarget(path);
+      if (
+        publishTarget.kind !== "absent"
+        || (expected.file.parent.kind === "directory"
+          && !sameConfigFileSnapshot(publishTarget, expected.file))
+      ) {
+        throw new ConfigEditConflictError();
+      }
+      await ownership.assertHeld();
+      await writeFileAtomicCreateSecure(path, content, async () => {
+        await ownership.assertHeld();
+        await assertExactEditTarget(path, publishTarget);
+        await ownership.assertHeld();
+      });
+    } else {
+      await writeFileAtomicSecure(path, content, async () => {
+        await ownership.assertHeld();
+        await assertExactEditTarget(path, expected.file);
+        await ownership.assertHeld();
+      });
+    }
+  } catch (error) {
+    if (hasCode(error, "EEXIST")) throw new ConfigEditConflictError();
+    if (!isAtomicFilePostPublicationError(error)) throw error;
+    writeError = error;
+  }
+  await ownership.assertHeld();
+  let readback: string | null = null;
+  try {
+    const snapshot = await readConfigFileSnapshot(path);
+    readback = snapshot.kind === "file" ? snapshot.raw : null;
+  } catch {
+    // Classified below without exposing the underlying path or bytes.
+  }
+  await ownership.assertHeld();
+  if (readback === content) return Object.freeze(validated);
+  if (writeError !== undefined) throw writeError;
+  throw new Error("Config publication could not be verified.");
+}
+
+function freezeEditSnapshot(
+  config: OrcodeConfigWithBudget,
+  file: ConfigFileSnapshot,
+): ConfigEditSnapshot {
+  return Object.freeze({ config: Object.freeze(config), file });
+}
+
+async function readExactEditTarget(path: string): Promise<ConfigFileSnapshot> {
+  try {
+    return await readConfigFileSnapshot(path);
+  } catch {
+    throw new ConfigEditConflictError();
+  }
+}
+
+/** Final raw-byte fence immediately before publication. */
+async function assertExactEditTarget(
+  path: string,
+  expected: ConfigFileSnapshot,
+): Promise<void> {
+  const current = await readExactEditTarget(path);
+  if (!sameConfigFileSnapshot(current, expected)) {
+    throw new ConfigEditConflictError();
+  }
 }
 
 /**
@@ -588,6 +796,25 @@ export function validateConfig(value: ConfigInput): OrcodeConfigWithBudget {
       DEFAULT_CONFIG.browserTimeoutSeconds,
     ),
     providerSetup: normalizeProviderSetupInput(value.providerSetup),
+    appearance: validateAppearance(value.appearance),
+  };
+}
+
+/** Each field falls back on its own default; a malformed sibling never erases a valid one. */
+export function validateAppearance(value: unknown): AppearanceConfig {
+  if (!isRecord(value)) {
+    return { ...DEFAULT_APPEARANCE };
+  }
+  return {
+    showLargeLogo: typeof value.showLargeLogo === "boolean"
+      ? value.showLargeLogo
+      : DEFAULT_APPEARANCE.showLargeLogo,
+    showHeaderMark: typeof value.showHeaderMark === "boolean"
+      ? value.showHeaderMark
+      : DEFAULT_APPEARANCE.showHeaderMark,
+    glyphMode: includes(GLYPH_MODES, value.glyphMode)
+      ? value.glyphMode
+      : DEFAULT_APPEARANCE.glyphMode,
   };
 }
 
@@ -831,6 +1058,7 @@ function defaults(): OrcodeConfigWithBudget {
     verify: { ...DEFAULT_VERIFY },
     panelModels: [],
     providerSetup: createNeverConfiguredProviderState(),
+    appearance: { ...DEFAULT_APPEARANCE },
   };
 }
 

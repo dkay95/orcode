@@ -25,7 +25,13 @@ import {
   serializeConversationState,
 } from "@openrouter/agent";
 import { initializeStartupStorage } from "../src/cli.js";
-import { migrateAppHome, withConfigWriteLock } from "../src/config.js";
+import {
+  DEFAULT_APPEARANCE,
+  loadConfigDetailed,
+  migrateAppHome,
+  readConfigEditSnapshot,
+  withConfigWriteLock,
+} from "../src/config.js";
 import { CredentialStore } from "../src/credentials.js";
 import { PrivateStore } from "../src/private-store.js";
 import {
@@ -2136,4 +2142,62 @@ test("future and corrupt provider homes remain byte-identical and stop before se
       }
     });
   }
+});
+
+test("current v1 config without appearance keeps additive defaults through migrateAppHome while explicit and legacy values survive", async () => {
+  const providerSetup = {
+    schemaVersion: 2,
+    revision: 0,
+    lifecycle: "never-configured",
+    connections: [],
+    defaultRoute: null,
+    cross: { enabled: false, preferredLead: null, preferredChallenger: null },
+  };
+
+  const fastRoot = await mkdtemp(join(tmpdir(), "orcode-appearance-fast-path-"));
+  const fastTarget = join(fastRoot, ".orcode");
+  await mkdir(fastTarget, { recursive: true });
+  const fastBytes = `${JSON.stringify({ schemaVersion: 1, mainModel: "vendor/main", providerSetup }, null, 2)}\n`;
+  await writeFile(join(fastTarget, "config.json"), fastBytes);
+  const fastResult = await migrateAppHome(fastTarget, join(fastRoot, ".routercode"));
+  assert.equal(fastResult.status, "ready");
+  const fastStored = JSON.parse(await readFile(join(fastTarget, "config.json"), "utf8")) as Record<string, unknown>;
+  assert.equal(fastStored.schemaVersion, 1);
+  assert.equal(fastStored.mainModel, "vendor/main");
+  assert.equal("appearance" in fastStored, false);
+  const fastLoaded = await loadConfigDetailed(join(fastTarget, "config.json"));
+  assert.equal(fastLoaded.source, "file");
+  assert.equal(fastLoaded.warning, null);
+  assert.deepEqual(fastLoaded.config.appearance, DEFAULT_APPEARANCE);
+  assert.deepEqual((await readConfigEditSnapshot(join(fastTarget, "config.json"))).config.appearance, DEFAULT_APPEARANCE);
+
+  const explicitRoot = await mkdtemp(join(tmpdir(), "orcode-appearance-explicit-"));
+  const explicitTarget = join(explicitRoot, ".orcode");
+  await mkdir(explicitTarget, { recursive: true });
+  const explicitAppearance = { showLargeLogo: false, showHeaderMark: false, glyphMode: "ascii" };
+  await writeFile(
+    join(explicitTarget, "config.json"),
+    `${JSON.stringify({ schemaVersion: 1, mainModel: "vendor/main", appearance: explicitAppearance, providerSetup }, null, 2)}\n`,
+  );
+  const explicitResult = await migrateAppHome(explicitTarget, join(explicitRoot, ".routercode"));
+  assert.equal(explicitResult.status, "ready");
+  const explicitStored = JSON.parse(await readFile(join(explicitTarget, "config.json"), "utf8")) as { appearance: unknown };
+  assert.deepEqual(explicitStored.appearance, explicitAppearance);
+  assert.deepEqual((await loadConfigDetailed(join(explicitTarget, "config.json"))).config.appearance, explicitAppearance);
+
+  const legacyRoot = await mkdtemp(join(tmpdir(), "orcode-appearance-legacy-"));
+  const legacyHome = join(legacyRoot, ".routercode");
+  const legacyTarget = join(legacyRoot, ".orcode");
+  await seedHome(legacyHome, { model: "legacy/model" });
+  const legacyResult = await migrateAppHome(legacyTarget, legacyHome, { randomUUID: () => "appearance-legacy-id" });
+  assert.equal(legacyResult.status, "ready");
+  const legacyStored = JSON.parse(await readFile(join(legacyTarget, "config.json"), "utf8")) as {
+    schemaVersion: number;
+    mainModel: string;
+    appearance: unknown;
+  };
+  assert.equal(legacyStored.schemaVersion, 1);
+  assert.equal(legacyStored.mainModel, "legacy/model");
+  assert.deepEqual(legacyStored.appearance, DEFAULT_APPEARANCE);
+  assert.deepEqual((await loadConfigDetailed(join(legacyTarget, "config.json"))).config.appearance, DEFAULT_APPEARANCE);
 });

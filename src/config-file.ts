@@ -115,6 +115,34 @@ export async function assertConfigFileSnapshot(
   await assertParentSnapshot(dirname(path), snapshot.parent);
 }
 
+/**
+ * Exact raw-byte snapshot equality: absence with the same parent identity, or
+ * the same regular file (dev/inode/parent) carrying byte-identical content.
+ * Unlike `assertConfigFileSnapshot()` this also catches a same-inode edit.
+ */
+export function sameConfigFileSnapshot(
+  left: ConfigFileSnapshot,
+  right: ConfigFileSnapshot,
+): boolean {
+  if (!sameParentSnapshot(left.parent, right.parent)) return false;
+  if (left.kind === "absent" || right.kind === "absent") {
+    return left.kind === right.kind;
+  }
+  return left.dev === right.dev
+    && left.ino === right.ino
+    && left.raw === right.raw;
+}
+
+function sameParentSnapshot(
+  left: ConfigParentSnapshot,
+  right: ConfigParentSnapshot,
+): boolean {
+  if (left.kind === "absent" || right.kind === "absent") {
+    return left.kind === right.kind;
+  }
+  return left.dev === right.dev && left.ino === right.ino;
+}
+
 async function canonicalizeDirectory(directory: string): Promise<string> {
   let cursor = resolve(directory);
   const missing: string[] = [];
