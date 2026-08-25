@@ -461,6 +461,112 @@ test("Dashboard /settings dispatch keeps the active TerminalUi owner and restore
   }
 });
 
+async function withProductionSettingsConfigEdit(
+  itemId: "approval-mode" | "reasoning",
+  value: string,
+  verify: (fixture: {
+    readonly appHome: string;
+    readonly configPath: string;
+    readonly config: typeof DEFAULT_CONFIG;
+    readonly session: SessionStore;
+    readonly approvals: ApprovalManager;
+  }) => Promise<void>,
+): Promise<void> {
+  const root = await mkdtemp(join(tmpdir(), "orcode-settings-live-config-"));
+  try {
+    const workspace = join(root, "workspace");
+    const appHome = join(root, ".orcode");
+    const configPath = join(appHome, "config.json");
+    await mkdir(workspace, { recursive: true });
+    const config = structuredClone(DEFAULT_CONFIG);
+    const route: RouteIdentityV1 = {
+      version: 1,
+      backendId: "openrouter",
+      accountFingerprint: "acct_settings_live_config",
+      billingRealm: "openrouter-payg",
+      requestedModelId: config.mainModel,
+      canonicalModelId: config.mainModel,
+      resolutionState: "resolved",
+    };
+    await saveConfig(config, configPath);
+    const session = SessionStore.create(workspace, appHome, "Settings live config");
+    session.setPreferences(config.mainModel, { mode: "auto" }, route);
+    await session.save();
+    const rules = await RuleStore.load(appHome);
+    const approvals = new ApprovalManager("ask", { workspace, ruleStore: rules });
+    const intents: Array<
+      { kind: "select-item"; itemId: string }
+      | { kind: "activate" }
+      | { kind: "back" }
+    > = [{ kind: "select-item", itemId }, { kind: "activate" }, { kind: "back" }];
+    const surface = {
+      begin() {},
+      async nextIntent() { return intents.shift()!; },
+      async edit() { return { kind: "value" as const, value }; },
+      end() {},
+      applyAppearance() {},
+      async confirmAction() { return { accepted: true }; },
+      async pickChoice() { return null; }, async readSecret() { return null; }, async pickModel() { return null; },
+      addMessage() {}, showSettingsNotice() {}, restoreSettings() {},
+    } as unknown as TerminalUi;
+    const context = {
+      executionMode: "local-interactive-owner",
+      workspace,
+      configPath,
+      config,
+      approvals,
+      session,
+      ruleStore: rules,
+      openRouter: new OpenRouterService(undefined),
+      providerCommands: { async execute() { throw new Error("unused provider command"); } },
+      providerRuntime: {
+        activity: () => ({ runActive: false, activationHeld: false }),
+        currentSessionRoute: () => structuredClone(route),
+        readCachedSettingsRoute: () => ({
+          backendId: "openrouter" as const,
+          providerLabel: "OpenRouter",
+          requestedModelId: route.requestedModelId,
+          canonicalModelId: route.canonicalModelId!,
+          modelLabel: route.requestedModelId,
+          billingRealm: "openrouter-payg" as const,
+        }),
+        readCachedProviderStatus: () => [],
+        readCachedSettingsModels: () => [{
+          id: route.requestedModelId,
+          name: route.requestedModelId,
+          description: "current main model",
+          contextLength: 128_000,
+          promptPrice: 0,
+          completionPrice: 0,
+          supportedParameters: ["tools", "reasoning"],
+          inputModalities: ["text"],
+          outputModalities: ["text"],
+        }],
+        async runSettingsConfigMutation<T>(task: () => Promise<T>) { return task(); },
+      },
+      localRuntime: { guard: { async resolvePath(path: string) { return join(workspace, path); } } },
+    } as never;
+
+    await createSettingsSession(context, surface, false).open();
+    await verify({ appHome, configPath, config, session, approvals });
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+}
+
+test("production Settings approval save publishes the exact live ApprovalManager after durable config", async () => {
+  await withProductionSettingsConfigEdit("approval-mode", "read-only", async ({
+    configPath,
+    config,
+    approvals,
+  }) => {
+    const stored = JSON.parse(await readFile(configPath, "utf8")) as typeof config;
+    assert.equal(stored.approvalMode, "read-only", "approval mode must be durable before Settings returns");
+    assert.equal(config.approvalMode, "read-only", "live config must match the durable approval mode");
+    assert.equal(approvals.mode, "read-only", "subsequent tool calls must use the exact updated ApprovalManager");
+  });
+});
+
 test("production Settings session adapter dispatches every enabled external family through the controller", async () => {
   const root = await mkdtemp(join(tmpdir(), "orcode-settings-production-adapter-"));
   try {

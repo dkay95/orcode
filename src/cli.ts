@@ -5518,10 +5518,21 @@ export function createSettingsSession(
           },
           liveConfig: {
             prepare(next) {
+              const previousConfig = structuredClone(context.config);
+              const previousApprovalMode = context.approvals.mode;
+              const appearanceChanged = JSON.stringify(previousConfig.appearance)
+                !== JSON.stringify(next.appearance);
               return {
                 publish: () => {
-                  Object.assign(context.config, next);
-                  surface.applyAppearance(next.appearance);
+                  try {
+                    if (appearanceChanged) surface.applyAppearance(next.appearance);
+                    Object.assign(context.config, next);
+                    context.approvals.mode = next.approvalMode;
+                  } catch (error) {
+                    Object.assign(context.config, previousConfig);
+                    context.approvals.mode = previousApprovalMode;
+                    throw error;
+                  }
                 },
               };
             },
