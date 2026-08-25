@@ -8,7 +8,6 @@ import test from "node:test";
 import {
   ConfigEditConflictError,
   ConfigEditUnavailableError,
-  ConfigEditUnverifiedError,
   consumeConfigWarning,
   DEFAULT_APPEARANCE,
   DEFAULT_CONFIG,
@@ -1000,6 +999,13 @@ async function pendingTemporaryFiles(path: string): Promise<string[]> {
   return (await readdir(dirname(path))).filter((name) => name.endsWith(".tmp"));
 }
 
+/** Structural check so the regression links against sources that predate the typed error. */
+function isConfigEditUnverified(error: unknown): error is Error & { readonly code: "config-edit-unverified" } {
+  return error instanceof Error
+    && error.name === "ConfigEditUnverifiedError"
+    && (error as { code?: unknown }).code === "config-edit-unverified";
+}
+
 test("validateConfig and DEFAULT_CONFIG carry the additive appearance defaults", () => {
   assert.deepEqual(DEFAULT_APPEARANCE, {
     showLargeLogo: true,
@@ -1690,7 +1696,7 @@ test("post-publication ownership loss adopts a confirmed commit and an unverifia
     secondCandidate,
   ).catch((reason: unknown) => reason));
   assert.equal(replaced, true);
-  assert.ok(unverified instanceof ConfigEditUnverifiedError);
+  assert.ok(isConfigEditUnverified(unverified), String(unverified));
   assert.equal(unverified.code, "config-edit-unverified");
   assert.equal(unverified instanceof ConfigEditConflictError, false);
   assert.notEqual(unverified, fenceReason);
@@ -1722,7 +1728,7 @@ test("post-publication ownership loss adopts a confirmed commit and an unverifia
     thirdCandidate,
   ).catch((reason: unknown) => reason));
   assert.equal(broken, true);
-  assert.ok(unreadable instanceof ConfigEditUnverifiedError);
+  assert.ok(isConfigEditUnverified(unreadable), String(unreadable));
   assert.equal(unreadable.code, "config-edit-unverified");
   assert.equal(await readFile(`${path}.published`, "utf8"), bytesOf(thirdCandidate));
   const afterwards = await readConfigEditSnapshot(path).catch((reason: unknown) => reason);
@@ -1822,4 +1828,243 @@ test("edit snapshots and saved configs are deeply frozen while caller-owned obje
   const live = structuredClone(saved);
   live.appearance.glyphMode = "auto";
   assert.equal(saved.appearance.glyphMode, "ascii");
+});
+
+test("saveConfigEdit adopts an exactly confirmed commit or stays typed-unverified when the outer lock release fails, and keeps earlier errors verbatim", async () => {
+  const { PrivateStore } = await import("../src/private-store.js");
+  const path = await configPath("edit-release-failure");
+  await saveConfig({ ...DEFAULT_CONFIG, mainModel: "vendor/old" }, path);
+  const bytesOf = (candidate: ConfigInput): string => `${JSON.stringify(validateConfig(candidate), null, 2)}\n`;
+  const releaseReason = new Error("fixed release verification failure");
+  const originalRelease = PrivateStore.prototype.releaseDirectoryClaim;
+  const originalAssert = PrivateStore.prototype.assertDirectoryClaim;
+  let releases = 0;
+  let foreignPlant: (() => Promise<void>) | null = null;
+  PrivateStore.prototype.releaseDirectoryClaim = async function (this: InstanceType<typeof PrivateStore>, ...args) {
+    await originalRelease.apply(this, args);
+    releases += 1;
+    throw releaseReason;
+  };
+  PrivateStore.prototype.assertDirectoryClaim = async function (this: InstanceType<typeof PrivateStore>, ...args) {
+    await originalAssert.apply(this, args);
+    await foreignPlant?.();
+  };
+  try {
+    // Control: the bare lock surfaces the release failure, so the seam is real.
+    const control = await withConfigWriteLock(path, async () => "done").catch((reason: unknown) => reason);
+    assert.match(String(control), /release could not be verified/);
+    assert.equal(releases, 1);
+
+    // Durable and exactly confirmed, then the outer release fails: adopted, never the raw release error.
+    const expected = await readConfigEditSnapshot(path);
+    const candidate = { ...expected.config, mainModel: "vendor/new" };
+    const saved = await saveConfigEdit(expected, candidate, path);
+    assert.deepEqual(saved, validateConfig(candidate));
+    assert.equal(Object.isFrozen(saved), true);
+    assert.equal(Object.isFrozen(saved.appearance), true);
+    assert.equal(await readFile(path, "utf8"), bytesOf(candidate));
+    assert.deepEqual(await readdir(dirname(path)), ["config.json"]);
+    assert.equal(releases, 2);
+
+    // Pre-publication failure with the same failing release: the conflict identity is preserved.
+    const stale = await saveConfigEdit(expected, { ...candidate, mainModel: "vendor/stale" }, path)
+      .catch((reason: unknown) => reason);
+    assert.ok(stale instanceof ConfigEditConflictError);
+    assert.equal(await readFile(path, "utf8"), bytesOf(candidate));
+    assert.equal(releases, 3);
+
+    // Pre-task failure (nested ownership) is neither adopted nor reclassified.
+    let nested: unknown;
+    await withConfigWriteLock(path, async () => {
+      nested = await saveConfigEdit(expected, candidate, path).catch((reason: unknown) => reason);
+    }).catch(() => undefined);
+    assert.match(String(nested), /Nested config writer ownership/);
+    assert.equal(isConfigEditUnverified(nested), false);
+
+    // Pre-acquisition failure (symlinked parent) surfaces verbatim and writes nothing.
+    const linkRoot = await mkdtemp(join(tmpdir(), "routercode-edit-release-link-"));
+    const linkDir = join(linkRoot, "linked");
+    await symlink(dirname(path), linkDir);
+    const before = await readFile(path, "utf8");
+    const aliased = await saveConfigEdit(await readConfigEditSnapshot(path), { ...candidate, mainModel: "vendor/aliased" }, join(linkDir, "config.json"))
+      .catch((reason: unknown) => reason);
+    assert.match(String(aliased), /real directory|could not be verified/);
+    assert.equal(isConfigEditUnverified(aliased), false);
+    assert.equal(aliased instanceof ConfigEditConflictError, false);
+    assert.equal(await readFile(path, "utf8"), before);
+
+    // Post-publication foreign replacement plus failing release: typed unverified, never the raw release error.
+    const second = await readConfigEditSnapshot(path);
+    const secondCandidate = { ...second.config, mainModel: "vendor/second" };
+    const foreign = `${JSON.stringify({ ...DEFAULT_CONFIG, mainModel: "vendor/foreign-after-publish" }, null, 2)}\n`;
+    let planted = false;
+    foreignPlant = async () => {
+      if (planted || (await readFile(path, "utf8")) !== bytesOf(secondCandidate)) return;
+      planted = true;
+      await writeFile(path, foreign, "utf8");
+    };
+    const unverified = await saveConfigEdit(second, secondCandidate, path).catch((reason: unknown) => reason);
+    foreignPlant = null;
+    assert.equal(planted, true);
+    assert.ok(isConfigEditUnverified(unverified), String(unverified));
+    assert.notEqual(unverified, releaseReason);
+    assert.equal(await readFile(path, "utf8"), foreign);
+  } finally {
+    PrivateStore.prototype.releaseDirectoryClaim = originalRelease;
+    PrivateStore.prototype.assertDirectoryClaim = originalAssert;
+  }
+  const fresh = await readConfigEditSnapshot(path);
+  const after = await saveConfigEdit(fresh, { ...fresh.config, mainModel: "vendor/after-seam" }, path);
+  assert.equal(after.mainModel, "vendor/after-seam");
+});
+
+test("a replacement of the parent this writer just created is rejected at every later fence and is never chmod-ed or published into", async () => {
+  const scenarios = [
+    { name: "at the next fence after exclusive creation", replaceOnExistingCall: 1 },
+    { name: "after the publish snapshot before directory preparation", replaceOnExistingCall: 2 },
+  ] as const;
+  for (const scenario of scenarios) {
+    const root = dirname(await configPath(`edit-created-parent-${scenario.replaceOnExistingCall}`));
+    const parent = join(root, "nested");
+    const moved = join(root, "nested.moved");
+    const path = join(parent, "config.json");
+    const expected = await readConfigEditSnapshot(path);
+    assert.equal(expected.file.kind, "absent");
+    assert.equal(expected.file.parent.kind, "absent");
+
+    let existingCalls = 0;
+    let replaced = false;
+    const error = await withConfigWriteLock(path, (ownership) => saveConfigEditUnderLock(
+      {
+        canonicalPath: ownership.canonicalPath,
+        assertHeld: async () => {
+          await ownership.assertHeld();
+          if (replaced || !(await pathExists(parent))) return;
+          existingCalls += 1;
+          if (existingCalls === scenario.replaceOnExistingCall) {
+            replaced = true;
+            // The writer's own directory survives elsewhere, so the replacement has a distinct identity.
+            await rename(parent, moved);
+            await mkdir(parent);
+            await chmod(parent, 0o755);
+            await writeFile(join(parent, "sentinel"), "foreign-sentinel", { encoding: "utf8", mode: 0o644 });
+          }
+        },
+      },
+      expected,
+      { ...expected.config, mainModel: "vendor/stale-editor" },
+    ).catch((reason: unknown) => reason));
+    assert.equal(replaced, true, scenario.name);
+    assert.ok(error instanceof ConfigEditConflictError, `${scenario.name}: ${String(error)}`);
+    assert.doesNotMatch(String(error), /stale-editor|sentinel|nested/);
+    assert.deepEqual(await readdir(parent), ["sentinel"], scenario.name);
+    assert.equal(await readFile(join(parent, "sentinel"), "utf8"), "foreign-sentinel");
+    if (process.platform !== "win32") {
+      assert.equal((await stat(parent)).mode & 0o777, 0o755, scenario.name);
+      assert.equal((await stat(moved)).mode & 0o777, 0o700, scenario.name);
+    }
+    assert.deepEqual(await readdir(moved), [], scenario.name);
+    assert.equal(await pathExists(path), false, scenario.name);
+  }
+});
+
+test("saveConfigEdit re-reads exactly after a failed outer release and is typed-unverified when the confirmed bytes were superseded meanwhile", async () => {
+  const { PrivateStore } = await import("../src/private-store.js");
+  const path = await configPath("edit-release-supersede");
+  await saveConfig({ ...DEFAULT_CONFIG, mainModel: "vendor/old" }, path);
+  const expected = await readConfigEditSnapshot(path);
+  const candidate = { ...expected.config, mainModel: "vendor/new" };
+  const content = `${JSON.stringify(validateConfig(candidate), null, 2)}\n`;
+  const foreign = `${JSON.stringify({ ...DEFAULT_CONFIG, mainModel: "vendor/foreign-after-release" }, null, 2)}\n`;
+  const releaseReason = new Error("fixed release verification failure");
+  const originalRelease = PrivateStore.prototype.releaseDirectoryClaim;
+  let superseded = false;
+  PrivateStore.prototype.releaseDirectoryClaim = async function (this: InstanceType<typeof PrivateStore>, ...args) {
+    await originalRelease.apply(this, args);
+    // The real release completed; a foreign writer supersedes the confirmed bytes before the failure surfaces.
+    if (!superseded && (await readFile(path, "utf8")) === content) {
+      superseded = true;
+      await writeFile(path, foreign, "utf8");
+    }
+    throw releaseReason;
+  };
+  try {
+    const result = await saveConfigEdit(expected, candidate, path).catch((reason: unknown) => reason);
+    assert.equal(superseded, true);
+    assert.ok(isConfigEditUnverified(result), String(result));
+    assert.notEqual(result, releaseReason);
+    assert.equal(await readFile(path, "utf8"), foreign);
+    assert.deepEqual(await readdir(dirname(path)), ["config.json"]);
+  } finally {
+    PrivateStore.prototype.releaseDirectoryClaim = originalRelease;
+  }
+  const fresh = await readConfigEditSnapshot(path);
+  assert.equal(fresh.config.mainModel, "vendor/foreign-after-release");
+  const after = await saveConfigEdit(fresh, { ...fresh.config, mainModel: "vendor/after-supersede" }, path);
+  assert.equal(after.mainModel, "vendor/after-supersede");
+});
+
+test("the create-only edit path fences ownership and exact identity immediately before its post-link chmod and never chmod-s a replacement", async () => {
+  if (process.platform === "win32") return;
+  // The restrictive umask is applied only under the held lock (PrivateStore verifies exact modes while
+  // acquiring) and restored at the post-link fence, so the temp file is published as 0400 until chmod.
+  const previousUmask = process.umask();
+  let umaskApplied = false;
+  const restoreUmask = () => {
+    if (umaskApplied) {
+      umaskApplied = false;
+      process.umask(previousUmask);
+    }
+  };
+  try {
+    const root = dirname(await configPath("edit-pre-chmod-fence"));
+    const parent = join(root, "nested");
+    const moved = join(root, "nested.moved");
+    const path = join(parent, "config.json");
+    const expected = await readConfigEditSnapshot(path);
+    assert.equal(expected.file.kind, "absent");
+    assert.equal(expected.file.parent.kind, "absent");
+    const candidate = { ...expected.config, mainModel: "vendor/created" };
+    const content = `${JSON.stringify(validateConfig(candidate), null, 2)}\n`;
+    const foreign = `${JSON.stringify({ ...DEFAULT_CONFIG, mainModel: "vendor/foreign-replacement" }, null, 2)}\n`;
+
+    let observedMode: number | null = null;
+    let replaced = false;
+    const error = await withConfigWriteLock(path, (ownership) => saveConfigEditUnderLock(
+      {
+        canonicalPath: ownership.canonicalPath,
+        assertHeld: async () => {
+          await ownership.assertHeld();
+          if (replaced) return;
+          if (!umaskApplied) {
+            umaskApplied = true;
+            process.umask(0o277);
+          }
+          if ((await readFile(path, "utf8").catch(() => null)) !== content) return;
+          // First fence after the link: the published file must still carry its pre-chmod mode.
+          observedMode = (await stat(path)).mode & 0o777;
+          restoreUmask();
+          replaced = true;
+          await rename(parent, moved);
+          await mkdir(parent);
+          await chmod(parent, 0o755);
+          await writeFile(join(parent, "config.json"), foreign, { encoding: "utf8", mode: 0o644 });
+          await chmod(join(parent, "config.json"), 0o644);
+        },
+      },
+      expected,
+      candidate,
+    ).catch((reason: unknown) => reason));
+    assert.equal(replaced, true);
+    assert.equal(observedMode, 0o400, "the fence must run before the pathname chmod");
+    assert.ok(isConfigEditUnverified(error), String(error));
+    assert.equal((await stat(join(parent, "config.json"))).mode & 0o777, 0o644, "replacement never chmod-ed");
+    assert.equal(await readFile(join(parent, "config.json"), "utf8"), foreign);
+    assert.equal((await stat(parent)).mode & 0o777, 0o755);
+    assert.deepEqual(await readdir(moved), ["config.json"]);
+    assert.equal(await readFile(join(moved, "config.json"), "utf8"), content);
+    assert.equal((await stat(moved)).mode & 0o777, 0o700);
+  } finally {
+    restoreUmask();
+  }
 });

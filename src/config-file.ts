@@ -24,6 +24,12 @@ export type ConfigFileSnapshot =
     readonly parent: ConfigParentSnapshot & { readonly kind: "directory" };
   };
 
+/** Exact dev/inode identity of one real config parent directory. */
+export interface ConfigParentIdentity {
+  readonly dev: bigint;
+  readonly ino: bigint;
+}
+
 export interface ConfigLockTargetIdentity {
   readonly canonicalPath: string;
   readonly identityKey: string;
@@ -140,6 +146,61 @@ export function sameConfigFileSnapshot(
   return left.dev === right.dev
     && left.ino === right.ino
     && left.digest === right.digest;
+}
+
+/**
+ * Binds the parent directory this writer has just created: observes its
+ * identity, pins that identity through a directory handle, secures the mode on
+ * the handle (never on the pathname, so a replacement is never chmod-ed), and
+ * confirms the pathname still resolves to the same identity. The window between
+ * `mkdir` and the first observation is the documented same-user pathname
+ * boundary; from here on the identity is retained, never re-derived.
+ */
+export async function secureCreatedConfigParent(
+  path: string,
+  mode: number,
+): Promise<ConfigParentIdentity> {
+  let handle: Awaited<ReturnType<typeof open>> | null = null;
+  try {
+    const observed = await lstat(path, { bigint: true });
+    if (observed.isSymbolicLink() || !observed.isDirectory()) {
+      throw new Error("config-parent-replaced");
+    }
+    handle = await open(
+      path,
+      fsConstants.O_RDONLY | (fsConstants.O_DIRECTORY ?? 0) | fsConstants.O_NOFOLLOW,
+    );
+    const bound = await handle.stat({ bigint: true });
+    if (!bound.isDirectory() || bound.dev !== observed.dev || bound.ino !== observed.ino) {
+      throw new Error("config-parent-replaced");
+    }
+    await handle.chmod(mode);
+    const after = await lstat(path, { bigint: true });
+    if (after.isSymbolicLink() || !after.isDirectory()
+      || after.dev !== observed.dev || after.ino !== observed.ino) {
+      throw new Error("config-parent-replaced");
+    }
+    return Object.freeze({ dev: observed.dev, ino: observed.ino });
+  } catch {
+    throw new Error("Config parent identity could not be verified.");
+  } finally {
+    await handle?.close().catch(() => undefined);
+  }
+}
+
+/** Revalidates that `path` is still the exact real directory identified before. */
+export async function assertConfigParentIdentity(
+  path: string,
+  identity: ConfigParentIdentity,
+): Promise<void> {
+  await assertParentSnapshot(path, { kind: "directory", dev: identity.dev, ino: identity.ino });
+}
+
+export function sameConfigParentIdentity(
+  left: ConfigParentIdentity,
+  right: ConfigParentIdentity,
+): boolean {
+  return left.dev === right.dev && left.ino === right.ino;
 }
 
 /** The same proof `readConfigFileSnapshot()` records, for comparing intended content with a readback. */

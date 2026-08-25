@@ -42,10 +42,14 @@ import {
 } from "./config-write-lock.js";
 import {
   assertConfigFileSnapshot,
+  assertConfigParentIdentity,
   configBytesDigest,
   readConfigFileSnapshot,
   sameConfigFileSnapshot,
+  sameConfigParentIdentity,
+  secureCreatedConfigParent,
   type ConfigFileSnapshot,
+  type ConfigParentIdentity,
 } from "./config-file.js";
 
 export {
@@ -524,7 +528,16 @@ export async function readConfigEditSnapshot(
   return freezeEditSnapshot(parsed.config, file);
 }
 
-/** Validates the complete candidate, acquires the config writer lock, then CAS-publishes. */
+/**
+ * Validates the complete candidate, acquires the config writer lock, then
+ * CAS-publishes. The under-lock outcome is retained in a private closure (not
+ * inferred from any message). If the lock's outer release fails after an
+ * exactly confirmed commit, the target is read back exactly once more
+ * (digest inside the bound parent): still exact → that frozen value is
+ * returned; superseded or unreadable → `ConfigEditUnverifiedError`. After a
+ * typed unverified outcome that same error is rethrown. Every earlier failure
+ * (acquisition, pre-publication, conflict) surfaces verbatim.
+ */
 export async function saveConfigEdit(
   expected: ConfigEditSnapshot,
   candidate: ConfigInput,
@@ -532,9 +545,45 @@ export async function saveConfigEdit(
 ): Promise<OrcodeConfigWithBudget> {
   const validated = validateConfig(candidate);
   requirePersistableProviderState(validated.providerSetup);
-  return withConfigWriteLock(path, (ownership) =>
-    saveConfigEditUnderLock(ownership, expected, candidate));
+  const outcome: { current: ConfigEditOutcome | null } = { current: null };
+  try {
+    return await withConfigWriteLock(path, async (ownership) => {
+      try {
+        const confirmed = await saveConfigEditExact(ownership, expected, candidate);
+        outcome.current = { kind: "confirmed", ...confirmed };
+        return confirmed.value;
+      } catch (error) {
+        if (error instanceof ConfigEditUnverifiedError) {
+          outcome.current = { kind: "unverified", error };
+        }
+        throw error;
+      }
+    });
+  } catch (error) {
+    const settled = outcome.current;
+    if (settled?.kind === "confirmed") {
+      if (await confirmExactPublication(settled.path, settled.digest, settled.parent)) {
+        return settled.value;
+      }
+      throw new ConfigEditUnverifiedError();
+    }
+    if (settled?.kind === "unverified") throw settled.error;
+    throw error;
+  }
 }
+
+/** Exactly confirmed publication: the frozen value plus the proof needed to re-verify it. */
+interface ConfirmedConfigEdit {
+  readonly value: OrcodeConfigWithBudget;
+  readonly path: string;
+  readonly digest: string;
+  readonly parent: ConfigParentIdentity;
+}
+
+/** Private, non-forgeable record of what the under-lock CAS actually reached. */
+type ConfigEditOutcome =
+  | ({ readonly kind: "confirmed" } & ConfirmedConfigEdit)
+  | { readonly kind: "unverified"; readonly error: ConfigEditUnverifiedError };
 
 /**
  * Exact compare-and-swap under an already held writer ownership. The current
@@ -552,6 +601,14 @@ export async function saveConfigEditUnderLock(
   expected: ConfigEditSnapshot,
   candidate: ConfigInput,
 ): Promise<OrcodeConfigWithBudget> {
+  return (await saveConfigEditExact(ownership, expected, candidate)).value;
+}
+
+async function saveConfigEditExact(
+  ownership: ConfigWriteOwnership,
+  expected: ConfigEditSnapshot,
+  candidate: ConfigInput,
+): Promise<ConfirmedConfigEdit> {
   const validated = validateConfig(candidate);
   requirePersistableProviderState(validated.providerSetup);
   const path = ownership.canonicalPath;
@@ -564,31 +621,38 @@ export async function saveConfigEditUnderLock(
   refuseUnsafeStoredConfig(path, current);
   const content = `${JSON.stringify(validated, null, 2)}\n`;
   const digest = configBytesDigest(content);
+  const publication = expected.file.kind === "absent"
+    ? await prepareCreatePublication(ownership, path, expected.file)
+    : { kind: "replace" as const, file: expected.file, parent: expected.file.parent };
   try {
-    if (expected.file.kind === "absent") {
-      if (expected.file.parent.kind === "absent") {
-        await createExclusiveConfigParent(dirname(path));
-      }
-      await ownership.assertHeld();
-      const publishTarget = await readExactEditTarget(path);
-      if (
-        publishTarget.kind !== "absent"
-        || publishTarget.parent.kind !== "directory"
-        || (expected.file.parent.kind === "directory"
-          && !sameConfigFileSnapshot(publishTarget, expected.file))
-      ) {
-        throw new ConfigEditConflictError();
-      }
-      await ownership.assertHeld();
+    if (publication.kind === "create") {
+      const { publishTarget, created } = publication;
       await writeFileAtomicCreateSecure(path, content, async () => {
         await ownership.assertHeld();
         await assertExactEditTarget(path, publishTarget);
         await ownership.assertHeld();
+      }, undefined, undefined, {
+        // Identity before any temp file; a directory this writer created is
+        // already secured on its handle and is never chmod-ed by pathname.
+        prepareDirectory: async () => {
+          await assertExactEditTarget(path, publishTarget);
+          if (created === null) await ensureSecureDirectory(dirname(path));
+          await assertExactEditTarget(path, publishTarget);
+        },
+        // Immediately before the post-link pathname chmod: ownership plus the
+        // exact published bytes inside the bound parent, or the chmod is skipped
+        // and the readback below decides.
+        beforeSecureMode: async () => {
+          await ownership.assertHeld();
+          if (!(await confirmExactPublication(path, digest, publication.parent))) {
+            throw new Error("Config publication fence lost before securing the mode.");
+          }
+        },
       });
     } else {
       await writeFileAtomicSecure(path, content, async () => {
         await ownership.assertHeld();
-        await assertExactEditTarget(path, expected.file);
+        await assertExactEditTarget(path, publication.file);
         await ownership.assertHeld();
       });
     }
@@ -601,15 +665,61 @@ export async function saveConfigEditUnderLock(
   // cannot un-publish durable bytes, so its outcome is not consulted here; only
   // exact readback distinguishes a confirmed commit from an unverifiable one.
   await ownership.assertHeld().catch(() => undefined);
-  if (await confirmExactPublication(path, digest)) return deepFreeze(validated);
+  if (await confirmExactPublication(path, digest, publication.parent)) {
+    return { value: deepFreeze(validated), path, digest, parent: publication.parent };
+  }
   throw new ConfigEditUnverifiedError();
 }
 
-/** Exact readback proof; never throws and never exposes the underlying path or bytes. */
-async function confirmExactPublication(path: string, digest: string): Promise<boolean> {
+interface CreatePublicationPlan {
+  readonly kind: "create";
+  /** Fresh absent snapshot inside the exact parent; the final fence before the create-only link. */
+  readonly publishTarget: ConfigFileSnapshot & { readonly kind: "absent" };
+  /** Identity of the parent this writer created, or `null` when the parent pre-existed. */
+  readonly created: ConfigParentIdentity | null;
+  readonly parent: ConfigParentIdentity;
+}
+
+/**
+ * Pre-publication preparation of the create-only path: creates an absent
+ * parent exclusively, then requires the publish snapshot to sit inside exactly
+ * that created identity (or, for a pre-existing parent, to equal the edit
+ * snapshot). Every rejection here is ordinary: nothing has been published.
+ */
+async function prepareCreatePublication(
+  ownership: ConfigWriteOwnership,
+  path: string,
+  expected: ConfigFileSnapshot & { readonly kind: "absent" },
+): Promise<CreatePublicationPlan> {
+  const created = expected.parent.kind === "absent"
+    ? await createExclusiveConfigParent(dirname(path))
+    : null;
+  await ownership.assertHeld();
+  const publishTarget = await readExactEditTarget(path);
+  if (
+    publishTarget.kind !== "absent"
+    || publishTarget.parent.kind !== "directory"
+    || (created !== null && !sameConfigParentIdentity(publishTarget.parent, created))
+    || (created === null && !sameConfigFileSnapshot(publishTarget, expected))
+  ) {
+    throw new ConfigEditConflictError();
+  }
+  await ownership.assertHeld();
+  return { kind: "create", publishTarget, created, parent: created ?? publishTarget.parent };
+}
+
+/** Exact readback proof inside the exact parent; never throws and never exposes the underlying path or bytes. */
+async function confirmExactPublication(
+  path: string,
+  digest: string,
+  parent: ConfigParentIdentity,
+): Promise<boolean> {
   try {
+    await assertConfigParentIdentity(dirname(path), parent);
     const snapshot = await readConfigFileSnapshot(path);
-    return snapshot.kind === "file" && snapshot.digest === digest;
+    return snapshot.kind === "file"
+      && snapshot.digest === digest
+      && sameConfigParentIdentity(snapshot.parent, parent);
   } catch {
     return false;
   }
@@ -618,10 +728,12 @@ async function confirmExactPublication(path: string, digest: string): Promise<bo
 /**
  * Exclusive, identity-bearing creation of a config parent that was absent in
  * the edit snapshot. An existing directory belongs to a concurrent creator: it
- * is a conflict and is never entered, chmod-ed, or published into. Missing
- * ancestors are not identity-bearing and may be created non-exclusively.
+ * is a conflict and is never entered, chmod-ed, or published into. The
+ * returned claim is the identity this writer created and secured on a handle;
+ * every later pathname operation revalidates against it. Missing ancestors are
+ * not identity-bearing and may be created non-exclusively.
  */
-async function createExclusiveConfigParent(directory: string): Promise<void> {
+async function createExclusiveConfigParent(directory: string): Promise<ConfigParentIdentity> {
   for (let attempt = 0; ; attempt += 1) {
     try {
       await mkdir(directory, { mode: SECURE_DIRECTORY_MODE });
@@ -632,11 +744,7 @@ async function createExclusiveConfigParent(directory: string): Promise<void> {
       await mkdir(dirname(directory), { recursive: true, mode: SECURE_DIRECTORY_MODE });
     }
   }
-  try {
-    await chmod(directory, SECURE_DIRECTORY_MODE);
-  } catch (error) {
-    if (!hasCode(error, "EPERM") && !hasCode(error, "ENOENT")) throw error;
-  }
+  return secureCreatedConfigParent(directory, SECURE_DIRECTORY_MODE);
 }
 
 function freezeEditSnapshot(
@@ -743,6 +851,21 @@ export async function writeFileAtomicSecure(
   }
 }
 
+export interface AtomicCreateOptions {
+  /**
+   * Replaces the default `ensureSecureDirectory(dirname(path))` step that runs
+   * before the temp file is created; a caller that already holds the exact
+   * parent identity revalidates it here instead of touching the pathname.
+   */
+  readonly prepareDirectory?: () => Promise<void>;
+  /**
+   * Runs immediately before the post-link pathname `chmod`; a rejection skips
+   * that chmod and surfaces as the post-publication brand, so a replacement
+   * that slipped in after the link is never chmod-ed.
+   */
+  readonly beforeSecureMode?: () => Promise<void>;
+}
+
 /**
  * Atomically publishes one newly created secure file without ever replacing an
  * existing target. The hard-link publish is the create-only CAS: if another
@@ -757,8 +880,9 @@ export async function writeFileAtomicCreateSecure(
   beforePublish?: () => Promise<void>,
   beforeLink?: () => void,
   afterPublish?: () => void,
+  options: AtomicCreateOptions = {},
 ): Promise<void> {
-  await ensureSecureDirectory(dirname(path));
+  await (options.prepareDirectory ?? (() => ensureSecureDirectory(dirname(path))))();
   const temporary = `${path}.${randomUUID()}.tmp`;
   let published = false;
   try {
@@ -787,6 +911,7 @@ export async function writeFileAtomicCreateSecure(
     throw error;
   }
   try {
+    await options.beforeSecureMode?.();
     await chmod(path, SECURE_FILE_MODE);
   } catch (error) {
     throw atomicFilePostPublicationError("create", error);
