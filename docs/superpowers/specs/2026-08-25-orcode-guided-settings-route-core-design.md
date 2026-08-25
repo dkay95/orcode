@@ -4,7 +4,7 @@
 
 **Target branch:** `codex/orcode-0.7-design`
 
-**Status:** Chat design approved; written specification awaiting final user review
+**Status:** Approved by the user; implementation planning in progress
 
 ## 1. Goal
 
