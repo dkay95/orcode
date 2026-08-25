@@ -2,6 +2,7 @@ import type { ProviderCommandBackendId } from "./commands.js";
 import type { OrcodeConfigWithBudget } from "./config.js";
 import {
   getReasoningSetting,
+  reasoningChoiceValue,
   reasoningChoices,
   reasoningLabel,
   supportsReasoning,
@@ -220,8 +221,6 @@ export interface SettingsProviderProjection {
 
 export interface SettingsApprovalRuleProjection {
   readonly id: string;
-  readonly tool: string;
-  readonly display: string;
   readonly decision: "allow" | "deny";
 }
 
@@ -282,10 +281,10 @@ const ON_OFF_CHOICES = [
 ] as const satisfies readonly SettingsChoice[];
 
 const APPROVAL_CHOICES = [
-  { value: "read-only", label: "Nur lesen", description: "Schreibende Werkzeuge nicht erlauben" },
-  { value: "ask", label: "Nachfragen", description: "Vor riskanten Werkzeugen bestätigen lassen" },
-  { value: "auto-edit", label: "Änderungen automatisch", description: "Lokale Dateiänderungen ohne einzelne Nachfrage erlauben" },
-  { value: "allow-all", label: "Alles erlauben", description: "Datei- und Shell-Aktionen ohne Nachfrage erlauben; Bestätigung erforderlich" },
+  { value: "read-only", label: "Nur lesen", description: "Nur lesen; Änderungen und Shell-Befehle werden blockiert. Lesezugriff auf Geheimnisse fragt nach." },
+  { value: "ask", label: "Nachfragen", description: "Vor Dateiänderungen und jedem Shell-Befehl fragen." },
+  { value: "auto-edit", label: "Änderungen automatisch", description: "Dateiänderungen automatisch, vor Shell-Befehlen fragen. Geschützte Pfade fragen trotzdem nach." },
+  { value: "allow-all", label: "Alles erlauben", description: "Dateiänderungen und Shell-Befehle ohne Nachfrage. Gefährlich. Nur geschützte Pfade fragen weiter nach." },
 ] as const satisfies readonly SettingsChoice[];
 
 const BUDGET_ACTION_CHOICES = [
@@ -406,11 +405,18 @@ function modelItems(snapshot: SettingsAuthoritativeSnapshot): SettingsItem[] {
   const config = snapshot.config;
   const currentModel = findModel(snapshot.cachedModels, config.mainModel);
   const currentReasoning = getReasoningSetting(config);
-  const reasoningOptions = reasoningChoices(currentModel, currentReasoning).map(({ value, label, description }) => ({
-    value,
-    label,
-    description,
-  }));
+  const currentReasoningLabel = reasoningLabel(currentReasoning);
+  const reasoningOptions = currentModel === null
+    ? [{
+        value: reasoningChoiceValue(currentReasoning),
+        label: `Gespeichert · ${currentReasoningLabel}`,
+        description: "Gespeicherter Wert; Modellfähigkeiten sind ohne Katalog nicht prüfbar",
+      }]
+    : reasoningChoices(currentModel, currentReasoning).map(({ value, label, description }) => ({
+        value,
+        label,
+        description,
+      }));
   return [
     item(snapshot, {
       id: "main-model",
@@ -438,12 +444,14 @@ function modelItems(snapshot: SettingsAuthoritativeSnapshot): SettingsItem[] {
       label: "Reasoning",
       description: "Thinking-Modus oder unterstützte Aufwandsstufe des Hauptmodells wählen",
       aliases: ["thinking", "denken", "effort"],
-      displayValue: reasoningLabel(currentReasoning),
+      displayValue: currentReasoningLabel,
       editor: { kind: "choice", actionId: "reasoning", options: reasoningOptions },
       affectsActiveRun: true,
-      ...(!supportsReasoning(currentModel)
-        ? { disabledReason: "Modell unterstützt Reasoning nicht" }
-        : {}),
+      ...(currentModel === null
+        ? { disabledReason: "Modellkatalog nicht verfügbar" }
+        : !supportsReasoning(currentModel)
+          ? { disabledReason: "Modell unterstützt Reasoning nicht" }
+          : {}),
     }),
     item(snapshot, {
       id: "compression-mode",
@@ -562,24 +570,25 @@ function securityItems(snapshot: SettingsAuthoritativeSnapshot): SettingsItem[] 
     }),
   ];
   for (const rule of rules) {
+    const anchor = ruleAnchor(rule.id);
     result.push(
       item(snapshot, {
         id: `approval-rule:${rule.id}`,
         categoryId: "security-approvals",
-        label: `Gemerkte Regel · ${rule.tool}`,
+        label: `Gemerkte Regel · ${anchor}`,
         description: "Read-only Ansicht einer lokal gemerkten Werkzeugfreigabe",
-        aliases: ["regel", "remembered", rule.tool],
-        displayValue: `${rule.decision === "allow" ? "Erlauben" : "Ablehnen"} · ${rule.display}`,
+        aliases: ["regel", "remembered", anchor],
+        displayValue: `${rule.decision === "allow" ? "Erlauben" : "Ablehnen"} · Regel ${anchor}`,
         editor: READONLY_EDITOR,
         affectsActiveRun: false,
       }),
       item(snapshot, {
         id: `approval-forget:${rule.id}`,
         categoryId: "security-approvals",
-        label: `Regel vergessen · ${rule.tool}`,
+        label: `Regel vergessen · ${anchor}`,
         description: "Diese gemerkte Werkzeugfreigabe nach Bestätigung entfernen",
-        aliases: ["regel löschen", "forget", rule.tool],
-        displayValue: rule.display,
+        aliases: ["regel löschen", "forget", anchor],
+        displayValue: `Regel ${anchor}`,
         editor: { kind: "confirm", actionId: "approval-forget", destructive: true },
         affectsActiveRun: true,
       }),
@@ -957,7 +966,10 @@ function orderedProviders(
 ): SettingsProviderProjection[] {
   const byBackend = new Map<ProviderCommandBackendId, SettingsProviderProjection>();
   for (const provider of providers) {
-    if (!byBackend.has(provider.backendId)) byBackend.set(provider.backendId, provider);
+    if (byBackend.has(provider.backendId)) {
+      throw new Error("Settings-Anbieterprojektion ist ungültig.");
+    }
+    byBackend.set(provider.backendId, provider);
   }
   return PROVIDER_BACKEND_ORDER
     .map((backendId) => byBackend.get(backendId))
@@ -969,9 +981,23 @@ function orderedRules(
 ): SettingsApprovalRuleProjection[] {
   const byId = new Map<string, SettingsApprovalRuleProjection>();
   for (const rule of rules) {
-    if (!byId.has(rule.id)) byId.set(rule.id, rule);
+    if (!CANONICAL_RULE_ID.test(rule.id)
+      || (rule.decision !== "allow" && rule.decision !== "deny")
+      || byId.has(rule.id)) {
+      throw new Error("Settings-Regelprojektion ist ungültig.");
+    }
+    byId.set(rule.id, { id: rule.id, decision: rule.decision });
   }
-  return [...byId.values()].sort((left, right) => left.id.localeCompare(right.id, "en"));
+  return [...byId.values()].sort((left, right) =>
+    left.id < right.id ? -1 : left.id > right.id ? 1 : 0
+  );
+}
+
+const CANONICAL_RULE_ID =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+
+function ruleAnchor(id: string): string {
+  return id.slice(0, 8);
 }
 
 function findModel(models: readonly ModelInfo[], id: string): ModelInfo | null {

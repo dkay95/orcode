@@ -74,6 +74,10 @@ const PROVIDER_ACTION_ORDER = [
 ] as const;
 
 const CURRENT_MODEL_ID = "openai/gpt-5.4";
+const RULE_A_ID = "11111111-1111-4111-8111-111111111111";
+const RULE_B_ID = "22222222-2222-4222-8222-222222222222";
+const RULE_PROJECTION_ERROR = "Settings-Regelprojektion ist ungültig.";
+const PROVIDER_PROJECTION_ERROR = "Settings-Anbieterprojektion ist ungültig.";
 
 function model(
   id: string,
@@ -222,15 +226,11 @@ function snapshot(runActive = false): SettingsAuthoritativeSnapshot {
     // Deliberately reversed; stable local rule IDs own dynamic ordering.
     approvalRules: [
       {
-        id: "rule-b",
-        tool: "shell",
-        display: "npm test",
+        id: RULE_B_ID,
         decision: "allow",
       },
       {
-        id: "rule-a",
-        tool: "edit",
-        display: "src/**/*.ts",
+        id: RULE_A_ID,
         decision: "deny",
       },
     ],
@@ -339,8 +339,8 @@ test("Item-IDs sind global eindeutig und dynamische Reihenfolge ist reproduzierb
   assert.deepEqual(second.items.map(({ id }) => id), ids);
   assert.ok(ids.indexOf("provider-status:openrouter") < ids.indexOf("provider-status:kimi-code"));
   assert.ok(ids.indexOf("provider-status:kimi-code") < ids.indexOf("provider-status:anthropic"));
-  assert.ok(ids.indexOf("approval-rule:rule-a") < ids.indexOf("approval-rule:rule-b"));
-  assert.ok(ids.indexOf("approval-forget:rule-a") < ids.indexOf("approval-forget:rule-b"));
+  assert.ok(ids.indexOf(`approval-rule:${RULE_A_ID}`) < ids.indexOf(`approval-rule:${RULE_B_ID}`));
+  assert.ok(ids.indexOf(`approval-forget:${RULE_A_ID}`) < ids.indexOf(`approval-forget:${RULE_B_ID}`));
 });
 
 test("geschlossene Action-Union deckt jede reale Zeile ab und keine Zeile ist Platzhalter", () => {
@@ -377,13 +377,98 @@ test("Coming soon bleibt ausschließlich eine nicht ausführbare Anthropic-Statu
 });
 
 test("Registry baut ausschließlich eine secretless Ansicht statt Eingaben durchzureichen", () => {
-  const input = snapshot();
+  const base = snapshot();
+  const rawRuleSentinel = "Authorization: Bearer raw-rule-token\u001b[31m\nINJECT";
+  const rawRule = {
+    id: RULE_B_ID,
+    decision: "allow",
+    tool: `shell-${rawRuleSentinel}`,
+    display: rawRuleSentinel,
+    match: { kind: "exact-subject", display: rawRuleSentinel },
+  } as unknown as SettingsAuthoritativeSnapshot["approvalRules"][number];
+  const input: SettingsAuthoritativeSnapshot = {
+    ...base,
+    approvalRules: [rawRule, ...base.approvalRules.slice(1)],
+  };
   const polluted = input.providers[0] as SettingsProviderProjection & Record<string, unknown>;
   polluted["accountFingerprintSuffix"] = "…private";
   polluted["credentialSlot"] = "slot-private";
   (input.route as SettingsAuthoritativeSnapshot["route"] & Record<string, unknown>)["accountFingerprint"] = "private";
   const registry = buildSettingsRegistry(input);
   assertNoForbiddenKeyOrValue(registry);
+  const rendered = JSON.stringify(registry);
+  assert.equal(rendered.includes("raw-rule-token"), false);
+  assert.equal(rendered.includes("INJECT"), false);
+  for (const candidate of registry.items.flatMap((entry) => [
+    entry.label,
+    entry.description,
+    ...entry.aliases,
+    entry.displayValue,
+  ])) {
+    assert.equal(/[\u0000-\u001f\u007f]/u.test(candidate), false, candidate);
+  }
+  assert.equal(item(registry, `approval-rule:${RULE_B_ID}`).label, "Gemerkte Regel · 22222222");
+  assert.equal(item(registry, `approval-rule:${RULE_B_ID}`).displayValue, "Erlauben · Regel 22222222");
+  assert.equal(item(registry, `approval-forget:${RULE_B_ID}`).label, "Regel vergessen · 22222222");
+});
+
+test("ungültige oder doppelte Regel-IDs scheitern mit fester secretloser Copy", () => {
+  const invalidIds = [
+    "rule-a",
+    "AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA",
+    "not-valid\u001b[31m\nAuthorization: Bearer never-echo",
+  ];
+  for (const id of invalidIds) {
+    const base = snapshot();
+    const input: SettingsAuthoritativeSnapshot = {
+      ...base,
+      approvalRules: [{ id, decision: "allow" }],
+    };
+    assert.throws(() => buildSettingsRegistry(input), { message: RULE_PROJECTION_ERROR });
+  }
+
+  const left = {
+    id: RULE_A_ID,
+    decision: "allow" as const,
+    display: "Authorization: Bearer left",
+  } as unknown as SettingsAuthoritativeSnapshot["approvalRules"][number];
+  const right = {
+    id: RULE_A_ID,
+    decision: "deny" as const,
+    tool: "shell-right\u001b[31m",
+  } as unknown as SettingsAuthoritativeSnapshot["approvalRules"][number];
+  for (const approvalRules of [[left, right], [right, left]]) {
+    const base = snapshot();
+    assert.throws(
+      () => buildSettingsRegistry({ ...base, approvalRules }),
+      { message: RULE_PROJECTION_ERROR },
+    );
+  }
+});
+
+test("doppelte Provider-Backends scheitern unabhängig von Eingabereihenfolge", () => {
+  const base = snapshot();
+  const original = base.providers.find(({ backendId }) => backendId === "openrouter");
+  assert.ok(original);
+  const conflicting: SettingsProviderProjection = {
+    ...original,
+    displayName: "Authorization: Bearer provider-left\u001b[31m",
+    configuration: "disabled",
+    allowedActions: ["logout"],
+  };
+  for (const pair of [[original, conflicting], [conflicting, original]]) {
+    const input: SettingsAuthoritativeSnapshot = {
+      ...base,
+      providers: [
+        ...base.providers.filter(({ backendId }) => backendId !== "openrouter"),
+        ...pair,
+      ],
+    };
+    assert.throws(
+      () => buildSettingsRegistry(input),
+      { message: PROVIDER_PROJECTION_ERROR },
+    );
+  }
 });
 
 test("aktive Läufe sperren nur mutierende Laufzeilen; Status und Darstellung bleiben verfügbar", () => {
@@ -418,6 +503,54 @@ test("aktuelle Konfiguration wird konkret und ohne erfundene Kosten projiziert",
   assert.equal(item(registry, "cost-summary").displayValue.includes("$0"), false);
 });
 
+test("fehlender Hauptmodell-Katalog sperrt Reasoning ohne Optionen zu erfinden", () => {
+  const base = snapshot();
+  const registry = buildSettingsRegistry({
+    ...base,
+    cachedModels: base.cachedModels.filter(({ id }) => id !== CURRENT_MODEL_ID),
+  });
+  const reasoning = item(registry, "reasoning");
+  assert.equal(reasoning.displayValue, "high");
+  assert.equal(reasoning.disabledReason, "Modellkatalog nicht verfügbar");
+  assert.equal(reasoning.editor.kind, "choice");
+  if (reasoning.editor.kind !== "choice") return;
+  assert.deepEqual(reasoning.editor.options, [
+    {
+      value: "effort:high",
+      label: "Gespeichert · high",
+      description: "Gespeicherter Wert; Modellfähigkeiten sind ohne Katalog nicht prüfbar",
+    },
+  ]);
+});
+
+test("Freigabemodi erklären die vollständige bestehende Sicherheitswirkung", () => {
+  const registry = buildSettingsRegistry(snapshot());
+  const approval = item(registry, "approval-mode");
+  assert.equal(approval.editor.kind, "choice");
+  if (approval.editor.kind !== "choice") return;
+  assert.deepEqual(
+    approval.editor.options.map(({ value, description }) => ({ value, description })),
+    [
+      {
+        value: "read-only",
+        description: "Nur lesen; Änderungen und Shell-Befehle werden blockiert. Lesezugriff auf Geheimnisse fragt nach.",
+      },
+      {
+        value: "ask",
+        description: "Vor Dateiänderungen und jedem Shell-Befehl fragen.",
+      },
+      {
+        value: "auto-edit",
+        description: "Dateiänderungen automatisch, vor Shell-Befehlen fragen. Geschützte Pfade fragen trotzdem nach.",
+      },
+      {
+        value: "allow-all",
+        description: "Dateiänderungen und Shell-Befehle ohne Nachfrage. Gefährlich. Nur geschützte Pfade fragen weiter nach.",
+      },
+    ],
+  );
+});
+
 test("Provider-Aktionszeilen entsprechen exakt der gelieferten Capability-Projektion", () => {
   const registry = buildSettingsRegistry(snapshot());
   assert.deepEqual(providerActionIds(registry, "openrouter"), PROVIDER_ACTION_ORDER);
@@ -448,6 +581,51 @@ test("OpenRouter-Datenschutz erscheint mit separaten Item-IDs aber identischen A
   }
 });
 
+test("jede Editorfamilie sowie Modell- und Zahlgrenzen sind konkret verdrahtet", () => {
+  const registry = buildSettingsRegistry(snapshot());
+  assert.deepEqual(
+    [...new Set(registry.items.map(({ editor }) => editor.kind))].sort(),
+    ["choice", "confirm", "invoke", "model", "number", "readonly", "text"],
+  );
+
+  const expectedModels = [
+    ["main-model", "main", false],
+    ["compressor-model", "compressor", false],
+    ["panel-models", "panel", true],
+    ["transcription-model", "audio-input", false],
+  ] as const;
+  for (const [id, filter, multiple] of expectedModels) {
+    const editor = item(registry, id).editor;
+    assert.equal(editor.kind, "model", id);
+    if (editor.kind !== "model") continue;
+    assert.equal(editor.filter, filter, id);
+    assert.equal(editor.multiple === true, multiple, id);
+  }
+
+  const expectedNumbers = [
+    ["max-steps", 1, 100, false, undefined],
+    ["max-cost", 0.001, 1_000, false, "USD"],
+    ["compressor-max-cost", 0.001, 100, false, "USD"],
+    ["budget-daily", 0.01, 100_000, true, "USD"],
+    ["budget-total", 0.01, 100_000, true, "USD"],
+    ["verify-repair-rounds", 0, 2, false, undefined],
+    ["browser-timeout", 1, 120, false, "s"],
+  ] as const;
+  for (const [id, minimum, maximum, allowOff, unit] of expectedNumbers) {
+    const editor = item(registry, id).editor;
+    assert.equal(editor.kind, "number", id);
+    if (editor.kind !== "number") continue;
+    assert.equal(editor.minimum, minimum, id);
+    assert.equal(editor.maximum, maximum, id);
+    assert.equal(editor.allowOff === true, allowOff, id);
+    assert.equal(editor.unit, unit, id);
+  }
+  assert.equal(
+    registry.items.filter(({ editor }) => editor.kind === "number").length,
+    expectedNumbers.length,
+  );
+});
+
 test("Suche normalisiert Diakritika und bewertet exakt, Präfix und Enthalten deterministisch", () => {
   const registry = buildSettingsRegistry(snapshot());
   assert.equal(searchSettings(registry, "budget")[0]?.id, "budget-daily");
@@ -462,4 +640,14 @@ test("Suche normalisiert Diakritika und bewertet exakt, Präfix und Enthalten de
   );
   assert.deepEqual(searchSettings(registry, "  "), registry.items);
   assert.deepEqual(searchSettings(registry, "nicht-vorhanden"), []);
+});
+
+test("Suche ordnet exakte Treffer vor Präfixen und Präfixe vor Enthalten", () => {
+  const registry = buildSettingsRegistry(snapshot());
+  assert.deepEqual(searchSettings(registry, "route").slice(0, 4).map(({ id }) => id), [
+    "main-model",
+    "current-route",
+    "appearance-large-logo",
+    "provider-status:openrouter",
+  ]);
 });
