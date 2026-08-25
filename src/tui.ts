@@ -96,8 +96,24 @@ const MAX_BUFFERED_SETTINGS_INPUTS = 128;
 const SIGNALS: readonly NodeJS.Signals[] = ["SIGINT", "SIGTERM", "SIGHUP"];
 
 interface BufferedSettingsKey {
+  readonly kind: "key";
   readonly character: string;
-  readonly key: Key;
+  readonly key: Pick<Key, "name" | "ctrl" | "meta" | "shift">;
+  readonly codepoints: number;
+}
+
+interface BufferedSettingsIntent {
+  readonly kind: "intent";
+  readonly intent: SettingsIntent;
+}
+
+type BufferedSettingsInput = BufferedSettingsKey | BufferedSettingsIntent;
+
+interface MouseKeypressToken {
+  raw: string;
+  consumed: number;
+  complete: boolean;
+  click: { readonly column: number; readonly row: number } | null;
 }
 
 export interface ChoicePickerItem {
@@ -251,7 +267,8 @@ export class TerminalUi implements SettingsSurface {
   #settingsView: SettingsViewModel | null = null;
   #settingsIntentResolve: ((intent: SettingsIntent) => void) | null = null;
   #settingsIntentReject: ((error: Error) => void) | null = null;
-  #settingsKeyQueue: BufferedSettingsKey[] = [];
+  #settingsInputQueue: BufferedSettingsInput[] = [];
+  #settingsQueuedCodepoints = 0;
   #settingsSearchChars: string[] = [];
   #settingsSearchCursor = 0;
   #lastSettingsHitTargets: readonly SettingsHitTarget[] = [];
@@ -330,7 +347,8 @@ export class TerminalUi implements SettingsSurface {
   #tick = 0;
   #spinnerTimer: NodeJS.Timeout | null = null;
   #mouseProtocolBuffer = "";
-  #ignoredMouseKeypresses: string[] = [];
+  #openMouseKeypressToken: MouseKeypressToken | null = null;
+  #mouseKeypressTokens: MouseKeypressToken[] = [];
   #mouseReporting = false;
   readonly #signalHandlers = new Map<NodeJS.Signals, () => void>();
 
@@ -373,7 +391,7 @@ export class TerminalUi implements SettingsSurface {
     }
     this.#surface = "settings";
     this.#settingsView = view;
-    this.#settingsKeyQueue = [];
+    this.#clearSettingsInputQueue();
     this.#settingsSearchChars = settingsSearchChars(view.search.query);
     this.#settingsSearchCursor = this.#settingsSearchChars.length;
     this.#lastSettingsHitTargets = [];
@@ -394,9 +412,21 @@ export class TerminalUi implements SettingsSurface {
       reject?.(error);
       return Promise.reject(error);
     }
+    const previousView = this.#settingsView;
+    const incomingSearchChars = settingsSearchChars(view.search.query);
+    const incomingQuery = incomingSearchChars.join("");
+    const preserveLocalCursor = Boolean(
+      previousView
+      && previousView.search.active === view.search.active
+      && previousView.selectedCategoryId === view.selectedCategoryId
+      && view.search.active
+      && this.#settingsSearchChars.join("") === incomingQuery,
+    );
     this.#settingsView = view;
-    this.#settingsSearchChars = settingsSearchChars(view.search.query);
-    this.#settingsSearchCursor = this.#settingsSearchChars.length;
+    this.#settingsSearchChars = incomingSearchChars;
+    this.#settingsSearchCursor = preserveLocalCursor
+      ? clamp(this.#settingsSearchCursor, 0, incomingSearchChars.length)
+      : incomingSearchChars.length;
     this.#lastSettingsHitTargets = [];
     this.scheduleRender(true);
     const pending = new Promise<SettingsIntent>((resolve, reject) => {
@@ -483,6 +513,7 @@ export class TerminalUi implements SettingsSurface {
           this.#resolveSettingsEditor({ kind: "cancel" });
           break;
       }
+      this.#drainSettingsEditorInput();
     });
   }
 
@@ -1199,7 +1230,7 @@ export class TerminalUi implements SettingsSurface {
   #closeSettingsSurface(): void {
     this.#surface = "chat";
     this.#settingsView = null;
-    this.#settingsKeyQueue = [];
+    this.#clearSettingsInputQueue();
     this.#settingsSearchChars = [];
     this.#settingsSearchCursor = 0;
     this.#lastSettingsHitTargets = [];
@@ -1246,17 +1277,19 @@ export class TerminalUi implements SettingsSurface {
   #emitSettingsIntent(intent: SettingsIntent): void {
     const resolve = this.#settingsIntentResolve;
     if (this.#surface !== "settings") return;
-    if (!resolve) return;
+    if (!resolve) {
+      this.#enqueueSettingsIntent(intent);
+      return;
+    }
     this.#settingsIntentResolve = null;
     this.#settingsIntentReject = null;
-    this.#lastSettingsHitTargets = [];
     resolve(intent);
   }
 
   #handleSettingsKey(character: string, key: Key): void {
     if (!this.#settingsView) return;
     if (!this.#settingsIntentResolve) {
-      this.#enqueueSettingsKey({ character, key: { ...key } });
+      this.#enqueueSettingsKey(character, key);
       return;
     }
     if (key.name === "up" || key.name === "down") {
@@ -1338,16 +1371,65 @@ export class TerminalUi implements SettingsSurface {
     }
   }
 
-  #enqueueSettingsKey(input: BufferedSettingsKey): void {
-    if (this.#settingsKeyQueue.length >= MAX_BUFFERED_SETTINGS_INPUTS) return;
-    this.#settingsKeyQueue.push(input);
+  #enqueueSettingsKey(character: string, key: Key): void {
+    if (this.#settingsInputQueue.length >= MAX_BUFFERED_SETTINGS_INPUTS) return;
+    const capacity = MAX_SETTINGS_SEARCH_CODEPOINTS - this.#settingsQueuedCodepoints;
+    const safeCharacter = typeof character === "string" ? character : "";
+    const chars = settingsSearchChars(safeCharacter)
+      .filter((value) => value >= " ")
+      .slice(0, Math.max(0, capacity));
+    const name = typeof key.name === "string" ? key.name.slice(0, 32) : undefined;
+    if (!chars.length && !name) return;
+    this.#settingsInputQueue.push({
+      kind: "key",
+      character: chars.join(""),
+      key: {
+        name,
+        ctrl: key.ctrl === true,
+        meta: key.meta === true,
+        shift: key.shift === true,
+      },
+      codepoints: chars.length,
+    });
+    this.#settingsQueuedCodepoints += chars.length;
+  }
+
+  #enqueueSettingsIntent(intent: SettingsIntent): void {
+    if (this.#settingsInputQueue.length >= MAX_BUFFERED_SETTINGS_INPUTS) return;
+    this.#settingsInputQueue.push({ kind: "intent", intent });
+  }
+
+  #shiftSettingsInput(): BufferedSettingsInput | undefined {
+    const input = this.#settingsInputQueue.shift();
+    if (input?.kind === "key") {
+      this.#settingsQueuedCodepoints = Math.max(
+        0,
+        this.#settingsQueuedCodepoints - input.codepoints,
+      );
+    }
+    return input;
+  }
+
+  #clearSettingsInputQueue(): void {
+    this.#settingsInputQueue = [];
+    this.#settingsQueuedCodepoints = 0;
   }
 
   #drainSettingsInput(): void {
     while (this.#settingsIntentResolve && this.#settingsView) {
-      const input = this.#settingsKeyQueue.shift();
+      const input = this.#shiftSettingsInput();
       if (!input) return;
-      this.#handleSettingsKey(input.character, input.key);
+      if (input.kind === "intent") this.#emitSettingsIntent(input.intent);
+      else this.#handleSettingsKey(input.character, input.key as Key);
+    }
+  }
+
+  #drainSettingsEditorInput(): void {
+    while (this.#editorResolve && this.#returnSurface === "settings") {
+      const next = this.#settingsInputQueue[0];
+      if (!next || next.kind !== "key") return;
+      const input = this.#shiftSettingsInput() as BufferedSettingsKey;
+      this.#onKeypress(input.character, input.key as Key, true);
     }
   }
 
@@ -1700,7 +1782,7 @@ export class TerminalUi implements SettingsSurface {
     this.#recordingResolve = null;
     this.#settingsIntentResolve = null;
     this.#settingsIntentReject = null;
-    this.#settingsKeyQueue = [];
+    this.#clearSettingsInputQueue();
     this.#pickerSearch = null;
     this.#pickerModels = [];
     this.#choiceAll = [];
@@ -1784,10 +1866,12 @@ export class TerminalUi implements SettingsSurface {
     this.render(true);
   };
 
-  #onKeypress = (character: string, key: Key): void => {
-    const filteredKeypress = this.#filterMouseKeypress(character, key);
-    if (!filteredKeypress) return;
-    ({ character, key } = filteredKeypress);
+  #onKeypress = (character: string, key: Key, accepted = false): void => {
+    if (!accepted) {
+      const filteredKeypress = this.#filterMouseKeypress(character, key);
+      if (!filteredKeypress) return;
+      ({ character, key } = filteredKeypress);
+    }
     // Ctrl+C is evaluated before everything else, especially before the paste
     // buffer: a paste without an end marker must never freeze the exit (B12).
     if (key.ctrl && key.name === "c") {
@@ -1997,53 +2081,47 @@ export class TerminalUi implements SettingsSurface {
     if (!this.#active) return;
     const text = typeof chunk === "string" ? chunk : chunk.toString("utf8");
     const buffered = this.#mouseProtocolBuffer;
-    let sequence = `${buffered}${text}`;
-    let priorLength = buffered.length;
+    const sequence = `${buffered}${text}`;
+    const openToken = this.#openMouseKeypressToken;
     this.#mouseProtocolBuffer = "";
-
-    // A buffered ESC/CSI prefix that diverges from SGR mouse belongs to the
-    // terminal decoder, not to this parser. Its already-marked prefix remains
-    // suppressed, while the new bytes are scanned afresh for another frame.
-    if (
-      buffered
-      && !"\u001b[<".startsWith(sequence)
-      && !sequence.startsWith("\u001b[<")
-    ) {
-      sequence = text;
-      priorLength = 0;
-    }
-
-    const rememberRange = (start: number, end: number): void => {
-      const freshStart = Math.max(start, priorLength);
-      if (end > freshStart) this.#rememberMouseKeypresses(sequence.slice(freshStart, end));
-    };
+    this.#openMouseKeypressToken = null;
 
     let cursor = 0;
     while (cursor < sequence.length) {
-      const rest = sequence.slice(cursor);
+      const escape = sequence.indexOf("\u001b", cursor);
+      if (escape < 0) break;
+      const rest = sequence.slice(escape);
 
-      if ("\u001b[<".startsWith(rest)) {
-        rememberRange(cursor, sequence.length);
+      // ESC and ESC[ remain ambiguous until the next raw chunk. Do not mark
+      // them as mouse bytes: readline may complete them as a normal CSI key.
+      if (rest.length < 3 && "\u001b[<".startsWith(rest)) {
         this.#mouseProtocolBuffer = rest;
         break;
       }
-      if (!rest.startsWith("\u001b[<")) break;
+      if (!rest.startsWith("\u001b[<")) {
+        cursor = escape + 1;
+        continue;
+      }
+
+      const token = openToken && escape === 0
+        ? openToken
+        : this.#createMouseKeypressToken();
+      const freshStart = openToken === token ? buffered.length : escape;
 
       const match = /^\u001b\[<(\d{1,3});(\d{1,5});(\d{1,5})([Mm])/.exec(rest);
       if (match) {
-        const end = cursor + match[0].length;
-        rememberRange(cursor, end);
+        const end = escape + match[0].length;
+        if (end > freshStart) token.raw += sequence.slice(freshStart, end);
         const button = Number(match[1]);
         const column = Number(match[2]);
         const row = Number(match[3]);
-        if (
+        token.click = (
           match[4] === "M"
           && button === 0
           && Number.isSafeInteger(column)
           && Number.isSafeInteger(row)
-        ) {
-          this.#selectMouseRow(column, row);
-        }
+        ) ? { column, row } : null;
+        token.complete = true;
         cursor = end;
         continue;
       }
@@ -2052,8 +2130,9 @@ export class TerminalUi implements SettingsSurface {
         rest.length <= MAX_MOUSE_SEQUENCE_LENGTH
         && /^\u001b\[<\d{0,3}(?:;\d{0,5}(?:;\d{0,5})?)?$/.test(rest)
       ) {
-        rememberRange(cursor, sequence.length);
+        if (sequence.length > freshStart) token.raw += sequence.slice(freshStart);
         this.#mouseProtocolBuffer = rest;
+        this.#openMouseKeypressToken = token;
         break;
       }
 
@@ -2061,58 +2140,103 @@ export class TerminalUi implements SettingsSurface {
       // Consume through its terminator when present so a printable suffix in
       // the same chunk can still reach readline exactly once.
       const terminator = rest.slice(3, MAX_MOUSE_SEQUENCE_LENGTH).search(/[Mm]/u);
+      const nextEscape = rest.indexOf("\u001b", 1);
+      const trailingEscape = nextEscape >= 0 && nextEscape === rest.length - 1;
       const malformedEnd = terminator >= 0
-        ? cursor + 3 + terminator + 1
-        : sequence.length;
-      rememberRange(cursor, malformedEnd);
+        ? escape + 3 + terminator + 1
+        : nextEscape >= 0
+          ? escape + nextEscape + (trailingEscape ? 1 : 0)
+          : sequence.length;
+      if (malformedEnd > freshStart) token.raw += sequence.slice(freshStart, malformedEnd);
+      token.complete = true;
       cursor = malformedEnd;
     }
   };
 
   #clearMouseProtocol(): void {
     this.#mouseProtocolBuffer = "";
-    this.#ignoredMouseKeypresses = [];
+    this.#openMouseKeypressToken = null;
+    this.#mouseKeypressTokens = [];
   }
 
-  #rememberMouseKeypresses(text: string): void {
-    this.#ignoredMouseKeypresses.push(...Array.from(text));
+  #createMouseKeypressToken(): MouseKeypressToken {
+    const token: MouseKeypressToken = {
+      raw: "",
+      consumed: 0,
+      complete: false,
+      click: null,
+    };
+    this.#mouseKeypressTokens.push(token);
+    return token;
+  }
+
+  #finishConsumedMouseTokens(): void {
+    while (true) {
+      const token = this.#mouseKeypressTokens[0];
+      if (!token?.complete || token.consumed < token.raw.length) return;
+      this.#mouseKeypressTokens.shift();
+      if (this.#openMouseKeypressToken === token) this.#openMouseKeypressToken = null;
+      if (token.click) this.#selectMouseRow(token.click.column, token.click.row);
+    }
   }
 
   #filterMouseKeypress(character: string, key: Key): { character: string; key: Key } | null {
-    const expected = this.#ignoredMouseKeypresses.join("");
-    if (!expected) return { character, key };
-    const actual = key.sequence || character || "";
-    if (!actual) {
-      this.#ignoredMouseKeypresses = [];
+    if (!this.#mouseKeypressTokens.length) {
+      if (key.name === "escape" && this.#mouseProtocolBuffer === "\u001b") {
+        this.#mouseProtocolBuffer = "";
+      }
       return { character, key };
     }
+    const actual = key.sequence || character || "";
     if (
       key.name === "escape"
       && actual === "\u001b"
       && this.#mouseProtocolBuffer === "\u001b"
-      && expected === "\u001b"
+      && !this.#openMouseKeypressToken
     ) {
-      this.#clearMouseProtocol();
+      this.#mouseProtocolBuffer = "";
       return { character, key };
     }
-    if (expected.startsWith(actual)) {
-      this.#ignoredMouseKeypresses.splice(0, Array.from(actual).length);
-      return null;
-    }
-    if (actual.startsWith(expected)) {
-      this.#ignoredMouseKeypresses = [];
-      const remainder = actual.slice(expected.length);
-      const remainderChars = Array.from(remainder);
-      if (key.meta && !key.ctrl && remainderChars.length === 1 && remainderChars[0]! >= " ") {
-        return {
-          character: remainderChars[0]!,
-          key: { ...key, sequence: remainder, ctrl: false, meta: false },
-        };
+    if (!actual) return { character, key };
+
+    let remainder = actual;
+    while (remainder) {
+      this.#finishConsumedMouseTokens();
+      const token = this.#mouseKeypressTokens[0];
+      if (!token) break;
+      const expected = token.raw.slice(token.consumed);
+      if (!expected) return null;
+      if (expected.startsWith(remainder)) {
+        token.consumed += remainder.length;
+        this.#finishConsumedMouseTokens();
+        return null;
       }
-      return null;
+      if (remainder.startsWith(expected)) {
+        token.consumed += expected.length;
+        remainder = remainder.slice(expected.length);
+        this.#finishConsumedMouseTokens();
+        continue;
+      }
+      // This key precedes the queued mouse frame in the same raw chunk. Keep
+      // the token intact so the later SGR keypresses are still suppressed.
+      return { character, key };
     }
-    this.#ignoredMouseKeypresses = [];
-    return { character, key };
+    if (remainder === actual) return { character, key };
+    const chars = Array.from(remainder);
+    if (chars.length === 1 && chars[0]! >= " ") {
+      return {
+        character: chars[0]!,
+        key: {
+          ...key,
+          name: chars[0]!.toLowerCase(),
+          sequence: remainder,
+          ctrl: false,
+          meta: false,
+          shift: chars[0] !== chars[0]!.toLowerCase(),
+        },
+      };
+    }
+    return null;
   }
 
   #enableMouseReporting(): void {
@@ -2657,10 +2781,7 @@ export class TerminalUi implements SettingsSurface {
         return;
       }
       if (!this.#settingsIntentResolve) {
-        this.#enqueueSettingsKey({
-          character: clean,
-          key: { name: undefined, sequence: clean, ctrl: false, meta: false },
-        });
+        this.#enqueueSettingsKey(clean, { name: undefined, ctrl: false, meta: false });
         this.scheduleRender(true);
         return;
       }

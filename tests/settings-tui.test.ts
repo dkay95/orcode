@@ -5,10 +5,13 @@ import type { ReadStream, WriteStream } from "node:tty";
 
 import { routeCoreCompact, routeCoreLarge } from "../src/branding.js";
 import type {
+  SettingsController,
   SettingsEditorRequest,
+  SettingsEditorResult,
   SettingsIntent,
   SettingsViewModel,
 } from "../src/settings-controller.js";
+import { runSettingsSession } from "../src/settings-session.js";
 import {
   TerminalUi,
   type DashboardState,
@@ -258,9 +261,7 @@ function pressSettings(
 }
 
 function emitSettingsData(stdin: SettingsFakeInput, value: string): void {
-  const listener = stdin.listeners("data")[0];
-  assert.ok(listener, "raw data listener fehlt");
-  listener(Buffer.from(value));
+  stdin.emit("data", Buffer.from(value));
 }
 
 test("Settings ist eine eigene Surface und lässt den Chat-Entwurf bytegleich", async () => {
@@ -455,6 +456,133 @@ test("Settings-Suchpaste zwischen zwei Intents wird als ein begrenztes Folgeerei
       await terminal.nextIntent(view({ search: { active: true, query: "ab" } })),
       { kind: "search-change", query: "abcd" },
     );
+  } finally {
+    terminal.end();
+    terminal.stop();
+  }
+});
+
+test("runSettingsSession übergibt Raw-Folgekeys nach Activate exakt einmal an den neuen Editor", async (context) => {
+  const cases: Array<{
+    readonly name: string;
+    readonly raw: string;
+    readonly request: SettingsEditorRequest;
+    readonly expected: SettingsEditorResult;
+    readonly options?: TerminalUiOptions;
+  }> = [
+    {
+      name: "text",
+      raw: "\rabc\r",
+      request: editorRequest({ kind: "text", actionId: "browser-path", valueKind: "path" }),
+      expected: { kind: "value", value: "abc" },
+    },
+    {
+      name: "choice",
+      raw: "\rb\r",
+      request: editorRequest({
+        kind: "choice",
+        actionId: "reasoning",
+        options: [
+          { value: "a", label: "Alpha", description: "A" },
+          { value: "b", label: "Beta", description: "B" },
+        ],
+      }),
+      expected: { kind: "value", value: "b" },
+    },
+    {
+      name: "model",
+      raw: "\rb\r",
+      request: editorRequest({ kind: "model", actionId: "main-model", filter: "main" }),
+      expected: { kind: "value", value: "model/b" },
+      options: {
+        settingsEditorResolver: {
+          searchModels: (_request, query) => [cachedModel("model/a"), cachedModel("model/b")]
+            .filter(({ id }) => id.includes(query)),
+        },
+      },
+    },
+    {
+      name: "confirm",
+      raw: "\ry",
+      request: editorRequest({ kind: "confirm", actionId: "verify-clear", destructive: true }),
+      expected: { kind: "value", value: true },
+    },
+  ];
+
+  for (const scenario of cases) {
+    await context.test(scenario.name, async () => {
+      const { terminal, stdin } = settingsUi(scenario.options);
+      terminal.start();
+      const chat = terminal.readInput();
+      for (const character of "chat-draft") pressSettings(stdin, character, character);
+      let completed: SettingsEditorResult | null = null;
+      const controller = {
+        get view() { return view({ runActive: false }); },
+        async dispatch(intent: SettingsIntent) {
+          assert.deepEqual(intent, { kind: "activate" });
+          return { kind: "edit", request: scenario.request } as const;
+        },
+        async completeEditor(_request: SettingsEditorRequest, result: SettingsEditorResult) {
+          completed = result;
+          return { kind: "close" } as const;
+        },
+      } as unknown as SettingsController;
+      let settled = false;
+      const session = runSettingsSession(controller, terminal).then(() => {
+        settled = true;
+      });
+      stdin.emit("data", Buffer.from(scenario.raw));
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      if (!settled) terminal.end();
+      await session;
+      assert.deepEqual(completed, scenario.expected);
+      pressSettings(stdin, "return");
+      assert.equal(await chat, "chat-draft");
+      terminal.stop();
+    });
+  }
+});
+
+test("lokaler Settings-Suchcursor bleibt über den bestätigten Controller-Refresh erhalten", async () => {
+  const initial = view({ search: { active: true, query: "ac" } });
+  const { terminal, stdin } = settingsUi();
+  terminal.start();
+  terminal.begin(initial);
+  try {
+    const first = terminal.nextIntent(initial);
+    stdin.emit("data", Buffer.from("\u001b[Dbx"));
+    assert.deepEqual(await first, { kind: "search-change", query: "abc" });
+    assert.deepEqual(
+      await terminal.nextIntent(view({ search: { active: true, query: "abc" } })),
+      { kind: "search-change", query: "abxc" },
+    );
+  } finally {
+    terminal.end();
+    terminal.stop();
+  }
+});
+
+test("gepufferte Settings-Nutzlast wird vor Speicherung auf 120 Codepoints normalisiert", async () => {
+  const initial = view({ search: { active: true, query: "" } });
+  const { terminal, stdin } = settingsUi();
+  terminal.start();
+  terminal.begin(initial);
+  let sequenceReads = 0;
+  const key = { name: "x", ctrl: false, meta: false } as Record<string, unknown>;
+  Object.defineProperty(key, "sequence", {
+    enumerable: true,
+    get() {
+      sequenceReads += 1;
+      return "secret-retained-payload".repeat(10_000);
+    },
+  });
+  try {
+    stdin.emit("keypress", "x".repeat(1_000_000), key);
+    assert.equal(sequenceReads, 0);
+    assert.deepEqual(await terminal.nextIntent(initial), {
+      kind: "search-change",
+      query: "x".repeat(120),
+    });
   } finally {
     terminal.end();
     terminal.stop();
@@ -1005,6 +1133,50 @@ test("ein fehlerhaftes SGR-Frame verschluckt seine Bytes, aber nicht den Suffix"
     const changed = terminal.nextIntent(searchView);
     stdin.emit("data", Buffer.from("\u001b[<x;2;3Mz"));
     assert.deepEqual(await changed, { kind: "search-change", query: "z" });
+  } finally {
+    terminal.end();
+    terminal.stop();
+  }
+});
+
+test("normaler Raw-Präfix bleibt vor einem SGR-Klick geordnet und Mausbytes bleiben unsichtbar", async () => {
+  const searchView = view({ search: { active: true, query: "" } });
+  const target = build(80, 24, { search: { active: true, query: "" } }).hitTargets.find(
+    ({ intent }) => intent.kind === "select-item" && intent.itemId === "main-model",
+  );
+  assert.ok(target);
+  const { terminal, stdin } = settingsUi();
+  terminal.start();
+  terminal.begin(searchView);
+  try {
+    terminal.frame();
+    const prefix = terminal.nextIntent(searchView);
+    stdin.emit(
+      "data",
+      Buffer.from(`z\u001b[<0;${target.columnStart};${target.row}M`),
+    );
+    assert.deepEqual(await prefix, { kind: "search-change", query: "z" });
+    assert.deepEqual(
+      await terminal.nextIntent(view({ search: { active: true, query: "z" } })),
+      { kind: "select-item", itemId: "main-model" },
+    );
+  } finally {
+    terminal.end();
+    terminal.stop();
+  }
+});
+
+test("split normales CSI wird nicht als Mauspräfix verschluckt", async () => {
+  const initial = view({ search: { active: true, query: "ab" } });
+  const { terminal, stdin } = settingsUi();
+  terminal.start();
+  terminal.begin(initial);
+  try {
+    const changed = terminal.nextIntent(initial);
+    stdin.emit("data", Buffer.from("\u001b["));
+    stdin.emit("data", Buffer.from("D"));
+    stdin.emit("data", Buffer.from("x"));
+    assert.deepEqual(await changed, { kind: "search-change", query: "axb" });
   } finally {
     terminal.end();
     terminal.stop();
