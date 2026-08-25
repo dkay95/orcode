@@ -2136,7 +2136,11 @@ async function replaceSession(
 ): Promise<void> {
   const previousRoute = readableCommandSessionRoute(context);
   let selectedRoute = readableCommandSessionRoute(context, false);
-  if (next.data.route?.resolutionState === "resolved") {
+  if (next.data.routeCleared) {
+    // A provider lifecycle action deliberately detached this chat. Opening it
+    // must not inherit the current chat's route or trigger a model transition.
+    selectedRoute = undefined;
+  } else if (next.data.route?.resolutionState === "resolved") {
     if (!context.providerRoutes?.selectSessionRoute) {
       throw new ProviderSetupRequiredError();
     }

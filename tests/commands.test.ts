@@ -1458,6 +1458,68 @@ test("chat open proves a foreign exact route before config, session, agent, or c
   assert.equal(await readFile(current.path, "utf8"), currentBytes);
 });
 
+test("chat open preserves an explicitly cleared provider identity instead of adopting the current default", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "routercode-command-cleared-route-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const workspace = join(root, "project");
+  const appHome = join(root, ".orcode");
+  const currentRoute = {
+    version: 1 as const,
+    backendId: "openrouter" as const,
+    accountFingerprint: "acct_command_current_cleared_111111",
+    billingRealm: "openrouter-payg" as const,
+    requestedModelId: "openrouter/auto",
+    canonicalModelId: "openrouter/auto",
+    resolutionState: "resolved" as const,
+  };
+  const clearedRoute = {
+    version: 1 as const,
+    backendId: "kimi-code" as const,
+    accountFingerprint: "acct_command_kimi_cleared_222222",
+    billingRealm: "kimi-code-membership-provider-managed-overage" as const,
+    requestedModelId: "k3",
+    canonicalModelId: "k3",
+    resolutionState: "resolved" as const,
+  };
+  const current = SessionStore.create(workspace, appHome, "Command current default");
+  current.setPreferences(currentRoute.requestedModelId, { mode: "auto" }, currentRoute);
+  await current.save();
+  const historical = SessionStore.create(workspace, appHome, "Command cleared Kimi");
+  historical.setPreferences(clearedRoute.requestedModelId, { mode: "auto" }, clearedRoute);
+  await historical.save();
+  assert.equal(await historical.clearRouteIfExact(clearedRoute), true);
+
+  const transitions: string[] = [];
+  const adopted: string[] = [];
+  const context = {
+    workspace,
+    config: { ...structuredClone(DEFAULT_CONFIG), mainModel: currentRoute.requestedModelId },
+    configPath: join(appHome, "config.json"),
+    session: current,
+    agent: { setSession() {} },
+    providerRoutes: {
+      currentSessionRoute() { return structuredClone(currentRoute); },
+      async transitionModel(modelId: string) { transitions.push(modelId); },
+      adoptSession(next: SessionStore) { adopted.push(next.data.id); },
+    },
+    providerRouteSurface: "plain",
+    out: { text() {}, error() {} },
+  } as unknown as CommandContext;
+
+  await handleSlashCommand(`/chat open ${historical.data.id}`, context);
+
+  assert.deepEqual(transitions, []);
+  assert.deepEqual(adopted, [historical.data.id]);
+  assert.equal(context.session.data.id, historical.data.id);
+  assert.equal(context.session.data.model, "k3");
+  assert.equal(context.session.data.route, undefined);
+  assert.equal(context.session.data.routeCleared, true);
+  const reopened = await SessionStore.openById(workspace, historical.data.id, appHome);
+  assert.equal(reopened.data.model, "k3");
+  assert.equal(reopened.data.route, undefined);
+  assert.equal(reopened.data.routeCleared, true);
+});
+
 test("chat, search, session, and checkpoint commands never render unknown Kimi cost as zero", async (t) => {
   const root = await mkdtemp(join(tmpdir(), "routercode-command-unknown-cost-"));
   t.after(() => rm(root, { recursive: true, force: true }));

@@ -391,13 +391,26 @@ test("clearRouteIfExact durably removes only one complete exact route and reject
   assert.deepEqual(store.data, before);
   assert.equal(await store.clearRouteIfExact(route), true);
   assert.equal(store.data.route, undefined);
+  assert.equal(store.data.routeCleared, true);
+  const { routeCleared: _routeCleared, ...clearedWithoutTombstone } = store.data;
   assert.deepEqual(
-    { ...store.data, route: before.route, revision: before.revision },
+    { ...clearedWithoutTombstone, route: before.route, revision: before.revision },
     { ...before },
-    "model, reasoning, turns, costs, timestamps, and every non-route field stay byte-exact",
+    "model, reasoning, turns, costs, timestamps, and every pre-existing non-route field stay byte-exact",
   );
   assert.equal(store.data.revision, before.revision + 1);
-  assert.equal((await SessionStore.openById(workspace, store.data.id, appHome)).data.route, undefined);
+  assert.equal(
+    (
+      await SessionStore.openById(
+        workspace,
+        store.data.id,
+        appHome,
+        LEGACY_OPENROUTER_DEFAULT_CONNECTION,
+      )
+    ).data.route,
+    undefined,
+    "an explicitly cleared Kimi identity never projects through a legacy OpenRouter default",
+  );
   assert.equal(await store.clearRouteIfExact(route), false);
 
   const legacy = SessionStore.create(workspace, appHome, "Legacy route");
@@ -413,6 +426,56 @@ test("clearRouteIfExact durably removes only one complete exact route and reject
   const legacyBefore = structuredClone(legacy.data);
   assert.equal(await legacy.clearRouteIfExact(route), false);
   assert.deepEqual(legacy.data, legacyBefore);
+});
+
+test("clearRouteIfExact rejects future and credential-like own keys without changing the session", async (t) => {
+  const route: RouteIdentityV1 = {
+    version: 1,
+    backendId: "kimi-code",
+    accountFingerprint: "acct_kimi_clear_closed_keys",
+    billingRealm: "kimi-code-membership-provider-managed-overage",
+    requestedModelId: "k3",
+    canonicalModelId: "k3",
+    resolutionState: "resolved",
+  };
+  const root = await mkdtemp(join(tmpdir(), "orcode-clear-route-closed-keys-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const workspace = join(root, "workspace");
+  const appHome = join(root, ".orcode");
+
+  for (const extra of [
+    { connectionId: "future-kimi-connection" },
+    { apiKey: "synthetic-credential-like-value" },
+  ]) {
+    const store = SessionStore.create(workspace, appHome, `Closed keys ${Object.keys(extra)[0]}`);
+    store.setPreferences("k3", { mode: "auto" }, route);
+    await store.save();
+    const before = structuredClone(store.data);
+
+    assert.equal(
+      await store.clearRouteIfExact({ ...route, ...extra } as unknown as RouteIdentityV1),
+      false,
+    );
+    assert.deepEqual(store.data, before);
+    assert.deepEqual(
+      (await SessionStore.openById(workspace, store.data.id, appHome)).data,
+      before,
+    );
+  }
+
+  const malformedCurrent = SessionStore.create(workspace, appHome, "Closed current route");
+  malformedCurrent.setPreferences("k3", { mode: "auto" }, route);
+  await malformedCurrent.save();
+  const persistedBefore = await readFile(malformedCurrent.path, "utf8");
+  Object.assign(
+    malformedCurrent.data.route as unknown as Record<string, unknown>,
+    { connectionId: "future-current-connection", apiKey: "synthetic-current-credential" },
+  );
+  const malformedBefore = structuredClone(malformedCurrent.data);
+
+  assert.equal(await malformedCurrent.clearRouteIfExact(route), false);
+  assert.deepEqual(malformedCurrent.data, malformedBefore);
+  assert.equal(await readFile(malformedCurrent.path, "utf8"), persistedBefore);
 });
 
 test("clearRouteIfExact preserves and adopts a concurrently persisted foreign route", async (t) => {
@@ -452,6 +515,115 @@ test("clearRouteIfExact preserves and adopts a concurrently persisted foreign ro
     (await SessionStore.openById(workspace, seed.data.id, appHome)).data.route,
     openRouterRoute,
   );
+});
+
+test("clearRouteIfExact adopts a concurrent foreign model and route as one identity", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "orcode-clear-route-canonical-race-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const workspace = join(root, "workspace");
+  const appHome = join(root, ".orcode");
+  const kimiRoute: RouteIdentityV1 = {
+    version: 1,
+    backendId: "kimi-code",
+    accountFingerprint: "acct_kimi_clear_canonical_race",
+    billingRealm: "kimi-code-membership-provider-managed-overage",
+    requestedModelId: "k3",
+    canonicalModelId: "kimi-k3-0905",
+    resolutionState: "resolved",
+  };
+  const openRouterRoute: RouteIdentityV1 = {
+    version: 1,
+    backendId: "openrouter",
+    accountFingerprint: "acct_openrouter_clear_canonical_race",
+    billingRealm: "openrouter-payg",
+    requestedModelId: "openrouter/auto",
+    canonicalModelId: "openrouter/auto",
+    resolutionState: "resolved",
+  };
+  const seed = SessionStore.create(workspace, appHome, "Canonical route race");
+  seed.setPreferences("k3", { mode: "auto" }, kimiRoute);
+  await seed.save();
+  const staleLifecycleOwner = await SessionStore.openById(workspace, seed.data.id, appHome);
+  const concurrentOwner = await SessionStore.openById(workspace, seed.data.id, appHome);
+
+  staleLifecycleOwner.setPreferences("kimi-k3-0905", { mode: "effort", effort: "high" });
+  concurrentOwner.setPreferences("openrouter/auto", { mode: "auto" }, openRouterRoute);
+  await concurrentOwner.save();
+
+  assert.equal(await staleLifecycleOwner.clearRouteIfExact(kimiRoute), false);
+  assert.equal(staleLifecycleOwner.data.model, "openrouter/auto");
+  assert.deepEqual(staleLifecycleOwner.data.route, openRouterRoute);
+  await staleLifecycleOwner.save();
+  const reopened = await SessionStore.openById(workspace, seed.data.id, appHome);
+  assert.equal(reopened.data.model, "openrouter/auto");
+  assert.deepEqual(reopened.data.route, openRouterRoute);
+});
+
+test("a durable route tombstone defeats a stale canonical-model save but permits a fresh explicit rebind", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "orcode-clear-route-stale-resurrection-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const workspace = join(root, "workspace");
+  const appHome = join(root, ".orcode");
+  const route: RouteIdentityV1 = {
+    version: 1,
+    backendId: "kimi-code",
+    accountFingerprint: "acct_kimi_stale_resurrection",
+    billingRealm: "kimi-code-membership-provider-managed-overage",
+    requestedModelId: "k3",
+    canonicalModelId: "kimi-k3-0905",
+    resolutionState: "resolved",
+  };
+  const seed = SessionStore.create(workspace, appHome, "Stale route resurrection");
+  seed.setPreferences("k3", { mode: "auto" }, route);
+  await seed.save();
+  const lifecycleOwner = await SessionStore.openById(workspace, seed.data.id, appHome);
+  const staleWindow = await SessionStore.openById(workspace, seed.data.id, appHome);
+  const reorderedSameRoute: RouteIdentityV1 = {
+    resolutionState: route.resolutionState,
+    canonicalModelId: route.canonicalModelId,
+    requestedModelId: route.requestedModelId,
+    billingRealm: route.billingRealm,
+    accountFingerprint: route.accountFingerprint,
+    backendId: route.backendId,
+    version: route.version,
+  };
+  staleWindow.setPreferences(
+    "kimi-k3-0905",
+    { mode: "effort", effort: "high" },
+    reorderedSameRoute,
+  );
+  staleWindow.addTurn("assistant", "stale window turn survives without its route");
+
+  assert.equal(await lifecycleOwner.clearRouteIfExact(route), true);
+  const outcome = await staleWindow.save();
+  assert.equal(outcome.merged, true);
+  assert.equal(staleWindow.data.model, "k3");
+  assert.equal(staleWindow.data.route, undefined);
+  assert.equal(staleWindow.data.routeCleared, true);
+  assert.deepEqual(staleWindow.data.reasoning, { mode: "effort", effort: "high" });
+  assert.equal(staleWindow.data.turns.at(-1)?.content, "stale window turn survives without its route");
+
+  const cleared = await SessionStore.openById(
+    workspace,
+    seed.data.id,
+    appHome,
+    LEGACY_OPENROUTER_DEFAULT_CONNECTION,
+  );
+  assert.equal(cleared.data.model, "k3");
+  assert.equal(cleared.data.route, undefined);
+  assert.equal(cleared.data.routeCleared, true);
+
+  cleared.setPreferences("k3", { mode: "auto" }, route);
+  await cleared.save();
+  const rebound = await SessionStore.openById(
+    workspace,
+    seed.data.id,
+    appHome,
+    LEGACY_OPENROUTER_DEFAULT_CONNECTION,
+  );
+  assert.equal(rebound.data.routeCleared, undefined);
+  assert.equal(rebound.data.model, "k3");
+  assert.deepEqual(rebound.data.route, route);
 });
 
 test("a secret-bearing workspace remains listable and reopenable after save", async () => {

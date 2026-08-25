@@ -669,6 +669,73 @@ test("dashboard picker opens a second historical chat through the migrated conne
   assert.equal(config.providerSetup.cross.enabled, false);
 });
 
+test("dashboard picker keeps an explicitly cleared chat unbound from the current route", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "orcode-dashboard-cleared-chat-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const workspace = join(root, "workspace");
+  const appHome = join(root, ".orcode");
+  const currentRoute = {
+    ...bootstrapRoute("openrouter/auto"),
+    accountFingerprint: "acct_dashboard_current_cleared_111111",
+  } as unknown as NonNullable<ProviderSetupStateV2["defaultRoute"]>;
+  const kimiRoute = {
+    version: 1 as const,
+    backendId: "kimi-code" as const,
+    accountFingerprint: "acct_dashboard_kimi_cleared_222222",
+    billingRealm: "kimi-code-membership-provider-managed-overage" as const,
+    requestedModelId: "k3",
+    canonicalModelId: "k3",
+    resolutionState: "resolved" as const,
+  };
+  const current = SessionStore.create(workspace, appHome, "Dashboard current");
+  current.setPreferences(currentRoute.requestedModelId, { mode: "auto" }, currentRoute);
+  await current.save();
+  const historical = SessionStore.create(workspace, appHome, "Dashboard cleared Kimi");
+  historical.setPreferences("k3", { mode: "auto" }, kimiRoute);
+  historical.addTurn("user", "cleared historical turn");
+  await historical.save();
+  assert.equal(await historical.clearRouteIfExact(kimiRoute), true);
+
+  const transitions: string[] = [];
+  const adopted: string[] = [];
+  const config = structuredClone(DEFAULT_CONFIG);
+  config.mainModel = currentRoute.requestedModelId;
+  const runtimeContext = {
+    workspace,
+    configPath: join(appHome, "config.json"),
+    config,
+    session: current,
+    agent: { setSession() {} },
+    localRuntime: { setSession() {} },
+    providerRuntime: {
+      migratedSessionConnection() { return undefined; },
+      currentSessionRoute() { return structuredClone(currentRoute); },
+      async transitionModel(modelId: string) { transitions.push(modelId); },
+      adoptSession(next: SessionStore) { adopted.push(next.data.id); },
+    },
+    providerRouteSurface: "fullscreen",
+  };
+  const ui = {
+    async pickChoice() {
+      return { value: historical.data.id, label: historical.data.title };
+    },
+    addMessage() {},
+    loadTurns() {},
+    setStatus() {},
+  };
+
+  assert.equal(await pickDashboardChat(ui as never, runtimeContext as never, false), true);
+  assert.deepEqual(transitions, []);
+  assert.deepEqual(adopted, [historical.data.id]);
+  assert.equal(runtimeContext.session.data.model, "k3");
+  assert.equal(runtimeContext.session.data.route, undefined);
+  assert.equal(runtimeContext.session.data.routeCleared, true);
+  const reopened = await SessionStore.openById(workspace, historical.data.id, appHome);
+  assert.equal(reopened.data.model, "k3");
+  assert.equal(reopened.data.route, undefined);
+  assert.equal(reopened.data.routeCleared, true);
+});
+
 test("dashboard proves a foreign historical route before current chat, config, or agent mutation", async (t) => {
   const root = await mkdtemp(join(tmpdir(), "orcode-dashboard-foreign-route-"));
   t.after(() => rm(root, { recursive: true, force: true }));
@@ -1523,6 +1590,18 @@ const OPENROUTER_LIFECYCLE_ROUTE = {
   resolutionState: "resolved",
 } as const;
 
+const LEGACY_OPENROUTER_LIFECYCLE_CONNECTION: ProviderConnectionStateV1 = {
+  id: "legacy-openrouter-lifecycle-connection",
+  backendId: "openrouter",
+  enabled: true,
+  maturity: "stable",
+  credentialSlot: "legacy:inference",
+  accountFingerprint: "acct_legacy_openrouter_lifecycle",
+  accountFingerprintState: "provisional",
+  billingRealm: "openrouter-payg",
+  lastHealth: null,
+};
+
 function kimiLifecycleState(options: {
   kimiEnabled?: boolean;
   includeOpenRouter?: boolean;
@@ -1594,6 +1673,7 @@ function kimiLifecycleRuntimeFixture(options: {
       execute(intent: Record<string, unknown>, surface: "plain"): Promise<Record<string, unknown>>;
       ensureRunnableRoute(): Record<string, unknown>;
       adoptCredentialActivation(route: Record<string, unknown>, persisted: boolean, secret: string): void;
+      adoptSession(session: SessionStore): void;
       transitionModel(modelId: string, canonicalModelId?: string, surface?: "plain"): Promise<void>;
       runSetup: (...args: unknown[]) => Promise<Record<string, unknown>>;
     };
@@ -2010,13 +2090,34 @@ test("Kimi disable clears and durably saves only the matching persisted session 
 
   assert.equal(result.kind, "changed");
   assert.equal(session.data.route, undefined);
-  assert.deepEqual({ ...session.data, route: before.route, revision: before.revision }, before);
-  const reopened = await SessionStore.openById(workspace, session.data.id, appHome);
+  assert.equal(session.data.routeCleared, true);
+  const { routeCleared: _routeCleared, ...clearedWithoutTombstone } = session.data;
+  assert.deepEqual({ ...clearedWithoutTombstone, route: before.route, revision: before.revision }, before);
+  const reopened = await SessionStore.openById(
+    workspace,
+    session.data.id,
+    appHome,
+    LEGACY_OPENROUTER_LIFECYCLE_CONNECTION,
+  );
   assert.equal(reopened.data.route, undefined);
+  assert.equal(reopened.data.routeCleared, true);
   assert.equal(reopened.data.model, "k3");
   assert.deepEqual(reopened.data.reasoning, before.reasoning);
   assert.deepEqual(reopened.data.turns, before.turns);
   assert.equal(reopened.data.costs.costKnowledge, "unknown");
+  const restartedRuntime = kimiLifecycleRuntimeFixture({
+    state: kimiLifecycleState({
+      kimiEnabled: false,
+      includeOpenRouter: true,
+      defaultBackend: "openrouter",
+    }),
+    session: reopened,
+  });
+  assert.throws(
+    () => restartedRuntime.runtime.ensureRunnableRoute(),
+    (error: unknown) => error instanceof Error
+      && (error as Error & { code?: string }).code === "provider-setup-required",
+  );
 });
 
 test("Kimi disable preserves a concurrently persisted OpenRouter session route", async (t) => {
@@ -2048,6 +2149,36 @@ test("Kimi disable preserves a concurrently persisted OpenRouter session route",
   assert.deepEqual(
     (await SessionStore.openById(workspace, seed.data.id, appHome)).data.route,
     OPENROUTER_LIFECYCLE_ROUTE,
+  );
+});
+
+test("session adoption keeps an explicitly cleared chat unbound from the current OpenRouter default", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "orcode-kimi-cleared-session-adoption-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const workspace = join(root, "workspace");
+  const appHome = join(root, ".orcode");
+  const current = SessionStore.create(workspace, appHome, "Current OpenRouter");
+  current.setPreferences("openrouter/auto", { mode: "auto" }, OPENROUTER_LIFECYCLE_ROUTE);
+  await current.save();
+  const cleared = SessionStore.create(workspace, appHome, "Cleared Kimi");
+  cleared.setPreferences("k3", { mode: "auto" }, KIMI_LIFECYCLE_ROUTE);
+  await cleared.save();
+  assert.equal(await cleared.clearRouteIfExact(KIMI_LIFECYCLE_ROUTE), true);
+
+  const fixture = kimiLifecycleRuntimeFixture({
+    state: kimiLifecycleState({ includeOpenRouter: true, defaultBackend: "openrouter" }),
+    session: current,
+  });
+  fixture.runtime.adoptCredentialActivation(OPENROUTER_LIFECYCLE_ROUTE, true, "");
+  fixture.runtime.adoptSession(cleared);
+
+  assert.equal(cleared.data.model, "k3");
+  assert.equal(cleared.data.route, undefined);
+  assert.equal(cleared.data.routeCleared, true);
+  assert.throws(
+    () => fixture.runtime.ensureRunnableRoute(),
+    (error: unknown) => error instanceof Error
+      && (error as Error & { code?: string }).code === "provider-setup-required",
   );
 });
 
@@ -2143,9 +2274,28 @@ test("Kimi logout deletes only its exact slot and durably clears the matching se
   assert.equal(fixture.stateStore.read().defaultRoute, null);
   assert.equal(fixture.stateStore.read().cross.enabled, false);
   assert.equal(session.data.route, undefined);
-  const reopened = await SessionStore.openById(workspace, session.data.id, appHome);
+  assert.equal(session.data.routeCleared, true);
+  const reopened = await SessionStore.openById(
+    workspace,
+    session.data.id,
+    appHome,
+    LEGACY_OPENROUTER_LIFECYCLE_CONNECTION,
+  );
   assert.equal(reopened.data.route, undefined);
+  assert.equal(reopened.data.routeCleared, true);
   assert.deepEqual(reopened.data.turns, session.data.turns);
+  const restartedRuntime = kimiLifecycleRuntimeFixture({
+    state: kimiLifecycleState({
+      includeOpenRouter: true,
+      defaultBackend: "openrouter",
+    }),
+    session: reopened,
+  });
+  assert.throws(
+    () => restartedRuntime.runtime.ensureRunnableRoute(),
+    (error: unknown) => error instanceof Error
+      && (error as Error & { code?: string }).code === "provider-setup-required",
+  );
   assert.equal(await forgetJournal.readPending(), null);
   assert.equal(fixture.calls.includes("kimi:logout"), true);
 });
@@ -5595,6 +5745,86 @@ test("failed startup proof for a foreign current session cannot fall back to the
   );
   assert.deepEqual(session.data.route, foreignRoute);
   assert.equal(config.mainModel, DEFAULT_CONFIG.mainModel);
+});
+
+test("startup keeps a cleared session setup-required before automatic environment activation", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "orcode-cleared-startup-environment-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const workspace = join(root, "workspace");
+  const appHome = join(root, ".orcode");
+  const session = SessionStore.create(workspace, appHome, "Cleared startup Kimi");
+  session.setPreferences("k3", { mode: "auto" }, KIMI_LIFECYCLE_ROUTE);
+  await session.save();
+  assert.equal(await session.clearRouteIfExact(KIMI_LIFECYCLE_ROUTE), true);
+  const initial: ProviderSetupStateV2 = {
+    schemaVersion: 2,
+    revision: 0,
+    lifecycle: "never-configured",
+    connections: [],
+    defaultRoute: null,
+    cross: { enabled: false, preferredLead: null, preferredChallenger: null },
+  };
+  const calls: string[] = [];
+  const config = structuredClone(DEFAULT_CONFIG);
+  config.providerSetup = structuredClone(initial);
+  const Runtime = (cliModule as unknown as {
+    DefaultProviderRuntime: new (...args: unknown[]) => {
+      inspectStartup(): Promise<Record<string, unknown>>;
+      runSetup: (...args: unknown[]) => Promise<Record<string, unknown>>;
+      adoptCredentialActivation(route: Record<string, unknown>, persisted: boolean, secret: string): void;
+    };
+  }).DefaultProviderRuntime;
+  const runtime = new Runtime(
+    {},
+    {},
+    { entries() { calls.push("registry"); return []; } },
+    new ProviderStateStore(initial),
+    {
+      nextStartupGeneration() { return 1; },
+      async inspectStartup() {
+        calls.push("inspect");
+        return {
+          mode: "setup-required",
+          generation: 1,
+          defaultRoute: null,
+          readyRoutes: [],
+          warnings: [],
+          crossEnabled: false,
+        };
+      },
+      ensureRunnableRoute() {
+        calls.push("ensure");
+        return structuredClone(OPENROUTER_LIFECYCLE_ROUTE);
+      },
+    },
+    {},
+    { beginRun() { return () => undefined; } },
+    {},
+    null,
+    "synthetic-environment-secret",
+    "openrouter/auto",
+    config,
+    session,
+    {
+      credentialAuthority: {},
+      adapter: {},
+      forgetJournal: {},
+      async recover() { calls.push("recover"); },
+    },
+  );
+  runtime.runSetup = async () => {
+    calls.push("automatic-setup");
+    runtime.adoptCredentialActivation(OPENROUTER_LIFECYCLE_ROUTE, false, "synthetic-environment-secret");
+    return { kind: "ready" };
+  };
+
+  const result = await runtime.inspectStartup();
+
+  assert.equal(result.mode, "setup-required");
+  assert.deepEqual(calls, ["recover"]);
+  assert.equal(session.data.model, "k3");
+  assert.equal(session.data.route, undefined);
+  assert.equal(session.data.routeCleared, true);
 });
 
 test("provider confirmation tokens bind every destructive intent to the exact fenced provider identity", async () => {

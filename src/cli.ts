@@ -949,10 +949,24 @@ export class DefaultProviderRuntime implements ProviderRuntime {
     const generation = typeof this.orchestrator.nextStartupGeneration === "function"
       ? this.orchestrator.nextStartupGeneration()
       : ++this.#startupAttemptGeneration;
+    const sessionRouteCleared = this.session?.data.routeCleared === true;
     const startup = await runProviderStartupAttempt({
       generation,
       recover: (context) => this.authorityOptions?.recover(context) ?? Promise.resolve(),
       inspect: async (context) => {
+        if (sessionRouteCleared) {
+          // Recovery still runs, but an intentionally detached chat performs
+          // no provider inspection until its owner explicitly enters setup.
+          this.#synchronizeAuthoritativeProviderState();
+          return {
+            mode: "setup-required",
+            generation: context.generation,
+            defaultRoute: null,
+            readyRoutes: [],
+            warnings: [],
+            crossEnabled: false,
+          };
+        }
         const result = await this.orchestrator.inspectStartup({
           signal: context.signal,
           deadlineAt: context.deadlineAt,
@@ -979,6 +993,7 @@ export class DefaultProviderRuntime implements ProviderRuntime {
         return resolved;
       },
       automaticEnvironment: async (result, context) => {
+        if (sessionRouteCleared) return result;
         if (
           result.mode !== "setup-required"
           && result.mode !== "route-choice-required"
@@ -1002,6 +1017,7 @@ export class DefaultProviderRuntime implements ProviderRuntime {
       },
       bindRuntime: async (result, context) => {
         if (!this.authorityOptions || !result.defaultRoute) return;
+        if (this.session?.data.routeCleared) throw new ProviderSetupRequiredError();
         if (
           this.#sessionRoute
           && !this.#sessionRoutePersisted
@@ -1330,6 +1346,18 @@ export class DefaultProviderRuntime implements ProviderRuntime {
 
   adoptSession(session: SessionStore): void {
     const requestedRoute = validateRouteIdentityV1(session.data.route);
+    if (session.data.routeCleared) {
+      // Explicitly detached historical chats are setup-required. Adopt the
+      // owner, but never inherit the previous chat or provider default route.
+      this.#processRouteGeneration += 1;
+      this.#sessionRoute = null;
+      this.#sessionRoutePersisted = false;
+      this.#pendingSessionBinding = null;
+      this.#preparedRoles = null;
+      this.session = session;
+      this.#synchronizeAuthoritativeProviderState();
+      return;
+    }
     const pending = this.#pendingSessionBinding;
     if (pending) {
       if (
@@ -1501,6 +1529,7 @@ export class DefaultProviderRuntime implements ProviderRuntime {
   ensureRunnableRoute(): RouteIdentityV1 {
     this.#assertDesiredKimiPolicy();
     if (this.#pendingSessionBinding) throw new ProviderSetupRequiredError();
+    if (this.session?.data.routeCleared) throw new ProviderSetupRequiredError();
     const requiredSessionRoute = validateRouteIdentityV1(this.session?.data.route);
     if (
       requiredSessionRoute?.resolutionState === "resolved"
@@ -5968,7 +5997,11 @@ export async function pickDashboardChat(
       migratedConnection,
     );
     const historicalRoute = validateRouteIdentityV1(next.data.route);
-    if (historicalRoute?.resolutionState === "resolved") {
+    if (next.data.routeCleared) {
+      // The lifecycle tombstone is authoritative over the route of the chat
+      // that happened to be open before the dashboard switch.
+      selectedRoute = null;
+    } else if (historicalRoute?.resolutionState === "resolved") {
       if (typeof context.providerRuntime.selectSessionRoute !== "function") {
         throw new ProviderSetupRequiredError();
       }
@@ -5991,6 +6024,7 @@ export async function pickDashboardChat(
   await saveDashboardSessionPreferences(context, ui, previousRoute ?? undefined);
   commitDashboardSessionHandoff(context, next);
   if (selectedRoute) context.config.mainModel = selectedRoute.requestedModelId;
+  if (!selectedRoute && next.data.model) context.config.mainModel = next.data.model;
   if (next.data.reasoning) {
     setReasoningSetting(context.config, next.data.reasoning);
   }

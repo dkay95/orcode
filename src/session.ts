@@ -91,6 +91,8 @@ export interface PersistedSessionData extends SessionData {
   toolCalls: SessionToolCall[];
   /** local day (YYYY-MM-DD) -> USD spent on that day in this chat. */
   dailySpendUsd: Record<string, number>;
+  /** Explicit tombstone: this model was deliberately detached from its route. */
+  routeCleared?: true;
 }
 
 export interface SaveOutcome {
@@ -304,11 +306,14 @@ export class SessionStore {
         throw new Error(ROUTE_MODEL_MISMATCH_MESSAGE);
       }
       this.#data.route = persistable;
+      delete this.#data.routeCleared;
       this.#pendingLegacyRouteProjection = false;
     } else if (this.#data.route === undefined || !routeOwnsModel(this.#data.route, trimmedModel)) {
       // A route-less update keeps the exact current route as long as it owns
       // the model (requested or canonical id); it never synthesizes one.
+      const detachedOwnedRoute = this.#data.route !== undefined;
       delete this.#data.route;
+      if (detachedOwnedRoute) this.#data.routeCleared = true;
       this.#pendingLegacyRouteProjection = false;
     }
     this.#data.model = trimmedModel;
@@ -318,7 +323,7 @@ export class SessionStore {
 
   /** Atomically clears only the exact resolved durable route named by a provider lifecycle action. */
   async clearRouteIfExact(expectedRoute: RouteIdentityV1): Promise<boolean> {
-    const expected = validateRouteIdentityV1(expectedRoute);
+    const expected = persistableSessionRoute(expectedRoute);
     if (!expected || !sameExactResolvedRoute(this.#data.route, expected)) return false;
     return enqueueWrite(this.path, () => this.#clearRouteIfExactNow(expected));
   }
@@ -338,7 +343,7 @@ export class SessionStore {
       if (!sameExactResolvedRoute(this.#data.route, expected)) return false;
       if (foreign.kind === "unreadable") return false;
       if (foreign.kind === "missing") {
-        delete this.#data.route;
+        markRouteCleared(this.#data);
         this.#pendingLegacyRouteProjection = false;
         return true;
       }
@@ -346,8 +351,7 @@ export class SessionStore {
         const reconciled = sameValue(foreign.data, this.#base)
           ? structuredClone(this.#data)
           : mergeSessions(this.#base, this.#data, foreign.data);
-        if (foreign.data.route === undefined) delete reconciled.route;
-        else reconciled.route = structuredClone(foreign.data.route);
+        adoptSessionIdentity(reconciled, foreign.data);
         reconciled.revision = Math.max(reconciled.revision, foreign.revision);
         this.#data = reconciled;
         this.#base = structuredClone(foreign.data);
@@ -358,7 +362,7 @@ export class SessionStore {
       const next = sameValue(foreign.data, this.#base)
         ? structuredClone(this.#data)
         : mergeSessions(this.#base, this.#data, foreign.data);
-      delete next.route;
+      markRouteCleared(next);
       next.revision = Math.max(next.revision, foreign.revision) + 1;
       await writeFileAtomicSecure(
         this.path,
@@ -400,6 +404,7 @@ export class SessionStore {
     }));
     fork.#data.model = this.#data.model;
     fork.#data.route = this.#data.route ? structuredClone(this.#data.route) : undefined;
+    fork.#data.routeCleared = this.#data.routeCleared;
     fork.#data.reasoning = this.#data.reasoning
       ? structuredClone(this.#data.reasoning)
       : undefined;
@@ -451,12 +456,13 @@ export class SessionStore {
    * accounting must not be resettable with /clear.
    */
   clear(): void {
-    const { id, title, workspace, model, route, reasoning, createdAt } = this.#data;
+    const { id, title, workspace, model, route, routeCleared, reasoning, createdAt } = this.#data;
     const costKnowledge = knowledgeOf(this.#data.costs);
     this.#data = {
       ...emptySession(workspace, id, title),
       model,
       route,
+      routeCleared,
       reasoning,
       createdAt,
       revision: this.#data.revision,
@@ -1081,6 +1087,10 @@ function normalizeSession(
   const model = typeof value.model === "string" && value.model.trim()
     ? value.model.trim()
     : null;
+  if (value.routeCleared !== undefined && value.routeCleared !== true) {
+    return null;
+  }
+  const routeCleared = value.routeCleared === true;
   let route: RouteIdentityV1 | null;
   if (value.route !== undefined) {
     // A chat that carries a route key owns exactly that identity. A partial,
@@ -1088,11 +1098,13 @@ function normalizeSession(
     // is corrupt state: fail closed rather than drop the route and let the
     // model string be re-bound to whatever backend is the current default.
     route = persistableSessionRoute(value.route);
-    if (route === null || model === null || !routeOwnsModel(route, model)) {
+    if (routeCleared || route === null || model === null || !routeOwnsModel(route, model)) {
       return null;
     }
   } else {
-    route = model !== null && isActiveMigratedOpenRouterConnection(providerConnection)
+    route = !routeCleared
+      && model !== null
+      && isActiveMigratedOpenRouterConnection(providerConnection)
       ? mapLegacyOpenRouterModel(model, providerConnection)
       : null;
   }
@@ -1112,6 +1124,7 @@ function normalizeSession(
       ? { model }
       : {}),
     ...(route !== null ? { route } : {}),
+    ...(routeCleared ? { routeCleared: true as const } : {}),
     ...(isReasoningSetting(value.reasoning)
       ? { reasoning: structuredClone(value.reasoning) }
       : {}),
@@ -1648,7 +1661,7 @@ export function mergeSessions(
       mine.dailySpendUsd,
       theirs.dailySpendUsd,
     ),
-    ...pickField(sessionIdentity(base), sessionIdentity(mine), sessionIdentity(theirs)),
+    ...mergeSessionIdentity(base, mine, theirs),
     ...(pickField(base.reasoning, mine.reasoning, theirs.reasoning) !== undefined
       ? { reasoning: pickField(base.reasoning, mine.reasoning, theirs.reasoning) }
       : {}),
@@ -1660,6 +1673,7 @@ export function mergeSessions(
 interface SessionIdentity {
   model?: string;
   route?: RouteIdentityV1;
+  routeCleared?: true;
 }
 
 /**
@@ -1670,7 +1684,54 @@ function sessionIdentity(data: PersistedSessionData): SessionIdentity {
   return {
     ...(data.model !== undefined ? { model: data.model } : {}),
     ...(data.route !== undefined ? { route: data.route } : {}),
+    ...(data.routeCleared ? { routeCleared: true as const } : {}),
   };
+}
+
+/**
+ * An exact-route lifecycle tombstone defeats a stale window that still owns
+ * the route from its base. A genuinely different explicit route remains a
+ * valid concurrent rebind and is not swallowed by clearing the old tuple.
+ */
+function mergeSessionIdentity(
+  base: PersistedSessionData,
+  mine: PersistedSessionData,
+  theirs: PersistedSessionData,
+): SessionIdentity {
+  if (base.route !== undefined) {
+    const mineRetainsBaseRoute = samePersistableSessionRoute(mine.route, base.route);
+    const theirsRetainsBaseRoute = samePersistableSessionRoute(theirs.route, base.route);
+    if (theirs.routeCleared && mineRetainsBaseRoute) return sessionIdentity(theirs);
+    if (mine.routeCleared && theirsRetainsBaseRoute) return sessionIdentity(mine);
+    if (mine.routeCleared && theirs.route !== undefined && !theirsRetainsBaseRoute) {
+      return sessionIdentity(theirs);
+    }
+    if (theirs.routeCleared && mine.route !== undefined && !mineRetainsBaseRoute) {
+      return sessionIdentity(mine);
+    }
+  }
+  return pickField(sessionIdentity(base), sessionIdentity(mine), sessionIdentity(theirs));
+}
+
+/** Replaces the complete provider/model identity without mixing either side. */
+function adoptSessionIdentity(
+  target: PersistedSessionData,
+  authoritative: PersistedSessionData,
+): void {
+  delete target.model;
+  delete target.route;
+  delete target.routeCleared;
+  if (authoritative.model !== undefined) target.model = authoritative.model;
+  if (authoritative.route !== undefined) {
+    target.route = structuredClone(authoritative.route);
+  }
+  if (authoritative.routeCleared) target.routeCleared = true;
+}
+
+/** Preserves the user's model label while durably blocking legacy/default rebinding. */
+function markRouteCleared(data: PersistedSessionData): void {
+  delete data.route;
+  data.routeCleared = true;
 }
 
 function pickField<T>(base: T, mine: T, theirs: T): T {
@@ -1684,17 +1745,28 @@ function sameExactResolvedRoute(
   candidate: unknown,
   expected: RouteIdentityV1,
 ): boolean {
-  const current = validateRouteIdentityV1(candidate);
+  const current = persistableSessionRoute(candidate);
+  const exact = persistableSessionRoute(expected);
   return current?.resolutionState === "resolved"
     && current.canonicalModelId !== null
-    && expected.resolutionState === "resolved"
-    && expected.canonicalModelId !== null
+    && exact?.resolutionState === "resolved"
+    && exact.canonicalModelId !== null
+    && samePersistableSessionRoute(current, exact);
+}
+
+/** Closed, insertion-order-independent equality for the seven route fields. */
+function samePersistableSessionRoute(left: unknown, right: unknown): boolean {
+  const current = persistableSessionRoute(left);
+  const expected = persistableSessionRoute(right);
+  return current !== null
+    && expected !== null
     && current.version === expected.version
     && current.backendId === expected.backendId
     && current.accountFingerprint === expected.accountFingerprint
     && current.billingRealm === expected.billingRealm
     && current.requestedModelId === expected.requestedModelId
-    && current.canonicalModelId === expected.canonicalModelId;
+    && current.canonicalModelId === expected.canonicalModelId
+    && current.resolutionState === expected.resolutionState;
 }
 
 function sameValue(left: unknown, right: unknown): boolean {
