@@ -494,7 +494,7 @@ The test suite never calls a paid model.
 `npm run check:package`, `npm run test:migration`,
 `npm run test:release-regressions`, and `npm run test:pty` are local release
 gates. Run the metadata gate with the exact intended tag, for example
-`npm run check:release -- --tag v0.4.1`. The package check performs both
+`npm run check:release -- --tag v0.7.0`. The package check performs both
 `npm pack --dry-run --json` and a real
 tarball install, scans publishable text for recognizable credentials and
 private checkout paths, and runs both CLI aliases. The PTY gate is a real POSIX
@@ -525,7 +525,7 @@ never publishes. A trusted initiator dispatches the workflow explicitly from the
 existing release tag and repeats the same tag as input:
 
 ```bash
-TAG=v0.4.1
+TAG=v0.7.0
 gh workflow run release.yml --repo dkay95/orcode --ref "$TAG" -f tag="$TAG"
 ```
 

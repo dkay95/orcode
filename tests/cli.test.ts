@@ -205,7 +205,7 @@ test("runCli help and version return before every startup and model side effect"
     assert.equal(exitCode, 0);
     assert.deepEqual(calls, []);
     assert.equal(stderr.length, 0);
-    assert.match(stdout.join(""), flag === "--help" ? /Usage|Verwendung|Optionen/i : /orcode 0\.4\.1/);
+    assert.match(stdout.join(""), flag === "--help" ? /Usage|Verwendung|Optionen/i : /orcode 0\.7\.0/);
   }
 });
 
@@ -3716,7 +3716,7 @@ test("automatic environment setup selects only one exact compatible configured r
 
 test("banner, help, and version derive from the same package metadata", () => {
   const version = readPackageVersion();
-  assert.equal(version, "0.4.1");
+  assert.equal(version, "0.7.0");
   assert.match(renderCliBanner("/tmp/workspace", "provider/model"), new RegExp(`orcode ${version}`));
   assert.match(renderCliHelp(), new RegExp(`orcode ${version}`));
   const source = readFileSync(new URL("../src/cli.ts", import.meta.url), "utf8");

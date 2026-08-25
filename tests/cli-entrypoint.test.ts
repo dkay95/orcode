@@ -189,7 +189,7 @@ test("the real --help entrypoint exits before app-home, key, provider, or model 
   }
 });
 
-test("release metadata packages both CLI names at version 0.4.1", async () => {
+test("release metadata packages both CLI names at version 0.7.0", async () => {
   const packageJson = JSON.parse(
     await readFile(join(PROJECT_ROOT, "package.json"), "utf8"),
   ) as {
@@ -213,21 +213,21 @@ test("release metadata packages both CLI names at version 0.4.1", async () => {
     routercode: "./dist/cli.js",
   };
   assert.equal(packageJson.name, "orcode");
-  assert.equal(packageJson.version, "0.4.1");
+  assert.equal(packageJson.version, "0.7.0");
   assert.deepEqual(packageJson.bin, bins);
   assert.equal(packageJson.scripts["install:user"], "node scripts/install-user.mjs");
   assert.ok(packageJson.files.includes("CHANGELOG.md"));
   assert.ok(packageJson.files.includes("scripts/install-user.mjs"));
   assert.ok(packageJson.files.includes("scripts/check-package.mjs"));
   assert.equal(packageLock.name, "orcode");
-  assert.equal(packageLock.version, "0.4.1");
+  assert.equal(packageLock.version, "0.7.0");
   assert.equal(packageLock.packages[""]?.name, "orcode");
-  assert.equal(packageLock.packages[""]?.version, "0.4.1");
+  assert.equal(packageLock.packages[""]?.version, "0.7.0");
   assert.deepEqual(packageLock.packages[""]?.bin, {
     orcode: "dist/cli.js",
     routercode: "dist/cli.js",
   });
-  assert.match(changelog, /^## \[0\.4\.1\] - \d{4}-\d{2}-\d{2}$/m);
+  assert.match(changelog, /^## \[0\.7\.0\] - \d{4}-\d{2}-\d{2}$/m);
 });
 
 test("release scripts expose bounded package, metadata, migration, regression, and PTY gates", async () => {

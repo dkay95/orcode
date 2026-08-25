@@ -241,7 +241,7 @@ test("metadata inspection sends one exact GET /models request and never a comple
     method: "GET",
     headers: {
       Authorization: "Bearer fixture-kimi-membership-key",
-      "User-Agent": "orcode/0.4.1",
+      "User-Agent": "orcode/0.7.0",
       Accept: "application/json",
     },
     redirect: "error",

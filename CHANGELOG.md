@@ -9,6 +9,8 @@ breaking changes.
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-08-25
+
 ### Added
 
 - Kimi Code membership provider (**Preview**). `/provider connect kimi-code`

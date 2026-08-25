@@ -3,7 +3,7 @@ import { normalizeProviderSecret } from "./credentials.js";
 
 export const KIMI_CODE_API_BASE = "https://api.kimi.com/coding/v1" as const;
 export const KIMI_CODE_MODELS_ENDPOINT = `${KIMI_CODE_API_BASE}/models` as const;
-export const KIMI_CODE_USER_AGENT = "orcode/0.4.1" as const;
+export const KIMI_CODE_USER_AGENT = "orcode/0.7.0" as const;
 export const KIMI_CODE_MAX_METADATA_BODY_BYTES = 64 * 1024;
 const KIMI_CODE_MAX_CATALOG_ITEMS = 64;
 
