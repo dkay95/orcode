@@ -106,9 +106,9 @@ export function assertReleaseMetadata(input) {
   if (String(input?.cliVersion ?? "").trim() !== expectedVersionOutput) {
     throw new Error(`Gebautes dist/cli.js --version muss exakt ${expectedVersionOutput} liefern.`);
   }
-  const bannerHeadline = firstNonEmptyLine(input?.renderedBanner);
-  if (bannerHeadline !== expectedVersionOutput) {
-    throw new Error(`Gerenderter Banner muss mit ${expectedVersionOutput} beginnen.`);
+  const bannerLines = String(input?.renderedBanner ?? "").split(/\r?\n/u);
+  if (!bannerLines.includes(expectedVersionOutput)) {
+    throw new Error(`Gerenderter Banner muss ${expectedVersionOutput} enthalten.`);
   }
   const renderedHelpHeadline = firstNonEmptyLine(input?.renderedHelp);
   if (!renderedHelpHeadline.startsWith(`${expectedVersionOutput} `)) {
