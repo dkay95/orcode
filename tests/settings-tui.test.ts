@@ -1194,6 +1194,62 @@ test("ein fehlerhaftes SGR-Frame verschluckt seine Bytes, aber nicht den Suffix"
   }
 });
 
+test("malformed SGR bleibt an jeder Chunkgrenze unterdrückt und liefert den Suffix einmal", async () => {
+  const malformed = "\u001b[<x;2;3M";
+  for (let split = 1; split < malformed.length; split += 1) {
+    const initial = view({ search: { active: true, query: "" } });
+    const { terminal, stdin } = settingsUi();
+    terminal.start();
+    terminal.begin(initial);
+    try {
+      const changed = terminal.nextIntent(initial);
+      stdin.emit("data", Buffer.from(malformed.slice(0, split)));
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      stdin.emit("data", Buffer.from(`${malformed.slice(split)}z`));
+      assert.deepEqual(
+        await changed,
+        { kind: "search-change", query: "z" },
+        `split ${split}`,
+      );
+    } finally {
+      terminal.end();
+      terminal.stop();
+    }
+  }
+});
+
+test("valides SGR-Klickframe bleibt an jeder Chunkgrenze vollständig", async () => {
+  const initial = view({ search: { active: true, query: "" } });
+  const target = build(80, 24, { search: { active: true, query: "" } }).hitTargets.find(
+    ({ intent }) => intent.kind === "select-item" && intent.itemId === "main-model",
+  );
+  assert.ok(target);
+  const packet = `\u001b[<0;${target.columnStart};${target.row}M`;
+  for (let split = 1; split < packet.length; split += 1) {
+    const { terminal, stdin } = settingsUi();
+    terminal.start();
+    terminal.begin(initial);
+    try {
+      terminal.frame();
+      const selected = terminal.nextIntent(initial);
+      stdin.emit("data", Buffer.from(packet.slice(0, split)));
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      stdin.emit("data", Buffer.from(packet.slice(split)));
+      assert.deepEqual(
+        await selected,
+        { kind: "select-item", itemId: "main-model" },
+        `split ${split}`,
+      );
+      const changed = terminal.nextIntent(initial);
+      stdin.emit("data", Buffer.from("z"));
+      assert.deepEqual(await changed, { kind: "search-change", query: "z" });
+    } finally {
+      terminal.end();
+      terminal.stop();
+    }
+  }
+});
+
 test("normaler Raw-Präfix bleibt vor einem SGR-Klick geordnet und Mausbytes bleiben unsichtbar", async () => {
   const searchView = view({ search: { active: true, query: "" } });
   const target = build(80, 24, { search: { active: true, query: "" } }).hitTargets.find(

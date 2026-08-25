@@ -113,6 +113,7 @@ interface MouseKeypressToken {
   raw: string;
   consumed: number;
   complete: boolean;
+  malformed: boolean;
   click: { readonly column: number; readonly row: number } | null;
   passthroughSuffix: boolean;
   readonly surface: UiSurface;
@@ -2084,13 +2085,52 @@ export class TerminalUi implements SettingsSurface {
   #onTerminalData = (chunk: string | Buffer): void => {
     if (!this.#active) return;
     const text = typeof chunk === "string" ? chunk : chunk.toString("utf8");
-    const buffered = this.#mouseProtocolBuffer;
-    const sequence = `${buffered}${text}`;
-    const openToken = this.#openMouseKeypressToken;
+    let buffered = this.#mouseProtocolBuffer;
+    let sequence = `${buffered}${text}`;
+    let openToken = this.#openMouseKeypressToken;
     let recoverBufferedPrefix = this.#mouseProtocolBufferRecovery;
     this.#mouseProtocolBuffer = "";
     this.#mouseProtocolBufferRecovery = false;
     this.#openMouseKeypressToken = null;
+
+    if (openToken?.malformed) {
+      const capacity = Math.max(0, MAX_MOUSE_SEQUENCE_LENGTH - openToken.raw.length);
+      let freshCursor = 0;
+      let recoveryEscape = false;
+      while (freshCursor < text.length && freshCursor < capacity) {
+        const value = text[freshCursor]!;
+        if (/[\d;]/u.test(value)) {
+          openToken.raw += value;
+          freshCursor += 1;
+          continue;
+        }
+        if (value === "M" || value === "m") {
+          openToken.raw += value;
+          freshCursor += 1;
+          openToken.complete = true;
+        } else {
+          openToken.complete = true;
+          recoveryEscape = value === "\u001b";
+        }
+        break;
+      }
+      if (
+        !openToken.complete
+        && freshCursor === text.length
+        && openToken.raw.length < MAX_MOUSE_SEQUENCE_LENGTH
+      ) {
+        this.#mouseProtocolBuffer = openToken.raw;
+        this.#openMouseKeypressToken = openToken;
+        return;
+      }
+      if (!openToken.complete) openToken.complete = true;
+      buffered = "";
+      sequence = text.slice(freshCursor);
+      openToken = null;
+      recoverBufferedPrefix = recoveryEscape
+        && sequence.length < 3
+        && "\u001b[<".startsWith(sequence);
+    }
 
     if (buffered && recoverBufferedPrefix) {
       const confirmedMouse = sequence.startsWith("\u001b[<");
@@ -2158,9 +2198,21 @@ export class TerminalUi implements SettingsSurface {
       // the same chunk can still reach readline exactly once.
       const terminator = rest.slice(3, MAX_MOUSE_SEQUENCE_LENGTH).search(/[Mm]/u);
       const nextEscape = rest.indexOf("\u001b", 1);
+      if (
+        terminator < 0
+        && nextEscape < 0
+        && rest.length < MAX_MOUSE_SEQUENCE_LENGTH
+      ) {
+        if (sequence.length > freshStart) token.raw += sequence.slice(freshStart);
+        token.malformed = true;
+        token.click = null;
+        this.#mouseProtocolBuffer = token.raw;
+        this.#openMouseKeypressToken = token;
+        break;
+      }
       const terminatorEnd = terminator >= 0
         ? escape + 3 + terminator + 1
-        : sequence.length;
+        : Math.min(sequence.length, escape + MAX_MOUSE_SEQUENCE_LENGTH);
       const nextEscapeStart = nextEscape >= 0
         ? escape + nextEscape
         : sequence.length;
@@ -2215,6 +2267,7 @@ export class TerminalUi implements SettingsSurface {
       raw: "",
       consumed: 0,
       complete: false,
+      malformed: false,
       click: null,
       passthroughSuffix: false,
       surface: this.#surface,
@@ -2274,7 +2327,14 @@ export class TerminalUi implements SettingsSurface {
       const token = this.#mouseKeypressTokens[0];
       if (!token) break;
       const expected = token.raw.slice(token.consumed);
-      if (!expected) return null;
+      if (!expected) {
+        if (token.malformed && !token.complete) {
+          token.complete = true;
+          this.#finishConsumedMouseTokens();
+          continue;
+        }
+        return null;
+      }
       if (expected.startsWith(remainder)) {
         token.consumed += remainder.length;
         this.#finishConsumedMouseTokens();
