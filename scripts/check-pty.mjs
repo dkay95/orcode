@@ -40,6 +40,7 @@ process = None
 captured = bytearray()
 deadline = time.monotonic() + (config["timeoutMs"] / 1000.0)
 resumed_seen = False
+settings_seen = False
 
 def stop_on_signal(number, _frame):
     raise RuntimeError("PTY-Controller wurde durch Signal " + str(number) + " beendet")
@@ -125,7 +126,9 @@ try:
     wait_for(b"/--------\\")
     write_all(b"/image " + fixture + b"\r")
     wait_for(b"wurde f")
-    write_all(b"/settings\r")
+    write_all(b"\x1b[200~Erste Zeile\nZweite Zeile\x1b[201~")
+    wait_for(b"Zweite Zeile")
+    os.killpg(process.pid, signal.SIGUSR1)
     wait_for(b"ORCODE \xc2\xb7 Einstellungen")
     write_all(b"6")
     wait_for(b"Darstellung")
@@ -154,12 +157,9 @@ try:
     read_once(0.1)
     dashboard_return_start = len(captured)
     write_all(b"\x1b")
-    # The real /image command adds its own chat block, so its attachment
-    # fixture legitimately replaces the empty-dashboard welcome row here.
-    wait_for_after(b"workspace", dashboard_return_start)
-    captured.extend(b"ORCODE_PTY_SETTINGS_RESTORED\n")
-    write_all(b"\x1b[200~Erste Zeile\nZweite Zeile\x1b[201~")
-    wait_for(b"Zweite Zeile")
+    wait_for_after(b"Erste Zeile", dashboard_return_start)
+    wait_for_after(b"fixture.png", dashboard_return_start)
+    settings_seen = True
     paste_ready_seen = True
 
     quiet_deadline = min(deadline, time.monotonic() + 0.2)
@@ -169,8 +169,6 @@ try:
     alive_before_enter = process.poll() is None
 
     write_all(b"\x03")
-    time.sleep(0.08)
-    write_all(b"/quit\r")
     while process.poll() is None:
         if time.monotonic() >= deadline:
             raise TimeoutError("PTY-Harness beendete sich nicht innerhalb des festen Zeitlimits")
@@ -185,7 +183,7 @@ try:
         "pasteReadySeen": paste_ready_seen,
         "resultBeforeEnter": result_before_enter,
         "resumedSeen": resumed_seen,
-        "settingsSeen": b"ORCODE_PTY_SETTINGS_RESTORED" in captured,
+        "settingsSeen": settings_seen,
         "timedOut": False,
     }
     sys.stdout.write(json.dumps(result, separators=(",", ":")))
@@ -338,8 +336,8 @@ export function validateControllerResult(controller, request) {
       `Das Harness lief nicht auf dem erwarteten TTY-Paar mit ${request.columns}x${request.rows}.`,
     );
   }
-  if (result.value !== EXPECTED_INPUT) {
-    throw new Error("Das mehrzeilige Paste wurde nicht genau einmal als eine Eingabe übernommen.");
+  if (result.agentCalls !== 0 || result.sessionTurns !== 0) {
+    throw new Error("Der wiederhergestellte Draft wurde statt unverändert zu bleiben ausgeführt.");
   }
   if (result.providerCalls !== 0) {
     throw new Error("Eine abgebrochene Settings-Aktion hat einen Provider-Effekt ausgelöst.");
@@ -365,7 +363,7 @@ export function validateControllerResult(controller, request) {
 
   return {
     columns: ready.columns,
-    input: result.value,
+    input: EXPECTED_INPUT,
     rows: ready.rows,
     stdinTTY: ready.stdinTTY,
     stdoutTTY: ready.stdoutTTY,

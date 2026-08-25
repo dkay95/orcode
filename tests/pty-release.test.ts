@@ -61,7 +61,8 @@ function successfulControllerResult(overrides: Partial<PtyControllerResult> = {}
     rows: 28,
   });
   const result = JSON.stringify({
-    value: EXPECTED_INPUT,
+    agentCalls: 0,
+    sessionTurns: 0,
     providerCalls: 0,
     configMode: 0o600,
     configRaw: '{"appearance":{"showHeaderMark":false}}',

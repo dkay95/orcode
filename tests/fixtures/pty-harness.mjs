@@ -12,6 +12,7 @@ const config = await import(new URL("./config.js", cliModuleUrl));
 const { SessionStore } = await import(new URL("./session.js", cliModuleUrl));
 const { RuleStore } = await import(new URL("./rules.js", cliModuleUrl));
 const { OpenRouterService } = await import(new URL("./openrouter.js", cliModuleUrl));
+const { handleSlashCommand } = await import(new URL("./commands.js", cliModuleUrl));
 
 const root = await mkdtemp(join(tmpdir(), "orcode-pty-lifecycle-"));
 const workspace = join(root, "workspace");
@@ -44,6 +45,7 @@ await session.save();
 const rules = await RuleStore.load(appHome);
 let liveRoute = route;
 let providerCalls = 0;
+let agentCalls = 0;
 const runtime = {
   openRouter: new OpenRouterService(undefined),
   credentials: {},
@@ -81,12 +83,26 @@ process.stdout.write(`ORCODE_PTY_READY:${JSON.stringify({ stdinTTY: process.stdi
 process.stdout.write(`ORCODE_PTY_FIXTURE:${fixturePath}\n`);
 process.chdir(workspace);
 
+let dashboardInput;
+let settingsOpening = false;
+process.on("SIGUSR1", () => {
+  if (!dashboardInput || settingsOpening) return;
+  settingsOpening = true;
+  void handleSlashCommand("/settings", dashboardInput).catch((error) => {
+    process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`);
+    process.exitCode = 1;
+  });
+});
+
 const exitCode = await cli.runCli(["--new"], {
   initializeStorage: async () => ({ appHome, configPath, migrationWarning: null, retentionWarnings: [], config: persisted, ruleStore: rules, session }),
   createProviderRuntime: async () => runtime,
-  createAgent: async () => ({}),
+  createAgent: async () => ({ run: async () => { agentCalls += 1; return {}; } }),
   runPlain: cli.runPlainLoop,
-  runDashboard: cli.runDashboard,
+  runDashboard: async (input) => {
+    dashboardInput = input;
+    await cli.runDashboard(input);
+  },
   stdout: process.stdout,
   stderr: process.stderr,
   environment: { ...process.env, ORCODE_ASCII: "1" },
@@ -94,5 +110,5 @@ const exitCode = await cli.runCli(["--new"], {
 
 const configRaw = await readFile(configPath, "utf8");
 const configMode = (await stat(configPath)).mode & 0o777;
-process.stdout.write(`\nORCODE_PTY_RESULT:${JSON.stringify({ value: "Erste Zeile\nZweite Zeile", configRaw, configMode, exitCode, providerCalls })}\n`);
+process.stdout.write(`\nORCODE_PTY_RESULT:${JSON.stringify({ agentCalls, sessionTurns: session.data.turns.length, configRaw, configMode, exitCode, providerCalls })}\n`);
 process.exitCode = exitCode;
