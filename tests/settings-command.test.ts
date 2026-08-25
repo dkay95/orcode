@@ -5,12 +5,48 @@ import {
   type CommandContext,
   type SettingsCommandPort,
 } from "../src/commands.js";
+import { createSettingsCommandPort } from "../src/cli.js";
+import type { ProviderExecutionMode } from "../src/setup.js";
 import { describeOpenRouterFailure, formatFailure } from "../src/openrouter.js";
 import { errorMessage } from "../src/utils.js";
 
 const SETTINGS_INTERACTIVE_REQUIRED_CODE = "settings-interactive-required";
 const SETTINGS_INTERACTIVE_REQUIRED_MESSAGE =
   "settings-interactive-required · /settings ist nur im lokalen interaktiven Eigentümer-Terminal verfügbar.";
+
+test("Settings command factory fails closed before creating a session outside an owner TTY", async () => {
+  const modes: readonly ProviderExecutionMode[] = [
+    "local-interactive-owner",
+    "json",
+    "piped",
+    "scheduled",
+    "batch",
+    "relay",
+    "collaborator",
+    "shared-service",
+    "multi-user",
+    "unenrolled-device",
+  ];
+  for (const executionMode of modes) {
+    for (const [stdinIsTty, stdoutIsTty] of [[true, true], [true, false], [false, true], [false, false]] as const) {
+      let created = 0;
+      const port = createSettingsCommandPort({
+        executionMode,
+        stdinIsTty,
+        stdoutIsTty,
+        async createSession() {
+          created += 1;
+          return { async open() {} };
+        },
+      });
+      const accepted = executionMode === "local-interactive-owner" && stdinIsTty && stdoutIsTty;
+      assert.equal(port === undefined, !accepted, `${executionMode}/${stdinIsTty}/${stdoutIsTty}`);
+      assert.equal(created, 0, `${executionMode}/${stdinIsTty}/${stdoutIsTty}`);
+      if (port) await port.open();
+      assert.equal(created, accepted ? 1 : 0, `${executionMode}/${stdinIsTty}/${stdoutIsTty}`);
+    }
+  }
+});
 
 test("/settings opens the installed command port exactly once and stays in chat", async () => {
   const argumentCounts: number[] = [];

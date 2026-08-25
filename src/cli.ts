@@ -53,6 +53,7 @@ import {
   type ProviderCommandResult,
   type ProviderCommandStatusEntry,
   type ProviderRouteIntentPort,
+  type SettingsCommandPort,
 } from "./commands.js";
 import {
   APP_HOME,
@@ -4551,6 +4552,39 @@ export interface PlainRunInput extends Omit<RuntimeContext, "agent"> {
   ensureAgentForPrompt(surface?: SetupSurface): Promise<OrcodeAgent>;
   resumeFlag?: boolean;
   noResumeFlag?: boolean;
+}
+
+/** The one deliberately small boundary between `/settings` parsing and an interactive owner UI. */
+export interface SettingsSessionDependencies {
+  open(): Promise<void>;
+}
+
+export interface SettingsCommandPortInput {
+  readonly executionMode: ProviderExecutionMode;
+  readonly stdinIsTty: boolean;
+  readonly stdoutIsTty: boolean;
+  readonly createSession: () => Promise<SettingsSessionDependencies>;
+}
+
+/**
+ * Fences Settings before creating its controller, reading config, or touching
+ * any provider surface.  The lazy session factory also prevents a rejected
+ * command from accumulating UI resources.
+ */
+export function createSettingsCommandPort(
+  input: SettingsCommandPortInput,
+): SettingsCommandPort | undefined {
+  if (
+    input.executionMode !== "local-interactive-owner"
+    || !input.stdinIsTty
+    || !input.stdoutIsTty
+  ) return undefined;
+  return Object.freeze({
+    async open(): Promise<void> {
+      const session = await input.createSession();
+      await session.open();
+    },
+  });
 }
 
 export interface DashboardRunInput extends PlainRunInput {
