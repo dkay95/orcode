@@ -77,9 +77,11 @@ import {
 } from "./config.js";
 import {
   SettingsController,
+  SettingsRunActiveError,
   type SettingsExternalAction,
 } from "./settings-controller.js";
 import { runSettingsSession } from "./settings-session.js";
+import type { SettingsProviderProjection, SettingsRouteProjection } from "./settings-registry.js";
 import {
   CredentialStore,
   normalizeProviderSecret,
@@ -529,6 +531,10 @@ export interface ProviderRuntime extends ProviderRouteIntentPort, ProviderComman
   runSetup(surface: SetupSurface | "plain" | "fullscreen"): Promise<SetupHubResult>;
   /** A cached counter projection; this never acquires a runtime lease. */
   settingsActivity?(): ProviderRuntimeActivity;
+  readCachedSettingsProjection?(): {
+    readonly route: SettingsRouteProjection | null;
+    readonly providers: readonly SettingsProviderProjection[];
+  };
   ensureRunnableRoute(): RouteIdentityV1;
   currentSessionRoute(): RouteIdentityV1;
   selectSessionRoute(
@@ -782,6 +788,51 @@ export class DefaultProviderRuntime implements ProviderRuntime {
 
   settingsActivity(): ProviderRuntimeActivity {
     return this.runtimeGuard.activity();
+  }
+
+  readCachedSettingsProjection(): {
+    readonly route: SettingsRouteProjection | null;
+    readonly providers: readonly SettingsProviderProjection[];
+  } {
+    const state = this.stateStore.read();
+    const route = this.#sessionRoute ?? state.defaultRoute;
+    const projectedRoute = route && (route.backendId === "openrouter" || route.backendId === "kimi-code")
+      && route.canonicalModelId
+      && (route.billingRealm === "openrouter-payg" || route.billingRealm === "kimi-code-membership-provider-managed-overage") ? {
+      backendId: route.backendId,
+      providerLabel: route.backendId === "kimi-code" ? "Kimi Code" : "OpenRouter",
+      requestedModelId: route.requestedModelId,
+      canonicalModelId: route.canonicalModelId,
+      modelLabel: route.requestedModelId,
+      billingRealm: route.billingRealm,
+    } satisfies SettingsRouteProjection : null;
+    const providers: SettingsProviderProjection[] = state.connections
+      .filter((connection): connection is typeof connection & { backendId: "openrouter" | "kimi-code" } =>
+        connection.backendId === "openrouter" || connection.backendId === "kimi-code")
+      .filter((connection): connection is typeof connection & { billingRealm: "openrouter-payg" | "kimi-code-membership-provider-managed-overage" } =>
+        connection.billingRealm === "openrouter-payg" || connection.billingRealm === "kimi-code-membership-provider-managed-overage")
+      .map((connection) => ({
+      backendId: connection.backendId,
+      displayName: connection.backendId === "kimi-code" ? "Kimi Code" : "OpenRouter",
+      availability: "connectable",
+      configuration: connection.enabled ? "enabled" : "disabled",
+      maturity: connection.maturity,
+      billingRealm: connection.billingRealm,
+      headline: connection.lastHealth?.credential === "valid" ? "ready" : "unknown",
+      health: connection.lastHealth ? {
+        credential: connection.lastHealth.credential,
+        connectivity: connection.lastHealth.connectivity,
+        spend: connection.lastHealth.spend,
+        runtime: connection.lastHealth.runtime,
+      } : null,
+      isDefault: state.defaultRoute?.backendId === connection.backendId
+        && state.defaultRoute.accountFingerprint === connection.accountFingerprint,
+      selectedModel: null,
+      allowedActions: connection.backendId === "openrouter"
+        ? ["connect", "enable", "disable", "disconnect", "reconnect", "models", "logout"]
+        : ["connect", "enable", "disable", "reconnect", "models", "logout"],
+    }));
+    return { route: projectedRoute, providers };
   }
 
   modelRuntime(route: RouteIdentityV1): ModelRuntime {
@@ -4628,14 +4679,17 @@ function createSettingsSession(
           snapshots: {
             // Deliberately cached-only: opening Settings must not execute a
             // provider command or inspect a credential.
-            read: async () => ({
+            read: async () => {
+              const provider = context.providerRuntime.readCachedSettingsProjection?.()
+                ?? { route: null, providers: [] };
+              return ({
               config: context.config,
               runActive: (() => {
                 const activity = context.providerRuntime.settingsActivity?.();
                 return activity?.runActive === true || activity?.activationHeld === true;
               })(),
-              route: null,
-              providers: [],
+              route: provider.route,
+              providers: provider.providers,
               approvalRules: context.ruleStore.list(context.workspace).map((rule) => ({
                 id: rule.id,
                 decision: rule.decision,
@@ -4647,7 +4701,8 @@ function createSettingsSession(
                 totalUsd: context.session.data.costs.totalUsd,
               },
               cachedModels: context.openRouter.readCachedModels(),
-            }),
+              });
+            },
           },
           externalActions: {
             async execute(action: SettingsExternalAction): Promise<void> {
@@ -4691,7 +4746,14 @@ function createSettingsSession(
             },
           },
           readConfig: readConfigEditSnapshot,
-          saveConfig: async (expected, candidate, path) => saveConfigEdit(expected, candidate, path),
+          saveConfig: async (expected, candidate, path) => {
+            try {
+              assertSettingsIdle(context);
+            } catch {
+              throw new SettingsRunActiveError();
+            }
+            return saveConfigEdit(expected, candidate, path);
+          },
         });
         await runSettingsSession(controller, surface);
       } finally {

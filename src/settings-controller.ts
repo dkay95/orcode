@@ -206,6 +206,11 @@ const ACTION_REFRESH_NOTICE = "Aktion ausgeführt; Ansicht konnte nicht aktualis
 const ALLOW_ALL_WARNING =
   "allow-all führt Dateiänderungen und Shell-Befehle ohne Nachfrage aus. Wirklich aktivieren?";
 
+/** A dependency may discover a run between the controller refresh and its CAS. */
+export class SettingsRunActiveError extends Error {
+  readonly code = "settings-run-active" as const;
+}
+
 export class SettingsController {
   readonly #dependencies: SettingsControllerDependencies;
   #snapshot: SettingsControllerSnapshot;
@@ -501,6 +506,10 @@ export class SettingsController {
         this.#dependencies.configPath,
       );
     } catch (error) {
+      if (error instanceof SettingsRunActiveError) {
+        this.#notice = Object.freeze({ kind: "info", message: "Lauf aktiv" });
+        return { kind: "render" };
+      }
       if (error instanceof ConfigEditConflictError) {
         await this.#refreshOrReadOnly(
           pending.item.id,
