@@ -631,10 +631,17 @@ export class SettingsController {
     const runtime = await this.#dependencies.snapshots.read();
     this.#snapshot = freezeClone(runtime);
     try {
-      this.#configEditState = {
-        kind: "editable",
-        snapshot: await this.#dependencies.readConfig(this.#dependencies.configPath),
-      };
+      const exact = await this.#dependencies.readConfig(this.#dependencies.configPath);
+      if (sameConfig(runtime.config, exact.config)) {
+        this.#configEditState = { kind: "editable", snapshot: exact };
+      } else {
+        this.#snapshot = freezeClone({ ...runtime, config: exact.config });
+        this.#configEditState = {
+          kind: "read-only",
+          config: freezeClone(exact.config),
+          reason: READ_ONLY_REASON,
+        };
+      }
     } catch {
       this.#configEditState = {
         kind: "read-only",

@@ -385,6 +385,47 @@ test("ein CAS-Konflikt publiziert nichts, lädt neu und verlangt einen frischen 
   });
 });
 
+test("ein CAS-Konflikt mit Runtime-Disk-Split zeigt den fremden Disk-Wert und bleibt read-only", async () => {
+  await withTempConfig(async (path) => {
+    const initial = await readConfigEditSnapshot(path);
+    const foreign = structuredClone(DEFAULT_CONFIG);
+    foreign.appearance.showLargeLogo = false;
+    let configReads = 0;
+    let writes = 0;
+    const setup = harness(path, {
+      readConfig: async () => {
+        configReads += 1;
+        return configReads === 1
+          ? initial
+          : { file: initial.file, config: foreign };
+      },
+      saveConfig: async () => {
+        writes += 1;
+        throw new ConfigEditConflictError();
+      },
+    });
+    const controller = await SettingsController.open(setup.dependencies);
+    await controller.dispatch({ kind: "select-item", itemId: "appearance-large-logo" });
+    const opened = await controller.dispatch({ kind: "activate" });
+    assert.equal(opened.kind, "edit");
+    if (opened.kind !== "edit") return;
+
+    await controller.completeEditor(opened.request, { kind: "value", value: "off" });
+
+    assert.equal(writes, 1);
+    assert.equal(setup.published.length, 0);
+    assert.equal(controller.view.notice?.message, "Einstellung wurde parallel geändert");
+    assert.equal(controller.view.readOnlyReason, "Konfiguration schreibgeschützt");
+    assert.equal(
+      controller.view.allItems.find(({ id }) => id === "appearance-large-logo")?.displayValue,
+      "Aus",
+    );
+    assert.equal((await controller.dispatch({ kind: "activate" })).kind, "render");
+    await controller.completeEditor(opened.request, { kind: "value", value: "on" });
+    assert.equal(writes, 1);
+  });
+});
+
 test("ein Refreshfehler nach CAS-Konflikt behält die Konfliktmeldung und sperrt den stale Editor", async () => {
   await withTempConfig(async (path) => {
     let writes = 0;
