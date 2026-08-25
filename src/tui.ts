@@ -1890,7 +1890,7 @@ export class TerminalUi implements SettingsSurface {
     }
     // Ctrl+C is evaluated before everything else, especially before the paste
     // buffer: a paste without an end marker must never freeze the exit (B12).
-    if ((key.ctrl && key.name === "c") || character === "\u0003" || key.sequence === "\u0003") {
+    if ((key.ctrl && key.name === "c") || character === "\u0003") {
       this.#pasting = false;
       this.#pasteBuffer = "";
       this.#interrupt();
