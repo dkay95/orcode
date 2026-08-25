@@ -7,6 +7,7 @@ import {
   COMMAND_CATALOG,
   commandTokenIsExact,
   rankSlashCommands,
+  resolveSlashCommand,
 } from "../src/command-catalog.js";
 
 interface TestCatalogEntry {
@@ -89,6 +90,39 @@ test("completion exposes every documented top-level command", () => {
   assert.ok(names.has("panel"));
   assert.ok(names.has("resume"));
   assert.ok(names.has("ssh"));
+});
+
+test("settings has one canonical catalog token, one handler, and no aliases", () => {
+  const settingsEntries = COMMAND_CATALOG.filter(
+    (entry) => entry.handlerId === "settings",
+  );
+  assert.deepEqual(settingsEntries, [{
+    name: "settings",
+    handlerId: "settings",
+    usage: "/settings",
+    description: "Geführte Einstellungen im Vollbild öffnen",
+  }]);
+  assert.deepEqual(resolveSlashCommand("settings"), {
+    command: settingsEntries[0],
+    handlerId: "settings",
+    matchedToken: "settings",
+  });
+  assert.equal(Object.hasOwn(settingsEntries[0]!, "aliases"), false);
+  assert.equal(Object.hasOwn(settingsEntries[0]!, "acceptsArguments"), false);
+
+  const settingsCompletion = rankSlashCommands("/").filter(
+    (entry) => entry.name === "settings",
+  );
+  assert.equal(settingsCompletion.length, 1);
+
+  const tokensForSettings = COMMAND_CATALOG.flatMap((entry) => [
+    { token: entry.name, handlerId: entry.handlerId },
+    ...(("aliases" in entry ? entry.aliases : []) ?? []).map((token) => ({
+      token,
+      handlerId: entry.handlerId,
+    })),
+  ]).filter((entry) => entry.handlerId === "settings");
+  assert.deepEqual(tokensForSettings, [{ token: "settings", handlerId: "settings" }]);
 });
 
 test("provider catalog, completion, help, and generated docs expose the one flat dispatcher", () => {
@@ -218,6 +252,9 @@ test("README command bytes are rendered and checked from the shared catalog", as
   assert.match(generated, /`\/panel`/);
   assert.match(generated, /`\/resume`/);
   assert.match(generated, /`\/ssh`/);
+  const settingsRow = "| `/settings` |  | `/settings` | Geführte Einstellungen im Vollbild öffnen |";
+  assert.equal(generated.split(settingsRow).length - 1, 1);
+  assert.equal(readmeBlock.split(settingsRow).length - 1, 1);
   assert.match(generated, /chat \[new\\\|list\\\|open\\\|search\\\|rename\\\|fork\\\|delete\]/);
   assert.match(generated, /ORCODE\.md/);
 });

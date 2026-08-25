@@ -244,6 +244,12 @@ export const COMMAND_CATALOG = [
     description: "Gespeicherte, nicht geheime Konfiguration anzeigen",
   },
   {
+    name: "settings",
+    handlerId: "settings",
+    usage: "/settings",
+    description: "Geführte Einstellungen im Vollbild öffnen",
+  },
+  {
     name: "help",
     handlerId: "help",
     usage: "/help",

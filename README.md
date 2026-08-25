@@ -250,6 +250,7 @@ provider keep Cross off until an explicit later `/collab` or `/cross` action.
 | `/init` |  | `/init` | ORCODE.md im Workspace anlegen |
 | `/ssh` |  | `/ssh [<alias>\|status\|off]` | SSH-Ziel aus ~/.ssh/config wählen, prüfen oder trennen |
 | `/config` |  | `/config` | Gespeicherte, nicht geheime Konfiguration anzeigen |
+| `/settings` |  | `/settings` | Geführte Einstellungen im Vollbild öffnen |
 | `/help` | `/?` | `/help` | Alle Befehle und ihre Verwendung anzeigen |
 | `/quit` | `/exit`, `/q` | `/quit` | orcode beenden |
 <!-- orcode:command-docs:end -->

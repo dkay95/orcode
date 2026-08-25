@@ -119,6 +119,21 @@ export interface CommandOutput {
   error(value: string, hint?: string): void;
 }
 
+export interface SettingsCommandPort {
+  open(): Promise<void>;
+}
+
+export class SettingsInteractiveRequiredError extends Error {
+  readonly code = "settings-interactive-required" as const;
+
+  constructor() {
+    super(
+      "settings-interactive-required · /settings ist nur im lokalen interaktiven Eigentümer-Terminal verfügbar.",
+    );
+    this.name = "SettingsInteractiveRequiredError";
+  }
+}
+
 export type ProviderCredentialIntent =
   | {
       kind: "replace";
@@ -282,6 +297,8 @@ export interface CommandContext<Agent extends OrcodeAgent | null = OrcodeAgent> 
   providerRoutes?: ProviderRouteIntentPort;
   /** One shared provider-command controller owned by the provider runtime. */
   providerCommands?: ProviderCommandIntentPort;
+  /** Installed only by a local interactive owner surface. */
+  settings?: SettingsCommandPort;
   providerRouteSurface?: SetupSurface | "plain" | "fullscreen";
   workspace: string;
   credentials: CredentialStoreLike;
@@ -603,6 +620,10 @@ export async function handleSlashCommand(
       return "continue";
     case "resume":
       await resumeCommand(args, dispatchContext);
+      return "continue";
+    case "settings":
+      if (!context.settings) throw new SettingsInteractiveRequiredError();
+      await context.settings.open();
       return "continue";
     case "config":
       context.out.text(chalk.bold(context.configPath ?? CONFIG_PATH));

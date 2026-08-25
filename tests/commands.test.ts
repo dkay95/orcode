@@ -426,6 +426,21 @@ test("slash help renders every shared catalog usage and catalog aliases dispatch
   assert.equal(await handleSlashCommand("/q", context), "exit");
 });
 
+test("slash help renders the canonical /settings guidance exactly once", async () => {
+  const output: string[] = [];
+  const context = {
+    out: {
+      text: (value: string) => output.push(value),
+      error: (value: string) => output.push(value),
+    },
+  } as unknown as CommandContext;
+
+  assert.equal(await handleSlashCommand("/help", context), "continue");
+  const settingsLines = output.filter((line) => /^\s*\/settings(?:\s|$)/.test(line));
+  assert.equal(settingsLines.length, 1);
+  assert.match(settingsLines[0]!, /Geführte Einstellungen im Vollbild öffnen/);
+});
+
 test("bare and legacy provider routing policy remain byte exact", async () => {
   const root = await mkdtemp(join(tmpdir(), "orcode-provider-compat-"));
   const config = structuredClone(DEFAULT_CONFIG);
