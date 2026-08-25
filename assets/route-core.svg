@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48" role="img" aria-labelledby="title desc">
+  <title id="title">orcode Route Core</title>
+  <desc id="desc">Open routing core connected to a filled and an outlined endpoint</desc>
+  <path d="M9 14h13l6 10-6 10H9L3 24l6-10Z" fill="none" stroke="currentColor" stroke-width="3"/>
+  <path d="M25 24h4m0 0 3-6m-3 6 3 6" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round"/>
+  <circle cx="35" cy="14" r="5" fill="currentColor"/>
+  <circle cx="35" cy="34" r="5" fill="none" stroke="currentColor" stroke-width="3"/>
+</svg>
