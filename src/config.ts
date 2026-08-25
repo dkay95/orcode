@@ -881,9 +881,12 @@ export interface AtomicCreateOptions {
  * handle before the link, so the published link inherits the secure mode and
  * no pathname chmod ever follows publication. Its dev/inode identity is bound
  * at creation: the temp pathname is revalidated against it immediately before
- * the link, and cleanup unlinks the pathname only while it still resolves to
- * that identity — a foreign entry at the temp pathname is never removed (Node
- * has no unlinkat, so the original temp may then remain, unpublished, wherever
+ * the link, the published target is proven to carry that identity immediately
+ * after the link (an exchange inside the lstat→link window is a branded
+ * post-publication failure, never success), and cleanup unlinks the temp
+ * pathname only while it still resolves to that identity — a foreign entry at
+ * the temp pathname or at the target is never removed (Node has no
+ * unlinkat/linkat, so the original temp may then remain, unpublished, wherever
  * its parent was moved).
  */
 export async function writeFileAtomicCreateSecure(
@@ -919,6 +922,13 @@ export async function writeFileAtomicCreateSecure(
     }
     await link(temporary, path);
     published = true;
+    // Node has no linkat: the temp pathname could have been exchanged between
+    // the lstat above and the link. The published target must resolve to the
+    // exact bound temp identity, or this is a branded post-publication failure;
+    // foreign target bytes are never unlinked (documented bounded outcome).
+    if (!(await pathHasFileIdentity(path, identity))) {
+      throw new Error("Atomic create published target does not carry the bound temp identity.");
+    }
     const postPublishResult: unknown = afterPublish?.();
     if (postPublishResult !== undefined) {
       throw new Error("Atomic create afterPublish hook must be synchronous.");

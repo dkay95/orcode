@@ -2019,11 +2019,27 @@ test("the create-only edit path publishes 0600 from the secured temp handle unde
       process.umask(previousUmask);
     }
   };
+  // Every pathname `chmod` of the final config path is counted through the builtin the sources import;
+  // handle-bound `FileHandle.chmod` is a different function and stays allowed (and required).
+  const fsModule = await import("node:fs");
+  const { syncBuiltinESMExports } = await import("node:module");
+  const originalChmod = fsModule.promises.chmod;
+  let finalPathChmods = 0;
+  let restoreChmod: (() => void) | null = null;
   try {
     const root = dirname(await configPath("edit-handle-secured-mode"));
     const parent = join(root, "nested");
     const moved = join(root, "nested.moved");
     const path = join(parent, "config.json");
+    (fsModule.promises as { chmod: typeof originalChmod }).chmod = (async (target, mode) => {
+      if (String(target) === path) finalPathChmods += 1;
+      return originalChmod(target, mode);
+    }) as typeof originalChmod;
+    syncBuiltinESMExports();
+    restoreChmod = () => {
+      (fsModule.promises as { chmod: typeof originalChmod }).chmod = originalChmod;
+      syncBuiltinESMExports();
+    };
     const expected = await readConfigEditSnapshot(path);
     assert.equal(expected.file.kind, "absent");
     assert.equal(expected.file.parent.kind, "absent");
@@ -2070,7 +2086,9 @@ test("the create-only edit path publishes 0600 from the secured temp handle unde
     assert.equal(await readFile(join(moved, "config.json"), "utf8"), content);
     assert.equal((await stat(join(moved, "config.json"))).mode & 0o777, 0o600, "secured on the handle before link");
     assert.equal((await stat(moved)).mode & 0o777, 0o700);
+    assert.equal(finalPathChmods, 0, "no pathname chmod of the final config path may exist on the create path");
   } finally {
+    restoreChmod?.();
     restoreUmask();
   }
 });
@@ -2187,4 +2205,60 @@ test("create-only temp cleanup after a parent replacement never unlinks a foreig
   ).catch((reason: unknown) => reason));
   assert.equal(plainError, plainReason);
   assert.deepEqual(await readdir(dirname(plainPath)), []);
+});
+
+test("the create-only writer never reports success when the parent is exchanged between the pre-link lstat and the link", async () => {
+  const fsModule = await import("node:fs");
+  const { syncBuiltinESMExports } = await import("node:module");
+  const root = dirname(await configPath("atomic-create-lstat-link-gap"));
+  const parent = join(root, "nested");
+  const moved = join(root, "nested.moved");
+  const path = join(parent, "config.json");
+  await mkdir(parent, { mode: 0o700 });
+  const originalLstat = fsModule.promises.lstat;
+  let swapped = false;
+  let temporaryName: string | null = null;
+  (fsModule.promises as { lstat: typeof originalLstat }).lstat = (async (target: unknown, options: unknown) => {
+    const result = await (originalLstat as (t: unknown, o: unknown) => Promise<unknown>)(target, options);
+    const spelled = String(target);
+    const name = basename(spelled);
+    if (!swapped && dirname(spelled) === parent && name.startsWith("config.json.") && name.endsWith(".tmp")) {
+      // Exactly the pre-link identity lstat on the temp pathname: exchange the parent before `link` runs.
+      swapped = true;
+      temporaryName = name;
+      renameSync(parent, moved);
+      mkdirSync(parent);
+      chmodSync(parent, 0o755);
+      writeFileSync(join(parent, name), "FOREIGN", { encoding: "utf8", mode: 0o644 });
+      chmodSync(join(parent, name), 0o644);
+    }
+    return result;
+  }) as unknown as typeof originalLstat;
+  syncBuiltinESMExports();
+  let outcome: unknown;
+  try {
+    outcome = await writeFileAtomicCreateSecure(path, "candidate\n").then(
+      () => "resolved" as const,
+      (reason: unknown) => reason,
+    );
+  } finally {
+    (fsModule.promises as { lstat: typeof originalLstat }).lstat = originalLstat;
+    syncBuiltinESMExports();
+  }
+  assert.equal(swapped, true);
+  const name = temporaryName as unknown as string;
+  assert.notEqual(outcome, "resolved", "the helper must never resolve after publishing foreign bytes");
+  assert.ok(isAtomicFilePostPublicationError(outcome), String(outcome));
+  assert.equal(outcome.operation, "create");
+  // Bounded adversarial outcome: the foreign bytes were linked and stay untouched; nothing is unlinked.
+  assert.equal(await readFile(path, "utf8"), "FOREIGN");
+  assert.equal(await readFile(join(parent, name), "utf8"), "FOREIGN");
+  assert.deepEqual((await readdir(parent)).sort(), ["config.json", name].sort());
+  if (process.platform !== "win32") {
+    assert.equal((await stat(path)).mode & 0o777, 0o644);
+    assert.equal((await stat(join(parent, name))).mode & 0o777, 0o644);
+    assert.equal((await stat(parent)).mode & 0o777, 0o755);
+  }
+  assert.deepEqual(await readdir(moved), [name]);
+  assert.equal(await readFile(join(moved, name), "utf8"), "candidate\n");
 });
