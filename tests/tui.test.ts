@@ -658,6 +658,69 @@ test("suspend and resume preserve a pending secret until explicit submission", a
   }
 });
 
+test("stop and EOF settle picker, confirmation, and recording exactly once", async () => {
+  const cases = ["stop", "eof"] as const;
+  for (const exit of cases) {
+    const stdin = new FakeInput();
+    const stdout = new FakeOutput();
+    const terminal = ui(stdin, stdout);
+    terminal.start();
+    let choiceSettlements = 0;
+    const choice = terminal.pickChoice("Provider", [
+      { value: "openrouter", label: "OpenRouter", description: "Ready" },
+    ], "openrouter").then((value) => {
+      choiceSettlements += 1;
+      return value;
+    });
+    if (exit === "stop") terminal.stop();
+    else stdin.emit("end");
+    assert.equal(await Promise.race([
+      choice,
+      new Promise<"pending">((resolve) => setImmediate(() => resolve("pending"))),
+    ]), null, exit);
+    assert.equal(choiceSettlements, 1, exit);
+
+    terminal.start();
+    let confirmSettlements = 0;
+    const confirmation = terminal.confirmAction("Löschen", "lokal").then((value) => {
+      confirmSettlements += 1;
+      return value;
+    });
+    if (exit === "stop") terminal.stop();
+    else stdin.emit("end");
+    assert.deepEqual(await confirmation, { accepted: false });
+    assert.equal(confirmSettlements, 1, exit);
+
+    terminal.start();
+    let recordingSettlements = 0;
+    const recording = terminal.awaitRecordingControl("Aufnahme").then((value) => {
+      recordingSettlements += 1;
+      return value;
+    });
+    if (exit === "stop") terminal.stop();
+    else stdin.emit("end");
+    assert.equal(await recording, "cancel");
+    assert.equal(recordingSettlements, 1, exit);
+    assert.equal(terminal.active, false);
+  }
+});
+
+test("suspend stoppt nur den Timer und lässt einen aktiven Lauf weiter running", async () => {
+  const stdin = new FakeInput();
+  const stdout = new FakeOutput();
+  const terminal = ui(stdin, stdout);
+  terminal.start();
+  terminal.handleRunEvent({
+    type: "run-start",
+    model: "openrouter/auto",
+    maxSteps: 12,
+    timestamp: Date.now(),
+  });
+  await terminal.suspend(async () => undefined);
+  assert.match(text(terminal.frame().lines), /[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]/u);
+  terminal.stop();
+});
+
 test("setup TUI retry shows one latest current revision card at narrow and wide widths and replaces status", async () => {
   for (const columns of [58, 120]) {
     const stdin = new FakeInput();

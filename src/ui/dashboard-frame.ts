@@ -70,7 +70,8 @@ export type UiMode =
   | "model-picker"
   | "choice-picker"
   | "secret"
-  | "recording";
+  | "recording"
+  | "validated-input";
 
 export interface DashboardFrameInput {
   width: number;
@@ -93,6 +94,12 @@ export interface DashboardFrameInput {
   /** Whether this exact approval request has a safe persistable subject. */
   rememberAvailable?: boolean;
   secretLabel?: string;
+  editorPrompt?: {
+    readonly label: string;
+    readonly description: string;
+    readonly validationMessage?: string;
+  };
+  settingsConfirmation?: boolean;
   helpRequested?: boolean;
   newLinesBelow?: number;
   tick?: number;
@@ -190,6 +197,7 @@ export function buildListLines(
 /** Bauplan 2.4: the help line only appears on approval, open list or `?`. */
 function helpText(input: DashboardFrameInput): string | undefined {
   if (input.mode === "confirm") {
+    if (input.settingsConfirmation) return "j oder Enter bestätigen · n oder Esc abbrechen";
     return input.rememberAvailable
       ? "j ja · n nein · Enter = nein · a immer erlauben · d nie erlauben · g Begründung"
       : "j ja · n nein · Enter = nein · g Begründung";
@@ -198,6 +206,7 @@ function helpText(input: DashboardFrameInput): string | undefined {
     return "Tippen filtert · ↑↓ wählen · Enter übernehmen · Esc abbrechen";
   }
   if (input.mode === "secret") return "Der Key wird nie angezeigt · Enter prüfen · Esc abbrechen";
+  if (input.mode === "validated-input") return "Enter übernehmen · Esc abbrechen";
   if (input.list) return "↑↓ wählen · Tab einsetzen · Enter vervollständigen · Esc Liste schließen";
   if (input.helpRequested) {
     return "/ Befehle · @ Datei · Ctrl+T Denken · PgUp/PgDn blättern · Ctrl+C Abbruch";
@@ -264,10 +273,25 @@ export function buildDashboardFrame(input: DashboardFrameInput): Frame {
   const inputCursor = clamp(input.cursor, 0, Array.from(text).length);
   // A7: the label — the only hint that a secret is being typed — is a fixed
   // prefix, never part of the scrollable text.
-  const inputLabel = input.mode === "secret" ? input.secretLabel || "Key" : undefined;
+  const inputLabel = input.mode === "secret"
+    ? input.secretLabel || "Key"
+    : input.mode === "validated-input"
+      ? input.editorPrompt?.label
+      : undefined;
   const expansionLimit = height >= 20 ? 6 : 4;
+  const editorExpansion: Line[] = input.editorPrompt
+    ? [
+        { spans: [span(input.editorPrompt.label, "accent", { bold: true })] },
+        { spans: [span(input.editorPrompt.description, "muted")] },
+        ...(input.editorPrompt.validationMessage
+          ? [{ spans: [span(input.editorPrompt.validationMessage, "warn")] }]
+          : []),
+      ]
+    : [];
   const expansion: Line[] = input.list
     ? buildListLines(input.list, Math.max(1, width - 1), expansionLimit, theme)
+    : editorExpansion.length
+      ? editorExpansion
     : input.blocks.length === 0
       // R8: the welcome text sits directly above the divider, not below a header.
       ? [{ spans: [span("  ", "text"), span(WELCOME, "muted")] }]
