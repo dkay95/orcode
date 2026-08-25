@@ -11,6 +11,7 @@ import {
   commandRequiresRunnableRoute,
   createDefaultProviderRuntime,
   createCliPlainSetupSurface,
+  createSettingsRuntimeSnapshotPort,
   createOpenRouterServiceForStartup,
   executeProviderModelAction,
   formatChatCost,
@@ -25,13 +26,14 @@ import {
   renderCliHelp,
   resolveCliCommandName,
   runOutcomeExitCode,
+  SessionProviderRuntimeGuard,
 } from "../src/cli.js";
 import {
   readModelRuntimeIdentity,
   type AgentRunResult,
 } from "../src/agent.js";
 import * as cliModule from "../src/cli.js";
-import { createPlainSetupSurface } from "../src/setup-ui.js";
+import { createPlainSetupSurface, createSettingsSetupSurface } from "../src/setup-ui.js";
 import type { SetupSurface } from "../src/setup-ui.js";
 import {
   BackendRegistry,
@@ -43,6 +45,8 @@ import {
 import { COMMAND_CATALOG } from "../src/command-catalog.js";
 import {
   handleSlashCommand,
+  PROVIDER_BACKEND_ACTIONS,
+  providerBackendActions,
   shouldReplaceCredential,
   type CommandContext,
 } from "../src/commands.js";
@@ -68,6 +72,303 @@ import { PrivateStore } from "../src/private-store.js";
 import { SessionStore } from "../src/session.js";
 import { SetupOrchestrator } from "../src/setup.js";
 import type { ModelInfo } from "../src/types.js";
+
+test("Provider-Backend-Matrix ist die unveränderliche Authority für Parser und Projektion", () => {
+  assert.deepEqual(providerBackendActions("openrouter"), [
+    "connect", "enable", "disable", "disconnect", "reconnect", "models", "logout",
+  ]);
+  assert.deepEqual(providerBackendActions("kimi-code"), [
+    "connect", "enable", "disable", "reconnect", "models", "logout",
+  ]);
+  assert.deepEqual(providerBackendActions("anthropic"), [
+    "connect", "enable", "disable", "disconnect", "reconnect", "models", "logout",
+  ]);
+  assert.equal(PROVIDER_BACKEND_ACTIONS["kimi-code"].has("disconnect"), false);
+  assert.equal(Object.isFrozen(PROVIDER_BACKEND_ACTIONS), true);
+  assert.equal(
+    "add" in (PROVIDER_BACKEND_ACTIONS.openrouter as unknown as object),
+    false,
+    "die exportierte ReadonlySet-Ansicht darf kein mutierendes Set-API leaken",
+  );
+  assert.equal(Object.isFrozen(providerBackendActions("openrouter")), true);
+});
+
+test("Provider runtime activity liest nur Counter und erwirbt selbst keinen Lease", async () => {
+  const guard = new SessionProviderRuntimeGuard();
+  assert.deepEqual(guard.activity(), { runActive: false, activationHeld: false });
+  assert.deepEqual(guard.activity(), { runActive: false, activationHeld: false });
+
+  const lease = await guard.acquire(new AbortController().signal);
+  assert.deepEqual(guard.activity(), { runActive: false, activationHeld: true });
+  lease.release();
+  const endRun = guard.beginRun();
+  assert.deepEqual(guard.activity(), { runActive: true, activationHeld: false });
+  endRun();
+  assert.deepEqual(guard.activity(), { runActive: false, activationHeld: false });
+});
+
+test("cached Settings snapshot mappt ausschließlich secretless Felder und führt keine Provider-Aktion aus", () => {
+  const config = structuredClone(DEFAULT_CONFIG);
+  const route = {
+    backendId: "kimi-code" as const,
+    providerLabel: "Kimi Code",
+    requestedModelId: "k3",
+    canonicalModelId: "k3",
+    modelLabel: "Kimi K3",
+    billingRealm: "kimi-code-membership-provider-managed-overage" as const,
+  };
+  let commandExecutions = 0;
+  let credentialReads = 0;
+  let networkCalls = 0;
+  const port = createSettingsRuntimeSnapshotPort({
+    config,
+    runtime: {
+      activity: () => ({ runActive: false, activationHeld: false }),
+      readCachedSettingsRoute: () => route,
+      readCachedProviderStatus: () => [{
+        backendId: "kimi-code",
+        displayName: "Kimi Code",
+        availability: "connectable",
+        configuration: "enabled",
+        maturity: "preview",
+        billingRealm: "kimi-code-membership-provider-managed-overage",
+        accountFingerprintSuffix: "SECRET_FINGERPRINT_CANARY",
+        headline: "ready",
+        health: {
+          credential: "valid",
+          connectivity: "connected",
+          spend: "unknown",
+          runtime: "not-applicable",
+        },
+        isDefault: true,
+        selectedModel: {
+          requestedModelId: "k3",
+          canonicalModelId: "k3",
+          displayName: "Kimi K3",
+        },
+      }, {
+        backendId: "anthropic",
+        displayName: "Anthropic",
+        availability: "coming-soon",
+        configuration: "disabled",
+        maturity: "coming-soon",
+        billingRealm: "none",
+        accountFingerprintSuffix: null,
+        headline: null,
+        health: null,
+        isDefault: false,
+        selectedModel: null,
+      }],
+      execute: () => {
+        commandExecutions += 1;
+        throw new Error("not reachable");
+      },
+      readCredential: () => {
+        credentialReads += 1;
+        throw new Error("not reachable");
+      },
+      fetch: () => {
+        networkCalls += 1;
+        throw new Error("not reachable");
+      },
+    },
+    session: {
+      data: {
+        costs: { mainUsd: 1, compressorUsd: 0.25, voiceUsd: 0, totalUsd: 1.25, costKnowledge: "unknown" },
+        dailySpendUsd: { "2026-08-25": 0.75 },
+      },
+    },
+    ruleStore: {
+      list: () => [{ id: "rule-safe", decision: "allow" as const, secret: "RULE_SECRET_CANARY" }],
+    },
+    workspace: "/owner/workspace",
+    readCachedModels: () => [{
+      id: "k3",
+      canonicalSlug: "k3",
+      name: "Kimi K3",
+      description: "safe cached model",
+      contextLength: 262_144,
+      promptPrice: -1,
+      completionPrice: -1,
+      supportedParameters: ["tools", "reasoning"],
+      inputModalities: ["text"],
+      outputModalities: ["text"],
+      credentialSlot: "SECRET_MODEL_SLOT_CANARY",
+      nested: { requestId: "SECRET_MODEL_REQUEST_CANARY" },
+    } as ModelInfo],
+    readCachedWorkspaceTotalUsd: () => 2.5,
+    now: () => new Date("2026-08-25T12:00:00.000Z"),
+  });
+
+  const snapshot = port.readCached();
+  assert.equal(commandExecutions, 0);
+  assert.equal(credentialReads, 0);
+  assert.equal(networkCalls, 0);
+  assert.equal(snapshot.providers[0]?.allowedActions.includes("disconnect"), false);
+  assert.deepEqual(snapshot.providers[1]?.allowedActions, []);
+  assert.deepEqual(snapshot.costs, {
+    costKnowledge: "unknown",
+    sessionUsd: 1.25,
+    dayUsd: 0.75,
+    totalUsd: 2.5,
+  });
+  assert.deepEqual(snapshot.approvalRules, [{ id: "rule-safe", decision: "allow" }]);
+  assert.equal(snapshot.cachedModels[0]?.id, "k3");
+  assert.equal(JSON.stringify(snapshot).includes("SECRET"), false);
+  assert.deepEqual(
+    collectObjectKeys(snapshot).filter((key) =>
+      /^(providerSetup|credentialSlot|accountFingerprint|accountFingerprintSuffix|apiKey|secret|requestId)$/i.test(key)),
+    [],
+  );
+  assert.equal(Object.isFrozen(snapshot), true);
+});
+
+test("default runtime exposes and populates a synchronous secretless model cache without provider effects", async () => {
+  const Runtime = (cliModule as unknown as {
+    DefaultProviderRuntime: new (...args: unknown[]) => {
+      readCachedModels(): readonly ModelInfo[];
+      runModelCatalog<T>(run: () => Promise<T>): Promise<T>;
+      runWithReadyRoute<T>(run: (route: RouteIdentityV1) => Promise<T>): Promise<T>;
+    };
+  }).DefaultProviderRuntime;
+  let forbiddenEffects = 0;
+  const forbidden = new Proxy({}, {
+    get() {
+      forbiddenEffects += 1;
+      throw new Error("cached model reads must not touch provider effects");
+    },
+  });
+  const runtime = new Runtime(
+    forbidden,
+    forbidden,
+    forbidden,
+    new ProviderStateStore(structuredClone(DEFAULT_CONFIG.providerSetup)),
+    forbidden,
+    forbidden,
+    new SessionProviderRuntimeGuard(),
+    forbidden,
+    null,
+    null,
+    "openrouter/auto",
+    structuredClone(DEFAULT_CONFIG),
+  );
+
+  const models = runtime.readCachedModels();
+  assert.deepEqual(models.map((model) => model.id), [
+    "k3",
+    "k3-256k",
+    "kimi-for-coding",
+    "kimi-for-coding-highspeed",
+  ]);
+  assert.equal(forbiddenEffects, 0);
+  assert.equal(Object.isFrozen(models), true);
+  assert.deepEqual(
+    collectObjectKeys(models).filter((key) =>
+      /^(providerSetup|credentialSlot|accountFingerprint|accountFingerprintSuffix|apiKey|secret|requestId)$/i.test(key)),
+    [],
+  );
+
+  runtime.runWithReadyRoute = async (run) => run({
+    version: 1,
+    backendId: "openrouter",
+    accountFingerprint: "acct_cache_test_only",
+    billingRealm: "openrouter-payg",
+    requestedModelId: "vendor/cached",
+    canonicalModelId: "vendor/cached-canonical",
+    resolutionState: "resolved",
+  });
+  await runtime.runModelCatalog(async () => [{
+    id: "vendor/cached",
+    canonicalSlug: "vendor/cached-canonical",
+    name: "Cached OpenRouter Model",
+    description: "safe",
+    contextLength: 128_000,
+    promptPrice: 0.1,
+    completionPrice: 0.2,
+    supportedParameters: ["tools"],
+    inputModalities: ["text"],
+    outputModalities: ["text"],
+    requestId: "SECRET_CATALOG_REQUEST_CANARY",
+  } as ModelInfo]);
+  const populated = runtime.readCachedModels();
+  assert.equal(populated.some((model) => model.id === "vendor/cached"), true);
+  assert.equal(JSON.stringify(populated).includes("SECRET"), false);
+  assert.equal(forbiddenEffects, 0);
+});
+
+test("Settings-Setup-Surface nutzt Picker und Notices ohne Chat- oder Config-Mutation", async () => {
+  const chatMessages: string[] = [];
+  const notices: string[] = [];
+  let restores = 0;
+  const config = structuredClone(DEFAULT_CONFIG);
+  const before = structuredClone(config);
+  const settingsUi = {
+    pickChoice: async () => null,
+    readSecret: async () => "SECRET_INPUT_CANARY",
+    pickModel: async () => null,
+    confirmAction: async () => ({ accepted: false }),
+    addMessage: (_role: string, message: string) => chatMessages.push(message),
+    showSettingsNotice: (message: string) => notices.push(message),
+    restoreSettings: () => {
+      restores += 1;
+    },
+  };
+  const surface = createSettingsSetupSurface(settingsUi);
+
+  assert.equal(await surface.chooseHub([{
+    id: "openrouter",
+    label: "OpenRouter",
+    description: "Provider",
+    disabled: false,
+    current: true,
+    generation: 1,
+  }]), null);
+  surface.present({ version: 1, type: "notice", message: "Abgebrochen" });
+
+  assert.deepEqual(config, before);
+  assert.deepEqual(chatMessages, []);
+  assert.deepEqual(notices, ["Abgebrochen"]);
+  assert.equal(notices.join(" ").includes("SECRET_INPUT_CANARY"), false);
+  assert.ok(restores >= 1);
+});
+
+test("Settings-Setup-Surface stellt Settings auch nach synchronen UI-Fehlern wieder her", async () => {
+  let restores = 0;
+  const surface = createSettingsSetupSurface({
+    pickChoice() {
+      throw new Error("sync-picker-failure");
+    },
+    async readSecret() {
+      return null;
+    },
+    async pickModel() {
+      return null;
+    },
+    async confirmAction() {
+      return { accepted: false };
+    },
+    showSettingsNotice() {
+      throw new Error("sync-notice-failure");
+    },
+    restoreSettings() {
+      restores += 1;
+    },
+  });
+
+  await assert.rejects(surface.chooseHub([]), /sync-picker-failure/);
+  assert.equal(restores, 1);
+  assert.throws(
+    () => surface.present({ version: 1, type: "notice", message: "Status" }),
+    /sync-notice-failure/,
+  );
+  assert.equal(restores, 2);
+});
+
+function collectObjectKeys(value: unknown): string[] {
+  if (Array.isArray(value)) return value.flatMap(collectObjectKeys);
+  if (!value || typeof value !== "object") return [];
+  return Object.entries(value).flatMap(([key, nested]) => [key, ...collectObjectKeys(nested)]);
+}
 
 type BootstrapRuntimeDouble = {
   inspectStartup(): Promise<Record<string, unknown>>;

@@ -9,13 +9,22 @@ import {
   writeFile,
 } from "node:fs/promises";
 import { hostname } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
+import { isDeepStrictEqual } from "node:util";
 import {
   APP_HOME,
   ensureSecureDirectory,
+  isAtomicFilePostPublicationError,
   SECURE_FILE_MODE,
   writeFileAtomicSecure,
 } from "./config.js";
+import type { ConfigWriteOwnership } from "./config-write-lock.js";
+import {
+  configBytesDigest,
+  readConfigFileSnapshot,
+  sameConfigFileSnapshot,
+  type ConfigFileSnapshot,
+} from "./config-file.js";
 import {
   REASONING_EFFORTS,
   type ChatSummary,
@@ -105,6 +114,270 @@ export interface SaveOutcome {
 
 export interface SessionRunSnapshot {
   data: PersistedSessionData;
+}
+
+/** Exact stored session bytes plus the strictly parsed value they contain. */
+export interface SessionEditSnapshot {
+  readonly path: string;
+  readonly data: PersistedSessionData;
+  readonly file: ConfigFileSnapshot & { readonly kind: "file" };
+}
+
+export interface SessionPreferenceEdit {
+  readonly requestedModelId: string;
+  readonly reasoning: ReasoningSetting;
+  readonly route: RouteIdentityV1;
+}
+
+export interface PreparedSessionPreferencePublication {
+  /** Prevalidated idempotent live adoption; this method never throws. */
+  publish(): void;
+}
+
+export class SessionEditConflictError extends Error {
+  readonly code = "session-edit-conflict" as const;
+
+  constructor() {
+    super("Session target changed since the edit snapshot was taken.");
+    this.name = "SessionEditConflictError";
+  }
+}
+
+export class SessionEditUnavailableError extends Error {
+  readonly code = "session-edit-unavailable" as const;
+
+  constructor() {
+    super("Session cannot be edited in its current stored state.");
+    this.name = "SessionEditUnavailableError";
+  }
+}
+
+export class SessionEditUnverifiedError extends Error {
+  readonly code = "session-edit-unverified" as const;
+
+  constructor() {
+    super("Session publication could not be verified after it was reached.");
+    this.name = "SessionEditUnverifiedError";
+  }
+}
+
+/** Reads and strictly binds one current session file without mutating its live owner. */
+export async function readSessionEditSnapshot(path: string): Promise<SessionEditSnapshot> {
+  let file: ConfigFileSnapshot;
+  try {
+    file = await readConfigFileSnapshot(path);
+  } catch {
+    throw new SessionEditUnavailableError();
+  }
+  if (file.kind !== "file") throw new SessionEditUnavailableError();
+  return freezeSessionEditSnapshot(resolve(path), parseSessionEditBytes(file.raw), file);
+}
+
+/** Builds only the model/reasoning/route delta on a clone of an exact snapshot. */
+export function prepareSessionPreferenceEdit(
+  expected: SessionEditSnapshot,
+  preference: SessionPreferenceEdit,
+): PersistedSessionData {
+  const currentRoute = persistableSessionRoute(expected.data.route);
+  const nextRoute = persistableSessionRoute(preference.route);
+  const requestedModelId = preference.requestedModelId.trim();
+  if (!currentRoute
+    || currentRoute.resolutionState !== "resolved"
+    || currentRoute.canonicalModelId === null
+    || !nextRoute
+    || nextRoute.resolutionState !== "resolved"
+    || nextRoute.canonicalModelId === null
+    || !requestedModelId
+    || !routeOwnsModel(nextRoute, requestedModelId)
+    || nextRoute.requestedModelId !== requestedModelId
+    || nextRoute.backendId !== currentRoute.backendId
+    || nextRoute.accountFingerprint !== currentRoute.accountFingerprint
+    || nextRoute.billingRealm !== currentRoute.billingRealm
+    || !isReasoningSetting(preference.reasoning)) {
+    throw new Error("Session-Modellroute ist ungültig.");
+  }
+  const candidate = structuredClone(expected.data);
+  candidate.model = requestedModelId;
+  candidate.reasoning = structuredClone(preference.reasoning);
+  candidate.route = structuredClone(nextRoute);
+  delete candidate.routeCleared;
+  candidate.revision = expected.data.revision + 1;
+  candidate.updatedAt = new Date().toISOString();
+  return deepFreezeSessionEdit(candidate);
+}
+
+/** Exact session CAS under the already-held shared config/session writer locks. */
+export async function saveSessionEditUnderLock(
+  ownership: ConfigWriteOwnership,
+  expected: SessionEditSnapshot,
+  candidate: PersistedSessionData,
+): Promise<SessionEditSnapshot> {
+  const validated = validateSessionEditCandidate(expected, candidate);
+  const path = ownership.canonicalPath;
+  if (path !== expected.path) throw new SessionEditConflictError();
+  await ownership.assertHeld();
+  let current: ConfigFileSnapshot;
+  try {
+    current = await readConfigFileSnapshot(path);
+  } catch {
+    throw new SessionEditConflictError();
+  }
+  await ownership.assertHeld();
+  if (current.kind !== "file" || !sameConfigFileSnapshot(current, expected.file)) {
+    throw new SessionEditConflictError();
+  }
+  parseSessionEditBytes(current.raw);
+  const content = `${JSON.stringify(validated, null, 2)}\n`;
+  const digest = configBytesDigest(content);
+  try {
+    await writeFileAtomicSecure(path, content, async () => {
+      await ownership.assertHeld();
+      const fenced = await readConfigFileSnapshot(path);
+      if (fenced.kind !== "file" || !sameConfigFileSnapshot(fenced, expected.file)) {
+        throw new SessionEditConflictError();
+      }
+      await ownership.assertHeld();
+    });
+  } catch (error) {
+    if (!isAtomicFilePostPublicationError(error)) throw error;
+  }
+  await ownership.assertHeld().catch(() => undefined);
+  try {
+    const readback = await readConfigFileSnapshot(path);
+    if (readback.kind === "file" && readback.digest === digest) {
+      const data = parseSessionEditBytes(readback.raw);
+      if (isDeepStrictEqual(data, validated)) {
+        return freezeSessionEditSnapshot(path, data, readback);
+      }
+    }
+  } catch {
+    // Publication was reached; only exact readback may classify success.
+  }
+  throw new SessionEditUnverifiedError();
+}
+
+function parseSessionEditBytes(raw: string): PersistedSessionData {
+  let value: unknown;
+  try {
+    value = JSON.parse(raw);
+  } catch {
+    throw new SessionEditUnavailableError();
+  }
+  if (!isRecord(value)
+    || typeof value.workspace !== "string"
+    || value.workspace.length === 0
+    || typeof value.id !== "string"
+    || value.id.length === 0) {
+    throw new SessionEditUnavailableError();
+  }
+  const parsed = normalizeSession(value, value.workspace, value.id);
+  if (parsed === null || !isDeepStrictEqual(parsed, value)) {
+    throw new SessionEditUnavailableError();
+  }
+  return parsed;
+}
+
+/** Strict canonical parser used only by the private model-preference recovery journal. */
+export function validateSessionEditBytes(raw: string): PersistedSessionData {
+  return deepFreezeSessionEdit(structuredClone(parseSessionEditBytes(raw)));
+}
+
+function freezeSessionEditSnapshot(
+  path: string,
+  data: PersistedSessionData,
+  file: ConfigFileSnapshot & { readonly kind: "file" },
+): SessionEditSnapshot {
+  return deepFreezeSessionEdit({
+    path,
+    data: structuredClone(data),
+    file,
+  });
+}
+
+function validateSessionEditCandidate(
+  expected: SessionEditSnapshot,
+  candidate: PersistedSessionData,
+): PersistedSessionData {
+  let exactExpected: PersistedSessionData;
+  try {
+    exactExpected = parseSessionEditBytes(expected.file.raw);
+  } catch {
+    throw new SessionEditUnavailableError();
+  }
+  if (!isDeepStrictEqual(exactExpected, expected.data)
+    || expected.path !== resolve(expected.path)
+    || !Number.isSafeInteger(exactExpected.revision)
+    || exactExpected.revision < 0) {
+    throw new SessionEditUnavailableError();
+  }
+  const normalized = normalizeSession(candidate, exactExpected.workspace, exactExpected.id);
+  const currentRoute = persistableSessionRoute(exactExpected.route);
+  const nextRoute = persistableSessionRoute(candidate.route);
+  if (normalized === null
+    || !isDeepStrictEqual(normalized, candidate)
+    || !isDeepStrictEqual(redactValue(candidate), candidate)
+    || currentRoute === null
+    || currentRoute.resolutionState !== "resolved"
+    || currentRoute.canonicalModelId === null
+    || nextRoute === null
+    || nextRoute.resolutionState !== "resolved"
+    || nextRoute.canonicalModelId === null
+    || nextRoute.backendId !== currentRoute.backendId
+    || nextRoute.accountFingerprint !== currentRoute.accountFingerprint
+    || nextRoute.billingRealm !== currentRoute.billingRealm
+    || typeof candidate.model !== "string"
+    || candidate.model.length === 0
+    || candidate.model !== candidate.model.trim()
+    || candidate.model !== nextRoute.requestedModelId
+    || !routeOwnsModel(nextRoute, candidate.model)
+    || !isStrictReasoningSetting(candidate.reasoning)
+    || candidate.routeCleared !== undefined
+    || candidate.revision !== exactExpected.revision + 1
+    || !Number.isSafeInteger(candidate.revision)
+    || validDate(candidate.updatedAt) !== candidate.updatedAt
+    || !sameSessionOutsidePreference(exactExpected, candidate)) {
+    throw new Error("Session-Modellroute ist ungültig.");
+  }
+  return deepFreezeSessionEdit(structuredClone(candidate));
+}
+
+function sameSessionOutsidePreference(
+  left: PersistedSessionData,
+  right: PersistedSessionData,
+): boolean {
+  const strip = (value: PersistedSessionData): Record<string, unknown> => {
+    const clone = structuredClone(value) as unknown as Record<string, unknown>;
+    for (const key of [
+      "model",
+      "reasoning",
+      "route",
+      "routeCleared",
+      "revision",
+      "updatedAt",
+    ]) {
+      delete clone[key];
+    }
+    return clone;
+  };
+  return isDeepStrictEqual(strip(left), strip(right));
+}
+
+function isStrictReasoningSetting(value: unknown): value is ReasoningSetting {
+  if (!isReasoningSetting(value) || !isRecord(value)) return false;
+  const keys = Object.keys(value).sort();
+  if (value.mode === "auto") return isDeepStrictEqual(keys, ["mode"]);
+  if (value.mode === "effort") return isDeepStrictEqual(keys, ["effort", "mode"]);
+  return isDeepStrictEqual(keys, ["maxTokens", "mode"]);
+}
+
+function deepFreezeSessionEdit<T>(value: T): T {
+  if (value !== null && typeof value === "object" && !Object.isFrozen(value)) {
+    for (const item of Object.values(value as Record<string, unknown>)) {
+      deepFreezeSessionEdit(item);
+    }
+    Object.freeze(value);
+  }
+  return value;
 }
 
 /**
@@ -267,6 +540,70 @@ export class SessionStore {
 
   get data(): Readonly<PersistedSessionData> {
     return this.#data;
+  }
+
+  /**
+   * Prepares the only live-session mutation used after a verified preference
+   * transaction. Validation and cloning happen up front; `publish()` performs
+   * assignments only, updates the merge base to the exact durable candidate,
+   * and is an idempotent no-op after its first call.
+   */
+  preparePreferencePublication(
+    expected: SessionEditSnapshot,
+    candidate: PersistedSessionData,
+  ): PreparedSessionPreferencePublication {
+    if (this.path !== expected.path
+      || !isDeepStrictEqual(this.#data, expected.data)
+      || !isDeepStrictEqual(this.#base, expected.data)
+      || this.#pendingLegacyRouteProjection) {
+      throw new SessionEditConflictError();
+    }
+    const validated = validateSessionEditCandidate(expected, candidate);
+    const nextData = structuredClone(validated);
+    const nextBase = structuredClone(validated);
+    let published = false;
+    return Object.freeze({
+      publish: () => {
+        if (published) return;
+        published = true;
+        this.#data = nextData;
+        this.#base = nextBase;
+        this.#pendingLegacyRouteProjection = false;
+      },
+    });
+  }
+
+  /**
+   * Startup-only adoption after the private model-preference journal has
+   * already converged this exact file. It never writes and refuses to replace
+   * dirty live state or a different session owner.
+   */
+  adoptRecoveredPreferenceSnapshot(snapshot: SessionEditSnapshot): void {
+    this.prepareRecoveredPreferencePublication(snapshot).publish();
+  }
+
+  prepareRecoveredPreferencePublication(
+    snapshot: SessionEditSnapshot,
+  ): PreparedSessionPreferencePublication {
+    if (snapshot.path !== this.path
+      || !isDeepStrictEqual(this.#data, this.#base)
+      || this.#pendingLegacyRouteProjection
+      || snapshot.data.workspace !== this.#data.workspace
+      || snapshot.data.id !== this.#data.id) {
+      throw new SessionEditConflictError();
+    }
+    const nextData = structuredClone(snapshot.data);
+    const nextBase = structuredClone(snapshot.data);
+    let published = false;
+    return Object.freeze({
+      publish: () => {
+        if (published) return;
+        published = true;
+        this.#data = nextData;
+        this.#base = nextBase;
+        this.#pendingLegacyRouteProjection = false;
+      },
+    });
   }
 
   addTurn(role: ChatTurn["role"], content: string): void {

@@ -8,6 +8,8 @@ import { promisify } from "node:util";
 import { SpendUnavailableError, assertSpendAvailable } from "../src/agent.js";
 import {
   handleSlashCommand,
+  audioInputModelCandidates,
+  panelModelCandidates,
   promptForValidKey,
   shouldReplaceCredential,
   validateAndActivateInferenceKey,
@@ -1975,4 +1977,34 @@ test("slash compressor selection requires text output but no text input or tools
     imageToText.id,
     "the rejected value must not replace the last compatible compressor",
   );
+});
+
+test("Settings panel and audio roles use distinct exact capability filters", () => {
+  const textPanel = roleModel({
+    id: "provider/text-panel",
+    supportedParameters: [],
+    inputModalities: ["text"],
+    outputModalities: ["text"],
+  });
+  const outputOnly = roleModel({
+    id: "provider/output-only",
+    supportedParameters: [],
+    inputModalities: ["image"],
+    outputModalities: ["text"],
+  });
+  const audioText = roleModel({
+    id: "provider/audio-text",
+    supportedParameters: [],
+    inputModalities: ["audio"],
+    outputModalities: ["text"],
+  });
+  const audioImage = roleModel({
+    id: "provider/audio-image",
+    supportedParameters: [],
+    inputModalities: ["audio"],
+    outputModalities: ["image"],
+  });
+
+  assert.deepEqual(panelModelCandidates([textPanel, outputOnly, audioText]), [textPanel]);
+  assert.deepEqual(audioInputModelCandidates([textPanel, audioText, audioImage]), [audioText]);
 });

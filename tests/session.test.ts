@@ -15,11 +15,16 @@ import { hostname, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
 import { evaluateBudget } from "../src/config.js";
+import { withConfigWriteLock } from "../src/config-write-lock.js";
 import {
   chatLockPath,
   dayKey,
   exportSessionMarkdown,
   mergeSessions,
+  prepareSessionPreferenceEdit,
+  readSessionEditSnapshot,
+  saveSessionEditUnderLock,
+  SessionEditConflictError,
   type PersistedSessionData,
   rankChatMatches,
   redactSensitive,
@@ -362,6 +367,126 @@ test("workspace can contain multiple independently persisted chats", async () =>
     mode: "effort",
     effort: "high",
   });
+});
+
+test("session edit CAS persistiert eine exakte neue Modellroute ohne den Live-SessionStore vor Readback zu mutieren", async (t) => {
+  const { workspace, appHome } = await workspaceRoot("session-edit-cas");
+  t.after(() => rm(dirname(appHome), { recursive: true, force: true }));
+  const oldRoute: RouteIdentityV1 = {
+    version: 1,
+    backendId: "kimi-code",
+    accountFingerprint: "acct_kimi_session_edit",
+    billingRealm: "kimi-code-membership-provider-managed-overage",
+    requestedModelId: "k3",
+    canonicalModelId: "k3",
+    resolutionState: "resolved",
+  };
+  const newRoute: RouteIdentityV1 = {
+    ...oldRoute,
+    requestedModelId: "k3-256k",
+    canonicalModelId: "k3-256k",
+  };
+  const store = SessionStore.create(workspace, appHome, "Transactional route");
+  store.setPreferences("k3", { mode: "auto" }, oldRoute);
+  await store.save();
+  const liveBefore = structuredClone(store.data);
+  const expected = await readSessionEditSnapshot(store.path);
+  const candidate = prepareSessionPreferenceEdit(expected, {
+    requestedModelId: "k3-256k",
+    reasoning: { mode: "effort", effort: "high" },
+    route: newRoute,
+  });
+
+  const saved = await withConfigWriteLock(store.path, (ownership) =>
+    saveSessionEditUnderLock(ownership, expected, candidate));
+
+  assert.deepEqual(store.data, liveBefore, "der unter Lock schreibende Port mutiert keinen Live-Owner");
+  assert.equal(saved.data.model, "k3-256k");
+  assert.deepEqual(saved.data.route, newRoute);
+  assert.equal(saved.data.revision, expected.data.revision + 1);
+  assert.deepEqual(expected.data, liveBefore, "Snapshot bleibt caller-owned und unverändert");
+  const reopened = await SessionStore.openById(workspace, store.data.id, appHome);
+  assert.equal(reopened.data.model, "k3-256k");
+  assert.deepEqual(reopened.data.route, newRoute);
+
+  await assert.rejects(
+    withConfigWriteLock(store.path, (ownership) =>
+      saveSessionEditUnderLock(ownership, expected, candidate)),
+    SessionEditConflictError,
+  );
+});
+
+test("prepared session publication adopts the verified candidate and merge base synchronously without throwing", async (t) => {
+  const { workspace, appHome } = await workspaceRoot("session-live-publication");
+  t.after(() => rm(dirname(appHome), { recursive: true, force: true }));
+  const oldRoute: RouteIdentityV1 = {
+    version: 1,
+    backendId: "openrouter",
+    accountFingerprint: "acct_session_publication_owner",
+    billingRealm: "openrouter-payg",
+    requestedModelId: "openai/old",
+    canonicalModelId: "openai/old",
+    resolutionState: "resolved",
+  };
+  const nextRoute: RouteIdentityV1 = {
+    ...oldRoute,
+    requestedModelId: "openai/new",
+    canonicalModelId: "openai/new",
+  };
+  const store = SessionStore.create(workspace, appHome, "Live publication");
+  store.setPreferences(oldRoute.requestedModelId, { mode: "auto" }, oldRoute);
+  await store.save();
+  const expected = await readSessionEditSnapshot(store.path);
+  const candidate = prepareSessionPreferenceEdit(expected, {
+    requestedModelId: nextRoute.requestedModelId,
+    reasoning: { mode: "effort", effort: "high" },
+    route: nextRoute,
+  });
+  const publication = store.preparePreferencePublication(expected, candidate);
+
+  await withConfigWriteLock(store.path, (ownership) =>
+    saveSessionEditUnderLock(ownership, expected, candidate));
+  assert.doesNotThrow(() => publication.publish());
+  assert.doesNotThrow(() => publication.publish(), "repeat settlement is a no-op, never a throw");
+  assert.deepEqual(store.data, candidate);
+
+  store.addTurn("user", "after publication");
+  const outcome = await store.save();
+  assert.equal(outcome.merged, false, "the exact candidate became the live merge base");
+  const reopened = await SessionStore.openById(workspace, store.data.id, appHome);
+  assert.equal(reopened.data.model, nextRoute.requestedModelId);
+  assert.deepEqual(reopened.data.route, nextRoute);
+  assert.equal(reopened.data.turns.at(-1)?.content, "after publication");
+});
+
+test("session preference candidate lehnt fremde Accounts, unaufgelöste Routes und Caller-Mutation strikt ab", async (t) => {
+  const { workspace, appHome } = await workspaceRoot("session-edit-validation");
+  t.after(() => rm(dirname(appHome), { recursive: true, force: true }));
+  const route: RouteIdentityV1 = {
+    version: 1,
+    backendId: "openrouter",
+    accountFingerprint: "acct_openrouter_owner",
+    billingRealm: "openrouter-payg",
+    requestedModelId: "openai/owner-model",
+    canonicalModelId: "openai/owner-model",
+    resolutionState: "resolved",
+  };
+  const store = SessionStore.create(workspace, appHome, "Owner route");
+  store.setPreferences(route.requestedModelId, { mode: "auto" }, route);
+  await store.save();
+  const expected = await readSessionEditSnapshot(store.path);
+
+  assert.throws(() => prepareSessionPreferenceEdit(expected, {
+    requestedModelId: "openai/foreign-model",
+    reasoning: { mode: "auto" },
+    route: { ...route, requestedModelId: "openai/foreign-model", canonicalModelId: "openai/foreign-model", accountFingerprint: "acct_foreign" },
+  }), /Session-Modellroute ist ungültig/);
+  assert.throws(() => prepareSessionPreferenceEdit(expected, {
+    requestedModelId: route.requestedModelId,
+    reasoning: { mode: "auto" },
+    route: { ...route, resolutionState: "legacy-unverified", canonicalModelId: null },
+  }), /Session-Modellroute ist ungültig/);
+  assert.deepEqual(expected.data.route, route);
 });
 
 test("clearRouteIfExact durably removes only one complete exact route and rejects mismatches or invalid identities", async (t) => {

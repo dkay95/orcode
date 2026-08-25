@@ -14,7 +14,12 @@ import {
 import {
   DEFAULT_CONFIG,
   loadConfigDetailed,
+  readConfigFileSnapshot,
+  readConfigEditSnapshot,
+  sameConfigFileSnapshot,
+  saveConfigEditUnderLock,
   saveConfig,
+  withConfigWriteLock,
   type OrcodeConfigWithBudget,
 } from "../src/config.js";
 import type {
@@ -28,6 +33,8 @@ import { OpenRouterHttpError, OpenRouterService } from "../src/openrouter.js";
 import {
   ProviderActivationCoordinator,
   type ProviderActivationBoundary,
+  type ProviderPreferenceCleanupAuthority,
+  type ProviderPreferenceMutationAuthority,
 } from "../src/provider-activation.js";
 import { PrivateStore } from "../src/private-store.js";
 import {
@@ -37,7 +44,18 @@ import {
 } from "../src/provider-state.js";
 import { createRunId, RunLog } from "../src/runlog.js";
 import { RuleStore, rulesPath, shellApprovalSubject } from "../src/rules.js";
-import { SessionStore } from "../src/session.js";
+import {
+  prepareSessionPreferenceEdit,
+  readSessionEditSnapshot,
+  SessionStore,
+} from "../src/session.js";
+import {
+  MODEL_PREFERENCE_FAILPOINTS,
+  ModelPreferenceCrashError,
+  recoverModelPreferenceTransactions,
+  runModelPreferenceTransaction,
+  type ModelPreferenceAuthorityPublication,
+} from "../src/model-preference-transaction.js";
 import type {
   BackendModelDescriptor,
   CandidateProviderState,
@@ -59,6 +77,125 @@ interface Harness {
   context: CommandContext;
   workspace: string;
   asked: ToolCallPreview[];
+}
+
+function integrationPreferenceMutationAuthority() {
+  const controller = new AbortController();
+  let phase: "active" | "reconciling" | "completing" | "cleaning" | "completed" = "active";
+  let completionAcknowledged = false;
+  let cleanupAcknowledged = false;
+  const authority = Object.freeze<ProviderPreferenceMutationAuthority>({
+    signal: controller.signal,
+    deadlineAt: Number.MAX_SAFE_INTEGER,
+    assertMutationAllowed() {
+      if (phase !== "active" || controller.signal.aborted) {
+        throw controller.signal.reason instanceof Error
+          ? controller.signal.reason
+          : new Error("integration preference authority revoked");
+      }
+    },
+    async assertMutationAuthorityHeld() {
+      this.assertMutationAllowed();
+    },
+    assertReconcileAllowed() {
+      if (phase !== "reconciling") {
+        throw new Error("integration preference reconcile authority lost");
+      }
+    },
+    async assertReconcileAuthorityHeld() {
+      this.assertReconcileAllowed();
+    },
+    assertCompletionAllowed() {
+      if (phase !== "completing") {
+        throw new Error("integration preference completion authority lost");
+      }
+    },
+    async acknowledgePersistence(configFence) {
+      return Object.freeze({ configFence });
+    },
+    async assertCompletionAuthorityHeld() {
+      this.assertCompletionAllowed();
+    },
+    async acknowledgeCompletion() {
+      this.assertCompletionAllowed();
+      if (completionAcknowledged) {
+        throw new Error("integration preference completion replayed");
+      }
+      completionAcknowledged = true;
+      return Object.freeze({ version: 1 as const });
+    },
+  });
+  const cleanupAuthority = Object.freeze<ProviderPreferenceCleanupAuthority>({
+    signal: new AbortController().signal,
+    assertCleanupAllowed() {
+      if (phase !== "cleaning" || cleanupAcknowledged) {
+        throw new Error("integration preference cleanup authority lost");
+      }
+    },
+    async assertCleanupAuthorityHeld() {
+      this.assertCleanupAllowed();
+    },
+    async acknowledgeCleanup() {
+      this.assertCleanupAllowed();
+      cleanupAcknowledged = true;
+      return Object.freeze({ version: 1 as const });
+    },
+  });
+  return {
+    authority,
+    cleanupAuthority,
+    beginCompletion() {
+      if (phase !== "active") throw new Error("integration preference authority lost");
+      phase = "completing";
+    },
+    finishCompletion() {
+      if (phase !== "completing" || !completionAcknowledged) {
+        throw new Error("integration preference completion is not acknowledged");
+      }
+      phase = "cleaning";
+    },
+    finishCleanup() {
+      if (phase !== "cleaning" || !cleanupAcknowledged) {
+        throw new Error("integration preference cleanup is not acknowledged");
+      }
+      phase = "completed";
+    },
+  };
+}
+
+function providerCommittedConfigRaw(
+  stagingRaw: string,
+  nextProviderState: ProviderSetupStateV2,
+): string {
+  const marker = '"providerSetup": ';
+  const markerAt = stagingRaw.indexOf(marker);
+  assert.notEqual(markerAt, -1);
+  const start = markerAt + marker.length;
+  assert.equal(stagingRaw[start], "{");
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+  let end = start;
+  for (; end < stagingRaw.length; end += 1) {
+    const character = stagingRaw[end]!;
+    if (inString) {
+      if (escaped) escaped = false;
+      else if (character === "\\") escaped = true;
+      else if (character === '"') inString = false;
+      continue;
+    }
+    if (character === '"') inString = true;
+    else if (character === "{") depth += 1;
+    else if (character === "}") {
+      depth -= 1;
+      if (depth === 0) {
+        end += 1;
+        break;
+      }
+    }
+  }
+  assert.equal(depth, 0);
+  return `${stagingRaw.slice(0, start)}${JSON.stringify(nextProviderState)}${stagingRaw.slice(end)}`;
 }
 
 async function harness(
@@ -1267,4 +1404,274 @@ test("/budget reports the workspace spend and rejects nonsense limits", async ()
     handleSlashCommand("/budget on-exceed vielleicht", context),
     /on-exceed/,
   );
+});
+
+test("model preference journal converges every crash boundary to one complete OpenRouter or Kimi tuple", async (t) => {
+  for (const backendId of ["openrouter", "kimi-code"] as const) {
+    for (const boundary of MODEL_PREFERENCE_FAILPOINTS) {
+      await t.test(`${backendId}:${boundary}`, async () => {
+        const root = await mkdtemp(join(tmpdir(), `orcode-model-pref-${backendId}-`));
+        try {
+          const workspace = join(root, "workspace");
+          const appHome = join(root, ".orcode");
+          const configPath = join(appHome, "config.json");
+          await mkdir(workspace, { recursive: true });
+          const accountFingerprint = backendId === "openrouter"
+            ? "acct_model_pref_openrouter_owner"
+            : "acct_model_pref_kimi_owner";
+          const billingRealm = backendId === "openrouter"
+            ? "openrouter-payg" as const
+            : "kimi-code-membership-provider-managed-overage" as const;
+          const oldModel = backendId === "openrouter" ? "openai/old-model" : "k3";
+          const newModel = backendId === "openrouter" ? "openai/new-model" : "k3-256k";
+          const oldRoute: RouteIdentityV1 = {
+            version: 1,
+            backendId,
+            accountFingerprint,
+            billingRealm,
+            requestedModelId: oldModel,
+            canonicalModelId: oldModel,
+            resolutionState: "resolved",
+          };
+          const newRoute: RouteIdentityV1 = {
+            ...oldRoute,
+            requestedModelId: newModel,
+            canonicalModelId: newModel,
+          };
+          const connection: ProviderConnectionStateV1 = {
+            id: `${backendId}-model-preference-owner`,
+            backendId,
+            enabled: true,
+            maturity: backendId === "openrouter" ? "stable" : "preview",
+            credentialSlot: backendId === "openrouter"
+              ? "v1:inference:61616161-6161-4161-8161-616161616161"
+              : "v1:kimi-code:62626262-6262-4262-8262-626262626262",
+            accountFingerprint,
+            accountFingerprintState: "verified",
+            billingRealm,
+            lastHealth: null,
+          };
+          const beforeConfig = structuredClone(DEFAULT_CONFIG);
+          beforeConfig.mainModel = oldModel;
+          beforeConfig.providerSetup = {
+            schemaVersion: 2,
+            revision: 7,
+            lifecycle: "configured",
+            connections: [connection],
+            defaultRoute: oldRoute,
+            cross: { enabled: false, preferredLead: null, preferredChallenger: null },
+          };
+          await saveConfig(beforeConfig, configPath);
+          const session = SessionStore.create(workspace, appHome, "Model preference transaction");
+          session.setPreferences(oldModel, { mode: "auto" }, oldRoute);
+          await session.save();
+          const expectedConfig = await readConfigEditSnapshot(configPath);
+          const expectedSession = await readSessionEditSnapshot(session.path);
+          const nextConfig = structuredClone(expectedConfig.config);
+          nextConfig.mainModel = newModel;
+          nextConfig.providerSetup = {
+            ...structuredClone(nextConfig.providerSetup),
+            revision: 8,
+            defaultRoute: newRoute,
+          } as ProviderSetupStateV2;
+          const nextSession = prepareSessionPreferenceEdit(expectedSession, {
+            requestedModelId: newModel,
+            reasoning: { mode: "auto" },
+            route: newRoute,
+          });
+          const stagingConfigRaw = `${JSON.stringify({
+            ...structuredClone(nextConfig),
+            providerSetup: structuredClone(expectedConfig.config.providerSetup),
+          }, null, 2)}\n`;
+          const committedConfigRaw = providerCommittedConfigRaw(
+            stagingConfigRaw,
+            nextConfig.providerSetup as ProviderSetupStateV2,
+          );
+          let authoritative = {
+            route: structuredClone(oldRoute),
+            providerRevision: 7,
+            connectionId: connection.id,
+          };
+          let liveRoute = structuredClone(oldRoute);
+          const routeAuthority = {
+            async assertHeld() {},
+            async read() {
+              return structuredClone(authoritative);
+            },
+            async commit(
+              route: RouteIdentityV1,
+              publication: ModelPreferenceAuthorityPublication,
+            ) {
+              const scope = integrationPreferenceMutationAuthority();
+              const { configFence } = await publication.persist(
+                nextConfig.providerSetup as ProviderSetupStateV2,
+                scope.authority,
+              );
+              const staging = await loadConfigDetailed(configPath);
+              const stagingConfig = staging.config;
+              const stagingSession = JSON.parse(
+                await readFile(session.path, "utf8"),
+              ) as { model: string; route: RouteIdentityV1 };
+              assert.equal(stagingConfig.mainModel, newModel);
+              assert.deepEqual("defaultRoute" in stagingConfig.providerSetup
+                ? stagingConfig.providerSetup.defaultRoute
+                : null, oldRoute, "STAGING keeps the old provider authority");
+              assert.equal(stagingSession.model, newModel);
+              assert.deepEqual(stagingSession.route, newRoute);
+              assert.equal(
+                await readFile(configPath, "utf8"),
+                stagingConfigRaw,
+              );
+              assert.ok(sameConfigFileSnapshot(
+                await readConfigFileSnapshot(configPath),
+                configFence,
+              ), "fake Provider-CAS consumes the exact returned STAGING fence");
+              if (configFence.kind !== "file") assert.fail("provider config fence must be a file");
+              const finalConfigRaw = providerCommittedConfigRaw(
+                configFence.raw,
+                nextConfig.providerSetup as ProviderSetupStateV2,
+              );
+              assert.equal(finalConfigRaw, committedConfigRaw);
+              await writeFile(configPath, finalConfigRaw, "utf8");
+              assert.equal(
+                await readFile(configPath, "utf8"),
+                finalConfigRaw,
+              );
+              authoritative = {
+                route: structuredClone(route),
+                providerRevision: 8,
+                connectionId: connection.id,
+              };
+              scope.beginCompletion();
+              const acknowledgement = await publication.complete(scope.authority);
+              assert.equal(acknowledgement.version, 1);
+              scope.finishCompletion();
+              const cleanupAcknowledgement = await publication.cleanup(
+                scope.cleanupAuthority,
+              );
+              assert.equal(cleanupAcknowledgement.version, 1);
+              scope.finishCleanup();
+            },
+          };
+
+          await assert.rejects(
+            runModelPreferenceTransaction({
+              appHome,
+              configPath,
+              sessionPath: session.path,
+              expectedConfig,
+              nextConfig,
+              expectedSession,
+              nextSession,
+              beforeRoute: oldRoute,
+              afterRoute: newRoute,
+              routeAuthority,
+              publish(route) {
+                liveRoute = structuredClone(route);
+              },
+              failpoint: boundary,
+            }),
+            ModelPreferenceCrashError,
+          );
+
+          await recoverModelPreferenceTransactions({
+            appHome,
+            routeAuthority,
+          });
+          const storedConfig = JSON.parse(await readFile(configPath, "utf8")) as OrcodeConfigWithBudget;
+          const storedSession = await SessionStore.openById(workspace, session.data.id, appHome);
+          const expectedRoute = authoritative.route.requestedModelId === newModel ? newRoute : oldRoute;
+          assert.equal(
+            await readFile(configPath, "utf8"),
+            authoritative.route.requestedModelId === newModel
+              ? committedConfigRaw
+              : expectedConfig.file.kind === "file"
+                ? expectedConfig.file.raw
+                : "",
+          );
+          assert.equal(
+            await readFile(session.path, "utf8"),
+            authoritative.route.requestedModelId === newModel
+              ? `${JSON.stringify(nextSession, null, 2)}\n`
+              : expectedSession.file.raw,
+          );
+          assert.equal(storedConfig.mainModel, expectedRoute.requestedModelId);
+          assert.deepEqual("defaultRoute" in storedConfig.providerSetup
+            ? storedConfig.providerSetup.defaultRoute
+            : null, expectedRoute);
+          assert.equal(storedSession.data.model, expectedRoute.requestedModelId);
+          assert.deepEqual(storedSession.data.route, expectedRoute);
+          assert.deepEqual(authoritative.route, expectedRoute);
+          // Recovery is disk/provider-only. Normal startup adopts the exact
+          // authoritative route later and must not receive a recovery callback.
+          liveRoute = structuredClone(authoritative.route);
+          assert.deepEqual(liveRoute, expectedRoute);
+        } finally {
+          await rm(root, { recursive: true, force: true });
+        }
+      });
+    }
+  }
+});
+
+test("model preference transaction rejects stale foreign-account routes before any write", async () => {
+  const root = await mkdtemp(join(tmpdir(), "orcode-model-pref-stale-account-"));
+  try {
+    const workspace = join(root, "workspace");
+    const appHome = join(root, ".orcode");
+    const configPath = join(appHome, "config.json");
+    await mkdir(workspace, { recursive: true });
+    const oldRoute: RouteIdentityV1 = {
+      version: 1,
+      backendId: "openrouter",
+      accountFingerprint: "acct_model_pref_exact_owner",
+      billingRealm: "openrouter-payg",
+      requestedModelId: "openai/old",
+      canonicalModelId: "openai/old",
+      resolutionState: "resolved",
+    };
+    const beforeConfig = structuredClone(DEFAULT_CONFIG);
+    beforeConfig.mainModel = oldRoute.requestedModelId;
+    await saveConfig(beforeConfig, configPath);
+    const session = SessionStore.create(workspace, appHome, "Stale account");
+    session.setPreferences(oldRoute.requestedModelId, { mode: "auto" }, oldRoute);
+    await session.save();
+    const configBytes = await readFile(configPath, "utf8");
+    const sessionBytes = await readFile(session.path, "utf8");
+    const expectedConfig = await readConfigEditSnapshot(configPath);
+    const expectedSession = await readSessionEditSnapshot(session.path);
+    const foreignRoute: RouteIdentityV1 = {
+      ...oldRoute,
+      accountFingerprint: "acct_model_pref_foreign",
+      requestedModelId: "openai/new",
+      canonicalModelId: "openai/new",
+    };
+
+    await assert.rejects(runModelPreferenceTransaction({
+      appHome,
+      configPath,
+      sessionPath: session.path,
+      expectedConfig,
+      nextConfig: { ...expectedConfig.config, mainModel: foreignRoute.requestedModelId },
+      expectedSession,
+      nextSession: structuredClone(expectedSession.data),
+      beforeRoute: oldRoute,
+      afterRoute: foreignRoute,
+      routeAuthority: {
+        async read() {
+          return {
+            route: oldRoute,
+            providerRevision: 0,
+            connectionId: "stale-account-fixture",
+          };
+        },
+        async commit() { throw new Error("must not commit"); },
+      },
+      publish() { throw new Error("must not publish"); },
+    }), /route identity/i);
+    assert.equal(await readFile(configPath, "utf8"), configBytes);
+    assert.equal(await readFile(session.path, "utf8"), sessionBytes);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
 });

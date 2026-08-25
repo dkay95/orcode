@@ -13,7 +13,11 @@ import {
   validatePanelModelSelection,
   validateConfig,
 } from "./config.js";
-import type { ProviderCommandIntent } from "./commands.js";
+import {
+  isAudioInputModelCandidate,
+  isPanelModelCandidate,
+  type ProviderCommandIntent,
+} from "./commands.js";
 import {
   getReasoningSetting,
   reasoningChoiceValue,
@@ -37,8 +41,48 @@ import type {
   ReasoningEffort,
   ReasoningSetting,
 } from "./types.js";
+import { createNeverConfiguredProviderState } from "./provider-state.js";
+import {
+  isCompressorModelCandidate,
+  isMainModelCandidate,
+} from "./openrouter.js";
 
-export type SettingsControllerSnapshot = SettingsAuthoritativeSnapshot;
+export type SettingsConfigProjection = Omit<OrcodeConfigWithBudget, "providerSetup">;
+
+export type SettingsControllerSnapshot = Omit<SettingsAuthoritativeSnapshot, "config"> & {
+  readonly config: SettingsConfigProjection;
+};
+
+/** Explicit allow-list: provider identities and credential slots never enter Settings state. */
+export function projectSettingsConfig(
+  config: OrcodeConfigWithBudget | SettingsConfigProjection,
+): SettingsConfigProjection {
+  return freezeClone({
+    schemaVersion: config.schemaVersion,
+    mainModel: config.mainModel,
+    compressorModel: config.compressorModel,
+    compressionMode: config.compressionMode,
+    compressionThresholdChars: config.compressionThresholdChars,
+    approvalMode: config.approvalMode,
+    maxSteps: config.maxSteps,
+    maxCostUsd: config.maxCostUsd,
+    compressorMaxCostUsd: config.compressorMaxCostUsd,
+    reasoningByModel: config.reasoningByModel,
+    transcriptionModel: config.transcriptionModel,
+    voiceConsentGiven: config.voiceConsentGiven,
+    budget: config.budget,
+    fallbackModels: config.fallbackModels,
+    provider: config.provider,
+    web: config.web,
+    verify: config.verify,
+    contextBudgetRatio: config.contextBudgetRatio,
+    panelModels: config.panelModels,
+    panelJudge: config.panelJudge,
+    browserPath: config.browserPath,
+    browserTimeoutSeconds: config.browserTimeoutSeconds,
+    appearance: config.appearance,
+  });
+}
 
 export type SettingsIntent =
   | { readonly kind: "move"; readonly delta: -1 | 1 }
@@ -107,7 +151,7 @@ export type SettingsConfigEditState =
   | { readonly kind: "editable"; readonly snapshot: ConfigEditSnapshot }
   | {
       readonly kind: "read-only";
-      readonly config: OrcodeConfigWithBudget;
+      readonly config: SettingsConfigProjection;
       readonly reason: "Konfiguration schreibgeschützt";
     };
 
@@ -122,6 +166,7 @@ export interface SettingsControllerDependencies {
     candidate: ConfigInput,
     path: string,
   ) => Promise<OrcodeConfigWithBudget>;
+  readonly runConfigMutation?: <T>(task: () => Promise<T>) => Promise<T>;
 }
 
 export interface SettingsNotice {
@@ -206,9 +251,24 @@ const ACTION_REFRESH_NOTICE = "Aktion ausgeführt; Ansicht konnte nicht aktualis
 const ALLOW_ALL_WARNING =
   "allow-all führt Dateiänderungen und Shell-Befehle ohne Nachfrage aus. Wirklich aktivieren?";
 
-/** A dependency may discover a run between the controller refresh and its CAS. */
 export class SettingsRunActiveError extends Error {
   readonly code = "settings-run-active" as const;
+}
+
+export class SettingsExternalActionCancelledError extends Error {
+  readonly code = "settings-action-cancelled" as const;
+
+  constructor() {
+    super("Settings action was cancelled.");
+    this.name = "SettingsExternalActionCancelledError";
+  }
+}
+
+class SettingsConfigUnverifiedMismatchError extends Error {
+  constructor(readonly exact: ConfigEditSnapshot) {
+    super("Settings config readback differs from the requested candidate.");
+    this.name = "SettingsConfigUnverifiedMismatchError";
+  }
 }
 
 export class SettingsController {
@@ -233,7 +293,7 @@ export class SettingsController {
     initialCategory: SettingsCategoryId,
   ) {
     this.#dependencies = dependencies;
-    this.#snapshot = freezeClone(snapshot);
+    this.#snapshot = projectControllerSnapshot(snapshot);
     this.#configEditState = configEditState;
     this.#selectedCategoryId = initialCategory;
     this.#rebuildRegistry();
@@ -244,18 +304,18 @@ export class SettingsController {
     dependencies: SettingsControllerDependencies,
     initialCategory: SettingsCategoryId = "models-reasoning",
   ): Promise<SettingsController> {
-    const runtime = await dependencies.snapshots.read();
+    const runtime = projectControllerSnapshot(await dependencies.snapshots.read());
     let controllerSnapshot = runtime;
     let configEditState: SettingsConfigEditState;
     try {
       const exact = await dependencies.readConfig(dependencies.configPath);
-      if (sameConfig(runtime.config, exact.config)) {
+      if (sameProjectedConfig(runtime.config, exact.config)) {
         configEditState = { kind: "editable", snapshot: exact };
       } else {
-        controllerSnapshot = { ...runtime, config: exact.config };
+        controllerSnapshot = { ...runtime, config: projectSettingsConfig(exact.config) };
         configEditState = {
           kind: "read-only",
-          config: freezeClone(exact.config),
+          config: projectSettingsConfig(exact.config),
           reason: READ_ONLY_REASON,
         };
       }
@@ -277,7 +337,7 @@ export class SettingsController {
   get view(): SettingsViewModel {
     const items = this.#visibleItems();
     return Object.freeze({
-      categories: Object.freeze([...buildSettingsRegistry(this.#snapshot).categories]),
+      categories: Object.freeze([...buildSettingsRegistry(registrySnapshot(this.#snapshot)).categories]),
       items: Object.freeze([...items]),
       allItems: Object.freeze([...this.#allItems]),
       selectedCategoryId: this.#selectedCategoryId,
@@ -387,7 +447,7 @@ export class SettingsController {
 
     let activity: SettingsControllerSnapshot;
     try {
-      activity = await this.#dependencies.snapshots.read();
+      activity = projectControllerSnapshot(await this.#dependencies.snapshots.read());
     } catch {
       this.#notice = Object.freeze({ kind: "error", message: ACTIVITY_ERROR_NOTICE });
       return { kind: "render" };
@@ -448,7 +508,15 @@ export class SettingsController {
   ): Promise<SettingsControllerEffect> {
     try {
       await this.#dependencies.externalActions.execute(action);
-    } catch {
+    } catch (error) {
+      if (error instanceof SettingsRunActiveError) {
+        await this.#showRunActive(pending.item.id);
+        return { kind: "render" };
+      }
+      if (error instanceof SettingsExternalActionCancelledError) {
+        this.#notice = Object.freeze({ kind: "info", message: "Abgebrochen" });
+        return { kind: "render" };
+      }
       this.#notice = Object.freeze({ kind: "error", message: EXTERNAL_ERROR_NOTICE });
       return { kind: "render" };
     }
@@ -500,14 +568,35 @@ export class SettingsController {
 
     let saved: OrcodeConfigWithBudget;
     try {
-      saved = await this.#dependencies.saveConfig(
-        pending.configSnapshot,
-        validated,
-        this.#dependencies.configPath,
-      );
+      const runMutation = this.#dependencies.runConfigMutation
+        ?? (<T>(task: () => Promise<T>) => task());
+      saved = await runMutation(async () => {
+        let persisted: OrcodeConfigWithBudget;
+        try {
+          persisted = await this.#dependencies.saveConfig(
+            pending.configSnapshot,
+            validated,
+            this.#dependencies.configPath,
+          );
+        } catch (error) {
+          if (!(error instanceof ConfigEditUnverifiedError)) throw error;
+          let exact: ConfigEditSnapshot;
+          try {
+            exact = await this.#dependencies.readConfig(this.#dependencies.configPath);
+          } catch {
+            throw error;
+          }
+          if (!sameExactConfig(exact.config, validated)) {
+            throw new SettingsConfigUnverifiedMismatchError(exact);
+          }
+          persisted = exact.config;
+        }
+        if (sameExactConfig(persisted, validated)) publication.publish();
+        return persisted;
+      });
     } catch (error) {
       if (error instanceof SettingsRunActiveError) {
-        this.#notice = Object.freeze({ kind: "info", message: "Lauf aktiv" });
+        await this.#showRunActive(pending.item.id);
         return { kind: "render" };
       }
       if (error instanceof ConfigEditConflictError) {
@@ -520,18 +609,22 @@ export class SettingsController {
         return { kind: "render" };
       }
       if (error instanceof ConfigEditUnverifiedError) {
-        return this.#reconcileUnverified(
+        this.#enterReadOnly(pending.item.id, activity, activity.config);
+        this.#notice = Object.freeze({ kind: "error", message: UNVERIFIED_NOTICE });
+        return { kind: "render" };
+      }
+      if (error instanceof SettingsConfigUnverifiedMismatchError) {
+        return this.#reconcileUnverifiedMismatch(
           pending.item.id,
           activity,
-          validated,
-          publication,
+          error.exact,
         );
       }
       this.#notice = Object.freeze({ kind: "error", message: SAVE_ERROR_NOTICE });
       return { kind: "render" };
     }
 
-    if (!sameConfig(saved, validated)) {
+    if (!sameExactConfig(saved, validated)) {
       await this.#refreshOrReadOnly(
         pending.item.id,
         { ...activity, config: saved },
@@ -541,7 +634,6 @@ export class SettingsController {
       return { kind: "render" };
     }
 
-    publication.publish();
     if (!await this.#refreshOrReadOnly(
       pending.item.id,
       { ...activity, config: saved },
@@ -554,84 +646,36 @@ export class SettingsController {
     return { kind: "render" };
   }
 
-  async #reconcileUnverified(
+  async #reconcileUnverifiedMismatch(
     focusItemId: SettingsItemId,
     activity: SettingsControllerSnapshot,
-    validated: OrcodeConfigWithBudget,
-    publication: PreparedLiveConfigPublication,
+    exact: ConfigEditSnapshot,
   ): Promise<SettingsControllerEffect> {
-    let exact: ConfigEditSnapshot;
     try {
-      exact = await this.#dependencies.readConfig(this.#dependencies.configPath);
-    } catch {
-      this.#snapshot = freezeClone(activity);
-      this.#configEditState = {
-        kind: "read-only",
-        config: freezeClone(activity.config),
-        reason: READ_ONLY_REASON,
-      };
-      this.#rebuildRegistry();
-      this.#restoreFocus(focusItemId);
-      this.#notice = Object.freeze({ kind: "error", message: UNVERIFIED_NOTICE });
-      return { kind: "render" };
-    }
-
-    if (!sameConfig(exact.config, validated)) {
-      try {
-        const runtime = await this.#dependencies.snapshots.read();
-        if (!sameConfig(runtime.config, exact.config)) {
-          this.#enterReadOnly(
-            focusItemId,
-            { ...runtime, config: exact.config },
-            exact.config,
-          );
-          this.#notice = Object.freeze({ kind: "error", message: CONFLICT_NOTICE });
-          return { kind: "render" };
-        }
-        this.#snapshot = freezeClone(runtime);
-        this.#configEditState = { kind: "editable", snapshot: exact };
-      } catch {
+      const runtime = projectControllerSnapshot(await this.#dependencies.snapshots.read());
+      if (!sameProjectedConfig(runtime.config, exact.config)) {
         this.#enterReadOnly(
           focusItemId,
-          { ...activity, config: exact.config },
+          { ...runtime, config: projectSettingsConfig(exact.config) },
           exact.config,
         );
         this.#notice = Object.freeze({ kind: "error", message: CONFLICT_NOTICE });
         return { kind: "render" };
       }
-      this.#rebuildRegistry();
-      this.#restoreFocus(focusItemId);
-      this.#notice = Object.freeze({ kind: "error", message: CONFLICT_NOTICE });
-      return { kind: "render" };
-    }
-
-    publication.publish();
-    let runtime: SettingsControllerSnapshot;
-    try {
-      runtime = await this.#dependencies.snapshots.read();
+      this.#snapshot = freezeClone(runtime);
+      this.#configEditState = { kind: "editable", snapshot: exact };
     } catch {
       this.#enterReadOnly(
         focusItemId,
-        { ...activity, config: validated },
-        validated,
-      );
-      this.#notice = Object.freeze({ kind: "success", message: SAVED_REFRESH_NOTICE });
-      return { kind: "render" };
-    }
-    if (!sameConfig(runtime.config, exact.config)) {
-      this.#enterReadOnly(
-        focusItemId,
-        { ...runtime, config: exact.config },
+        { ...activity, config: projectSettingsConfig(exact.config) },
         exact.config,
       );
-      this.#notice = Object.freeze({ kind: "success", message: SAVED_REFRESH_NOTICE });
+      this.#notice = Object.freeze({ kind: "error", message: CONFLICT_NOTICE });
       return { kind: "render" };
     }
-    this.#snapshot = freezeClone(runtime);
-    this.#configEditState = { kind: "editable", snapshot: exact };
     this.#rebuildRegistry();
     this.#restoreFocus(focusItemId);
-    this.#notice = Object.freeze({ kind: "success", message: "Gespeichert" });
+    this.#notice = Object.freeze({ kind: "error", message: CONFLICT_NOTICE });
     return { kind: "render" };
   }
 
@@ -661,20 +705,32 @@ export class SettingsController {
     return { kind: "edit", request };
   }
 
+  async #showRunActive(focusItemId: SettingsItemId): Promise<void> {
+    try {
+      const runtime = projectControllerSnapshot(await this.#dependencies.snapshots.read());
+      this.#snapshot = freezeClone(runtime.runActive ? runtime : { ...runtime, runActive: true });
+    } catch {
+      this.#snapshot = freezeClone({ ...this.#snapshot, runActive: true });
+    }
+    this.#rebuildRegistry();
+    this.#restoreFocus(focusItemId);
+    this.#notice = Object.freeze({ kind: "info", message: "Lauf aktiv" });
+  }
+
   async #refresh(focusItemId: SettingsItemId): Promise<boolean> {
-    const runtime = await this.#dependencies.snapshots.read();
+    const runtime = projectControllerSnapshot(await this.#dependencies.snapshots.read());
     this.#snapshot = freezeClone(runtime);
     let editable = false;
     try {
       const exact = await this.#dependencies.readConfig(this.#dependencies.configPath);
-      if (sameConfig(runtime.config, exact.config)) {
+      if (sameProjectedConfig(runtime.config, exact.config)) {
         this.#configEditState = { kind: "editable", snapshot: exact };
         editable = true;
       } else {
-        this.#snapshot = freezeClone({ ...runtime, config: exact.config });
+        this.#snapshot = freezeClone({ ...runtime, config: projectSettingsConfig(exact.config) });
         this.#configEditState = {
           kind: "read-only",
-          config: freezeClone(exact.config),
+          config: projectSettingsConfig(exact.config),
           reason: READ_ONLY_REASON,
         };
       }
@@ -693,7 +749,7 @@ export class SettingsController {
   async #refreshOrReadOnly(
     focusItemId: SettingsItemId,
     fallbackSnapshot: SettingsControllerSnapshot,
-    fallbackConfig: OrcodeConfigWithBudget,
+    fallbackConfig: SettingsConfigProjection,
   ): Promise<boolean> {
     try {
       return await this.#refresh(focusItemId);
@@ -706,12 +762,13 @@ export class SettingsController {
   #enterReadOnly(
     focusItemId: SettingsItemId,
     snapshot: SettingsControllerSnapshot,
-    config: OrcodeConfigWithBudget,
+    config: OrcodeConfigWithBudget | SettingsConfigProjection,
   ): void {
-    this.#snapshot = freezeClone({ ...snapshot, config });
+    const projected = projectSettingsConfig(config);
+    this.#snapshot = freezeClone({ ...snapshot, config: projected });
     this.#configEditState = {
       kind: "read-only",
-      config: freezeClone(config),
+      config: projected,
       reason: READ_ONLY_REASON,
     };
     this.#rebuildRegistry();
@@ -732,7 +789,7 @@ export class SettingsController {
   }
 
   #rebuildRegistry(): void {
-    const registry = buildSettingsRegistry(this.#snapshot);
+    const registry = buildSettingsRegistry(registrySnapshot(this.#snapshot));
     this.#allItems = Object.freeze(registry.items.map((item) => {
       if (this.#configEditState.kind === "editable" || item.editor.kind === "readonly") {
         return item;
@@ -909,7 +966,9 @@ function actionForItem(
     case "main-model": {
       if (typeof value !== "string") return invalid(value, "Modellauswahl ist ungültig");
       const model = findModel(snapshot, value);
-      if (!model) return invalid(value, "Modellauswahl ist nicht mehr verfügbar");
+      if (!model || !isMainModelCandidate(model)) {
+        return invalid(value, "Modellauswahl ist nicht mehr verfügbar");
+      }
       return {
         kind: "external",
         action: {
@@ -1019,7 +1078,9 @@ function actionForItem(
       try {
         const modelIds = validatePanelModelSelection(
           value,
-          snapshot.cachedModels.flatMap((model) => [model.id, model.canonicalSlug].filter(isString)),
+          snapshot.cachedModels
+            .filter(isPanelModelCandidate)
+            .flatMap((model) => [model.id, model.canonicalSlug].filter(isString)),
         );
         return { kind: "external", action: { kind: "panel-models", modelIds } };
       } catch {
@@ -1031,7 +1092,7 @@ function actionForItem(
     case "transcription-model": {
       if (typeof value !== "string") return invalid(value, "Audiomodell ist ungültig");
       const model = findModel(snapshot, value);
-      if (!model || !model.inputModalities.includes("audio")) {
+      if (!model || !isAudioInputModelCandidate(model)) {
         return invalid(value, "Audiomodell ist nicht verfügbar");
       }
       return {
@@ -1446,7 +1507,7 @@ function modelAction(
 ): InterpretedEditorResult {
   if (typeof value !== "string") return invalid(value, "Modellauswahl ist ungültig");
   const model = findModel(snapshot, value);
-  return model
+  return model && isCompressorModelCandidate(model)
     ? { kind: "external", action: { kind, modelId: model.id } }
     : invalid(value, "Modellauswahl ist nicht mehr verfügbar");
 }
@@ -1590,8 +1651,33 @@ function oneLine(value: string): string {
   return [...value.replace(/[\r\n\p{Cc}\p{Cf}]/gu, " ")].slice(0, 160).join("");
 }
 
-function sameConfig(left: OrcodeConfigWithBudget, right: OrcodeConfigWithBudget): boolean {
+function sameExactConfig(left: OrcodeConfigWithBudget, right: OrcodeConfigWithBudget): boolean {
   return JSON.stringify(left) === JSON.stringify(right);
+}
+
+function sameProjectedConfig(
+  left: OrcodeConfigWithBudget | SettingsConfigProjection,
+  right: OrcodeConfigWithBudget | SettingsConfigProjection,
+): boolean {
+  return JSON.stringify(projectSettingsConfig(left)) === JSON.stringify(projectSettingsConfig(right));
+}
+
+/** Registry compatibility shell with a static identity-free provider state it never reads. */
+function registrySnapshot(snapshot: SettingsControllerSnapshot): SettingsAuthoritativeSnapshot {
+  return {
+    ...snapshot,
+    config: {
+      ...snapshot.config,
+      providerSetup: createNeverConfiguredProviderState(),
+    },
+  };
+}
+
+function projectControllerSnapshot(snapshot: SettingsControllerSnapshot): SettingsControllerSnapshot {
+  return freezeClone({
+    ...snapshot,
+    config: projectSettingsConfig(snapshot.config),
+  });
 }
 
 function freezeRequest(request: SettingsEditorRequest): SettingsEditorRequest {

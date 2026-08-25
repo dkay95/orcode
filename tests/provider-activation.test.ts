@@ -6,6 +6,7 @@ import test from "node:test";
 import {
   DEFAULT_CONFIG,
   loadConfigDetailed,
+  readConfigEditSnapshot,
   saveConfig,
   withConfigWriteLock,
   writeFileAtomicCreateSecure,
@@ -13,6 +14,17 @@ import {
   type OrcodeConfigWithBudget,
 } from "../src/config.js";
 import { PrivateStore } from "../src/private-store.js";
+import {
+  ModelPreferenceRecoveryRequiredError,
+  recoverModelPreferenceTransactions,
+  runModelPreferenceTransaction,
+  type ModelPreferenceAuthorityPublication,
+} from "../src/model-preference-transaction.js";
+import {
+  prepareSessionPreferenceEdit,
+  readSessionEditSnapshot,
+  SessionStore,
+} from "../src/session.js";
 import {
   createNeverConfiguredProviderState,
   ProviderStateStore,
@@ -32,9 +44,27 @@ import type {
 } from "../src/credentials.js";
 import { ProviderCredentialAuthority } from "../src/provider-authority.js";
 import {
+  createProviderPreferenceCommitPort,
   ProviderActivationCoordinator,
+  type ProviderActivationConfigCandidate,
   type ProviderActivationJournalV2,
+  type ProviderPreferenceCleanupAuthority,
+  type ProviderPreferenceCompletionAck,
+  type ProviderPreferenceMutationAuthority,
 } from "../src/provider-activation.js";
+
+async function acknowledgePreferenceCompletion(
+  _candidate: ProviderActivationConfigCandidate,
+  authority: ProviderPreferenceMutationAuthority,
+) {
+  return authority.acknowledgeCompletion();
+}
+
+async function acknowledgePreferenceCleanup(
+  authority: ProviderPreferenceCleanupAuthority,
+) {
+  return authority.acknowledgeCleanup();
+}
 
 const OLD_SLOT: CredentialSlotRef = Object.freeze({
   version: 1,
@@ -615,16 +645,842 @@ async function activationFixture(options: ActivationFixtureOptions = {}) {
   };
 }
 
+test("authority-internal preference hook persists before Provider-CAS and its config prefix survives", async () => {
+  const fixture = await activationFixture();
+  let calls = 0;
+  const result = await fixture.coordinator().activate({
+    ...fixture.request,
+    persistBeforeProviderConfigCommit: createProviderPreferenceCommitPort({
+      persist: async ({
+        route,
+        state,
+      }: ProviderActivationConfigCandidate, authority) => {
+        authority.assertMutationAllowed();
+        calls += 1;
+        const before = await loadConfigDetailed(fixture.path);
+        assert.deepEqual(before.config.providerSetup, fixture.oldState);
+        assert.deepEqual(route, state.defaultRoute);
+        assert.equal(state.revision, fixture.oldState.revision + 1);
+        before.config.mainModel = "openai/preference-hook-survives";
+        await saveConfig(before.config, fixture.path);
+        authority.assertMutationAllowed();
+        return authority.acknowledgePersistence(
+          (await readConfigEditSnapshot(fixture.path)).file,
+        );
+      },
+      abortAndReconcile: async () => ({ kind: "old" }),
+      complete: acknowledgePreferenceCompletion,
+      cleanup: acknowledgePreferenceCleanup,
+    }),
+  });
+
+  const stored = await loadConfigDetailed(fixture.path);
+  assert.equal(calls, 1);
+  assert.equal(stored.config.mainModel, "openai/preference-hook-survives");
+  assert.deepEqual(stored.config.providerSetup, result.state);
+  assert.deepEqual("defaultRoute" in stored.config.providerSetup
+    ? stored.config.providerSetup.defaultRoute
+    : null, result.route);
+});
+
+test("preference completion runs exactly once under retained provider and runtime authority", async (t) => {
+  for (const backendId of ["openrouter", "kimi-code"] as const) {
+    await t.test(backendId, async () => {
+      const fixture = backendId === "openrouter"
+        ? await activationFixture()
+        : await kimiActivationFixture();
+      const oldSlot = backendId === "openrouter" ? OLD_SLOT : KIMI_OLD_SLOT;
+      let completionCalls = 0;
+      const result = await fixture.coordinator().activate({
+        ...fixture.request,
+        persistBeforeProviderConfigCommit: createProviderPreferenceCommitPort({
+          persist: async (_candidate, authority) => {
+            authority.assertMutationAllowed();
+            return authority.acknowledgePersistence(
+              (await readConfigEditSnapshot(fixture.path)).file,
+            );
+          },
+          abortAndReconcile: async () => ({ kind: "old" }),
+          complete: async (candidate, authority) => {
+            authority.assertCompletionAllowed();
+            completionCalls += 1;
+            assert.equal(fixture.runtimeGuard.held, true);
+            assert.equal(fixture.runtimeGuard.tryStartRun(), false);
+            assert.deepEqual(fixture.stateStore.read(), candidate.state);
+            assert.deepEqual(candidate.route, candidate.state.defaultRoute);
+            assert.equal(fixture.credentials.slots.has(oldSlot.id), true);
+            assert.equal((await journalDirectories(fixture.appHome)).length, 1);
+            assert.equal(fixture.adapter.calls.includes("activate"), true);
+            return authority.acknowledgeCompletion();
+          },
+          cleanup: acknowledgePreferenceCleanup,
+        }),
+      });
+
+      assert.equal(completionCalls, 1);
+      assert.deepEqual(result.state, fixture.stateStore.read());
+      assert.equal(fixture.runtimeGuard.held, false);
+      assert.equal(fixture.credentials.slots.has(oldSlot.id), false);
+      assert.deepEqual(await journalDirectories(fixture.appHome), []);
+    });
+  }
+});
+
+test("missing or forged completion acknowledgement retains the committed recovery journal", async (t) => {
+  for (const [name, complete] of [
+    ["missing", async () => undefined as never],
+    ["forged", async () => Object.freeze({ version: 1 as const })],
+  ] as const) {
+    await t.test(name, async () => {
+      const fixture = await activationFixture();
+      let reconcileCalls = 0;
+      await assert.rejects(
+        fixture.coordinator().activate({
+          ...fixture.request,
+          persistBeforeProviderConfigCommit: createProviderPreferenceCommitPort({
+            persist: async (_candidate, authority) => authority.acknowledgePersistence(
+              (await readConfigEditSnapshot(fixture.path)).file,
+            ),
+            abortAndReconcile: async () => {
+              reconcileCalls += 1;
+              return { kind: "old" };
+            },
+            complete,
+            cleanup: acknowledgePreferenceCleanup,
+          }),
+        }),
+        (error: unknown) => error instanceof Error
+          && "code" in error
+          && error.code === "provider-preference-completion-required",
+      );
+
+      assert.equal(reconcileCalls, 0, "provider durability makes OLD reconciliation too late");
+      assert.deepEqual(fixture.stateStore.read().defaultRoute, newRoute());
+      assert.equal(fixture.credentials.slots.has(OLD_SLOT.id), true);
+      assert.equal(fixture.credentials.slots.has(NEW_SLOT_ID), true);
+      assert.equal((await journalDirectories(fixture.appHome)).length, 1);
+    });
+  }
+});
+
+test("missing or forged cleanup acknowledgement retains the committed provider journal", async (t) => {
+  for (const [name, cleanup] of [
+    ["missing", async () => undefined as never],
+    ["forged", async () => Object.freeze({ version: 1 as const })],
+  ] as const) {
+    await t.test(name, async () => {
+      const fixture = await activationFixture();
+      let cleanupCalls = 0;
+      await assert.rejects(
+        fixture.coordinator().activate({
+          ...fixture.request,
+          persistBeforeProviderConfigCommit: createProviderPreferenceCommitPort({
+            persist: async (_candidate, authority) => authority.acknowledgePersistence(
+              (await readConfigEditSnapshot(fixture.path)).file,
+            ),
+            abortAndReconcile: async () => {
+              throw new Error("FINAL must never reconcile to OLD during cleanup");
+            },
+            complete: acknowledgePreferenceCompletion,
+            cleanup: async (authority) => {
+              authority.assertCleanupAllowed();
+              cleanupCalls += 1;
+              return cleanup();
+            },
+          }),
+        }),
+        (error: unknown) => error instanceof Error
+          && "code" in error
+          && error.code === "provider-preference-completion-required",
+      );
+
+      assert.equal(cleanupCalls, 1);
+      assert.deepEqual(fixture.stateStore.read().defaultRoute, newRoute());
+      assert.equal(fixture.credentials.slots.has(OLD_SLOT.id), true);
+      assert.equal(fixture.credentials.slots.has(NEW_SLOT_ID), true);
+      assert.equal((await journalDirectories(fixture.appHome)).length, 1);
+    });
+  }
+});
+
+test("cleanup cannot acknowledge after the exact provider lease expires", async () => {
+  const fixture = await activationFixture({ now: 10_000 });
+  let passedAfterExpiry = false;
+  await assert.rejects(
+    fixture.coordinator().activate({
+      ...fixture.request,
+      persistBeforeProviderConfigCommit: createProviderPreferenceCommitPort({
+        persist: async (_candidate, authority) => authority.acknowledgePersistence(
+          (await readConfigEditSnapshot(fixture.path)).file,
+        ),
+        abortAndReconcile: async () => ({ kind: "old" }),
+        complete: acknowledgePreferenceCompletion,
+        cleanup: async (authority) => {
+          fixture.setNow(10_101);
+          authority.assertCleanupAllowed();
+          passedAfterExpiry = true;
+          return authority.acknowledgeCleanup();
+        },
+      }),
+    }),
+    (error: unknown) => error instanceof Error
+      && "code" in error
+      && error.code === "provider-preference-completion-required",
+  );
+  assert.equal(passedAfterExpiry, false);
+  assert.equal(fixture.credentials.slots.has(OLD_SLOT.id), true);
+  assert.equal(fixture.credentials.slots.has(NEW_SLOT_ID), true);
+  assert.equal((await journalDirectories(fixture.appHome)).length, 1);
+});
+
+test("a completion acknowledgement cannot be replayed by another authority", async () => {
+  const first = await activationFixture();
+  let acknowledgement: ProviderPreferenceCompletionAck | null = null;
+  await first.coordinator().activate({
+    ...first.request,
+    persistBeforeProviderConfigCommit: createProviderPreferenceCommitPort({
+      persist: async (_candidate, authority) => authority.acknowledgePersistence(
+        (await readConfigEditSnapshot(first.path)).file,
+      ),
+      abortAndReconcile: async () => ({ kind: "old" }),
+      complete: async (_candidate, authority) => {
+        acknowledgement = await authority.acknowledgeCompletion();
+        return acknowledgement;
+      },
+      cleanup: acknowledgePreferenceCleanup,
+    }),
+  });
+  assert.ok(acknowledgement);
+
+  const second = await activationFixture();
+  await assert.rejects(
+    second.coordinator().activate({
+      ...second.request,
+      persistBeforeProviderConfigCommit: createProviderPreferenceCommitPort({
+        persist: async (_candidate, authority) => authority.acknowledgePersistence(
+          (await readConfigEditSnapshot(second.path)).file,
+        ),
+        abortAndReconcile: async () => ({ kind: "old" }),
+        complete: async () => acknowledgement!,
+        cleanup: acknowledgePreferenceCleanup,
+      }),
+    }),
+    (error: unknown) => error instanceof Error
+      && "code" in error
+      && error.code === "provider-preference-completion-required",
+  );
+  assert.equal((await journalDirectories(second.appHome)).length, 1);
+  assert.equal(second.credentials.slots.has(OLD_SLOT.id), true);
+});
+
+test("caller abort after provider durability cannot revoke a late exact completion", async () => {
+  const fixture = await activationFixture();
+  const controller = new AbortController();
+  const reason = new DOMException("fixed late caller abort", "AbortError");
+  let reached!: () => void;
+  let resume!: () => void;
+  const completionReached = new Promise<void>((resolve) => { reached = resolve; });
+  const completionResume = new Promise<void>((resolve) => { resume = resolve; });
+  let completionCalls = 0;
+  const activation = fixture.coordinator().activate({
+    ...fixture.request,
+    signal: controller.signal,
+    persistBeforeProviderConfigCommit: createProviderPreferenceCommitPort({
+      persist: async (_candidate, authority) => authority.acknowledgePersistence(
+        (await readConfigEditSnapshot(fixture.path)).file,
+      ),
+      abortAndReconcile: async () => {
+        throw new Error("OLD reconciliation must not run after provider durability");
+      },
+      complete: async (_candidate, authority) => {
+        completionCalls += 1;
+        reached();
+        await completionResume;
+        authority.assertCompletionAllowed();
+        return authority.acknowledgeCompletion();
+      },
+      cleanup: acknowledgePreferenceCleanup,
+    }),
+  });
+  await completionReached;
+  controller.abort(reason);
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(fixture.runtimeGuard.held, true);
+  assert.equal((await journalDirectories(fixture.appHome)).length, 1);
+  resume();
+
+  const result = await activation;
+  assert.equal(result.persisted, true);
+  assert.equal(completionCalls, 1);
+  assert.equal(fixture.runtimeGuard.held, false);
+  assert.deepEqual(await journalDirectories(fixture.appHome), []);
+});
+
+test("completion cannot acknowledge after the exact provider lease expires", async () => {
+  const fixture = await activationFixture({ now: 10_000 });
+  let passedAfterExpiry = false;
+  await assert.rejects(
+    fixture.coordinator().activate({
+      ...fixture.request,
+      persistBeforeProviderConfigCommit: createProviderPreferenceCommitPort({
+        persist: async (_candidate, authority) => authority.acknowledgePersistence(
+          (await readConfigEditSnapshot(fixture.path)).file,
+        ),
+        abortAndReconcile: async () => ({ kind: "old" }),
+        complete: async (_candidate, authority) => {
+          fixture.setNow(10_101);
+          authority.assertCompletionAllowed();
+          passedAfterExpiry = true;
+          return authority.acknowledgeCompletion();
+        },
+        cleanup: acknowledgePreferenceCleanup,
+      }),
+    }),
+    (error: unknown) => error instanceof Error
+      && "code" in error
+      && error.code === "provider-preference-completion-required",
+  );
+  assert.equal(passedAfterExpiry, false);
+  assert.equal(fixture.credentials.slots.has(OLD_SLOT.id), true);
+  assert.equal(fixture.credentials.slots.has(NEW_SLOT_ID), true);
+  assert.equal((await journalDirectories(fixture.appHome)).length, 1);
+});
+
+test("completion acknowledgement rechecks the exact cross-process provider claim", async () => {
+  const fixture = await activationFixture();
+  const originalReadOwner = fixture.privateStore.readClaimOwner.bind(
+    fixture.privateStore,
+  );
+  let exposeForeignOwner = false;
+  fixture.privateStore.readClaimOwner = async (...args) => {
+    const raw = await originalReadOwner(...args);
+    if (!exposeForeignOwner) return raw;
+    const parsed = JSON.parse(raw) as { ownerId: string };
+    return `${JSON.stringify({
+      ...parsed,
+      ownerId: "91919191-9191-4191-8191-919191919191",
+    })}\n`;
+  };
+
+  await assert.rejects(
+    fixture.coordinator().activate({
+      ...fixture.request,
+      persistBeforeProviderConfigCommit: createProviderPreferenceCommitPort({
+        persist: async (_candidate, authority) => authority.acknowledgePersistence(
+          (await readConfigEditSnapshot(fixture.path)).file,
+        ),
+        abortAndReconcile: async () => ({ kind: "old" }),
+        complete: async (_candidate, authority) => {
+          authority.assertCompletionAllowed();
+          exposeForeignOwner = true;
+          return authority.acknowledgeCompletion();
+        },
+        cleanup: acknowledgePreferenceCleanup,
+      }),
+    }),
+    (error: unknown) => error instanceof Error
+      && "code" in error
+      && error.code === "provider-preference-completion-required",
+  );
+  assert.equal(fixture.credentials.slots.has(OLD_SLOT.id), true);
+  assert.equal(fixture.credentials.slots.has(NEW_SLOT_ID), true);
+  assert.equal((await journalDirectories(fixture.appHome)).length, 1);
+});
+
+test("preference capabilities close synchronously at persistence and completion acknowledgement", async () => {
+  const fixture = await activationFixture();
+  let mutationPassedAfterPersist = false;
+  let completionPassedAfterAck = false;
+  let cleanupPassedAfterAck = false;
+  let persistMicrotask!: Promise<void>;
+  let completionMicrotask!: Promise<void>;
+  let cleanupMicrotask!: Promise<void>;
+  await fixture.coordinator().activate({
+    ...fixture.request,
+    persistBeforeProviderConfigCommit: createProviderPreferenceCommitPort({
+      persist: async (_candidate, authority) => {
+        const result = await authority.acknowledgePersistence(
+          (await readConfigEditSnapshot(fixture.path)).file,
+        );
+        persistMicrotask = new Promise<void>((resolve) => queueMicrotask(() => {
+          try {
+            authority.assertMutationAllowed();
+            mutationPassedAfterPersist = true;
+          } catch {
+            // Expected: the persist acknowledgement closed this capability.
+          }
+          resolve();
+        }));
+        return result;
+      },
+      abortAndReconcile: async () => ({ kind: "old" }),
+      complete: async (_candidate, authority) => {
+        const acknowledgement = await authority.acknowledgeCompletion();
+        completionMicrotask = new Promise<void>((resolve) => queueMicrotask(() => {
+          try {
+            authority.assertCompletionAllowed();
+            completionPassedAfterAck = true;
+          } catch {
+            // Expected: acknowledgement is the final authorized operation.
+          }
+          resolve();
+        }));
+        return acknowledgement;
+      },
+      cleanup: async (authority) => {
+        const acknowledgement = await authority.acknowledgeCleanup();
+        cleanupMicrotask = new Promise<void>((resolve) => queueMicrotask(() => {
+          try {
+            authority.assertCleanupAllowed();
+            cleanupPassedAfterAck = true;
+          } catch {
+            // Expected: cleanup acknowledgement closes its separate capability.
+          }
+          resolve();
+        }));
+        return acknowledgement;
+      },
+    }),
+  });
+  await persistMicrotask;
+  await completionMicrotask;
+  await cleanupMicrotask;
+  assert.equal(mutationPassedAfterPersist, false);
+  assert.equal(completionPassedAfterAck, false);
+  assert.equal(cleanupPassedAfterAck, false);
+});
+
+test("startup recovery idempotently completes FINAL when provider and preference journals coexist", async (t) => {
+  const fixture = await kimiActivationFixture({ oldModelId: "k3-256k" });
+  t.after(() => rm(fixture.appHome, { recursive: true, force: true }));
+  const oldRoute = kimiActivationRoute("k3-256k");
+  const finalRoute = kimiActivationRoute("kimi-for-coding");
+  const workspace = join(fixture.appHome, "workspace");
+  await mkdir(workspace, { recursive: true });
+  const session = SessionStore.create(workspace, fixture.appHome, "Both journals");
+  session.setPreferences(oldRoute.requestedModelId, { mode: "auto" }, oldRoute);
+  await session.save();
+  const expectedConfig = await readConfigEditSnapshot(fixture.path);
+  const expectedSession = await readSessionEditSnapshot(session.path);
+  const nextSession = prepareSessionPreferenceEdit(expectedSession, {
+    requestedModelId: finalRoute.requestedModelId,
+    reasoning: { mode: "auto" },
+    route: finalRoute,
+  });
+  let livePublications = 0;
+  const readAuthority = async () => {
+    const state = fixture.stateStore.read();
+    const route = state.defaultRoute;
+    const connection = route
+      ? state.connections.find((candidate) =>
+          candidate.backendId === route.backendId
+          && candidate.accountFingerprint === route.accountFingerprint
+          && candidate.billingRealm === route.billingRealm)
+      : null;
+    return {
+      route: route ? structuredClone(route) : null,
+      providerRevision: state.revision,
+      connectionId: connection?.id ?? null,
+    };
+  };
+
+  await assert.rejects(runModelPreferenceTransaction({
+    appHome: fixture.appHome,
+    configPath: fixture.path,
+    sessionPath: session.path,
+    expectedConfig,
+    nextConfig: (nextProviderState) => ({
+      ...structuredClone(expectedConfig.config),
+      mainModel: finalRoute.requestedModelId,
+      providerSetup: structuredClone(nextProviderState),
+    }),
+    expectedSession,
+    nextSession,
+    beforeRoute: oldRoute,
+    afterRoute: finalRoute,
+    routeAuthority: {
+      read: readAuthority,
+      async commit(route, publication: ModelPreferenceAuthorityPublication) {
+        const result = await fixture.coordinator().activate({
+          ...fixture.request,
+          persistBeforeProviderConfigCommit: createProviderPreferenceCommitPort({
+            persist: async ({ state }, authority) => {
+              const staged = await publication.persist(state, authority);
+              return authority.acknowledgePersistence(staged.configFence);
+            },
+            abortAndReconcile: (authority) => publication.abortAndReconcile(authority),
+            complete: (_candidate, authority) => publication.complete(authority),
+            cleanup: (authority) => publication.cleanup(authority),
+          }),
+        });
+        assert.deepEqual(result.route, route);
+      },
+    },
+    publish(route) {
+      assert.deepEqual(route, finalRoute);
+      livePublications += 1;
+    },
+    failpoint: "before-journal-remove",
+  }), ModelPreferenceRecoveryRequiredError);
+
+  const preferenceRoot = join(
+    fixture.appHome,
+    "transactions",
+    "model-preference",
+  );
+  assert.equal((await journalDirectories(fixture.appHome)).length, 1);
+  assert.equal((await readdir(preferenceRoot)).length, 1);
+  assert.equal(livePublications, 1);
+  assert.deepEqual((await readAuthority()).route, finalRoute);
+
+  const restarted = fixture.coordinatorWith({
+    runtimeGuard: new FakeRuntimeGuard(),
+    onBoundary: async () => undefined,
+  });
+  const recovered = await restarted.recoverAndRun(
+    {
+      signal: new AbortController().signal,
+      inspectCommitted: true,
+      allowedBackendIds: ["kimi-code"],
+    },
+    async (lease) => recoverModelPreferenceTransactions({
+      appHome: fixture.appHome,
+      routeAuthority: {
+        assertHeld: () => lease.assertHeld(),
+        read: readAuthority,
+      },
+      allowedBackendIds: ["kimi-code"],
+    }),
+  );
+
+  assert.equal(recovered.value.length, 1);
+  assert.deepEqual(await journalDirectories(fixture.appHome), []);
+  assert.deepEqual(await readdir(preferenceRoot).catch(() => [] as string[]), []);
+  assert.equal(livePublications, 1, "startup recovery must never republish live state");
+  const storedConfig = await loadConfigDetailed(fixture.path);
+  const storedSession = await readSessionEditSnapshot(session.path);
+  assert.equal(storedConfig.config.mainModel, finalRoute.requestedModelId);
+  assert.deepEqual("defaultRoute" in storedConfig.config.providerSetup
+    ? storedConfig.config.providerSetup.defaultRoute
+    : null, finalRoute);
+  assert.equal(storedSession.data.model, finalRoute.requestedModelId);
+  assert.deepEqual(storedSession.data.route, finalRoute);
+  assert.deepEqual((await readAuthority()).route, finalRoute);
+});
+
+test("abort before preference persist returns exact OLD without invoking the publication reconciler", async () => {
+  const fixture = await activationFixture();
+  const controller = new AbortController();
+  const reason = new DOMException("fixed abort before preference persist", "AbortError");
+  const originalWriteManifest = fixture.privateStore.writeClaimManifest.bind(
+    fixture.privateStore,
+  );
+  fixture.privateStore.writeClaimManifest = async (...args) => {
+    await originalWriteManifest(...args);
+    try {
+      const manifest = JSON.parse(args[1]) as { phase?: string };
+      if (manifest.phase === "credential-staged") controller.abort(reason);
+    } catch {
+      // Non-provider manifests are irrelevant to this exact boundary fixture.
+    }
+  };
+  let persistCalls = 0;
+  let reconcileCalls = 0;
+  await assert.rejects(
+    fixture.coordinator().activate({
+      ...fixture.request,
+      signal: controller.signal,
+      persistBeforeProviderConfigCommit: createProviderPreferenceCommitPort({
+        persist: async (_candidate, authority) => {
+          persistCalls += 1;
+          return authority.acknowledgePersistence(
+            (await readConfigEditSnapshot(fixture.path)).file,
+          );
+        },
+        abortAndReconcile: async () => {
+          reconcileCalls += 1;
+          return { kind: "old" };
+        },
+        complete: acknowledgePreferenceCompletion,
+        cleanup: acknowledgePreferenceCleanup,
+      }),
+    }),
+    (error: unknown) => error === reason,
+  );
+  assert.equal(persistCalls, 0);
+  assert.equal(reconcileCalls, 0);
+  assert.deepEqual(fixture.stateStore.read(), fixture.oldState);
+  assert.equal(fixture.credentials.slots.has(NEW_SLOT_ID), false);
+  assert.deepEqual(await journalDirectories(fixture.appHome), []);
+});
+
+test("pre-Provider-CAS hook failure cleans the staged credential and journal before retry", async () => {
+  const fixture = await activationFixture();
+  const beforeConfig = await readFile(fixture.path, "utf8");
+  await assert.rejects(
+    fixture.coordinator().activate({
+      ...fixture.request,
+      persistBeforeProviderConfigCommit: createProviderPreferenceCommitPort({
+        persist: async (_candidate, authority) => {
+          throw new Error("fixed-preference-persist-failure");
+        },
+        abortAndReconcile: async () => ({ kind: "old" }),
+        complete: acknowledgePreferenceCompletion,
+        cleanup: acknowledgePreferenceCleanup,
+      }),
+    }),
+    /fixed-preference-persist-failure/,
+  );
+
+  assert.equal(await readFile(fixture.path, "utf8"), beforeConfig);
+  assert.deepEqual(fixture.stateStore.read(), fixture.oldState);
+  assert.equal(fixture.credentials.slots.has(NEW_SLOT_ID), false);
+  assert.deepEqual(await journalDirectories(fixture.appHome), []);
+
+  const retried = await fixture.coordinator().activate(fixture.request);
+  assert.equal(retried.persisted, true);
+});
+
+test("returned preference config fence rejects a later edit without overwriting its bytes", async () => {
+  const fixture = await activationFixture();
+  let foreignBytes = "";
+  await assert.rejects(
+    fixture.coordinator().activate({
+      ...fixture.request,
+      persistBeforeProviderConfigCommit: createProviderPreferenceCommitPort({
+        persist: async (_candidate, authority) => {
+          const staged = await loadConfigDetailed(fixture.path);
+          staged.config.mainModel = "openai/staged-preference";
+          await saveConfig(staged.config, fixture.path);
+          const configFence = (await readConfigEditSnapshot(fixture.path)).file;
+
+          const foreign = await loadConfigDetailed(fixture.path);
+          foreign.config.maxSteps = 77;
+          await saveConfig(foreign.config, fixture.path);
+          foreignBytes = await readFile(fixture.path, "utf8");
+          return authority.acknowledgePersistence(configFence);
+        },
+        abortAndReconcile: async () => ({ kind: "old" }),
+        complete: acknowledgePreferenceCompletion,
+        cleanup: acknowledgePreferenceCleanup,
+      }),
+    }),
+    (error: unknown) => error instanceof Error
+      && "code" in error
+      && error.code === "provider-preference-config-stale",
+  );
+
+  assert.notEqual(foreignBytes, "");
+  assert.equal(await readFile(fixture.path, "utf8"), foreignBytes);
+  assert.deepEqual(fixture.stateStore.read(), fixture.oldState);
+  assert.equal(fixture.credentials.slots.has(NEW_SLOT_ID), false);
+  assert.deepEqual(await journalDirectories(fixture.appHome), []);
+});
+
+test("final preference fence rejects a same-inode edit immediately before Provider-CAS", async () => {
+  const fixture = await activationFixture();
+  let foreignBytes = "";
+  let sameInode = false;
+  const coordinator = fixture.coordinatorWith({
+    writeConfigAtomic: async (
+      path: string,
+      content: string,
+      beforePublish?: () => Promise<void>,
+    ) => {
+      const before = await lstat(path, { bigint: true });
+      const foreign = await loadConfigDetailed(path);
+      foreign.config.maxSteps = 83;
+      foreignBytes = `${JSON.stringify(foreign.config, null, 2)}\n`;
+      await writeFile(path, foreignBytes, "utf8");
+      const after = await lstat(path, { bigint: true });
+      sameInode = before.dev === after.dev && before.ino === after.ino;
+      await beforePublish?.();
+      await writeFileAtomicSecure(path, content);
+    },
+  });
+
+  await assert.rejects(
+    coordinator.activate({
+      ...fixture.request,
+      persistBeforeProviderConfigCommit: createProviderPreferenceCommitPort({
+        persist: async (_candidate, authority) => {
+          const staged = await loadConfigDetailed(fixture.path);
+          staged.config.mainModel = "openai/staged-preference";
+          await saveConfig(staged.config, fixture.path);
+          return authority.acknowledgePersistence(
+            (await readConfigEditSnapshot(fixture.path)).file,
+          );
+        },
+        abortAndReconcile: async () => ({ kind: "old" }),
+        complete: acknowledgePreferenceCompletion,
+        cleanup: acknowledgePreferenceCleanup,
+      }),
+    }),
+    (error: unknown) => error instanceof Error
+      && "code" in error
+      && error.code === "provider-preference-config-stale",
+  );
+
+  assert.equal(sameInode, true, "fixture must retain dev/inode while changing exact bytes");
+  assert.notEqual(foreignBytes, "");
+  assert.equal(await readFile(fixture.path, "utf8"), foreignBytes);
+  assert.deepEqual(fixture.stateStore.read(), fixture.oldState);
+  assert.equal(fixture.credentials.slots.has(NEW_SLOT_ID), false);
+  assert.deepEqual(await journalDirectories(fixture.appHome), []);
+});
+
+test("preference commit requires one exact runtime config fence", async (t) => {
+  for (const [name, result] of [
+    ["missing", undefined],
+    ["invalid", { configFence: { kind: "file", raw: "{}" } }],
+  ] as const) {
+    await t.test(name, async () => {
+      const fixture = await activationFixture();
+      const beforeConfig = await readFile(fixture.path, "utf8");
+      await assert.rejects(
+        fixture.coordinator().activate({
+          ...fixture.request,
+          persistBeforeProviderConfigCommit: createProviderPreferenceCommitPort({
+            persist: async () => result as never,
+            abortAndReconcile: async () => ({ kind: "old" }),
+            complete: acknowledgePreferenceCompletion,
+            cleanup: acknowledgePreferenceCleanup,
+          }),
+        }),
+        (error: unknown) => error instanceof Error
+          && "code" in error
+          && error.code === "provider-preference-config-fence-invalid",
+      );
+      assert.equal(await readFile(fixture.path, "utf8"), beforeConfig);
+      assert.deepEqual(fixture.stateStore.read(), fixture.oldState);
+      assert.equal(fixture.credentials.slots.has(NEW_SLOT_ID), false);
+      assert.deepEqual(await journalDirectories(fixture.appHome), []);
+    });
+  }
+});
+
+test("an unbranded preference commit port fails closed and leaves exact OLD", async () => {
+  const fixture = await activationFixture();
+  const beforeConfig = await readFile(fixture.path, "utf8");
+  await assert.rejects(
+    fixture.coordinator().activate({
+      ...fixture.request,
+      persistBeforeProviderConfigCommit: Object.freeze({ version: 1 }) as never,
+    }),
+    (error: unknown) => error instanceof Error
+      && "code" in error
+      && error.code === "provider-preference-port-invalid",
+  );
+  assert.equal(await readFile(fixture.path, "utf8"), beforeConfig);
+  assert.deepEqual(fixture.stateStore.read(), fixture.oldState);
+  assert.equal(fixture.credentials.slots.has(NEW_SLOT_ID), false);
+  assert.deepEqual(await journalDirectories(fixture.appHome), []);
+});
+
+test("deadline revokes a never-settling preference commit and permits an immediate clean retry", async () => {
+  const fixture = await activationFixture();
+  const beforeConfig = await readFile(fixture.path, "utf8");
+  let reached!: () => void;
+  const commitReached = new Promise<void>((resolve) => { reached = resolve; });
+  let reconcileCalls = 0;
+  const coordinator = fixture.coordinatorWith({
+    now: Date.now,
+    leaseDurationMs: 10_000,
+  });
+  const first = coordinator.activate({
+    ...fixture.request,
+    deadlineAt: Date.now() + 2_000,
+    persistBeforeProviderConfigCommit: createProviderPreferenceCommitPort({
+      persist: async (_candidate, authority) => {
+        authority.assertMutationAllowed();
+        reached();
+        return new Promise<never>(() => undefined);
+      },
+      abortAndReconcile: async (_authority) => {
+        reconcileCalls += 1;
+        return { kind: "old" };
+      },
+      complete: acknowledgePreferenceCompletion,
+      cleanup: acknowledgePreferenceCleanup,
+    }),
+  });
+  await commitReached;
+
+  const firstError = await Promise.race([
+    first.catch((error: unknown) => error),
+    new Promise<"still-held">((resolve) => setTimeout(() => resolve("still-held"), 3_000)),
+  ]);
+  assert.notEqual(firstError, "still-held");
+  assert.ok(firstError instanceof Error);
+  assert.equal("code" in firstError ? firstError.code : null, "provider-activation-deadline");
+  assert.equal(reconcileCalls, 1);
+  assert.equal(await readFile(fixture.path, "utf8"), beforeConfig);
+  assert.equal(fixture.credentials.slots.has(NEW_SLOT_ID), false);
+  assert.deepEqual(await journalDirectories(fixture.appHome), []);
+
+  const retried = await fixture.coordinator().activate(fixture.request);
+  assert.equal(retried.persisted, true);
+});
+
+test("a preference continuation settling after revoke cannot mutate config or orphan a credential", async () => {
+  const fixture = await activationFixture();
+  const beforeConfig = await readFile(fixture.path, "utf8");
+  const controller = new AbortController();
+  const reason = new DOMException("fixed preference cancellation", "AbortError");
+  let reached!: () => void;
+  let resume!: () => void;
+  let lateSettled!: () => void;
+  const commitReached = new Promise<void>((resolve) => { reached = resolve; });
+  const resumeCommit = new Promise<void>((resolve) => { resume = resolve; });
+  const lateSettlement = new Promise<void>((resolve) => { lateSettled = resolve; });
+  const first = fixture.coordinator().activate({
+    ...fixture.request,
+    signal: controller.signal,
+    persistBeforeProviderConfigCommit: createProviderPreferenceCommitPort({
+      persist: async (_candidate, authority) => {
+        reached();
+        try {
+          await resumeCommit;
+          authority.assertMutationAllowed();
+          const config = await loadConfigDetailed(fixture.path);
+          config.config.maxSteps = 91;
+          await saveConfig(config.config, fixture.path);
+          return authority.acknowledgePersistence(
+            (await readConfigEditSnapshot(fixture.path)).file,
+          );
+        } finally {
+          lateSettled();
+        }
+      },
+      abortAndReconcile: async () => ({ kind: "old" }),
+      complete: acknowledgePreferenceCompletion,
+      cleanup: acknowledgePreferenceCleanup,
+    }),
+  });
+  await commitReached;
+  controller.abort(reason);
+  await assert.rejects(first, (error: unknown) => error === reason);
+  resume();
+  await lateSettlement;
+  await new Promise<void>((resolve) => setImmediate(resolve));
+
+  assert.equal(await readFile(fixture.path, "utf8"), beforeConfig);
+  assert.equal(fixture.credentials.slots.has(NEW_SLOT_ID), false);
+  assert.deepEqual(await journalDirectories(fixture.appHome), []);
+});
+
 interface KimiActivationFixtureOptions {
   crashAfter?: Boundary;
+  oldModelId?: "k3" | "k3-256k" | "kimi-for-coding" | "kimi-for-coding-highspeed";
 }
 
 async function kimiActivationFixture(options: KimiActivationFixtureOptions = {}) {
   const appHome = await mkdtemp(join(tmpdir(), "orcode-kimi-activation-"));
   const path = join(appHome, "config.json");
-  const oldState = kimiActivationState();
+  const oldState = kimiActivationState(options.oldModelId);
   const initialConfig = {
     ...structuredClone(DEFAULT_CONFIG),
+    mainModel: oldState.defaultRoute?.requestedModelId ?? DEFAULT_CONFIG.mainModel,
     providerSetup: oldState,
   } satisfies OrcodeConfigWithBudget;
   await saveConfig(initialConfig, path);
@@ -3203,19 +4059,23 @@ test("targeted replacement rejects duplicate account realm identity in both conn
   }
 });
 
-function kimiActivationRoute(): RouteIdentityV1 {
+function kimiActivationRoute(
+  modelId: "k3" | "k3-256k" | "kimi-for-coding" | "kimi-for-coding-highspeed" = "kimi-for-coding",
+): RouteIdentityV1 {
   return {
     version: 1,
     backendId: "kimi-code",
     accountFingerprint: KIMI_FINGERPRINT,
     billingRealm: KIMI_REALM,
-    requestedModelId: KIMI_MODEL.requestedModelId,
-    canonicalModelId: KIMI_MODEL.canonicalModelId,
+    requestedModelId: modelId,
+    canonicalModelId: modelId,
     resolutionState: "resolved",
   };
 }
 
-function kimiActivationState(): ProviderSetupStateV2 {
+function kimiActivationState(
+  modelId?: "k3" | "k3-256k" | "kimi-for-coding" | "kimi-for-coding-highspeed",
+): ProviderSetupStateV2 {
   return {
     schemaVersion: 2,
     revision: 3,
@@ -3231,7 +4091,7 @@ function kimiActivationState(): ProviderSetupStateV2 {
       billingRealm: KIMI_REALM,
       lastHealth: null,
     }],
-    defaultRoute: kimiActivationRoute(),
+    defaultRoute: kimiActivationRoute(modelId),
     cross: { enabled: false, preferredLead: null, preferredChallenger: null },
   };
 }

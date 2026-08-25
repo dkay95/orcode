@@ -8,8 +8,11 @@ import {
   readFile,
   readdir,
   rename,
+  rmdir,
   stat,
   symlink,
+  truncate,
+  unlink,
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -35,7 +38,37 @@ type TokenBoundClaimStore = ExclusiveDirectoryStore & {
   ): Promise<void>;
   readClaimManifest(claim: object, maxBytes?: number): Promise<string>;
   removeClaimManifest(claim: object, expectedContent: string): Promise<void>;
+  writeClaimPayload(
+    claim: object,
+    name: ClaimPayloadName,
+    content: string,
+  ): Promise<void>;
+  readClaimPayload(
+    claim: object,
+    name: ClaimPayloadName,
+    maxBytes?: number,
+  ): Promise<string>;
+  removeClaimPayload(
+    claim: object,
+    name: ClaimPayloadName,
+    expectedContent: string,
+  ): Promise<void>;
 };
+
+type ClaimPayloadName =
+  | "before-config.json"
+  | "after-config.json"
+  | "before-session.json"
+  | "after-session.json";
+
+const CLAIM_PAYLOAD_NAMES = [
+  "before-config.json",
+  "after-config.json",
+  "before-session.json",
+  "after-session.json",
+] as const satisfies readonly ClaimPayloadName[];
+
+const CLAIM_PAYLOAD_MAX_BYTES = 16 * 1_024 * 1_024;
 
 test("PrivateStore exclusive directory creation returns one opaque claim token and null losers", async () => {
   const { PosixPrivateStoreAdapter, PrivateStore } = await import("../src/private-store.js");
@@ -151,6 +184,266 @@ test("PrivateStore transaction manifest lifecycle stays claim-scoped bounded and
   assert.deepEqual(await readdir(transaction), []);
   await store.releaseDirectoryClaim(claim, null);
   await assert.rejects(stat(transaction), /ENOENT/);
+});
+
+test("PrivateStore fixed transaction payloads are write-once, exact, manifest-compatible, and cleanly removable", async () => {
+  const { PosixPrivateStoreAdapter, PrivateStore } = await import("../src/private-store.js");
+  const root = await mkdtemp(join(tmpdir(), "orcode-private-claim-payloads-"));
+  const transaction = join(root, "model-preference", "70000000-0000-4000-8000-000000000101");
+  const store = new PrivateStore({
+    adapter: new PosixPrivateStoreAdapter(),
+    root,
+  }) as unknown as TokenBoundClaimStore;
+  await store.ensureDirectory(join(root, "model-preference"));
+  const claim = await store.createDirectoryExclusive(transaction);
+  assert.ok(claim);
+  const payloads: Readonly<Record<ClaimPayloadName, string>> = {
+    "before-config.json": "{\"mainModel\":\"openai/old\"}\n",
+    "after-config.json": "{\"mainModel\":\"openai/new\"}\n",
+    "before-session.json": "{\"model\":\"openai/old\"}\n",
+    "after-session.json": "{\"model\":\"openai/new\"}\n",
+  };
+
+  for (const name of CLAIM_PAYLOAD_NAMES) {
+    await store.writeClaimPayload(claim, name, payloads[name]);
+    assert.equal(await store.readClaimPayload(claim, name), payloads[name]);
+    assert.equal((await stat(join(transaction, name))).mode & 0o777, 0o600);
+  }
+  await assert.rejects(
+    store.writeClaimPayload(claim, "before-config.json", "replacement"),
+    /exist|once|payload|claim/i,
+  );
+  assert.equal(
+    await store.readClaimPayload(claim, "before-config.json"),
+    payloads["before-config.json"],
+  );
+
+  const prepared = '{"version":1,"phase":"prepared"}\n';
+  const committed = '{"version":1,"phase":"committed"}\n';
+  await store.writeClaimManifest(claim, prepared, null);
+  assert.equal(await store.readClaimManifest(claim), prepared);
+  assert.equal(await store.readClaimPayload(claim, "after-session.json"), payloads["after-session.json"]);
+  await store.writeClaimManifest(claim, committed, prepared);
+  assert.equal(await store.readClaimManifest(claim), committed);
+  await store.removeClaimManifest(claim, committed);
+  assert.deepEqual(
+    (await readdir(transaction)).sort(),
+    [...CLAIM_PAYLOAD_NAMES].sort(),
+  );
+
+  await assert.rejects(
+    store.removeClaimPayload(
+      claim,
+      "before-config.json",
+      `${payloads["before-config.json"]}changed`,
+    ),
+    /exact|stimmt|payload/i,
+  );
+  assert.equal(
+    await store.readClaimPayload(claim, "before-config.json"),
+    payloads["before-config.json"],
+  );
+
+  for (const name of CLAIM_PAYLOAD_NAMES) {
+    await store.removeClaimPayload(claim, name, payloads[name]);
+  }
+  assert.deepEqual(await readdir(transaction), []);
+  await store.releaseDirectoryClaim(claim, null);
+  await assert.rejects(stat(transaction), /ENOENT/);
+});
+
+test("PrivateStore payload names are a closed runtime allowlist and never traverse the claim", async () => {
+  const { PosixPrivateStoreAdapter, PrivateStore } = await import("../src/private-store.js");
+  const fixture = await mkdtemp(join(tmpdir(), "orcode-private-claim-payload-name-"));
+  const root = join(fixture, "root");
+  const transaction = join(root, "model-preference", "70000000-0000-4000-8000-000000000102");
+  const outside = join(fixture, "outside.json");
+  await mkdir(root);
+  const store = new PrivateStore({
+    adapter: new PosixPrivateStoreAdapter(),
+    root,
+  }) as unknown as TokenBoundClaimStore;
+  await store.ensureDirectory(join(root, "model-preference"));
+  const claim = await store.createDirectoryExclusive(transaction);
+  assert.ok(claim);
+
+  for (const invalid of ["../outside.json", "manifest.json", "/tmp/outside.json", "before-config.json/child"]) {
+    await assert.rejects(
+      store.writeClaimPayload(claim, invalid as ClaimPayloadName, "must not escape"),
+      /allow|name|payload|claim/i,
+    );
+    await assert.rejects(
+      store.readClaimPayload(claim, invalid as ClaimPayloadName),
+      /allow|name|payload|claim/i,
+    );
+    await assert.rejects(
+      store.removeClaimPayload(claim, invalid as ClaimPayloadName, "must not escape"),
+      /allow|name|payload|claim/i,
+    );
+  }
+
+  await assert.rejects(readFile(outside), /ENOENT/);
+  assert.deepEqual(await readdir(transaction), []);
+});
+
+test("PrivateStore payload-name export is runtime-frozen and cannot weaken the private complete-set authority", async () => {
+  const {
+    PosixPrivateStoreAdapter,
+    PRIVATE_STORE_CLAIM_PAYLOAD_NAMES,
+    PrivateStore,
+  } = await import("../src/private-store.js");
+  assert.equal(Object.isFrozen(PRIVATE_STORE_CLAIM_PAYLOAD_NAMES), true);
+  assert.throws(
+    () => (PRIVATE_STORE_CLAIM_PAYLOAD_NAMES as unknown as string[]).pop(),
+    TypeError,
+  );
+
+  const root = await mkdtemp(join(tmpdir(), "orcode-private-payload-authority-"));
+  const transaction = join(root, "model-preference", "70000000-0000-4000-8000-000000000109");
+  const store = new PrivateStore({
+    adapter: new PosixPrivateStoreAdapter(),
+    root,
+  }) as unknown as TokenBoundClaimStore;
+  await store.ensureDirectory(join(root, "model-preference"));
+  const claim = await store.createDirectoryExclusive(transaction);
+  assert.ok(claim);
+  for (const name of CLAIM_PAYLOAD_NAMES.slice(0, -1)) {
+    await store.writeClaimPayload(claim, name, `{"name":${JSON.stringify(name)}}\n`);
+  }
+
+  await assert.rejects(
+    store.writeClaimManifest(claim, '{"version":1,"phase":"prepared"}\n', null),
+    /complete|payload|manifest|unvollständig/i,
+  );
+  assert.deepEqual(
+    (await readdir(transaction)).sort(),
+    CLAIM_PAYLOAD_NAMES.slice(0, -1).sort(),
+  );
+});
+
+test("PrivateStore payload reads and removal compare canonical UTF-8 raw bytes", async () => {
+  const { PosixPrivateStoreAdapter, PrivateStore } = await import("../src/private-store.js");
+  const root = await mkdtemp(join(tmpdir(), "orcode-private-payload-utf8-"));
+  const transaction = join(root, "model-preference", "70000000-0000-4000-8000-000000000110");
+  const payloadPath = join(transaction, "before-config.json");
+  const store = new PrivateStore({
+    adapter: new PosixPrivateStoreAdapter(),
+    root,
+  }) as unknown as TokenBoundClaimStore;
+  await store.ensureDirectory(join(root, "model-preference"));
+  const claim = await store.createDirectoryExclusive(transaction);
+  assert.ok(claim);
+  const expected = '{"value":"\uFFFD"}\n';
+  await store.writeClaimPayload(claim, "before-config.json", expected);
+  const tampered = Buffer.concat([
+    Buffer.from('{"value":"', "utf8"),
+    Buffer.from([0xff]),
+    Buffer.from('"}\n', "utf8"),
+  ]);
+  await writeFile(payloadPath, tampered);
+
+  await assert.rejects(
+    store.readClaimPayload(claim, "before-config.json"),
+    /canonical|utf-?8|kanonisch|payload/i,
+  );
+  await assert.rejects(
+    store.removeClaimPayload(claim, "before-config.json", expected),
+    /exact|stimmt|changed|payload|utf-?8|kanonisch/i,
+  );
+  assert.deepEqual(await readFile(payloadPath), tampered);
+});
+
+test("PrivateStore payloads reject symlinks, oversize bytes, and unexpected claim entries without cleanup outside authority", async () => {
+  const { PosixPrivateStoreAdapter, PrivateStore } = await import("../src/private-store.js");
+  const fixture = await mkdtemp(join(tmpdir(), "orcode-private-claim-payload-bounds-"));
+  const root = join(fixture, "root");
+  const transaction = join(root, "model-preference", "70000000-0000-4000-8000-000000000103");
+  const outside = join(fixture, "outside.json");
+  await mkdir(root);
+  await writeFile(outside, "outside survives");
+  const store = new PrivateStore({
+    adapter: new PosixPrivateStoreAdapter(),
+    root,
+  }) as unknown as TokenBoundClaimStore;
+  await store.ensureDirectory(join(root, "model-preference"));
+  const claim = await store.createDirectoryExclusive(transaction);
+  assert.ok(claim);
+  const beforeConfigPath = join(transaction, "before-config.json");
+  await symlink(outside, beforeConfigPath);
+
+  await assert.rejects(
+    store.readClaimPayload(claim, "before-config.json"),
+    /link|regular|payload|claim/i,
+  );
+  await assert.rejects(
+    store.writeClaimPayload(claim, "before-config.json", "replacement"),
+    /link|regular|payload|claim|exist/i,
+  );
+  assert.equal(await readFile(outside, "utf8"), "outside survives");
+  await unlink(beforeConfigPath);
+
+  const oversized = "x".repeat(CLAIM_PAYLOAD_MAX_BYTES + 1);
+  await assert.rejects(
+    store.writeClaimPayload(claim, "before-config.json", oversized),
+    /large|size|groß|payload/i,
+  );
+  await assert.rejects(stat(beforeConfigPath), /ENOENT/);
+  await writeFile(beforeConfigPath, "x");
+  await truncate(beforeConfigPath, CLAIM_PAYLOAD_MAX_BYTES + 1);
+  await assert.rejects(
+    store.readClaimPayload(claim, "before-config.json"),
+    /large|size|groß|payload/i,
+  );
+  assert.equal((await stat(beforeConfigPath)).size, CLAIM_PAYLOAD_MAX_BYTES + 1);
+
+  await unlink(beforeConfigPath);
+  await store.writeClaimPayload(claim, "before-config.json", "small payload");
+  await writeFile(join(transaction, "foreign.txt"), "foreign survives");
+  await assert.rejects(
+    store.readClaimPayload(claim, "before-config.json"),
+    /entry|content|claim|unerwartet/i,
+  );
+  assert.equal(await readFile(join(transaction, "foreign.txt"), "utf8"), "foreign survives");
+});
+
+test("PrivateStore manifest coexistence requires the complete fixed regular payload set", async () => {
+  const { PosixPrivateStoreAdapter, PrivateStore } = await import("../src/private-store.js");
+  const root = await mkdtemp(join(tmpdir(), "orcode-private-manifest-payload-set-"));
+  const transaction = join(root, "model-preference", "70000000-0000-4000-8000-000000000104");
+  const store = new PrivateStore({
+    adapter: new PosixPrivateStoreAdapter(),
+    root,
+  }) as unknown as TokenBoundClaimStore;
+  await store.ensureDirectory(join(root, "model-preference"));
+  const claim = await store.createDirectoryExclusive(transaction);
+  assert.ok(claim);
+  for (const name of CLAIM_PAYLOAD_NAMES) {
+    await store.writeClaimPayload(claim, name, `{\"name\":${JSON.stringify(name)}}\n`);
+  }
+  const manifest = '{"version":1,"phase":"prepared"}\n';
+  await store.writeClaimManifest(claim, manifest, null);
+
+  await unlink(join(transaction, "after-session.json"));
+  await assert.rejects(
+    store.readClaimManifest(claim),
+    /complete|payload|manifest|content|entry|unerwartet/i,
+  );
+  await writeFile(join(transaction, "after-session.json"), "restored");
+  await unlink(join(transaction, "before-session.json"));
+  await mkdir(join(transaction, "before-session.json"));
+  await assert.rejects(
+    store.readClaimManifest(claim),
+    /regular|payload|manifest|content|entry|unerwartet/i,
+  );
+  await rmdir(join(transaction, "before-session.json"));
+  await writeFile(join(transaction, "before-session.json"), "restored");
+  await writeFile(join(transaction, "foreign.txt"), "foreign survives");
+  await assert.rejects(
+    store.removeClaimManifest(claim, manifest),
+    /content|entry|unerwartet/i,
+  );
+  assert.equal(await readFile(join(transaction, "manifest.json"), "utf8"), manifest);
+  assert.equal(await readFile(join(transaction, "foreign.txt"), "utf8"), "foreign survives");
 });
 
 test("PrivateStore bounded manifest read rejects oversized or multiple entries and retains all artifacts", async () => {

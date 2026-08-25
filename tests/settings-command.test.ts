@@ -5,7 +5,12 @@ import {
   type CommandContext,
   type SettingsCommandPort,
 } from "../src/commands.js";
-import { createSettingsCommandPort } from "../src/cli.js";
+import {
+  createSettingsCommandPort,
+  runSettingsProviderAction,
+  runSettingsVerifySuggestion,
+  runSettingsTerminalOwner,
+} from "../src/cli.js";
 import { SessionProviderRuntimeGuard } from "../src/cli.js";
 import type { ProviderExecutionMode } from "../src/setup.js";
 import { describeOpenRouterFailure, formatFailure } from "../src/openrouter.js";
@@ -72,6 +77,136 @@ test("/settings opens the installed command port exactly once and stays in chat"
 
   assert.equal(await handleSlashCommand("/settings", context), "continue");
   assert.deepEqual(argumentCounts, [0]);
+});
+
+test("Plain besitzt temporär Raw/Alternate, Dashboard nutzt den aktiven Owner und beide bewahren den Chat-Draft", async () => {
+  const calls: string[] = [];
+  let raw = false;
+  let alternate = false;
+  let draft = "unveränderter chat-draft";
+  const surface = {
+    start() {
+      calls.push("start");
+      raw = true;
+      alternate = true;
+    },
+    stop() {
+      calls.push("stop");
+      raw = false;
+      alternate = false;
+    },
+  };
+
+  await assert.rejects(
+    runSettingsTerminalOwner(surface, true, async () => {
+      calls.push("plain-settings");
+      assert.equal(raw, true);
+      assert.equal(alternate, true);
+      assert.equal(draft, "unveränderter chat-draft");
+      throw new Error("scripted-escape");
+    }),
+    /scripted-escape/,
+  );
+  assert.equal(raw, false);
+  assert.equal(alternate, false);
+  assert.equal(draft, "unveränderter chat-draft");
+
+  await runSettingsTerminalOwner(surface, false, async () => {
+    calls.push("dashboard-settings");
+    draft = `${draft}`;
+  });
+  assert.deepEqual(calls, ["start", "plain-settings", "stop", "dashboard-settings"]);
+  assert.equal(draft, "unveränderter chat-draft");
+});
+
+test("Verify-Suggest übernimmt echte Skripte typisiert und lässt bestehende Kommandos bei Cancel/Fehler unverändert", async () => {
+  let commands = ["npm run existing"];
+  let persists = 0;
+  await assert.rejects(runSettingsVerifySuggestion({
+    packageJson: { scripts: { check: "tsc", test: "node --test" } },
+    confirm: async () => false,
+    persist: async (next) => {
+      persists += 1;
+      commands = [...next];
+    },
+  }), (error: unknown) => error instanceof Error && error.name === "SettingsExternalActionCancelledError");
+  assert.deepEqual(commands, ["npm run existing"]);
+  assert.equal(persists, 0);
+
+  await assert.rejects(runSettingsVerifySuggestion({
+    packageJson: { scripts: { check: "tsc" } },
+    confirm: async () => true,
+    persist: async () => {
+      persists += 1;
+      throw new Error("durable-config-failure");
+    },
+  }), /durable-config-failure/);
+  assert.deepEqual(commands, ["npm run existing"]);
+
+  await runSettingsVerifySuggestion({
+    packageJson: { scripts: { build: "vite build", test: "node --test", check: "tsc" } },
+    confirm: async (next) => {
+      assert.deepEqual(next, ["npm run check", "npm run test", "npm run build"]);
+      return true;
+    },
+    persist: async (next) => {
+      persists += 1;
+      commands = [...next];
+    },
+  });
+  assert.deepEqual(commands, ["npm run check", "npm run test", "npm run build"]);
+  assert.equal(persists, 2);
+});
+
+test("Settings-Providerbestätigung bindet den echten Token an exakte Aktion und Backend", async () => {
+  const seen: unknown[] = [];
+  const surface = {} as never;
+  await runSettingsProviderAction({
+    intent: { kind: "logout", backendId: "kimi-code" },
+    surface,
+    execute: async (intent) => {
+      seen.push(intent);
+      if (!("confirmationToken" in intent)) {
+        return {
+          kind: "confirmation-required",
+          operation: "logout",
+          backendId: "kimi-code",
+          message: "Kimi wirklich abmelden?",
+          confirmationToken: "real-authority-token",
+        };
+      }
+      return {
+        kind: "changed",
+        operation: "logout",
+        backendId: "kimi-code",
+        setupRequired: true,
+        defaultCleared: true,
+      };
+    },
+    confirm: async (message) => message === "Kimi wirklich abmelden?",
+  });
+  assert.deepEqual(seen, [
+    { kind: "logout", backendId: "kimi-code" },
+    { kind: "logout", backendId: "kimi-code", confirmationToken: "real-authority-token" },
+  ]);
+
+  let cancelledCalls = 0;
+  await assert.rejects(runSettingsProviderAction({
+    intent: { kind: "disable", backendId: "openrouter" },
+    surface,
+    execute: async () => {
+      cancelledCalls += 1;
+      return {
+        kind: "confirmation-required",
+        operation: "disable",
+        backendId: "openrouter",
+        message: "Deaktivieren?",
+        confirmationToken: "must-not-be-used",
+      };
+    },
+    confirm: async () => false,
+  }), (error: unknown) => error instanceof Error && error.name === "SettingsExternalActionCancelledError");
+  assert.equal(cancelledCalls, 1);
 });
 
 test("a missing /settings port rejects before config, credentials, providers, routes, sessions, or network", async () => {

@@ -5,6 +5,7 @@ import chalk from "chalk";
 import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { readFileSync, realpathSync } from "node:fs";
+import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -35,11 +36,14 @@ import { createSshSession, type SshSession } from "./ssh.js";
 import {
   createPlainCommandOutput,
   handleSlashCommand,
+  audioInputModelCandidates,
   compressorModelCandidates,
   mainModelCandidates,
+  panelModelCandidates,
   ModelCapabilityError,
   ModelNotFoundError,
   rankModels,
+  providerBackendActions,
   resolveCompressorModelCandidate,
   resolveMainModelCandidate,
   shouldReplaceCredential,
@@ -50,6 +54,7 @@ import {
   type ProviderCredentialIntentPort,
   type ProviderCommandIntent,
   type ProviderCommandIntentPort,
+  type ProviderCommandBackendId,
   type ProviderCommandResult,
   type ProviderCommandStatusEntry,
   type ProviderRouteIntentPort,
@@ -70,6 +75,7 @@ import {
   readConfigFileSnapshot,
   saveConfig,
   saveConfigEdit,
+  validateConfig,
   withConfigWriteLock,
   writeFileAtomicCreateSecure,
   writeFileAtomicSecure,
@@ -77,11 +83,20 @@ import {
 } from "./config.js";
 import {
   SettingsController,
+  SettingsExternalActionCancelledError,
   SettingsRunActiveError,
+  projectSettingsConfig,
+  type SettingsConfigProjection,
   type SettingsExternalAction,
 } from "./settings-controller.js";
 import { runSettingsSession } from "./settings-session.js";
-import type { SettingsProviderProjection, SettingsRouteProjection } from "./settings-registry.js";
+import type {
+  SettingsAuthoritativeSnapshot,
+  SettingsProviderHealthProjection,
+  SettingsProviderHeadline,
+  SettingsProviderProjection,
+  SettingsRouteProjection,
+} from "./settings-registry.js";
 import {
   CredentialStore,
   normalizeProviderSecret,
@@ -115,8 +130,11 @@ import {
 } from "./reasoning.js";
 import {
   SessionStore,
+  dayKey,
   migratedOpenRouterSessionConnection,
   migrateLegacySession,
+  prepareSessionPreferenceEdit,
+  readSessionEditSnapshot,
   type SaveOutcome,
 } from "./session.js";
 import {
@@ -201,10 +219,21 @@ import {
 import {
   PROVIDER_CREDENTIAL_FORGET_DIRECTORY,
   ProviderActivationCoordinator,
+  createProviderPreferenceCommitPort,
+  type ProviderPreferenceCommitPort,
   type ProviderCoordinatorLease,
   type ProviderActivationRuntimeGuard,
   type ProviderActivationRuntimeLease,
 } from "./provider-activation.js";
+import {
+  recoverModelPreferenceTransactions,
+  runModelPreferenceTransaction,
+  type RecoveredModelPreferenceOwner,
+  type ModelPreferenceAuthorityPublication,
+  type ModelPreferenceAuthoritySnapshot,
+  type ModelPreferenceRouteAuthority,
+} from "./model-preference-transaction.js";
+import { suggestVerifyCommands } from "./verify.js";
 import {
   adoptDurablyCommittedProviderState,
   ProviderStateStore,
@@ -531,6 +560,13 @@ export interface ProviderRuntime extends ProviderRouteIntentPort, ProviderComman
   runSetup(surface: SetupSurface | "plain" | "fullscreen"): Promise<SetupHubResult>;
   /** A cached counter projection; this never acquires a runtime lease. */
   settingsActivity?(): ProviderRuntimeActivity;
+  activity?(): ProviderRuntimeActivity;
+  readCachedModels?(): readonly ModelInfo[];
+  readCachedProviderStatus?(): readonly ProviderCommandStatusEntry[];
+  readCachedSettingsRoute?(): SettingsRouteProjection | null;
+  readModelPreferenceAuthority?(): ModelPreferenceAuthoritySnapshot;
+  runSettingsConfigMutation?<T>(task: () => Promise<T>): Promise<T>;
+  prepareSettingsModelPublication?(route: RouteIdentityV1): { publish(): void };
   readCachedSettingsProjection?(): {
     readonly route: SettingsRouteProjection | null;
     readonly providers: readonly SettingsProviderProjection[];
@@ -704,6 +740,345 @@ export class SessionProviderRuntimeGuard implements ProviderActivationRuntimeGua
   }
 }
 
+export type SettingsRuntimeProjection = Omit<SettingsAuthoritativeSnapshot, "config"> & {
+  readonly config: SettingsConfigProjection;
+};
+
+export interface SettingsRuntimeSnapshotPort {
+  readCached(): SettingsRuntimeProjection;
+}
+
+export interface SettingsCachedRuntimeSource {
+  activity(): ProviderRuntimeActivity;
+  readCachedSettingsRoute(): SettingsRouteProjection | null;
+  readCachedProviderStatus(): readonly ProviderCommandStatusEntry[];
+  readCachedModels?(): readonly ModelInfo[];
+  /** Additional runtime methods are deliberately ignored by the cached mapper. */
+  readonly [key: string]: unknown;
+}
+
+export interface SettingsRuntimeSnapshotInput {
+  readonly config: OrcodeConfigWithBudget;
+  readonly runtime: SettingsCachedRuntimeSource;
+  readonly session: {
+    readonly data: {
+      readonly costs: {
+        readonly mainUsd?: number;
+        readonly compressorUsd?: number;
+        readonly voiceUsd?: number;
+        readonly totalUsd: number;
+        readonly costKnowledge?: "known" | "unknown";
+      };
+      readonly dailySpendUsd: Readonly<Record<string, number>>;
+    };
+  };
+  readonly ruleStore: {
+    list(workspace: string): readonly { readonly id: string; readonly decision: "allow" | "deny" }[];
+  };
+  readonly workspace: string;
+  readonly readCachedModels?: () => readonly ModelInfo[];
+  readonly readCachedWorkspaceTotalUsd?: () => number;
+  readonly now?: () => Date;
+}
+
+/** Pure synchronous projection: it has no provider command, credential, env, or fetch seam. */
+export function createSettingsRuntimeSnapshotPort(
+  input: SettingsRuntimeSnapshotInput,
+): SettingsRuntimeSnapshotPort {
+  return Object.freeze({
+    readCached(): SettingsRuntimeProjection {
+      const activity = input.runtime.activity();
+      const sessionUsd = safeCachedUsd(input.session.data.costs.totalUsd);
+      const dayUsd = safeCachedUsd(
+        input.session.data.dailySpendUsd[dayKey((input.now ?? (() => new Date()))())] ?? 0,
+      );
+      const totalUsd = safeCachedUsd(input.readCachedWorkspaceTotalUsd?.() ?? sessionUsd);
+      return deepFreezeSettingsProjection({
+        config: projectSettingsConfig(input.config),
+        runActive: activity.runActive || activity.activationHeld,
+        route: projectCachedSettingsRoute(input.runtime.readCachedSettingsRoute()),
+        providers: projectSettingsProviderStatus(input.runtime.readCachedProviderStatus()),
+        approvalRules: input.ruleStore.list(input.workspace).map((rule) => ({
+          id: rule.id,
+          decision: rule.decision,
+        })),
+        costs: {
+          costKnowledge: input.session.data.costs.costKnowledge === "unknown" ? "unknown" : "known",
+          sessionUsd,
+          dayUsd,
+          totalUsd,
+        },
+        cachedModels: projectSettingsModelInfos(
+          input.readCachedModels?.()
+            ?? input.runtime.readCachedModels?.()
+            ?? [],
+        ),
+      });
+    },
+  });
+}
+
+/**
+ * Bridges the model-preference journal to the existing provider coordinator.
+ * The returned authority creates exactly one opaque provider commit port; it
+ * never owns a second runtime/provider lock or exposes the mutation token.
+ */
+export function createModelPreferenceRouteAuthority(input: {
+  readonly runtime: ProviderRuntime;
+  readonly candidate: {
+    readonly requestedModelId: string;
+    readonly canonicalModelId: string;
+  };
+  readonly surface?: SetupSurface | "plain" | "fullscreen";
+}): ModelPreferenceRouteAuthority {
+  const transition = input.runtime.transitionSessionModel;
+  const read = input.runtime.readModelPreferenceAuthority;
+  if (typeof transition !== "function" || typeof read !== "function") {
+    throw new ProviderSetupRequiredError();
+  }
+  const candidate = Object.freeze({
+    requestedModelId: input.candidate.requestedModelId,
+    canonicalModelId: input.candidate.canonicalModelId,
+  });
+  let commitCalled = false;
+  return Object.freeze({
+    async read() {
+      return structuredClone(read.call(input.runtime));
+    },
+    async commit(
+      route: RouteIdentityV1,
+      publication: ModelPreferenceAuthorityPublication,
+    ) {
+      if (commitCalled) throw new ProviderSetupRequiredError();
+      commitCalled = true;
+      const port = createProviderPreferenceCommitPort({
+        persist: async ({ state }, authority) => {
+          const staged = await publication.persist(state, authority);
+          return authority.acknowledgePersistence(staged.configFence);
+        },
+        abortAndReconcile: (authority) => publication.abortAndReconcile(authority),
+        complete: (_providerCandidate, authority) => publication.complete(authority),
+        cleanup: (authority) => publication.cleanup(authority),
+      });
+      const committed = await transition.call(
+        input.runtime,
+        candidate,
+        port,
+        input.surface,
+      );
+      if (!sameExactRoute(committed, route)) throw new ProviderSetupRequiredError();
+    },
+  });
+}
+
+export function projectSettingsProviderStatus(
+  entries: readonly ProviderCommandStatusEntry[],
+): readonly SettingsProviderProjection[] {
+  const seen = new Set<string>();
+  const projected: SettingsProviderProjection[] = [];
+  for (const entry of entries) {
+    if (seen.has(entry.backendId)) continue;
+    seen.add(entry.backendId);
+    const comingSoon = entry.backendId === "anthropic";
+    projected.push({
+      backendId: entry.backendId,
+      displayName: providerDisplayName(entry.backendId),
+      availability: comingSoon ? "coming-soon" : "connectable",
+      configuration: comingSoon ? "disabled" : entry.configuration,
+      maturity: comingSoon
+        ? "coming-soon"
+        : entry.maturity === "preview" ? "preview" : "stable",
+      billingRealm: entry.backendId === "openrouter"
+        ? "openrouter-payg"
+        : entry.backendId === "kimi-code"
+          ? "kimi-code-membership-provider-managed-overage"
+          : "none",
+      headline: safeSettingsHeadline(entry.headline),
+      health: safeSettingsHealth(entry.health),
+      isDefault: comingSoon ? false : entry.isDefault,
+      selectedModel: comingSoon || !entry.selectedModel
+        ? null
+        : {
+            requestedModelId: entry.selectedModel.requestedModelId,
+            canonicalModelId: entry.selectedModel.canonicalModelId,
+            displayName: entry.selectedModel.displayName,
+          },
+      allowedActions: comingSoon ? [] : providerBackendActions(entry.backendId),
+    });
+  }
+  return deepFreezeSettingsProjection(projected);
+}
+
+function projectCachedSettingsRoute(
+  route: SettingsRouteProjection | null,
+): SettingsRouteProjection | null {
+  if (!route) return null;
+  return {
+    backendId: route.backendId,
+    providerLabel: providerDisplayName(route.backendId),
+    requestedModelId: route.requestedModelId,
+    canonicalModelId: route.canonicalModelId,
+    modelLabel: route.modelLabel,
+    billingRealm: route.backendId === "openrouter"
+      ? "openrouter-payg"
+      : route.backendId === "kimi-code"
+        ? "kimi-code-membership-provider-managed-overage"
+        : "none",
+  };
+}
+
+function providerDisplayName(backendId: ProviderCommandBackendId): string {
+  if (backendId === "openrouter") return "OpenRouter";
+  if (backendId === "kimi-code") return "Kimi Code";
+  return "Anthropic";
+}
+
+function safeSettingsHeadline(value: string | null): SettingsProviderHeadline | null {
+  const known = new Set<SettingsProviderHeadline>([
+    "ready", "login-required", "auth-rejected", "credential-expired", "offline",
+    "limit-reached", "runtime-missing", "incompatible-runtime", "policy-unavailable", "unknown",
+  ]);
+  return value === null ? null : known.has(value as SettingsProviderHeadline)
+    ? value as SettingsProviderHeadline
+    : "unknown";
+}
+
+function safeSettingsHealth(
+  value: ProviderCommandStatusEntry["health"],
+): SettingsProviderHealthProjection | null {
+  if (!value) return null;
+  const credential = ["valid", "rejected", "expired", "login-required", "unknown", "not-applicable"]
+    .includes(value.credential) ? value.credential as SettingsProviderHealthProjection["credential"] : "unknown";
+  const connectivity = ["connected", "offline", "unknown"].includes(value.connectivity)
+    ? value.connectivity as SettingsProviderHealthProjection["connectivity"] : "unknown";
+  const spend = ["available", "limit-reached", "unknown"].includes(value.spend)
+    ? value.spend as SettingsProviderHealthProjection["spend"] : "unknown";
+  const runtime = ["ready", "missing", "incompatible", "policy-unavailable", "not-applicable"]
+    .includes(value.runtime) ? value.runtime as SettingsProviderHealthProjection["runtime"] : "policy-unavailable";
+  return { credential, connectivity, spend, runtime };
+}
+
+function safeCachedUsd(value: number): number {
+  return Number.isFinite(value) && value >= 0 ? value : 0;
+}
+
+function projectSettingsModelInfos(values: readonly ModelInfo[]): readonly ModelInfo[] {
+  const projected: ModelInfo[] = [];
+  const seen = new Set<string>();
+  for (const value of values) {
+    const model = projectSettingsModelInfo(value);
+    if (!model || seen.has(model.id)) continue;
+    seen.add(model.id);
+    projected.push(model);
+  }
+  return projected;
+}
+
+/** Explicit allowlist projection. Runtime-added properties, including request
+ * metadata or credential canaries, never cross into the Settings snapshot. */
+function projectSettingsModelInfo(value: ModelInfo): ModelInfo | null {
+  if (!value
+    || typeof value !== "object"
+    || !safeCachedModelString(value.id)
+    || !safeCachedModelString(value.name)
+    || typeof value.description !== "string"
+    || !safeCachedModelNumber(value.contextLength, 0)
+    || !safeCachedModelNumber(value.promptPrice)
+    || !safeCachedModelNumber(value.completionPrice)
+    || !safeCachedStringArray(value.supportedParameters)
+    || !safeCachedStringArray(value.inputModalities)
+    || !safeCachedStringArray(value.outputModalities)) return null;
+  if (value.canonicalSlug !== undefined && !safeCachedModelString(value.canonicalSlug)) return null;
+  if (value.createdAt !== undefined && !safeCachedModelNumber(value.createdAt, 0)) return null;
+  if (value.maxCompletionTokens !== undefined
+    && value.maxCompletionTokens !== null
+    && !safeCachedModelNumber(value.maxCompletionTokens, 0)) return null;
+  if (value.modality !== undefined && typeof value.modality !== "string") return null;
+  if (value.tokenizer !== undefined && typeof value.tokenizer !== "string") return null;
+  if (value.isModerated !== undefined && typeof value.isModerated !== "boolean") return null;
+  if (value.intelligenceIndex !== undefined && !safeCachedModelNumber(value.intelligenceIndex)) return null;
+  if (value.codingIndex !== undefined && !safeCachedModelNumber(value.codingIndex)) return null;
+  if (value.agenticIndex !== undefined && !safeCachedModelNumber(value.agenticIndex)) return null;
+  const reasoning = projectCachedModelReasoning(value.reasoning);
+  if (value.reasoning !== undefined && !reasoning) return null;
+  return {
+    id: value.id,
+    ...(value.canonicalSlug === undefined ? {} : { canonicalSlug: value.canonicalSlug }),
+    name: value.name,
+    description: value.description,
+    ...(value.createdAt === undefined ? {} : { createdAt: value.createdAt }),
+    contextLength: value.contextLength,
+    ...(value.maxCompletionTokens === undefined
+      ? {}
+      : { maxCompletionTokens: value.maxCompletionTokens }),
+    promptPrice: value.promptPrice,
+    completionPrice: value.completionPrice,
+    supportedParameters: [...value.supportedParameters],
+    ...(value.modality === undefined ? {} : { modality: value.modality }),
+    inputModalities: [...value.inputModalities],
+    outputModalities: [...value.outputModalities],
+    ...(value.tokenizer === undefined ? {} : { tokenizer: value.tokenizer }),
+    ...(value.isModerated === undefined ? {} : { isModerated: value.isModerated }),
+    ...(reasoning ? { reasoning } : {}),
+    ...(value.intelligenceIndex === undefined ? {} : { intelligenceIndex: value.intelligenceIndex }),
+    ...(value.codingIndex === undefined ? {} : { codingIndex: value.codingIndex }),
+    ...(value.agenticIndex === undefined ? {} : { agenticIndex: value.agenticIndex }),
+  };
+}
+
+function projectCachedModelReasoning(
+  value: ModelInfo["reasoning"],
+): ModelInfo["reasoning"] | null {
+  if (!value
+    || typeof value !== "object"
+    || typeof value.mandatory !== "boolean"
+    || typeof value.supportsMaxTokens !== "boolean") return null;
+  const allowedEfforts = new Set([
+    "none", "minimal", "low", "medium", "high", "xhigh", "max",
+  ]);
+  if (value.defaultEffort !== undefined
+    && value.defaultEffort !== null
+    && !allowedEfforts.has(value.defaultEffort)) return null;
+  if (value.defaultEnabled !== undefined && typeof value.defaultEnabled !== "boolean") return null;
+  if (value.supportedEfforts !== null
+    && (!Array.isArray(value.supportedEfforts)
+      || value.supportedEfforts.some((effort) => !allowedEfforts.has(effort)))) return null;
+  return {
+    ...(value.defaultEffort === undefined ? {} : { defaultEffort: value.defaultEffort }),
+    ...(value.defaultEnabled === undefined ? {} : { defaultEnabled: value.defaultEnabled }),
+    mandatory: value.mandatory,
+    supportedEfforts: value.supportedEfforts === null ? null : [...value.supportedEfforts],
+    supportsMaxTokens: value.supportsMaxTokens,
+  };
+}
+
+function safeCachedModelString(value: unknown): value is string {
+  return typeof value === "string"
+    && value.length > 0
+    && [...value].length <= 512
+    && !/[\u0000-\u001f\u007f-\u009f]/u.test(value);
+}
+
+function safeCachedStringArray(value: unknown): value is string[] {
+  return Array.isArray(value)
+    && value.length <= 256
+    && value.every((entry) => safeCachedModelString(entry));
+}
+
+function safeCachedModelNumber(value: unknown, minimum = Number.NEGATIVE_INFINITY): value is number {
+  return typeof value === "number" && Number.isFinite(value) && value >= minimum;
+}
+
+function deepFreezeSettingsProjection<T>(value: T): T {
+  if (value !== null && typeof value === "object" && !Object.isFrozen(value)) {
+    for (const item of Object.values(value as Record<string, unknown>)) {
+      deepFreezeSettingsProjection(item);
+    }
+    Object.freeze(value);
+  }
+  return value;
+}
+
 type ProviderDestructiveOperation = "disable" | "disconnect" | "logout";
 type ProviderConfirmationResult = Extract<
   ProviderCommandResult,
@@ -757,6 +1132,12 @@ export class DefaultProviderRuntime implements ProviderRuntime {
   readonly #providerConfirmations = new Map<string, ProviderConfirmationBinding>();
   #startupAttemptGeneration = 0;
   #modelRuntimeCache: { key: string; runtime: ModelRuntime } | null = null;
+  readonly #cachedSettingsModels = new Map<string, ModelInfo>(
+    KIMI_CODE_MODELS.map((model) => {
+      const projected = kimiDashboardModelInfo(model.id)!;
+      return [projected.id, deepFreezeSettingsProjection(projected)] as const;
+    }),
+  );
 
   constructor(
     readonly openRouter: OpenRouterService,
@@ -788,6 +1169,64 @@ export class DefaultProviderRuntime implements ProviderRuntime {
 
   settingsActivity(): ProviderRuntimeActivity {
     return this.runtimeGuard.activity();
+  }
+
+  activity(): ProviderRuntimeActivity {
+    return this.runtimeGuard.activity();
+  }
+
+  async runSettingsConfigMutation<T>(task: () => Promise<T>): Promise<T> {
+    const lease = await this.runtimeGuard.acquire(new AbortController().signal);
+    try {
+      lease.assertHeldSynchronously?.();
+      const result = await task();
+      lease.assertHeldSynchronously?.();
+      return result;
+    } finally {
+      await lease.release();
+    }
+  }
+
+  readCachedModels(): readonly ModelInfo[] {
+    const models = [...this.#cachedSettingsModels.values()];
+    const route = this.#desiredSessionRoute(this.stateStore.read());
+    if (route?.resolutionState === "resolved"
+      && route.canonicalModelId
+      && !models.some((model) =>
+        model.id === route.requestedModelId || model.canonicalSlug === route.canonicalModelId)) {
+      models.push(cachedModelInfoFromRoute(route));
+    }
+    return deepFreezeSettingsProjection(
+      projectSettingsModelInfos(models).map((model) => structuredClone(model)),
+    );
+  }
+
+  readCachedProviderStatus(): readonly ProviderCommandStatusEntry[] {
+    const status = this.#providerStatus();
+    return status.kind === "status" ? status.providers : [];
+  }
+
+  readCachedSettingsRoute(): SettingsRouteProjection | null {
+    const route = this.#desiredSessionRoute(this.stateStore.read());
+    if (!route || route.resolutionState !== "resolved" || !route.canonicalModelId
+      || (route.backendId !== "openrouter" && route.backendId !== "kimi-code"
+        && route.backendId !== "anthropic")) return null;
+    const modelLabel = route.backendId === "kimi-code"
+      ? KIMI_CODE_MODELS.find((model) => model.id === route.canonicalModelId)?.displayName
+        ?? route.canonicalModelId
+      : route.canonicalModelId;
+    return {
+      backendId: route.backendId,
+      providerLabel: providerDisplayName(route.backendId),
+      requestedModelId: route.requestedModelId,
+      canonicalModelId: route.canonicalModelId,
+      modelLabel,
+      billingRealm: route.backendId === "openrouter"
+        ? "openrouter-payg"
+        : route.backendId === "kimi-code"
+          ? "kimi-code-membership-provider-managed-overage"
+          : "none",
+    };
   }
 
   readCachedSettingsProjection(): {
@@ -828,9 +1267,7 @@ export class DefaultProviderRuntime implements ProviderRuntime {
       isDefault: state.defaultRoute?.backendId === connection.backendId
         && state.defaultRoute.accountFingerprint === connection.accountFingerprint,
       selectedModel: null,
-      allowedActions: connection.backendId === "openrouter"
-        ? ["connect", "enable", "disable", "disconnect", "reconnect", "models", "logout"]
-        : ["connect", "enable", "disable", "reconnect", "models", "logout"],
+      allowedActions: providerBackendActions(connection.backendId),
     }));
     return { route: projectedRoute, providers };
   }
@@ -1028,12 +1465,13 @@ export class DefaultProviderRuntime implements ProviderRuntime {
     const generation = typeof this.orchestrator.nextStartupGeneration === "function"
       ? this.orchestrator.nextStartupGeneration()
       : ++this.#startupAttemptGeneration;
-    const sessionRouteCleared = this.session?.data.routeCleared === true;
+    let recoveredSessionRouteCleared = false;
     const startup = await runProviderStartupAttempt({
       generation,
       recover: (context) => this.authorityOptions?.recover(context) ?? Promise.resolve(),
       inspect: async (context) => {
-        if (sessionRouteCleared) {
+        recoveredSessionRouteCleared = this.session?.data.routeCleared === true;
+        if (recoveredSessionRouteCleared) {
           // Recovery still runs, but an intentionally detached chat performs
           // no provider inspection until its owner explicitly enters setup.
           this.#synchronizeAuthoritativeProviderState();
@@ -1072,7 +1510,7 @@ export class DefaultProviderRuntime implements ProviderRuntime {
         return resolved;
       },
       automaticEnvironment: async (result, context) => {
-        if (sessionRouteCleared) return result;
+        if (recoveredSessionRouteCleared) return result;
         if (
           result.mode !== "setup-required"
           && result.mode !== "route-choice-required"
@@ -1423,6 +1861,51 @@ export class DefaultProviderRuntime implements ProviderRuntime {
     return this.ensureRunnableRoute();
   }
 
+  readModelPreferenceAuthority(): ModelPreferenceAuthoritySnapshot {
+    const state = this.stateStore.read();
+    const route = validateRouteIdentityV1(state.defaultRoute);
+    if (!route || route.resolutionState !== "resolved" || !route.canonicalModelId) {
+      return Object.freeze({ route: null, providerRevision: state.revision, connectionId: null });
+    }
+    const selected = selectProviderBinding(state, { kind: "route", route });
+    if (selected.kind !== "exact") {
+      return Object.freeze({
+        route: structuredClone(route),
+        providerRevision: state.revision,
+        connectionId: null,
+      });
+    }
+    return Object.freeze({
+      route: structuredClone(route),
+      providerRevision: state.revision,
+      connectionId: selected.binding.connectionId,
+    });
+  }
+
+  prepareSettingsModelPublication(route: RouteIdentityV1): { publish(): void } {
+    const next = validateRouteIdentityV1(route);
+    const current = this.ensureRunnableRoute();
+    if (!next || next.resolutionState !== "resolved" || !next.canonicalModelId
+      || next.backendId !== current.backendId
+      || next.accountFingerprint !== current.accountFingerprint
+      || next.billingRealm !== current.billingRealm) {
+      throw new ProviderSetupRequiredError();
+    }
+    const exact = structuredClone(next);
+    let published = false;
+    return Object.freeze({
+      publish: () => {
+        if (published) return;
+        published = true;
+        this.#sessionRoute = exact;
+        this.#sessionRoutePersisted = true;
+        this.#pendingSessionBinding = null;
+        this.#preparedRoles = null;
+        this.#modelRuntimeCache = null;
+      },
+    });
+  }
+
   adoptSession(session: SessionStore): void {
     const requestedRoute = validateRouteIdentityV1(session.data.route);
     if (session.data.routeCleared) {
@@ -1652,7 +2135,18 @@ export class DefaultProviderRuntime implements ProviderRuntime {
     run: () => Promise<T>,
     surface?: SetupSurface | "plain" | "fullscreen",
   ): Promise<T> {
-    return this.runWithReadyRoute(() => run(), surface);
+    const result = await this.runWithReadyRoute(() => run(), surface);
+    this.#rememberCachedModels(result);
+    return result;
+  }
+
+  #rememberCachedModels(value: unknown): void {
+    if (!Array.isArray(value)) return;
+    for (const candidate of value) {
+      const model = projectSettingsModelInfo(candidate as ModelInfo);
+      if (!model) continue;
+      this.#cachedSettingsModels.set(model.id, deepFreezeSettingsProjection(model));
+    }
   }
 
   async transitionModel(
@@ -1660,10 +2154,39 @@ export class DefaultProviderRuntime implements ProviderRuntime {
     canonicalModelId?: string,
     surface?: SetupSurface | "plain" | "fullscreen",
   ): Promise<void> {
+    await this.#transitionModel(modelId, canonicalModelId, surface);
+  }
+
+  async transitionSessionModel(
+    candidate: {
+      readonly requestedModelId: string;
+      readonly canonicalModelId: string;
+    },
+    publication: ProviderPreferenceCommitPort,
+    surface?: SetupSurface | "plain" | "fullscreen",
+  ): Promise<RouteIdentityV1> {
+    return this.#transitionModel(
+      candidate.requestedModelId,
+      candidate.canonicalModelId,
+      surface,
+      publication,
+    );
+  }
+
+  async #transitionModel(
+    modelId: string,
+    canonicalModelId?: string,
+    surface?: SetupSurface | "plain" | "fullscreen",
+    preferencePublication?: ProviderPreferenceCommitPort,
+  ): Promise<RouteIdentityV1> {
     const current = this.ensureRunnableRoute();
     if (current.backendId === "kimi-code") {
-      await this.#transitionKimiModel(current, modelId, canonicalModelId);
-      return;
+      return this.#transitionKimiModel(
+        current,
+        modelId,
+        canonicalModelId,
+        preferencePublication,
+      );
     }
     const resolved = canonicalModelId === undefined
       ? await this.runModelCatalog(
@@ -1679,7 +2202,7 @@ export class DefaultProviderRuntime implements ProviderRuntime {
       current.requestedModelId === modelId
       && current.canonicalModelId === selectedCanonicalModelId
     ) {
-      return;
+      return structuredClone(current);
     }
 
     const state = this.stateStore.read();
@@ -1697,13 +2220,13 @@ export class DefaultProviderRuntime implements ProviderRuntime {
       ? (this.#sessionRoutePersisted ? "persisted" : "process-only")
       : (currentIsPersisted ? "persisted" : "process-only");
     const effectAttempt = createProviderEffectAttempt();
-    let terminalActivation: Promise<void> | null = null;
+    let terminalActivation: Promise<RouteIdentityV1> | null = null;
     const activateExactCandidate = async (
       candidate: string,
       expectedRevision: number,
       targetConnectionId?: string,
       candidatePermit?: ProviderCandidateCredentialPermit,
-    ): Promise<void> => {
+    ): Promise<RouteIdentityV1> => {
       if (terminalActivation) throw new ProviderSetupRequiredError();
       terminalActivation = (async () => {
         const result = await this.orchestrator.activateCandidate({
@@ -1717,6 +2240,9 @@ export class DefaultProviderRuntime implements ProviderRuntime {
           persistence,
           candidatePermit,
           requireCandidatePermit: candidatePermit !== undefined,
+          ...(preferencePublication
+            ? { persistBeforeProviderConfigCommit: preferencePublication }
+            : {}),
           ...(targetConnectionId ? { targetConnectionId } : {}),
         });
         const route = validateRouteIdentityV1(result.route);
@@ -1731,9 +2257,14 @@ export class DefaultProviderRuntime implements ProviderRuntime {
         ) {
           throw new ProviderSetupRequiredError();
         }
-        this.adoptCredentialActivation(route, result.persisted, candidate);
+        if (preferencePublication) {
+          if (!result.persisted) throw new ProviderSetupRequiredError();
+        } else {
+          this.adoptCredentialActivation(route, result.persisted, candidate);
+        }
+        return structuredClone(route);
       })();
-      await terminalActivation;
+      return terminalActivation;
     };
 
     try {
@@ -1768,12 +2299,12 @@ export class DefaultProviderRuntime implements ProviderRuntime {
             );
           },
         );
-        if (access.kind === "available") return;
+        if (access.kind === "available" && terminalActivation) return await terminalActivation;
         if (terminalActivation) return await terminalActivation;
         throw new ProviderSetupRequiredError();
       }
 
-      await activateExactCandidate(this.openRouter.requireKey(), state.revision);
+      return await activateExactCandidate(this.openRouter.requireKey(), state.revision);
     } catch (error) {
       if (terminalActivation) return await terminalActivation;
       throw error;
@@ -1786,7 +2317,8 @@ export class DefaultProviderRuntime implements ProviderRuntime {
     current: RouteIdentityV1,
     modelId: string,
     canonicalModelId?: string,
-  ): Promise<void> {
+    preferencePublication?: ProviderPreferenceCommitPort,
+  ): Promise<RouteIdentityV1> {
     this.#assertKimiOwnerMode();
     const selectedCanonicalModelId = canonicalModelId ?? modelId;
     if (
@@ -1796,7 +2328,15 @@ export class DefaultProviderRuntime implements ProviderRuntime {
     if (
       current.requestedModelId === modelId
       && current.canonicalModelId === selectedCanonicalModelId
-    ) return;
+    ) return structuredClone(current);
+    if (preferencePublication) {
+      return this.#transitionKimiModelWithPreference(
+        current,
+        modelId,
+        selectedCanonicalModelId,
+        preferencePublication,
+      );
+    }
     const adapter = this.authorityOptions?.kimiAdapter;
     if (!adapter) throw new ProviderSetupRequiredError();
     const controller = new AbortController();
@@ -1925,8 +2465,94 @@ export class DefaultProviderRuntime implements ProviderRuntime {
         },
       );
     } catch (error) {
-      if (adoptCommittedTuple()) return;
+      if (adoptCommittedTuple()) return structuredClone(committedTuple!.route);
       throw error;
+    }
+    const completed = committedTuple as {
+      state: ProviderSetupStateV2;
+      route: RouteIdentityV1;
+    } | null;
+    if (!completed || !committedAdopted) throw new ProviderSetupRequiredError();
+    return structuredClone(completed.route);
+  }
+
+  async #transitionKimiModelWithPreference(
+    current: RouteIdentityV1,
+    modelId: string,
+    selectedCanonicalModelId: string,
+    preferencePublication: ProviderPreferenceCommitPort,
+  ): Promise<RouteIdentityV1> {
+    const authority = this.authorityOptions?.credentialAuthority;
+    if (!authority || !this.authorityOptions?.kimiAdapter) {
+      throw new ProviderSetupRequiredError();
+    }
+    const state = this.stateStore.read();
+    const selected = selectProviderBinding(state, { kind: "route", route: current });
+    if (selected.kind !== "exact"
+      || selected.binding.backendId !== "kimi-code"
+      || !state.defaultRoute
+      || !sameExactRoute(state.defaultRoute, current)) {
+      throw new ProviderSetupRequiredError();
+    }
+    const effectAttempt = createProviderEffectAttempt();
+    let terminalActivation: Promise<RouteIdentityV1> | null = null;
+    try {
+      const access = await authority.withCredential({
+        backendId: "kimi-code",
+        connectionId: selected.binding.connectionId,
+        credentialKind: "inference",
+        purpose: "explicit-repair",
+        environmentEligibility: "forbidden",
+        deadlineAt: effectAttempt.deadlineAt,
+        signal: effectAttempt.signal,
+      }, async (candidate, context) => {
+        if (context.binding.stateRevision !== state.revision
+          || context.binding.connectionId !== selected.binding.connectionId
+          || context.binding.accountFingerprint !== current.accountFingerprint
+          || context.binding.billingRealm !== current.billingRealm) {
+          throw new ProviderSetupRequiredError();
+        }
+        terminalActivation = (async () => {
+          const result = await this.orchestrator.activateCandidate({
+            backendId: "kimi-code",
+            expectedRevision: context.binding.stateRevision,
+            candidate,
+            expectedRequestedModelId: modelId,
+            selectedCanonicalModelId,
+            signal: effectAttempt.signal,
+            deadlineAt: effectAttempt.deadlineAt,
+            persistence: "persisted",
+            environmentEligibility: "forbidden",
+            targetConnectionId: context.binding.connectionId,
+            candidatePermit: context.candidatePermit,
+            requireCandidatePermit: true,
+            persistBeforeProviderConfigCommit: preferencePublication,
+          });
+          const route = validateRouteIdentityV1(result.route);
+          if (!result.persisted
+            || !route
+            || route.resolutionState !== "resolved"
+            || route.backendId !== "kimi-code"
+            || route.accountFingerprint !== current.accountFingerprint
+            || route.billingRealm !== current.billingRealm
+            || route.requestedModelId !== modelId
+            || route.canonicalModelId !== selectedCanonicalModelId) {
+            throw new ProviderSetupRequiredError();
+          }
+          return structuredClone(route);
+        })();
+        await terminalActivation;
+      });
+      if (access.kind === "available" && terminalActivation) {
+        return await terminalActivation;
+      }
+      if (terminalActivation) return await terminalActivation;
+      throw new ProviderSetupRequiredError();
+    } catch (error) {
+      if (terminalActivation) return await terminalActivation;
+      throw error;
+    } finally {
+      effectAttempt.close();
     }
   }
 
@@ -4486,6 +5112,45 @@ function scanStartupJsonValue(raw: string, start: number): number | null {
   return index > start ? index : null;
 }
 
+async function adoptRecoveredStartupOwners(
+  startup: StartupStorageResult,
+  recovered: readonly RecoveredModelPreferenceOwner[],
+  lease: Pick<ProviderCoordinatorLease, "assertHeld">,
+): Promise<void> {
+  const configRecovered = recovered.some((owner) =>
+    resolve(owner.configPath) === resolve(startup.configPath));
+  const sessionRecovered = recovered.some((owner) =>
+    resolve(owner.sessionPath) === resolve(startup.session.path));
+  if (!configRecovered && !sessionRecovered) return;
+
+  let recoveredConfig: OrcodeConfigWithBudget | null = null;
+  let recoveredSessionPublication: ReturnType<
+    SessionStore["prepareRecoveredPreferencePublication"]
+  > | null = null;
+  if (configRecovered) {
+    await lease.assertHeld();
+    recoveredConfig = structuredClone(
+      (await readConfigEditSnapshot(startup.configPath)).config,
+    );
+    await lease.assertHeld();
+  }
+  if (sessionRecovered) {
+    await lease.assertHeld();
+    const snapshot = await readSessionEditSnapshot(startup.session.path);
+    await lease.assertHeld();
+    recoveredSessionPublication = startup.session.prepareRecoveredPreferencePublication(
+      snapshot,
+    );
+  }
+  // This is the final awaited authority fence. Both following publications
+  // use already-cloned values and contain assignments only.
+  await lease.assertHeld();
+  if (recoveredConfig) {
+    Object.assign(startup.config, recoveredConfig);
+  }
+  recoveredSessionPublication?.publish();
+}
+
 export async function createDefaultProviderRuntime(
   input: ProviderRuntimeInput,
 ): Promise<ProviderRuntime> {
@@ -4616,6 +5281,20 @@ export async function createDefaultProviderRuntime(
               },
               ...(allowedBackendIds ? { allowedBackendIds } : {}),
             });
+            const recovered = await recoverModelPreferenceTransactions({
+              appHome: startup.appHome,
+              routeAuthority: {
+                assertHeld: () => lease.assertHeld(),
+                async read() {
+                  const snapshot = runtimeOwner?.readModelPreferenceAuthority();
+                  if (!snapshot) throw new ProviderSetupRequiredError();
+                  return snapshot;
+                },
+              },
+              ...(allowedBackendIds ? { allowedBackendIds } : {}),
+            });
+            await lease.assertHeld();
+            await adoptRecoveredStartupOwners(startup, recovered, lease);
           },
         );
       },
@@ -4630,6 +5309,12 @@ export interface PlainRunInput extends Omit<RuntimeContext, "agent"> {
   ensureAgentForPrompt(surface?: SetupSurface): Promise<OrcodeAgent>;
   resumeFlag?: boolean;
   noResumeFlag?: boolean;
+  /** Test/integration seam for a temporary Settings owner in plain mode. */
+  createTemporarySettingsUi?: () => TerminalUi;
+  /** Scripted line source; production deliberately falls back to Inquirer. */
+  readPlainInput?: () => Promise<string>;
+  stdinIsTty?: boolean;
+  stdoutIsTty?: boolean;
 }
 
 /** The one deliberately small boundary between `/settings` parsing and an interactive owner UI. */
@@ -4665,6 +5350,19 @@ export function createSettingsCommandPort(
   });
 }
 
+export async function runSettingsTerminalOwner(
+  surface: Pick<TerminalUi, "start" | "stop">,
+  ownsTerminal: boolean,
+  run: () => Promise<void>,
+): Promise<void> {
+  if (ownsTerminal) surface.start();
+  try {
+    await run();
+  } finally {
+    if (ownsTerminal) surface.stop();
+  }
+}
+
 function createSettingsSession(
   context: RuntimeContext,
   surface: TerminalUi,
@@ -4672,71 +5370,62 @@ function createSettingsSession(
 ): SettingsSessionDependencies {
   return {
     async open(): Promise<void> {
-      if (ownsTerminal) surface.start();
-      try {
+      await runSettingsTerminalOwner(surface, ownsTerminal, async () => {
+        const snapshotPort = createSettingsRuntimeSnapshotPort({
+          config: context.config,
+          runtime: {
+            activity: () => context.providerRuntime.activity?.()
+              ?? context.providerRuntime.settingsActivity?.()
+              ?? { runActive: false, activationHeld: false },
+            readCachedSettingsRoute: () => context.providerRuntime.readCachedSettingsRoute?.()
+              ?? context.providerRuntime.readCachedSettingsProjection?.().route
+              ?? null,
+            readCachedProviderStatus: () => context.providerRuntime.readCachedProviderStatus?.()
+              ?? [],
+            readCachedModels: () => [
+              ...(context.providerRuntime.readCachedModels?.() ?? []),
+              ...context.openRouter.readCachedModels(),
+            ],
+          },
+          session: context.session,
+          ruleStore: context.ruleStore,
+          workspace: context.workspace,
+        });
         const controller = await SettingsController.open({
           configPath: context.configPath,
           snapshots: {
-            // Deliberately cached-only: opening Settings must not execute a
-            // provider command or inspect a credential.
-            read: async () => {
-              const provider = context.providerRuntime.readCachedSettingsProjection?.()
-                ?? { route: null, providers: [] };
-              return ({
-              config: context.config,
-              runActive: (() => {
-                const activity = context.providerRuntime.settingsActivity?.();
-                return activity?.runActive === true || activity?.activationHeld === true;
-              })(),
-              route: provider.route,
-              providers: provider.providers,
-              approvalRules: context.ruleStore.list(context.workspace).map((rule) => ({
-                id: rule.id,
-                decision: rule.decision,
-              })),
-              costs: {
-                costKnowledge: context.session.data.costs.costKnowledge ?? "unknown",
-                sessionUsd: context.session.data.costs.totalUsd,
-                dayUsd: 0,
-                totalUsd: context.session.data.costs.totalUsd,
-              },
-              cachedModels: context.openRouter.readCachedModels(),
-              });
-            },
+            read: async () => snapshotPort.readCached(),
           },
           externalActions: {
             async execute(action: SettingsExternalAction): Promise<void> {
-              assertSettingsIdle(context);
               if (action.kind === "provider") {
-                await context.providerCommands.execute(
-                  action.intent,
-                  action.intent.kind === "setup"
-                    ? createSettingsSetupSurface(surface)
-                    : context.providerRouteSurface,
-                );
+                assertSettingsIdle(context);
+                await mapSettingsBusyRace(context, () =>
+                  executeSettingsProviderAction(context, surface, action.intent));
                 return;
               }
               if (action.kind === "approval-forget") {
-                await context.ruleStore.forget(action.ruleId);
+                await runSettingsConfigMutation(context, () => context.ruleStore.forget(action.ruleId));
                 return;
               }
               if (action.kind === "approval-forget-all") {
-                await context.ruleStore.forgetAll(context.workspace);
+                await runSettingsConfigMutation(context, () => context.ruleStore.forgetAll(context.workspace));
                 return;
               }
               if (action.kind === "main-model") {
-                await context.providerRuntime.transitionModel(
-                  action.requestedModelId,
-                  action.canonicalModelId,
-                  "fullscreen",
-                );
+                assertSettingsIdle(context);
+                await mapSettingsBusyRace(context, () =>
+                  transitionSettingsMainModel(context, surface, action));
+                return;
+              }
+              if (action.kind === "verify-suggest") {
+                await suggestSettingsVerifyCommands(context, surface);
                 return;
               }
               await persistSettingsExternalConfig(context, (next) => {
                 if (action.kind === "compressor-model") next.compressorModel = action.modelId;
                 else if (action.kind === "panel-models") next.panelModels = [...action.modelIds];
                 else if (action.kind === "transcription-model") next.transcriptionModel = action.modelId;
-                else if (action.kind === "verify-suggest") next.verify.commands = [];
               });
             },
           },
@@ -4746,38 +5435,216 @@ function createSettingsSession(
             },
           },
           readConfig: readConfigEditSnapshot,
-          saveConfig: async (expected, candidate, path) => {
-            try {
-              assertSettingsIdle(context);
-            } catch {
-              throw new SettingsRunActiveError();
-            }
-            return saveConfigEdit(expected, candidate, path);
-          },
+          saveConfig: saveConfigEdit,
+          runConfigMutation: (task) => runSettingsConfigMutation(context, task),
         });
         await runSettingsSession(controller, surface);
-      } finally {
-        if (ownsTerminal) surface.stop();
-      }
+      });
     },
   };
 }
 
 function assertSettingsIdle(context: RuntimeContext): void {
-  const activity = context.providerRuntime.settingsActivity?.();
-  if (activity?.runActive || activity?.activationHeld) throw new Error("Lauf aktiv");
+  const activity = context.providerRuntime.activity?.()
+    ?? context.providerRuntime.settingsActivity?.();
+  if (activity?.runActive || activity?.activationHeld) {
+    throw new SettingsRunActiveError();
+  }
+}
+
+async function mapSettingsBusyRace<T>(
+  context: RuntimeContext,
+  task: () => Promise<T>,
+): Promise<T> {
+  try {
+    return await task();
+  } catch (error) {
+    const activity = context.providerRuntime.activity?.()
+      ?? context.providerRuntime.settingsActivity?.();
+    if (activity?.runActive || activity?.activationHeld
+      || /runtime is not idle|lauf aktiv/i.test(errorMessage(error))) {
+      throw new SettingsRunActiveError();
+    }
+    throw error;
+  }
+}
+
+async function runSettingsConfigMutation<T>(
+  context: RuntimeContext,
+  task: () => Promise<T>,
+): Promise<T> {
+  const run = context.providerRuntime.runSettingsConfigMutation;
+  if (typeof run !== "function") {
+    assertSettingsIdle(context);
+    return task();
+  }
+  try {
+    return await context.providerRuntime.runSettingsConfigMutation!(task);
+  } catch (error) {
+    const activity = context.providerRuntime.activity?.()
+      ?? context.providerRuntime.settingsActivity?.();
+    if (activity?.runActive || activity?.activationHeld
+      || /runtime is not idle|lauf aktiv/i.test(errorMessage(error))) {
+      throw new SettingsRunActiveError();
+    }
+    throw error;
+  }
 }
 
 async function persistSettingsExternalConfig(
   context: RuntimeContext,
   edit: (candidate: OrcodeConfigWithBudget) => void,
 ): Promise<void> {
-  assertSettingsIdle(context);
-  const expected = await readConfigEditSnapshot(context.configPath);
-  const candidate = structuredClone(expected.config);
-  edit(candidate);
-  const saved = await saveConfigEdit(expected, candidate, context.configPath);
-  Object.assign(context.config, saved);
+  await runSettingsConfigMutation(context, async () => {
+    const expected = await readConfigEditSnapshot(context.configPath);
+    const candidate = structuredClone(expected.config);
+    edit(candidate);
+    const saved = await saveConfigEdit(expected, candidate, context.configPath);
+    Object.assign(context.config, saved);
+  });
+}
+
+async function executeSettingsProviderAction(
+  context: RuntimeContext,
+  surface: TerminalUi,
+  intent: ProviderCommandIntent,
+): Promise<void> {
+  const setupSurface = createSettingsSetupSurface(surface);
+  await runSettingsProviderAction({
+    intent,
+    surface: setupSurface,
+    execute: (next, nextSurface) => context.providerCommands.execute(next, nextSurface),
+    confirm: (message) => surface.confirmAction(
+      "Provider ändern?",
+      message,
+      false,
+    ).then((result) => result.accepted),
+  });
+}
+
+export async function runSettingsProviderAction(input: {
+  readonly intent: ProviderCommandIntent;
+  readonly surface: SetupSurface;
+  readonly execute: (
+    intent: ProviderCommandIntent,
+    surface: SetupSurface,
+  ) => Promise<ProviderCommandResult>;
+  readonly confirm: (message: string) => Promise<boolean>;
+}): Promise<void> {
+  let result = await input.execute(input.intent, input.surface);
+  if (result.kind !== "confirmation-required") return;
+  if (input.intent.kind !== result.operation
+    || !("backendId" in input.intent)
+    || input.intent.backendId !== result.backendId) {
+    throw new Error("Provider-Bestätigung ist nicht an die angeforderte Aktion gebunden.");
+  }
+  if (!await input.confirm(result.message)) throw new SettingsExternalActionCancelledError();
+  const operation = result.operation;
+  const backendId = result.backendId;
+  result = await input.execute({
+    kind: operation,
+    backendId,
+    confirmationToken: result.confirmationToken,
+  }, input.surface);
+  if (result.kind === "confirmation-required"
+    || (result.kind === "changed"
+      && (result.operation !== operation || result.backendId !== backendId))) {
+    throw new Error("Provider-Bestätigung konnte nicht autoritativ abgeschlossen werden.");
+  }
+}
+
+async function transitionSettingsMainModel(
+  context: RuntimeContext,
+  surface: TerminalUi,
+  action: Extract<SettingsExternalAction, { kind: "main-model" }>,
+): Promise<void> {
+  const beforeRoute = context.providerRuntime.currentSessionRoute();
+  const afterRoute = validateRouteIdentityV1({
+    ...structuredClone(beforeRoute),
+    requestedModelId: action.requestedModelId,
+    canonicalModelId: action.canonicalModelId,
+    resolutionState: "resolved",
+  });
+  if (!afterRoute || !afterRoute.canonicalModelId) throw new ProviderSetupRequiredError();
+
+  const expectedConfig = await readConfigEditSnapshot(context.configPath);
+  const expectedSession = await readSessionEditSnapshot(context.session.path);
+  const nextSession = prepareSessionPreferenceEdit(expectedSession, {
+    requestedModelId: action.requestedModelId,
+    reasoning: getReasoningSetting(expectedConfig.config, action.requestedModelId),
+    route: afterRoute,
+  });
+  const sessionPublication = context.session.preparePreferencePublication(
+    expectedSession,
+    nextSession,
+  );
+  const runtimePublication = context.providerRuntime.prepareSettingsModelPublication?.(afterRoute);
+  if (!runtimePublication) throw new ProviderSetupRequiredError();
+  let finalConfig: OrcodeConfigWithBudget | null = null;
+  const routeAuthority = createModelPreferenceRouteAuthority({
+    runtime: context.providerRuntime,
+    candidate: action,
+    surface: createSettingsSetupSurface(surface),
+  });
+  await runModelPreferenceTransaction({
+    appHome: context.session.appHome,
+    configPath: context.configPath,
+    sessionPath: context.session.path,
+    expectedConfig,
+    nextConfig(nextProviderState) {
+      const candidate = validateConfig({
+        ...structuredClone(expectedConfig.config),
+        mainModel: action.requestedModelId,
+        providerSetup: structuredClone(nextProviderState),
+      });
+      finalConfig = candidate;
+      return candidate;
+    },
+    expectedSession,
+    nextSession,
+    beforeRoute,
+    afterRoute,
+    routeAuthority,
+    publish() {
+      Object.assign(context.config, finalConfig!);
+      sessionPublication.publish();
+      runtimePublication.publish();
+    },
+  });
+}
+
+async function suggestSettingsVerifyCommands(
+  context: RuntimeContext,
+  surface: TerminalUi,
+): Promise<void> {
+  const packagePath = await context.localRuntime.guard.resolvePath("package.json");
+  const parsed = JSON.parse(await readFile(packagePath, "utf8")) as unknown;
+  await runSettingsVerifySuggestion({
+    packageJson: parsed,
+    confirm: (commands) => surface.confirmAction(
+      "Prüfkommandos übernehmen?",
+      commands.join("\n"),
+      false,
+    ).then((result) => result.accepted),
+    persist: (commands) => persistSettingsExternalConfig(context, (next) => {
+      next.verify = { ...next.verify, commands: [...commands] };
+    }),
+  });
+}
+
+export async function runSettingsVerifySuggestion(input: {
+  readonly packageJson: unknown;
+  readonly confirm: (commands: readonly string[]) => Promise<boolean>;
+  readonly persist: (commands: readonly string[]) => Promise<void>;
+}): Promise<void> {
+  const commands = Object.freeze(suggestVerifyCommands(input.packageJson));
+  if (commands.length === 0) {
+    throw new Error("Keine passenden Prüfkommandos in package.json gefunden.");
+  }
+  if (!await input.confirm(commands)) {
+    throw new SettingsExternalActionCancelledError();
+  }
+  await input.persist(commands);
 }
 
 export interface DashboardRunInput extends PlainRunInput {
@@ -5155,7 +6022,7 @@ interface RuntimeContext {
   onRunEvent?: (event: AgentRunEvent) => void;
 }
 
-async function runPlainLoop(
+export async function runPlainLoop(
   context: PlainRunInput,
   resumeOptions: Pick<CliOptions, "resume" | "noResume">,
 ): Promise<void> {
@@ -5172,21 +6039,22 @@ async function runPlainLoop(
   };
   context.settings = createSettingsCommandPort({
     executionMode: context.executionMode,
-    stdinIsTty: process.stdin.isTTY === true,
-    stdoutIsTty: process.stdout.isTTY === true,
+    stdinIsTty: context.stdinIsTty ?? process.stdin.isTTY === true,
+    stdoutIsTty: context.stdoutIsTty ?? process.stdout.isTTY === true,
     createSession: async () => {
-      const ui = new TerminalUi(() => plainSettingsDashboardState(context), process.stdin, process.stdout, undefined, {
-        settingsEditorResolver: createSettingsEditorResolver(context),
-      });
+      const ui = context.createTemporarySettingsUi?.()
+        ?? new TerminalUi(() => plainSettingsDashboardState(context), process.stdin, process.stdout, undefined, {
+          settingsEditorResolver: createSettingsEditorResolver(context),
+        });
       return createSettingsSession(context, ui, true);
     },
   });
   while (true) {
     let value: string;
     try {
-      value = await input({
-        message: chalk.cyan("›"),
-      });
+      value = context.readPlainInput
+        ? await context.readPlainInput()
+        : await input({ message: chalk.cyan("›") });
     } catch (error) {
       if (isPromptExit(error)) {
         process.stdout.write("\n");
@@ -5269,10 +6137,21 @@ function plainSettingsDashboardState(context: RuntimeContext): DashboardState {
 function createSettingsEditorResolver(context: RuntimeContext): SettingsEditorResolver {
   return {
     searchModels(request, query) {
-      const cached = [...context.openRouter.readCachedModels()];
-      const eligible = request.itemId === "compressor-model"
-        ? compressorModelCandidates(cached)
-        : mainModelCandidates(cached);
+      const cached = [
+        ...(context.providerRuntime.readCachedModels?.() ?? []),
+        ...context.openRouter.readCachedModels(),
+      ].filter((model, index, models) => models.findIndex((candidate) =>
+        candidate.id === model.id
+        && candidate.canonicalSlug === model.canonicalSlug) === index);
+      const eligible = request.editor.kind !== "model"
+        ? []
+        : request.editor.filter === "main"
+          ? mainModelCandidates(cached)
+          : request.editor.filter === "compressor"
+            ? compressorModelCandidates(cached)
+            : request.editor.filter === "panel"
+              ? panelModelCandidates(cached)
+              : audioInputModelCandidates(cached);
       return rankModels(eligible, query, context.config.mainModel);
     },
   };
@@ -7035,6 +7914,45 @@ function kimiDashboardModelInfo(modelId: string): ModelInfo | null {
       supportedEfforts: model.reasoningEfforts === null ? null : [...model.reasoningEfforts],
       supportsMaxTokens: false,
     },
+  };
+}
+
+function cachedModelInfoFromRoute(route: RouteIdentityV1): ModelInfo {
+  const kimi = route.backendId === "kimi-code"
+    ? kimiDashboardModelInfo(route.canonicalModelId ?? route.requestedModelId)
+    : null;
+  if (kimi) return kimi;
+  return {
+    id: route.requestedModelId,
+    ...(route.canonicalModelId
+      ? { canonicalSlug: route.canonicalModelId }
+      : {}),
+    name: route.canonicalModelId ?? route.requestedModelId,
+    description: "Zuletzt bestätigte Provider-Modellroute",
+    contextLength: 0,
+    promptPrice: -1,
+    completionPrice: -1,
+    supportedParameters: [],
+    inputModalities: ["text"],
+    outputModalities: ["text"],
+  };
+}
+
+function cachedModelInfoFromDescriptor(model: BackendModelDescriptor): ModelInfo {
+  return {
+    id: model.requestedModelId,
+    canonicalSlug: model.canonicalModelId,
+    name: model.displayName,
+    description: "Bestätigtes Provider-Katalogmodell",
+    contextLength: 0,
+    promptPrice: model.backendId === "kimi-code" ? -1 : 0,
+    completionPrice: model.backendId === "kimi-code" ? -1 : 0,
+    supportedParameters: [
+      ...(model.capabilities.tools ? ["tools"] : []),
+      ...(model.capabilities.reasoning ? ["reasoning"] : []),
+    ],
+    inputModalities: model.capabilities.textInput ? ["text"] : [],
+    outputModalities: model.capabilities.textOutput ? ["text"] : [],
   };
 }
 

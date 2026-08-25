@@ -1247,9 +1247,12 @@ export function createSettingsSetupSurface(ui: SettingsSetupPromptUi): SetupSurf
         .then((result) => result.accepted));
     },
     present(event) {
-      if (event.type === "provider-state") ui.showSettingsNotice(providerStateLabel(event.entries));
-      else if (event.type === "notice") ui.showSettingsNotice(event.message);
-      ui.restoreSettings();
+      try {
+        if (event.type === "provider-state") ui.showSettingsNotice(providerStateLabel(event.entries));
+        else if (event.type === "notice") ui.showSettingsNotice(event.message);
+      } finally {
+        ui.restoreSettings();
+      }
     },
   };
 }

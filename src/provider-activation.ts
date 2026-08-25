@@ -16,6 +16,7 @@ import {
   isAtomicFilePostPublicationError,
   readConfigFileSnapshot,
   saveConfig as saveConfigDefault,
+  sameConfigFileSnapshot,
   withConfigWriteLock,
   writeFileAtomicCreateSecure,
   writeFileAtomicSecure,
@@ -141,6 +142,490 @@ export interface ProviderActivationRequest {
   candidateAuthorityPurpose?: "initial-setup";
   targetConnectionId?: string;
   onPersistenceFailure?: () => Promise<"process-only" | "decline">;
+  /**
+   * Optional high-level preference publication while Runtime -> Provider is
+   * held, after the credential journal is durable and before this authority
+   * acquires the config writer lock. The callback receives only a clone of
+   * the exact candidate tuple, never the credential itself.
+   */
+  persistBeforeProviderConfigCommit?: ProviderPreferenceCommitPort;
+}
+
+export interface ProviderActivationConfigCandidate {
+  readonly route: RouteIdentityV1;
+  readonly state: ProviderSetupStateV2;
+}
+
+export interface ProviderActivationConfigPersistResult {
+  /** Exact staging config returned by the preference transaction. */
+  readonly configFence: ConfigFileSnapshot;
+}
+
+export interface ProviderPreferenceMutationAuthority {
+  readonly signal: AbortSignal;
+  readonly deadlineAt: number;
+  /** Synchronous, object-identity-bound gate for every mutation boundary. */
+  assertMutationAllowed(): void;
+  /** Exact async Provider/Runtime lease fence around awaited mutations. */
+  assertMutationAuthorityHeld(): Promise<void>;
+  /** Synchronous gate used only by the idempotent abort reconciler. */
+  assertReconcileAllowed(): void;
+  assertReconcileAuthorityHeld(): Promise<void>;
+  /** Synchronous gate available only after exact provider/runtime durability. */
+  assertCompletionAllowed(): void;
+  assertCompletionAuthorityHeld(): Promise<void>;
+  /** Closes the persistence capability and binds its exact staging fence. */
+  acknowledgePersistence(
+    configFence: ConfigFileSnapshot,
+  ): Promise<ProviderActivationConfigPersistResult>;
+  /** Issues the one non-forgeable acknowledgement for this completion. */
+  acknowledgeCompletion(): Promise<ProviderPreferenceCompletionAck>;
+}
+
+/** Separate post-completion capability opened only after the provider has
+ * consumed the exact completion acknowledgement. */
+export interface ProviderPreferenceCleanupAuthority {
+  readonly signal: AbortSignal;
+  assertCleanupAllowed(): void;
+  assertCleanupAuthorityHeld(): Promise<void>;
+  /** Closes this cleanup capability and proves its one successful turn. */
+  acknowledgeCleanup(): Promise<ProviderPreferenceCleanupAck>;
+}
+
+/** Opaque acknowledgement bound to one authority object and completion turn. */
+export interface ProviderPreferenceCompletionAck {
+  readonly version: 1;
+}
+
+/** Opaque acknowledgement bound to one post-completion cleanup turn. */
+export interface ProviderPreferenceCleanupAck {
+  readonly version: 1;
+}
+
+export type ProviderPreferenceReconcileResult =
+  | { readonly kind: "old" }
+  | { readonly kind: "final" }
+  | { readonly kind: "recovery-required" };
+
+export interface ProviderPreferenceCommitPortInput {
+  readonly persist: (
+    candidate: ProviderActivationConfigCandidate,
+    authority: ProviderPreferenceMutationAuthority,
+  ) => Promise<ProviderActivationConfigPersistResult>;
+  readonly abortAndReconcile: (
+    authority: ProviderPreferenceMutationAuthority,
+  ) => Promise<ProviderPreferenceReconcileResult>;
+  readonly complete: (
+    candidate: ProviderActivationConfigCandidate,
+    authority: ProviderPreferenceMutationAuthority,
+  ) => Promise<ProviderPreferenceCompletionAck>;
+  readonly cleanup: (
+    authority: ProviderPreferenceCleanupAuthority,
+  ) => Promise<ProviderPreferenceCleanupAck>;
+}
+
+/** Opaque, runtime-branded, one-shot preference publication port. */
+export interface ProviderPreferenceCommitPort {
+  readonly version: 1;
+}
+
+interface ProviderPreferenceCommitPortState {
+  readonly input: ProviderPreferenceCommitPortInput;
+  used: boolean;
+}
+
+const providerPreferenceCommitPorts = new WeakMap<
+  ProviderPreferenceCommitPort,
+  ProviderPreferenceCommitPortState
+>();
+
+export function createProviderPreferenceCommitPort(
+  input: ProviderPreferenceCommitPortInput,
+): ProviderPreferenceCommitPort {
+  if (!input || typeof input.persist !== "function"
+    || typeof input.abortAndReconcile !== "function"
+    || typeof input.complete !== "function"
+    || typeof input.cleanup !== "function") {
+    throw new Error("Provider preference commit port is invalid.");
+  }
+  const port = Object.freeze({ version: 1 as const });
+  providerPreferenceCommitPorts.set(port, { input, used: false });
+  return port;
+}
+
+interface ProviderPreferenceCommitSession {
+  persist(
+    candidate: ProviderActivationConfigCandidate,
+  ): Promise<ProviderActivationConfigPersistResult>;
+  abortAndReconcile(reason: unknown): Promise<ProviderPreferenceReconcileResult>;
+  markProviderDurable(): void;
+  complete(candidate: ProviderActivationConfigCandidate): Promise<void>;
+  dispose(): void;
+}
+
+interface ProviderPreferenceCompletionAckState {
+  readonly authority: ProviderPreferenceMutationAuthority;
+  readonly completionKey: object;
+  consumed: boolean;
+}
+
+interface ProviderPreferenceCleanupAckState {
+  readonly authority: ProviderPreferenceCleanupAuthority;
+  readonly cleanupKey: object;
+  consumed: boolean;
+}
+
+interface ProviderPreferencePersistAckState {
+  readonly authority: ProviderPreferenceMutationAuthority;
+  readonly persistKey: object;
+  consumed: boolean;
+}
+
+const providerPreferenceCompletionAcks = new WeakMap<
+  ProviderPreferenceCompletionAck,
+  ProviderPreferenceCompletionAckState
+>();
+const providerPreferenceCleanupAcks = new WeakMap<
+  ProviderPreferenceCleanupAck,
+  ProviderPreferenceCleanupAckState
+>();
+const providerPreferencePersistAcks = new WeakMap<
+  ProviderActivationConfigPersistResult,
+  ProviderPreferencePersistAckState
+>();
+
+function openProviderPreferenceCommitSession(
+  port: ProviderPreferenceCommitPort,
+  signal: AbortSignal,
+  deadlineAt: number,
+  assertOwnershipHeld: () => void,
+  assertOwnershipHeldAsync: () => Promise<void>,
+): ProviderPreferenceCommitSession {
+  const state = providerPreferenceCommitPorts.get(port);
+  if (!state || state.used || port.version !== 1) {
+    throw new ProviderActivationError(
+      "provider-preference-port-invalid",
+      "Provider preference publication authority is invalid.",
+    );
+  }
+  state.used = true;
+  const controller = new AbortController();
+  let phase:
+    | "active"
+    | "persisting"
+    | "persisted"
+    | "revoked"
+    | "reconciling"
+    | "aborted"
+    | "provider-durable"
+    | "completing"
+    | "cleaning"
+    | "completion-failed"
+    | "completed" = "active";
+  let persistStarted = false;
+  let abortPromise: Promise<ProviderPreferenceReconcileResult> | null = null;
+  let completionAckIssued = false;
+  let cleanupAckIssued = false;
+  let persistAckIssued = false;
+  const persistKey = Object.freeze({});
+  const completionKey = Object.freeze({});
+  const cleanupKey = Object.freeze({});
+  const committedController = new AbortController();
+  const revoke = (reason: unknown) => {
+    if (phase !== "active" && phase !== "persisting" && phase !== "persisted") return;
+    phase = "revoked";
+    controller.abort(reason);
+  };
+  const relayAbort = () => revoke(signal.reason);
+  signal.addEventListener("abort", relayAbort, { once: true });
+  if (signal.aborted) relayAbort();
+  const authority = Object.freeze<ProviderPreferenceMutationAuthority>({
+    get signal() {
+      return phase === "provider-durable"
+        || phase === "completing"
+        || phase === "cleaning"
+        || phase === "completion-failed"
+        || phase === "completed"
+        ? committedController.signal
+        : controller.signal;
+    },
+    get deadlineAt() {
+      return phase === "provider-durable"
+        || phase === "completing"
+        || phase === "cleaning"
+        || phase === "completion-failed"
+        || phase === "completed"
+        ? Number.MAX_SAFE_INTEGER
+        : deadlineAt;
+    },
+    assertMutationAllowed() {
+      if (phase !== "persisting" || persistAckIssued || controller.signal.aborted) {
+        throw abortFrom(controller.signal);
+      }
+      assertOwnershipHeld();
+    },
+    async assertMutationAuthorityHeld() {
+      this.assertMutationAllowed();
+      await assertOwnershipHeldAsync();
+      this.assertMutationAllowed();
+    },
+    async acknowledgePersistence(configFence) {
+      this.assertMutationAllowed();
+      await this.assertMutationAuthorityHeld();
+      this.assertMutationAllowed();
+      if (persistAckIssued || !validProviderPreferenceConfigPersistResult({ configFence })) {
+        throw new ProviderPreferenceConfigFenceError();
+      }
+      persistAckIssued = true;
+      phase = "persisted";
+      const result = Object.freeze({ configFence });
+      providerPreferencePersistAcks.set(result, {
+        authority,
+        persistKey,
+        consumed: false,
+      });
+      return result;
+    },
+    assertReconcileAllowed() {
+      if (phase !== "reconciling") {
+        throw new ProviderActivationRecoveryRequiredError(
+          "provider-preference-reconcile-authority-lost",
+        );
+      }
+      assertOwnershipHeld();
+    },
+    async assertReconcileAuthorityHeld() {
+      this.assertReconcileAllowed();
+      await assertOwnershipHeldAsync();
+      this.assertReconcileAllowed();
+    },
+    assertCompletionAllowed() {
+      if (phase !== "completing"
+        || completionAckIssued
+        || committedController.signal.aborted) {
+        throw new ProviderActivationRecoveryRequiredError(
+          "provider-preference-completion-authority-lost",
+        );
+      }
+      assertOwnershipHeld();
+    },
+    async assertCompletionAuthorityHeld() {
+      this.assertCompletionAllowed();
+      await assertOwnershipHeldAsync();
+      this.assertCompletionAllowed();
+    },
+    async acknowledgeCompletion() {
+      this.assertCompletionAllowed();
+      await this.assertCompletionAuthorityHeld();
+      this.assertCompletionAllowed();
+      if (completionAckIssued) {
+        throw new ProviderActivationRecoveryRequiredError(
+          "provider-preference-completion-replayed",
+        );
+      }
+      completionAckIssued = true;
+      const acknowledgement = Object.freeze({ version: 1 as const });
+      providerPreferenceCompletionAcks.set(acknowledgement, {
+        authority,
+        completionKey,
+        consumed: false,
+      });
+      return acknowledgement;
+    },
+  });
+  const cleanupAuthority = Object.freeze<ProviderPreferenceCleanupAuthority>({
+    get signal() {
+      return committedController.signal;
+    },
+    assertCleanupAllowed() {
+      if (phase !== "cleaning"
+        || cleanupAckIssued
+        || committedController.signal.aborted) {
+        throw new ProviderActivationRecoveryRequiredError(
+          "provider-preference-cleanup-authority-lost",
+        );
+      }
+      assertOwnershipHeld();
+    },
+    async assertCleanupAuthorityHeld() {
+      this.assertCleanupAllowed();
+      await assertOwnershipHeldAsync();
+      this.assertCleanupAllowed();
+    },
+    async acknowledgeCleanup() {
+      this.assertCleanupAllowed();
+      await this.assertCleanupAuthorityHeld();
+      this.assertCleanupAllowed();
+      if (cleanupAckIssued) {
+        throw new ProviderActivationRecoveryRequiredError(
+          "provider-preference-cleanup-replayed",
+        );
+      }
+      cleanupAckIssued = true;
+      const acknowledgement = Object.freeze({ version: 1 as const });
+      providerPreferenceCleanupAcks.set(acknowledgement, {
+        authority: cleanupAuthority,
+        cleanupKey,
+        consumed: false,
+      });
+      return acknowledgement;
+    },
+  });
+  return {
+    async persist(candidate) {
+      if (persistStarted || phase !== "active") {
+        throw new ProviderActivationRecoveryRequiredError(
+          "provider-preference-port-replayed",
+        );
+      }
+      persistStarted = true;
+      phase = "persisting";
+      authority.assertMutationAllowed();
+      const result = await state.input.persist(Object.freeze({
+        route: structuredClone(candidate.route),
+        state: structuredClone(candidate.state),
+      }), authority);
+      const persistAck = providerPreferencePersistAcks.get(result);
+      if ((phase as string) !== "persisted"
+        || !persistAck
+        || persistAck.authority !== authority
+        || persistAck.persistKey !== persistKey
+        || persistAck.consumed) {
+        throw new ProviderPreferenceConfigFenceError();
+      }
+      persistAck.consumed = true;
+      return result;
+    },
+    abortAndReconcile(reason) {
+      if (abortPromise) return abortPromise;
+      if (phase === "completed") return Promise.resolve({ kind: "final" });
+      if (phase === "provider-durable"
+        || phase === "completing"
+        || phase === "completion-failed") {
+        return Promise.resolve({ kind: "recovery-required" });
+      }
+      if (!persistStarted) {
+        revoke(reason);
+        phase = "aborted";
+        return Promise.resolve({ kind: "old" });
+      }
+      revoke(reason);
+      phase = "reconciling";
+      abortPromise = Promise.resolve()
+        .then(() => state.input.abortAndReconcile(authority))
+        .then((result) => {
+          authority.assertReconcileAllowed();
+          phase = "aborted";
+          return validProviderPreferenceReconcileResult(result)
+            ? Object.freeze({ kind: result.kind })
+            : Object.freeze({ kind: "recovery-required" as const });
+        })
+        .catch(() => {
+          phase = "aborted";
+          return Object.freeze({ kind: "recovery-required" as const });
+        });
+      return abortPromise;
+    },
+    markProviderDurable() {
+      if (phase !== "persisted" && phase !== "revoked") {
+        throw new ProviderActivationRecoveryRequiredError(
+          "provider-preference-completion-ambiguous",
+        );
+      }
+      phase = "provider-durable";
+      signal.removeEventListener("abort", relayAbort);
+    },
+    async complete(candidate) {
+      if (phase !== "provider-durable") {
+        throw new ProviderActivationRecoveryRequiredError(
+          "provider-preference-completion-ambiguous",
+        );
+      }
+      phase = "completing";
+      try {
+        authority.assertCompletionAllowed();
+        const acknowledgement = await state.input.complete(Object.freeze({
+          route: structuredClone(candidate.route),
+          state: structuredClone(candidate.state),
+        }), authority);
+        const acknowledgementState = providerPreferenceCompletionAcks.get(
+          acknowledgement,
+        );
+        if (!acknowledgementState
+          || acknowledgement.version !== 1
+          || acknowledgementState.authority !== authority
+          || acknowledgementState.completionKey !== completionKey
+          || acknowledgementState.consumed) {
+          throw new ProviderActivationRecoveryRequiredError(
+            "provider-preference-completion-ack-invalid",
+          );
+        }
+        acknowledgementState.consumed = true;
+        phase = "cleaning";
+        const cleanupAcknowledgement = await state.input.cleanup(cleanupAuthority);
+        const cleanupAcknowledgementState = providerPreferenceCleanupAcks.get(
+          cleanupAcknowledgement,
+        );
+        if (!cleanupAcknowledgementState
+          || cleanupAcknowledgement.version !== 1
+          || cleanupAcknowledgementState.authority !== cleanupAuthority
+          || cleanupAcknowledgementState.cleanupKey !== cleanupKey
+          || cleanupAcknowledgementState.consumed) {
+          throw new ProviderActivationRecoveryRequiredError(
+            "provider-preference-cleanup-ack-invalid",
+          );
+        }
+        cleanupAcknowledgementState.consumed = true;
+        phase = "completed";
+      } catch {
+        phase = "completion-failed";
+        throw new ProviderActivationRecoveryRequiredError(
+          "provider-preference-completion-required",
+        );
+      }
+    },
+    dispose() {
+      signal.removeEventListener("abort", relayAbort);
+    },
+  };
+}
+
+function validProviderPreferenceReconcileResult(
+  value: unknown,
+): value is ProviderPreferenceReconcileResult {
+  return isRecord(value)
+    && exactKeys(value, ["kind"])
+    && (value.kind === "old"
+      || value.kind === "final"
+      || value.kind === "recovery-required");
+}
+
+function validProviderPreferenceConfigPersistResult(
+  value: unknown,
+): value is ProviderActivationConfigPersistResult & {
+  readonly configFence: ConfigFileSnapshot & { readonly kind: "file" };
+} {
+  if (!isRecord(value) || !exactKeys(value, ["configFence"])
+    || !isRecord(value.configFence)) return false;
+  const fence = value.configFence;
+  return Object.isFrozen(fence)
+    && exactKeys(fence, ["kind", "dev", "ino", "raw", "digest", "parent"])
+    && fence.kind === "file"
+    && typeof fence.dev === "bigint"
+    && fence.dev >= 0n
+    && typeof fence.ino === "bigint"
+    && fence.ino >= 0n
+    && typeof fence.raw === "string"
+    && typeof fence.digest === "string"
+    && /^[0-9a-f]{64}$/.test(fence.digest)
+    && isRecord(fence.parent)
+    && Object.isFrozen(fence.parent)
+    && exactKeys(fence.parent, ["kind", "dev", "ino"])
+    && fence.parent.kind === "directory"
+    && typeof fence.parent.dev === "bigint"
+    && fence.parent.dev >= 0n
+    && typeof fence.parent.ino === "bigint"
+    && fence.parent.ino >= 0n;
 }
 
 interface CandidateActivationAuthorityContext {
@@ -284,6 +769,26 @@ export class ProviderActivationBusyError extends ProviderActivationError {
   constructor() {
     super("provider-activation-busy", "Provider activation lease is busy.");
     this.name = "ProviderActivationBusyError";
+  }
+}
+
+class ProviderPreferenceConfigStaleError extends ProviderActivationError {
+  constructor() {
+    super(
+      "provider-preference-config-stale",
+      "Preference config changed before provider publication.",
+    );
+    this.name = "ProviderPreferenceConfigStaleError";
+  }
+}
+
+class ProviderPreferenceConfigFenceError extends ProviderActivationError {
+  constructor() {
+    super(
+      "provider-preference-config-fence-invalid",
+      "Provider preference publication did not return an exact config fence.",
+    );
+    this.name = "ProviderPreferenceConfigFenceError";
   }
 }
 
@@ -614,6 +1119,73 @@ export class ProviderActivationCoordinator {
       await this.#assertMutationAllowed(providerLease, runtimeLease, true, request.signal);
       await this.#writeJournal(transaction, manifest, providerLease);
       await this.#assertFence(providerLease);
+      let preferenceConfigFence: ConfigFileSnapshot | null = null;
+      let preferenceCommitSession: ProviderPreferenceCommitSession | null = null;
+      if (request.persistBeforeProviderConfigCommit) {
+        try {
+          preferenceCommitSession = openProviderPreferenceCommitSession(
+            request.persistBeforeProviderConfigCommit,
+            request.signal,
+            request.deadlineAt,
+            () => {
+              this.#assertSynchronousProviderFence(providerLease!);
+              assertRuntimeLeaseSynchronously(runtimeLease);
+            },
+            async () => {
+              await assertRuntimeLease(runtimeLease);
+              // The cross-process provider claim is the final awaited fence;
+              // only synchronous capability closure follows before mutation.
+              await this.#assertFence(providerLease!);
+            },
+          );
+          await this.#assertMutationAllowed(
+            providerLease,
+            runtimeLease,
+            true,
+            request.signal,
+          );
+          const persisted = await this.#awaitActivation(
+            request,
+            () => preferenceCommitSession!.persist(Object.freeze({
+              route: structuredClone(candidateRoute),
+              state: structuredClone(nextState),
+            })),
+          );
+          if (!validProviderPreferenceConfigPersistResult(persisted)) {
+            throw new ProviderPreferenceConfigFenceError();
+          }
+          preferenceConfigFence = persisted.configFence;
+          await this.#assertMutationAllowed(
+            providerLease,
+            runtimeLease,
+            true,
+            request.signal,
+          );
+        } catch (error) {
+          const settlement = preferenceCommitSession
+            ? await preferenceCommitSession.abortAndReconcile(error)
+            : { kind: "old" as const };
+          if (settlement.kind !== "old") {
+            throw new ProviderActivationRecoveryRequiredError(
+              "provider-preference-reconcile-required",
+            );
+          }
+          const cleaned = await this.#cleanupFailedCandidate(
+            candidateSlot,
+            normalized,
+            transaction,
+            providerLease,
+          );
+          transaction = cleaned ? null : transaction;
+          if (!cleaned) {
+            throw new ProviderActivationRecoveryRequiredError(
+              "provider-preference-hook-cleanup-ambiguous",
+            );
+          }
+          preferenceCommitSession?.dispose();
+          throw error;
+        }
+      }
       let publication: "candidate" | "old" | "ambiguous";
       const configCommit = this.#configCommitSignal(request.signal);
       try {
@@ -633,6 +1205,10 @@ export class ProviderActivationCoordinator {
               throw new ProviderActivationRecoveryRequiredError(
                 "provider-config-cas-mismatch",
               );
+            }
+            if (preferenceConfigFence
+              && !sameConfigFileSnapshot(beforeSave.target, preferenceConfigFence)) {
+              throw new ProviderPreferenceConfigStaleError();
             }
             const nextRaw = `${beforeSave.prefix}${JSON.stringify(nextState)}${beforeSave.suffix}`;
             await assertRuntimeLease(runtimeLease);
@@ -669,11 +1245,26 @@ export class ProviderActivationCoordinator {
                     runtimeLease,
                     authorityContext,
                   );
-                  await assertConfigFileSnapshot(
-                    ownership.canonicalPath,
-                    beforeSave.target,
-                  );
                   await ownership.assertHeld();
+                  if (preferenceConfigFence) {
+                    // This exact byte snapshot is the last awaited boundary in
+                    // the callback. All authority checks stay before it so a
+                    // same-inode edit cannot hide inside a later awaited check.
+                    const publicationFence = await readConfigFileSnapshot(
+                      ownership.canonicalPath,
+                    );
+                    if (!sameConfigFileSnapshot(
+                      publicationFence,
+                      preferenceConfigFence,
+                    )) {
+                      throw new ProviderPreferenceConfigStaleError();
+                    }
+                  } else {
+                    await assertConfigFileSnapshot(
+                      ownership.canonicalPath,
+                      beforeSave.target,
+                    );
+                  }
                   throwIfAborted(request.signal);
                 },
                 () => {
@@ -686,6 +1277,7 @@ export class ProviderActivationCoordinator {
               await this.#observeCriticalConfigWritten(request.signal);
             } catch (error) {
               if (isBoundaryFault(error)) throw error;
+              if (error instanceof ProviderPreferenceConfigStaleError) throw error;
               writeDisposition = isAtomicFilePostPublicationError(error)
                 ? "post-publication-failed"
                 : "pre-publication-failed";
@@ -721,6 +1313,35 @@ export class ProviderActivationCoordinator {
           { signal: configCommit.signal },
         );
       } catch (error) {
+        if (!isBoundaryFault(error) && preferenceCommitSession) {
+          const settlement = await preferenceCommitSession.abortAndReconcile(error);
+          if (settlement.kind !== "old") {
+            throw new ProviderActivationRecoveryRequiredError(
+              "provider-preference-reconcile-required",
+            );
+          }
+          const cleaned = await this.#cleanupFailedCandidate(
+            candidateSlot,
+            normalized,
+            transaction,
+            providerLease,
+          );
+          transaction = cleaned ? null : transaction;
+          if (!cleaned) {
+            throw new ProviderActivationRecoveryRequiredError(
+              "provider-preference-hook-cleanup-ambiguous",
+            );
+          }
+          preferenceCommitSession.dispose();
+          if (error instanceof ProviderPreferenceConfigStaleError
+            || isAbort(error, request.signal)
+            || error instanceof ProviderActivationError) {
+            throw error;
+          }
+          throw new ProviderActivationRecoveryRequiredError(
+            "provider-config-writer-ownership-failed",
+          );
+        }
         if (isBoundaryFault(error)
           || isAbort(error, request.signal)
           || error instanceof ProviderActivationError) {
@@ -733,6 +1354,19 @@ export class ProviderActivationCoordinator {
         configCommit.dispose();
       }
       if (publication === "old") {
+        if (preferenceCommitSession) {
+          const settlement = await preferenceCommitSession.abortAndReconcile(
+            new ProviderActivationError(
+              "provider-config-persistence-failed",
+              "Provider config persistence failed without changing the active route.",
+            ),
+          );
+          if (settlement.kind !== "old") {
+            throw new ProviderActivationRecoveryRequiredError(
+              "provider-preference-reconcile-required",
+            );
+          }
+        }
         const cleaned = await this.#cleanupFailedCandidate(
           candidateSlot,
           normalized,
@@ -745,14 +1379,38 @@ export class ProviderActivationCoordinator {
             "provider-candidate-cleanup-ambiguous",
           );
         }
+        preferenceCommitSession?.dispose();
         throw new ProviderActivationError(
           "provider-config-persistence-failed",
           "Provider config persistence failed without changing the active route.",
         );
       }
       if (publication === "ambiguous") {
+        if (preferenceCommitSession) {
+          const settlement = await preferenceCommitSession.abortAndReconcile(
+            new ProviderActivationRecoveryRequiredError(
+              "provider-config-commit-ambiguous",
+            ),
+          );
+          if (settlement.kind === "old") {
+            const cleaned = await this.#cleanupFailedCandidate(
+              candidateSlot,
+              normalized,
+              transaction,
+              providerLease,
+            );
+            transaction = cleaned ? null : transaction;
+            if (!cleaned) {
+              throw new ProviderActivationRecoveryRequiredError(
+                "provider-preference-hook-cleanup-ambiguous",
+              );
+            }
+            preferenceCommitSession.dispose();
+          }
+        }
         throw new ProviderActivationRecoveryRequiredError("provider-config-commit-ambiguous");
       }
+      preferenceCommitSession?.markProviderDurable();
       // The exact candidate config is now durable. Caller cancellation is too
       // late to roll it back, so retain Runtime -> Provider ownership and
       // finish adopting that exact tuple instead of exposing a detached half
@@ -794,6 +1452,12 @@ export class ProviderActivationCoordinator {
         throw new ProviderActivationRecoveryRequiredError("provider-runtime-bind-ambiguous");
       }
       await this.#awaitActivation(committedRequest, () => this.#boundary("runtime-activated"));
+      if (preferenceCommitSession) {
+        await preferenceCommitSession.complete(Object.freeze({
+          route: structuredClone(candidateRoute),
+          state: structuredClone(nextState),
+        }));
+      }
       const warnings: string[] = [];
       const oldCleaned = await this.#cleanupPreviousSlot(
         previousSlot,

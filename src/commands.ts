@@ -45,6 +45,7 @@ import {
 } from "./config.js";
 import { approvalDescription, ApprovalManager } from "./approval.js";
 import { RuleStore } from "./rules.js";
+import type { ProviderPreferenceCommitPort } from "./provider-activation.js";
 import { loadSshHosts } from "./ssh-config.js";
 import { checkHost, closeSshControl, createSshSession, type RunSsh, type SshSession } from "./ssh.js";
 import {
@@ -181,6 +182,15 @@ export interface ProviderRouteIntentPort {
   ): Promise<RouteIdentityV1>;
   /** Commits the staged route together with current-session ownership. */
   adoptSession?(session: SessionStore): void;
+  /** Internal owner-only transaction seam; callers cannot forge its opaque port. */
+  transitionSessionModel?(
+    candidate: {
+      readonly requestedModelId: string;
+      readonly canonicalModelId: string;
+    },
+    publication: ProviderPreferenceCommitPort,
+    surface?: SetupSurface | "plain" | "fullscreen",
+  ): Promise<RouteIdentityV1>;
   transitionModel(
     modelId: string,
     canonicalModelId?: string,
@@ -2727,24 +2737,52 @@ const PROVIDER_ACCOUNT_ACTIONS = [
 
 type ProviderAccountAction = (typeof PROVIDER_ACCOUNT_ACTIONS)[number];
 
-type ProviderBackendAction = Exclude<ProviderAccountAction, "setup" | "status">;
+export type ProviderBackendAction = Exclude<ProviderAccountAction, "setup" | "status">;
+
+const PROVIDER_BACKEND_ACTION_ORDER = [
+  "connect", "enable", "disable", "disconnect", "reconnect", "models", "logout",
+] as const satisfies readonly ProviderBackendAction[];
 
 /**
  * Action-specific backend gate. Kimi Code is approved for connect, enable,
  * disable, reconnect, models, and logout only; disconnect stays unapproved
  * and must fail at the parser with the exact usage and zero port calls.
  */
-const PROVIDER_BACKEND_ACTIONS: Record<ProviderCommandBackendId, ReadonlySet<ProviderBackendAction>> = {
-  openrouter: new Set<ProviderBackendAction>([
+export const PROVIDER_BACKEND_ACTIONS: Readonly<Record<ProviderCommandBackendId, ReadonlySet<ProviderBackendAction>>> = Object.freeze({
+  openrouter: immutableReadonlySet<ProviderBackendAction>([
     "connect", "enable", "disable", "disconnect", "reconnect", "models", "logout",
   ]),
-  "kimi-code": new Set<ProviderBackendAction>([
+  "kimi-code": immutableReadonlySet<ProviderBackendAction>([
     "connect", "enable", "disable", "reconnect", "models", "logout",
   ]),
-  anthropic: new Set<ProviderBackendAction>([
+  anthropic: immutableReadonlySet<ProviderBackendAction>([
     "connect", "enable", "disable", "disconnect", "reconnect", "models", "logout",
   ]),
-};
+});
+
+export function providerBackendActions(backendId: ProviderCommandBackendId): readonly ProviderBackendAction[] {
+  return Object.freeze(
+    PROVIDER_BACKEND_ACTION_ORDER.filter((action) => PROVIDER_BACKEND_ACTIONS[backendId].has(action)),
+  );
+}
+
+function immutableReadonlySet<T>(values: readonly T[]): ReadonlySet<T> {
+  const source = new Set(values);
+  let view!: ReadonlySet<T>;
+  view = Object.freeze({
+    get size() { return source.size; },
+    has(value: T) { return source.has(value); },
+    entries() { return source.entries(); },
+    keys() { return source.keys(); },
+    values() { return source.values(); },
+    forEach(callback: (value: T, value2: T, set: ReadonlySet<T>) => void, thisArg?: unknown) {
+      source.forEach((value) => callback.call(thisArg, value, value, view));
+    },
+    [Symbol.iterator]() { return source[Symbol.iterator](); },
+    [Symbol.toStringTag]: "Set",
+  });
+  return view;
+}
 
 function isProviderAccountAction(value: string): value is ProviderAccountAction {
   return includesValue(PROVIDER_ACCOUNT_ACTIONS, value);
@@ -3194,6 +3232,24 @@ export function compressorModelCandidates(
   models: readonly ModelInfo[],
 ): ModelInfo[] {
   return models.filter(isCompressorModelCandidate);
+}
+
+export function isPanelModelCandidate(model: ModelInfo): boolean {
+  return model.inputModalities.includes("text")
+    && model.outputModalities.includes("text");
+}
+
+export function panelModelCandidates(models: readonly ModelInfo[]): ModelInfo[] {
+  return models.filter(isPanelModelCandidate);
+}
+
+export function isAudioInputModelCandidate(model: ModelInfo): boolean {
+  return model.inputModalities.includes("audio")
+    && model.outputModalities.includes("text");
+}
+
+export function audioInputModelCandidates(models: readonly ModelInfo[]): ModelInfo[] {
+  return models.filter(isAudioInputModelCandidate);
 }
 
 export async function resolveMainModelCandidate(

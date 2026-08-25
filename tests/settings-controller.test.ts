@@ -16,6 +16,7 @@ import {
 } from "../src/config.js";
 import {
   SettingsController,
+  SettingsRunActiveError,
   applyConfigAction,
   type SettingsConfigAction,
   type SettingsControllerDependencies,
@@ -45,6 +46,15 @@ function runtimeSnapshot(
     },
     cachedModels: [],
   };
+}
+
+function fullConfigFromProjection(
+  config: SettingsControllerSnapshot["config"],
+): OrcodeConfigWithBudget {
+  return validateConfig({
+    ...structuredClone(config),
+    providerSetup: structuredClone(DEFAULT_CONFIG.providerSetup),
+  });
 }
 
 const RULE_ID = "11111111-1111-4111-8111-111111111111";
@@ -163,6 +173,7 @@ interface HarnessOptions {
   readonly saveConfig?: SettingsControllerDependencies["saveConfig"];
   readonly executeExternal?: (action: SettingsExternalAction) => Promise<void>;
   readonly prepareLive?: SettingsControllerDependencies["liveConfig"]["prepare"];
+  readonly runConfigMutation?: SettingsControllerDependencies["runConfigMutation"];
 }
 
 function harness(
@@ -248,9 +259,74 @@ function harness(
         }
         return saved;
       },
+      ...(options.runConfigMutation
+        ? { runConfigMutation: options.runConfigMutation }
+        : {}),
     },
   };
 }
+
+test("Config-Persistenz und Live-Publikation bleiben innerhalb eines atomaren Aktivitäts-Fence", async () => {
+  await withTempConfig(async (path) => {
+    const events: string[] = [];
+    let insideFence = false;
+    const setup = harness(path, {
+      runConfigMutation: async (task) => {
+        events.push("fence-enter");
+        insideFence = true;
+        try { return await task(); } finally {
+          insideFence = false;
+          events.push("fence-exit");
+        }
+      },
+      saveConfig: async (_expected, candidate) => {
+        assert.equal(insideFence, true);
+        events.push("persist");
+        return validateConfig(candidate);
+      },
+      prepareLive: (candidate) => ({
+        publish() {
+          assert.equal(insideFence, true);
+          events.push("publish");
+          void candidate;
+        },
+      }),
+    });
+    const controller = await SettingsController.open(setup.dependencies);
+    await controller.dispatch({ kind: "select-item", itemId: "appearance-large-logo" });
+    const opened = await controller.dispatch({ kind: "activate" });
+    assert.equal(opened.kind, "edit");
+    if (opened.kind !== "edit") return;
+    await controller.completeEditor(opened.request, { kind: "value", value: "off" });
+    assert.deepEqual(events, ["fence-enter", "persist", "publish", "fence-exit"]);
+  });
+});
+
+test("Idle-zu-Busy am Mutations-Fence schreibt und publiziert nichts und aktualisiert Lauf aktiv", async () => {
+  await withTempConfig(async (path) => {
+    let tasks = 0;
+    const setup = harness(path, {
+      runConfigMutation: async () => {
+        setup.setRunActive(true);
+        throw new SettingsRunActiveError();
+      },
+      saveConfig: async () => {
+        tasks += 1;
+        throw new Error("unreachable");
+      },
+    });
+    const controller = await SettingsController.open(setup.dependencies);
+    await controller.dispatch({ kind: "select-item", itemId: "appearance-large-logo" });
+    const opened = await controller.dispatch({ kind: "activate" });
+    assert.equal(opened.kind, "edit");
+    if (opened.kind !== "edit") return;
+    await controller.completeEditor(opened.request, { kind: "value", value: "off" });
+    assert.equal(tasks, 0);
+    assert.equal(setup.published.length, 0);
+    assert.equal(controller.view.runActive, true);
+    assert.equal(controller.view.notice?.message, "Lauf aktiv");
+  });
+});
 
 test("open wählt Kategorie eins und behält stabile Zeilen beim Navigieren, Suchen und Zurückgehen", async () => {
   await withTempConfig(async (path) => {
@@ -1120,7 +1196,7 @@ test("jede konkrete Registry-Zeile erreicht exakt eine Config- oder ExternalActi
     const exactFile = await readConfigEditSnapshot(path);
     const editable: ConfigEditSnapshot = {
       file: exactFile.file,
-      config: projected.config,
+      config: fullConfigFromProjection(projected.config),
     };
     const registryController = await SettingsController.open(harness(path, {
       initialSnapshot: projected,
@@ -1223,7 +1299,10 @@ test("unbekannte und gefälschte dynamische IDs bleiben ohne jede Action", async
     const exact = await readConfigEditSnapshot(path);
     const setup = harness(path, {
       initialSnapshot: projected,
-      readConfig: async () => ({ file: exact.file, config: projected.config }),
+      readConfig: async () => ({
+        file: exact.file,
+        config: fullConfigFromProjection(projected.config),
+      }),
     });
     const controller = await SettingsController.open(setup.dependencies);
     const original = controller.view.selectedItemId;
@@ -1268,7 +1347,10 @@ test("überlange oder kontrollierte Modellwerte und Panel-Arrays über fünf lö
     ): Promise<void> => {
       const setup = harness(path, {
         initialSnapshot: projected,
-        readConfig: async () => ({ file: exact.file, config: projected.config }),
+        readConfig: async () => ({
+          file: exact.file,
+          config: fullConfigFromProjection(projected.config),
+        }),
       });
       const controller = await SettingsController.open(setup.dependencies);
       await controller.dispatch({ kind: "select-item", itemId });
