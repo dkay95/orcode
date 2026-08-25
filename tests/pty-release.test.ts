@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { join } from "node:path";
 import test from "node:test";
 
-const EXPECTED_INPUT = "Erste Zeile\nZweite Zeile";
+const EXPECTED_DRAFT_LINES = ["Erste Zeile", "Zweite Zeile"] as const;
 
 interface PtyControllerRequest {
   columns: number;
@@ -21,11 +21,9 @@ interface PtyControllerResult {
   aliveBeforeEnter: boolean;
   exitCode: number;
   outputBase64: string;
-  pasteReadySeen: boolean;
   resultBeforeEnter: boolean;
   timedOut: boolean;
   resumedSeen: boolean;
-  settingsSeen: boolean;
   providerCalls: number;
   configMode: number;
   configRaw: string;
@@ -41,7 +39,7 @@ interface PtyCheckModule {
     runController?(request: PtyControllerRequest): Promise<PtyControllerResult>;
   }): Promise<{
     columns: number;
-    input: string;
+    draftRestored: boolean;
     rows: number;
     stdinTTY: boolean;
     stdoutTTY: boolean;
@@ -74,6 +72,7 @@ function successfulControllerResult(overrides: Partial<PtyControllerResult> = {}
     "\u001b[?2004l\u001b[?25h\u001b[?1049l",
     "\u001b[?1049h\u001b[?2004h",
     "ORCODE · Einstellungen\r\n",
+    `${EXPECTED_DRAFT_LINES.join("\r\n")}\r\nfixture.png\r\n`,
     "Enter sendet alles gemeinsam",
     "\u001b[?2004l\u001b[?25h\u001b[?1049l",
     `\r\nORCODE_PTY_RESULT:${result}\r\n`,
@@ -82,11 +81,9 @@ function successfulControllerResult(overrides: Partial<PtyControllerResult> = {}
     aliveBeforeEnter: true,
     exitCode: 0,
     outputBase64: Buffer.from(output, "utf8").toString("base64"),
-    pasteReadySeen: true,
     resultBeforeEnter: false,
     timedOut: false,
     resumedSeen: true,
-    settingsSeen: true,
     providerCalls: 0,
     configMode: 0o600,
     configRaw: '{"appearance":{"showHeaderMark":false}}',
@@ -130,7 +127,7 @@ test("the POSIX PTY smoke uses deterministic geometry and validates a later Ente
   assert.ok((request?.timeoutMs ?? 0) > 0);
   assert.deepEqual(result, {
     columns: 100,
-    input: EXPECTED_INPUT,
+    draftRestored: true,
     rows: 28,
     stdinTTY: true,
     stdoutTTY: true,
@@ -202,6 +199,50 @@ test("the PTY contract rejects mouse reporting and requires a suspend-resume che
       log: () => {},
     }),
     /mouse reporting/i,
+  );
+});
+
+test("the PTY contract requires both restored draft lines after Settings closes", async () => {
+  const { runPtySmoke } = await loadPtyCheck();
+  const controller = successfulControllerResult();
+  const output = Buffer.from(controller.outputBase64, "base64")
+    .toString("utf8")
+    .replace("Zweite Zeile\r\n", "");
+
+  await assert.rejects(
+    runPtySmoke({
+      platform: "darwin",
+      projectRoot: "/virtual/orcode",
+      accessFile: async () => {},
+      runController: async () => ({ ...controller, outputBase64: Buffer.from(output).toString("base64") }),
+      log: () => {},
+    }),
+    /wiederhergestellte Draft.*Zeile/i,
+  );
+});
+
+test("the PTY contract requires the restored attachment and ignores asserted restoration booleans", async () => {
+  const { runPtySmoke } = await loadPtyCheck();
+  const controller = successfulControllerResult();
+  const output = Buffer.from(controller.outputBase64, "base64")
+    .toString("utf8")
+    .replace("fixture.png\r\n", "");
+
+  await assert.rejects(
+    runPtySmoke({
+      platform: "darwin",
+      projectRoot: "/virtual/orcode",
+      accessFile: async () => {},
+      runController: async () => ({
+        ...controller,
+        draftRestored: true,
+        pasteReadySeen: true,
+        settingsSeen: true,
+        outputBase64: Buffer.from(output).toString("base64"),
+      }),
+      log: () => {},
+    }),
+    /wiederhergestellte.*Attachment/i,
   );
 });
 

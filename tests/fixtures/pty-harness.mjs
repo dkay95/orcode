@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-import { mkdtemp, mkdir, readFile, stat, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -135,11 +135,11 @@ try {
     stderr: process.stderr,
     environment: { ...process.env, ORCODE_ASCII: "1" },
   });
+  const configRaw = await readFile(configPath, "utf8");
+  const configMode = (await stat(configPath)).mode & 0o777;
+  process.stdout.write(`\nORCODE_PTY_RESULT:${JSON.stringify({ agentCalls, sessionTurns: session.data.turns.length, configRaw, configMode, exitCode, providerCalls })}\n`);
 } finally {
   clearInterval(suspendPoll);
+  await rm(root, { recursive: true, force: true });
 }
-
-const configRaw = await readFile(configPath, "utf8");
-const configMode = (await stat(configPath)).mode & 0o777;
-process.stdout.write(`\nORCODE_PTY_RESULT:${JSON.stringify({ agentCalls, sessionTurns: session.data.turns.length, configRaw, configMode, exitCode, providerCalls })}\n`);
 process.exitCode = exitCode;

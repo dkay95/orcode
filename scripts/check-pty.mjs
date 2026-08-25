@@ -10,7 +10,7 @@ const DEFAULT_COLUMNS = 100;
 const DEFAULT_ROWS = 28;
 const DEFAULT_TIMEOUT_MS = 6_000;
 const DEFAULT_MAX_OUTPUT_BYTES = 256 * 1024;
-const EXPECTED_INPUT = "Erste Zeile\nZweite Zeile";
+const EXPECTED_DRAFT_LINES = ["Erste Zeile", "Zweite Zeile"];
 const ENABLE_BRACKETED_PASTE = "\u001b[?2004h";
 const DISABLE_BRACKETED_PASTE = "\u001b[?2004l";
 const ENTER_ALTERNATE_SCREEN = "\u001b[?1049h";
@@ -43,7 +43,6 @@ control_path = None
 control_created = False
 deadline = time.monotonic() + (config["timeoutMs"] / 1000.0)
 resumed_seen = False
-settings_seen = False
 
 def stop_on_signal(number, _frame):
     raise RuntimeError("PTY-Controller wurde durch Signal " + str(number) + " beendet")
@@ -205,9 +204,14 @@ try:
     dashboard_return_start = len(captured)
     write_all(b"\x1b")
     wait_for_after(b"Erste Zeile", dashboard_return_start)
+    wait_for_after(b"Zweite Zeile", dashboard_return_start)
     wait_for_after(b"fixture.png", dashboard_return_start)
-    settings_seen = True
-    paste_ready_seen = True
+    restored = bytes(captured[dashboard_return_start:])
+    first_draft = restored.find(b"Erste Zeile")
+    second_draft = restored.find(b"Zweite Zeile", first_draft + len(b"Erste Zeile"))
+    attachment = restored.find(b"fixture.png")
+    if first_draft < 0 or second_draft <= first_draft or attachment < 0:
+        raise RuntimeError("PTY-Draft und Attachment wurden nach Settings-Close nicht exakt wiederhergestellt")
 
     quiet_deadline = min(deadline, time.monotonic() + 0.2)
     while time.monotonic() < quiet_deadline:
@@ -227,10 +231,8 @@ try:
         "aliveBeforeEnter": alive_before_enter,
         "exitCode": process.returncode,
         "outputBase64": base64.b64encode(bytes(captured)).decode("ascii"),
-        "pasteReadySeen": paste_ready_seen,
         "resultBeforeEnter": result_before_enter,
         "resumedSeen": resumed_seen,
-        "settingsSeen": settings_seen,
         "timedOut": False,
     }
     sys.stdout.write(json.dumps(result, separators=(",", ":")))
@@ -340,14 +342,8 @@ export function validateControllerResult(controller, request) {
   if (controller.timedOut === true) {
     throw new Error("Der PTY-Smoke überschritt sein festes Zeitlimit.");
   }
-  if (controller.pasteReadySeen !== true) {
-    throw new Error("Der PTY-Smoke sah keinen abgeschlossenen mehrzeiligen Paste-Zustand.");
-  }
   if (controller.resumedSeen !== true) {
     throw new Error("Der PTY-Smoke erreichte keinen suspend-resume Checkpoint.");
-  }
-  if (controller.settingsSeen !== true) {
-    throw new Error("Der PTY-Smoke erreichte keinen keyboard-only Settings Checkpoint.");
   }
   if (controller.resultBeforeEnter === true) {
     throw new Error("Die Eingabe wurde vor dem separaten Enter abgeschickt.");
@@ -407,6 +403,10 @@ export function validateControllerResult(controller, request) {
   const suspendLeaveAt = output.indexOf(LEAVE_ALTERNATE_SCREEN, suspendDisableAt + DISABLE_BRACKETED_PASTE.length);
   const resumeEnterAt = output.indexOf(ENTER_ALTERNATE_SCREEN, suspendLeaveAt + LEAVE_ALTERNATE_SCREEN.length);
   const resumeEnableAt = output.indexOf(ENABLE_BRACKETED_PASTE, resumeEnterAt + ENTER_ALTERNATE_SCREEN.length);
+  const settingsFrameAt = output.indexOf("ORCODE · Einstellungen", resumeEnableAt + ENABLE_BRACKETED_PASTE.length);
+  const firstDraftAt = output.indexOf(EXPECTED_DRAFT_LINES[0], settingsFrameAt + "ORCODE · Einstellungen".length);
+  const secondDraftAt = output.indexOf(EXPECTED_DRAFT_LINES[1], firstDraftAt + EXPECTED_DRAFT_LINES[0].length);
+  const attachmentAt = output.indexOf("fixture.png", settingsFrameAt + "ORCODE · Einstellungen".length);
   const finalDisableAt = output.lastIndexOf(DISABLE_BRACKETED_PASTE);
   const finalLeaveAt = output.lastIndexOf(LEAVE_ALTERNATE_SCREEN);
   const resultAt = output.lastIndexOf("ORCODE_PTY_RESULT:");
@@ -417,6 +417,7 @@ export function validateControllerResult(controller, request) {
     suspendLeaveAt <= suspendDisableAt ||
     resumeEnterAt <= suspendLeaveAt ||
     resumeEnableAt <= resumeEnterAt ||
+    settingsFrameAt <= resumeEnableAt ||
     finalDisableAt <= resumeEnableAt ||
     finalLeaveAt <= finalDisableAt ||
     resultAt <= finalLeaveAt
@@ -425,10 +426,16 @@ export function validateControllerResult(controller, request) {
       "Suspend-resume Terminal-Cycle unvollständig: Bracketed Paste und Alternate Screen müssen geordnet verlassen und erneut betreten werden.",
     );
   }
+  if (firstDraftAt <= settingsFrameAt || secondDraftAt <= firstDraftAt) {
+    throw new Error("Die wiederhergestellte Draft-Zeile fehlt nach dem Settings-Close.");
+  }
+  if (attachmentAt <= settingsFrameAt || resultAt <= attachmentAt) {
+    throw new Error("Das wiederhergestellte Attachment fehlt nach dem Settings-Close.");
+  }
 
   return {
     columns: ready.columns,
-    input: EXPECTED_INPUT,
+    draftRestored: true,
     rows: ready.rows,
     stdinTTY: ready.stdinTTY,
     stdoutTTY: ready.stdoutTTY,
