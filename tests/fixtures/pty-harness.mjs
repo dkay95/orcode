@@ -57,6 +57,7 @@ try {
   ui.start();
   await ui.suspend(async () => {});
   process.stdout.write("ORCODE_PTY_RESUMED\n");
+  ui.addMessage("system", "synthetic provider state");
   ui.begin(settingsView);
   process.stdout.write("ORCODE_PTY_SETTINGS_READY\n");
   await ui.nextIntent(settingsView);

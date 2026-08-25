@@ -15,6 +15,8 @@ const ENABLE_BRACKETED_PASTE = "\u001b[?2004h";
 const DISABLE_BRACKETED_PASTE = "\u001b[?2004l";
 const LEAVE_ALTERNATE_SCREEN = "\u001b[?1049l";
 const ENABLE_SGR_MOUSE = "\u001b[?1000h";
+const ASCII_ROUTE_CORE_START = "/--------\\";
+const ASCII_ROUTE_CORE_COMPACT = "<>-+*o";
 
 const PYTHON_CONTROLLER = String.raw`
 import base64
@@ -258,6 +260,9 @@ export function validateControllerResult(controller, request) {
     throw new Error("Die PTY-Roh-Ausgabe ist leer oder überschreitet das feste Ausgabelimit.");
   }
   const output = bytes.toString("utf8");
+  if (!output.includes(ASCII_ROUTE_CORE_START) || !output.includes(ASCII_ROUTE_CORE_COMPACT)) {
+    throw new Error("Der PTY-Smoke sah nicht beide kanonischen Route-Core-Marken.");
+  }
   if (output.includes(ENABLE_SGR_MOUSE)) {
     throw new Error("Settings-PTY darf kein SGR mouse reporting aktivieren.");
   }

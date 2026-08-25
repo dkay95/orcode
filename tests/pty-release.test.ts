@@ -60,6 +60,7 @@ function successfulControllerResult(overrides: Partial<PtyControllerResult> = {}
   const output = [
     `ORCODE_PTY_READY:${ready}\r\n`,
     "\u001b[?1049h\u001b[?2004h",
+    "    /--------\\         *\r\n<>-+*o",
     "ORCODE_PTY_RESUMED\r\n",
     "ORCODE_PTY_SETTINGS_READY\r\nORCODE_PTY_SETTINGS_CATEGORY\r\nORCODE_PTY_SETTINGS_RESTORED\r\n",
     "Enter sendet alles gemeinsam",
