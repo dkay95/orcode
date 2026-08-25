@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -15,6 +15,7 @@ import {
 import { DEFAULT_CONFIG, saveConfig } from "../src/config.js";
 import {
   createSettingsCommandPort,
+  createSettingsSession,
   runPlainLoop,
   runSettingsProviderAction,
   runSettingsVerifySuggestion,
@@ -23,7 +24,7 @@ import {
 import * as cliModule from "../src/cli.js";
 import { SessionProviderRuntimeGuard } from "../src/cli.js";
 import { OpenRouterService } from "../src/openrouter.js";
-import { RuleStore } from "../src/rules.js";
+import { RuleStore, shellApprovalSubject } from "../src/rules.js";
 import { SessionStore } from "../src/session.js";
 import type { ProviderExecutionMode } from "../src/setup.js";
 import { describeOpenRouterFailure, formatFailure } from "../src/openrouter.js";
@@ -449,6 +450,158 @@ test("Dashboard /settings dispatch keeps the active TerminalUi owner and restore
       terminal.stop();
     }
     assert.equal(stdin.isRaw, false);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("production Settings session adapter dispatches every enabled external family through the controller", async () => {
+  const root = await mkdtemp(join(tmpdir(), "orcode-settings-production-adapter-"));
+  try {
+    const workspace = join(root, "workspace");
+    const appHome = join(root, ".orcode");
+    const configPath = join(appHome, "config.json");
+    await mkdir(workspace, { recursive: true });
+    await writeFile(join(workspace, "package.json"), JSON.stringify({ scripts: {
+      check: "tsc --noEmit", test: "node --test", build: "tsc",
+    } }), "utf8");
+    const route: RouteIdentityV1 = {
+      version: 1, backendId: "openrouter", accountFingerprint: "acct_production_adapter",
+      billingRealm: "openrouter-payg", requestedModelId: "vendor/main",
+      canonicalModelId: "vendor/main", resolutionState: "resolved",
+    };
+    const config = structuredClone(DEFAULT_CONFIG);
+    config.mainModel = route.requestedModelId;
+    await saveConfig(config, configPath);
+    const session = SessionStore.create(workspace, appHome, "production adapter");
+    session.setPreferences(config.mainModel, { mode: "auto" }, route);
+    await session.save();
+    const rules = await RuleStore.load(appHome);
+    const remembered = await Promise.all(["one", "two"].map((command) => rules.remember({
+      workspace, tool: "shell", decision: "allow",
+      subject: shellApprovalSubject({ platform: "darwin", executable: "/bin/echo", mode: [], cwd: ".", command }),
+    })));
+    const models = [
+      { id: "vendor/main", name: "Main", description: "main", contextLength: 128_000, promptPrice: 0, completionPrice: 0, supportedParameters: ["tools", "reasoning"], inputModalities: ["text"], outputModalities: ["text"] },
+      { id: "vendor/compressor", name: "Compressor", description: "compress", contextLength: 128_000, promptPrice: 0, completionPrice: 0, supportedParameters: [], inputModalities: ["text"], outputModalities: ["text"] },
+      { id: "vendor/panel", name: "Panel", description: "panel", contextLength: 128_000, promptPrice: 0, completionPrice: 0, supportedParameters: ["tools"], inputModalities: ["text"], outputModalities: ["text"] },
+      { id: "vendor/audio", name: "Audio", description: "audio", contextLength: 128_000, promptPrice: 0, completionPrice: 0, supportedParameters: [], inputModalities: ["text", "audio"], outputModalities: ["text"] },
+    ];
+    const providerIntents: string[] = [];
+    let mainAuthorityCalls = 0;
+    const intents: Array<{ kind: "select-item"; itemId: string } | { kind: "activate" } | { kind: "back" }> = [];
+    const activate = (itemId: string) => intents.push({ kind: "select-item", itemId }, { kind: "activate" });
+    activate("provider-action:openrouter:connect");
+    activate("main-model"); // cancellation must preserve the real transaction boundary.
+    activate("compressor-model");
+    activate(`approval-forget:${remembered[0]!.id}`);
+    activate("approval-forget-all");
+    activate("verify-suggest");
+    activate("panel-models");
+    activate("transcription-model");
+    intents.push({ kind: "back" });
+    const livePublishes: string[] = [];
+    const surface = {
+      begin() {},
+      async nextIntent() {
+        const next = intents.shift();
+        if (!next) throw new Error("script exhausted");
+        return next;
+      },
+      async edit(request: { itemId: string }) {
+        if (request.itemId === "main-model") return { kind: "cancel" as const };
+        if (request.itemId === "compressor-model") return { kind: "value" as const, value: "vendor/compressor" };
+        if (request.itemId === "panel-models") return { kind: "value" as const, value: ["vendor/main", "vendor/panel"] };
+        if (request.itemId === "transcription-model") return { kind: "value" as const, value: "vendor/audio" };
+        return { kind: "value" as const, value: true };
+      },
+      end() {},
+      applyAppearance() { livePublishes.push("live"); },
+      async confirmAction() { return { accepted: true }; },
+      async pickChoice() { return null; }, async readSecret() { return null; }, async pickModel() { return null; },
+      addMessage() {}, showSettingsNotice() {}, restoreSettings() {},
+    } as unknown as TerminalUi;
+    const context = {
+      executionMode: "local-interactive-owner", workspace, configPath, config, session, ruleStore: rules,
+      openRouter: new OpenRouterService(undefined),
+      providerCommands: { async execute(intent: { kind: string }) {
+        providerIntents.push(intent.kind);
+        return { kind: "changed", operation: intent.kind, backendId: "openrouter" };
+      } },
+      providerRuntime: {
+        activity: () => ({ runActive: false, activationHeld: false }), currentSessionRoute: () => structuredClone(route),
+        readCachedSettingsRoute: () => ({ backendId: "openrouter" as const, providerLabel: "OpenRouter", requestedModelId: route.requestedModelId, canonicalModelId: route.canonicalModelId!, modelLabel: "Main", billingRealm: "openrouter-payg" as const }),
+        readCachedProviderStatus: () => [{ backendId: "openrouter", displayName: "OpenRouter", availability: "connectable", configuration: "enabled", maturity: "stable", billingRealm: "openrouter-payg", headline: "synthetic ready", health: { credential: "valid", connectivity: "connected", spend: "available", runtime: "ready" }, isDefault: true, allowedActions: ["connect"], selectedModel: null }],
+        readCachedSettingsModels: () => models,
+        async runSettingsConfigMutation<T>(task: () => Promise<T>) { return task(); },
+        prepareSettingsModelPublication() { mainAuthorityCalls += 1; return { publish() {} }; },
+        readModelPreferenceAuthority() { mainAuthorityCalls += 1; return { route, providerRevision: 1, connectionId: "synthetic" }; },
+        async transitionSessionModel() { mainAuthorityCalls += 1; return route; },
+      },
+      localRuntime: { guard: { async resolvePath(path: string) { return join(workspace, path); } } },
+    } as never;
+
+    await createSettingsSession(context, surface, false).open();
+
+    const stored = JSON.parse(await readFile(configPath, "utf8")) as typeof config;
+    assert.deepEqual(providerIntents, ["connect"], "production provider adapter delegation");
+    assert.equal(mainAuthorityCalls, 0, "cancelled main-model editor must not enter transaction authority");
+    assert.equal(stored.compressorModel, "vendor/compressor", "compressor external action reaches durable config");
+    assert.deepEqual(stored.panelModels, ["vendor/main", "vendor/panel"], "panel external action reaches durable config");
+    assert.equal(stored.transcriptionModel, "vendor/audio", "transcription external action reaches durable config");
+    assert.deepEqual(stored.verify.commands, ["npm run check", "npm run test", "npm run build"], "verify suggestion confirms then persists");
+    assert.deepEqual(rules.list(workspace), [], "approval forget and forget-all reach the real rule store");
+    assert.ok(livePublishes.length >= 3, "durable external model config changes publish to the live consumer");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("production Settings session leaves Kimi-disabled compressor, panel, and audio rows before every authority", async () => {
+  const root = await mkdtemp(join(tmpdir(), "orcode-settings-kimi-disabled-"));
+  try {
+    const workspace = join(root, "workspace");
+    const appHome = join(root, ".orcode");
+    const configPath = join(appHome, "config.json");
+    await mkdir(workspace, { recursive: true });
+    const route: RouteIdentityV1 = {
+      version: 1, backendId: "kimi-code", accountFingerprint: "acct_kimi_disabled",
+      billingRealm: "kimi-code-membership-provider-managed-overage", requestedModelId: "k3",
+      canonicalModelId: "k3", resolutionState: "resolved",
+    };
+    const config = structuredClone(DEFAULT_CONFIG);
+    config.mainModel = "k3";
+    await saveConfig(config, configPath);
+    const session = SessionStore.create(workspace, appHome, "kimi disabled");
+    session.setPreferences("k3", { mode: "auto" }, route);
+    await session.save();
+    const rules = await RuleStore.load(appHome);
+    const intents: Array<{ kind: "select-item"; itemId: string } | { kind: "activate" } | { kind: "back" }> = ["compressor-model", "panel-models", "transcription-model"]
+      .flatMap((itemId) => [{ kind: "select-item" as const, itemId }, { kind: "activate" as const }]);
+    intents.push({ kind: "back" as const });
+    let editorCalls = 0;
+    let externalAuthorityCalls = 0;
+    const surface = {
+      begin() {}, async nextIntent() { return intents.shift()!; },
+      async edit() { editorCalls += 1; return { kind: "cancel" as const }; }, end() {},
+      applyAppearance() {}, async confirmAction() { return { accepted: true }; },
+      async pickChoice() { return null; }, async readSecret() { return null; }, async pickModel() { return null; },
+      addMessage() {}, showSettingsNotice() {}, restoreSettings() {},
+    } as unknown as TerminalUi;
+    const context = {
+      executionMode: "local-interactive-owner", workspace, configPath, config, session, ruleStore: rules,
+      openRouter: new OpenRouterService(undefined),
+      providerCommands: { async execute() { externalAuthorityCalls += 1; return { kind: "changed", operation: "connect", backendId: "kimi-code" }; } },
+      providerRuntime: {
+        activity: () => ({ runActive: false, activationHeld: false }), currentSessionRoute: () => route,
+        readCachedSettingsRoute: () => ({ backendId: "kimi-code" as const, providerLabel: "Kimi Code", requestedModelId: "k3", canonicalModelId: "k3", modelLabel: "K3", billingRealm: "kimi-code-membership-provider-managed-overage" as const }),
+        readCachedProviderStatus: () => [], readCachedSettingsModels: () => [{ id: "k3", name: "K3", description: "Kimi", contextLength: 1, promptPrice: 0, completionPrice: 0, supportedParameters: [], inputModalities: ["text"], outputModalities: ["text"] }],
+        async runSettingsConfigMutation<T>(task: () => Promise<T>) { externalAuthorityCalls += 1; return task(); },
+      }, localRuntime: { guard: { async resolvePath() { return join(workspace, "package.json"); } } },
+    } as never;
+    await createSettingsSession(context, surface, false).open();
+    assert.equal(editorCalls, 0, "enabling a disabled Kimi external row would open an editor");
+    assert.equal(externalAuthorityCalls, 0, "enabling a disabled Kimi external row would call an authority");
   } finally {
     await rm(root, { recursive: true, force: true });
   }

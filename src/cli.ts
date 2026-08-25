@@ -5514,6 +5514,7 @@ export function createSettingsSession(
                 else if (action.kind === "panel-models") next.panelModels = [...action.modelIds];
                 else if (action.kind === "transcription-model") next.transcriptionModel = action.modelId;
               });
+              surface.applyAppearance(context.config.appearance);
             },
           },
           liveConfig: {
