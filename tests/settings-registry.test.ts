@@ -379,6 +379,8 @@ test("Coming soon bleibt ausschließlich eine nicht ausführbare Anthropic-Statu
 test("Registry baut ausschließlich eine secretless Ansicht statt Eingaben durchzureichen", () => {
   const base = snapshot();
   const rawRuleSentinel = "Authorization: Bearer raw-rule-token\u001b[31m\nINJECT";
+  const configSlotSentinel = "CONFIG_PROVIDER_SLOT_SENTINEL";
+  const configFingerprintSentinel = "CONFIG_ACCOUNT_FINGERPRINT_SENTINEL";
   const rawRule = {
     id: RULE_B_ID,
     decision: "allow",
@@ -386,8 +388,39 @@ test("Registry baut ausschließlich eine secretless Ansicht statt Eingaben durch
     display: rawRuleSentinel,
     match: { kind: "exact-subject", display: rawRuleSentinel },
   } as unknown as SettingsAuthoritativeSnapshot["approvalRules"][number];
+  const providerSetup = {
+    schemaVersion: 2,
+    revision: 7,
+    lifecycle: "configured",
+    connections: [{
+      id: "33333333-3333-4333-8333-333333333333",
+      backendId: "openrouter",
+      enabled: true,
+      maturity: "stable",
+      credentialSlot: configSlotSentinel,
+      accountFingerprint: configFingerprintSentinel,
+      accountFingerprintState: "verified",
+      billingRealm: "openrouter-payg",
+      lastHealth: null,
+    }],
+    defaultRoute: {
+      version: 1,
+      backendId: "openrouter",
+      accountFingerprint: configFingerprintSentinel,
+      billingRealm: "openrouter-payg",
+      requestedModelId: CURRENT_MODEL_ID,
+      canonicalModelId: CURRENT_MODEL_ID,
+      resolutionState: "resolved",
+    },
+    cross: {
+      enabled: false,
+      preferredLead: null,
+      preferredChallenger: null,
+    },
+  } as unknown as OrcodeConfigWithBudget["providerSetup"];
   const input: SettingsAuthoritativeSnapshot = {
     ...base,
+    config: { ...base.config, providerSetup },
     approvalRules: [rawRule, ...base.approvalRules.slice(1)],
   };
   const polluted = input.providers[0] as SettingsProviderProjection & Record<string, unknown>;
@@ -399,6 +432,8 @@ test("Registry baut ausschließlich eine secretless Ansicht statt Eingaben durch
   const rendered = JSON.stringify(registry);
   assert.equal(rendered.includes("raw-rule-token"), false);
   assert.equal(rendered.includes("INJECT"), false);
+  assert.equal(rendered.includes(configSlotSentinel), false);
+  assert.equal(rendered.includes(configFingerprintSentinel), false);
   for (const candidate of registry.items.flatMap((entry) => [
     entry.label,
     entry.description,
@@ -623,6 +658,104 @@ test("jede Editorfamilie sowie Modell- und Zahlgrenzen sind konkret verdrahtet",
   assert.equal(
     registry.items.filter(({ editor }) => editor.kind === "number").length,
     expectedNumbers.length,
+  );
+});
+
+test("alle Text-Editoren besitzen exakt ihre stabile ID, Action und Werteart", () => {
+  const registry = buildSettingsRegistry(snapshot());
+  assert.deepEqual(
+    registry.items.flatMap(({ id, editor }) => editor.kind === "text"
+      ? [{ id, actionId: editor.actionId, valueKind: editor.valueKind }]
+      : []),
+    [
+      { id: "provider-only", actionId: "provider-only", valueKind: "provider-list" },
+      { id: "provider-ignore", actionId: "provider-ignore", valueKind: "provider-list" },
+      { id: "security-provider-only", actionId: "provider-only", valueKind: "provider-list" },
+      { id: "security-provider-ignore", actionId: "provider-ignore", valueKind: "provider-list" },
+      { id: "verify-commands", actionId: "verify-commands", valueKind: "command-list" },
+      { id: "browser-path", actionId: "browser-path", valueKind: "path" },
+    ],
+  );
+});
+
+test("alle Confirm-Editoren besitzen exakt ihre stabile ID, Action und Destruktivität", () => {
+  const registry = buildSettingsRegistry(snapshot());
+  assert.deepEqual(
+    registry.items.flatMap(({ id, editor }) => editor.kind === "confirm"
+      ? [{ id, actionId: editor.actionId, destructive: editor.destructive }]
+      : []),
+    [
+      { id: `approval-forget:${RULE_A_ID}`, actionId: "approval-forget", destructive: true },
+      { id: `approval-forget:${RULE_B_ID}`, actionId: "approval-forget", destructive: true },
+      { id: "approval-forget-all", actionId: "approval-forget-all", destructive: true },
+      { id: "verify-clear", actionId: "verify-clear", destructive: true },
+      { id: "voice-consent-clear", actionId: "voice-consent-clear", destructive: true },
+    ],
+  );
+});
+
+test("alle Invoke-Editoren besitzen exakt ihre stabile ID und Action", () => {
+  const registry = buildSettingsRegistry(snapshot());
+  assert.deepEqual(
+    registry.items.flatMap(({ id, editor }) => editor.kind === "invoke"
+      ? [{ id, actionId: editor.actionId }]
+      : []),
+    [
+      { id: "provider-setup", actionId: "provider-setup" },
+      { id: "provider-action:openrouter:connect", actionId: "provider-connect" },
+      { id: "provider-action:openrouter:enable", actionId: "provider-enable" },
+      { id: "provider-action:openrouter:disable", actionId: "provider-disable" },
+      { id: "provider-action:openrouter:disconnect", actionId: "provider-disconnect" },
+      { id: "provider-action:openrouter:reconnect", actionId: "provider-reconnect" },
+      { id: "provider-action:openrouter:models", actionId: "provider-models" },
+      { id: "provider-action:openrouter:logout", actionId: "provider-logout" },
+      { id: "provider-action:kimi-code:connect", actionId: "provider-connect" },
+      { id: "provider-action:kimi-code:enable", actionId: "provider-enable" },
+      { id: "provider-action:kimi-code:disable", actionId: "provider-disable" },
+      { id: "provider-action:kimi-code:reconnect", actionId: "provider-reconnect" },
+      { id: "provider-action:kimi-code:models", actionId: "provider-models" },
+      { id: "provider-action:kimi-code:logout", actionId: "provider-logout" },
+      { id: "verify-suggest", actionId: "verify-suggest" },
+    ],
+  );
+});
+
+test("alle Choice-Editoren besitzen exakt ID, Action und kanonische Optionsreihenfolge", () => {
+  const registry = buildSettingsRegistry(snapshot());
+  assert.deepEqual(
+    registry.items.flatMap(({ id, editor }) => editor.kind === "choice"
+      ? [{ id, actionId: editor.actionId, values: editor.options.map(({ value }) => value) }]
+      : []),
+    [
+      {
+        id: "reasoning",
+        actionId: "reasoning",
+        values: [
+          "auto",
+          "effort:low",
+          "effort:medium",
+          "effort:high",
+          "budget:2000",
+          "budget:4000",
+          "budget:8000",
+          "budget:16000",
+          "budget:32000",
+        ],
+      },
+      { id: "compression-mode", actionId: "compression-mode", values: ["off", "auto", "always"] },
+      { id: "provider-sort", actionId: "provider-sort", values: ["off", "price", "throughput", "latency"] },
+      { id: "provider-data-collection", actionId: "provider-data-collection", values: ["deny", "allow"] },
+      { id: "provider-fallback", actionId: "provider-fallback", values: ["on", "off"] },
+      { id: "approval-mode", actionId: "approval-mode", values: ["read-only", "ask", "auto-edit", "allow-all"] },
+      { id: "security-provider-data-collection", actionId: "provider-data-collection", values: ["deny", "allow"] },
+      { id: "budget-on-exceed", actionId: "budget-on-exceed", values: ["warn", "block"] },
+      { id: "verify-mode", actionId: "verify-mode", values: ["off", "on-edit"] },
+      { id: "web-mode", actionId: "web-mode", values: ["auto", "on", "off"] },
+      { id: "panel-judge", actionId: "panel-judge", values: ["on", "off"] },
+      { id: "appearance-large-logo", actionId: "appearance-large-logo", values: ["on", "off"] },
+      { id: "appearance-header-mark", actionId: "appearance-header-mark", values: ["on", "off"] },
+      { id: "appearance-glyph-mode", actionId: "appearance-glyph-mode", values: ["auto", "unicode", "ascii"] },
+    ],
   );
 });
 
