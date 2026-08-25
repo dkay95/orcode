@@ -139,8 +139,8 @@ export interface SettingsExternalActionPort {
 }
 
 export interface PreparedLiveConfigPublication {
-  /** Prevalidated synchronous commit; implementations MUST NOT throw. */
-  publish(): void;
+  /** Runs only after exact durable config readback; async owner state must settle before success. */
+  publish(): Promise<void> | void;
 }
 
 export interface SettingsLiveConfigPort {
@@ -591,7 +591,7 @@ export class SettingsController {
           }
           persisted = exact.config;
         }
-        if (sameExactConfig(persisted, validated)) publication.publish();
+        if (sameExactConfig(persisted, validated)) await publication.publish();
         return persisted;
       });
     } catch (error) {

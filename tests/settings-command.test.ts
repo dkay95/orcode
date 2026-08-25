@@ -567,6 +567,22 @@ test("production Settings approval save publishes the exact live ApprovalManager
   });
 });
 
+test("production Settings reasoning save persists the current session so the next prompt keeps it", async () => {
+  await withProductionSettingsConfigEdit("reasoning", "effort:high", async ({
+    configPath,
+    config,
+    session,
+  }) => {
+    const expected = { mode: "effort" as const, effort: "high" as const };
+    const stored = JSON.parse(await readFile(configPath, "utf8")) as typeof config;
+    const durableSession = await readSessionEditSnapshot(session.path);
+    assert.deepEqual(stored.reasoningByModel[config.mainModel], expected, "reasoning must be durable in config");
+    assert.deepEqual(config.reasoningByModel[config.mainModel], expected, "live config must expose the saved reasoning");
+    assert.deepEqual(session.data.reasoning, expected, "ensureAgentForPrompt must read the new live session reasoning");
+    assert.deepEqual(durableSession.data.reasoning, expected, "the next process must reopen the same reasoning from session storage");
+  });
+});
+
 test("production Settings session adapter dispatches every enabled external family through the controller", async () => {
   const root = await mkdtemp(join(tmpdir(), "orcode-settings-production-adapter-"));
   try {

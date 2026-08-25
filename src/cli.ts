@@ -9,7 +9,7 @@ import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { promisify } from "node:util";
+import { isDeepStrictEqual, promisify } from "node:util";
 import {
   AgentRunError,
   OrcodeAgent,
@@ -5520,17 +5520,40 @@ export function createSettingsSession(
             prepare(next) {
               const previousConfig = structuredClone(context.config);
               const previousApprovalMode = context.approvals.mode;
+              const previousSessionModel = context.session.data.model ?? previousConfig.mainModel;
+              const previousSessionReasoning = structuredClone(
+                context.session.data.reasoning ?? getReasoningSetting(previousConfig),
+              );
               const appearanceChanged = JSON.stringify(previousConfig.appearance)
                 !== JSON.stringify(next.appearance);
+              const nextReasoning = getReasoningSetting(next, next.mainModel);
+              const reasoningChanged = previousConfig.mainModel === next.mainModel
+                && JSON.stringify(previousSessionReasoning) !== JSON.stringify(nextReasoning);
               return {
-                publish: () => {
+                async publish() {
                   try {
                     if (appearanceChanged) surface.applyAppearance(next.appearance);
+                    if (reasoningChanged) {
+                      context.session.setPreferences(next.mainModel, nextReasoning);
+                      await context.session.save();
+                    }
                     Object.assign(context.config, next);
                     context.approvals.mode = next.approvalMode;
                   } catch (error) {
+                    if (reasoningChanged) {
+                      context.session.setPreferences(
+                        previousSessionModel,
+                        previousSessionReasoning,
+                      );
+                      await context.session.save().catch(() => undefined);
+                    }
                     Object.assign(context.config, previousConfig);
                     context.approvals.mode = previousApprovalMode;
+                    await readConfigEditSnapshot(context.configPath)
+                      .then((committed) => isDeepStrictEqual(committed.config, next)
+                        ? saveConfigEdit(committed, previousConfig, context.configPath)
+                        : undefined)
+                      .catch(() => undefined);
                     throw error;
                   }
                 },
