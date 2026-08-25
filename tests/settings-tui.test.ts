@@ -589,30 +589,129 @@ test("gepufferte Settings-Nutzlast wird vor Speicherung auf 120 Codepoints norma
   }
 });
 
-test("Settings-Maus nutzt ausschließlich den letzten inklusiven Hit-Target", async () => {
+test("Settings-Oberfläche aktiviert nie SGR-Mausreporting und bleibt über suspend und resume per Tastatur bedienbar", async () => {
   const { terminal, stdin, stdout } = settingsUi();
   terminal.start();
   terminal.begin(view());
-  const rendered = build(80, 24);
-  const target = rendered.hitTargets.find(
+  const move = terminal.nextIntent(view());
+  pressSettings(stdin, "down");
+  assert.deepEqual(await move, { kind: "move", delta: 1 });
+
+  await terminal.suspend(async () => undefined);
+  const activate = terminal.nextIntent(view());
+  pressSettings(stdin, "return");
+  assert.deepEqual(await activate, { kind: "activate" });
+
+  const back = terminal.nextIntent(view());
+  pressSettings(stdin, "escape");
+  assert.deepEqual(await back, { kind: "back" });
+  terminal.end();
+  terminal.stop();
+  assert.doesNotMatch(stdout.output, /\u001b\[\?1000h/u, stdout.output);
+  assert.doesNotMatch(stdout.output, /\u001b\[\?1006h/u, stdout.output);
+  assert.doesNotMatch(stdout.output, /\u001b\[\?1000l/u, stdout.output);
+});
+
+test("verschachtelte Settings-Choice- und Modell-Editoren aktivieren nie SGR-Mausreporting und bleiben per Tastatur bedienbar", async () => {
+  const models = [cachedModel("model/a"), cachedModel("model/b")];
+  const { terminal, stdin, stdout } = settingsUi({
+    settingsEditorResolver: { searchModels: () => models },
+  });
+  terminal.start();
+  terminal.begin(view());
+
+  const chosen = terminal.edit(editorRequest({
+    kind: "choice",
+    actionId: "reasoning",
+    options: [
+      { value: "low", label: "Niedrig", description: "kurz" },
+      { value: "high", label: "Hoch", description: "gründlich" },
+    ],
+  }, { initialValue: "low" }));
+  pressSettings(stdin, "down");
+  pressSettings(stdin, "return");
+  assert.deepEqual(await chosen, { kind: "value", value: "high" });
+
+  const picked = terminal.edit(editorRequest({
+    kind: "model",
+    actionId: "main-model",
+    filter: "main",
+  }, { itemId: "main-model", initialValue: "model/a" }));
+  await terminal.suspend(async () => undefined);
+  pressSettings(stdin, "down");
+  pressSettings(stdin, "return");
+  assert.deepEqual(await picked, { kind: "value", value: "model/b" });
+
+  const multi = terminal.edit(editorRequest({
+    kind: "model",
+    actionId: "panel-models",
+    filter: "panel",
+    multiple: true,
+  }, { itemId: "panel-models", initialValue: ["model/a"] }));
+  pressSettings(stdin, "down");
+  pressSettings(stdin, "space", " ");
+  pressSettings(stdin, "return");
+  assert.deepEqual(await multi, { kind: "value", value: ["model/a", "model/b"] });
+
+  terminal.end();
+  terminal.stop();
+  assert.doesNotMatch(stdout.output, /\u001b\[\?1000h/u, stdout.output);
+  assert.doesNotMatch(stdout.output, /\u001b\[\?1006h/u, stdout.output);
+  assert.doesNotMatch(stdout.output, /\u001b\[\?1000l/u, stdout.output);
+});
+
+test("SGR-Klick auf ein Settings-Hit-Target löst kein Intent aus, Enter aktiviert per Tastatur", async () => {
+  const { terminal, stdin } = settingsUi();
+  terminal.start();
+  terminal.begin(view());
+  const target = build(80, 24).hitTargets.find(
     ({ intent }) => intent.kind === "select-item" && intent.itemId === "main-model",
   );
   assert.ok(target);
-
-  let settled = false;
-  const pending = terminal.nextIntent(view()).then((intent) => {
-    settled = true;
-    return intent;
-  });
   terminal.frame();
-  emitSettingsData(stdin, `\u001b[<0;${target.columnStart};${target.row}m`);
-  emitSettingsData(stdin, `\u001b[<2;${target.columnStart};${target.row}M`);
-  emitSettingsData(stdin, `\u001b[<0;${stdout.columns + 1};${target.row}M`);
-  await Promise.resolve();
-  assert.equal(settled, false);
 
-  emitSettingsData(stdin, `\u001b[<0;${target.columnEnd};${target.row}M`);
-  assert.deepEqual(await pending, { kind: "select-item", itemId: "main-model" });
+  const pending = terminal.nextIntent(view());
+  emitSettingsData(stdin, `\u001b[<0;${target.columnStart};${target.row}M`);
+  emitSettingsData(stdin, `\u001b[<0;${target.columnEnd};${target.row}m`);
+  const clicked = await Promise.race([
+    pending.then(() => true),
+    new Promise<false>((resolve) => setImmediate(() => resolve(false))),
+  ]);
+  assert.equal(clicked, false);
+
+  pressSettings(stdin, "return");
+  assert.deepEqual(await pending, { kind: "activate" });
+  terminal.end();
+  terminal.stop();
+});
+
+test("SGR-Klick auf eine Zeile eines verschachtelten Settings-Choice-Editors wählt nichts, Esc bricht per Tastatur ab", async () => {
+  const { terminal, stdin } = settingsUi();
+  terminal.start();
+  terminal.begin(view());
+  const editor = terminal.edit(editorRequest({
+    kind: "choice",
+    actionId: "reasoning",
+    options: [
+      { value: "low", label: "Niedrig", description: "kurz" },
+      { value: "high", label: "Hoch", description: "gründlich" },
+    ],
+  }, { initialValue: "low" }));
+  const row = terminal.frame().lines.findIndex(
+    (line) => plainText(line).includes("Hoch"),
+  ) + 1;
+  assert.ok(row > 0);
+
+  emitSettingsData(stdin, `\u001b[<0;1;${row}M\u001b[<0;1;${row}m`);
+  const clicked = await Promise.race([
+    editor.then(() => true),
+    new Promise<false>((resolve) => setImmediate(() => resolve(false))),
+  ]);
+  assert.equal(clicked, false);
+
+  pressSettings(stdin, "escape");
+  assert.deepEqual(await editor, { kind: "cancel" });
+  assert.match(terminal.frame().lines.map(plainText).join("\n"), /Hauptmodell/u);
   terminal.end();
   terminal.stop();
 });
@@ -669,6 +768,50 @@ test("partielles SGR Release bleibt über Picker zu Secret vollständig unterdr�
     assert.equal(await secret, "");
   } finally {
     terminal.stop();
+  }
+});
+
+test("generischer Picker: Press und Release lecken an keiner Chunkgrenze in Chat oder Secret", async () => {
+  const items = [
+    { value: "a", label: "Alpha", description: "A" },
+    { value: "b", label: "Beta", description: "B" },
+  ];
+  for (const follow of ["input", "secret"] as const) {
+    const probe = settingsUi();
+    probe.terminal.start();
+    const probePick = probe.terminal.pickChoice("Provider", items, "a");
+    const row = probe.terminal.frame().lines.findIndex(
+      (line) => plainText(line).includes("Beta"),
+    ) + 1;
+    probe.terminal.stop();
+    await probePick;
+    assert.ok(row > 0);
+    const packet = `\u001b[<0;1;${row}M\u001b[<0;1;${row}m`;
+
+    for (let split = 1; split < packet.length; split += 1) {
+      const { terminal, stdin } = settingsUi();
+      terminal.start();
+      try {
+        const attempt = terminal.pickChoice("Provider", items, "a");
+        terminal.frame();
+        stdin.emit("data", Buffer.from(packet.slice(0, split)));
+        const settledEarly = await Promise.race([
+          attempt.then(() => true),
+          new Promise<false>((resolve) => setImmediate(() => resolve(false))),
+        ]);
+        const early = settledEarly
+          ? (follow === "input" ? terminal.readInput() : terminal.readSecret("Provider-Key"))
+          : null;
+        stdin.emit("data", Buffer.from(packet.slice(split)));
+        assert.equal((await attempt)?.value, "b", `${follow} split ${split}`);
+        const next = early
+          ?? (follow === "input" ? terminal.readInput() : terminal.readSecret("Provider-Key"));
+        pressSettings(stdin, "return");
+        assert.equal(await next, "", `${follow} split ${split}`);
+      } finally {
+        terminal.stop();
+      }
+    }
   }
 });
 
@@ -916,7 +1059,7 @@ test("Settings-Bestätigung ist ViewModel-frei und Enter bestätigt", async () =
   terminal.stop();
 });
 
-test("Settings-Maus ist über suspend, resume, end und stop exakt balanciert", async () => {
+test("Settings schreiben über suspend, resume, end und stop keine SGR-Maussequenzen", async () => {
   const enable = "\u001b[?1000h\u001b[?1006h";
   const disable = "\u001b[?1000l\u001b[?1006l";
   const { terminal, stdout } = settingsUi();
@@ -925,8 +1068,8 @@ test("Settings-Maus ist über suspend, resume, end und stop exakt balanciert", a
   await terminal.suspend(async () => undefined);
   terminal.end();
   terminal.stop();
-  assert.equal(stdout.output.split(enable).length - 1, 2, stdout.output);
-  assert.equal(stdout.output.split(disable).length - 1, 2, stdout.output);
+  assert.equal(stdout.output.split(enable).length - 1, 0, stdout.output);
+  assert.equal(stdout.output.split(disable).length - 1, 0, stdout.output);
 });
 
 test("stop und end settlen Settings-Intent und verschachtelten Editor genau einmal", async () => {
@@ -1072,7 +1215,7 @@ test("Settings-Rundreise bewahrt Draft-Cursor, Anhänge, Viewport und externen R
   terminal.stop();
 });
 
-test("end im Editor stellt Chat-Status exakt wieder her und aktiviert die Settings-Maus nicht erneut", async () => {
+test("end im Editor stellt Chat-Status exakt wieder her und aktiviert nie die Maus", async () => {
   const enable = "\u001b[?1000h\u001b[?1006h";
   const disable = "\u001b[?1000l\u001b[?1006l";
   const originalNow = Date.now;
@@ -1095,8 +1238,8 @@ test("end im Editor stellt Chat-Status exakt wieder her und aktiviert die Settin
     terminal.end();
     assert.deepEqual(await editor, { kind: "cancel" });
     assert.deepEqual(terminal.frame(), before);
-    assert.equal(stdout.output.split(enable).length - 1, 1, stdout.output);
-    assert.equal(stdout.output.split(disable).length - 1, 1, stdout.output);
+    assert.equal(stdout.output.split(enable).length - 1, 0, stdout.output);
+    assert.equal(stdout.output.split(disable).length - 1, 0, stdout.output);
     pressSettings(stdin, "return");
     assert.equal(await pendingChat, "status-draft");
   } finally {
@@ -1105,7 +1248,7 @@ test("end im Editor stellt Chat-Status exakt wieder her und aktiviert die Settin
   }
 });
 
-test("split und fehlerhafte SGR-Frames lecken keine Bytes in Settings-Suche", async () => {
+test("split und fehlerhafte SGR-Frames lösen in Settings kein Intent aus und lecken keine Bytes in die Suche", async () => {
   const { terminal, stdin } = settingsUi();
   terminal.start();
   terminal.begin(view());
@@ -1113,12 +1256,18 @@ test("split und fehlerhafte SGR-Frames lecken keine Bytes in Settings-Suche", as
     ({ intent }) => intent.kind === "select-item" && intent.itemId === "main-model",
   );
   assert.ok(target);
-  const selected = terminal.nextIntent(view());
+  const pending = terminal.nextIntent(view());
   terminal.frame();
   for (const part of ["\u001b", "[", "<0", `;${target.columnStart}`, `;${target.row}`, "M"]) {
     emitSettingsData(stdin, part);
   }
-  assert.deepEqual(await selected, { kind: "select-item", itemId: "main-model" });
+  const clicked = await Promise.race([
+    pending.then(() => true),
+    new Promise<false>((resolve) => setImmediate(() => resolve(false))),
+  ]);
+  assert.equal(clicked, false);
+  pressSettings(stdin, "return");
+  assert.deepEqual(await pending, { kind: "activate" });
 
   const searchView = view({ search: { active: true, query: "" } });
   const changed = terminal.nextIntent(searchView);
@@ -1129,7 +1278,7 @@ test("split und fehlerhafte SGR-Frames lecken keine Bytes in Settings-Suche", as
   terminal.stop();
 });
 
-test("SGR verarbeitet mehrere Frames und liefert den normalen Suffix exakt einmal", async () => {
+test("mehrere SGR-Frames vor einem Suffix lösen kein Intent aus und liefern den Suffix exakt einmal", async () => {
   const searchView = view({ search: { active: true, query: "" } });
   const target = build(80, 24, { search: { active: true, query: "" } }).hitTargets.find(
     ({ intent }) => intent.kind === "select-item" && intent.itemId === "main-model",
@@ -1138,45 +1287,29 @@ test("SGR verarbeitet mehrere Frames und liefert den normalen Suffix exakt einma
   const { terminal, stdin } = settingsUi();
   terminal.start();
   terminal.begin(searchView);
-  const observed: SettingsIntent[] = [];
+  let after: Promise<SettingsIntent> | null = null;
   try {
     terminal.frame();
-    const click = terminal.nextIntent(searchView);
+    const changed = terminal.nextIntent(searchView);
     stdin.emit(
       "data",
       Buffer.from(`\u001b[<2;${target.columnStart};${target.row}M`
         + `\u001b[<0;${target.columnStart};${target.row}M`
         + "z"),
     );
-    const clickResult = await Promise.race([
-      click.then((intent) => ({ settled: true as const, intent })),
-      new Promise<{ settled: false }>((resolve) => setImmediate(() => resolve({ settled: false }))),
+    assert.deepEqual(await changed, { kind: "search-change", query: "z" });
+
+    after = terminal.nextIntent(view({ search: { active: true, query: "z" } }));
+    const leaked = await Promise.race([
+      after.then(() => true),
+      new Promise<false>((resolve) => setImmediate(() => resolve(false))),
     ]);
-    if (clickResult.settled) observed.push(clickResult.intent);
-    else {
-      terminal.end();
-      await click.catch(() => undefined);
-    }
-    if (clickResult.settled) {
-      const suffix = terminal.nextIntent(searchView);
-      const suffixResult = await Promise.race([
-        suffix.then((intent) => ({ settled: true as const, intent })),
-        new Promise<{ settled: false }>((resolve) => setImmediate(() => resolve({ settled: false }))),
-      ]);
-      if (suffixResult.settled) observed.push(suffixResult.intent);
-      else {
-        terminal.end();
-        await suffix.catch(() => undefined);
-      }
-    }
+    assert.equal(leaked, false);
   } finally {
     terminal.end();
+    await Promise.allSettled(after ? [after] : []);
     terminal.stop();
   }
-  assert.deepEqual(observed, [
-    { kind: "select-item", itemId: "main-model" },
-    { kind: "search-change", query: "z" },
-  ]);
 });
 
 test("ein fehlerhaftes SGR-Frame verschluckt seine Bytes, aber nicht den Suffix", async () => {
@@ -1218,7 +1351,7 @@ test("malformed SGR bleibt an jeder Chunkgrenze unterdrückt und liefert den Suf
   }
 });
 
-test("valides SGR-Klickframe bleibt an jeder Chunkgrenze vollständig", async () => {
+test("valides SGR-Klickframe löst an keiner Chunkgrenze ein Settings-Intent aus und lässt die Tastatur unberührt", async () => {
   const initial = view({ search: { active: true, query: "" } });
   const target = build(80, 24, { search: { active: true, query: "" } }).hitTargets.find(
     ({ intent }) => intent.kind === "select-item" && intent.itemId === "main-model",
@@ -1231,18 +1364,21 @@ test("valides SGR-Klickframe bleibt an jeder Chunkgrenze vollständig", async ()
     terminal.begin(initial);
     try {
       terminal.frame();
-      const selected = terminal.nextIntent(initial);
+      const changed = terminal.nextIntent(initial);
       stdin.emit("data", Buffer.from(packet.slice(0, split)));
       await new Promise<void>((resolve) => setImmediate(resolve));
       stdin.emit("data", Buffer.from(packet.slice(split)));
+      const clicked = await Promise.race([
+        changed.then(() => true),
+        new Promise<false>((resolve) => setImmediate(() => resolve(false))),
+      ]);
+      assert.equal(clicked, false, `split ${split}`);
+      stdin.emit("data", Buffer.from("z"));
       assert.deepEqual(
-        await selected,
-        { kind: "select-item", itemId: "main-model" },
+        await changed,
+        { kind: "search-change", query: "z" },
         `split ${split}`,
       );
-      const changed = terminal.nextIntent(initial);
-      stdin.emit("data", Buffer.from("z"));
-      assert.deepEqual(await changed, { kind: "search-change", query: "z" });
     } finally {
       terminal.end();
       terminal.stop();
@@ -1250,7 +1386,7 @@ test("valides SGR-Klickframe bleibt an jeder Chunkgrenze vollständig", async ()
   }
 });
 
-test("normaler Raw-Präfix bleibt vor einem SGR-Klick geordnet und Mausbytes bleiben unsichtbar", async () => {
+test("normaler Raw-Präfix vor einem SGR-Frame kommt an und die Mausbytes bleiben unsichtbar", async () => {
   const searchView = view({ search: { active: true, query: "" } });
   const target = build(80, 24, { search: { active: true, query: "" } }).hitTargets.find(
     ({ intent }) => intent.kind === "select-item" && intent.itemId === "main-model",
@@ -1259,6 +1395,7 @@ test("normaler Raw-Präfix bleibt vor einem SGR-Klick geordnet und Mausbytes ble
   const { terminal, stdin } = settingsUi();
   terminal.start();
   terminal.begin(searchView);
+  let after: Promise<SettingsIntent> | null = null;
   try {
     terminal.frame();
     const prefix = terminal.nextIntent(searchView);
@@ -1267,17 +1404,20 @@ test("normaler Raw-Präfix bleibt vor einem SGR-Klick geordnet und Mausbytes ble
       Buffer.from(`z\u001b[<0;${target.columnStart};${target.row}M`),
     );
     assert.deepEqual(await prefix, { kind: "search-change", query: "z" });
-    assert.deepEqual(
-      await terminal.nextIntent(view({ search: { active: true, query: "z" } })),
-      { kind: "select-item", itemId: "main-model" },
-    );
+    after = terminal.nextIntent(view({ search: { active: true, query: "z" } }));
+    const leaked = await Promise.race([
+      after.then(() => true),
+      new Promise<false>((resolve) => setImmediate(() => resolve(false))),
+    ]);
+    assert.equal(leaked, false);
   } finally {
     terminal.end();
+    await Promise.allSettled(after ? [after] : []);
     terminal.stop();
   }
 });
 
-test("malformed SGR mit trailing ESC lässt ein split-valides Folgeframe anklicken", async () => {
+test("malformed SGR mit trailing ESC und split-validem Folgeframe löst kein Intent aus und leckt nichts", async () => {
   const searchView = view({ search: { active: true, query: "" } });
   const target = build(80, 24, { search: { active: true, query: "" } }).hitTargets.find(
     ({ intent }) => intent.kind === "select-item" && intent.itemId === "main-model",
@@ -1286,8 +1426,7 @@ test("malformed SGR mit trailing ESC lässt ein split-valides Folgeframe anklick
   const { terminal, stdin } = settingsUi();
   terminal.start();
   terminal.begin(searchView);
-  const selected = terminal.nextIntent(searchView);
-  let after: Promise<SettingsIntent> | null = null;
+  const pending = terminal.nextIntent(searchView);
   try {
     terminal.frame();
     stdin.emit("data", Buffer.from("\u001b[<x\u001b"));
@@ -1295,21 +1434,16 @@ test("malformed SGR mit trailing ESC lässt ein split-valides Folgeframe anklick
       "data",
       Buffer.from(`[<0;${target.columnStart};${target.row}M`),
     );
-    const result = await Promise.race([
-      selected,
-      new Promise<null>((resolve) => setImmediate(() => resolve(null))),
-    ]);
-    assert.deepEqual(result, { kind: "select-item", itemId: "main-model" });
-
-    after = terminal.nextIntent(searchView);
     const leaked = await Promise.race([
-      after.then(() => true),
+      pending.then(() => true),
       new Promise<false>((resolve) => setImmediate(() => resolve(false))),
     ]);
     assert.equal(leaked, false);
+    pressSettings(stdin, "x", "x");
+    assert.deepEqual(await pending, { kind: "search-change", query: "x" });
   } finally {
     terminal.end();
-    await Promise.allSettled([selected, ...(after ? [after] : [])]);
+    await Promise.allSettled([pending]);
     terminal.stop();
   }
 });

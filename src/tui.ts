@@ -52,10 +52,7 @@ import {
 } from "./ui/dashboard-frame.js";
 import { renderBlock } from "./ui/render-block.js";
 import { MAX_CONTENT_WIDTH, type Frame } from "./ui/render-frame.js";
-import {
-  buildSettingsFrame,
-  type SettingsHitTarget,
-} from "./ui/settings-frame.js";
+import { buildSettingsFrame } from "./ui/settings-frame.js";
 import { createTheme, type Theme } from "./ui/theme.js";
 import { RunViewModel } from "./ui/view-model.js";
 
@@ -275,7 +272,6 @@ export class TerminalUi implements SettingsSurface {
   #settingsQueuedCodepoints = 0;
   #settingsSearchChars: string[] = [];
   #settingsSearchCursor = 0;
-  #lastSettingsHitTargets: readonly SettingsHitTarget[] = [];
   #editorChars: string[] = [];
   #editorCursor = 0;
   #editorRequest: SettingsEditorRequest | null = null;
@@ -399,7 +395,6 @@ export class TerminalUi implements SettingsSurface {
     this.#clearSettingsInputQueue();
     this.#settingsSearchChars = settingsSearchChars(view.search.query);
     this.#settingsSearchCursor = this.#settingsSearchChars.length;
-    this.#lastSettingsHitTargets = [];
     this.#syncMouseReporting();
     this.scheduleRender(true);
   }
@@ -432,7 +427,6 @@ export class TerminalUi implements SettingsSurface {
     this.#settingsSearchCursor = preserveLocalCursor
       ? clamp(this.#settingsSearchCursor, 0, incomingSearchChars.length)
       : incomingSearchChars.length;
-    this.#lastSettingsHitTargets = [];
     this.scheduleRender(true);
     const pending = new Promise<SettingsIntent>((resolve, reject) => {
       this.#settingsIntentResolve = resolve;
@@ -457,7 +451,6 @@ export class TerminalUi implements SettingsSurface {
     this.#returnSurface = this.#surface;
     this.#returnMode = this.#mode;
     this.#surface = "chat";
-    this.#lastSettingsHitTargets = [];
     this.#editorRequest = request;
     this.#editorValidationMessage = oneLine(request.validationMessage ?? "");
     this.#setEditorValue(request.initialValue);
@@ -1132,7 +1125,6 @@ export class TerminalUi implements SettingsSurface {
           visible: this.#appearance.showLargeLogo,
         },
       });
-      this.#lastSettingsHitTargets = result.hitTargets;
       return result.frame;
     }
     const editorBuffer = this.#returnSurface === "settings"
@@ -1238,7 +1230,6 @@ export class TerminalUi implements SettingsSurface {
     this.#clearSettingsInputQueue();
     this.#settingsSearchChars = [];
     this.#settingsSearchCursor = 0;
-    this.#lastSettingsHitTargets = [];
     if (this.#settingsChatStatus) {
       this.#status = this.#settingsChatStatus.value;
       this.#statusAt = this.#settingsChatStatus.at;
@@ -1254,7 +1245,6 @@ export class TerminalUi implements SettingsSurface {
     this.#returnSurface = "settings";
     this.#returnMode = this.#mode;
     this.#surface = "chat";
-    this.#lastSettingsHitTargets = [];
   }
 
   #restoreCapturedSurface(fallbackMode: UiMode, status: string): void {
@@ -1811,7 +1801,6 @@ export class TerminalUi implements SettingsSurface {
       this.#settingsView = null;
       this.#settingsSearchChars = [];
       this.#settingsSearchCursor = 0;
-      this.#lastSettingsHitTargets = [];
     }
     this.#returnSurface = null;
     this.#returnMode = null;
@@ -2243,9 +2232,15 @@ export class TerminalUi implements SettingsSurface {
       && openToken.raw.length <= MAX_MOUSE_SEQUENCE_LENGTH
       && this.#mouseProtocolBuffer.length <= MAX_MOUSE_SEQUENCE_LENGTH,
     );
+    // An ambiguous ESC / ESC[ prefix is still held by readline's decoder as
+    // well. Dropping it here would desynchronise both parsers: the frame that
+    // completes it in the next chunk would then reach the new mode as text.
+    const ambiguousPrefix = this.#mouseProtocolBuffer.length > 0
+      && this.#mouseProtocolBuffer.length < 3
+      && "\u001b[<".startsWith(this.#mouseProtocolBuffer);
     const keepRecoveryBuffer = Boolean(
       !keepOpenToken
-      && this.#mouseProtocolBufferRecovery
+      && (this.#mouseProtocolBufferRecovery || ambiguousPrefix)
       && this.#mouseProtocolBuffer.length <= MAX_MOUSE_SEQUENCE_LENGTH,
     );
     this.#mouseKeypressTokens = this.#mouseKeypressTokens.filter((token) => {
@@ -2396,11 +2391,12 @@ export class TerminalUi implements SettingsSurface {
   }
 
   #syncMouseReporting(): void {
-    const wanted = this.#active && (
-      this.#surface === "settings"
-      || this.#mode === "model-picker"
-      || this.#mode === "choice-picker"
-    );
+    // orcode 0.7: Settings and every nested Settings editor are keyboard-only.
+    // SGR mouse reporting belongs solely to the generic non-Settings pickers.
+    const wanted = this.#active
+      && this.#surface !== "settings"
+      && this.#returnSurface !== "settings"
+      && (this.#mode === "model-picker" || this.#mode === "choice-picker");
     if (wanted) this.#enableMouseReporting();
     else this.#disableMouseReporting();
   }
@@ -2413,21 +2409,8 @@ export class TerminalUi implements SettingsSurface {
   }
 
   #selectMouseRow(column: number, row: number): void {
-    if (this.#surface === "settings") {
-      if (
-        column < 1
-        || column > Math.max(1, this.stdout.columns || 1)
-        || row < 1
-        || row > Math.max(1, this.stdout.rows || 1)
-      ) return;
-      const target = this.#lastSettingsHitTargets.find(
-        (candidate) => candidate.row === row
-          && column >= candidate.columnStart
-          && column <= candidate.columnEnd,
-      );
-      if (target) this.#emitSettingsIntent(target.intent);
-      return;
-    }
+    // Settings never enable mouse reporting; a stray SGR click must not act.
+    if (this.#surface === "settings" || this.#returnSurface === "settings") return;
     if (
       (this.#mode !== "model-picker" && this.#mode !== "choice-picker")
       || column < 1
@@ -2438,15 +2421,7 @@ export class TerminalUi implements SettingsSurface {
     const items: Array<ModelInfo | ChoicePickerItem> = models
       ? this.#pickerModels
       : this.#choiceItems;
-    const expansionLimit = (this.stdout.rows || 24) >= 20 ? 6 : 4;
-    const validationRows = this.#returnSurface === "settings"
-      && this.#editorValidationMessage
-      ? 1
-      : 0;
-    const visibleRows = Math.min(
-      Math.max(0, expansionLimit - validationRows),
-      items.length,
-    );
+    const visibleRows = Math.min((this.stdout.rows || 24) >= 20 ? 6 : 4, items.length);
     if (!visibleRows) return;
     const visibleStart = clamp(
       this.#selectedIndex - Math.floor(visibleRows / 2),
@@ -2461,27 +2436,7 @@ export class TerminalUi implements SettingsSurface {
     const line = frame.lines[row - 1];
     const itemLabel = item && (models ? (item as ModelInfo).id : (item as ChoicePickerItem).label);
     if (!item || offset < 0 || offset >= visibleRows || !line || !itemLabel || !line.spans.some((span) => span.text.includes(itemLabel))) return;
-    if (this.#editorResolve && this.#returnSurface === "settings") {
-      this.#selectedIndex = visibleStart + offset;
-      if (models && this.#pickerMultiple) {
-        const id = (item as ModelInfo).id;
-        if (this.#pickerSelected.has(id)) {
-          this.#pickerSelected.delete(id);
-          this.#editorValidationMessage = "";
-        }
-        else if (this.#pickerSelected.size < 5) {
-          this.#pickerSelected.add(id);
-          this.#editorValidationMessage = "";
-        }
-        else this.#editorValidationMessage = "Höchstens fünf Panel-Modelle sind zulässig";
-        this.scheduleRender(true);
-      } else {
-        this.#resolveSettingsEditor({
-          kind: "value",
-          value: models ? (item as ModelInfo).id : (item as ChoicePickerItem).value,
-        });
-      }
-    } else this.#resolveSelection(item);
+    this.#resolveSelection(item);
   }
 
   #interrupt(): void {
