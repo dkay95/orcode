@@ -6,7 +6,7 @@ import { join } from "node:path";
 import test from "node:test";
 import type { ReadStream, WriteStream } from "node:tty";
 import { ApprovalManager } from "../src/approval.js";
-import type { RouteIdentityV1 } from "../src/backends.js";
+import { BackendRegistry, type RouteIdentityV1 } from "../src/backends.js";
 import {
   handleSlashCommand,
   type CommandContext,
@@ -16,6 +16,8 @@ import { DEFAULT_CONFIG, saveConfig } from "../src/config.js";
 import {
   createSettingsCommandPort,
   createSettingsSession,
+  DefaultProviderRuntime,
+  persistProviderSetupState,
   runPlainLoop,
   runSettingsProviderAction,
   runSettingsVerifySuggestion,
@@ -24,9 +26,13 @@ import {
 import * as cliModule from "../src/cli.js";
 import { SessionProviderRuntimeGuard } from "../src/cli.js";
 import { OpenRouterService } from "../src/openrouter.js";
+import { ProviderActivationCoordinator } from "../src/provider-activation.js";
+import { ProviderCredentialAuthority } from "../src/provider-authority.js";
+import { ProviderStateStore, type ProviderSetupStateV2 } from "../src/provider-state.js";
+import { PrivateStore } from "../src/private-store.js";
 import { RuleStore, shellApprovalSubject } from "../src/rules.js";
-import { SessionStore } from "../src/session.js";
-import type { ProviderExecutionMode } from "../src/setup.js";
+import { readSessionEditSnapshot, SessionStore } from "../src/session.js";
+import { SetupOrchestrator, type ProviderExecutionMode } from "../src/setup.js";
 import { describeOpenRouterFailure, formatFailure } from "../src/openrouter.js";
 import { TerminalUi } from "../src/tui.js";
 import { plainText } from "../src/ui/spans.js";
@@ -470,28 +476,206 @@ test("production Settings session adapter dispatches every enabled external fami
       billingRealm: "openrouter-payg", requestedModelId: "vendor/main",
       canonicalModelId: "vendor/main", resolutionState: "resolved",
     };
+    const nextRoute: RouteIdentityV1 = {
+      ...route,
+      requestedModelId: "vendor/next",
+      canonicalModelId: "vendor/next-canonical",
+    };
+    const connectionId = "production-settings-connection";
+    const credentialSlot = "v1:inference:51515151-5151-4151-8151-515151515151";
+    const initialProviderState: ProviderSetupStateV2 = {
+      schemaVersion: 2,
+      revision: 4,
+      lifecycle: "configured",
+      connections: [{
+        id: connectionId,
+        backendId: "openrouter",
+        enabled: true,
+        maturity: "stable",
+        credentialSlot,
+        accountFingerprint: route.accountFingerprint,
+        accountFingerprintState: "verified",
+        billingRealm: "openrouter-payg",
+        lastHealth: {
+          credential: "valid",
+          connectivity: "connected",
+          spend: "available",
+          runtime: "ready",
+          observedAt: 1,
+          generation: 1,
+        },
+      }],
+      defaultRoute: route,
+      cross: { enabled: false, preferredLead: null, preferredChallenger: null },
+    };
     const config = structuredClone(DEFAULT_CONFIG);
     config.mainModel = route.requestedModelId;
+    config.providerSetup = structuredClone(initialProviderState);
     await saveConfig(config, configPath);
     const session = SessionStore.create(workspace, appHome, "production adapter");
     session.setPreferences(config.mainModel, { mode: "auto" }, route);
     await session.save();
     const rules = await RuleStore.load(appHome);
-    const remembered = await Promise.all(["one", "two"].map((command) => rules.remember({
-      workspace, tool: "shell", decision: "allow",
-      subject: shellApprovalSubject({ platform: "darwin", executable: "/bin/echo", mode: [], cwd: ".", command }),
-    })));
+    const remembered = [];
+    for (const command of ["one", "two"]) {
+      remembered.push(await rules.remember({
+        workspace, tool: "shell", decision: "allow",
+        subject: shellApprovalSubject({ platform: "darwin", executable: "/bin/echo", mode: [], cwd: ".", command }),
+      }));
+    }
     const models = [
       { id: "vendor/main", name: "Main", description: "main", contextLength: 128_000, promptPrice: 0, completionPrice: 0, supportedParameters: ["tools", "reasoning"], inputModalities: ["text"], outputModalities: ["text"] },
+      { id: "vendor/next", canonicalSlug: "vendor/next-canonical", name: "Next", description: "next", contextLength: 128_000, promptPrice: 0, completionPrice: 0, supportedParameters: ["tools", "reasoning"], inputModalities: ["text"], outputModalities: ["text"] },
       { id: "vendor/compressor", name: "Compressor", description: "compress", contextLength: 128_000, promptPrice: 0, completionPrice: 0, supportedParameters: [], inputModalities: ["text"], outputModalities: ["text"] },
       { id: "vendor/panel", name: "Panel", description: "panel", contextLength: 128_000, promptPrice: 0, completionPrice: 0, supportedParameters: ["tools"], inputModalities: ["text"], outputModalities: ["text"] },
       { id: "vendor/audio", name: "Audio", description: "audio", contextLength: 128_000, promptPrice: 0, completionPrice: 0, supportedParameters: [], inputModalities: ["text", "audio"], outputModalities: ["text"] },
     ];
+    const secret = "synthetic-production-settings-secret";
+    const slots = new Map<string, string>([[credentialSlot, secret]]);
+    let slotSequence = 1;
+    const credentials = {
+      location: "synthetic-versioned-store",
+      async get() { return null; },
+      async set() {},
+      async delete() { return false; },
+      async has() { return false; },
+      reserveSlot(kind: string) {
+        return Object.freeze({
+          version: 1 as const,
+          kind,
+          id: `v1:${kind}:52525252-5252-4252-8252-${String(slotSequence++).padStart(12, "0")}`,
+        });
+      },
+      async writeSlot(slot: { id: string }, value: string) { slots.set(slot.id, value); },
+      async readSlot(slot: { id: string }) { return slots.get(slot.id) ?? null; },
+      async deleteSlot(slot: { id: string }) { return slots.delete(slot.id); },
+      async getOrCreateAccountHmacKey() { return new Uint8Array(32).fill(5); },
+    };
+    const stateStore = new ProviderStateStore(initialProviderState, {
+      persist: (request) => persistProviderSetupState(configPath, request),
+    });
+    let coordinator!: ProviderActivationCoordinator;
+    const credentialAuthority = new ProviderCredentialAuthority({
+      stateStore,
+      credentials: credentials as never,
+      environment: {},
+      coordinator: () => coordinator,
+    });
+    const publicationOrder: string[] = [];
+    let runtime!: DefaultProviderRuntime;
+    let candidateSequence = 1;
+    const adapter = {
+      backendId: "openrouter" as const,
+      async inspect() { throw new Error("unused production Settings inspection"); },
+      async reconnect() { throw new Error("unused production Settings reconnect"); },
+      async bindRuntime() {},
+      async logout() {},
+      async connect(request: { generation: number }) {
+        return {
+          candidateId: `settings-candidate-${candidateSequence++}`,
+          backendId: "openrouter" as const,
+          connectionId,
+          accountFingerprint: route.accountFingerprint,
+          billingRealm: "openrouter-payg" as const,
+          health: {
+            credential: "valid" as const,
+            connectivity: "connected" as const,
+            spend: "available" as const,
+            runtime: "ready" as const,
+            observedAt: 2,
+            generation: request.generation,
+          },
+        };
+      },
+      async listModels() {
+        return [route, nextRoute].map((candidate) => ({
+          backendId: "openrouter" as const,
+          requestedModelId: candidate.requestedModelId,
+          canonicalModelId: candidate.canonicalModelId!,
+          displayName: candidate.requestedModelId,
+          capabilities: { textInput: true, textOutput: true, tools: true, reasoning: true },
+        }));
+      },
+      async activate(request: { candidateId: string; model: { requestedModelId: string } }) {
+        const durableConfig = JSON.parse(await readFile(configPath, "utf8")) as typeof config;
+        const durableSession = await readSessionEditSnapshot(session.path);
+        assert.equal(durableConfig.mainModel, nextRoute.requestedModelId, "publication persist precedes provider runtime activation");
+        assert.deepEqual((durableConfig.providerSetup as ProviderSetupStateV2).defaultRoute, nextRoute, "provider route is durable before live publication");
+        assert.equal(durableSession.data.model, nextRoute.requestedModelId, "session model is durable before live publication");
+        assert.deepEqual(durableSession.data.route, nextRoute, "session route is durable before live publication");
+        assert.equal(config.mainModel, route.requestedModelId, "live config remains OLD until publication publish");
+        assert.equal(session.data.model, route.requestedModelId, "live session remains OLD until publication publish");
+        assert.deepEqual(runtime.currentSessionRoute(), route, "live runtime remains OLD until publication publish");
+        publicationOrder.push("persist");
+        return {
+          candidateId: request.candidateId,
+          backendId: "openrouter" as const,
+          connectionId,
+          accountFingerprint: route.accountFingerprint,
+          billingRealm: "openrouter-payg" as const,
+          route: nextRoute,
+        };
+      },
+      async discardCandidate() {},
+    };
+    const registry = new BackendRegistry([{
+      descriptor: {
+        id: "openrouter",
+        displayName: "OpenRouter",
+        maturity: "stable",
+        connectable: true,
+        kind: "raw-model",
+        credentialOwner: "orcode-keychain",
+        billingRealmKind: "api-payg",
+        capabilities: { models: true, tools: true, reasoning: true },
+      },
+      adapter: adapter as never,
+    }]);
+    const runtimeGuard = new SessionProviderRuntimeGuard();
+    coordinator = new ProviderActivationCoordinator({
+      appHome,
+      configPath,
+      privateStore: new PrivateStore({ root: appHome }),
+      credentials: credentials as never,
+      adapterResolver: () => adapter as never,
+      stateStore,
+      runtimeGuard,
+      candidateAuthority: credentialAuthority,
+      createUuid: () => `53535353-5353-4353-8353-${String(candidateSequence++).padStart(12, "0")}`,
+    });
+    const orchestrator = new SetupOrchestrator({
+      registry,
+      stateStore,
+      activationCoordinator: coordinator,
+    });
+    runtime = new DefaultProviderRuntime(
+      new OpenRouterService(secret),
+      credentials as never,
+      registry,
+      stateStore,
+      orchestrator,
+      coordinator,
+      runtimeGuard,
+      {} as never,
+      null,
+      null,
+      route.requestedModelId,
+      config,
+      session,
+      {
+        credentialAuthority,
+        adapter: adapter as never,
+        forgetJournal: {} as never,
+        async recover() {},
+      },
+      "local-interactive-owner",
+    );
+    runtime.adoptCredentialActivation(route, true, secret);
+    await session.save();
     const providerIntents: string[] = [];
     const providerStatePath = join(appHome, "synthetic-provider-state.json");
     let providerConnected = false;
     const providerStatus = () => [{ backendId: "openrouter", displayName: "OpenRouter", availability: "connectable", configuration: providerConnected ? "enabled" : "disabled", maturity: "stable", billingRealm: "openrouter-payg", headline: providerConnected ? "synthetic connected" : "synthetic ready", health: { credential: "valid", connectivity: providerConnected ? "connected" : "unknown", spend: "available", runtime: providerConnected ? "ready" : "not-applicable" }, isDefault: true, allowedActions: ["connect"], selectedModel: null }];
-    let mainAuthorityCalls = 0;
     const intents: Array<{ kind: "select-item"; itemId: string } | { kind: "activate" } | { kind: "back" }> = [];
     const activate = (itemId: string) => intents.push({ kind: "select-item", itemId }, { kind: "activate" });
     activate("provider-action:openrouter:connect");
@@ -512,7 +696,7 @@ test("production Settings session adapter dispatches every enabled external fami
         return next;
       },
       async edit(request: { itemId: string }) {
-        if (request.itemId === "main-model") return { kind: "cancel" as const };
+        if (request.itemId === "main-model") return { kind: "value" as const, value: "vendor/next" };
         if (request.itemId === "compressor-model") return { kind: "value" as const, value: "vendor/compressor" };
         if (request.itemId === "panel-models") return { kind: "value" as const, value: ["vendor/main", "vendor/panel"] };
         if (request.itemId === "transcription-model") return { kind: "value" as const, value: "vendor/audio" };
@@ -534,14 +718,24 @@ test("production Settings session adapter dispatches every enabled external fami
         return { kind: "changed", operation: intent.kind, backendId: "openrouter" };
       } },
       providerRuntime: {
-        activity: () => ({ runActive: false, activationHeld: false }), currentSessionRoute: () => structuredClone(route),
+        activity: () => runtime.activity(), currentSessionRoute: () => runtime.currentSessionRoute(),
         readCachedSettingsRoute: () => ({ backendId: "openrouter" as const, providerLabel: "OpenRouter", requestedModelId: route.requestedModelId, canonicalModelId: route.canonicalModelId!, modelLabel: "Main", billingRealm: "openrouter-payg" as const }),
         readCachedProviderStatus: providerStatus,
         readCachedSettingsModels: () => models,
-        async runSettingsConfigMutation<T>(task: () => Promise<T>) { return task(); },
-        prepareSettingsModelPublication() { mainAuthorityCalls += 1; return { publish() {} }; },
-        readModelPreferenceAuthority() { mainAuthorityCalls += 1; return { route, providerRevision: 1, connectionId: "synthetic" }; },
-        async transitionSessionModel() { mainAuthorityCalls += 1; return route; },
+        async runSettingsConfigMutation<T>(task: () => Promise<T>) { return runtime.runSettingsConfigMutation(task); },
+        prepareSettingsModelPublication(next: RouteIdentityV1) {
+          return runtime.prepareSettingsModelPublication(next);
+        },
+        readModelPreferenceAuthority() {
+          return runtime.readModelPreferenceAuthority();
+        },
+        async transitionSessionModel(
+          candidate: { requestedModelId: string; canonicalModelId: string },
+          publication: Parameters<DefaultProviderRuntime["transitionSessionModel"]>[1],
+          setupSurface: Parameters<DefaultProviderRuntime["transitionSessionModel"]>[2],
+        ) {
+          return runtime.transitionSessionModel(candidate, publication, setupSurface);
+        },
       },
       localRuntime: { guard: { async resolvePath(path: string) { return join(workspace, path); } } },
     } as never;
@@ -549,10 +743,18 @@ test("production Settings session adapter dispatches every enabled external fami
     await createSettingsSession(context, surface, false).open();
 
     const stored = JSON.parse(await readFile(configPath, "utf8")) as typeof config;
+    assert.deepEqual(publicationOrder, ["persist"], "main-model durable stage is reached before final live assertions");
     assert.deepEqual(providerIntents, ["connect"], "production provider adapter delegation");
     assert.deepEqual(JSON.parse(await readFile(providerStatePath, "utf8")), { connected: true }, "provider connect durably updates its lower-level state");
     assert.equal(providerStatus()[0].headline, "synthetic connected", "provider view refreshes from the durable mutation");
-    assert.equal(mainAuthorityCalls, 0, "cancelled main-model editor must not enter transaction authority");
+    assert.equal(stored.mainModel, "vendor/next", "accepted main-model editor reaches durable config");
+    assert.deepEqual((stored.providerSetup as ProviderSetupStateV2).defaultRoute, nextRoute, "accepted main-model editor reaches the durable provider route");
+    assert.equal(config.mainModel, "vendor/next", "accepted main-model editor publishes the live config");
+    assert.equal(session.data.model, "vendor/next", "accepted main-model editor reaches the live session");
+    assert.deepEqual(session.data.route, nextRoute, "accepted main-model editor publishes the exact live session route");
+    assert.deepEqual(runtime.currentSessionRoute(), nextRoute, "accepted main-model editor publishes the exact live runtime route");
+    publicationOrder.push("publish");
+    assert.deepEqual(publicationOrder, ["persist", "publish"], "main-model publication persists before it publishes live state");
     assert.equal(stored.compressorModel, "vendor/compressor", "compressor external action reaches durable config");
     assert.deepEqual(stored.panelModels, ["vendor/main", "vendor/panel"], "panel external action reaches durable config");
     assert.equal(stored.transcriptionModel, "vendor/audio", "transcription external action reaches durable config");
