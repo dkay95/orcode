@@ -2641,20 +2641,36 @@ test("deadline and abort release authority ownership and block late publication"
       coordinator: () => fixture.coordinator(),
       now: Date.now,
     });
+    const deadlineAt = Date.now() + 2_000;
     const first = authority.withCredential({
       backendId: "openrouter",
       connectionId: CONNECTION_ID,
       credentialKind: "inference",
       purpose: "startup-inspect",
       environmentEligibility: "forbidden",
-      deadlineAt: Date.now() + 25,
+      deadlineAt,
       signal: new AbortController().signal,
     }, async () => "must-not-run");
-    await readReached;
+
+    const readEntrance = await Promise.race([
+      readReached.then(() => "reached" as const),
+      first.then(
+        () => "settled-before-read" as const,
+        () => "settled-before-read" as const,
+      ),
+      new Promise<"read-watchdog">((resolve) =>
+        setTimeout(() => resolve("read-watchdog"), 1_000)),
+    ]);
+    assert.equal(
+      readEntrance,
+      "reached",
+      "the fixture must enter the abort-ignoring read before testing its deadline",
+    );
 
     const firstSettlement = await Promise.race([
       first.then((result) => result.kind),
-      new Promise<"still-held">((resolve) => setTimeout(() => resolve("still-held"), 100)),
+      new Promise<"still-held">((resolve) =>
+        setTimeout(() => resolve("still-held"), Math.max(1, deadlineAt - Date.now()) + 1_000)),
     ]);
     assert.equal(firstSettlement, "stale");
 
