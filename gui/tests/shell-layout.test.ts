@@ -80,8 +80,8 @@ it("uses German chrome at the supported minimum", async () => {
   }
 });
 
-it("shows a non-mutating hint below 760 by 520", async () => {
-  setViewport(759, 519);
+it("shows a non-mutating hint only below the usable compact layout", async () => {
+  setViewport(359, 399);
   vi.stubGlobal("requestAnimationFrame", (callback: FrameRequestCallback) => window.setTimeout(() => callback(0), 0));
   vi.stubGlobal("cancelAnimationFrame", (id: number) => window.clearTimeout(id));
   const root = document.createElement("div");
@@ -108,7 +108,7 @@ it("does not retain a subminimum class across dispose and remount", async () => 
   root.id = "app";
   document.body.append(root);
 
-  setViewport(759, 519);
+  setViewport(359, 399);
   const first = mountDesktopWindow({ bridge: new FakeBridge(capabilitySnapshot()), root });
   expect(root.classList.contains("shell-too-small")).toBe(true);
   first.dispose();
@@ -121,4 +121,61 @@ it("does not retain a subminimum class across dispose and remount", async () => 
   } finally {
     second.dispose();
   }
+});
+
+it("keeps navigation recoverable in a compact window without losing a draft", async () => {
+  setViewport(648, 808);
+  vi.stubGlobal("requestAnimationFrame", (callback: FrameRequestCallback) => window.setTimeout(() => callback(0), 0));
+  vi.stubGlobal("cancelAnimationFrame", (id: number) => window.clearTimeout(id));
+  const root = document.createElement("div"); root.id = "app"; document.body.append(root);
+  const bridge = new FakeBridge(capabilitySnapshot());
+  const mount = mountDesktopWindow({ bridge, root });
+  try {
+    await vi.waitFor(() => expect(root.querySelector("textarea")).not.toBeNull());
+    const field = root.querySelector("textarea")!;
+    field.value = "Mein unverlierbarer Entwurf";
+    field.dispatchEvent(new InputEvent("input", { bubbles: true }));
+    const toggle = root.querySelector<HTMLButtonElement>(".navigation-toggle")!;
+    expect(toggle).not.toBeNull();
+    expect(toggle.getAttribute("aria-expanded")).toBe("false");
+    expect(root.querySelector<HTMLElement>(".side")!.hidden).toBe(true);
+    expect(root.querySelector(".size-hint")).toBeNull();
+    const before = bridge.requests.length;
+    toggle.click();
+    await vi.waitFor(() => expect(root.querySelector<HTMLElement>(".side")!.hidden).toBe(false));
+    const close = root.querySelector<HTMLButtonElement>(".navigation-close")!;
+    expect(document.activeElement).toBe(close);
+    expect(root.querySelector<HTMLElement>(".main")!.inert).toBe(true);
+    close.dispatchEvent(new KeyboardEvent("keydown", { key: "Tab", shiftKey: true, bubbles: true }));
+    expect(document.activeElement?.textContent).toContain("Einstellungen");
+    document.activeElement!.dispatchEvent(new KeyboardEvent("keydown", { key: "Tab", bubbles: true }));
+    expect(document.activeElement).toBe(close);
+    expect(root.querySelector(".side")!.textContent).toContain("Einstellungen");
+    root.querySelector<HTMLButtonElement>(".navigation-shade")!.click();
+    await vi.waitFor(() => expect(toggle.getAttribute("aria-expanded")).toBe("false"));
+    expect(field.value).toBe("Mein unverlierbarer Entwurf");
+    expect(bridge.requests).toHaveLength(before);
+    toggle.click();
+    root.querySelector<HTMLButtonElement>(".newchat")!.focus();
+    document.activeElement!.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+    expect(toggle.getAttribute("aria-expanded")).toBe("false");
+    expect(document.activeElement).toBe(toggle);
+    expect(root.querySelector<HTMLElement>(".main")!.inert).toBe(false);
+    expect(field.value).toBe("Mein unverlierbarer Entwurf");
+  } finally { mount.dispose(); }
+});
+
+it("opens changes only on request and renders a single compact brand", async () => {
+  setViewport(1440, 900);
+  vi.stubGlobal("requestAnimationFrame", (callback: FrameRequestCallback) => window.setTimeout(() => callback(0), 0));
+  vi.stubGlobal("cancelAnimationFrame", (id: number) => window.clearTimeout(id));
+  const root = document.createElement("div"); root.id = "app"; document.body.append(root);
+  const mount = mountDesktopWindow({ bridge: new FakeBridge(capabilitySnapshot()), root });
+  try {
+    await vi.waitFor(() => expect(root.querySelector("textarea")).not.toBeNull());
+    expect(root.querySelector<HTMLElement>(".workbench-panel")!.hidden).toBe(true);
+    expect(root.querySelectorAll('img[data-brand="route-core"]')).toHaveLength(1);
+    root.querySelector<HTMLButtonElement>(".workbench-toggle")!.click();
+    await vi.waitFor(() => expect(root.querySelector<HTMLElement>(".workbench-panel")!.hidden).toBe(false));
+  } finally { mount.dispose(); }
 });

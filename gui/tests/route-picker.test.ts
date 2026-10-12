@@ -122,15 +122,17 @@ describe("the shared canonical route picker", () => {
       { purpose: "main", providers: [provider([only])], routes: [only], canGoBack: false },
       { choose, cancel: () => {} },
     );
-    const option = root.querySelector<HTMLButtonElement>("[role='option']")!;
+    const option = root.querySelector<HTMLButtonElement>("button.route-option")!;
     const confirm = byText(root, "Auswählen");
 
-    expect(option.getAttribute("aria-selected")).toBe("false");
+    expect(root.querySelector(".route-picker-list")?.getAttribute("role")).toBe("group");
+    expect(option.getAttribute("role")).toBeNull();
+    expect(option.getAttribute("aria-pressed")).toBe("false");
     expect(confirm.disabled).toBe(true);
     expect(choose).not.toHaveBeenCalled();
 
     option.click();
-    expect(option.getAttribute("aria-selected")).toBe("true");
+    expect(option.getAttribute("aria-pressed")).toBe("true");
     expect(confirm.disabled).toBe(false);
     expect(choose).not.toHaveBeenCalled();
 
@@ -140,8 +142,8 @@ describe("the shared canonical route picker", () => {
   });
 
   it.each([
-    ["lead", "Lead-Modell und Konto wählen"],
-    ["challenger", "Challenger-Modell und Konto wählen"],
+    ["lead", "Coding-Modell wählen"],
+    ["challenger", "Prüfmodell wählen"],
   ] as const)("names the explicit %s role before any model is selected", (purpose, heading) => {
     const only = route();
     const choose = vi.fn();
@@ -152,9 +154,149 @@ describe("the shared canonical route picker", () => {
 
     expect(root.querySelector("h2")?.textContent).toBe(heading);
     expect(root.textContent).toContain("Provider, Konto und Modell bewusst auswählen.");
-    expect(root.querySelector("[role='option']")?.getAttribute("aria-selected")).toBe("false");
+    expect(root.querySelector("button.route-option")?.getAttribute("aria-pressed")).toBe("false");
     expect(byText(root, "Auswählen").disabled).toBe(true);
     expect(choose).not.toHaveBeenCalled();
+  });
+
+  it("keeps model identity, cost and policy visible while technical facts stay in independent native details", () => {
+    const only = route();
+    const choose = vi.fn();
+    const root = routePicker(
+      { purpose: "main", providers: [provider([only])], routes: [only], canGoBack: false },
+      { choose, cancel: () => {} },
+    );
+    const option = root.querySelector<HTMLButtonElement>("button.route-option")!;
+    const details = root.querySelector<HTMLDetailsElement>("details");
+
+    expect(option.textContent).toContain("Claude Sonnet 4");
+    expect(option.textContent).toContain("OpenRouter · Eigentümerkonto");
+    expect(option.textContent).toContain("Persönliches Konto");
+    expect(option.textContent).toContain("Abrechnung nach Nutzung");
+    expect(option.textContent).toContain("Provider-Richtlinie");
+    expect(option.textContent).not.toContain("anthropic/claude-sonnet-4");
+    expect(option.textContent).not.toContain("Denkmodus unterstützt");
+    expect(option.querySelector("button, details, summary, input")).toBeNull();
+    expect(details).not.toBeNull();
+    expect(details?.open).toBe(false);
+    expect(details?.textContent).toContain("anthropic/claude-sonnet-4");
+    expect(details?.textContent).toContain("Denkmodus unterstützt");
+    expect(details?.textContent).toContain("Dateiänderungen");
+    expect(details?.querySelector("summary")?.textContent).toContain("Technische Details");
+
+    details!.querySelector("summary")!.click();
+    expect(details!.open).toBe(true);
+    expect(option.getAttribute("aria-pressed")).toBe("false");
+    expect(byText(root, "Auswählen").disabled).toBe(true);
+    expect(choose).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["sonnet", ["Claude Sonnet 4"]],
+    ["  kimi code  ", ["Kimi K2"]],
+    ["geschäftlich", ["Basic"]],
+  ])("filters visible choices by model, canonical provider or account name for %s without selecting", (term, names) => {
+    const sonnet = route();
+    const basic = route({ handle: "route-basic", displayName: "Basic", accountLabel: "Geschäftlich" });
+    const kimi = route({ handle: "route-kimi", displayName: "Kimi K2", accountLabel: "Mitgliedschaft" });
+    const choose = vi.fn();
+    const root = routePicker(
+      {
+        purpose: "main",
+        providers: [provider([sonnet, basic]), provider([kimi], { providerLabel: "Kimi Code" })],
+        routes: [sonnet, basic, kimi],
+        canGoBack: false,
+      },
+      { choose, cancel: () => {} },
+    );
+    const search = root.querySelector<HTMLInputElement>("input[type='search']");
+    expect(search).not.toBeNull();
+    expect(search!.getAttribute("aria-label")).toBe("Modelle, Provider oder Konten suchen");
+    search!.value = term;
+    search!.dispatchEvent(new Event("input", { bubbles: true }));
+
+    const visibleOptions = [...root.querySelectorAll<HTMLElement>("button.route-option")]
+      .filter((option) => !option.closest("[hidden]"));
+    expect(visibleOptions.map((option) => option.querySelector(".route-name")?.textContent)).toEqual(names);
+    expect(visibleOptions.every((option) => option.getAttribute("aria-pressed") === "false")).toBe(true);
+    expect(byText(root, "Auswählen").disabled).toBe(true);
+    expect(choose).not.toHaveBeenCalled();
+  });
+
+  it("clears a selection hidden by search and explains the empty result without confirming a route", () => {
+    const only = route();
+    const choose = vi.fn();
+    const root = routePicker(
+      { purpose: "main", providers: [provider([only])], routes: [only], canGoBack: false },
+      { choose, cancel: () => {} },
+    );
+    const option = root.querySelector<HTMLButtonElement>("button.route-option")!;
+    option.click();
+    expect(byText(root, "Auswählen").disabled).toBe(false);
+
+    const search = root.querySelector<HTMLInputElement>("input[type='search']");
+    expect(search).not.toBeNull();
+    search!.value = "no matching model";
+    search!.dispatchEvent(new Event("input", { bubbles: true }));
+
+    expect(option.closest("[hidden]")).not.toBeNull();
+    expect(root.querySelector("[role='status']")?.textContent).toBe("Keine Modelle passen zur Suche.");
+    expect(root.querySelector("[role='status']")?.closest("[hidden]")).toBeNull();
+    expect(option.getAttribute("aria-pressed")).toBe("false");
+    expect(byText(root, "Auswählen").disabled).toBe(true);
+    byText(root, "Auswählen").click();
+    expect(choose).not.toHaveBeenCalled();
+
+    search!.value = "";
+    search!.dispatchEvent(new Event("input", { bubbles: true }));
+    expect(option.closest("[hidden]")).toBeNull();
+    expect(option.getAttribute("aria-pressed")).toBe("false");
+    expect(byText(root, "Auswählen").disabled).toBe(true);
+  });
+
+  it("keeps keyboard navigation within visible runnable choices and requires a separate confirmation", () => {
+    const first = route();
+    const hidden = route({ handle: "route-basic", displayName: "Basic" });
+    const disabled = route({
+      handle: "route-disabled-sonnet",
+      displayName: "Claude Sonnet unavailable",
+      disabled: { code: "account-limit-reached", label: "Kontolimit erreicht" },
+    });
+    const second = route({ handle: "route-second-sonnet", displayName: "Claude Sonnet second" });
+    const choose = vi.fn();
+    const root = routePicker(
+      { purpose: "main", providers: [provider([first, hidden, disabled, second])], routes: [first, hidden, disabled, second], canGoBack: false },
+      { choose, cancel: () => {} },
+    );
+    document.body.append(root);
+    const search = root.querySelector<HTMLInputElement>("input[type='search']");
+    expect(search).not.toBeNull();
+    search!.value = "sonnet";
+    search!.dispatchEvent(new Event("input", { bubbles: true }));
+    const choices = root.querySelectorAll<HTMLButtonElement>("button.route-option");
+    choices[0]!.focus();
+    choices[0]!.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowDown", bubbles: true }));
+
+    expect(document.activeElement).toBe(choices[3]);
+    expect(choices[3]!.getAttribute("aria-pressed")).toBe("true");
+    expect(choices[1]!.getAttribute("aria-pressed")).toBe("false");
+    expect(choices[2]!.getAttribute("aria-pressed")).toBe("false");
+    expect(choose).not.toHaveBeenCalled();
+    byText(root, "Auswählen").click();
+    expect(choose).toHaveBeenCalledWith("route-second-sonnet");
+    root.remove();
+  });
+
+  it("explains an unrunnable route even without a provider-supplied disabled reason", () => {
+    const unavailable = route({ runnable: false });
+    const root = routePicker(
+      { purpose: "main", providers: [provider([unavailable])], routes: [unavailable], canGoBack: false },
+      { choose: () => {}, cancel: () => {} },
+    );
+
+    expect(root.querySelector<HTMLButtonElement>("button.route-option")!.disabled).toBe(true);
+    expect(root.querySelector("button.route-option")?.textContent).toContain("Nicht verfügbar");
+    expect(root.querySelector("details summary")).not.toBeNull();
   });
 
   it("keeps a canonically disabled route visible and wholly inert", () => {
@@ -172,7 +314,7 @@ describe("the shared canonical route picker", () => {
       { purpose: "main", providers: [provider([disabled])], routes: [disabled], canGoBack: true },
       { choose, back: () => {}, cancel: () => {} },
     );
-    const option = root.querySelector<HTMLButtonElement>("[role='option']")!;
+    const option = root.querySelector<HTMLButtonElement>("button.route-option")!;
 
     expect(option.getAttribute("aria-disabled")).toBe("true");
     expect(option.disabled).toBe(true);

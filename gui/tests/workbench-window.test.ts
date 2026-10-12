@@ -114,14 +114,16 @@ test("inspector uses engine events, preserves open details during streaming, and
 
 test("inspector remains recoverable; undo and busy actions follow engine state", async () => {
   const bridge = await openWindow();
-  await vi.waitFor(() => expect(button("Arbeitsstand")).toBeDefined());
+  await vi.waitFor(() => expect(button("Änderungen")).toBeDefined());
   expect(button("Zurücknehmen").disabled).toBe(true);
   bridge.snapshot(true);
   await vi.waitFor(() => expect(button("Zurücknehmen").disabled).toBe(false));
-  button("Arbeitsstand").click();
-  await vi.waitFor(() => expect(button("Arbeitsstand").getAttribute("aria-expanded")).toBe("false"));
-  button("Arbeitsstand").click();
-  await vi.waitFor(() => expect(button("Arbeitsstand").getAttribute("aria-expanded")).toBe("true"));
+  expect(button("Änderungen").getAttribute("aria-expanded")).toBe("false");
+  button("Änderungen").click();
+  await vi.waitFor(() => expect(button("Änderungen").getAttribute("aria-expanded")).toBe("true"));
+  button("Änderungen").click();
+  await vi.waitFor(() => expect(button("Änderungen").getAttribute("aria-expanded")).toBe("false"));
+  button("Änderungen").click();
   button("Prüfen").click();
   await vi.waitFor(() => expect(bridge.requests.filter(({ t }) => t === "command")).toEqual([
     { t: "command", raw: "/verify now", draft: "" },
@@ -148,7 +150,7 @@ test("a pending task command allows interjection once the engine reports an acti
   button("Plan erstellen").click();
   bridge.emit("run", { event: { type: "run-start", model: "fixture" } });
   await draft("Bitte auch den Fehlerfall beachten");
-  expect(button("Einwerfen").disabled).toBe(false); button("Einwerfen").click();
+  expect(button("Ergänzen").disabled).toBe(false); button("Ergänzen").click();
   await vi.waitFor(() => expect(bridge.requests).toContainEqual({ t: "interject", text: "Bitte auch den Fehlerfall beachten" }));
   resolve({});
 });
@@ -162,5 +164,47 @@ test("a deferred inspector close cannot steal focus from a remounted window", as
   vi.stubGlobal("requestAnimationFrame", (callback: FrameRequestCallback) => window.setTimeout(() => callback(0), 0));
   await openWindow();
   callbacks.at(-1)!(0);
-  expect(document.activeElement).not.toBe(button("Arbeitsstand"));
+  expect(document.activeElement).not.toBe(button("Änderungen"));
+});
+
+test("keeps secondary actions in an explicit menu and starts only the owner's written task", async () => {
+  const bridge = await openWindow();
+  const more = document.querySelector<HTMLDetailsElement>(".composer-actions")!;
+  expect(more).not.toBeNull();
+  expect(more.open).toBe(false);
+  expect(more.querySelector("summary")?.textContent).toBe("Weitere Aktionen");
+  expect(more.contains(button("Plan erstellen"))).toBe(true);
+  expect(more.contains(button("Mit zwei Modellen"))).toBe(true);
+  expect(more.querySelector('button[aria-label="Plan erstellen"]')).toBe(button("Plan erstellen"));
+  expect(more.querySelector('button[aria-label="Mit zwei Modellen"]')).toBe(button("Mit zwei Modellen"));
+  expect(more.querySelector('button[aria-label="Befehle"]')).toBe(button("Befehle"));
+  expect(button("Aufgabe starten").disabled).toBe(true);
+  await draft("Login verständlicher machen");
+  expect(button("Aufgabe starten").disabled).toBe(false);
+  button("Aufgabe starten").click();
+  await vi.waitFor(() => expect(bridge.requests).toContainEqual({ t: "submit", text: "Login verständlicher machen" }));
+  expect(bridge.requests.some(({ t }) => /route\.select|model\.select/.test(String(t)))).toBe(false);
+});
+
+test("preserves the opened status disclosure and its keyboard focus through live updates", async () => {
+  const bridge = await openWindow();
+  const details = document.querySelector<HTMLDetailsElement>(".status-details")!;
+  const summary = details.querySelector("summary")!;
+  details.open = true; summary.focus();
+  bridge.emit("status", { text: "Werkzeug läuft", busy: true });
+  await vi.waitFor(() => expect(document.querySelector(".statusbar")?.textContent).toContain("Werkzeug läuft"));
+  expect(document.querySelector(".status-details")).toBe(details);
+  expect(details.open).toBe(true);
+  expect(document.activeElement).toBe(summary);
+});
+
+test("keeps the secondary-action disclosure mounted while draft availability changes", async () => {
+  await openWindow();
+  const menu = document.querySelector<HTMLDetailsElement>(".composer-actions")!;
+  const summary = menu.querySelector("summary")!;
+  menu.open = true; summary.focus();
+  await draft("Mein neuer Entwurf");
+  expect(document.querySelector(".composer-actions")).toBe(menu);
+  expect(menu.open).toBe(true);
+  expect(document.activeElement).toBe(summary);
 });

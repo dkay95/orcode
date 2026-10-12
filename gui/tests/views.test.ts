@@ -19,6 +19,7 @@ import {
   crossPanel,
   crossPreflightPanel,
   renderBlock,
+  statusBar,
   type StreamHandlers,
 } from "../src/views.js";
 
@@ -438,9 +439,9 @@ describe("the sidebar", () => {
     const side = sidebar([row], acted, options);
     const item = side.querySelector<HTMLElement>(".chatitem")!;
     expect(item.textContent).toContain("Settings-Bug");
-    expect(item.textContent).toContain("1h ago");
-    expect(item.textContent).toContain("$0.006");
-    expect(item.textContent).toContain("qwen3.8-max");
+    expect(item.textContent).not.toContain("qwen3.8-max");
+    expect(item.textContent).not.toContain("$0.006");
+    expect(item.title).toContain(row.detail);
     item.click();
     expect(acted.openChat).toHaveBeenCalledWith("c1");
   });
@@ -580,7 +581,10 @@ describe("the chat header", () => {
     expect(head.textContent).toContain("Claude Sonnet 4 · Eigentümerkonto");
     expect(head.textContent).not.toContain("legacy/status-model-must-not-render");
     expect(head.textContent).not.toContain("private-route-handle");
-    button(head, "Modell/Konto · Ändern").click();
+    const picker = head.querySelector<HTMLButtonElement>(".route-change")!;
+    expect(picker.contains(head.querySelector(".route-current"))).toBe(true);
+    expect(head.querySelectorAll(".route-change")).toHaveLength(1);
+    picker.click();
     expect(pickRoute).toHaveBeenCalledExactlyOnceWith("chat");
   });
 
@@ -607,6 +611,18 @@ describe("the chat header", () => {
 
     expect(head.querySelector(".route-change")).toBeNull();
   });
+});
+
+it("keeps technical chat facts in a disclosure while connection warnings stay visible", () => {
+  const bar = statusBar({ approval: "ask", model: "owner/model", chat: "Chat", folder: "/private/project",
+    today: null, session: "Kosten unbekannt", balance: null, balanceLow: false, routeConnected: false }, "Bereit", false);
+  const details = bar.querySelector("details")!;
+  expect(details).not.toBeNull();
+  expect(details.open).toBe(false);
+  expect(details.textContent).toContain("owner/model");
+  expect(details.textContent).toContain("Kosten unbekannt");
+  expect(bar.querySelector(".warn")?.closest("details")).toBeNull();
+  expect(bar.querySelector(".warn")?.textContent).toContain("kein Anbieter verbunden");
 });
 
 describe("the stream after a run has ended", () => {

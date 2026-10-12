@@ -257,7 +257,12 @@ let composerSlot!: HTMLElement;
 let statusSlot!: HTMLElement;
 let sizeHint!: HTMLElement;
 let workbenchPanel!: ReturnType<typeof createWorkbenchPanel>;
-let inspectorOpen = true;
+let inspectorOpen = false;
+let navigationOpen = false;
+let navigationToggle!: HTMLButtonElement;
+let navigationShade!: HTMLButtonElement;
+let workspaceName!: HTMLElement;
+let toolbarBrand!: HTMLElement;
 let workbenchRequestPending = false;
 let workbenchDraftCapture: { text: string; editGeneration: number } | null = null;
 
@@ -305,23 +310,39 @@ export function mountDesktopWindow(
   bridgeHandlers = createBridgeHandlers(generation);
   root = nextRoot;
   root.classList.add("workbench-shell");
-  inspectorOpen = window.innerWidth >= 1180;
+  inspectorOpen = false;
+  navigationOpen = window.innerWidth >= 900;
   document.documentElement.lang = "de";
   overlayManager = new OverlayManager(root, document.body);
 
-  sideNode = el("aside", { class: "side" });
+  sideNode = el("aside", { class: "side", id: "workspace-navigation" });
   mainPane = el("section", { class: "main" });
+  navigationToggle = el("button", {
+    class: "iconbtn navigation-toggle", type: "button", text: "Projekt und Chats",
+    "aria-controls": "workspace-navigation", "aria-expanded": String(navigationOpen),
+  }) as HTMLButtonElement;
+  navigationToggle.addEventListener("click", () => setNavigationOpen(!navigationOpen));
+  workspaceName = el("span", { class: "workspace-name" });
+  toolbarBrand = routeCoreBrand("chat-header");
+  toolbarBrand.hidden = true;
+  const toolbar = el("nav", { class: "workspace-toolbar", "aria-label": "Arbeitsbereich" }, [
+    navigationToggle, workspaceName, el("span", { class: "spacer" }), toolbarBrand,
+  ]);
+  navigationShade = el("button", {
+    class: "navigation-shade", type: "button", "aria-label": "Navigation schließen", tabindex: "-1",
+  }) as HTMLButtonElement;
+  navigationShade.addEventListener("click", () => setNavigationOpen(false, true));
   headSlot = el("div");
   contentSlot = el("div", { class: "content" });
   composerSlot = el("div");
   statusSlot = el("div");
   sizeHint = el("div", { class: "size-hint", role: "status", text: "Fenster vergrößern" });
-  mainPane.append(headSlot, contentSlot, composerSlot, statusSlot);
+  mainPane.append(toolbar, headSlot, contentSlot, composerSlot, statusSlot);
   workbenchPanel = createWorkbenchPanel({
     command: (raw) => void runWorkbenchCommand(raw),
     close: () => setInspectorOpen(false, true),
   });
-  root.replaceChildren(sideNode, mainPane, workbenchPanel.node);
+  root.replaceChildren(sideNode, mainPane, workbenchPanel.node, navigationShade);
   updateShellLayout();
   window.addEventListener("resize", updateShellLayout);
 
@@ -351,7 +372,7 @@ export function mountDesktopWindow(
       window.removeEventListener("resize", updateShellLayout);
       uninstallInputHandlers();
       nextRoot.replaceChildren();
-      nextRoot.classList.remove("workbench-shell", "workbench-inspector-open");
+      nextRoot.classList.remove("workbench-shell", "workbench-inspector-open", "navigation-open", "navigation-closed", "shell-too-small");
       resetDesktopWindowState();
     },
   };
@@ -389,7 +410,8 @@ function resetDesktopWindowState(): void {
   pendingCommandDraft = null;
   workbenchRequestPending = false;
   workbenchDraftCapture = null;
-  inspectorOpen = true;
+  inspectorOpen = false;
+  navigationOpen = false;
   forecast = null;
   forecastRequestGeneration += 1;
   openChatId = null;
@@ -415,11 +437,41 @@ function resetDesktopWindowState(): void {
 function updateShellLayout(): void {
   if (!mounted) return;
   const layout: ShellLayoutState = {
-    tooSmall: window.innerWidth < 760 || window.innerHeight < 520,
+    tooSmall: window.innerWidth < 360 || window.innerHeight < 400,
   };
   root.classList.toggle("shell-too-small", layout.tooSmall);
   if (layout.tooSmall) root.append(sizeHint);
   else sizeHint.remove();
+  renderNavigation();
+}
+
+function renderNavigation(): void {
+  const compactOpen = navigationOpen && window.innerWidth < 900;
+  sideNode.hidden = !navigationOpen;
+  sideNode.setAttribute("role", compactOpen ? "dialog" : "navigation");
+  if (compactOpen) sideNode.setAttribute("aria-modal", "true");
+  else sideNode.removeAttribute("aria-modal");
+  const close = sideNode.querySelector<HTMLButtonElement>(".navigation-close");
+  if (close) close.hidden = window.innerWidth >= 900;
+  mainPane.inert = compactOpen;
+  workbenchPanel.node.inert = compactOpen;
+  root.classList.toggle("navigation-open", navigationOpen);
+  root.classList.toggle("navigation-closed", !navigationOpen);
+  navigationToggle.setAttribute("aria-expanded", String(navigationOpen));
+  navigationShade.hidden = !navigationOpen || window.innerWidth >= 900;
+}
+
+function setNavigationOpen(open: boolean, restoreFocus = false): void {
+  navigationOpen = open;
+  renderNavigation();
+  if (open && window.innerWidth < 900) {
+    sideNode.querySelector<HTMLButtonElement>(".navigation-close")?.focus();
+  }
+  if (restoreFocus) navigationToggle.focus();
+}
+
+function closeCompactNavigation(): void {
+  if (window.innerWidth < 900) setNavigationOpen(false, true);
 }
 
 /* --- frames ------------------------------------------------------------- */
@@ -1242,6 +1294,11 @@ function render(): void {
   const segments = ready && status ? statusSegments(status, home) : null;
 
   renderSidebar(segments, status, ready);
+  renderNavigation();
+  const workspace = status?.workspace ?? "";
+  workspaceName.textContent = workspace.replace(/[/\\]+$/, "").split(/[/\\]/).pop() || "Kein Projekt geöffnet";
+  workspaceName.title = workspace;
+  toolbarBrand.hidden = desktop.snapshot?.appearance.showHeaderMark !== true;
   const showInspector = ready && !surface.settingsOpen && inspectorOpen;
   root.classList.toggle("workbench-inspector-open", showInspector);
   workbenchPanel.node.hidden = !showInspector;
@@ -1281,7 +1338,6 @@ function render(): void {
         ? document.activeElement.selectionStart
         : null;
       const header = settingsHeader(settings, { dispatch: dispatchSettings, close: closeSettings });
-      if (showSettingsHeaderMark) header.append(routeCoreBrand("settings-header"));
       replace(headSlot, [header]);
       replace(contentSlot, [
         settingsContent(
@@ -1380,20 +1436,20 @@ function renderSidebar(
   const next = sidebar(
     rows,
     {
-      openChat: (id) => surface.run(() => void openChat(id)),
-      newChat: () => surface.run(() => void newChat()),
+      openChat: (id) => { closeCompactNavigation(); surface.run(() => void openChat(id)); },
+      newChat: () => { closeCompactNavigation(); surface.run(() => void newChat()); },
       // Through the one command path, so `/provider setup`'s asks and
       // `/folder`'s D4 confirm arrive as the asks they already are.
-      run: dispatchCommand,
-      connect: () => openRoutePicker("chat"),
-      openSettings: () => void openSettings(),
+      run: (command) => { closeCompactNavigation(); dispatchCommand(command); },
+      connect: () => { closeCompactNavigation(); openRoutePicker("chat"); },
+      openSettings: () => { closeCompactNavigation(); void openSettings(); },
     },
     {
       activeChatId: status?.chatId ?? null,
       total: chats.length,
       folder: segments?.folder ?? "",
       workspace: status?.workspace ?? "",
-      showBrand: desktop.snapshot?.appearance.showHeaderMark === true,
+      showBrand: false,
       setupNeeded,
       settingsOpen: surface.settingsOpen,
       // Review i3: before the engine is ready there is nothing behind any of
@@ -1402,13 +1458,18 @@ function renderSidebar(
       ready,
     },
   );
+  const close = el("button", {
+    class: "iconbtn navigation-close", type: "button", text: "Navigation schließen",
+  });
+  close.addEventListener("click", () => setNavigationOpen(false, true));
+  next.prepend(close);
   sideNode.replaceWith(next);
   sideNode = next;
+  sideNode.id = "workspace-navigation";
 }
 
 function renderChatHead(segments: StatusSegments | null, title: string): void {
-  const showHeaderMark = chat.blocks.length > 0
-    && desktop.snapshot?.appearance.showHeaderMark === true;
+  const showHeaderMark = false;
   const activeRoute = desktop.snapshot?.activeRoute ?? null;
   const routeRunnable = desktop.snapshot?.routeRunnable ?? null;
   const signature = JSON.stringify([
@@ -1429,7 +1490,7 @@ function renderChatHead(segments: StatusSegments | null, title: string): void {
       showHeaderMark,
     );
   const toggle = el("button", {
-    class: "chip workbench-toggle", type: "button", text: "Arbeitsstand",
+    class: "chip workbench-toggle", type: "button", text: "Änderungen",
     "aria-controls": "workbench-panel", "aria-expanded": String(inspectorOpen),
     title: "Änderungen und Ausführungen ein- oder ausblenden",
   });
@@ -1443,7 +1504,27 @@ function renderStatusBar(segments: StatusSegments | null, ready: boolean): void 
   const signature = JSON.stringify([segments, text, chat.status.busy]);
   if (signature === statusSignature) return;
   statusSignature = signature;
-  replace(statusSlot, [statusBar(segments, text, chat.status.busy)]);
+  const next = statusBar(segments, text, chat.status.busy);
+  const current = statusSlot.querySelector<HTMLElement>(".statusbar");
+  if (!current) { replace(statusSlot, [next]); return; }
+  const currentDetails = current.querySelector<HTMLDetailsElement>(".status-details");
+  const nextDetails = next.querySelector<HTMLDetailsElement>(".status-details");
+  if (currentDetails && nextDetails) {
+    const content = currentDetails.querySelector(".status-details-content")!;
+    content.replaceChildren(...nextDetails.querySelector(".status-details-content")!.childNodes);
+  }
+  syncControlChildren(current, [...next.children].map((node) =>
+    node === nextDetails && currentDetails ? currentDetails : node));
+}
+
+/** Update the chrome without detaching an owner's focused disclosure. */
+function syncControlChildren(parent: HTMLElement, nodes: readonly Element[]): void {
+  const keep = new Set(nodes);
+  for (const child of [...parent.children]) if (!keep.has(child)) child.remove();
+  nodes.forEach((node, index) => {
+    const position = parent.children.item(index);
+    if (position !== node) parent.insertBefore(node, position);
+  });
 }
 
 /**
@@ -1456,8 +1537,9 @@ function renderStatusBar(segments: StatusSegments | null, ready: boolean): void 
 function renderComposerBar(): void {
   const running = chat.runActive;
   const thinking = chat.reasoningLive;
-  const taskDisabled = workbenchBusy() || desktop.snapshot?.routeRunnable !== true || !composer.value.trim();
-  const signature = JSON.stringify([running, thinking, forecast, chat.attachments, taskDisabled, workbenchRequestPending]);
+  const hasDraft = Boolean(composer.value.trim());
+  const taskDisabled = workbenchBusy() || desktop.snapshot?.routeRunnable !== true || !hasDraft;
+  const signature = JSON.stringify([running, thinking, forecast, chat.attachments, hasDraft, taskDisabled, workbenchRequestPending]);
   if (signature === barSignature) return;
   barSignature = signature;
   composerBox.querySelector(".composer-attachments")?.remove();
@@ -1475,22 +1557,36 @@ function renderComposerBar(): void {
     composerBox.prepend(attachmentList);
   }
   const parts: HTMLElement[] = [];
+  const previousMenu = composerBar.querySelector<HTMLDetailsElement>(".composer-actions");
+  const more = previousMenu ?? el("details", { class: "composer-actions" }) as HTMLDetailsElement;
+  if (!previousMenu) more.append(el("summary", { text: "Weitere Aktionen" }));
+  const menu = more.querySelector<HTMLElement>(".composer-action-menu")
+    ?? el("div", { class: "composer-action-menu", "aria-label": "Zusätzliche Aufgabenaktionen" });
   for (const [label, raw, hint] of [
     ["Plan erstellen", "/architect", "Die Aufgabe erst planen – mit dem von dir gewählten Modell."],
     ["Mit zwei Modellen", "/cross", "Du wählst das Coding-Modell und das Prüfmodell selbst."],
   ] as const) {
-    const action = el("button", { class: "iconbtn task-action", type: "button", text: label,
-      title: !composer.value.trim() ? "Beschreibe zuerst deine Aufgabe." : hint, disabled: taskDisabled });
-    action.addEventListener("click", () => void startTaskAction(raw));
-    parts.push(action);
+    let action = menu.querySelector<HTMLButtonElement>(`[data-task-command="${raw}"]`);
+    if (!action) {
+      action = el("button", { class: "iconbtn task-action", type: "button", text: label,
+        "data-task-command": raw, "aria-label": label }) as HTMLButtonElement;
+      action.addEventListener("click", () => { more.open = false; void startTaskAction(raw); });
+      menu.append(action);
+    }
+    action.title = !hasDraft ? "Beschreibe zuerst deine Aufgabe." : hint;
+    action.disabled = taskDisabled;
   }
+  if (!menu.querySelector(".palette-action")) {
+    const palette = el("button", { class: "iconbtn palette-action", type: "button", text: "Befehle", "aria-label": "Befehle", title: "Alle Befehle durchsuchen (⌘P)" });
+    palette.addEventListener("click", () => { more.open = false; void openPalette(); });
+    menu.append(palette);
+  }
+  if (!menu.isConnected) more.append(menu);
+  parts.push(more);
   // Only where the terminal shows it: on the composer, with a draft, and
   // never while a run is already spending. `null` is silence, not zero.
   if (!running && forecast) parts.push(el("span", { class: "forecast", text: forecast }));
   parts.push(el("span", { class: "spacer" }));
-  const palette = el("button", { class: "iconbtn", type: "button", text: "⌘P Befehle" });
-  palette.addEventListener("click", () => void openPalette());
-  parts.push(palette);
   if (running) {
     const stop = el("button", {
       class: "iconbtn danger",
@@ -1503,12 +1599,12 @@ function renderComposerBar(): void {
   const send = el("button", {
     class: "send",
     type: "button",
-    text: running ? "Einwerfen" : "Senden",
-    disabled: workbenchRequestPending && !running,
+    text: running ? "Ergänzen" : "Aufgabe starten",
+    disabled: !hasDraft || (!running && (workbenchRequestPending || desktop.snapshot?.routeRunnable !== true)),
   });
   send.addEventListener("click", () => void submit());
   parts.push(send);
-  replace(composerBar, parts);
+  syncControlChildren(composerBar, parts);
 }
 
 function renderSlashCompletion(): void {
@@ -1755,13 +1851,14 @@ function renderStream(): void {
   // An empty chat says so rather than showing a blank pane that could be
   // mistaken for a transcript that failed to load.
   if (chat.blocks.length === 0) {
-    const showLargeLogo = desktop.snapshot?.appearance.showLargeLogo === true;
+    const showLargeLogo = desktop.snapshot?.appearance.showLargeLogo === true
+      && desktop.snapshot?.appearance.showHeaderMark !== true;
     if (emptyAppearanceSignature !== showLargeLogo) {
       emptyAppearanceSignature = showLargeLogo;
       replace(emptyStream, [
         showLargeLogo ? routeCoreBrand("empty") : null,
-        el("h1", { text: "Was bauen wir als Nächstes?" }),
-        el("p", { text: "Beschreibe deine Aufgabe. Sende sie direkt, erstelle zuerst einen Plan oder wähle zwei Modelle für Coding und Review." }),
+        el("h1", { class: "empty-start-title", text: "Was möchtest du bauen?" }),
+        el("p", { class: "empty-start-help", text: "Wähle dein Modell und beschreibe die Aufgabe. Änderungen und Ausgaben findest du anschließend unter Änderungen." }),
       ]);
     }
     if (!emptyStream.isConnected) streamRoot.append(emptyStream);
@@ -1847,11 +1944,15 @@ function renderOverlay(): void {
           ? `engine:${engine.phase}:${engine.failure?.code ?? ""}:${engine.exit?.code ?? ""}:${engine.exit?.signal ?? ""}:${info?.pid ?? ""}`
           : null;
   if (key === overlayKey && overlayHandle?.element.isConnected !== false) return;
+  const closingOnboarding = key === null && overlayKey?.startsWith("onboarding:");
   const trigger = document.activeElement instanceof HTMLElement ? document.activeElement : null;
   overlayHandle?.close();
   overlayHandle = null;
   overlayKey = key;
   if (key === null) {
+    if (closingOnboarding && document.activeElement === document.body) {
+      (root.querySelector<HTMLElement>(".route-change") ?? composer)?.focus();
+    }
     onboardingTrigger = null;
     return;
   }
@@ -2083,6 +2184,32 @@ function typingSomewhere(target: EventTarget | null): boolean {
 
 function handleDocumentKeydown(event: KeyboardEvent): void {
   if (asks.current) return;
+  if (event.key === "Tab" && navigationOpen && window.innerWidth < 900 && !palette && !onboardingVisible) {
+    const buttons = [...sideNode.querySelectorAll<HTMLButtonElement>("button:not(:disabled)")];
+    const first = buttons[0];
+    const last = buttons.at(-1);
+    if (first && last && (event.shiftKey
+      ? document.activeElement === first || !sideNode.contains(document.activeElement)
+      : document.activeElement === last || !sideNode.contains(document.activeElement))) {
+      event.preventDefault();
+      (event.shiftKey ? last : first).focus();
+    }
+    return;
+  }
+  if (event.key === "Escape" && !palette && !onboardingVisible) {
+    if (navigationOpen && window.innerWidth < 900) {
+      event.preventDefault();
+      setNavigationOpen(false, true);
+      return;
+    }
+    const more = composerBar.querySelector<HTMLDetailsElement>(".composer-actions");
+    if (more?.open) {
+      event.preventDefault();
+      more.open = false;
+      more.querySelector("summary")?.focus();
+      return;
+    }
+  }
   // Ctrl+P is the palette's key in the terminal too (`ui/keymap.ts`), and
   // ⌘P is what this platform's hands reach for. It is never bound while a
   // question is open: a consent point owns the keyboard until it is answered.

@@ -168,7 +168,7 @@ describe("the canonical onboarding view", () => {
 
     expect(confirm.disabled).toBe(true);
     expect(dispatch).not.toHaveBeenCalled();
-    root.querySelector<HTMLButtonElement>("[role='option']")!.click();
+    root.querySelector<HTMLButtonElement>("button.route-option")!.click();
     expect(dispatch).not.toHaveBeenCalled();
     confirm.click();
     expect(dispatch).toHaveBeenCalledExactlyOnceWith({

@@ -58,8 +58,8 @@ function routeOwner(
 }
 
 function purposeHeading(purpose: RoutePickerPurpose): string {
-  if (purpose === "lead") return "Lead-Modell und Konto wählen";
-  if (purpose === "challenger") return "Challenger-Modell und Konto wählen";
+  if (purpose === "lead") return "Coding-Modell wählen";
+  if (purpose === "challenger") return "Prüfmodell wählen";
   return "Modell und Konto wählen";
 }
 
@@ -78,12 +78,25 @@ export function routePicker(
     text: "Provider, Konto und Modell bewusst auswählen.",
   }));
 
+  const search = el("input", {
+    class: "route-picker-search-input",
+    type: "search",
+    placeholder: "Modell, Provider oder Konto",
+    "aria-label": "Modelle, Provider oder Konten suchen",
+    autocomplete: "off",
+  });
+  card.append(el("label", { class: "route-picker-search" }, [
+    el("span", { text: "Modell suchen" }),
+    search,
+  ]));
+
   const list = el("div", {
     class: "route-picker-list",
-    role: "listbox",
+    role: "group",
     "aria-label": "Verfügbare Modelle und Konten",
   });
   const optionNodes: HTMLButtonElement[] = [];
+  const rows: { node: HTMLElement; searchText: string }[] = [];
   let selected: DesktopRouteCandidate | null = null;
 
   const confirm = el("button", {
@@ -94,9 +107,9 @@ export function routePicker(
   }) as HTMLButtonElement;
 
   const select = (candidate: DesktopRouteCandidate, node: HTMLButtonElement): void => {
-    if (!candidate.runnable || candidate.disabled) return;
+    if (!candidate.runnable || candidate.disabled || node.closest("[hidden]")) return;
     selected = candidate;
-    for (const option of optionNodes) option.setAttribute("aria-selected", option === node ? "true" : "false");
+    for (const option of optionNodes) option.setAttribute("aria-pressed", option === node ? "true" : "false");
     confirm.disabled = false;
   };
 
@@ -106,7 +119,7 @@ export function routePicker(
       const index = (from + delta * offset + optionNodes.length) % optionNodes.length;
       const candidate = options.routes[index];
       const node = optionNodes[index];
-      if (candidate?.runnable && !candidate.disabled && node) {
+      if (candidate?.runnable && !candidate.disabled && node && !rows[index]?.node.hidden) {
         node.focus();
         select(candidate, node);
         return;
@@ -118,30 +131,32 @@ export function routePicker(
     const owner = routeOwner(options.providers, candidate);
     const disabled = !candidate.runnable || candidate.disabled !== undefined;
     const facts: HTMLElement[] = [
-      el("span", { class: "route-provider", text: owner.providerLabel }),
-      el("span", { class: "route-account", text: candidate.accountLabel }),
-      el("strong", { class: "route-name", text: candidate.displayName }),
-      el("code", { class: "route-model-id", text: candidate.canonicalModelId }),
-      el("span", { class: "route-reasoning", text: REASONING_LABELS[candidate.reasoning] }),
-      el("span", {
-        class: "route-capabilities",
-        text: candidate.capabilities.map((capability) => CAPABILITY_LABELS[capability]).join(" · "),
-      }),
-      el("span", { class: "route-cost", text: candidate.cost.label }),
-      el("span", { class: "route-policy", text: candidate.dataPolicy.label }),
+      el("span", { class: "route-picker-primary" }, [
+        el("strong", { class: "route-name", text: candidate.displayName }),
+        el("span", { class: "route-picker-meta" }, [
+          el("span", { class: "route-provider", text: owner.providerLabel }),
+          " · ",
+          el("span", { class: "route-account", text: candidate.accountLabel }),
+        ]),
+      ]),
+      el("span", { class: "route-picker-facts" }, [
+        el("span", { class: "route-cost", text: candidate.cost.label }),
+        el("span", { class: "route-policy", text: candidate.dataPolicy.label }),
+      ]),
     ];
     if (candidate.disabled) {
       facts.push(el("span", { class: "route-disabled-label", text: candidate.disabled.label }));
       if (candidate.disabled.recoveryLabel) {
         facts.push(el("span", { class: "route-recovery-label", text: candidate.disabled.recoveryLabel }));
       }
+    } else if (!candidate.runnable) {
+      facts.push(el("span", { class: "route-disabled-label", text: "Nicht verfügbar" }));
     }
 
     const option = el("button", {
       class: `route-option${disabled ? " is-disabled" : ""}`,
       type: "button",
-      role: "option",
-      "aria-selected": "false",
+      "aria-pressed": "false",
       "aria-disabled": disabled ? "true" : undefined,
       disabled,
     }, facts) as HTMLButtonElement;
@@ -160,13 +175,52 @@ export function routePicker(
         }
       });
     }
-    list.append(option);
+    const details = el("details", { class: "route-picker-details" }, [
+      el("summary", {
+        text: "Technische Details",
+        "aria-label": `Technische Details zu ${candidate.displayName}`,
+      }),
+      el("div", { class: "route-picker-technical" }, [
+        el("code", { class: "route-model-id", text: candidate.canonicalModelId }),
+        el("span", { class: "route-reasoning", text: REASONING_LABELS[candidate.reasoning] }),
+        el("span", {
+          class: "route-capabilities",
+          text: candidate.capabilities.map((capability) => CAPABILITY_LABELS[capability]).join(" · "),
+        }),
+      ]),
+    ]);
+    const row = el("div", { class: `route-picker-row${disabled ? " is-disabled" : ""}` }, [option, details]);
+    rows.push({
+      node: row,
+      searchText: `${candidate.displayName} ${owner.providerLabel} ${candidate.accountLabel}`.toLocaleLowerCase("de"),
+    });
+    list.append(row);
   });
 
-  if (options.routes.length === 0) {
-    list.append(el("p", { class: "empty", text: "Keine Modelle verfügbar." }));
-  }
-  card.append(list);
+  const empty = el("p", {
+    class: "empty route-picker-empty",
+    role: "status",
+    text: "Keine Modelle verfügbar.",
+  });
+  empty.hidden = options.routes.length !== 0;
+  search.addEventListener("input", () => {
+    const term = search.value.trim().toLocaleLowerCase("de");
+    let visibleCount = 0;
+    rows.forEach((row, index) => {
+      row.node.hidden = !row.searchText.includes(term);
+      if (!row.node.hidden) visibleCount += 1;
+      if (row.node.hidden && options.routes[index]?.handle === selected?.handle) {
+        selected = null;
+        confirm.disabled = true;
+        for (const option of optionNodes) option.setAttribute("aria-pressed", "false");
+      }
+    });
+    empty.hidden = visibleCount !== 0;
+    empty.textContent = options.routes.length === 0
+      ? "Keine Modelle verfügbar."
+      : "Keine Modelle passen zur Suche.";
+  });
+  card.append(list, empty);
 
   const actions = el("div", { class: "actions route-picker-actions" });
   const cancel = el("button", {

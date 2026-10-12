@@ -14,7 +14,7 @@ import { composeCrossPanel } from "@core/cross-panel";
 import type { Block } from "./chat-model.js";
 import { routeCoreBrand } from "./brand.js";
 import { headerOf, readApprovalDiff, readDiff, renderDiffView } from "./diff.js";
-import { el, replace } from "./dom.js";
+import { el } from "./dom.js";
 import { messageMarkdown } from "./message-markdown.js";
 import type { EngineState } from "./engine-state.js";
 import { describeExit, describeExitCause, engineHeadline, exitConsequence } from "./engine-state.js";
@@ -48,7 +48,7 @@ export interface ChatHeadRouteState {
 
 export function chatHeader(
   title: string,
-  segments: StatusSegments | null,
+  _segments: StatusSegments | null,
   route: ChatHeadRouteState,
   handlers: ChatHeadHandlers,
   showHeaderMark = false,
@@ -57,16 +57,15 @@ export function chatHeader(
   head.append(el("span", { class: "title", text: title }));
   if (route.routeRunnable && route.activeRoute) {
     const account = route.activeRoute.accountLabel ?? route.activeRoute.providerLabel;
-    head.append(el("span", {
-      class: "chip route-current",
-      text: `${route.activeRoute.modelLabel} · ${account}`,
-      title: route.activeRoute.providerLabel,
-    }));
     const change = el("button", {
       class: "chip route-change",
       type: "button",
-      text: "Modell/Konto · Ändern",
-    });
+      "aria-label": `Modell und Konto ändern: ${route.activeRoute.modelLabel} · ${account}`,
+      title: route.activeRoute.providerLabel,
+    }, [
+      el("span", { class: "route-current", text: `${route.activeRoute.modelLabel} · ${account}` }),
+      el("span", { class: "route-change-hint", text: "Ändern" }),
+    ]);
     change.addEventListener("click", () => handlers.pickRoute("chat"));
     head.append(change);
   } else if (route.routeRunnable === false) {
@@ -79,13 +78,6 @@ export function chatHeader(
     head.append(choose);
   }
   head.append(el("span", { class: "spacer" }));
-  if (segments) {
-    // The figure is the engine's, through the shared `formatUsd`; only the
-    // words beside it are this window's.
-    head.append(el("span", { class: "chip" }, [
-      el("span", { class: "mono", text: segments.session }),
-    ]));
-  }
   if (showHeaderMark) head.append(routeCoreBrand("chat-header"));
   return head;
 }
@@ -99,48 +91,31 @@ export function statusBar(
   engineText: string,
   busy: boolean,
 ): HTMLElement {
-  const parts: HTMLElement[] = [];
+  const bar = el("footer", { class: "statusbar" });
   if (engineText) {
-    parts.push(el("span", { class: busy ? "busy" : "", text: engineText }));
+    bar.append(el("span", { class: busy ? "busy" : "", text: engineText }));
   }
   if (segments) {
-    parts.push(el("span", { text: segments.approval }));
-    parts.push(el("span", { class: "mono", text: segments.model }));
-    parts.push(el("span", { class: "mono", text: segments.folder }));
     if (segments.routeConnected === false) {
-      // The engine says there is no runnable route. Said in the status bar
-      // rather than as a modal — the owner decides when to connect.
-      parts.push(el("span", { class: "warn", text: "kein Anbieter verbunden" }));
+      bar.append(el("span", { class: "warn", text: "kein Anbieter verbunden" }));
     }
-  }
-  const bar = el("footer", { class: "statusbar" });
-  replace(bar, interleave(parts));
-  if (segments?.today || segments?.balance) {
+    if (segments.balanceLow) bar.append(el("span", { class: "warn", text: "wenig Guthaben" }));
     bar.append(el("span", { class: "spacer" }));
-    const right: HTMLElement[] = [];
-    if (segments.today) right.push(el("span", { class: "mono", text: segments.today }));
-    if (segments.balance) {
-      right.push(
-        el("span", {
-          class: segments.balanceLow ? "warn mono" : "mono",
-          text: segments.balanceLow
-            ? `${segments.balance} — wenig Guthaben`
-            : segments.balance,
-        }),
-      );
+    const details = el("details", { class: "status-details" });
+    const content = el("div", { class: "status-details-content" });
+    for (const [label, value] of [
+      ["Modell", segments.model], ["Freigaben", segments.approval],
+      ["Projekt", segments.folder], ["Kosten", segments.session],
+      ["Heute", segments.today], ["Guthaben", segments.balance],
+    ]) {
+      if (value) content.append(el("div", {}, [
+        el("strong", { text: `${label}: ` }), el("span", { text: value }),
+      ]));
     }
-    for (const node of interleave(right)) bar.append(node);
+    details.append(el("summary", { text: "Details" }), content);
+    bar.append(details);
   }
   return bar;
-}
-
-function interleave(parts: readonly HTMLElement[]): HTMLElement[] {
-  const out: HTMLElement[] = [];
-  parts.forEach((part, index) => {
-    if (index > 0) out.push(el("span", { class: "sep", text: "·" }));
-    out.push(part);
-  });
-  return out;
 }
 
 /* =========================================================================
@@ -397,21 +372,18 @@ export function renderBlock(block: Block, handlers: StreamHandlers): HTMLElement
     case "file-change": {
       // The engine's own reader, the terminal's own hunks. The counts on the
       // head line are the FILE's, from the event; the hunks are what fits.
-      const card = el("div", { class: "toolcard", "data-block": block.id });
+      const card = el("details", { class: "toolcard file-change-card", "data-block": block.id });
       card.append(
-        el("div", { class: "head", "data-static": "true" }, [
+        el("summary", { class: "head" }, [
           el("span", { class: "status-dot", "data-state": "ok" }),
-          el("span", { class: "name", text: block.tool || "Datei" }),
+          el("span", { class: "name", text: block.created ? "Neue Datei" : "Datei geändert" }),
           el("span", { class: "path mono", text: block.path }),
           el("span", { class: "meta" }, [
-            // The wire's own word for this state, in the slot the tool-state
-            // vocabulary lives in — a German `neu` beside an English
-            // `unverified` would blur the chrome/wire line for one label
-            // (review i2).
-            block.created ? el("span", { class: "badge", text: "created" }) : null,
             el("span", { class: "mono", text: `+${block.added} −${block.removed}` }),
+            el("span", { class: "tri" }),
           ]),
         ]),
+        el("div", { class: "diff-note", text: `Gemeldet durch ${block.tool || "Dateiwerkzeug"}` }),
         renderDiffView(
           readDiff(block.diff, {
             added: block.added,

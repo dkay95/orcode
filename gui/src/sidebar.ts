@@ -141,8 +141,6 @@ function chatItem(row: HubRow, active: boolean, ready: boolean, open: () => void
     if (facts.length > 0) facts.push(el("span", { text: "·" }));
     facts.push(node);
   };
-  if (row.cost) push(el("span", { class: "cost mono", text: row.cost }));
-  if (row.model) push(el("span", { text: row.model }));
   // A chat in ANOTHER folder: opening it re-roots the whole runtime, so the
   // row says which folder before it is clicked rather than after.
   if (row.folder) push(el("span", { class: "folder mono", text: row.folder }));
@@ -164,7 +162,6 @@ function chatItem(row: HubRow, active: boolean, ready: boolean, open: () => void
     [
       el("div", { class: "t" }, [
         el("span", { class: "title", text: row.title }),
-        el("small", { class: "age", text: row.age }),
       ]),
       el("div", { class: "m" }, facts),
     ],

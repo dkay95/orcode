@@ -65,3 +65,18 @@ describe("readable, inert assistant Markdown", () => {
     expect(node.querySelector("h2,strong")).toBeNull();
   });
 });
+
+it("shows a reported file change as a compact disclosure, retaining its exact inert diff", () => {
+  const node = renderBlock({ kind: "file-change", id: "change", at: 1, path: "src/login.ts",
+    tool: "apply_patch", created: false, added: 1, removed: 1, truncated: false,
+    diff: "@@ -1 +1 @@\n-old\n+<script>inert</script>" }, { toggle: () => {}, undo: () => {} });
+  expect(node.tagName).toBe("DETAILS");
+  expect((node as HTMLDetailsElement).open).toBe(false);
+  expect(node.querySelector("summary")?.textContent).toContain("src/login.ts");
+  expect(node.querySelector("summary")?.textContent).toContain("+1 −1");
+  expect(node.querySelector("summary")?.textContent).not.toContain("apply_patch");
+  (node as HTMLDetailsElement).open = true;
+  expect(node.textContent).toContain("apply_patch");
+  expect(node.querySelectorAll(".diff-text")[1]?.textContent).toBe("<script>inert</script>");
+  expect(node.querySelector("script")).toBeNull();
+});
