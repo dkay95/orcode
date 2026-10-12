@@ -1,0 +1,9 @@
+{
+  "version": 1,
+  "revision": 3,
+  "chatId": "legacy-fixture-chat",
+  "turnCount": 2,
+  "historyDigest": "5eb0b5755ca70ce35e11055b52252de8f6a74cb18078447b5e544aafdac39737",
+  "updatedAt": "2024-08-20T10:01:00.000Z",
+  "state": "{\"version\":1,\"id\":\"conv_fixture_legacy\",\"messages\":[{\"role\":\"user\",\"content\":\"Historische SDK-Nachricht\"}],\"status\":\"in_progress\",\"createdAt\":1724155200000,\"updatedAt\":1724155260000}"
+}

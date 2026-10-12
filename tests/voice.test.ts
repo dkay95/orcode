@@ -161,7 +161,7 @@ test("a quiet recording is flagged but not rejected", async () => {
   });
 });
 
-test("an empty recording is rejected with a clear German error", async () => {
+test("an empty recording is rejected with a clear error", async () => {
   await withTempRoot(async (root) => {
     const { spawnFn } = fakeRecorderSpawn({ audioOnStop: makeWavBuffer([]) });
     const recorder = createProcessAudioRecorder({
@@ -172,11 +172,11 @@ test("an empty recording is rejected with a clear German error", async () => {
       tempDir: root,
     });
     const handle = await recorder.start();
-    await assert.rejects(handle.stop(), /leer/i);
+    await assert.rejects(handle.stop(), /empty/i);
   });
 });
 
-test("a microphone-permission failure becomes a specific German message", async () => {
+test("a microphone-permission failure becomes a specific message", async () => {
   await withTempRoot(async (root) => {
     const spawnFn: SpawnFn = (_executable, _args) => {
       const proc = new FakeChildProcess();
@@ -194,11 +194,11 @@ test("a microphone-permission failure becomes a specific German message", async 
       tempDir: root,
     });
     const handle = await recorder.start();
-    await assert.rejects(handle.stop(), /Mikrofon/);
+    await assert.rejects(handle.stop(), /microphone/i);
   });
 });
 
-test("no microphone found becomes a specific German message", async () => {
+test("no microphone found becomes a specific message", async () => {
   await withTempRoot(async (root) => {
     const spawnFn: SpawnFn = (_executable, _args) => {
       const proc = new FakeChildProcess();
@@ -216,7 +216,7 @@ test("no microphone found becomes a specific German message", async () => {
       tempDir: root,
     });
     const handle = await recorder.start();
-    await assert.rejects(handle.stop(), /kein Mikrofon gefunden/);
+    await assert.rejects(handle.stop(), /no microphone was found/i);
   });
 });
 
@@ -313,7 +313,7 @@ test("stop() after the limit already fired is rejected instead of double-finaliz
     });
     const handle = await recorder.start();
     const outcome = await handle.autoStopped;
-    await assert.rejects(handle.stop(), /bereits beendet/);
+    await assert.rejects(handle.stop(), /already ended/);
     await deleteRecordedAudio(outcome.audio);
   });
 });
@@ -359,7 +359,7 @@ test("ensureSwiftRecorderCommand falls back to the swift interpreter when swiftc
   assert.equal(result.args.length, 1);
 });
 
-test("ensureSwiftRecorderCommand gives a clear German error when nothing works", async () => {
+test("ensureSwiftRecorderCommand gives a clear error when nothing works", async () => {
   const deps = {
     appHome: "/fake/home/.routercode",
     fileExists: async () => false,
@@ -369,7 +369,7 @@ test("ensureSwiftRecorderCommand gives a clear German error when nothing works",
     chmod: async () => {},
     checkCommand: async () => false,
   };
-  await assert.rejects(ensureSwiftRecorderCommand(deps), /Swift-Aufnahmeprogramm/);
+  await assert.rejects(ensureSwiftRecorderCommand(deps), /Swift recording program/);
 });
 
 test("createAudioRecorders on darwin tries Swift before ffmpeg", async () => {

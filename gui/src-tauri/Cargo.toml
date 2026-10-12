@@ -1,0 +1,40 @@
+[package]
+name = "orcode-gui"
+version = "0.7.0"
+description = "orcode's desktop shell — a window over the unchanged core, spoken to as a sidecar."
+authors = ["Dogancan Kaya <dogancan.kaya424@gmail.com>"]
+license = "Apache-2.0"
+edition = "2021"
+rust-version = "1.88"
+
+[lib]
+name = "orcode_gui_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+serde_json = "1"
+sha2 = "0.10"
+libc = "0.2"
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+libc = "0.2"
+getrandom = "0.4"
+url = "2.5"
+sha2 = "0.10"
+plist = "1"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2-app-kit = { version = "0.3.2", default-features = false, features = ["NSPasteboard", "NSWorkspace"] }
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["NSString", "NSURL"] }
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = "s"
+panic = "abort"
+strip = true

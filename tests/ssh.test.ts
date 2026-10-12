@@ -161,7 +161,7 @@ test("execSshCommand: unknown alias throws before touching ssh at all", async ()
     const runner = recordingRunner(okResult());
     await assert.rejects(
       execSshCommand("ghost", HOSTS, "uptime", runner.runSsh, { runtime: { appHome } }),
-      /kein bekannter Host/,
+      /not a known host/,
     );
     assert.equal(runner.calls.length, 0);
   } finally {

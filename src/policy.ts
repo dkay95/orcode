@@ -22,8 +22,28 @@ export interface PathPolicyDecision {
   verdict: PolicyVerdict;
   /** Stable rule id, used in messages and tests. */
   rule: string;
-  /** German explanation for the approval prompt. Empty for `allow`. */
+  /** Plain-English explanation for the approval prompt. Empty for `allow`. */
   reason: string;
+}
+
+export type GitReadOperation = "diff" | "status";
+
+export interface GitReadCapabilityPolicy {
+  id: `git.${GitReadOperation}`;
+  effect: "read";
+  hardened: true;
+  /** Read capabilities are declared/evaluated, never stored as mutation rules. */
+  rememberable: false;
+}
+
+/** Central classification used by both slash commands and model Git tools. */
+export function evaluateGitReadCapability(operation: GitReadOperation): GitReadCapabilityPolicy {
+  return {
+    id: `git.${operation}`,
+    effect: "read",
+    hardened: true,
+    rememberable: false,
+  };
 }
 
 const ALLOWED: PathPolicyDecision = { verdict: "allow", rule: "none", reason: "" };
@@ -34,24 +54,24 @@ const PROTECTED_WRITE_DIRECTORIES: Array<{ segments: string[]; rule: string; rea
     segments: [".git"],
     rule: "git-metadata",
     reason:
-      "Schreibzugriff auf .git/** ändert das Repository selbst (z. B. .git/config), nicht deinen Code.",
+      "Write access to .git/** changes the repository itself (e.g. .git/config), not your code.",
   },
   {
     segments: ["node_modules"],
     rule: "node-modules",
     reason:
-      "Schreibzugriff auf node_modules/** ändert fremden Code, der beim nächsten Start ausgeführt wird.",
+      "Write access to node_modules/** changes third-party code that runs on the next start.",
   },
   {
     segments: [".ssh"],
     rule: "ssh-directory",
-    reason: "Schreibzugriff auf .ssh/** verändert SSH-Schlüssel und -Konfiguration.",
+    reason: "Write access to .ssh/** changes SSH keys and configuration.",
   },
   {
     segments: [".github", "workflows"],
     rule: "github-workflows",
     reason:
-      "Schreibzugriff auf .github/workflows/** ändert CI-Jobs, die beim nächsten Push mit deinen Rechten laufen.",
+      "Write access to .github/workflows/** changes CI jobs that run with your permissions on the next push.",
   },
 ];
 
@@ -60,27 +80,27 @@ const SECRET_READ_DIRECTORIES: Array<{ segments: string[]; rule: string; reason:
   {
     segments: [".ssh"],
     rule: "ssh-directory",
-    reason: "In .ssh/** liegen private Schlüssel.",
+    reason: "Private keys live in .ssh/**.",
   },
   {
     segments: [".aws"],
     rule: "aws-directory",
-    reason: "In .aws/** liegen Zugangsdaten für AWS.",
+    reason: "AWS credentials live in .aws/**.",
   },
   {
     segments: [".gnupg"],
     rule: "gnupg-directory",
-    reason: "In .gnupg/** liegen private GPG-Schlüssel.",
+    reason: "Private GPG keys live in .gnupg/**.",
   },
   {
     segments: [".kube"],
     rule: "kube-directory",
-    reason: "In .kube/** liegen Cluster-Zugangsdaten (z. B. Tokens in config).",
+    reason: "Cluster credentials live in .kube/** (e.g. tokens in config).",
   },
   {
     segments: [".docker"],
     rule: "docker-directory",
-    reason: "In .docker/** liegen Registry-Zugangsdaten (config.json).",
+    reason: "Registry credentials live in .docker/** (config.json).",
   },
 ];
 
@@ -94,17 +114,17 @@ interface NameRule {
 const SECRET_NAME_RULES: NameRule[] = [
   {
     rule: "dotenv",
-    reason: "Dateien mit dem Präfix .env enthalten üblicherweise Zugangsdaten.",
+    reason: "Files with the .env prefix usually contain credentials.",
     test: (name) => name.toLowerCase().startsWith(".env"),
   },
   {
     rule: "npmrc",
-    reason: ".npmrc enthält üblicherweise Registry-Tokens für npm und kann Registries umlenken.",
+    reason: ".npmrc usually contains registry tokens for npm and can redirect registries.",
     test: (name) => name.toLowerCase() === ".npmrc",
   },
   {
     rule: "netrc",
-    reason: ".netrc/_netrc enthält üblicherweise Klartext-Passwörter für Remote-Logins.",
+    reason: ".netrc/_netrc usually contains plaintext passwords for remote logins.",
     test: (name) => {
       const lowered = name.toLowerCase();
       return lowered === ".netrc" || lowered === "_netrc";
@@ -112,22 +132,22 @@ const SECRET_NAME_RULES: NameRule[] = [
   },
   {
     rule: "git-credentials",
-    reason: ".git-credentials enthält Klartext-Passwörter für Git-Remotes.",
+    reason: ".git-credentials contains plaintext passwords for Git remotes.",
     test: (name) => name.toLowerCase() === ".git-credentials",
   },
   {
     rule: "key-file",
-    reason: "Dateien mit dieser Endung enthalten üblicherweise Schlüsselmaterial.",
+    reason: "Files with this extension usually contain key material.",
     test: (name) => /\.(key|p12|pfx|keystore|jks)$/.test(name.toLowerCase()),
   },
   {
     rule: "pem-file",
-    reason: "PEM-Dateien enthalten üblicherweise private Schlüssel oder Zertifikate.",
+    reason: "PEM files usually contain private keys or certificates.",
     test: (name) => name.toLowerCase().endsWith(".pem"),
   },
   {
     rule: "ssh-key",
-    reason: "Dateien mit dem Präfix id_ sind üblicherweise SSH-Schlüssel.",
+    reason: "Files with the id_ prefix are usually SSH keys.",
     // Narrowed against `id_utils.ts` and friends: only extension-less names or
     // the usual key suffixes count as a key.
     test: (name) => /^id_[A-Za-z0-9][A-Za-z0-9_-]*(\.(pub|pem|key))?$/.test(name),
@@ -139,7 +159,7 @@ const SECRET_READ_NAME_RULES: NameRule[] = [
   ...SECRET_NAME_RULES,
   {
     rule: "credentials-file",
-    reason: "Dateien mit dem Präfix credentials enthalten üblicherweise Zugangsdaten.",
+    reason: "Files with the credentials prefix usually contain credentials.",
     test: (name) => name.toLowerCase().startsWith("credentials"),
   },
 ];
@@ -195,7 +215,7 @@ export function classifyPath(relativePath: string, access: PathAccess): PathPoli
         verdict: "deny",
         rule: "git-hooks",
         reason:
-          "Git-Hooks sind gesperrt: eine Datei unter .git/hooks/** würde bei deinem nächsten git-Befehl fremden Code ausführen.",
+          "Git hooks are blocked: a file under .git/hooks/** would run foreign code on your next git command.",
       };
     }
     for (const directory of PROTECTED_WRITE_DIRECTORIES) {
@@ -236,25 +256,25 @@ export function isSecretReadPath(relativePath: string): boolean {
  * segment simply ignores that anchor — the pattern needs the same scrutiny as
  * a path.
  */
-export function assertSafeGlobPattern(pattern: string, label = "Muster"): void {
+export function assertSafeGlobPattern(pattern: string, label = "Pattern"): void {
   const value = pattern.trim();
   if (value.length === 0) {
-    throw new Error(`${label} darf nicht leer sein.`);
+    throw new Error(`${label} must not be empty.`);
   }
   if (value.includes("\0")) {
-    throw new Error(`${label} enthält ein Nullbyte.`);
+    throw new Error(`${label} contains a null byte.`);
   }
   if (isAbsolute(value) || value.startsWith("/") || value.startsWith("\\")) {
     throw new Error(
-      `${label} darf nicht absolut sein: ${pattern}. Nutze ein relatives Muster innerhalb des Arbeitsverzeichnisses.`,
+      `${label} must not be absolute: ${pattern}. Use a relative pattern inside the working directory.`,
     );
   }
   if (/^~/.test(value)) {
-    throw new Error(`${label} darf nicht mit ~ beginnen: ${pattern}.`);
+    throw new Error(`${label} must not start with ~: ${pattern}.`);
   }
   if (/(^|[\\/])\.\.([\\/]|$)/.test(value)) {
     throw new Error(
-      `${label} darf kein ..-Segment enthalten: ${pattern}. Es würde das Arbeitsverzeichnis verlassen.`,
+      `${label} must not contain a ..-segment: ${pattern}. It would leave the working directory.`,
     );
   }
 }

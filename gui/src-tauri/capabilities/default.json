@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "What the WebView may reach. The sidecar is spawned, written to and killed from RUST (G0 D2), so the page holds no shell permission at all — not spawn, not stdin-write, not kill, and above all not `shell:allow-open`, which would hand arbitrary URLs to the OS.",
+  "windows": ["main"],
+  "permissions": ["core:default"]
+}

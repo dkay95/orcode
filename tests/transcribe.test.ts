@@ -84,7 +84,7 @@ test("a model without audio input is rejected with a clear German message", asyn
     }),
     (error: unknown) => {
       assert.ok(error instanceof Error);
-      assert.match(error.message, /keine Audio-Eingabe/);
+      assert.match(error.message, /does not support audio input/);
       assert.match(error.message, /audio\/cheap/); // suggested from the model list
       return true;
     },
@@ -100,7 +100,7 @@ test("an unknown model is rejected before any network call happens", async () =>
       modelId: "does/not-exist",
       audio: audio(),
     }),
-    /wurde bei OpenRouter nicht gefunden/,
+    /was not found on OpenRouter/,
   );
   assert.equal(called, false);
 });
@@ -113,7 +113,7 @@ test("an empty model id is rejected", async () => {
       modelId: "   ",
       audio: audio(),
     }),
-    /Kein Transkriptionsmodell konfiguriert/,
+    /No transcription model configured/,
   );
 });
 
@@ -166,7 +166,7 @@ test("a failed model call is reported as a clear German error", async () => {
       audio: audio(),
       readAudioFile: async () => Buffer.from("x"),
     }),
-    /Transkription fehlgeschlagen/,
+    /Transcription failed/,
   );
 });
 
@@ -182,7 +182,7 @@ test("a file read failure is reported as a clear German error", async () => {
         throw new Error("ENOENT");
       },
     }),
-    /Aufnahmedatei konnte nicht gelesen werden/,
+    /Recording file could not be read/,
   );
 });
 

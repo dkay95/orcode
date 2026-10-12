@@ -12,7 +12,7 @@ import { join } from "node:path";
 import test from "node:test";
 import { ApprovalManager } from "../src/approval.js";
 import { RuleStore } from "../src/rules.js";
-import type { RunSsh } from "../src/ssh.js";
+import type { RunSsh, SshSession } from "../src/ssh.js";
 import type { SshHost } from "../src/ssh-config.js";
 import type { ApprovalMode, ToolCallPreview } from "../src/types.js";
 import { ChangeJournal, WorkspaceGuard, createCodingTools } from "../src/workspace.js";
@@ -88,6 +88,12 @@ async function sandbox(options: {
   runSsh?: RunSsh;
   ruleStore?: RuleStore;
   workspace?: string;
+  onProcessStart?: (operation: { id: string }) => void;
+  onProcessEnd?: (
+    operation: { id: string },
+    completion: { exitCode: number | null; error?: string },
+  ) => void;
+  session?: SshSession;
 }): Promise<Sandbox> {
   const root = await mkdtemp(join(tmpdir(), "routercode-sshtool-"));
   const guard = await WorkspaceGuard.create(root);
@@ -104,7 +110,14 @@ async function sandbox(options: {
   const journal = new ChangeJournal({ appHome: join(root, ".routercode"), chatId: "test-chat" });
   const runner = options.runSsh ? { runSsh: options.runSsh, calls: [] } : recordingRunner(okResult());
   const tools = createCodingTools(guard, approvals, journal, {
-    ssh: { hosts: HOSTS, runSsh: runner.runSsh, appHome: join(root, ".routercode-ssh") },
+    ssh: {
+      hosts: HOSTS,
+      runSsh: runner.runSsh,
+      appHome: join(root, ".routercode-ssh"),
+      ...(options.session ? { session: options.session } : {}),
+    },
+    ...(options.onProcessStart ? { onProcessStart: options.onProcessStart } : {}),
+    ...(options.onProcessEnd ? { onProcessEnd: options.onProcessEnd } : {}),
   });
   return {
     tools,
@@ -139,7 +152,7 @@ test("ssh_command asks for approval in auto-edit mode too — the case that woul
 test("ssh_command rejection leaves the approval manager's normal rejection handling intact", async () => {
   const { tools, asked, cleanup } = await sandbox({ mode: "ask", answer: false });
   try {
-    await assert.rejects(invoke(tools, "ssh_command", { host: "vps", command: "uptime" }), /abgelehnt/);
+    await assert.rejects(invoke(tools, "ssh_command", { host: "vps", command: "uptime" }), /denied/);
     assert.equal(asked.length, 1);
   } finally {
     await cleanup();
@@ -157,6 +170,118 @@ test("ssh_command allow-all runs without asking", async () => {
   }
 });
 
+test("ssh_command without host resolves the active shared session at execution time", async () => {
+  const runner = recordingRunner(okResult({ stdout: "active host\n" }));
+  const session: SshSession = { active: null };
+  const { tools, cleanup } = await sandbox({
+    mode: "allow-all",
+    runSsh: runner.runSsh,
+    session,
+  });
+  try {
+    session.active = "vps";
+    const output = await invoke(tools, "ssh_command", { command: "hostname" });
+    assert.equal(output.host, "vps");
+    assert.deepEqual(runner.calls[0]?.slice(-2), ["vps", "hostname"]);
+  } finally {
+    await cleanup();
+  }
+});
+
+test("ssh_command without host or active session fails clearly before approval or spawn", async () => {
+  const runner = recordingRunner(okResult());
+  const session: SshSession = { active: null };
+  const { tools, asked, cleanup } = await sandbox({
+    mode: "ask",
+    answer: true,
+    runSsh: runner.runSsh,
+    session,
+  });
+  try {
+    await assert.rejects(
+      invoke(tools, "ssh_command", { command: "hostname" }),
+      /No active SSH target.*\/ssh <alias>/,
+    );
+    assert.equal(asked.length, 0);
+    assert.equal(runner.calls.length, 0);
+  } finally {
+    await cleanup();
+  }
+});
+
+test("ssh_command rejects an unknown active session before approval or spawn", async () => {
+  const runner = recordingRunner(okResult());
+  const session: SshSession = { active: "ghost" };
+  const { tools, asked, cleanup } = await sandbox({
+    mode: "ask",
+    answer: true,
+    runSsh: runner.runSsh,
+    session,
+  });
+  try {
+    await assert.rejects(
+      invoke(tools, "ssh_command", { command: "hostname" }),
+      /not a known host/,
+    );
+    assert.equal(asked.length, 0);
+    assert.equal(runner.calls.length, 0);
+  } finally {
+    await cleanup();
+  }
+});
+
+test("ssh_command explicit host wins over the active shared session", async () => {
+  const runner = recordingRunner(okResult());
+  const session: SshSession = { active: "vps" };
+  const { tools, cleanup } = await sandbox({
+    mode: "allow-all",
+    runSsh: runner.runSsh,
+    session,
+  });
+  try {
+    const output = await invoke(tools, "ssh_command", {
+      host: "produktion",
+      command: "hostname",
+    });
+    assert.equal(output.host, "produktion");
+    assert.deepEqual(runner.calls[0]?.slice(-2), ["produktion", "hostname"]);
+  } finally {
+    await cleanup();
+  }
+});
+
+test("ssh_command preserves a structured launch failure after one null-exit lifecycle", async () => {
+  const lifecycle: Array<{ type: "start" | "end"; id: string; exitCode?: number | null; error?: string }> = [];
+  const runner = recordingRunner(okResult({
+    code: null,
+    launchError: "spawn ssh ENOENT",
+  }));
+  const { tools, cleanup } = await sandbox({
+    mode: "allow-all",
+    runSsh: runner.runSsh,
+    onProcessStart: (operation) => lifecycle.push({ type: "start", id: operation.id }),
+    onProcessEnd: (operation, completion) => lifecycle.push({
+      type: "end",
+      id: operation.id,
+      exitCode: completion.exitCode,
+      ...(completion.error ? { error: completion.error } : {}),
+    }),
+  });
+  try {
+    await assert.rejects(
+      invoke(tools, "ssh_command", { host: "vps", command: "uptime" }),
+      /spawn ssh ENOENT/,
+    );
+    assert.equal(runner.calls.length, 1);
+    assert.deepEqual(lifecycle.map((event) => event.type), ["start", "end"]);
+    assert.equal(new Set(lifecycle.map((event) => event.id)).size, 1);
+    assert.equal(lifecycle[1]?.exitCode, null);
+    assert.match(lifecycle[1]?.error ?? "", /spawn ssh ENOENT/);
+  } finally {
+    await cleanup();
+  }
+});
+
 test("ssh_command's approval preview names the target host prominently", async () => {
   const { tools, asked, cleanup } = await sandbox({ mode: "ask", answer: true });
   try {
@@ -164,7 +289,12 @@ test("ssh_command's approval preview names the target host prominently", async (
     const preview = asked[0]!;
     assert.match(preview.summary, /VPS/);
     assert.match(preview.summary, /203\.0\.113\.5/);
-    assert.match(preview.details ?? "", /SSH-ZIEL \(NICHT LOKAL\): VPS/);
+    assert.match(preview.details ?? "", /SSH TARGET \(NOT LOCAL\): VPS/);
+    assert.equal(preview.rememberAvailable, true);
+    assert.equal(
+      preview.subject,
+      '{"kind":"ssh-command","host":"vps","command":"systemctl restart nginx"}',
+    );
   } finally {
     await cleanup();
   }
@@ -175,7 +305,7 @@ test("ssh_command rejects an alias that is not in the ssh config, before ever as
   try {
     await assert.rejects(
       invoke(tools, "ssh_command", { host: "ghost", command: "uptime" }),
-      /kein bekannter Host/,
+      /not a known host/,
     );
     assert.equal(asked.length, 0, "ein unbekannter Host darf keine Freigabe-Anfrage auslösen");
   } finally {

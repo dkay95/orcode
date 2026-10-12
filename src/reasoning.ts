@@ -23,7 +23,7 @@ export interface ReasoningPlan {
   request?: ReasoningRequest;
   /** True when the setting could not be sent as chosen. */
   degraded: boolean;
-  /** German explanation of the degradation, if any. */
+  /** Plain-English explanation of the degradation, if any. */
   note?: string;
 }
 
@@ -32,6 +32,18 @@ export interface ReasoningChoice {
   label: string;
   description: string;
   setting: ReasoningSetting;
+}
+
+/**
+ * The reasoning mapper only needs this capability-shaped subset. Keeping the
+ * input structural lets the provider-neutral runtime describe Kimi without
+ * inventing OpenRouter catalogue fields or prices.
+ */
+export interface ReasoningModelInfo {
+  readonly id: string;
+  readonly maxCompletionTokens?: number | null;
+  readonly reasoning?: ModelInfo["reasoning"];
+  readonly supportedParameters?: readonly string[];
 }
 
 export const DEFAULT_REASONING_SETTING: ReasoningSetting = {
@@ -55,7 +67,7 @@ export function setReasoningSetting(
 
 export function buildReasoningRequest(
   setting: ReasoningSetting,
-  model: ModelInfo | null = null,
+  model: ReasoningModelInfo | null = null,
 ): ReasoningRequest | undefined {
   return planReasoningRequest(setting, model).request;
 }
@@ -64,12 +76,12 @@ export function buildReasoningRequest(
  * Maps a stored setting onto the request the model actually accepts.
  * Models without reasoning support get no reasoning field, a token budget on a
  * model that only knows effort levels becomes the closest effort level, an
- * unsupported effort becomes the closest supported one, and "aus" is ignored
+ * unsupported effort becomes the closest supported one, and "off" is ignored
  * where the model requires reasoning.
  */
 export function planReasoningRequest(
   setting: ReasoningSetting,
-  model: ModelInfo | null = null,
+  model: ReasoningModelInfo | null = null,
 ): ReasoningPlan {
   if (setting.mode === "auto") {
     return { degraded: false };
@@ -77,7 +89,7 @@ export function planReasoningRequest(
   if (model && !supportsReasoning(model)) {
     return {
       degraded: true,
-      note: `${model.id} meldet keine Reasoning-Unterstützung; die Einstellung wird nicht gesendet.`,
+      note: `${model.id} reports no reasoning support; the setting is not sent.`,
     };
   }
 
@@ -88,14 +100,14 @@ export function planReasoningRequest(
       return {
         request: { enabled: true, effort },
         degraded: true,
-        note: `${model.id} kennt kein Reasoning-Token-Budget; gesendet wird die Stufe ${effort}.`,
+        note: `${model.id} does not know a reasoning token budget; sending level ${effort} instead.`,
       };
     }
     if (maxTokens !== setting.maxTokens) {
       return {
         request: { enabled: true, maxTokens },
         degraded: true,
-        note: `Das Reasoning-Budget wurde auf ${maxTokens} Tokens begrenzt (Modellmaximum).`,
+        note: `The reasoning budget was capped at ${maxTokens} tokens (model maximum).`,
       };
     }
     return { request: { enabled: true, maxTokens }, degraded: false };
@@ -107,7 +119,7 @@ export function planReasoningRequest(
       return {
         request: { enabled: true, effort },
         degraded: true,
-        note: `${model.id} erfordert Reasoning; gesendet wird die niedrigste mögliche Stufe ${effort}.`,
+        note: `${model.id} requires reasoning; sending the lowest possible level ${effort}.`,
       };
     }
     return { request: { enabled: false, effort: "none" }, degraded: false };
@@ -118,10 +130,45 @@ export function planReasoningRequest(
     return {
       request: { enabled: true, effort },
       degraded: true,
-      note: `${model?.id ?? "Das Modell"} unterstützt ${setting.effort} nicht; gesendet wird ${effort}.`,
+      note: `${model?.id ?? "The model"} does not support ${setting.effort}; sending ${effort} instead.`,
     };
   }
   return { request: { enabled: true, effort }, degraded: false };
+}
+
+/**
+ * Applies backend policy before the generic OpenRouter capability fallback.
+ * Kimi's membership API has no supported off or token-budget wire shape.
+ */
+export function planRuntimeReasoningRequest(
+  setting: ReasoningSetting,
+  model: ReasoningModelInfo | null,
+  backendId: "openrouter" | "kimi-code",
+): ReasoningPlan {
+  if (backendId === "openrouter") return planReasoningRequest(setting, model);
+  if (setting.mode === "budget") {
+    throw new Error("Kimi Code does not support a reasoning token budget.");
+  }
+  if (setting.mode === "effort" && setting.effort === "none") {
+    throw new Error("Kimi Code requires reasoning and cannot be turned off.");
+  }
+  if (setting.mode === "auto") return { degraded: false };
+
+  if (model?.reasoning?.supportedEfforts === null) {
+    return {
+      request: { enabled: true },
+      degraded: true,
+      note: `${model.id} uses a fixed thinking mode; the stored level ${setting.effort} is not sent.`,
+    };
+  }
+  if (setting.effort === "minimal") {
+    return {
+      request: { enabled: true, effort: "low" },
+      degraded: true,
+      note: `${model?.id ?? "Kimi Code"} does not support minimal; sending low instead.`,
+    };
+  }
+  return { request: { enabled: true, effort: setting.effort }, degraded: false };
 }
 
 export function reasoningLabel(setting: ReasoningSetting): string {
@@ -135,13 +182,13 @@ export function reasoningLabel(setting: ReasoningSetting): string {
 }
 
 export function reasoningChoices(
-  model: ModelInfo | null,
+  model: ReasoningModelInfo | null,
   current: ReasoningSetting,
 ): ReasoningChoice[] {
   const choices: ReasoningChoice[] = [
     {
       value: "auto",
-      label: "Automatisch",
+      label: "Automatic",
       description: autoDescription(model),
       setting: { mode: "auto" },
     },
@@ -165,7 +212,7 @@ export function reasoningChoices(
       choices.push({
         value: `budget:${maxTokens}`,
         label: `Budget ${compactTokens(maxTokens)}`,
-        description: "Maximale Reasoning-Tokens; zählen als kostenpflichtige Output-Tokens",
+        description: "Maximum reasoning tokens; count as billable output tokens",
         setting: { mode: "budget", maxTokens },
       });
     }
@@ -181,17 +228,17 @@ export function reasoningChoiceValue(setting: ReasoningSetting): string {
 
 export function validateReasoningSetting(
   setting: ReasoningSetting,
-  model: ModelInfo | null,
+  model: ReasoningModelInfo | null,
 ): void {
   if (setting.mode === "budget" && !(setting.maxTokens >= 1)) {
-    throw new Error("Das Reasoning-Budget muss mindestens 1 Token betragen.");
+    throw new Error("The reasoning budget must be at least 1 token.");
   }
   if (setting.mode === "auto" || !model) {
     return;
   }
   const dynamic = model.id.startsWith("openrouter/");
   if (!supportsReasoning(model)) {
-    throw new Error(`${model.id} meldet keine Reasoning-Unterstützung.`);
+    throw new Error(`${model.id} reports no reasoning support.`);
   }
   if (setting.mode === "budget") {
     if (
@@ -200,34 +247,34 @@ export function validateReasoningSetting(
       !model.reasoning.supportsMaxTokens
     ) {
       throw new Error(
-        `${model.id} meldet kein direktes Reasoning-Token-Budget. Verwende eine Effort-Stufe.`,
+        `${model.id} does not report a direct reasoning token budget. Use an effort level.`,
       );
     }
     return;
   }
   if (setting.effort === "none" && model.reasoning?.mandatory) {
-    throw new Error(`${model.id} erfordert Reasoning und kann nicht auf off gesetzt werden.`);
+    throw new Error(`${model.id} requires reasoning and cannot be set to off.`);
   }
   const supported = model.reasoning?.supportedEfforts;
   if (supported && !supported.includes(setting.effort)) {
     throw new Error(
-      `${model.id} unterstützt ${setting.effort} nicht. Erlaubt: ${supported.join(", ")}.`,
+      `${model.id} does not support ${setting.effort}. Allowed: ${supported.join(", ")}.`,
     );
   }
 }
 
-export function supportsReasoning(model: ModelInfo | null): boolean {
+export function supportsReasoning(model: ReasoningModelInfo | null): boolean {
   if (!model) {
     return true;
   }
   return (
     model.id.startsWith("openrouter/") ||
     Boolean(model.reasoning) ||
-    model.supportedParameters.includes("reasoning")
+    Boolean(model.supportedParameters?.includes("reasoning"))
   );
 }
 
-function supportedEfforts(model: ModelInfo | null): ReasoningEffort[] {
+function supportedEfforts(model: ReasoningModelInfo | null): ReasoningEffort[] {
   if (!model) {
     return [...REASONING_EFFORTS];
   }
@@ -246,7 +293,7 @@ function supportedEfforts(model: ModelInfo | null): ReasoningEffort[] {
 
 function nearestSupportedEffort(
   effort: ReasoningEffort,
-  model: ModelInfo | null,
+  model: ReasoningModelInfo | null,
 ): ReasoningEffort {
   const supported = model?.reasoning?.supportedEfforts;
   if (!supported || supported.length === 0 || supported.includes(effort)) {
@@ -272,7 +319,7 @@ function budgetAsEffort(maxTokens: number): ReasoningEffort {
   return "high";
 }
 
-function clampBudget(maxTokens: number, model: ModelInfo | null): number {
+function clampBudget(maxTokens: number, model: ReasoningModelInfo | null): number {
   const limit = model?.maxCompletionTokens;
   const bounded = Math.max(1, Math.round(maxTokens));
   return typeof limit === "number" && limit > 0
@@ -280,24 +327,24 @@ function clampBudget(maxTokens: number, model: ModelInfo | null): number {
     : bounded;
 }
 
-function supportsBudget(model: ModelInfo | null): boolean {
+function supportsBudget(model: ReasoningModelInfo | null): boolean {
   return !model || model.id.startsWith("openrouter/") ||
     Boolean(model.reasoning?.supportsMaxTokens);
 }
 
-function autoDescription(model: ModelInfo | null): string {
+function autoDescription(model: ReasoningModelInfo | null): string {
   if (model && !supportsReasoning(model)) {
-    return "Modell meldet kein Reasoning; es wird keine Vorgabe gesendet";
+    return "Model reports no reasoning; no setting is sent";
   }
   const defaultEffort = model?.reasoning?.defaultEffort;
   if (defaultEffort) {
-    return `Modellvorgabe verwenden: ${effortLabel(defaultEffort)}`;
+    return `Use the model default: ${effortLabel(defaultEffort)}`;
   }
-  return "Keine Reasoning-Vorgabe senden; das Modell entscheidet";
+  return "Send no reasoning setting; the model decides";
 }
 
 function effortLabel(effort: ReasoningEffort): string {
-  if (effort === "none") return "Aus";
+  if (effort === "none") return "Off";
   if (effort === "xhigh") return "Ultra (xhigh)";
   if (effort === "max") return "Maximum";
   return effort[0]!.toUpperCase() + effort.slice(1);
@@ -305,15 +352,15 @@ function effortLabel(effort: ReasoningEffort): string {
 
 function effortDescription(
   effort: ReasoningEffort,
-  model: ModelInfo | null,
+  model: ReasoningModelInfo | null,
 ): string {
   if (effort === "none") {
-    return "Reasoning deaktivieren und Kosten reduzieren";
+    return "Turn off reasoning and reduce cost";
   }
   const suffix = model?.reasoning?.defaultEffort === effort
-    ? " · Modellvorgabe"
+    ? " · model default"
     : "";
-  return `Reasoning-Aufwand ${effort}; mehr Aufwand kann Ausgabe und Kosten erhöhen${suffix}`;
+  return `Reasoning effort ${effort}; more effort can increase output and cost${suffix}`;
 }
 
 function compactTokens(value: number): string {

@@ -1,0 +1,300 @@
+import { createHash } from "node:crypto";
+import { constants as fsConstants } from "node:fs";
+import { lstat, open, realpath } from "node:fs/promises";
+import { basename, dirname, join, resolve } from "node:path";
+import { hasCode } from "./utils.js";
+
+type ConfigParentSnapshot =
+  | { readonly kind: "absent" }
+  | { readonly kind: "directory"; readonly dev: bigint; readonly ino: bigint };
+
+export type ConfigFileSnapshot =
+  | {
+    readonly kind: "absent";
+    readonly parent: ConfigParentSnapshot;
+  }
+  | {
+    readonly kind: "file";
+    readonly dev: bigint;
+    readonly ino: bigint;
+    /** Decoded UTF-8 text for parsing; never a byte proof (invalid sequences collapse). */
+    readonly raw: string;
+    /** SHA-256 hex of the exact stored bytes: the collision-resistant CAS/readback proof. */
+    readonly digest: string;
+    readonly parent: ConfigParentSnapshot & { readonly kind: "directory" };
+  };
+
+/** Exact dev/inode identity of one real config parent directory. */
+export interface ConfigParentIdentity {
+  readonly dev: bigint;
+  readonly ino: bigint;
+}
+
+export interface ConfigLockTargetIdentity {
+  readonly canonicalPath: string;
+  readonly identityKey: string;
+}
+
+/**
+ * Uses the real parent spelling for one stable path-wide writer key while
+ * retaining the caller's absolute path for PrivateStore boundary checks.
+ */
+export async function resolveConfigLockTarget(
+  path: string,
+): Promise<ConfigLockTargetIdentity> {
+  const absolute = resolve(path);
+  const parentPath = dirname(absolute);
+  const parent = await readParentSnapshot(parentPath);
+  const canonicalParent = await canonicalizeDirectory(parentPath);
+  await assertParentSnapshot(parentPath, parent);
+  return Object.freeze({
+    canonicalPath: absolute,
+    identityKey: `path:${canonicalParent.toLowerCase()}:${basename(absolute).toLowerCase()}`,
+  });
+}
+
+/** Reads one exact regular config file without following a target symlink. */
+export async function readConfigFileSnapshot(
+  path: string,
+): Promise<ConfigFileSnapshot> {
+  const parent = await readParentSnapshot(dirname(path));
+  let before: Awaited<ReturnType<typeof lstat>>;
+  try {
+    before = await lstat(path, { bigint: true });
+  } catch (error) {
+    if (hasCode(error, "ENOENT")) {
+      await assertParentSnapshot(dirname(path), parent);
+      return Object.freeze({ kind: "absent", parent });
+    }
+    throw new Error("Config target identity could not be verified.");
+  }
+  if (parent.kind !== "directory") {
+    throw new Error("Config target identity could not be verified.");
+  }
+  if (before.isSymbolicLink() || !before.isFile()) {
+    throw new Error("Config target must be one regular file.");
+  }
+  let handle: Awaited<ReturnType<typeof open>> | null = null;
+  try {
+    handle = await open(path, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+    const opened = await handle.stat({ bigint: true });
+    assertSameConfigIdentity(before, opened);
+    const bytes = await handle.readFile();
+    const raw = bytes.toString("utf8");
+    const digest = configBytesDigest(bytes);
+    const afterHandle = await handle.stat({ bigint: true });
+    assertSameConfigIdentity(before, afterHandle);
+    const afterPath = await lstat(path, { bigint: true });
+    assertSameConfigIdentity(before, afterPath);
+    await assertParentSnapshot(dirname(path), parent);
+    return Object.freeze({
+      kind: "file",
+      dev: before.dev,
+      ino: before.ino,
+      raw,
+      digest,
+      parent,
+    });
+  } catch {
+    throw new Error("Config target identity could not be verified.");
+  } finally {
+    await handle?.close().catch(() => undefined);
+  }
+}
+
+/** Revalidates the exact regular file (or absence) captured before publish. */
+export async function assertConfigFileSnapshot(
+  path: string,
+  snapshot: ConfigFileSnapshot,
+): Promise<void> {
+  await assertParentSnapshot(dirname(path), snapshot.parent);
+  let current: Awaited<ReturnType<typeof lstat>>;
+  try {
+    current = await lstat(path, { bigint: true });
+  } catch (error) {
+    if (snapshot.kind === "absent" && hasCode(error, "ENOENT")) {
+      await assertParentSnapshot(dirname(path), snapshot.parent);
+      return;
+    }
+    throw new Error("Config target changed before publication.");
+  }
+  if (snapshot.kind === "absent"
+    || current.isSymbolicLink()
+    || !current.isFile()
+    || current.dev !== snapshot.dev
+    || current.ino !== snapshot.ino) {
+    throw new Error("Config target changed before publication.");
+  }
+  await assertParentSnapshot(dirname(path), snapshot.parent);
+}
+
+/**
+ * Exact byte snapshot equality: absence with the same parent identity, or the
+ * same regular file (dev/inode/parent) whose stored bytes share one digest.
+ * Unlike `assertConfigFileSnapshot()` this also catches a same-inode edit, and
+ * unlike comparing decoded `raw` text it cannot be fooled by distinct invalid
+ * UTF-8 sequences that decode to the same replacement characters.
+ */
+export function sameConfigFileSnapshot(
+  left: ConfigFileSnapshot,
+  right: ConfigFileSnapshot,
+): boolean {
+  if (!sameParentSnapshot(left.parent, right.parent)) return false;
+  if (left.kind === "absent" || right.kind === "absent") {
+    return left.kind === right.kind;
+  }
+  return left.dev === right.dev
+    && left.ino === right.ino
+    && left.digest === right.digest;
+}
+
+/**
+ * Binds the parent directory this writer has just created: observes its
+ * identity, pins that identity through a directory handle, secures the mode on
+ * the handle (never on the pathname, so a replacement is never chmod-ed), and
+ * confirms the pathname still resolves to the same identity. The window between
+ * `mkdir` and the first observation is the documented same-user pathname
+ * boundary; from here on the identity is retained, never re-derived.
+ */
+export async function secureCreatedConfigParent(
+  path: string,
+  mode: number,
+): Promise<ConfigParentIdentity> {
+  let handle: Awaited<ReturnType<typeof open>> | null = null;
+  try {
+    const observed = await lstat(path, { bigint: true });
+    if (observed.isSymbolicLink() || !observed.isDirectory()) {
+      throw new Error("config-parent-replaced");
+    }
+    handle = await open(
+      path,
+      fsConstants.O_RDONLY | (fsConstants.O_DIRECTORY ?? 0) | fsConstants.O_NOFOLLOW,
+    );
+    const bound = await handle.stat({ bigint: true });
+    if (!bound.isDirectory() || bound.dev !== observed.dev || bound.ino !== observed.ino) {
+      throw new Error("config-parent-replaced");
+    }
+    await handle.chmod(mode);
+    const after = await lstat(path, { bigint: true });
+    if (after.isSymbolicLink() || !after.isDirectory()
+      || after.dev !== observed.dev || after.ino !== observed.ino) {
+      throw new Error("config-parent-replaced");
+    }
+    return Object.freeze({ dev: observed.dev, ino: observed.ino });
+  } catch {
+    throw new Error("Config parent identity could not be verified.");
+  } finally {
+    await handle?.close().catch(() => undefined);
+  }
+}
+
+/** Revalidates that `path` is still the exact real directory identified before. */
+export async function assertConfigParentIdentity(
+  path: string,
+  identity: ConfigParentIdentity,
+): Promise<void> {
+  await assertParentSnapshot(path, { kind: "directory", dev: identity.dev, ino: identity.ino });
+}
+
+export function sameConfigParentIdentity(
+  left: ConfigParentIdentity,
+  right: ConfigParentIdentity,
+): boolean {
+  return left.dev === right.dev && left.ino === right.ino;
+}
+
+/** The same proof `readConfigFileSnapshot()` records, for comparing intended content with a readback. */
+export function configBytesDigest(bytes: Uint8Array | string): string {
+  return createHash("sha256").update(bytes).digest("hex");
+}
+
+function sameParentSnapshot(
+  left: ConfigParentSnapshot,
+  right: ConfigParentSnapshot,
+): boolean {
+  if (left.kind === "absent" || right.kind === "absent") {
+    return left.kind === right.kind;
+  }
+  return left.dev === right.dev && left.ino === right.ino;
+}
+
+async function canonicalizeDirectory(directory: string): Promise<string> {
+  let cursor = resolve(directory);
+  const missing: string[] = [];
+  while (true) {
+    let before: Awaited<ReturnType<typeof lstat>>;
+    try {
+      before = await lstat(cursor, { bigint: true });
+    } catch (error) {
+      if (!hasCode(error, "ENOENT")) {
+        throw new Error("Config parent identity could not be verified.");
+      }
+      const parent = dirname(cursor);
+      if (parent === cursor) {
+        throw new Error("Config parent identity could not be verified.");
+      }
+      missing.unshift(basename(cursor));
+      cursor = parent;
+      continue;
+    }
+    if (before.isSymbolicLink() || !before.isDirectory()) {
+      throw new Error("Config parent must be one real directory.");
+    }
+    let canonical: string;
+    try {
+      canonical = await realpath(cursor);
+      const after = await lstat(cursor, { bigint: true });
+      if (after.isSymbolicLink() || !after.isDirectory()
+        || after.dev !== before.dev || after.ino !== before.ino) {
+        throw new Error("config-parent-changed");
+      }
+    } catch {
+      throw new Error("Config parent identity could not be verified.");
+    }
+    return join(canonical, ...missing);
+  }
+}
+
+async function readParentSnapshot(path: string): Promise<ConfigParentSnapshot> {
+  let before: Awaited<ReturnType<typeof lstat>>;
+  try {
+    before = await lstat(path, { bigint: true });
+  } catch (error) {
+    if (hasCode(error, "ENOENT")) return Object.freeze({ kind: "absent" });
+    throw new Error("Config parent identity could not be verified.");
+  }
+  if (before.isSymbolicLink() || !before.isDirectory()) {
+    throw new Error("Config parent must be one real directory.");
+  }
+  return Object.freeze({ kind: "directory", dev: before.dev, ino: before.ino });
+}
+
+async function assertParentSnapshot(
+  path: string,
+  snapshot: ConfigParentSnapshot,
+): Promise<void> {
+  let current: Awaited<ReturnType<typeof lstat>>;
+  try {
+    current = await lstat(path, { bigint: true });
+  } catch (error) {
+    if (snapshot.kind === "absent" && hasCode(error, "ENOENT")) return;
+    throw new Error("Config target changed before publication.");
+  }
+  if (snapshot.kind !== "directory"
+    || current.isSymbolicLink()
+    || !current.isDirectory()
+    || current.dev !== snapshot.dev
+    || current.ino !== snapshot.ino) {
+    throw new Error("Config target changed before publication.");
+  }
+}
+
+function assertSameConfigIdentity(
+  expected: { dev: bigint; ino: bigint; isFile(): boolean; isSymbolicLink(): boolean },
+  actual: { dev: bigint; ino: bigint; isFile(): boolean; isSymbolicLink(): boolean },
+): void {
+  if (actual.isSymbolicLink() || !actual.isFile()
+    || actual.dev !== expected.dev || actual.ino !== expected.ino) {
+    throw new Error("Config target identity changed.");
+  }
+}

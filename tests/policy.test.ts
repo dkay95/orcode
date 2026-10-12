@@ -79,20 +79,20 @@ test("key stores and cloud/cluster credential locations are guarded", () => {
   assert.equal(classifyPath("docker-compose.yml", "read").verdict, "allow");
 });
 
-test("policy rules carry an id and a German reason", () => {
+test("policy rules carry an id and a plain-English reason", () => {
   const decision = classifyPath(".git/hooks/pre-push", "write");
   assert.equal(decision.rule, "git-hooks");
-  assert.match(decision.reason, /Git-Hooks/);
+  assert.match(decision.reason, /Git hooks/);
   assert.equal(classifyPath("x.pem", "write").rule, "pem-file");
 });
 
 test("glob patterns may not leave the workspace", () => {
-  assert.throws(() => assertSafeGlobPattern("../**"), /\.\.-Segment/);
-  assert.throws(() => assertSafeGlobPattern("../../**/*.txt"), /\.\.-Segment/);
-  assert.throws(() => assertSafeGlobPattern("src/../../etc/*"), /\.\.-Segment/);
-  assert.throws(() => assertSafeGlobPattern("/etc/*.conf"), /absolut/);
+  assert.throws(() => assertSafeGlobPattern("../**"), /\.\.-segment/);
+  assert.throws(() => assertSafeGlobPattern("../../**/*.txt"), /\.\.-segment/);
+  assert.throws(() => assertSafeGlobPattern("src/../../etc/*"), /\.\.-segment/);
+  assert.throws(() => assertSafeGlobPattern("/etc/*.conf"), /absolute/);
   assert.throws(() => assertSafeGlobPattern("~/**"), /~/);
-  assert.throws(() => assertSafeGlobPattern("   "), /leer/);
+  assert.throws(() => assertSafeGlobPattern("   "), /empty/);
 
   assert.doesNotThrow(() => assertSafeGlobPattern("**/*"));
   assert.doesNotThrow(() => assertSafeGlobPattern("src/**/*.ts"));

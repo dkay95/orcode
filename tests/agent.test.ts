@@ -1,18 +1,30 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { existsSync } from "node:fs";
+import { mkdir, mkdtemp, readdir, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import test from "node:test";
 import {
   AgentRunError,
+  END_THINKING_STEERING_MESSAGE,
+  EndThinkingSignal,
+  InterjectionQueue,
   OrcodeAgent,
   SuggestedReplyStreamFilter,
   assertSpendAvailable,
+  bindModelRuntimeIdentity,
   buildInstructions,
+  contextFillPercent,
+  isAbortError,
   parseSuggestedReplies,
   projectNotesBlock,
+  readModelRuntimeIdentity,
   shouldCutContext,
+  standingGoalInstruction,
+  STANDING_GOAL_LABEL,
+  type ModelRuntimeBindingIdentityV1,
 } from "../src/agent.js";
+import type { RouteIdentityV1 } from "../src/backends.js";
 import { ApprovalManager } from "../src/approval.js";
 import {
   DEFAULT_CONFIG,
@@ -20,8 +32,18 @@ import {
 } from "../src/config.js";
 import { ConversationStore } from "../src/conversation.js";
 import { OpenRouterService } from "../src/openrouter.js";
+import type { ModelRuntime } from "../src/model-runtime.js";
+import { RunLog, runLogPath } from "../src/runlog.js";
 import { SessionStore } from "../src/session.js";
+import { createSshSession } from "../src/ssh.js";
+import { CHAT_ARTIFACT_REGISTRY } from "../src/storage.js";
+import {
+  checkpointRunPath,
+  createCodingTools,
+  type CodingToolOptions,
+} from "../src/workspace.js";
 import type { AgentRunEvent } from "../src/types.js";
+import { runVerify, type VerifyOutcome } from "../src/verify.js";
 
 const healthy = {
   key: {
@@ -36,6 +58,31 @@ const healthy = {
   },
 };
 
+const KIMI_RUNTIME_ROUTE: RouteIdentityV1 = Object.freeze({
+  version: 1,
+  backendId: "kimi-code",
+  accountFingerprint: "acct_kimi_agent_fixture",
+  billingRealm: "kimi-code-membership-provider-managed-overage",
+  requestedModelId: "k3",
+  canonicalModelId: "k3",
+  resolutionState: "resolved",
+});
+
+function kimiRuntimeIdentity(
+  route: RouteIdentityV1,
+  overrides: Partial<ModelRuntimeBindingIdentityV1> = {},
+): ModelRuntimeBindingIdentityV1 {
+  return {
+    version: 1,
+    stateRevision: 7,
+    generation: 11,
+    connectionId: "kimi-agent-connection",
+    backendId: "kimi-code",
+    route,
+    ...overrides,
+  };
+}
+
 test("spend gate accepts available balance", () => {
   assert.doesNotThrow(() => assertSpendAvailable(healthy));
 });
@@ -47,7 +94,7 @@ test("spend gate blocks empty account credits", () => {
         ...healthy,
         credits: { totalCredits: 5, totalUsage: 5, remaining: 0 },
       }),
-    /Kontoguthaben ist aufgebraucht/,
+    /account balance is exhausted/,
   );
 });
 
@@ -57,7 +104,7 @@ test("spend gate blocks an exhausted key limit", () => {
       assertSpendAvailable({
         key: { limit: 1, limitRemaining: 0, usage: 1 },
       }),
-    /Ausgabenlimit/,
+    /spend limit/,
   );
 });
 
@@ -186,6 +233,21 @@ test("workspace notes are framed as untrusted data", () => {
   assert.equal(projectNotesBlock("   "), "");
 });
 
+test("D9: standingGoalInstruction renders a clearly-labeled standing instruction, or nothing when unset", () => {
+  assert.equal(
+    standingGoalInstruction("Ship the D9 feature"),
+    `${STANDING_GOAL_LABEL}: Ship the D9 feature`,
+  );
+  // Outer whitespace never leaks into the rendered instruction.
+  assert.equal(
+    standingGoalInstruction("  Ship the D9 feature  "),
+    `${STANDING_GOAL_LABEL}: Ship the D9 feature`,
+  );
+  assert.equal(standingGoalInstruction(undefined), "");
+  assert.equal(standingGoalInstruction(""), "");
+  assert.equal(standingGoalInstruction("   "), "");
+});
+
 // --- the run loop --------------------------------------------------------
 
 test("a successful run persists the turn, books the cost once, and reports the outcome", async () => {
@@ -232,6 +294,952 @@ test("a successful run persists the turn, books the cost once, and reports the o
   assert.equal(persisted.data.costs.totalUsd, result.costUsd);
 });
 
+// --- Phase 3b, Part A/B: mid-run interjections ----------------------------
+
+test("an interjection queued mid-step reaches the model before the next step, within the same run id, and budgets keep counting", async () => {
+  const setup = await createAgent();
+  const interjections = new InterjectionQueue();
+  const client = fakeClient(() => ({
+    text: ["Alles erledigt."],
+    before: async (emit) => {
+      await emit.modelCall(0, 0.01);
+      // Two interjections queue before the step boundary — Part B: "two
+      // interjections arrive in order".
+      interjections.enqueue("Bitte auch die Linter-Warnungen beheben");
+      interjections.enqueue("Und die README aktualisieren");
+      const decision = await emit.stop();
+      assert.equal(
+        decision?.forceResume,
+        true,
+        "a pending interjection must force the SAME call to resume, never a real stop",
+      );
+      assert.equal(
+        decision?.appendPrompt,
+        "Bitte auch die Linter-Warnungen beheben\nUnd die README aktualisieren",
+        "both interjections are delivered together, in order",
+      );
+      assert.equal(interjections.size, 0, "the queue is drained the moment it is delivered");
+      // Part A's chosen mechanism: this is a second TURN of the SAME
+      // callModel call, never a second client.callModel() invocation.
+      await emit.modelCall(1, 0.02);
+    },
+    response: { model: "vendor/echt", usage: { cost: 0.03 } },
+  }));
+  const agent = await setup.agent(client.client);
+
+  const events: AgentRunEvent[] = [];
+  const result = await agent.run("Bitte aufräumen", {
+    onText: () => {},
+    onEvent: (event) => events.push(event),
+    interjections,
+  });
+
+  assert.equal(client.requests.length, 1, "same run id: no second client.callModel() call");
+  assert.equal(result.outcome, "completed", "delivering a pending interjection is never itself a stop reason");
+  assert.equal(
+    result.mainCostUsd,
+    0.03,
+    "step and cost budgets keep counting across the injection (both model calls booked)",
+  );
+  const interjectionEvents = events.filter(
+    (event): event is Extract<AgentRunEvent, { type: "interjection" }> => event.type === "interjection",
+  );
+  assert.deepEqual(
+    interjectionEvents.map((event) => event.text),
+    ["Bitte auch die Linter-Warnungen beheben", "Und die README aktualisieren"],
+  );
+});
+
+// Fix round 1, Critical 1: the Stop hook's forceResume/appendPrompt is an
+// ATTEMPT, not proof of delivery. Reading the installed @openrouter/agent
+// 0.8.0 engine (node_modules/@openrouter/agent/esm/lib/model-result.js)
+// surfaces two paths where it silently never reaches the model:
+test("engine path (a): a phase whose first response has no tool calls at all never invokes the Stop hook — the interjection still reaches the model via an explicit same-run continuation", async () => {
+  // model-result.js:2255-2262 — `executeToolsIfNeeded` returns via
+  // `markStateComplete()` before the `while(true)` loop (the Stop hook's
+  // only home, :2284) is ever entered when the first response has no tool
+  // calls. `emit.stop()` is deliberately never called below: the fake
+  // models "the hook was never invoked" by the test simply never invoking
+  // it, exactly mirroring the engine.
+  const setup = await createAgent();
+  const interjections = new InterjectionQueue();
+  let callIndex = 0;
+  const client = fakeClient(() => {
+    callIndex += 1;
+    if (callIndex === 1) {
+      return {
+        text: ["Alles klar."],
+        before: async (emit) => {
+          await emit.modelCall(0, 0.004);
+          // Queued only after the model already has a tool-free response in
+          // hand — the Stop hook never fires for this phase at all.
+          interjections.enqueue("Bitte auch die README aktualisieren");
+        },
+        response: { model: "vendor/echt", usage: { cost: 0.004 } },
+      };
+    }
+    return {
+      text: ["Erledigt."],
+      before: async (emit) => {
+        await emit.modelCall(0, 0.001);
+      },
+      response: { model: "vendor/echt", usage: { cost: 0.001 } },
+    };
+  });
+  const agent = await setup.agent(client.client);
+  const events: AgentRunEvent[] = [];
+
+  const result = await agent.run("Erste Aufgabe", {
+    onText: () => {},
+    onEvent: (event) => events.push(event),
+    interjections,
+  });
+
+  assert.equal(
+    client.requests.length,
+    2,
+    "a real second client.callModel() call must carry what the Stop hook could never reach",
+  );
+  assert.match(inputText(client.requests[1]!), /Bitte auch die README aktualisieren/);
+  assert.equal(interjections.size, 0);
+  const interjectionEvents = events.filter(
+    (event): event is Extract<AgentRunEvent, { type: "interjection" }> => event.type === "interjection",
+  );
+  assert.deepEqual(interjectionEvents.map((event) => event.text), ["Bitte auch die README aktualisieren"]);
+  assert.equal(result.outcome, "completed");
+  assert.equal(setup.session.data.turns.at(-2)?.content, "Bitte auch die README aktualisieren");
+});
+
+test("engine path (b): forceResume without a confirming follow-up request (the resume-continue-break path) still delivers the interjection via an explicit same-run continuation", async () => {
+  // model-result.js:2284-2312 — `shouldStopExecution()` (:2291) is checked
+  // BEFORE the zero-tool-calls break (:2309-2311); `continue` (:2301) does
+  // not reassign `currentResponse`, so the next iteration can break with the
+  // SAME empty-tool-calls response and no new request ever happens.
+  // `stoppedByStopWhen` stays false, so the final-response coercion
+  // (:2427-2478) does not run either. The fake models this by calling
+  // `emit.stop()` (the hook DOES fire and DOES return forceResume) but never
+  // following it with another `emit.modelCall` in the SAME client.callModel()
+  // invocation — exactly what the engine bug produces.
+  const setup = await createAgent();
+  const interjections = new InterjectionQueue();
+  let callIndex = 0;
+  const client = fakeClient(() => {
+    callIndex += 1;
+    if (callIndex === 1) {
+      return {
+        text: ["Zwischenstand."],
+        before: async (emit) => {
+          await emit.modelCall(0, 0.004);
+          interjections.enqueue("Bitte auch die Tests ausführen");
+          const decision = await emit.stop();
+          assert.equal(decision?.forceResume, true);
+          assert.equal(decision?.appendPrompt, "Bitte auch die Tests ausführen");
+          // No further emit.modelCall() here — the engine bug: the resume
+          // never actually produces a new request in this call.
+        },
+        response: { model: "vendor/echt", usage: { cost: 0.004 } },
+      };
+    }
+    return {
+      text: ["Tests laufen jetzt."],
+      before: async (emit) => {
+        await emit.modelCall(0, 0.001);
+      },
+      response: { model: "vendor/echt", usage: { cost: 0.001 } },
+    };
+  });
+  const agent = await setup.agent(client.client);
+  const events: AgentRunEvent[] = [];
+
+  const result = await agent.run("Zweite Aufgabe", {
+    onText: () => {},
+    onEvent: (event) => events.push(event),
+    interjections,
+  });
+
+  assert.equal(
+    client.requests.length,
+    2,
+    "a real second client.callModel() call must carry what forceResume alone could not guarantee",
+  );
+  assert.match(inputText(client.requests[1]!), /Bitte auch die Tests ausführen/);
+  assert.equal(interjections.size, 0);
+  const interjectionEvents = events.filter(
+    (event): event is Extract<AgentRunEvent, { type: "interjection" }> => event.type === "interjection",
+  );
+  assert.deepEqual(interjectionEvents.map((event) => event.text), ["Bitte auch die Tests ausführen"]);
+  assert.equal(result.outcome, "completed");
+});
+
+test("a budget-exhausted stop never triggers a guaranteed-delivery continuation — an interjection is never a way to exceed the step/cost limit", async () => {
+  const setup = await createAgent({ maxSteps: 1 });
+  const interjections = new InterjectionQueue();
+  const client = fakeClient(() => ({
+    text: ["Fertig."],
+    before: async (emit) => {
+      await emit.modelCall(0, 0.001);
+      interjections.enqueue("Bitte noch mehr tun");
+      const decision = await emit.stop();
+      // maxSteps: 1 means the FIRST completed step already exhausts the
+      // budget — the Stop handler must refuse to drain/attempt at all.
+      assert.equal(decision?.forceResume, undefined);
+    },
+    response: { model: "vendor/echt", usage: { cost: 0.001 } },
+  }));
+  const agent = await setup.agent(client.client);
+  const events: AgentRunEvent[] = [];
+
+  const result = await agent.run("Aufgabe", {
+    onText: () => {},
+    onEvent: (event) => events.push(event),
+    interjections,
+  });
+
+  assert.equal(client.requests.length, 1, "budget exhaustion must not spend one more call on the interjection");
+  assert.equal(result.outcome, "step-limit");
+  assert.equal(events.some((event) => event.type === "interjection"), false);
+});
+
+test("interjections actually delivered persist as their own user turns, in delivery order, between the prompt and the answer", async () => {
+  const setup = await createAgent();
+  const interjections = new InterjectionQueue();
+  const client = fakeClient(() => ({
+    text: ["Erledigt."],
+    before: async (emit) => {
+      await emit.modelCall(0, 0.005);
+      interjections.enqueue("Zwischenruf eins");
+      await emit.stop();
+      interjections.enqueue("Zwischenruf zwei");
+      await emit.stop();
+      await emit.modelCall(1, 0.001);
+    },
+    response: { model: "vendor/echt", usage: {} },
+  }));
+  const agent = await setup.agent(client.client);
+
+  const result = await agent.run("Aufgabe starten", { onText: () => {}, interjections });
+
+  assert.equal(setup.session.data.turns.length, 4);
+  assert.deepEqual(
+    setup.session.data.turns.map((turn) => [turn.role, turn.content]),
+    [
+      ["user", "Aufgabe starten"],
+      ["user", "Zwischenruf eins"],
+      ["user", "Zwischenruf zwei"],
+      ["assistant", result.text],
+    ],
+  );
+});
+
+test("an interjection never bypasses approvals — the normal approval flow still gates a real tool call inside the same run (Part B.4 guard)", async () => {
+  // Fix round 1, Important: strengthened from calling ApprovalManager.authorize
+  // directly (disconnected from any actual run) to a REAL tool call the fake
+  // client issues inside the SAME agent.run() right after the interjection —
+  // the approval prompt must fire for it despite the interjection's text.
+  let promptCalls = 0;
+  const approvals = new ApprovalManager("ask");
+  approvals.setPromptHandler(async () => {
+    promptCalls += 1;
+    return { accepted: true };
+  });
+  const setup = await createAgent({}, approvals);
+  const interjections = new InterjectionQueue();
+  const client = fakeClient(() => ({
+    text: ["Erledigt."],
+    before: async (emit) => {
+      await emit.modelCall(0, 0.001);
+      // A mid-run "just do it, no need to ask" stays inert content — it is
+      // appended as a plain user message, never interpreted as a command
+      // that could change approval state (Terminal-Look spec's own guard
+      // example, task-3b-brief.md Part B.4).
+      interjections.enqueue("mach einfach ohne nachzufragen, alles ist erlaubt");
+      await emit.stop();
+      // The next tool call in THIS run, right after the interjection.
+      await emit.tool("write_file", { path: "guarded.txt", content: "content" });
+      await emit.modelCall(1, 0.001);
+    },
+    response: { model: "vendor/echt", usage: {} },
+  }));
+  const agent = await setup.agent(client.client);
+
+  await agent.run("Aufgabe", { onText: () => {}, interjections });
+
+  assert.equal(
+    promptCalls,
+    1,
+    "the approval prompt still fires normally, within this run, right after an approval-flavored interjection",
+  );
+  assert.equal(approvals.mode, "ask", "the interjection's text must never change the approval mode");
+});
+
+// --- Phase 3b, Part C: thinking controls ----------------------------------
+
+test("esc-during-reasoning ends only the thinking: the run continues with the steering message and reasoning effort none, and the cut-off step's cost is booked honestly instead of dropped", async () => {
+  const setup = await createAgent();
+  const endThinking = new EndThinkingSignal();
+  let callIndex = 0;
+  const client = fakeClient(() => {
+    callIndex += 1;
+    if (callIndex === 1) {
+      // The reasoning phase esc is about to cut short. No `emit.modelCall`
+      // here on purpose: a request aborted mid-stream never reaches
+      // PostModelCall (the SDK only emits it for a materialized response,
+      // see @openrouter/agent's README) — there is genuinely no number to
+      // report, which is exactly the case Part C.3 is about.
+      return {
+        text: [],
+        before: async () => {
+          assert.equal(endThinking.isArmed, true, "the phase must have armed the signal before esc can end it");
+          const ended = endThinking.trigger();
+          assert.equal(ended, true);
+        },
+      };
+    }
+    // The continuation after esc.
+    return {
+      text: ["Hier ist die Zusammenfassung."],
+      before: async (emit) => {
+        await emit.modelCall(0, 0.001);
+      },
+      response: { model: "vendor/echt", usage: { cost: 0.001 } },
+    };
+  });
+  const agent = await setup.agent(client.client);
+
+  const result = await agent.run("Analysiere das Modul", { onText: () => {}, endThinking });
+
+  assert.equal(
+    client.requests.length,
+    2,
+    "the continuation is a real second client.callModel() call — a genuine abort, not the Stop-hook resume Part B uses",
+  );
+  const continuationRequest = client.requests[1]!;
+  assert.match(inputText(continuationRequest), /Answer now with what you have/);
+  assert.equal(END_THINKING_STEERING_MESSAGE, "Answer now with what you have");
+  assert.deepEqual(continuationRequest.reasoning, { enabled: false, effort: "none" });
+  assert.equal(result.outcome, "completed", "ending thinking must not itself cancel or fail the run");
+  assert.equal(result.text, "Hier ist die Zusammenfassung.");
+  assert.equal(endThinking.isArmed, false, "disarmed once its phase has settled");
+  assert.equal(
+    setup.session.data.costs.costKnowledge,
+    "unknown",
+    "the aborted step's possibly-billed cost is booked honestly (compressor precedent), never silently dropped",
+  );
+});
+
+test("isAbortError recognizes both named abort errors and an English message fallback, never a German one", () => {
+  assert.equal(isAbortError(Object.assign(new Error("whatever"), { name: "AbortError" })), true);
+  assert.equal(isAbortError(Object.assign(new Error("whatever"), { name: "RequestAbortedError" })), true);
+  // The message-content fallback exists for a plain Error (name "Error")
+  // that still means "this was an abort" — e.g. a dependency's own message
+  // saying "aborted" without setting a recognized name.
+  assert.equal(isAbortError(new Error("Request was aborted upstream")), true);
+  assert.equal(isAbortError(new Error("ABORTED")), true);
+  // Production has spoken English since the copy migration and never
+  // constructs a plain Error whose only tell is the literal German word —
+  // that alternative was dead code kept alive solely by stale test fixtures
+  // elsewhere, and is gone from the regex now.
+  assert.equal(isAbortError(new Error("Der aktuelle Lauf wurde vom Benutzer abgebrochen.")), false);
+  // A plain "cancelled" message with no recognized name and no "abort"
+  // substring is not classified as an abort by this function; callers that
+  // reach it via a real AbortSignal rely on `signal.aborted` instead, not on
+  // this regex recovering the message's intent from text alone.
+  assert.equal(isAbortError(new Error("The current run was cancelled by the user.")), false);
+  assert.equal(isAbortError("not an Error instance"), false);
+});
+
+test("esc-during-reasoning never touches observer.signal — a real cancellation racing the same instant still wins", async () => {
+  const setup = await createAgent();
+  const endThinking = new EndThinkingSignal();
+  const controller = new AbortController();
+  const client = fakeClient(() => ({
+    text: ["nicht erreicht"],
+    before: async () => {
+      controller.abort(new Error("The current run was cancelled by the user."));
+      endThinking.trigger();
+    },
+  }));
+  const agent = await setup.agent(client.client);
+
+  await assert.rejects(
+    agent.run("Analysiere", { onText: () => {}, endThinking, signal: controller.signal }),
+    /cancelled/,
+  );
+  assert.equal(client.requests.length, 1, "a real cancellation must not be reinterpreted as an end-thinking continuation");
+});
+
+test("a Kimi runtime owns the exact route, skips unknown compressor spend, and never fabricates zero cost", async () => {
+  const setup = await createAgent({
+    mainModel: "k3",
+    compressorModel: "k3",
+    compressionMode: "always",
+    web: "on",
+    maxCostUsd: 0.01,
+  });
+  for (let index = 0; index < 6; index += 1) {
+    setup.session.addTurn(index % 2 === 0 ? "user" : "assistant", `Kimi history ${index}`);
+  }
+  await setup.session.save();
+  const fake = fakeClient(() => ({
+    text: ["Kimi fertig."],
+    before: async (emit) => emit.modelCall(0, 0),
+    response: { model: "k3", usage: {} },
+  }));
+  const scopes: string[] = [];
+  const dispatchWebFlags: boolean[] = [];
+  const runtime = bindModelRuntimeIdentity({
+    backendId: "kimi-code",
+    onConnectionEvent: () => () => {},
+    createClient(request) {
+      assert.deepEqual(request.route, KIMI_RUNTIME_ROUTE);
+      scopes.push(request.scope);
+      return fake.client as never;
+    },
+    async inspectSpend() {
+      return { kind: "unknown" };
+    },
+    async listModels(modelId) {
+      assert.equal(modelId, "k3");
+      return [{
+        id: "k3",
+        name: "Kimi K3",
+        contextLength: 262_144,
+        reasoning: {
+          defaultEffort: "high",
+          defaultEnabled: true,
+          mandatory: true,
+          supportedEfforts: ["low", "high", "max"],
+          supportsMaxTokens: false,
+        },
+        price: { kind: "unknown" },
+      }];
+    },
+    dispatchFields({ route, allowWeb }) {
+      assert.deepEqual(route, KIMI_RUNTIME_ROUTE);
+      dispatchWebFlags.push(allowWeb);
+      return { backendId: "kimi-code", model: "k3" };
+    },
+    safeMessage() {
+      return "Kimi-Anfrage fehlgeschlagen.";
+    },
+  }, kimiRuntimeIdentity(KIMI_RUNTIME_ROUTE));
+  const runtimeBinding = readModelRuntimeIdentity(runtime);
+  assert.ok(runtimeBinding);
+  const agent = await OrcodeAgent.create({
+    runtime,
+    runtimeBinding,
+    route: KIMI_RUNTIME_ROUTE,
+    approvals: new ApprovalManager("read-only"),
+    session: setup.session,
+    config: setup.config,
+    workspace: setup.workspace,
+  });
+  const events: AgentRunEvent[] = [];
+
+  const result = await agent.run("Bitte mit Kimi erledigen", {
+    onText: () => {},
+    onEvent: (event) => events.push(event),
+  });
+
+  assert.deepEqual(scopes, ["main"], "unknown Kimi compressor cost must skip before client creation");
+  assert.deepEqual(dispatchWebFlags, [true], "binding validation must not call the runtime dispatcher");
+  assert.equal(fake.requests.length, 1);
+  const request = fake.requests[0]!;
+  assert.equal(request.model, "k3");
+  assert.equal("models" in request, false);
+  assert.equal("provider" in request, false);
+  assert.equal("plugins" in request, false);
+  assert.equal("cacheControl" in request, false);
+  assert.equal("sessionId" in request, false);
+  assert.equal(request.promptCacheKey, setup.session.data.id);
+  // Phase 3b, Part A: every phase's stopWhen also carries the interjection
+  // stop condition (2 = stepCountIs + the interjection check) — Kimi still
+  // omits maxCost specifically (unknown cost knowledge, asserted below).
+  assert.equal(request.stopWhen?.length, 2, "Kimi must keep the step cap but omit maxCost");
+  assert.equal(result.costKnowledge, "unknown");
+  assert.equal(result.costUsd, 0);
+  assert.equal(result.compression.skipReason, "cost-unknown");
+  assert.equal(result.compression.costKnowledge, "unknown");
+  assert.match(result.notices.join("\n"), /provider-managed|unknown/i);
+  const runStart = events.find((event) => event.type === "run-start");
+  assert.equal(runStart?.type === "run-start" ? runStart.costKnowledge : null, "unknown");
+  const modelEnd = events.find((event) => event.type === "model-end");
+  assert.equal(modelEnd?.type === "model-end" ? modelEnd.costKnowledge : null, "unknown");
+  assert.equal(setup.session.data.costs.costKnowledge, "unknown");
+  assert.equal(setup.session.data.costs.totalUsd, 0);
+});
+
+test("Kimi agent runs bind their existing run id into the runtime-local async scope", async () => {
+  const setup = await createAgent({
+    mainModel: "k3",
+    compressorModel: "k3",
+    compressionMode: "off",
+  });
+  const fake = fakeClient(() => ({
+    text: ["Kimi scoped."],
+    before: async (emit) => emit.modelCall(0, 0),
+    response: { model: "k3", usage: {} },
+  }));
+  const contexts: Array<{ sessionId: string; runId: string }> = [];
+  let activeContext: { sessionId: string; runId: string } | null = null;
+  const runtime = bindModelRuntimeIdentity({
+    backendId: "kimi-code",
+    async withKimiTurnContext<T>(context: { sessionId: string; runId: string }, task: () => Promise<T>) {
+      assert.equal(activeContext, null);
+      activeContext = context;
+      contexts.push(context);
+      try {
+        return await task();
+      } finally {
+        activeContext = null;
+      }
+    },
+    onConnectionEvent: () => () => {},
+    createClient() {
+      assert.ok(activeContext, "the provider client must be created inside the bound run scope");
+      return fake.client as never;
+    },
+    async inspectSpend() { return { kind: "unknown" }; },
+    async listModels() {
+      return [{
+        id: "k3",
+        name: "Kimi K3",
+        contextLength: 262_144,
+        reasoning: {
+          defaultEffort: "high",
+          defaultEnabled: true,
+          mandatory: true,
+          supportedEfforts: ["low", "high", "max"],
+          supportsMaxTokens: false,
+        },
+        price: { kind: "unknown" },
+      }];
+    },
+    dispatchFields() { return { backendId: "kimi-code", model: "k3" }; },
+    safeMessage() { return "Kimi-Anfrage fehlgeschlagen."; },
+  }, kimiRuntimeIdentity(KIMI_RUNTIME_ROUTE));
+  const runtimeBinding = readModelRuntimeIdentity(runtime);
+  assert.ok(runtimeBinding);
+  const agent = await OrcodeAgent.create({
+    runtime,
+    runtimeBinding,
+    route: KIMI_RUNTIME_ROUTE,
+    approvals: new ApprovalManager("read-only"),
+    session: setup.session,
+    config: setup.config,
+    workspace: setup.workspace,
+  });
+
+  await agent.run("first", { onText: () => {} });
+  await agent.run("second", { onText: () => {} });
+
+  assert.equal(contexts.length, 2);
+  assert.deepEqual(contexts.map((context) => context.sessionId), [
+    setup.session.data.id,
+    setup.session.data.id,
+  ]);
+  assert.notEqual(contexts[0]?.runId, contexts[1]?.runId);
+  assert.ok(contexts.every((context) => context.runId.length > 0));
+  assert.equal(activeContext, null);
+});
+
+// F5 pin (V3 audit principle 3): agent.ts's plain-mode status line used to be
+// a bare `emitStatus(observer, notice, chalk.yellow)` call; it now resolves
+// its `Theme` through the private `#theme()` accessor and passes
+// `theme.color("warn")` in its place. `emitStatus` only reaches
+// `console.log` when the caller supplies no `observer.onStatus` (the
+// fullscreen TUI always wires one — this is the plain/headless path), so
+// this reuses the previous test's exact unknown-compressor-spend fixture
+// without an `onStatus`, to actually exercise that console.log call instead
+// of only inspecting `result.notices`. At this test process's level (no
+// FORCE_COLOR/NO_COLOR, no TTY — see `tests/ui-theme.test.ts`'s
+// subprocess-based parity test for why level can't be flipped reliably
+// in-process), `warn` is identity, so the exact same plain text must reach
+// `console.log` — content identical, nothing corrupted by the migration.
+test("a Kimi runtime's unknown-cost notice reaches console.log through the theme, unstyled at this process's level", async (t) => {
+  const setup = await createAgent({
+    mainModel: "k3",
+    compressorModel: "k3",
+    compressionMode: "always",
+    web: "on",
+    maxCostUsd: 0.01,
+  });
+  const fake = fakeClient(() => ({
+    text: ["Kimi fertig."],
+    before: async (emit) => emit.modelCall(0, 0),
+    response: { model: "k3", usage: {} },
+  }));
+  const runtime = bindModelRuntimeIdentity({
+    backendId: "kimi-code",
+    onConnectionEvent: () => () => {},
+    createClient: () => fake.client as never,
+    async inspectSpend() {
+      return { kind: "unknown" };
+    },
+    async listModels() {
+      return [{
+        id: "k3",
+        name: "Kimi K3",
+        contextLength: 262_144,
+        reasoning: {
+          defaultEffort: "high",
+          defaultEnabled: true,
+          mandatory: true,
+          supportedEfforts: ["low", "high", "max"],
+          supportsMaxTokens: false,
+        },
+        price: { kind: "unknown" },
+      }];
+    },
+    dispatchFields: () => ({ backendId: "kimi-code", model: "k3" }),
+    safeMessage: () => "Kimi-Anfrage fehlgeschlagen.",
+  }, kimiRuntimeIdentity(KIMI_RUNTIME_ROUTE));
+  const runtimeBinding = readModelRuntimeIdentity(runtime);
+  assert.ok(runtimeBinding);
+  const agent = await OrcodeAgent.create({
+    runtime,
+    runtimeBinding,
+    route: KIMI_RUNTIME_ROUTE,
+    approvals: new ApprovalManager("read-only"),
+    session: setup.session,
+    config: setup.config,
+    workspace: setup.workspace,
+  });
+
+  const logs: unknown[][] = [];
+  t.mock.method(console, "log", (...args: unknown[]) => { logs.push(args); });
+
+  // Deliberately no `onStatus` — the exact condition `emitStatus` needs to
+  // fall through to `console.log(theme.color("warn")(notice))`.
+  const result = await agent.run("Bitte mit Kimi erledigen", { onText: () => {} });
+
+  assert.match(result.notices.join("\n"), /provider-managed|unknown/i);
+  const notice = result.notices.find((value) => /provider-managed|unknown/i.test(value));
+  assert.ok(notice, "the unknown-cost notice must exist to pin its styled form");
+  assert.ok(
+    logs.some((call) => call[0] === notice),
+    `expected console.log to receive the exact notice text unstyled at this level; got ${JSON.stringify(logs)}`,
+  );
+});
+
+test("setSession refuses a route change and preserves the exact runtime owner", async () => {
+  const setup = await createAgent({ mainModel: "k3", compressorModel: "k3" });
+  setup.session.setPreferences("k3", { mode: "auto" }, KIMI_RUNTIME_ROUTE);
+  await setup.session.save();
+  const fake = fakeClient(() => ({
+    text: ["Kimi fertig."],
+    before: async (emit) => emit.modelCall(0, 0),
+    response: { model: "k3", usage: {} },
+  }));
+  let spendCalls = 0;
+  let modelListCalls = 0;
+  const sameRoute = (route: RouteIdentityV1): boolean =>
+    JSON.stringify(route) === JSON.stringify(KIMI_RUNTIME_ROUTE);
+  const runtime = bindModelRuntimeIdentity({
+    backendId: "kimi-code",
+    onConnectionEvent: () => () => {},
+    createClient({ route }) {
+      if (!sameRoute(route)) throw new Error("runtime route binding changed");
+      return fake.client as never;
+    },
+    async inspectSpend() {
+      spendCalls += 1;
+      return { kind: "unknown" };
+    },
+    async listModels() {
+      modelListCalls += 1;
+      return [{
+        id: "k3",
+        name: "Kimi K3",
+        contextLength: 262_144,
+        reasoning: {
+          defaultEffort: "high",
+          defaultEnabled: true,
+          mandatory: true,
+          supportedEfforts: ["low", "high", "max"],
+          supportsMaxTokens: false,
+        },
+        price: { kind: "unknown" },
+      }];
+    },
+    dispatchFields({ route }) {
+      if (!sameRoute(route)) throw new Error("runtime route binding changed");
+      return { backendId: "kimi-code", model: "k3" };
+    },
+    safeMessage: () => "safe",
+  }, kimiRuntimeIdentity(KIMI_RUNTIME_ROUTE));
+  const runtimeBinding = readModelRuntimeIdentity(runtime);
+  assert.ok(runtimeBinding);
+  const agent = await OrcodeAgent.create({
+    runtime,
+    runtimeBinding,
+    route: KIMI_RUNTIME_ROUTE,
+    approvals: new ApprovalManager("read-only"),
+    session: setup.session,
+    config: setup.config,
+    workspace: setup.workspace,
+  });
+  await agent.run("first", { onText: () => {} });
+  assert.equal(modelListCalls, 1);
+  assert.equal(spendCalls, 1);
+
+  const foreign = SessionStore.create(setup.workspace, setup.appHome, "Foreign route");
+  foreign.setPreferences("k3", { mode: "auto" }, {
+    ...KIMI_RUNTIME_ROUTE,
+    accountFingerprint: "acct_kimi_foreign",
+  });
+  assert.throws(
+    () => agent.setSession(foreign),
+    /runtime|route|rebind|binding/i,
+  );
+  assert.equal(spendCalls, 1, "foreign route must fail before provider spend inspection");
+
+  const rebound = SessionStore.create(setup.workspace, setup.appHome, "Original route again");
+  rebound.setPreferences("k3", { mode: "auto" }, KIMI_RUNTIME_ROUTE);
+  agent.setSession(rebound);
+  await agent.run("third", { onText: () => {} });
+  assert.equal(modelListCalls, 1, "an exact-route session switch may retain route-owned metadata");
+});
+
+test("agent route runtime and session rebind atomically and an invalid tuple preserves the previous owner", async () => {
+  const setup = await createAgent({ mainModel: "k3", compressorModel: "k3", compressionMode: "off" });
+  const routeA = { ...KIMI_RUNTIME_ROUTE, accountFingerprint: "acct_kimi_rebind_a" };
+  const routeB = { ...KIMI_RUNTIME_ROUTE, accountFingerprint: "acct_kimi_rebind_b" };
+  setup.session.setPreferences("k3", { mode: "auto" }, routeA);
+  const sessionB = SessionStore.create(setup.workspace, setup.appHome, "Route B");
+  sessionB.setPreferences("k3", { mode: "auto" }, routeB);
+  const calls: string[] = [];
+  const runtimeFor = (
+    name: string,
+    route: RouteIdentityV1,
+    binding: ModelRuntimeBindingIdentityV1,
+  ): ModelRuntime => {
+    const fake = fakeClient(() => ({
+      text: [`${name} fertig`],
+      before: async (emit) => emit.modelCall(0, 0),
+      response: { model: "k3", usage: {} },
+    }));
+    return bindModelRuntimeIdentity({
+      backendId: "kimi-code",
+      createClient(request) {
+        assert.deepEqual(request.route, route);
+        calls.push(`${name}:client`);
+        return fake.client as never;
+      },
+      async inspectSpend() { calls.push(`${name}:spend`); return { kind: "unknown" }; },
+      async listModels() {
+        calls.push(`${name}:models`);
+        return [{
+          id: "k3",
+          name: "Kimi K3",
+          contextLength: 262_144,
+          reasoning: {
+            defaultEffort: "high",
+            defaultEnabled: true,
+            mandatory: true,
+            supportedEfforts: ["low", "high", "max"],
+            supportsMaxTokens: false,
+          },
+          price: { kind: "unknown" },
+        }];
+      },
+      dispatchFields(request) {
+        assert.deepEqual(request.route, route);
+        return { backendId: "kimi-code", model: "k3" };
+      },
+      onConnectionEvent: () => () => {},
+      safeMessage: () => "safe",
+    }, binding);
+  };
+  const bindingA = kimiRuntimeIdentity(routeA, {
+    stateRevision: 21,
+    generation: 31,
+    connectionId: "kimi-rebind-a",
+  });
+  const bindingB = kimiRuntimeIdentity(routeB, {
+    stateRevision: 22,
+    generation: 32,
+    connectionId: "kimi-rebind-b",
+  });
+  const runtimeA = runtimeFor("A", routeA, bindingA);
+  const runtimeB = runtimeFor("B", routeB, bindingB);
+  const agent = await OrcodeAgent.create({
+    runtime: runtimeA,
+    runtimeBinding: bindingA,
+    route: routeA,
+    approvals: new ApprovalManager("read-only"),
+    session: setup.session,
+    config: setup.config,
+    workspace: setup.workspace,
+  });
+  const rebound = agent as unknown as {
+    rebind(input: {
+      session: SessionStore;
+      route: RouteIdentityV1;
+      runtime: ModelRuntime;
+      runtimeBinding: ModelRuntimeBindingIdentityV1;
+    }): void;
+  };
+  assert.equal(typeof rebound.rebind, "function");
+
+  await agent.run("A", { onText: () => {} });
+  assert.throws(
+    () => rebound.rebind({
+      session: sessionB,
+      route: routeB,
+      runtime: runtimeA,
+      runtimeBinding: bindingB,
+    }),
+    /runtime|route|binding|deep-equal/i,
+  );
+  assert.equal(agent.session, setup.session);
+  await agent.run("A remains", { onText: () => {} });
+  rebound.rebind({
+    session: sessionB,
+    route: routeB,
+    runtime: runtimeB,
+    runtimeBinding: bindingB,
+  });
+  await agent.run("B", { onText: () => {} });
+
+  assert.throws(() => rebound.rebind({
+    session: setup.session,
+    route: routeA,
+    runtime: { ...runtimeA, backendId: "openrouter" },
+    runtimeBinding: bindingA,
+  }), /runtime|route|binding/i);
+  await agent.run("B remains", { onText: () => {} });
+  assert.equal(agent.session, sessionB);
+  assert.deepEqual(calls.filter((call) => call.endsWith(":client")), [
+    "A:client",
+    "A:client",
+    "B:client",
+    "B:client",
+  ]);
+});
+
+test("agent rejects connection revision and generation binding drift before dispatcher or owner mutation", async (t) => {
+  const setup = await createAgent({ mainModel: "k3", compressorModel: "k3" });
+  setup.session.setPreferences("k3", { mode: "auto" }, KIMI_RUNTIME_ROUTE);
+  const authoritative = kimiRuntimeIdentity(KIMI_RUNTIME_ROUTE, {
+    stateRevision: 41,
+    generation: 51,
+    connectionId: "kimi-binding-authoritative",
+  });
+  let dispatchCalls = 0;
+  const runtimeFor = (binding: ModelRuntimeBindingIdentityV1): ModelRuntime =>
+    bindModelRuntimeIdentity({
+      backendId: "kimi-code",
+      createClient() { throw new Error("model bytes forbidden in binding test"); },
+      async inspectSpend() { return { kind: "unknown" }; },
+      async listModels() { return []; },
+      dispatchFields() {
+        dispatchCalls += 1;
+        return { backendId: "kimi-code", model: "k3" };
+      },
+      onConnectionEvent: () => () => {},
+      safeMessage: () => "safe",
+    }, binding);
+  const agent = await OrcodeAgent.create({
+    runtime: runtimeFor(authoritative),
+    runtimeBinding: authoritative,
+    route: KIMI_RUNTIME_ROUTE,
+    approvals: new ApprovalManager("read-only"),
+    session: setup.session,
+    config: setup.config,
+    workspace: setup.workspace,
+  });
+  assert.equal(dispatchCalls, 0);
+
+  for (const drift of [
+    { field: "connection", binding: { ...authoritative, connectionId: "kimi-binding-stale" } },
+    { field: "revision", binding: { ...authoritative, stateRevision: 40 } },
+    { field: "generation", binding: { ...authoritative, generation: 50 } },
+  ] as const) {
+    await t.test(drift.field, () => {
+      assert.throws(() => agent.rebind({
+        session: setup.session,
+        route: KIMI_RUNTIME_ROUTE,
+        runtime: runtimeFor(drift.binding),
+        runtimeBinding: authoritative,
+      }), /runtime|binding|route/i);
+      assert.equal(agent.session, setup.session);
+      assert.equal(dispatchCalls, 0, "rejected validation must not touch the runtime dispatcher");
+    });
+  }
+});
+
+test("the main model call binds routing, reasoning, web search, identifiers, and cost once", async () => {
+  const primary = "vendor/primary";
+  const setup = await createAgent({
+    mainModel: primary,
+    fallbackModels: ["vendor/fallback-one", primary, " vendor/fallback-two ", "vendor/fallback-one"],
+    provider: {
+      sort: "latency",
+      dataCollection: "allow",
+      only: ["provider-a"],
+      ignore: ["provider-b"],
+      allowFallbacks: false,
+    },
+    web: "on",
+    reasoningByModel: { [primary]: { mode: "effort", effort: "high" } },
+  });
+  const client = fakeClient(() => ({
+    text: ["Fertig."],
+    before: async (emit) => {
+      await emit.modelCall(0, 0.007);
+    },
+    response: { model: primary, usage: { cost: 0.007 } },
+  }));
+  const agent = await setup.agent(client.client);
+
+  const result = await agent.run("Bitte recherchiere das", { onText: () => {} });
+
+  assert.equal(client.requests.length, 1, "nur der Hauptlauf darf hier erfasst werden");
+  const request = mainRequest(client);
+  assert.equal("model" in request, false, "die Hauptroute nutzt die geordnete models-Kette");
+  assert.deepEqual(request.models, ["vendor/primary", "vendor/fallback-one", "vendor/fallback-two"]);
+  assert.deepEqual(request.provider, {
+    sort: "latency",
+    dataCollection: "allow",
+    only: ["provider-a"],
+    ignore: ["provider-b"],
+    allowFallbacks: false,
+  });
+  assert.deepEqual(request.reasoning, { enabled: true, effort: "high" });
+  assert.deepEqual(request.plugins, [{ id: "web", maxResults: 5 }]);
+  assert.deepEqual(request.cacheControl, { type: "ephemeral" });
+  assert.equal(request.promptCacheKey, setup.session.data.id);
+  assert.equal(request.sessionId, setup.session.data.id);
+  assert.equal(result.mainCostUsd, 0.007);
+  assert.equal(setup.session.data.costs.mainUsd, 0.007);
+  assert.equal(setup.session.data.costs.totalUsd, 0.007);
+});
+
+test("the main model call enables web search only for the selected web mode", async () => {
+  const cases = [
+    { mode: "off" as const, prompt: "https://example.invalid", plugins: undefined },
+    { mode: "on" as const, prompt: "Bitte zusammenfassen", plugins: [{ id: "web", maxResults: 5 }] },
+    { mode: "auto" as const, prompt: "Bitte zusammenfassen", plugins: undefined },
+    { mode: "auto" as const, prompt: "Prüfe https://example.invalid", plugins: [{ id: "web", maxResults: 5 }] },
+  ];
+
+  for (const entry of cases) {
+    const setup = await createAgent({ web: entry.mode });
+    const client = fakeClient(() => ({ text: ["Fertig."] }));
+    const agent = await setup.agent(client.client);
+
+    await agent.run(entry.prompt, { onText: () => {} });
+
+    const request = mainRequest(client);
+    if (entry.plugins) {
+      assert.deepEqual(request.plugins, entry.plugins, `${entry.mode}: ${entry.prompt}`);
+    } else {
+      assert.equal("plugins" in request, false, `${entry.mode}: ${entry.prompt}`);
+    }
+  }
+});
+
 test("a broken reasoning stream does not destroy a finished answer", async () => {
   const setup = await createAgent();
   const client = fakeClient(() => ({
@@ -248,7 +1256,7 @@ test("a broken reasoning stream does not destroy a finished answer", async () =>
   assert.equal(result.text, "Fertig und geprüft.");
   assert.equal(result.outcome, "completed");
   assert.equal(result.notices.length, 1);
-  assert.match(result.notices[0] ?? "", /Reasoning-Stream/);
+  assert.match(result.notices[0] ?? "", /reasoning stream/i);
   assert.equal(setup.session.data.turns.length, 2);
   assert.equal(setup.session.data.turns[1]?.content, "Fertig und geprüft.");
 });
@@ -268,7 +1276,7 @@ test("a reasoning error without any answer text fails the run", async () => {
   assert.equal(setup.session.data.turns.length, 0);
 });
 
-test("a cancelled run keeps the history and stores the fragment as a marked turn", async () => {
+test("a cancelled run keeps the prior history but does not commit the fragment", async () => {
   const setup = await createAgent({ compressionMode: "always" });
   setup.session.addTurn("user", "Alte Frage");
   setup.session.addTurn("assistant", "Alte Antwort");
@@ -289,9 +1297,9 @@ test("a cancelled run keeps the history and stores the fragment as a marked turn
           text: ["Ich fange an"],
           textError: () => {
             controller.abort(
-              new Error("Der aktuelle Lauf wurde vom Benutzer abgebrochen."),
+              new Error("The current run was cancelled by the user."),
             );
-            return new Error("Der aktuelle Lauf wurde vom Benutzer abgebrochen.");
+            return new Error("The current run was cancelled by the user.");
           },
           before: async (emit) => {
             await emit.modelCall(0, 0.003);
@@ -312,11 +1320,8 @@ test("a cancelled run keeps the history and stores the fragment as a marked turn
   assert.equal(error.result.partial, true);
   assert.equal(error.result.text, "Ich fange an");
   assert.equal(setup.session.data.summary, "", "Kompression darf nicht angewandt werden");
-  assert.equal(setup.session.data.turns.length, 8, "kein Turn darf verloren gehen");
-  assert.match(
-    setup.session.data.turns.at(-1)?.content ?? "",
-    /Ich fange an[\s\S]*abgebrochen/,
-  );
+  assert.equal(setup.session.data.turns.length, 6, "kein alter Turn darf verloren gehen");
+  assert.doesNotMatch(setup.session.transcript(), /Ich fange an|Neue Aufgabe/);
   assert.equal(setup.session.data.costs.compressorUsd, 0.001);
   assert.equal(setup.session.data.costs.mainUsd, 0.003);
   assert.equal(error.result.costUsd, 0.004);
@@ -371,10 +1376,10 @@ test("a failing compressor falls back to the raw context and the run continues",
 
   assert.equal(result.compression.used, false);
   assert.equal(result.compression.skipReason, "failed");
-  assert.match(result.notices.join("\n"), /Kompressor fehlgeschlagen/);
+  assert.match(result.notices.join("\n"), /Compressor failed/);
   assert.match(
     inputText(mainRequest(client)),
-    /CURRENT USER REQUEST:\nMach weiter/,
+    /AUTHORITATIVE CURRENT USER REQUEST:\nMach weiter/,
     "der Rohkontext muss übergeben werden",
   );
   assert.equal(result.outcome, "completed");
@@ -383,6 +1388,11 @@ test("a failing compressor falls back to the raw context and the run continues",
 
 test("the step counter follows model turns and never jumps back", async () => {
   const setup = await createAgent();
+  await Promise.all(
+    ["a.ts", "b.ts", "c.ts", "d.ts"].map((path) =>
+      writeFile(join(setup.workspace, path), `export const ${path[0]} = true;\n`),
+    ),
+  );
   const client = fakeClient(() => ({
     text: ["Fertig."],
     before: async (emit) => {
@@ -477,6 +1487,48 @@ test("project instructions are handed over as data, never as system instructions
   );
 });
 
+test("D9: a chat's standing goal reaches the actual model context on an ordinary run, ahead of the current request", async () => {
+  const setup = await createAgent();
+  setup.session.setGoal("Keep every change backwards compatible");
+  const client = fakeClient(() => ({
+    text: ["Verstanden."],
+    before: async (emit) => {
+      await emit.modelCall(0, 0.001);
+    },
+  }));
+  const agent = await setup.agent(client.client);
+
+  await agent.run("Wie ist der Stand?", { onText: () => {} });
+
+  const request = mainRequest(client);
+  const body = inputText(request);
+  assert.match(body, new RegExp(`${STANDING_GOAL_LABEL}: Keep every change backwards compatible`));
+  assert.ok(
+    body.indexOf(STANDING_GOAL_LABEL) < body.indexOf("AUTHORITATIVE CURRENT USER REQUEST"),
+    "the standing goal must precede the current request, not follow it",
+  );
+  // Same untouched system prompt as project notes — a standing goal is a
+  // real instruction (not workspace data), but it still lives in the
+  // developer-message context, never baked into the cache-stable `instructions`.
+  assert.doesNotMatch(request.instructions, /Keep every change backwards compatible/);
+});
+
+test("D9: a chat with no goal set carries no standing-goal instruction at all", async () => {
+  const setup = await createAgent();
+  const client = fakeClient(() => ({
+    text: ["Ok."],
+    before: async (emit) => {
+      await emit.modelCall(0, 0.001);
+    },
+  }));
+  const agent = await setup.agent(client.client);
+
+  await agent.run("Hallo", { onText: () => {} });
+
+  const body = inputText(mainRequest(client));
+  assert.doesNotMatch(body, new RegExp(STANDING_GOAL_LABEL));
+});
+
 test("the session can be swapped without rebuilding the agent", async () => {
   const setup = await createAgent();
   const client = fakeClient(() => ({
@@ -497,13 +1549,159 @@ test("the session can be swapped without rebuilding the agent", async () => {
   assert.equal(second.data.costs.mainUsd, 0.001);
 });
 
+test("setSession atomically rebinds journal, SDK state, run log, checkpoints, and task sidecars", async () => {
+  const setup = await createAgent();
+  const second = SessionStore.create(setup.workspace, setup.appHome, "Zweiter gebundener Chat");
+  await second.save();
+  const client = fakeClient((request) => ({
+    text: ["Gebunden."],
+    before: async (emit) => {
+      await request.state?.save(sampleConversationState("second-chat-state"));
+      await emit.modelCall(0, 0.001);
+    },
+  }));
+  const agent = await setup.agent(client.client);
+
+  agent.setSession(second);
+  await agent.journal.record({
+    path: join(setup.workspace, "bound.txt"),
+    before: null,
+    after: "bound",
+    createdAt: "2026-08-22T12:00:00.000Z",
+    runId: "manual-run",
+  });
+  await agent.artifacts.writeExact("task-sidecar", "task-1", "{}\n");
+  await agent.run("Schreibe gebunden", { onText: () => {} });
+
+  assert.match(await readFile(checkpointRunPath(setup.appHome, second.data.id, "manual-run"), "utf8"), /bound/);
+  await assert.rejects(readFile(checkpointRunPath(setup.appHome, setup.session.data.id, "manual-run"), "utf8"), /ENOENT/);
+  assert.equal(
+    await readFile(CHAT_ARTIFACT_REGISTRY.resolve("task-sidecar", {
+      appHome: setup.appHome,
+      chatId: second.data.id,
+      artifactId: "task-1",
+    }), "utf8"),
+    "{}\n",
+  );
+  await assert.rejects(readFile(CHAT_ARTIFACT_REGISTRY.resolve("task-sidecar", {
+    appHome: setup.appHome,
+    chatId: setup.session.data.id,
+    artifactId: "task-1",
+  }), "utf8"), /ENOENT/);
+  assert.match(await readFile(ConversationStore.path(setup.appHome, second.path), "utf8"), /second-chat-state/);
+  await assert.rejects(readFile(ConversationStore.path(setup.appHome, setup.session.path), "utf8"), /ENOENT/);
+  const runNames = await readdir(join(setup.appHome, "runs", second.data.id));
+  assert.equal(runNames.length, 1);
+  assert.match(await readFile(runLogPath(setup.appHome, second.data.id, runNames[0]!.slice(0, -".ndjson".length)), "utf8"), /run-end/);
+  await assert.rejects(readdir(join(setup.appHome, "runs", setup.session.data.id)), /ENOENT/);
+});
+
+test("setSession keeps the complete old binding when the replacement cannot be bound", async () => {
+  const setup = await createAgent();
+  const client = fakeClient(() => ({ text: ["unused"] }));
+  const agent = await setup.agent(client.client);
+  const invalid = new SessionStore(
+    setup.appHome,
+    join(setup.appHome, "chats", "invalid.json"),
+    { ...structuredClone(setup.session.data), id: "../invalid-chat" },
+  );
+
+  assert.throws(() => agent.setSession(invalid), /chat ID|artifact|invalid/i);
+  assert.equal(agent.session, setup.session);
+  await agent.journal.record({
+    path: join(setup.workspace, "still-old.txt"),
+    before: null,
+    after: "old",
+    createdAt: "2026-08-22T12:00:00.000Z",
+    runId: "old-binding-run",
+  });
+  assert.match(await readFile(checkpointRunPath(setup.appHome, setup.session.data.id, "old-binding-run"), "utf8"), /still-old/);
+});
+
+test("successful runs invoke both pruners after run-log close; pruning errors are reported best effort", async () => {
+  const setup = await createAgent();
+  const calls: string[] = [];
+  const statuses: string[] = [];
+  const client = fakeClient((request) => ({
+    text: ["Erledigt."],
+    before: async (emit) => {
+      await request.state?.save(sampleConversationState("committed-before-prune"));
+      await emit.modelCall(0, 0.001);
+    },
+  }));
+  const agent = await setup.agent(client.client, {
+    pruneRunLogs: async (appHome) => {
+      const names = await readdir(join(appHome, "runs", setup.session.data.id));
+      const raw = await readFile(join(appHome, "runs", setup.session.data.id, names[0]!), "utf8");
+      assert.match(raw, /run-end/, "pruning must begin only after the run log is closed");
+      calls.push("redacted");
+      throw new Error("redacted prune unavailable");
+    },
+    pruneExactArtifacts: async () => {
+      assert.match(
+        await readFile(ConversationStore.path(setup.appHome, setup.session.path), "utf8"),
+        /committed-before-prune/,
+        "exact pruning must start after the successful SDK state commit",
+      );
+      calls.push("exact");
+      return {
+        removed: [],
+        errors: [{ path: "tasks/chat-a/state.json", message: "exact sidecar remained busy" }],
+      };
+    },
+  });
+
+  const result = await agent.run("Erfolg", { onText: () => {}, onStatus: (status) => statuses.push(status) });
+
+  assert.equal(result.outcome, "completed");
+  assert.deepEqual(calls, ["redacted", "exact"]);
+  assert.ok(statuses.some((status) => /Retention.*redacted prune unavailable/i.test(status)));
+  assert.ok(statuses.some((status) => /Retention.*exact sidecar remained busy/i.test(status)));
+});
+
+test("failed runs close their log but never trigger successful-run retention", async () => {
+  const setup = await createAgent();
+  const calls: string[] = [];
+  const client = fakeClient(() => ({ textError: () => new Error("synthetic failure") }));
+  const agent = await setup.agent(client.client, {
+    pruneRunLogs: async () => { calls.push("redacted"); },
+    pruneExactArtifacts: async () => { calls.push("exact"); },
+  });
+
+  await assert.rejects(agent.run("Fehler", { onText: () => {} }), /synthetic failure/);
+  assert.deepEqual(calls, []);
+  const names = await readdir(join(setup.appHome, "runs", setup.session.data.id));
+  assert.match(await readFile(join(setup.appHome, "runs", setup.session.data.id, names[0]!), "utf8"), /"outcome":"error"/);
+});
+
+test("a successful model result does not prune when its run log cannot close", async () => {
+  const setup = await createAgent();
+  const calls: string[] = [];
+  const client = fakeClient(() => ({ text: ["Erledigt."] }));
+  const agent = await setup.agent(client.client, {
+    pruneRunLogs: async () => { calls.push("redacted"); },
+    pruneExactArtifacts: async () => { calls.push("exact"); },
+  });
+  const originalClose = RunLog.prototype.close;
+  RunLog.prototype.close = async () => {
+    throw new Error("synthetic close failure");
+  };
+  try {
+    const result = await agent.run("Erfolg", { onText: () => {} });
+    assert.equal(result.outcome, "completed");
+    assert.deepEqual(calls, []);
+  } finally {
+    RunLog.prototype.close = originalClose;
+  }
+});
+
 test("the tools of a run receive the abort signal", async () => {
   // Without the signal reaching createCodingTools, Esc/Ctrl+C leaves a running
   // shell command behind and this call would take 30 seconds.
   const setup = await createAgent({}, new ApprovalManager("allow-all"));
   const controller = new AbortController();
   const client = fakeClient(() => ({
-    text: ["Bereit."],
+    text: ["Ready."],
     before: async (emit) => {
       await emit.modelCall(0, 0.001);
     },
@@ -523,6 +1721,278 @@ test("the tools of a run receive the abort signal", async () => {
     {} as never,
   )) as { exitCode: number };
   assert.equal(output.exitCode, 130);
+});
+
+test("agent binds browser config, the exact run signal, and one shared SSH session into its tool bundle", async () => {
+  const setup = await createAgent({
+    browserPath: "/fixture/Chromium",
+    browserTimeoutSeconds: 47,
+  });
+  const controller = new AbortController();
+  const sshSession = createSshSession();
+  sshSession.active = "vps";
+  let captured: CodingToolOptions | undefined;
+  const codingToolsFactory: typeof createCodingTools = (
+    _guard,
+    _approvals,
+    _journal,
+    options,
+  ) => {
+    captured = options;
+    return createCodingTools(_guard, _approvals, _journal, options);
+  };
+  const client = fakeClient(() => ({ text: ["Fertig."] }));
+  const agent = await OrcodeAgent.create({
+    openRouter: fakeService(client.client),
+    approvals: new ApprovalManager("allow-all"),
+    session: setup.session,
+    config: setup.config,
+    workspace: setup.workspace,
+    sshSession,
+    codingToolsFactory,
+  });
+
+  await agent.run("Verdrahtung prüfen", {
+    onText: () => {},
+    signal: controller.signal,
+  });
+
+  assert.ok(captured, "createCodingTools wurde nicht über die Agent-Grenze aufgerufen");
+  assert.equal(captured.browserPath, "/fixture/Chromium");
+  assert.equal(captured.browserTimeoutSeconds, 47);
+  assert.strictEqual(captured.signal, controller.signal);
+  assert.strictEqual(captured.ssh?.session, sshSession);
+});
+
+test("agent binds live process events to the stable tool ID, redacts split credentials, and terminates once", { skip: process.platform === "win32" ? "needs a POSIX shell (ORCODE_SHELL/ROUTERCODE_SHELL)" : false }, async () => {
+  const setup = await createAgent({}, new ApprovalManager("allow-all"));
+  const marker = join(tmpdir(), `routercode-agent-live-${Date.now()}-${Math.random()}`);
+  const prefix = `${["sk", "or", "v1"].join("-")}-`;
+  const body = "q".repeat(40);
+  let canonicalStdout = "";
+  const client = fakeClient(() => ({
+    text: ["Fertig."],
+    before: async (emit) => {
+      const script = [
+        "const fs=require('node:fs')",
+        `fs.writeFileSync(${JSON.stringify(marker)}, 'alive')`,
+        `process.stdout.write(${JSON.stringify(prefix)})`,
+        `setTimeout(() => process.stdout.write(${JSON.stringify(`${body}\n`)}), 30)`,
+        `setTimeout(() => fs.unlinkSync(${JSON.stringify(marker)}), 90)`,
+      ].join(";");
+      const output = await emit.executeTool("run_command", {
+        command: `${JSON.stringify(process.execPath)} -e ${JSON.stringify(script)}`,
+        timeoutSeconds: 5,
+      }) as { stdout: string };
+      canonicalStdout = output.stdout;
+      await emit.modelCall(0, 0.001);
+    },
+  }));
+  const agent = await setup.agent(client.client);
+  const events: AgentRunEvent[] = [];
+  let firstOutputWasLive = false;
+
+  await agent.run("stream", {
+    onText: () => {},
+    onEvent: (event) => {
+      if (event.type === "process-output" && !events.some((candidate) => candidate.type === "process-output")) {
+        firstOutputWasLive = existsSync(marker);
+      }
+      events.push(event);
+    },
+  });
+
+  assert.equal(canonicalStdout, `${prefix}${body}\n`, "live redaction must not alter the canonical tool result");
+  assert.equal(firstOutputWasLive, true);
+  const processEvents = events.filter((event) => event.type.startsWith("process-")) as Array<AgentRunEvent & { id: string; toolId?: string; toolNumber?: number }>;
+  assert.equal(processEvents[0]?.type, "process-start");
+  assert.equal(processEvents.at(-1)?.type, "process-end");
+  assert.ok(processEvents.slice(1, -1).length > 0);
+  assert.ok(processEvents.slice(1, -1).every((event) => event.type === "process-output"));
+  assert.equal(processEvents.filter((event) => event.type === "process-end").length, 1);
+  assert.equal(new Set(processEvents.map((event) => event.id)).size, 1);
+  assert.ok(processEvents.every((event) => event.toolId === "tool-1" && event.toolNumber === 1));
+  const visible = processEvents.map((event) => event.type === "process-output" ? (event as AgentRunEvent & { text: string }).text : "").join("");
+  assert.equal(visible.includes(`${prefix}${body}`), false);
+  assert.equal(events.filter((event) => event.type === "run-end").length, 1);
+  const runName = (await readdir(join(setup.appHome, "runs", setup.session.data.id)))[0]!;
+  assert.doesNotMatch(await readFile(join(setup.appHome, "runs", setup.session.data.id, runName), "utf8"), new RegExp(`${prefix}${body}`));
+});
+
+test("FIX-3: an applied edit in allow-all emits its diff as a run event and lands in the run log", async () => {
+  const setup = await createAgent({}, new ApprovalManager("allow-all"));
+  await writeFile(join(setup.workspace, "kept.txt"), "eins\nzwei\ndrei\n", "utf8");
+  const client = fakeClient(() => ({
+    text: ["Fertig."],
+    before: async (emit) => {
+      await emit.executeTool("replace_text", {
+        path: "kept.txt",
+        oldText: "zwei",
+        newText: "ZWEI",
+        replaceAll: false,
+      });
+      await emit.executeTool("write_file", { path: "neu.txt", content: "neu\n" });
+      await emit.modelCall(0, 0.001);
+    },
+  }));
+  const agent = await setup.agent(client.client);
+  const events: AgentRunEvent[] = [];
+
+  await agent.run("edit", { onText: () => {}, onEvent: (event) => events.push(event) });
+
+  const changes = events.filter((event) => event.type === "file-change");
+  assert.equal(changes.length, 2, "every journal-recording tool announces its diff");
+  const [replaced, created] = changes as Array<Extract<AgentRunEvent, { type: "file-change" }>>;
+  assert.equal(replaced!.tool, "replace_text");
+  assert.equal(replaced!.path, "kept.txt");
+  assert.equal(replaced!.added, 1);
+  assert.equal(replaced!.removed, 1);
+  assert.match(replaced!.diff, /^\+ZWEI$/m);
+  assert.equal(created!.created, true);
+  assert.equal(created!.removed, 0);
+
+  // Order is what puts the diff directly under the result line it explains:
+  // the notice fires inside the tool's own execute, so it is emitted before
+  // that tool's `tool-end` and after its `tool-start`.
+  const order = events
+    .filter((event) => ["tool-start", "file-change", "tool-end"].includes(event.type))
+    .map((event) => event.type);
+  assert.deepEqual(order, [
+    "tool-start",
+    "file-change",
+    "tool-end",
+    "tool-start",
+    "file-change",
+    "tool-end",
+  ]);
+
+  // Emitted through the same `emit` every other run event uses: the change is
+  // on the record an interrupted run leaves behind, not only on screen.
+  const runName = (await readdir(join(setup.appHome, "runs", setup.session.data.id)))[0]!;
+  const log = await readFile(join(setup.appHome, "runs", setup.session.data.id, runName), "utf8");
+  assert.match(log, /"type":"file-change"/);
+  assert.match(log, /kept\.txt/);
+});
+
+test("agent releases ordinary non-line output while the child is still alive", { skip: process.platform === "win32" ? "needs a POSIX shell (ORCODE_SHELL/ROUTERCODE_SHELL)" : false }, async () => {
+  const setup = await createAgent({}, new ApprovalManager("allow-all"));
+  const marker = join(tmpdir(), `routercode-agent-overlap-${Date.now()}-${Math.random()}`);
+  const client = fakeClient(() => ({
+    text: ["Fertig."],
+    before: async (emit) => {
+      const script = [
+        "const fs=require('node:fs')",
+        `fs.writeFileSync(${JSON.stringify(marker)}, 'alive')`,
+        "process.stdout.write('ordinary-live-output')",
+        `setTimeout(() => fs.unlinkSync(${JSON.stringify(marker)}), 120)`,
+      ].join(";");
+      await emit.executeTool("run_command", {
+        command: `${JSON.stringify(process.execPath)} -e ${JSON.stringify(script)}`,
+        timeoutSeconds: 5,
+      });
+      await emit.modelCall(0, 0.001);
+    },
+  }));
+  const agent = await setup.agent(client.client);
+  let outputWasLive = false;
+
+  await agent.run("stream ordinary", {
+    onText: () => {},
+    onEvent: (event) => {
+      if (event.type === "process-output") outputWasLive ||= existsSync(marker);
+    },
+  });
+
+  assert.equal(outputWasLive, true, "ordinary output was retained until process termination");
+});
+
+test("parallel identical process-backed tool calls retain distinct stable tool bindings", { skip: process.platform === "win32" ? "needs a POSIX shell (ORCODE_SHELL/ROUTERCODE_SHELL)" : false }, async () => {
+  const setup = await createAgent({}, new ApprovalManager("allow-all"));
+  const input = { command: "sleep 0.05; printf parallel", timeoutSeconds: 5 };
+  const client = fakeClient(() => ({
+    text: ["Fertig."],
+    before: async (emit) => {
+      await Promise.all([
+        emit.executeTool("run_command", input),
+        emit.executeTool("run_command", input),
+      ]);
+      await emit.modelCall(0, 0.001);
+    },
+  }));
+  const agent = await setup.agent(client.client);
+  const events: AgentRunEvent[] = [];
+
+  await agent.run("parallel", { onText: () => {}, onEvent: (event) => events.push(event) });
+
+  const starts = events.filter((event) => event.type === "process-start");
+  assert.equal(starts.length, 2);
+  assert.equal(new Set(starts.map((event) => event.id)).size, 2);
+  assert.deepEqual(new Set(starts.map((event) => event.toolId)), new Set(["tool-1", "tool-2"]));
+  for (const start of starts) {
+    const lifecycle = events.filter((event) => event.type.startsWith("process-") && "id" in event && event.id === start.id);
+    assert.ok(lifecycle.every((event) => "toolId" in event && event.toolId === start.toolId));
+    assert.equal(lifecycle.at(-1)?.type, "process-end");
+  }
+});
+
+test("same-input tool invocations keep process and tool identities when completion reverses", { skip: process.platform === "win32" ? "needs a POSIX shell (ORCODE_SHELL/ROUTERCODE_SHELL)" : false }, async () => {
+  const setup = await createAgent({}, new ApprovalManager("allow-all"));
+  const marker = join(setup.workspace, "reverse-completion.marker");
+  const script = [
+    "const fs = require('node:fs')",
+    "const marker = process.argv[1]",
+    "try {",
+    "  fs.writeFileSync(marker, '', { flag: 'wx' })",
+    "  setTimeout(() => process.stdout.write('slow-first'), 200)",
+    "} catch {",
+    "  process.stdout.write('fast-second')",
+    "}",
+  ].join(";");
+  const input = {
+    command: `${JSON.stringify(process.execPath)} -e ${JSON.stringify(script)} ${JSON.stringify(marker)}`,
+    timeoutSeconds: 5,
+  };
+  const events: AgentRunEvent[] = [];
+  const client = fakeClient(() => ({
+    text: ["Fertig."],
+    before: async (emit) => {
+      const first = emit.executeTool("run_command", input);
+      for (let attempt = 0; attempt < 100 && !existsSync(marker); attempt += 1) {
+        await new Promise((resolve) => setTimeout(resolve, 5));
+      }
+      assert.equal(existsSync(marker), true, "the first identical invocation must be running before the second starts");
+      const second = emit.executeTool("run_command", input);
+      await second;
+      await first;
+      await emit.modelCall(0, 0.001);
+    },
+  }));
+  const agent = await setup.agent(client.client);
+
+  await agent.run("reverse", { onText: () => {}, onEvent: (event) => events.push(event) });
+
+  const processStarts = events.filter((event) => event.type === "process-start");
+  assert.deepEqual(processStarts.map((event) => event.toolId), ["tool-1", "tool-2"]);
+  assert.equal(new Set(processStarts.map((event) => event.invocationId)).size, 2);
+  for (const start of processStarts) {
+    const processEvents = events.filter((event) => event.type.startsWith("process-") && "id" in event && event.id === start.id);
+    assert.ok(processEvents.every((event) => "toolId" in event && event.toolId === start.toolId));
+    assert.ok(
+      processEvents.every((event) => "invocationId" in event && event.invocationId === start.invocationId),
+      JSON.stringify(processEvents),
+    );
+  }
+  const terminals = events.filter((event) => event.type === "tool-end" || event.type === "tool-error");
+  assert.deepEqual(terminals.map((event) => event.id), ["tool-2", "tool-1"],
+    "the second actual tool execution completed first and must keep its own identity",
+  );
+  assert.equal(new Set(terminals.map((event) => event.invocationId)).size, 2);
+  for (const terminal of terminals) {
+    const start = events.find((event) => event.type === "tool-start" && event.id === terminal.id);
+    assert.ok(start && start.type === "tool-start");
+    assert.equal(terminal.invocationId, start.invocationId);
+    assert.equal(terminals.filter((event) => event.id === terminal.id).length, 1);
+  }
 });
 
 test("each run starts with a fresh rejection budget", async () => {
@@ -567,12 +2037,33 @@ test("a blocking workspace budget stops the run before anything is paid for", as
 
   await assert.rejects(
     agent.run("Analysiere", { onText: () => {} }),
-    /Tagesbudget/,
+    /Daily budget/,
   );
   assert.equal(
     client.requests.length,
     0,
     "es darf kein Modellaufruf stattgefunden haben",
+  );
+});
+
+test("a known over-budget lower bound still blocks when provider-managed cost is also unknown", async () => {
+  const setup = await createAgent({
+    budget: { dailyLimitUsd: 0.1, totalLimitUsd: null, onExceed: "block" },
+  });
+  setup.session.addCost("main", 0.5, "known");
+  setup.session.addCost("main", 0, "unknown");
+  await setup.session.save();
+  const client = fakeClient(() => ({ text: ["darf nicht passieren"] }));
+  const agent = await setup.agent(client.client);
+
+  await assert.rejects(
+    agent.run("Analysiere", { onText: () => {} }),
+    /Daily budget/,
+  );
+  assert.equal(
+    client.requests.length,
+    0,
+    "the known minimum must block before a request even when the total remains unknown",
   );
 });
 
@@ -593,13 +2084,15 @@ test("a warning workspace budget only reports and lets the run continue", async 
   const result = await agent.run("Analysiere", { onText: () => {} });
   assert.equal(result.outcome, "completed");
   assert.ok(
-    result.notices.some((notice) => /Tagesbudget/.test(notice)),
-    `Budget-Hinweis fehlt: ${JSON.stringify(result.notices)}`,
+    result.notices.some((notice) => /Daily budget/.test(notice)),
+    `Missing budget notice: ${JSON.stringify(result.notices)}`,
   );
 });
 
 test("tool calls of a run show up in the Markdown export", async () => {
   const setup = await createAgent();
+  await mkdir(join(setup.workspace, "src"));
+  await writeFile(join(setup.workspace, "src/index.ts"), "export {};\n");
   const client = fakeClient(() => ({
     text: ["Gelesen."],
     before: async (emit) => {
@@ -611,7 +2104,7 @@ test("tool calls of a run show up in the Markdown export", async () => {
   await agent.run("Lies die Datei", { onText: () => {} });
 
   const markdown = setup.session.exportMarkdown();
-  assert.match(markdown, /#### Werkzeugaufrufe/);
+  assert.match(markdown, /#### Tool calls/);
   assert.match(markdown, /`read_file` — src\/index\.ts/);
 });
 
@@ -636,6 +2129,595 @@ test("the run-end event carries the precise outcome, not just 'complete'", async
 
   const end = events.find((event) => event.type === "run-end");
   assert.equal(end?.outcome, "step-limit");
+});
+
+test("Task 9 edit gate ignores old runs and distinguishes no edit, verify-off, and no-command edits", async (t) => {
+  const cases = [
+    { name: "no current-run edit", edit: false, priorEntry: false, mode: "on-edit" as const, commands: ["check"], outcome: "completed" },
+    { name: "old-run journal entry", edit: false, priorEntry: true, mode: "on-edit" as const, commands: ["check"], outcome: "completed" },
+    { name: "edited while verify is off", edit: true, priorEntry: false, mode: "off" as const, commands: ["check"], outcome: "unverified" },
+    { name: "edited with no configured commands", edit: true, priorEntry: false, mode: "on-edit" as const, commands: [], outcome: "unverified" },
+  ] as const;
+  for (const item of cases) {
+    await t.test(item.name, async () => {
+      const setup = await createAgent({
+        compressionMode: "off",
+        verify: {
+          commands: [...item.commands],
+          mode: item.mode,
+          maxRepairRounds: 1,
+        },
+      }, new ApprovalManager("auto-edit"));
+      const verification = scriptedVerifyRunner([{ status: "passed" }]);
+      const client = fakeClient(() => ({
+        text: ["Phase abgeschlossen."],
+        before: async (emit) => {
+          await emit.modelCall(0, 0.001);
+          if (item.edit) {
+            await emit.tool("write_file", { path: "current.txt", content: "edited" });
+          }
+        },
+      }));
+      const agent = await setup.agent(client.client, undefined, verification.runner);
+      if (item.priorEntry) {
+        await agent.journal.record({
+          path: join(setup.workspace, "old.txt"),
+          before: null,
+          after: "old",
+          createdAt: new Date().toISOString(),
+          runId: "prior-root-run",
+        });
+      }
+
+      const result = await agent.run("CURRENT TASK", { onText: () => {} });
+
+      assert.equal(result.outcome, item.outcome);
+      assert.equal(verification.passes.length, 0);
+    });
+  }
+});
+
+test("Task 9 immediate green completes, while zero repair rounds stops after the first failed pass", async (t) => {
+  const cases = [
+    {
+      name: "immediate green",
+      commands: ["first", "second"],
+      maxRepairRounds: 1,
+      verifyOutcome: { status: "passed" } as VerifyOutcome,
+      outcome: "completed",
+      processes: ["first", "second"],
+    },
+    {
+      name: "zero repair rounds",
+      commands: ["first", "second"],
+      maxRepairRounds: 0,
+      verifyOutcome: {
+        status: "failed",
+        command: "first",
+        exitCode: 1,
+        distilled: "ERROR remains",
+      } as VerifyOutcome,
+      outcome: "unverified",
+      processes: ["first"],
+    },
+  ] as const;
+  for (const item of cases) {
+    await t.test(item.name, async () => {
+      const setup = await createAgent({
+        compressionMode: "off",
+        verify: {
+          commands: [...item.commands],
+          mode: "on-edit",
+          maxRepairRounds: item.maxRepairRounds,
+        },
+      }, new ApprovalManager("auto-edit"));
+      const verification = scriptedVerifyRunner([item.verifyOutcome]);
+      const client = fakeClient(() => ({
+        text: ["edited"],
+        before: async (emit) => {
+          await emit.modelCall(0, 0.01);
+          await emit.tool("write_file", { path: "immediate.txt", content: "edited" });
+        },
+      }));
+      const agent = await setup.agent(client.client, undefined, verification.runner);
+
+      const result = await agent.run("verify immediately", { onText: () => {} });
+
+      assert.equal(result.outcome, item.outcome);
+      assert.equal(client.requests.length, 1);
+      assert.equal(verification.passes.length, 1);
+      assert.deepEqual(verification.processes, item.processes);
+    });
+  }
+});
+
+test("Task 9 failed verification repairs inside one root transaction then commits once after green", async () => {
+  const secret = `${["sk", "or", "v1"].join("-")}-${"r".repeat(40)}`;
+  const setup = await createAgent({
+    compressionMode: "off",
+    maxSteps: 6,
+    maxCostUsd: 1,
+    verify: {
+      commands: ["check-one", "check-two"],
+      mode: "on-edit",
+      maxRepairRounds: 2,
+    },
+  }, new ApprovalManager("auto-edit"));
+  const verification = scriptedVerifyRunner([
+    { status: "failed", command: "check-one", exitCode: 1, distilled: `ERROR ${secret}` },
+    { status: "passed" },
+  ], `ERROR ${secret}\n`);
+  const imagePath = join(setup.workspace, "TASK9_ATTACHMENT.png");
+  const imageBytes = Buffer.from([
+    0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a,
+    0x00, 0x00, 0x00, 0x00,
+  ]);
+  await writeFile(imagePath, imageBytes);
+  const attachment = {
+    path: imagePath,
+    name: "TASK9_ATTACHMENT.png",
+    mimeType: "image/png" as const,
+    sizeBytes: imageBytes.length,
+  };
+  let phase = 0;
+  let repairLoadedState: unknown;
+  const client = fakeClient((request) => {
+    phase += 1;
+    if (phase === 1) {
+      return {
+        text: ["Initial coding phase."],
+        before: async (emit) => {
+          await request.state?.save(sampleConversationState("FIRST_PHASE_SDK_STATE"));
+          await emit.modelCall(0, 0.01);
+          await emit.tool("write_file", { path: "task9.txt", content: "broken" });
+        },
+      };
+    }
+    return {
+      text: ["Repair phase."],
+      before: async (emit) => {
+        repairLoadedState = await request.state?.load();
+        await request.state?.save(sampleConversationState("REPAIR_PHASE_SDK_STATE"));
+        await emit.modelCall(0, 0.02);
+        await emit.tool("write_file", { path: "task9.txt", content: "fixed" });
+      },
+    };
+  });
+  const agent = await setup.agent(client.client, undefined, verification.runner);
+  const events: AgentRunEvent[] = [];
+
+  const result = await agent.run(
+    "TASK9_CURRENT_PROMPT",
+    { onText: () => {}, onEvent: (event) => events.push(event) },
+    [attachment],
+  );
+
+  assert.equal(result.outcome, "completed");
+  assert.equal(result.mainCostUsd, 0.03);
+  assert.equal(result.modelSteps, 2);
+  assert.equal(client.requests.length, 2);
+  assert.deepEqual(verification.passes, [
+    ["check-one", "check-two"],
+    ["check-one", "check-two"],
+  ]);
+  assert.deepEqual(verification.processes, ["check-one", "check-one", "check-two"]);
+  assert.equal(occurrences(inputText(client.requests[0]!), "TASK9_CURRENT_PROMPT"), 1);
+  assert.equal(occurrences(inputText(client.requests[1]!), "TASK9_CURRENT_PROMPT"), 0);
+  assert.match(inputText(client.requests[0]!), /TASK9_ATTACHMENT\.png/);
+  assert.doesNotMatch(inputText(client.requests[1]!), /TASK9_ATTACHMENT|input_image/);
+  assert.deepEqual(
+    (client.requests[1]!.input as FakeInputItem[]).map((item) => item.role),
+    ["developer"],
+  );
+  assert.match(JSON.stringify(repairLoadedState), /FIRST_PHASE_SDK_STATE/);
+  assert.doesNotMatch(inputText(client.requests[1]!), new RegExp(secret));
+  assert.match(inputText(client.requests[1]!), /REDACTED/);
+  assert.deepEqual(
+    events.filter((event) => event.type === "model-start").map((event) => event.step),
+    [1, 2],
+  );
+  assert.deepEqual(
+    events.filter((event) => event.type === "model-end").map((event) => event.step),
+    [1, 2],
+  );
+  assert.deepEqual(
+    events.filter((event) => event.type === "tool-start").map((event) => event.id),
+    ["tool-1", "tool-2"],
+  );
+  assert.equal(events.filter((event) => event.type === "verify").length, 0);
+  assert.equal(events.filter((event) => event.type === "run-end").length, 1);
+  assert.equal(events.find((event) => event.type === "run-end")?.outcome, "complete");
+  assert.doesNotMatch(JSON.stringify(events), new RegExp(secret));
+
+  const checkpointDirectory = dirname(checkpointRunPath(
+    setup.appHome,
+    setup.session.data.id,
+    "placeholder",
+  ));
+  const checkpointFiles = (await readdir(checkpointDirectory)).filter((name) => name.endsWith(".json"));
+  assert.equal(checkpointFiles.length, 1);
+  const checkpoint = JSON.parse(
+    await readFile(join(checkpointDirectory, checkpointFiles[0]!), "utf8"),
+  ) as Array<{ runId: string }>;
+  assert.equal(checkpoint.length, 2);
+  assert.equal(new Set(checkpoint.map((entry) => entry.runId)).size, 1);
+  const rootRunId = checkpoint[0]!.runId;
+  const stateFile = JSON.parse(
+    await readFile(ConversationStore.path(setup.appHome, setup.session.path), "utf8"),
+  ) as { revision: number };
+  assert.equal(stateFile.revision, 1);
+  const runEvents: AgentRunEvent[] = [];
+  for await (const event of RunLog.read(
+    setup.appHome,
+    setup.session.data.id,
+    rootRunId,
+  )) {
+    runEvents.push(event);
+  }
+  assert.equal(runEvents.filter((event) => event.type === "run-end").length, 1);
+  assert.doesNotMatch(
+    await readFile(runLogPath(setup.appHome, setup.session.data.id, rootRunId), "utf8"),
+    new RegExp(secret),
+  );
+});
+
+test("Task 9 repair model failure discards every staged turn/state but persists incurred cost", async () => {
+  const setup = await createAgent({
+    compressionMode: "off",
+    maxSteps: 6,
+    maxCostUsd: 1,
+    verify: { commands: ["check"], mode: "on-edit", maxRepairRounds: 2 },
+  }, new ApprovalManager("auto-edit"));
+  await addHistory(setup.session, "REPAIR_FAILURE_PRIOR_TURN");
+  await persistConversationState(setup, "REPAIR_FAILURE_PRIOR_SDK_STATE");
+  const beforeTurns = structuredClone(setup.session.data.turns);
+  const statePath = ConversationStore.path(setup.appHome, setup.session.path);
+  const beforeState = await readFile(statePath, "utf8");
+  const verification = scriptedVerifyRunner([{
+    status: "failed",
+    command: "check",
+    exitCode: 1,
+    distilled: "ERROR repair requested",
+  }]);
+  let phase = 0;
+  const client = fakeClient((request) => {
+    phase += 1;
+    if (phase === 1) {
+      return {
+        text: ["initial phase"],
+        before: async (emit) => {
+          await request.state?.save(sampleConversationState("INITIAL_STAGED_STATE"));
+          await emit.modelCall(0, 0.01);
+          await emit.tool("write_file", { path: "repair-failure.txt", content: "broken" });
+        },
+      };
+    }
+    return {
+      text: ["repair fragment"],
+      textError: () => new Error("synthetic repair model failure"),
+      before: async (emit) => {
+        await request.state?.save(sampleConversationState("FAILED_REPAIR_STAGED_STATE"));
+        await emit.modelCall(0, 0.02);
+        await emit.tool("write_file", { path: "repair-failure.txt", content: "partial" });
+      },
+    };
+  });
+  const agent = await setup.agent(client.client, undefined, verification.runner);
+  const events: AgentRunEvent[] = [];
+
+  await assert.rejects(
+    agent.run("repair failure", {
+      onText: () => {},
+      onEvent: (event) => events.push(event),
+    }),
+    (error) =>
+      error instanceof AgentRunError &&
+      error.outcome === "error" &&
+      error.result.mainCostUsd === 0.03,
+  );
+
+  assert.equal(client.requests.length, 2);
+  assert.equal(verification.passes.length, 1);
+  assert.deepEqual(setup.session.data.turns, beforeTurns);
+  assert.equal(setup.session.data.costs.mainUsd, 0.03);
+  assert.equal(await readFile(statePath, "utf8"), beforeState);
+  const persisted = JSON.parse(await readFile(setup.session.path, "utf8")) as {
+    costs: { mainUsd: number };
+  };
+  assert.equal(persisted.costs.mainUsd, 0.03);
+  assert.equal(events.filter((event) => event.type === "run-end").length, 1);
+  assert.equal(events.find((event) => event.type === "run-end")?.outcome, "error");
+});
+
+test("Task 9 repair and pass counts stop exactly at the configured hard bounds", async () => {
+  const setup = await createAgent({
+    compressionMode: "off",
+    maxSteps: 10,
+    maxCostUsd: 10,
+    verify: {
+      commands: ["first", "second", "third"],
+      mode: "on-edit",
+      maxRepairRounds: 2,
+    },
+  }, new ApprovalManager("auto-edit"));
+  const verification = scriptedVerifyRunner([
+    { status: "failed", command: "first", exitCode: 1, distilled: "ERROR one" },
+    { status: "failed", command: "first", exitCode: 1, distilled: "ERROR two" },
+    { status: "failed", command: "first", exitCode: 1, distilled: "ERROR three" },
+  ]);
+  let phase = 0;
+  const client = fakeClient((request) => {
+    phase += 1;
+    return {
+      text: [`phase ${phase}`],
+      before: async (emit) => {
+        await request.state?.save(sampleConversationState(`phase-${phase}`));
+        await emit.modelCall(0, 0.01);
+        if (phase === 1) {
+          await emit.tool("write_file", { path: "bounded.txt", content: "broken" });
+        }
+      },
+    };
+  });
+  const agent = await setup.agent(client.client, undefined, verification.runner);
+  const events: AgentRunEvent[] = [];
+
+  const result = await agent.run("bounded repair", {
+    onText: () => {},
+    onEvent: (event) => events.push(event),
+  });
+
+  assert.equal(result.outcome, "unverified");
+  assert.equal(client.requests.length, 3, "initial plus two repair model calls");
+  assert.equal(verification.passes.length, 3, "initial plus two verification passes");
+  assert.equal(verification.processes.length, 3, "fail-fast starts only the first command per pass");
+  assert.ok(verification.processes.length <= (1 + 2) * 3);
+  assert.equal(events.filter((event) => event.type === "run-end").length, 1);
+  assert.equal(events.find((event) => event.type === "run-end")?.outcome, "unverified");
+});
+
+test("Task 9 never starts a repair after root step/cost exhaustion, timeout, or spawn failure", async (t) => {
+  const cases: Array<{
+    name: string;
+    maxSteps: number;
+    maxCostUsd: number;
+    cost: number;
+    verifyOutcome: VerifyOutcome;
+  }> = [
+    { name: "step exhausted", maxSteps: 1, maxCostUsd: 1, cost: 0.01, verifyOutcome: { status: "failed", command: "check", exitCode: 1, distilled: "ERROR" } },
+    { name: "cost exhausted", maxSteps: 5, maxCostUsd: 0.01, cost: 0.01, verifyOutcome: { status: "failed", command: "check", exitCode: 1, distilled: "ERROR" } },
+    { name: "timeout", maxSteps: 5, maxCostUsd: 1, cost: 0.01, verifyOutcome: { status: "timed-out", command: "check" } },
+    { name: "spawn failure", maxSteps: 5, maxCostUsd: 1, cost: 0.01, verifyOutcome: { status: "spawn-failed", command: "check", error: "not found" } },
+  ];
+  for (const item of cases) {
+    await t.test(item.name, async () => {
+      const setup = await createAgent({
+        compressionMode: "off",
+        maxSteps: item.maxSteps,
+        maxCostUsd: item.maxCostUsd,
+        verify: { commands: ["check"], mode: "on-edit", maxRepairRounds: 2 },
+      }, new ApprovalManager("auto-edit"));
+      const verification = scriptedVerifyRunner([item.verifyOutcome]);
+      const client = fakeClient(() => ({
+        text: ["edited"],
+        before: async (emit) => {
+          await emit.modelCall(0, item.cost);
+          await emit.tool("write_file", { path: "bounded.txt", content: "edited" });
+        },
+      }));
+      const agent = await setup.agent(client.client, undefined, verification.runner);
+
+      const result = await agent.run("bounded", { onText: () => {} });
+
+      assert.equal(result.outcome, "unverified");
+      assert.equal(client.requests.length, 1);
+      assert.equal(verification.passes.length, 1);
+    });
+  }
+});
+
+test("Task 9 verification cancellation is the one root cancellation and never repairs", async () => {
+  const setup = await createAgent({
+    compressionMode: "off",
+    verify: { commands: ["check"], mode: "on-edit", maxRepairRounds: 2 },
+  }, new ApprovalManager("auto-edit"));
+  const verification = scriptedVerifyRunner([{ status: "cancelled" }]);
+  const client = fakeClient(() => ({
+    text: ["edited"],
+    before: async (emit) => {
+      await emit.modelCall(0, 0.01);
+      await emit.tool("write_file", { path: "cancelled.txt", content: "edited" });
+    },
+  }));
+  const agent = await setup.agent(client.client, undefined, verification.runner);
+  const events: AgentRunEvent[] = [];
+
+  await assert.rejects(
+    agent.run("cancel verify", {
+      onText: () => {},
+      onEvent: (event) => events.push(event),
+    }),
+    (error) => error instanceof AgentRunError && error.outcome === "cancelled",
+  );
+
+  assert.equal(client.requests.length, 1);
+  assert.equal(verification.passes.length, 1);
+  assert.equal(events.filter((event) => event.type === "run-end").length, 1);
+  assert.equal(events.find((event) => event.type === "run-end")?.outcome, "cancelled");
+});
+
+test("Task 9 real Agent root lets abort at verifier process end win over exit 0 and exit 1", async (t) => {
+  const cases = [
+    { name: "exit 0", verifyOutcome: { status: "passed" } as VerifyOutcome },
+    {
+      name: "exit 1",
+      verifyOutcome: {
+        status: "failed",
+        command: "check",
+        exitCode: 1,
+        distilled: "ERROR must not repair",
+      } as VerifyOutcome,
+    },
+  ];
+
+  for (const item of cases) {
+    await t.test(item.name, async () => {
+      const setup = await createAgent({
+        compressionMode: "off",
+        maxSteps: 6,
+        maxCostUsd: 1,
+        verify: { commands: ["check"], mode: "on-edit", maxRepairRounds: 2 },
+      }, new ApprovalManager("auto-edit"));
+      const verification = scriptedVerifyRunner([item.verifyOutcome]);
+      const beforeTurns = structuredClone(setup.session.data.turns);
+      const statePath = ConversationStore.path(setup.appHome, setup.session.path);
+      assert.equal(existsSync(statePath), false);
+      let phase = 0;
+      const client = fakeClient(() => {
+        phase += 1;
+        return {
+          text: [`phase ${phase}`],
+          before: async (emit) => {
+            await emit.modelCall(0, phase === 1 ? 0.01 : 0.02);
+            if (phase === 1) {
+              await emit.tool("write_file", {
+                path: "abort-at-process-end.txt",
+                content: "edited",
+              });
+            }
+          },
+        };
+      });
+      const agent = await setup.agent(client.client, undefined, verification.runner);
+      const controller = new AbortController();
+      const events: AgentRunEvent[] = [];
+
+      await assert.rejects(
+        agent.run("abort at process end", {
+          onText: () => {},
+          signal: controller.signal,
+          onEvent: (event) => {
+            events.push(event);
+            if (event.type === "process-end") controller.abort();
+          },
+        }),
+        (error) =>
+          error instanceof AgentRunError &&
+          error.outcome === "cancelled" &&
+          error.result.mainCostUsd === 0.01,
+      );
+
+      assert.equal(client.requests.length, 1, "abort must start no repair model phase");
+      assert.equal(verification.passes.length, 1);
+      assert.equal(events.filter((event) => event.type === "process-end").length, 1);
+      assert.equal(events.filter((event) => event.type === "run-end").length, 1);
+      assert.equal(events.find((event) => event.type === "run-end")?.outcome, "cancelled");
+      assert.deepEqual(setup.session.data.turns, beforeTurns);
+      assert.equal(existsSync(statePath), false, "cancelled root must not commit conversation state");
+      assert.equal(setup.session.data.costs.mainUsd, 0.01);
+      const persisted = JSON.parse(await readFile(setup.session.path, "utf8")) as {
+        costs: { mainUsd: number };
+      };
+      assert.equal(persisted.costs.mainUsd, 0.01);
+    });
+  }
+});
+
+test("Task 9 real signal and command-not-found verification stay unverified without repair", { skip: process.platform === "win32" ? "real POSIX verification paths" : false }, async (t) => {
+  const cases = [
+    { name: "signal termination", command: "kill -TERM $$", signal: "SIGTERM", exitCode: null },
+    {
+      name: "command not found",
+      command: "routercode_task9_agent_command_that_does_not_exist",
+      signal: undefined,
+      exitCode: null,
+    },
+  ] as const;
+
+  for (const item of cases) {
+    await t.test(item.name, async () => {
+      const setup = await createAgent({
+        compressionMode: "off",
+        verify: { commands: [item.command], mode: "on-edit", maxRepairRounds: 2 },
+      }, new ApprovalManager("auto-edit"));
+      const client = fakeClient(() => ({
+        text: ["edited"],
+        before: async (emit) => {
+          await emit.modelCall(0, 0.01);
+          await emit.tool("write_file", { path: "terminal-verify.txt", content: "edited" });
+        },
+      }));
+      const agent = await setup.agent(client.client);
+      const events: AgentRunEvent[] = [];
+
+      const result = await agent.run("terminal verify", {
+        onText: () => {},
+        onEvent: (event) => events.push(event),
+      });
+
+      assert.equal(result.outcome, "unverified");
+      assert.equal(client.requests.length, 1, "terminal verification failure must not repair");
+      const starts = events.filter((event) => event.type === "process-start");
+      const ends = events.filter((event) => event.type === "process-end");
+      assert.equal(starts.length, 1);
+      assert.equal(ends.length, 1);
+      assert.equal(ends[0]?.exitCode, item.exitCode);
+      assert.equal(ends[0]?.signal, item.signal);
+      assert.equal(events.filter((event) => event.type === "run-end").length, 1);
+      assert.equal(events.find((event) => event.type === "run-end")?.outcome, "unverified");
+    });
+  }
+});
+
+test("Task 9 invalid ORCODE_SHELL is one redacted Agent process and RunLog terminal", async (t) => {
+  const setup = await createAgent({
+    compressionMode: "off",
+    verify: { commands: ["echo unreachable"], mode: "on-edit", maxRepairRounds: 2 },
+  }, new ApprovalManager("auto-edit"));
+  const secret = `${["sk", "or", "v1"].join("-")}-${"t".repeat(40)}`;
+  const previous = process.env.ORCODE_SHELL;
+  process.env.ORCODE_SHELL = join(setup.workspace, `missing-${secret}`);
+  t.after(() => {
+    if (previous === undefined) delete process.env.ORCODE_SHELL;
+    else process.env.ORCODE_SHELL = previous;
+  });
+  const client = fakeClient(() => ({
+    text: ["edited"],
+    before: async (emit) => {
+      await emit.modelCall(0, 0.01);
+      await emit.tool("write_file", { path: "invalid-shell.txt", content: "edited" });
+    },
+  }));
+  const agent = await setup.agent(client.client);
+  const events: AgentRunEvent[] = [];
+
+  const result = await agent.run("invalid shell", {
+    onText: () => {},
+    onEvent: (event) => events.push(event),
+  });
+
+  assert.equal(result.outcome, "unverified");
+  assert.equal(client.requests.length, 1);
+  assert.deepEqual(
+    events.filter((event) => event.type === "process-start" || event.type === "process-end").map((event) => event.type),
+    ["process-start", "process-end"],
+  );
+  const end = events.find((event) => event.type === "process-end");
+  assert.equal(end?.type === "process-end" ? end.exitCode : 0, null);
+  assert.doesNotMatch(end?.type === "process-end" ? end.error ?? "" : "", new RegExp(secret));
+  assert.match(end?.type === "process-end" ? end.error ?? "" : "", /REDACTED/);
+  assert.equal(events.filter((event) => event.type === "run-end").length, 1);
+  assert.equal(events.find((event) => event.type === "run-end")?.outcome, "unverified");
+
+  const runDirectory = join(setup.appHome, "runs", setup.session.data.id);
+  const runFiles = (await readdir(runDirectory)).filter((name) => name.endsWith(".ndjson"));
+  assert.equal(runFiles.length, 1);
+  const rawLog = await readFile(join(runDirectory, runFiles[0]!), "utf8");
+  assert.doesNotMatch(rawLog, new RegExp(secret));
+  assert.match(rawLog, /REDACTED/);
+  assert.equal((rawLog.match(/\"type\":\"process-start\"/g) ?? []).length, 1);
+  assert.equal((rawLog.match(/\"type\":\"process-end\"/g) ?? []).length, 1);
+  assert.equal((rawLog.match(/\"type\":\"run-end\"/g) ?? []).length, 1);
 });
 
 // --- K7: memory, token budget, cache -------------------------------------
@@ -678,6 +2760,18 @@ test("K7.5: shouldCutContext trips exactly at the configured budget ratio", () =
   );
 });
 
+test("Phase 13 / Bauplan A7: contextFillPercent is the one inputTokens/contextLength computation cli.ts's header and /context share", () => {
+  assert.equal(contextFillPercent(51_200, 128_000), 40);
+  assert.equal(contextFillPercent(0, 128_000), 0);
+  // Same "no crash, no fabricated percentage on garbage input" contract as
+  // shouldCutContext above — undefined (not NaN, not 0) so a caller can
+  // distinguish "no measurement" from "0% full".
+  assert.equal(contextFillPercent(1_000, 0), undefined);
+  assert.equal(contextFillPercent(1_000, -1), undefined);
+  assert.equal(contextFillPercent(Number.NaN, 128_000), undefined);
+  assert.equal(contextFillPercent(-1, 128_000), undefined);
+});
+
 test("K7.6: a cancelled run leaves the conversation state file with an unchanged revision", async () => {
   const setup = await createAgent();
   const controller = new AbortController();
@@ -695,8 +2789,8 @@ test("K7.6: a cancelled run leaves the conversation state file with an unchanged
     return {
       text: ["Ich fange an"],
       textError: () => {
-        controller.abort(new Error("Der Lauf wurde abgebrochen."));
-        return new Error("Der Lauf wurde abgebrochen.");
+        controller.abort(new Error("The run was cancelled."));
+        return new Error("The run was cancelled.");
       },
       before: async (emit) => {
         await emit.modelCall(0, 0.001);
@@ -727,11 +2821,618 @@ test("K7.6: a cancelled run leaves the conversation state file with an unchanged
   assert.equal(
     afterCancel.revision,
     1,
-    "ein abgebrochener Lauf darf die Revision nicht verändern",
+    "a cancelled run must not change the revision",
   );
 });
 
+test("volatile run data is sent once per call and never loaded from committed SDK state", async () => {
+  const setup = await createAgent({ compressionMode: "off" });
+  await writeFile(
+    join(setup.workspace, "ORCODE.md"),
+    "VOLATILE_PROJECT_NOTE_SENTINEL",
+    "utf8",
+  );
+  const loadedStates: unknown[] = [];
+  const client = fakeClient((request) => ({
+    text: ["Fertig."],
+    before: async (emit) => {
+      const loaded = await request.state?.load();
+      loadedStates.push(loaded);
+      const previousMessages =
+        loaded && typeof loaded === "object" && "messages" in loaded &&
+        Array.isArray((loaded as { messages?: unknown }).messages)
+          ? (loaded as { messages: unknown[] }).messages
+          : [];
+      const inputItems = Array.isArray(request.input) ? request.input : [];
+      await request.state?.save({
+        ...sampleConversationState("sdk-like-save"),
+        messages: [...previousMessages, ...inputItems],
+      } as never);
+      await emit.modelCall(0, 0.001);
+    },
+  }));
+  const agent = await setup.agent(client.client);
+
+  await agent.run("FIRST_VOLATILE_REQUEST", { onText: () => {} });
+  await agent.run("SECOND_VOLATILE_REQUEST", { onText: () => {} });
+
+  const secondRequest = client.requests[1]!;
+  const secondLoaded = JSON.stringify(loadedStates[1]);
+  assert.equal(occurrences(secondLoaded, "FIRST_VOLATILE_REQUEST"), 1);
+  assert.equal(occurrences(secondLoaded, "RUN LIMITS:"), 0);
+  assert.equal(occurrences(secondLoaded, "VOLATILE_PROJECT_NOTE_SENTINEL"), 0);
+  assert.equal(occurrences(inputText(secondRequest), "RUN LIMITS:"), 1);
+  assert.equal(
+    occurrences(inputText(secondRequest), "VOLATILE_PROJECT_NOTE_SENTINEL"),
+    1,
+  );
+});
+
+test("an open conversation store rechecks the exact summary epoch before reusing SDK history", async () => {
+  const setup = await createAgent({ compressionMode: "off" });
+  const loadedStates: unknown[] = [];
+  const client = fakeClient((request) => ({
+    text: ["Fertig."],
+    before: async (emit) => {
+      loadedStates.push(await request.state?.load());
+      await request.state?.save(sampleConversationState("first-covered-state") as never);
+      await emit.modelCall(0, 0.001);
+    },
+  }));
+  const agent = await setup.agent(client.client);
+
+  await agent.run("Erster Prompt", { onText: () => {} });
+  setup.session.setSummary("Extern geänderter Summary-Epoch");
+  await setup.session.save();
+  await agent.run("Zweiter Prompt", { onText: () => {} });
+
+  assert.doesNotMatch(JSON.stringify(loadedStates[1]), /first-covered-state/);
+  assert.match(JSON.stringify(loadedStates[1]), /Extern geänderter Summary-Epoch/);
+});
+
+test("a compressor cost-save merge discards the stale compressed seed and rebuilds raw merged history", async () => {
+  const setup = await createAgent({ compressionMode: "always" });
+  for (let index = 0; index < 3; index += 1) {
+    setup.session.addTurn(
+      "user",
+      `PRE_MERGE_HISTORY_${index} ${"ausführlicher Verlauf ".repeat(4)}`,
+    );
+    setup.session.addTurn(
+      "assistant",
+      `PRE_MERGE_ANSWER_${index} ${"verifizierte Antwort ".repeat(4)}`,
+    );
+  }
+  setup.session.setSummary("PRE_MERGE_SUMMARY_SENTINEL");
+  await setup.session.save();
+  await persistConversationState(setup, "PRE_MERGE_SDK_STATE_SENTINEL");
+  const concurrent = await SessionStore.openById(
+    setup.workspace,
+    setup.session.data.id,
+    setup.appHome,
+  );
+  const concurrentSecret = ["sk", "or", "v1", "M".repeat(16)].join("-");
+  let loadedState: unknown = undefined;
+  const client = fakeClient((request) => {
+    if (request.model === DEFAULT_CONFIG.compressorModel) {
+      return {
+        compressed: "STALE_COMPRESSED_HANDOFF_SENTINEL",
+        response: { usage: { cost: 0.002 } },
+        before: async () => {
+          concurrent.addTurn(
+            "user",
+            `CONCURRENT_MERGED_TURN_SENTINEL ${concurrentSecret}`,
+          );
+          concurrent.addTurn(
+            "assistant",
+            "CONCURRENT_MERGED_ANSWER_SENTINEL",
+          );
+          await concurrent.save();
+        },
+      };
+    }
+    return {
+      text: ["Aktuelle Antwort"],
+      before: async (emit) => {
+        loadedState = await request.state?.load();
+        const loadedMessages =
+          loadedState && typeof loadedState === "object" &&
+          "messages" in loadedState &&
+          Array.isArray((loadedState as { messages?: unknown }).messages)
+            ? (loadedState as { messages: unknown[] }).messages
+            : [];
+        await request.state?.save({
+          ...sampleConversationState("merged-main-result"),
+          messages: [
+            ...loadedMessages,
+            { role: "assistant", content: "merged-main-result" },
+          ],
+        } as never);
+        await emit.modelCall(0, 0.003);
+      },
+    };
+  });
+  const agent = await setup.agent(client.client);
+
+  const result = await agent.run("CURRENT_AFTER_MERGE", { onText: () => {} });
+
+  const loaded = JSON.stringify(loadedState);
+  assert.doesNotMatch(loaded, /STALE_COMPRESSED_HANDOFF_SENTINEL/);
+  assert.match(loaded, /CONCURRENT_MERGED_TURN_SENTINEL/);
+  assert.match(loaded, /\[REDACTED_OPENROUTER_KEY\]/);
+  assert.doesNotMatch(loaded, new RegExp(concurrentSecret));
+  assert.equal(result.compression.used, false);
+  assert.equal(result.compression.costUsd, 0.002);
+  assert.equal(setup.session.data.summary, "PRE_MERGE_SUMMARY_SENTINEL");
+  assert.equal(setup.session.data.turns.length, 10);
+  assert.ok(
+    setup.session.data.turns.some((turn) =>
+      turn.content.includes("CONCURRENT_MERGED_TURN_SENTINEL"),
+    ),
+  );
+  const reopened = await ConversationStore.open(
+    setup.appHome,
+    setup.session.path,
+    setup.session.data.id,
+  );
+  const committed = JSON.stringify(await reopened.accessor().load());
+  assert.doesNotMatch(committed, /STALE_COMPRESSED_HANDOFF_SENTINEL/);
+  assert.match(committed, /CONCURRENT_MERGED_TURN_SENTINEL/);
+});
+
+test("zero-cost synchronous and streamed main failures are genuine session no-ops", async (t) => {
+  const cases = ["synchronous", "streamed"] as const;
+  for (const failureKind of cases) {
+    await t.test(failureKind, async () => {
+      const setup = await createAgent({ compressionMode: "off" });
+      await addHistory(setup.session, `ZERO_COST_${failureKind}_HISTORY`);
+      const beforeData = structuredClone(setup.session.data);
+      const beforeDisk = await readFile(setup.session.path, "utf8");
+      const scripted = fakeClient((request) => ({
+        textError: () => new Error("zero-cost streamed failure"),
+        before: async (emit) => {
+          await request.state?.save(sampleConversationState("discard-zero-cost"));
+          await emit.modelCall(0, 0);
+        },
+      }));
+      const client = failureKind === "streamed"
+        ? scripted.client
+        : {
+            callModel(request: FakeRequest) {
+              for (const entry of request.hooks?.PostModelCall ?? []) {
+                entry.handler({
+                  model: "vendor/echt",
+                  durationMs: 5,
+                  turnNumber: 0,
+                  usage: {
+                    inputTokens: 10,
+                    outputTokens: 5,
+                    totalTokens: 15,
+                    cachedTokens: 0,
+                    reasoningTokens: 0,
+                    cost: 0,
+                  },
+                } as never);
+              }
+              throw new Error("zero-cost synchronous failure");
+            },
+          };
+      const agent = await setup.agent(client);
+
+      await assert.rejects(
+        agent.run("ZERO_COST_CURRENT_REQUEST", { onText: () => {} }),
+        /zero-cost (?:synchronous|streamed) failure/,
+      );
+
+      assert.deepEqual(setup.session.data, beforeData);
+      assert.equal(await readFile(setup.session.path, "utf8"), beforeDisk);
+    });
+  }
+});
+
+test("Task 7 captured-request matrix: every main call uses one history source and commits only on success", async (t) => {
+  const prompt = "CURRENT_REQUEST_SENTINEL";
+
+  await t.test("first run without SDK state seeds transcript history and sends the current request once", async () => {
+    const setup = await createAgent({ compressionMode: "off" });
+    await addHistory(setup.session, "FIRST_TRANSCRIPT_SENTINEL");
+    let loadedState: unknown = undefined;
+    const client = fakeClient((request) => ({
+      text: ["Fertig."],
+      before: async (emit) => {
+        loadedState = await request.state?.load();
+        await request.state?.save(sampleConversationState("first-result"));
+        await emit.modelCall(0, 0.001);
+      },
+    }));
+    const agent = await setup.agent(client.client);
+
+    await agent.run(prompt, { onText: () => {} });
+
+    const request = mainRequest(client);
+    assert.equal(occurrences(mainPayload(request, loadedState), prompt), 1);
+    assert.equal(occurrences(inputText(request), "FIRST_TRANSCRIPT_SENTINEL"), 0);
+    assert.equal(occurrences(JSON.stringify(loadedState), "FIRST_TRANSCRIPT_SENTINEL"), 1);
+  });
+
+  await t.test("a valid SDK state excludes transcript history and carries only the new request plus volatile input", async () => {
+    const setup = await createAgent({ compressionMode: "off" });
+    await addHistory(setup.session, "STALE_TRANSCRIPT_SENTINEL");
+    await persistConversationState(setup, "VALID_SDK_HISTORY_SENTINEL");
+    let loadedState: unknown = undefined;
+    const client = fakeClient((request) => ({
+      text: ["Fertig."],
+      before: async (emit) => {
+        loadedState = await request.state?.load();
+        await request.state?.save(sampleConversationState("valid-result"));
+        await emit.modelCall(0, 0.001);
+      },
+    }));
+    const agent = await setup.agent(client.client);
+
+    await agent.run(prompt, { onText: () => {} });
+
+    const request = mainRequest(client);
+    const payload = mainPayload(request, loadedState);
+    assert.equal(occurrences(payload, prompt), 1);
+    assert.equal(occurrences(payload, "VALID_SDK_HISTORY_SENTINEL"), 1);
+    assert.equal(occurrences(payload, "STALE_TRANSCRIPT_SENTINEL"), 0);
+    assert.doesNotMatch(inputText(request), /WORK CONTEXT/);
+  });
+
+  await t.test("forced compression seeds the fresh handoff into the state used by that same main call", async () => {
+    const setup = await createAgent({ compressionMode: "always" });
+    await addHistory(setup.session, "OLD_TRANSCRIPT_SENTINEL");
+    await persistConversationState(setup, "OLD_SDK_STATE_SENTINEL");
+    const imagePath = join(setup.workspace, "ATTACHMENT_SENTINEL.png");
+    const imageBytes = Buffer.from([
+      0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a,
+      0x00, 0x00, 0x00, 0x00,
+    ]);
+    await writeFile(imagePath, imageBytes);
+    const attachment = {
+      path: imagePath,
+      name: "ATTACHMENT_SENTINEL.png",
+      mimeType: "image/png" as const,
+      sizeBytes: imageBytes.length,
+    };
+    let stateAtCall: Promise<unknown> | undefined;
+    let compressorInput = "";
+    const client = fakeClient((request) => {
+      if (request.model === DEFAULT_CONFIG.compressorModel) {
+        compressorInput = inputText(request);
+        return { compressed: "FRESH_COMPRESSED_HANDOFF_SENTINEL", response: { usage: { cost: 0.002 } } };
+      }
+      stateAtCall = request.state?.load();
+      return {
+            text: ["Fertig."],
+            before: async (emit) => {
+              await request.state?.save(sampleConversationState("compressed-result"));
+              await emit.modelCall(0, 0.003);
+            },
+          };
+    });
+    const agent = await setup.agent(client.client);
+
+    const result = await agent.run(prompt, { onText: () => {} }, [attachment]);
+    const loadedState = await stateAtCall;
+
+    assert.equal(result.compression.used, true);
+    const request = mainRequest(client);
+    const payload = mainPayload(request, loadedState);
+    assert.equal(occurrences(payload, prompt), 1);
+    assert.equal(occurrences(payload, "FRESH_COMPRESSED_HANDOFF_SENTINEL"), 1);
+    assert.equal(occurrences(JSON.stringify(loadedState), "FRESH_COMPRESSED_HANDOFF_SENTINEL"), 1);
+    assert.equal(occurrences(inputText(request), "FRESH_COMPRESSED_HANDOFF_SENTINEL"), 0);
+    assert.equal(occurrences(payload, "OLD_TRANSCRIPT_SENTINEL"), 0);
+    assert.equal(occurrences(payload, "OLD_SDK_STATE_SENTINEL"), 0);
+    assert.equal(occurrences(compressorInput, prompt), 0);
+    assert.equal(occurrences(compressorInput, "ATTACHMENT_SENTINEL"), 0);
+  });
+
+  await t.test("below-threshold compression still seeds raw history once without owning the current request", async () => {
+    const setup = await createAgent({
+      compressionMode: "auto",
+      compressionThresholdChars: 100_000,
+    });
+    await addHistory(setup.session, "BELOW_THRESHOLD_HISTORY_SENTINEL");
+    let loadedState: unknown = undefined;
+    const client = fakeClient((request) => ({
+      text: ["Fertig."],
+      before: async (emit) => {
+        loadedState = await request.state?.load();
+        await request.state?.save(sampleConversationState("below-result"));
+        await emit.modelCall(0, 0.001);
+      },
+    }));
+    const agent = await setup.agent(client.client);
+
+    const result = await agent.run(prompt, { onText: () => {} });
+
+    assert.equal(result.compression.skipReason, "below-threshold");
+    const request = mainRequest(client);
+    assert.equal(occurrences(mainPayload(request, loadedState), prompt), 1);
+    assert.equal(occurrences(inputText(request), "BELOW_THRESHOLD_HISTORY_SENTINEL"), 0);
+    assert.equal(occurrences(JSON.stringify(loadedState), "BELOW_THRESHOLD_HISTORY_SENTINEL"), 1);
+  });
+
+  await t.test("compressor failure falls back to one fresh raw-history source", async () => {
+    const setup = await createAgent({ compressionMode: "always" });
+    await addHistory(setup.session, "COMPRESSOR_FAILURE_HISTORY_SENTINEL");
+    let loadedState: unknown = undefined;
+    const client = fakeClient((request) => {
+      if (request.model === DEFAULT_CONFIG.compressorModel) {
+        throw new Error("compressor unavailable");
+      }
+      return {
+        text: ["Fertig."],
+        before: async (emit) => {
+          loadedState = await request.state?.load();
+          await request.state?.save(sampleConversationState("fallback-result"));
+          await emit.modelCall(0, 0.001);
+        },
+      };
+    });
+    const agent = await setup.agent(client.client);
+
+    const result = await agent.run(prompt, { onText: () => {} });
+
+    assert.equal(result.compression.skipReason, "failed");
+    const request = mainRequest(client);
+    assert.equal(occurrences(mainPayload(request, loadedState), prompt), 1);
+    assert.equal(occurrences(inputText(request), "COMPRESSOR_FAILURE_HISTORY_SENTINEL"), 0);
+    assert.equal(occurrences(JSON.stringify(loadedState), "COMPRESSOR_FAILURE_HISTORY_SENTINEL"), 1);
+  });
+
+  await t.test("main failure discards buffered SDK state and preserves session data except incurred cost", async () => {
+    const setup = await createAgent({ compressionMode: "off" });
+    await writeFile(join(setup.workspace, "a.ts"), "export {};\n");
+    await addHistory(setup.session, "MAIN_FAILURE_TRANSCRIPT_SENTINEL");
+    await persistConversationState(setup, "MAIN_FAILURE_COMMITTED_STATE");
+    setup.session.setSummary("MAIN_FAILURE_SUMMARY");
+    await setup.session.save();
+    const beforeTurns = structuredClone(setup.session.data.turns);
+    const beforeToolCalls = structuredClone(setup.session.data.toolCalls);
+    const statePath = ConversationStore.path(setup.appHome, setup.session.path);
+    const beforeState = await readFile(statePath, "utf8");
+    let loadedState: unknown = undefined;
+    const client = fakeClient((request) => ({
+      textError: () => new Error("main failed"),
+      before: async (emit) => {
+        loadedState = await request.state?.load();
+        await request.state?.save(sampleConversationState("must-not-commit"));
+        await emit.modelCall(0, 0.004);
+        await emit.tool("read_file", { path: "a.ts" });
+      },
+    }));
+    const agent = await setup.agent(client.client);
+
+    await assert.rejects(agent.run(prompt, { onText: () => {} }), /main failed/);
+
+    assert.equal(occurrences(mainPayload(mainRequest(client), loadedState), prompt), 1);
+    assert.deepEqual(setup.session.data.turns, beforeTurns);
+    assert.deepEqual(setup.session.data.toolCalls, beforeToolCalls);
+    assert.equal(setup.session.data.summary, "MAIN_FAILURE_SUMMARY");
+    assert.equal(setup.session.data.costs.mainUsd, 0.004);
+    assert.equal(await readFile(statePath, "utf8"), beforeState);
+  });
+
+  await t.test("a synchronous main-call failure leaves the session artifact byte-identical when no cost was incurred", async () => {
+    const setup = await createAgent({ compressionMode: "off" });
+    await addHistory(setup.session, "SYNC_MAIN_FAILURE_HISTORY");
+    const beforeSession = await readFile(setup.session.path, "utf8");
+    const beforeData = structuredClone(setup.session.data);
+    const client = fakeClient(() => {
+      throw new Error("synchronous main call failure");
+    });
+    const agent = await setup.agent(client.client);
+
+    await assert.rejects(
+      agent.run(prompt, { onText: () => {} }),
+      /synchronous main call failure/,
+    );
+
+    assert.deepEqual(setup.session.data, beforeData);
+    assert.equal(await readFile(setup.session.path, "utf8"), beforeSession);
+  });
+
+  await t.test("a synchronous post-usage main failure persists the incurred cost exactly once", async () => {
+    const setup = await createAgent({ compressionMode: "off" });
+    await addHistory(setup.session, "SYNC_POST_USAGE_FAILURE_HISTORY");
+    const beforeTurns = structuredClone(setup.session.data.turns);
+    const client = {
+      callModel(request: FakeRequest) {
+        for (const entry of request.hooks?.PostModelCall ?? []) {
+          entry.handler({
+            model: "vendor/echt",
+            durationMs: 5,
+            turnNumber: 0,
+            usage: {
+              inputTokens: 10,
+              outputTokens: 5,
+              totalTokens: 15,
+              cachedTokens: 0,
+              reasoningTokens: 0,
+              cost: 0.006,
+            },
+          } as never);
+        }
+        throw new Error("synchronous post-usage failure");
+      },
+    };
+    const agent = await setup.agent(client);
+
+    await assert.rejects(
+      agent.run(prompt, { onText: () => {} }),
+      /synchronous post-usage failure/,
+    );
+
+    assert.deepEqual(setup.session.data.turns, beforeTurns);
+    assert.equal(setup.session.data.costs.mainUsd, 0.006);
+    const persisted = JSON.parse(await readFile(setup.session.path, "utf8")) as {
+      costs: { mainUsd: number; totalUsd: number };
+    };
+    assert.equal(persisted.costs.mainUsd, 0.006);
+    assert.equal(persisted.costs.totalUsd, 0.006);
+  });
+
+  await t.test("session commit failure restores staged turns and discards buffered conversation coverage", async () => {
+    const setup = await createAgent({ compressionMode: "off" });
+    await addHistory(setup.session, "SESSION_COMMIT_HISTORY");
+    await persistConversationState(setup, "SESSION_COMMIT_OLD_STATE");
+    const beforeTurns = structuredClone(setup.session.data.turns);
+    const statePath = ConversationStore.path(setup.appHome, setup.session.path);
+    const beforeState = await readFile(statePath, "utf8");
+    const client = fakeClient((request) => ({
+      text: ["Antwort, die nicht committed werden darf."],
+      before: async (emit) => {
+        await request.state?.save(sampleConversationState("session-save-failed"));
+        await emit.modelCall(0, 0.004);
+      },
+    }));
+    const agent = await setup.agent(client.client);
+    const originalSave = SessionStore.prototype.save;
+    let failNextSave = true;
+    SessionStore.prototype.save = async function() {
+      if (this === setup.session && failNextSave) {
+        failNextSave = false;
+        throw new Error("synthetic session commit failure");
+      }
+      return originalSave.call(this);
+    };
+    try {
+      await assert.rejects(
+        agent.run(prompt, { onText: () => {} }),
+        /synthetic session commit failure/,
+      );
+    } finally {
+      SessionStore.prototype.save = originalSave;
+    }
+
+    assert.deepEqual(setup.session.data.turns, beforeTurns);
+    assert.equal(setup.session.data.costs.mainUsd, 0.004);
+    assert.equal(await readFile(statePath, "utf8"), beforeState);
+  });
+
+  await t.test("a cost-free session commit failure leaves both persisted artifacts byte-identical", async () => {
+    const setup = await createAgent({ compressionMode: "off" });
+    await addHistory(setup.session, "COST_FREE_COMMIT_FAILURE_HISTORY");
+    await persistConversationState(setup, "COST_FREE_COMMIT_OLD_STATE");
+    const statePath = ConversationStore.path(setup.appHome, setup.session.path);
+    const beforeSession = await readFile(setup.session.path, "utf8");
+    const beforeState = await readFile(statePath, "utf8");
+    const beforeData = structuredClone(setup.session.data);
+    const client = fakeClient((request) => ({
+      text: ["Nicht persistierte Antwort"],
+      before: async () => {
+        await request.state?.save(sampleConversationState("must-not-cover") as never);
+      },
+    }));
+    const agent = await setup.agent(client.client);
+    const originalSave = SessionStore.prototype.save;
+    let failNextSave = true;
+    SessionStore.prototype.save = async function() {
+      if (this === setup.session && failNextSave) {
+        failNextSave = false;
+        throw new Error("cost-free session commit failure");
+      }
+      return originalSave.call(this);
+    };
+    try {
+      await assert.rejects(
+        agent.run(prompt, { onText: () => {} }),
+        /cost-free session commit failure/,
+      );
+    } finally {
+      SessionStore.prototype.save = originalSave;
+    }
+
+    assert.deepEqual(setup.session.data, beforeData);
+    assert.equal(await readFile(setup.session.path, "utf8"), beforeSession);
+    assert.equal(await readFile(statePath, "utf8"), beforeState);
+  });
+
+  await t.test("cancellation discards fresh compression state and preserves turns and summary while charging providers", async () => {
+    const setup = await createAgent({ compressionMode: "always" });
+    await writeFile(join(setup.workspace, "b.ts"), "export {};\n");
+    await addHistory(setup.session, "CANCEL_TRANSCRIPT_SENTINEL");
+    await persistConversationState(setup, "CANCEL_COMMITTED_STATE");
+    setup.session.setSummary("CANCEL_SUMMARY");
+    await setup.session.save();
+    const beforeTurns = structuredClone(setup.session.data.turns);
+    const beforeToolCalls = structuredClone(setup.session.data.toolCalls);
+    const statePath = ConversationStore.path(setup.appHome, setup.session.path);
+    const beforeState = await readFile(statePath, "utf8");
+    const controller = new AbortController();
+    let loadedState: unknown = undefined;
+    const client = fakeClient((request) =>
+      request.model === DEFAULT_CONFIG.compressorModel
+        ? { compressed: "CANCEL_FRESH_HANDOFF", response: { usage: { cost: 0.002 } } }
+        : {
+            text: ["Teilantwort"],
+            textError: () => {
+              controller.abort(new Error("cancelled"));
+              return new Error("cancelled");
+            },
+            before: async (emit) => {
+              loadedState = await request.state?.load();
+              await request.state?.save(sampleConversationState("cancelled-buffer"));
+              await emit.modelCall(0, 0.003);
+              await emit.tool("read_file", { path: "b.ts" });
+            },
+          },
+    );
+    const agent = await setup.agent(client.client);
+
+    await assert.rejects(
+      agent.run(prompt, { onText: () => {}, signal: controller.signal }),
+      /cancelled/,
+    );
+
+    assert.equal(occurrences(mainPayload(mainRequest(client), loadedState), prompt), 1);
+    assert.equal(occurrences(JSON.stringify(loadedState), "CANCEL_FRESH_HANDOFF"), 1);
+    assert.deepEqual(setup.session.data.turns, beforeTurns);
+    assert.deepEqual(setup.session.data.toolCalls, beforeToolCalls);
+    assert.equal(setup.session.data.summary, "CANCEL_SUMMARY");
+    assert.equal(setup.session.data.costs.compressorUsd, 0.002);
+    assert.equal(setup.session.data.costs.mainUsd, 0.003);
+    assert.equal(await readFile(statePath, "utf8"), beforeState);
+  });
+});
+
 // --- helpers -------------------------------------------------------------
+
+async function addHistory(session: SessionStore, sentinel: string): Promise<void> {
+  session.addTurn("user", sentinel);
+  session.addTurn("assistant", "Historische Antwort ohne Wiederholung des Markers");
+  await session.save();
+}
+
+async function persistConversationState(
+  setup: Pick<AgentSetup, "appHome" | "session">,
+  sentinel: string,
+): Promise<void> {
+  const store = await ConversationStore.open(
+    setup.appHome,
+    setup.session.path,
+    setup.session.data.id,
+  );
+  await store.accessor().save(sampleConversationState(sentinel) as never);
+  await store.commit(setup.session.data.turns.length);
+}
+
+function occurrences(value: string, needle: string): number {
+  let count = 0;
+  let offset = 0;
+  while ((offset = value.indexOf(needle, offset)) >= 0) {
+    count += 1;
+    offset += needle.length;
+  }
+  return count;
+}
+
+function mainPayload(request: FakeRequest, loadedState: unknown): string {
+  return `${inputText(request)}\n${JSON.stringify(loadedState)}`;
+}
 
 function sampleConversationState(tag: string): {
   id: string;
@@ -741,7 +3442,7 @@ function sampleConversationState(tag: string): {
   updatedAt: number;
 } {
   return {
-    id: `conv-${tag}`,
+    id: "conv-synthetic-state",
     messages: [{ role: "user", content: tag }],
     status: "complete",
     createdAt: Date.now(),
@@ -772,10 +3473,22 @@ interface FakeInputItem {
 }
 
 interface FakeRequest {
-  model: string;
+  model?: string;
+  models?: string[];
   instructions: string;
   input: string | FakeInputItem[];
+  provider?: {
+    sort?: string;
+    dataCollection?: string;
+    only?: string[];
+    ignore?: string[];
+    allowFallbacks?: boolean;
+  };
+  reasoning?: unknown;
+  plugins?: Array<{ id: string; maxResults?: number }>;
   tools?: readonly unknown[];
+  maxOutputTokens?: number;
+  stopWhen?: readonly unknown[];
   state?: FakeStateAccessor;
   cacheControl?: unknown;
   promptCacheKey?: string;
@@ -805,11 +3518,29 @@ interface RawTool {
   };
 }
 
+/** Phase 3b, Part A: what the real `StopResultSchema` carries (hooks-schemas.d.ts). */
+interface FakeStopResult {
+  forceResume?: boolean;
+  appendPrompt?: string;
+}
+
 interface HookEmitter {
   modelCall(turnNumber: number, cost: number): Promise<void>;
   turnStart(numberOfTurns: number): Promise<void>;
   tool(name: string, input: Record<string, unknown>): Promise<void>;
-  stop(): Promise<void>;
+  executeTool(
+    name: string,
+    input: Record<string, unknown>,
+  ): Promise<unknown>;
+  /**
+   * Fires the registered `Stop` handler and returns its decision, so a test
+   * can assert exactly what agent.ts told the SDK to do — forceResume with
+   * the drained interjections' appendPrompt, or a real stop (Phase 3b, Part
+   * A/B). The real SDK then continues the SAME callModel call on
+   * forceResume; the fake does not re-simulate that internal loop — the seam
+   * this test suite owns ends at "what did we hand back to the SDK".
+   */
+  stop(): Promise<FakeStopResult | undefined>;
 }
 
 interface FakeTurnSpec {
@@ -830,7 +3561,7 @@ interface FakeClient {
 function fakeClient(script: (request: FakeRequest) => FakeTurnSpec): FakeClient {
   const requests: FakeRequest[] = [];
   const client = {
-    callModel(request: FakeRequest) {
+    callModel(request: FakeRequest, options?: { signal?: AbortSignal }) {
       requests.push(request);
       const spec = script(request);
       const emit = hookEmitter(request);
@@ -839,9 +3570,19 @@ function fakeClient(script: (request: FakeRequest) => FakeTurnSpec): FakeClient 
         prepared ??= spec.before ? spec.before(emit) : Promise.resolve();
         return prepared;
       };
+      // Phase 3b, Part C: `before()` can call `endThinking.trigger()`
+      // synchronously, aborting `options.signal` (agent.ts's per-phase
+      // `phaseController`) before either stream yields anything — mirrors a
+      // real abort landing before the first chunk of an aborted request.
+      const throwIfAborted = () => {
+        if (options?.signal?.aborted) {
+          throw options.signal.reason ?? new Error("aborted");
+        }
+      };
       return {
         async *getTextStream(): AsyncGenerator<string> {
           await prepare();
+          throwIfAborted();
           for (const chunk of spec.text ?? []) {
             yield chunk;
           }
@@ -850,6 +3591,8 @@ function fakeClient(script: (request: FakeRequest) => FakeTurnSpec): FakeClient 
           }
         },
         async *getReasoningStream(): AsyncGenerator<string> {
+          await prepare();
+          throwIfAborted();
           for (const chunk of spec.reasoning ?? []) {
             yield chunk;
           }
@@ -866,6 +3609,7 @@ function fakeClient(script: (request: FakeRequest) => FakeTurnSpec): FakeClient 
           usage?: { cost?: number };
         }> {
           await prepare();
+          throwIfAborted();
           return spec.response ?? {};
         },
       };
@@ -875,9 +3619,32 @@ function fakeClient(script: (request: FakeRequest) => FakeTurnSpec): FakeClient 
 }
 
 function hookEmitter(request: FakeRequest): HookEmitter {
-  const call = async (name: string, payload: unknown) => {
+  const call = async (name: string, payload: unknown): Promise<unknown[]> => {
+    const results: unknown[] = [];
     for (const entry of request.hooks?.[name] ?? []) {
-      await entry.handler(payload as never);
+      results.push(await entry.handler(payload as never));
+    }
+    return results;
+  };
+  const executeTool = async (name: string, input: Record<string, unknown>) => {
+    const raw = (request.tools ?? []) as RawTool[];
+    const selected = raw.find((candidate) => candidate.function.name === name);
+    assert.ok(selected, `Tool ${name} fehlt im Request`);
+    const parsed = selected.function.inputSchema.parse(input);
+    const executeContext = { numberOfTurns: 1 };
+    await call("PreToolUse", { toolName: name, toolInput: parsed });
+    try {
+      const output = await selected.function.execute(parsed as never, executeContext as never);
+      await call("PostToolUse", {
+        toolName: name,
+        toolInput: parsed,
+        toolOutput: output,
+        durationMs: 2,
+      });
+      return output;
+    } catch (error) {
+      await call("PostToolUseFailure", { toolName: name, toolInput: parsed, error });
+      throw error;
     }
   };
   return {
@@ -901,16 +3668,14 @@ function hookEmitter(request: FakeRequest): HookEmitter {
       await request.onTurnStart?.({ numberOfTurns });
     },
     async tool(name, input) {
-      await call("PreToolUse", { toolName: name, toolInput: input });
-      await call("PostToolUse", {
-        toolName: name,
-        toolInput: input,
-        toolOutput: { ok: true },
-        durationMs: 2,
-      });
+      await executeTool(name, input);
+    },
+    async executeTool(name, input) {
+      return executeTool(name, input);
     },
     async stop() {
-      await call("Stop", { reason: "max_turns" });
+      const [result] = await call("Stop", { reason: "max_turns" });
+      return result as FakeStopResult | undefined;
     },
   };
 }
@@ -928,7 +3693,14 @@ interface AgentSetup {
   appHome: string;
   session: SessionStore;
   config: OrcodeConfigWithBudget;
-  agent: (client: unknown) => Promise<OrcodeAgent>;
+  agent: (
+    client: unknown,
+    retention?: {
+      pruneRunLogs: (appHome: string) => Promise<unknown>;
+      pruneExactArtifacts: (appHome: string) => Promise<unknown>;
+    },
+    verifyRunner?: typeof runVerify,
+  ) => Promise<OrcodeAgent>;
 }
 
 async function createAgent(
@@ -941,7 +3713,7 @@ async function createAgent(
   const config: OrcodeConfigWithBudget = {
     ...DEFAULT_CONFIG,
     ...overrides,
-    reasoningByModel: {},
+    reasoningByModel: { ...overrides.reasoningByModel },
     budget: { ...DEFAULT_CONFIG.budget, ...overrides.budget },
   };
   return {
@@ -949,15 +3721,81 @@ async function createAgent(
     appHome,
     session,
     config,
-    agent: (client) =>
+    agent: (client, retention, verifyRunner) =>
       OrcodeAgent.create({
         openRouter: fakeService(client),
         approvals,
         session,
         config,
         workspace,
+        ...(retention ? { retention } : {}),
+        ...(verifyRunner ? { verifyRunner } : {}),
       }),
   };
+}
+
+function scriptedVerifyRunner(
+  outcomes: readonly VerifyOutcome[],
+  output = "",
+): {
+  runner: typeof runVerify;
+  passes: string[][];
+  processes: string[];
+} {
+  const passes: string[][] = [];
+  const processes: string[] = [];
+  let passIndex = 0;
+  const runner: typeof runVerify = async (
+    commands,
+    _guard,
+    signal,
+    onEvent,
+    callbacks = {},
+  ) => {
+    if (signal?.aborted) return { status: "cancelled" };
+    const outcome = outcomes[Math.min(passIndex, outcomes.length - 1)] ?? {
+      status: "passed",
+    };
+    passIndex += 1;
+    passes.push([...commands]);
+    const attempted = outcome.status === "failed"
+      ? commands.slice(0, Math.max(1, commands.indexOf(outcome.command) + 1))
+      : outcome.status === "passed"
+        ? commands
+        : commands.slice(0, 1);
+    for (const command of attempted) {
+      const id = `verify-process-${processes.length + 1}`;
+      const operation = { id, name: "verify", input: { command } };
+      processes.push(command);
+      callbacks.onProcessStart?.(operation);
+      if (output) callbacks.onProcessChunk?.(operation, "stderr", output);
+      const isTerminalCommand = command === attempted.at(-1);
+      const exitCode = outcome.status === "failed" && isTerminalCommand
+        ? outcome.exitCode
+        : outcome.status === "spawn-failed" && isTerminalCommand
+          ? null
+          : outcome.status === "timed-out" && isTerminalCommand
+            ? 124
+            : outcome.status === "cancelled" && isTerminalCommand
+              ? 130
+              : 0;
+      callbacks.onProcessEnd?.(operation, {
+        exitCode,
+        durationMs: 1,
+        truncated: false,
+        timedOut: outcome.status === "timed-out" && isTerminalCommand,
+        aborted: outcome.status === "cancelled" && isTerminalCommand,
+        ...(outcome.status === "spawn-failed" && isTerminalCommand
+          ? { error: outcome.error }
+          : {}),
+      });
+      if (exitCode !== null && ![124, 130].includes(exitCode)) {
+        onEvent({ command, exitCode, durationMs: 1, timestamp: Date.now() });
+      }
+    }
+    return outcome;
+  };
+  return { runner, passes, processes };
 }
 
 function fakeService(client: unknown): OpenRouterService {

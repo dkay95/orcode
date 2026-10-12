@@ -21,14 +21,26 @@ import {
   type FetchLike,
   type RetryClock,
 } from "./reconnect.js";
-import type { PanelCall } from "./panel.js";
-import { errorMessage, isRecord } from "./utils.js";
+import { PanelAuthenticationRejectedError, type PanelCall } from "./panel.js";
+import type { ModelRuntime, RuntimeModelInfo } from "./model-runtime.js";
+import type { RouteIdentityV1 } from "./backends.js";
+import { ellipsize, errorMessage, estimateTokensFromChars, isRecord } from "./utils.js";
 
 const API_BASE = "https://openrouter.ai/api/v1";
 const APP_TITLE = "orcode";
 const MODEL_CACHE_TTL_MS = 5 * 60_000;
 
 export type KeyOrigin = "none" | "environment" | "keychain" | "interactive";
+export type CredentialValidity = "unknown" | "valid" | "rejected";
+export type ConnectivityState = "unknown" | "connected" | "disconnected";
+export type CreditState = "unknown" | "available" | "insufficient" | "unavailable";
+
+export interface OpenRouterRuntimeState {
+  inferenceValidity: CredentialValidity;
+  managementValidity: CredentialValidity;
+  connectivity: ConnectivityState;
+  credit: CreditState;
+}
 
 /** Injection points for tests and for future runtime tuning. */
 export interface OpenRouterRuntime {
@@ -59,9 +71,9 @@ export interface OpenRouterFailure {
   kind: FailureKind;
   status?: number;
   retryAfterMs?: number;
-  /** What happened, in plain German. */
+  /** What happened, in plain English. */
   message: string;
-  /** What the user can do about it, in plain German. */
+  /** What the user can do about it, in plain English. */
   action: string;
   /** Original technical text, with every known key redacted. */
   detail: string;
@@ -139,18 +151,18 @@ export function describeOpenRouterFailure(
   ) {
     return {
       kind: "timeout",
-      message: "OpenRouter hat nicht rechtzeitig geantwortet (Zeitüberschreitung).",
+      message: "OpenRouter did not respond in time (timeout).",
       action:
-        "Prüfe die Verbindung und versuche es erneut; bei großen Anfragen hilft ein kleinerer Kontext oder ein anderes Modell.",
+        "Check the connection and try again; for large requests, a smaller context or a different model helps.",
       detail,
     };
   }
   if (code === "ENOTFOUND" || code === "EAI_AGAIN") {
     return {
       kind: "network",
-      message: "openrouter.ai konnte nicht aufgelöst werden (DNS-Fehler).",
+      message: "openrouter.ai could not be resolved (DNS error).",
       action:
-        "Prüfe Internetverbindung, VPN und DNS-Einstellungen und versuche es danach erneut.",
+        "Check your internet connection, VPN, and DNS settings, then try again.",
       detail,
     };
   }
@@ -165,18 +177,18 @@ export function describeOpenRouterFailure(
   ) {
     return {
       kind: "network",
-      message: "Die Verbindung zu OpenRouter ist fehlgeschlagen.",
+      message: "The connection to OpenRouter failed.",
       action:
-        "Prüfe Internetverbindung, Proxy und Firewall und versuche es danach erneut.",
+        "Check your internet connection, proxy, and firewall, then try again.",
       detail,
     };
   }
   if (code?.startsWith("CERT_") || code === "SELF_SIGNED_CERT_IN_CHAIN") {
     return {
       kind: "network",
-      message: "Die TLS-Verbindung zu OpenRouter wurde nicht akzeptiert.",
+      message: "The TLS connection to OpenRouter was not accepted.",
       action:
-        "Prüfe Systemzeit, Zertifikatsspeicher und einen eventuellen TLS-Proxy.",
+        "Check the system clock, certificate store, and any TLS proxy.",
       detail,
     };
   }
@@ -210,9 +222,9 @@ function failureFromStatus(
     return {
       kind: "auth",
       status,
-      message: "OpenRouter hat den API-Key abgelehnt (ungültig oder widerrufen).",
+      message: "OpenRouter rejected the API key (invalid or revoked).",
       action:
-        "Lege auf openrouter.ai/keys einen gültigen Key an und hinterlege ihn mit /key set.",
+        "Create a valid key at openrouter.ai/keys and set it with /key set.",
       detail,
     };
   }
@@ -220,9 +232,9 @@ function failureFromStatus(
     return {
       kind: "credits",
       status,
-      message: "Das OpenRouter-Konto hat für diese Anfrage zu wenig Guthaben.",
+      message: "The OpenRouter account doesn't have enough credit for this request.",
       action:
-        "Lade auf openrouter.ai/credits Guthaben nach oder wechsle mit /model auf ein günstigeres Modell.",
+        "Top up credit at openrouter.ai/credits or switch to a cheaper model with /model.",
       detail,
     };
   }
@@ -231,9 +243,9 @@ function failureFromStatus(
       kind: "permission",
       status,
       message:
-        "OpenRouter hat den Zugriff verweigert (fehlende Berechtigung oder Moderation).",
+        "OpenRouter denied access (missing permission or moderation).",
       action:
-        "Prüfe die Rechte des Keys; Kontodaten wie /credits benötigen einen Management-Key (/key management set).",
+        "Check the key's permissions; account data like /credits needs a management key (/key management set).",
       detail,
     };
   }
@@ -241,8 +253,8 @@ function failureFromStatus(
     return {
       kind: "not-found",
       status,
-      message: "OpenRouter kennt dieses Modell oder diesen Endpunkt nicht.",
-      action: "Prüfe die Modell-ID mit /model; abgeschaltete Modelle müssen ersetzt werden.",
+      message: "OpenRouter doesn't know this model or endpoint.",
+      action: "Check the model ID with /model; retired models need to be replaced.",
       detail,
     };
   }
@@ -250,9 +262,9 @@ function failureFromStatus(
     return {
       kind: "timeout",
       status,
-      message: "OpenRouter hat nicht rechtzeitig geantwortet (Zeitüberschreitung).",
+      message: "OpenRouter did not respond in time (timeout).",
       action:
-        "Versuche es erneut; hält es an, hilft ein kleinerer Kontext oder ein anderes Modell.",
+        "Try again; if it persists, a smaller context or a different model helps.",
       detail,
     };
   }
@@ -262,10 +274,10 @@ function failureFromStatus(
       kind: "rate-limit",
       status,
       retryAfterMs: waitMs,
-      message: "OpenRouter drosselt die Anfragen (Rate-Limit erreicht).",
+      message: "OpenRouter is throttling requests (rate limit reached).",
       action: wait
-        ? `Warte etwa ${wait} Sekunde${wait === 1 ? "" : "n"} und versuche es erneut; orcode wiederholt idempotente Anfragen automatisch.`
-        : "Warte einen Moment und versuche es erneut; ein anderes Modell oder ein bezahlter Tarif entlastet zusätzlich.",
+        ? `Wait about ${wait} second${wait === 1 ? "" : "s"} and try again; orcode automatically retries idempotent requests.`
+        : "Wait a moment and try again; a different model or a paid tier also helps relieve the limit.",
       detail,
     };
   }
@@ -273,9 +285,9 @@ function failureFromStatus(
     return {
       kind: "provider",
       status,
-      message: `Der Anbieter hinter OpenRouter meldet eine Störung (HTTP ${status}).`,
+      message: `The provider behind OpenRouter is reporting an outage (HTTP ${status}).`,
       action:
-        "Kurz warten und erneut versuchen; bei anhaltender Störung mit /model einen anderen Anbieter wählen.",
+        "Wait briefly and try again; if the outage persists, pick a different provider with /model.",
       detail,
     };
   }
@@ -283,9 +295,9 @@ function failureFromStatus(
     return {
       kind: "invalid-request",
       status,
-      message: `OpenRouter hat die Anfrage abgelehnt (HTTP ${status}).`,
+      message: `OpenRouter rejected the request (HTTP ${status}).`,
       action:
-        "Prüfe Modell-ID, Reasoning-Einstellung (/think) und Anhänge; die Details unten nennen das beanstandete Feld.",
+        "Check the model ID, reasoning setting (/think), and attachments; the details below name the field that was flagged.",
       detail,
     };
   }
@@ -358,7 +370,7 @@ export interface KeyCapabilities {
   creditsSource: CreditsSource;
   managementKeySet: boolean;
   inferenceKeyIsManagement?: boolean;
-  /** One German sentence stating which key can do what. */
+  /** One sentence stating which key can do what. */
   summary: string;
 }
 
@@ -369,13 +381,6 @@ export interface KeyCapabilities {
  */
 export interface BalanceReport extends BalanceInfo {
   capabilities?: KeyCapabilities;
-}
-
-export interface ReconnectReport extends BalanceReport {
-  steps: string[];
-  message: string;
-  clientRebuilt: boolean;
-  modelCacheCleared: boolean;
 }
 
 export function describeKeyCapabilities(
@@ -390,7 +395,7 @@ export function describeKeyCapabilities(
       managementKeySet,
       inferenceKeyIsManagement: key.isManagementKey,
       summary:
-        "Der Management-Key liest das Kontoguthaben, der Inference-Key führt die Modellläufe aus.",
+        "The management key reads the account balance, the inference key runs the models.",
     };
   }
   if (key.isManagementKey === true) {
@@ -401,7 +406,7 @@ export function describeKeyCapabilities(
       managementKeySet,
       inferenceKeyIsManagement: true,
       summary:
-        "Der gesetzte Key ist zugleich Management-Key: Modellläufe und Kontoguthaben sind damit abgedeckt.",
+        "The configured key is also a management key: model runs and account balance are both covered.",
     };
   }
   if (key.isManagementKey === false) {
@@ -412,7 +417,7 @@ export function describeKeyCapabilities(
       managementKeySet,
       inferenceKeyIsManagement: false,
       summary:
-        "Der gesetzte Key ist ein reiner Inference-Key: Modellläufe ja, Kontoguthaben nein. Hinterlege mit /key management set einen Management-Key, um das Guthaben zu sehen.",
+        "The configured key is inference-only: model runs yes, account balance no. Set a management key with /key management set to see the balance.",
     };
   }
   return {
@@ -422,7 +427,7 @@ export function describeKeyCapabilities(
     managementKeySet,
     inferenceKeyIsManagement: undefined,
     summary:
-      "OpenRouter meldet für diesen Key nicht, ob er Kontodaten lesen darf; die Guthabenabfrage wird versucht.",
+      "OpenRouter doesn't report whether this key may read account data; the balance check will be attempted anyway.",
   };
 }
 
@@ -498,6 +503,23 @@ export function modelCapabilities(model: ModelInfo): ModelCapabilities {
     promptPricePerMillion: perMillion(model.promptPrice),
     completionPricePerMillion: perMillion(model.completionPrice),
   };
+}
+
+/** Complete capability contract for the tool-using main agent role. */
+export function isMainModelCandidate(model: ModelInfo): boolean {
+  if (model.id === "openrouter/auto") {
+    return true;
+  }
+  return (
+    model.supportedParameters.includes("tools") &&
+    model.inputModalities.includes("text") &&
+    model.outputModalities.includes("text")
+  );
+}
+
+/** Compressor calls only require a model that can produce text. */
+export function isCompressorModelCandidate(model: ModelInfo): boolean {
+  return model.outputModalities.includes("text");
 }
 
 export function filterModels(
@@ -619,6 +641,12 @@ export class OpenRouterService {
   readonly #runtime: OpenRouterRuntime;
   readonly #restMonitor: SdkReconnectMonitor;
   readonly #clients = new Map<string, OpenRouter>();
+  readonly #state: OpenRouterRuntimeState = {
+    inferenceValidity: "unknown",
+    managementValidity: "unknown",
+    connectivity: "unknown",
+    credit: "unknown",
+  };
   #modelCache: { models: ModelInfo[]; fetchedAt: number } | null = null;
 
   constructor(
@@ -661,34 +689,70 @@ export class OpenRouterService {
     return this.#managementKeyOrigin;
   }
 
+  get runtimeState(): OpenRouterRuntimeState {
+    return { ...this.#state };
+  }
+
   setKey(apiKey: string, origin: KeyOrigin = "interactive"): void {
     const normalized = normalizeKey(apiKey);
     if (!normalized || normalized.length < 20 || /\s/.test(normalized)) {
-      throw new Error("Der OpenRouter API-Key sieht ungültig aus.");
+      throw new Error("The OpenRouter API key looks invalid.");
     }
     this.#apiKey = normalized;
     this.#keyOrigin = origin;
+    this.#state.inferenceValidity = "unknown";
+    this.#state.connectivity = "unknown";
+    this.#state.credit = "unknown";
     this.dropClients();
+  }
+
+  activateValidatedKey(
+    apiKey: string,
+    origin: Exclude<KeyOrigin, "none">,
+    balance: BalanceReport,
+  ): void {
+    this.setKey(apiKey, origin);
+    this.#state.inferenceValidity = "valid";
+    this.#state.connectivity = "connected";
+    this.#state.credit = creditStateFromBalance(balance);
   }
 
   forgetKey(): void {
     this.#apiKey = null;
     this.#keyOrigin = "none";
+    this.#state.inferenceValidity = "unknown";
+    this.#state.connectivity = "unknown";
+    this.#state.credit = "unknown";
     this.dropClients();
   }
 
   setManagementKey(apiKey: string, origin: KeyOrigin = "interactive"): void {
     const normalized = normalizeKey(apiKey);
     if (!normalized || normalized.length < 20 || /\s/.test(normalized)) {
-      throw new Error("Der OpenRouter Management-Key sieht ungültig aus.");
+      throw new Error("The OpenRouter management key looks invalid.");
     }
     this.#managementKey = normalized;
     this.#managementKeyOrigin = origin;
+    this.#state.managementValidity = "unknown";
+    this.#state.credit = "unknown";
+  }
+
+  activateValidatedManagementKey(
+    apiKey: string,
+    origin: Exclude<KeyOrigin, "none">,
+    credits: CreditInfo,
+  ): void {
+    this.setManagementKey(apiKey, origin);
+    this.#state.managementValidity = "valid";
+    this.#state.connectivity = "connected";
+    this.#state.credit = credits.remaining > 0 ? "available" : "insufficient";
   }
 
   forgetManagementKey(): void {
     this.#managementKey = null;
     this.#managementKeyOrigin = "none";
+    this.#state.managementValidity = "unknown";
+    this.#state.credit = "unknown";
   }
 
   /**
@@ -723,12 +787,24 @@ export class OpenRouterService {
         {
           afterError: (context, response, error) => {
             monitor.afterError(context, response);
-            return { response, error };
+            if (response) {
+              this.#recordResponse(response.status, "inference", "sdk");
+            } else {
+              this.#state.connectivity = "disconnected";
+            }
+            return {
+              response,
+              error: scope === "panel" && response?.status === 401
+                ? new PanelAuthenticationRejectedError()
+                : error,
+            };
           },
         },
         {
           afterSuccess: (context, response) => {
             monitor.afterSuccess(context);
+            this.#state.connectivity = "connected";
+            this.#state.inferenceValidity = "valid";
             return response;
           },
         },
@@ -751,42 +827,18 @@ export class OpenRouterService {
   }
 
   /**
-   * Real reconnect: throw the SDK clients away, rebuild them, re-check the key
-   * and drop the cached model list.
+   * Live credit check against /credits — the one place a balance figure may
+   * come from (`/balance`, the startup inspection). Reconnect-as-a-method is
+   * gone (FIX-15 F2c): the provider runtime's reconnect path invalidates the
+   * model cache itself and re-resolves credentials through its own gate.
    */
-  async reconnect(signal?: AbortSignal): Promise<ReconnectReport> {
-    const hadClients = this.#clients.size > 0;
-    const cachedModels = this.#modelCache?.models.length ?? 0;
-    this.dropClients();
-    this.invalidateModelCache();
-
-    const balance = await this.checkBalance(signal);
-    this.client();
-
-    const steps = [
-      hadClients
-        ? "Bestehende OpenRouter-Verbindung verworfen und neu aufgebaut."
-        : "OpenRouter-Verbindung neu aufgebaut.",
-      `Key erneut geprüft: ${balance.key.label ?? "ohne Label"} · ${
-        balance.capabilities?.summary ?? "Fähigkeiten unbekannt."
-      }`,
-      cachedModels
-        ? `Modell-Cache geleert (${cachedModels} Einträge).`
-        : "Modell-Cache war leer und bleibt leer.",
-    ];
-    return {
-      ...balance,
-      steps,
-      message: steps.join(" "),
-      clientRebuilt: true,
-      modelCacheCleared: true,
-    };
-  }
-
   async checkBalance(signal?: AbortSignal): Promise<BalanceReport> {
     const key = await this.getCurrentKey(signal);
     const capabilities = describeKeyCapabilities(key, this.hasManagementKey);
     if (!capabilities.accountCredits) {
+      this.#state.credit = key.limitRemaining !== undefined && key.limitRemaining !== null
+        ? (key.limitRemaining > 0 ? "available" : "insufficient")
+        : "unavailable";
       return {
         key,
         capabilities,
@@ -798,7 +850,13 @@ export class OpenRouterService {
         ? (this.#managementKey ?? this.requireKey())
         : this.requireKey();
     try {
-      const credits = await this.getCredits(bearer, signal);
+      const credits = await this.getCredits(
+        bearer,
+        signal,
+        capabilities.creditsSource === "management-key"
+          ? "management"
+          : "inference",
+      );
       return { key, credits, capabilities };
     } catch (error) {
       if (
@@ -806,8 +864,8 @@ export class OpenRouterService {
         (error.status === 401 || error.status === 403)
       ) {
         const reason = this.#managementKey
-          ? "Der gesetzte Management-Key wurde für /credits abgelehnt; das Limit des Inference-Keys wurde trotzdem geprüft."
-          : "Der /credits-Endpunkt benötigt einen Management-Key; das Limit des aktuellen Inference-Keys wurde geprüft.";
+          ? "The configured management key was rejected for /credits; the inference key's limit was checked instead."
+          : "The /credits endpoint needs a management key; the current inference key's limit was checked.";
         return {
           key,
           capabilities: {
@@ -829,41 +887,109 @@ export class OpenRouterService {
   ): Promise<CreditInfo> {
     const normalized = normalizeKey(apiKey);
     if (!normalized || normalized.length < 20 || /\s/.test(normalized)) {
-      throw new Error("Der OpenRouter Management-Key sieht ungültig aus.");
+      throw new Error("The OpenRouter management key looks invalid.");
     }
-    return this.getCredits(normalized, signal);
+    return this.getCredits(normalized, signal, "candidate");
+  }
+
+  async validateInferenceKey(
+    apiKey: string,
+    signal?: AbortSignal,
+  ): Promise<BalanceReport> {
+    const normalized = normalizeKey(apiKey);
+    if (!normalized || normalized.length < 20 || /\s/.test(normalized)) {
+      throw new Error("The OpenRouter API key looks invalid.");
+    }
+    const payload = await this.request("/key", normalized, signal, "candidate");
+    const key = keyInfoFromPayload(payload);
+    const capabilities = describeKeyCapabilities(key, false);
+    if (!capabilities.accountCredits) {
+      return {
+        key,
+        capabilities,
+        creditsUnavailableReason: capabilities.summary,
+      };
+    }
+    try {
+      const credits = await this.getCredits(normalized, signal, "candidate");
+      return { key, credits, capabilities };
+    } catch (error) {
+      if (
+        error instanceof OpenRouterHttpError &&
+        (error.status === 401 || error.status === 403)
+      ) {
+        const reason =
+          "The /credits endpoint needs a management key; the checked inference key's limit is valid.";
+        return {
+          key,
+          capabilities: {
+            ...capabilities,
+            accountCredits: false,
+            creditsSource: "none",
+            summary: reason,
+          },
+          creditsUnavailableReason: reason,
+        };
+      }
+      throw error;
+    }
+  }
+
+  /**
+   * Reads documented key metadata with candidate scope. This operation never
+   * changes the active key, credential validity, connectivity, or spend state.
+   */
+  async inspectKey(
+    apiKey: string,
+    signal?: AbortSignal,
+  ): Promise<KeyInfo> {
+    const normalized = normalizeKey(apiKey);
+    if (!normalized || normalized.length < 20 || /\s/.test(normalized)) {
+      throw new Error("The OpenRouter API key looks invalid.");
+    }
+    const payload = await this.request("/key", normalized, signal, "candidate");
+    return keyInfoFromPayload(payload);
   }
 
   async getCredits(
     bearerKey: string,
-    signal?: AbortSignal,
+    signal: AbortSignal | undefined,
+    requestScope: "inference" | "management" | "candidate",
   ): Promise<CreditInfo> {
-    const payload = await this.request("/credits", bearerKey, signal);
-    const data = requireRecord(payload.data, "Ungültige Guthaben-Antwort");
-    const totalCredits = numberOf(data.total_credits);
-    const totalUsage = numberOf(data.total_usage);
-    return {
+    const payload = await this.request(
+      "/credits",
+      bearerKey,
+      signal,
+      requestScope,
+    );
+    const data = requireRecord(payload.data, "Invalid balance response");
+    const totalCredits = finiteNumberOf(data.total_credits);
+    const totalUsage = finiteNumberOf(data.total_usage);
+    if (totalCredits === undefined || totalUsage === undefined) {
+      if (requestScope !== "candidate") {
+        this.#state.credit = "unknown";
+      }
+      throw new Error("Invalid balance response");
+    }
+    const credits = {
       totalCredits,
       totalUsage,
       remaining: Math.max(0, totalCredits - totalUsage),
     };
+    if (requestScope !== "candidate") {
+      this.#state.credit = credits.remaining > 0 ? "available" : "insufficient";
+    }
+    return credits;
   }
 
   async getCurrentKey(signal?: AbortSignal): Promise<KeyInfo> {
-    const payload = await this.request("/key", this.requireKey(), signal);
-    const data = requireRecord(payload.data, "Ungültige Key-Antwort");
-    return {
-      label: stringOf(data.label),
-      isFreeTier: booleanOf(data.is_free_tier),
-      isManagementKey: booleanOf(data.is_management_key),
-      limit: nullableNumberOf(data.limit),
-      limitRemaining: nullableNumberOf(data.limit_remaining),
-      usage: numberOf(data.usage),
-      usageDaily: numberOf(data.usage_daily),
-      usageWeekly: numberOf(data.usage_weekly),
-      usageMonthly: numberOf(data.usage_monthly),
-      expiresAt: nullableStringOf(data.expires_at),
-    };
+    const payload = await this.request(
+      "/key",
+      this.requireKey(),
+      signal,
+      "inference",
+    );
+    return keyInfoFromPayload(payload);
   }
 
   /** Full model catalogue, cached for `modelCacheTtlMs`. */
@@ -878,26 +1004,41 @@ export class OpenRouterService {
     ) {
       return [...cached.models];
     }
+    const models = await this.#fetchModels(options.signal);
+    this.#modelCache = { models, fetchedAt: this.#now() };
+    return [...models];
+  }
+
+  /** Synchronous cache read for UI projections; it never fetches or reads a key. */
+  readCachedModels(): readonly ModelInfo[] {
+    return this.#modelCache ? this.#modelCache.models.map((model) => ({ ...model })) : [];
+  }
+
+  /** Candidate/setup catalogue read that cannot populate the active cache. */
+  async inspectModels(signal?: AbortSignal): Promise<ModelInfo[]> {
+    return this.#fetchModels(signal);
+  }
+
+  async #fetchModels(signal?: AbortSignal): Promise<ModelInfo[]> {
     const response = await this.#send(
       `${API_BASE}/models`,
       { headers: { "X-OpenRouter-Title": APP_TITLE } },
       "models",
-      options.signal,
+      signal,
     );
     const text = await response.text();
     if (!response.ok) {
       throw new OpenRouterHttpError(
         response.status,
-        `Modellliste konnte nicht geladen werden: ${truncateDetail(text)}`,
+        `Could not load the model list: ${truncateDetail(text)}`,
         { retryAfterMs: retryAfterMs(response) },
       );
     }
-    const payload = requireRecord(parseJson(text), "Ungültige Modell-Antwort");
+    const payload = requireRecord(parseJson(text), "Invalid model response");
     const data = Array.isArray(payload.data) ? payload.data : [];
     const models = data
       .map(parseModel)
       .filter((model): model is ModelInfo => Boolean(model));
-    this.#modelCache = { models, fetchedAt: this.#now() };
     return [...models];
   }
 
@@ -946,12 +1087,24 @@ export class OpenRouterService {
 
   requireKey(): string {
     if (!this.#apiKey) {
-      throw new Error("Kein OpenRouter API-Key gesetzt. Verwende /key set.");
+      // FIX-18 (advice triangle): with no key loaded there is no connected
+      // provider, and in that state /key set itself refuses with
+      // "Provider setup is required." — so name the one step that works.
+      throw new Error("No OpenRouter API key is available. Run /provider setup to connect an account.");
     }
     return this.#apiKey;
   }
 
-  /** Structured, German translation of an OpenRouter or network failure. */
+  requireManagementKey(): string {
+    if (!this.#managementKey) {
+      throw new Error(
+        "No OpenRouter management key set. Use /key management replace.",
+      );
+    }
+    return this.#managementKey;
+  }
+
+  /** Structured, plain-English translation of an OpenRouter or network failure. */
   explain(error: unknown): OpenRouterFailure {
     return describeOpenRouterFailure(error, [this.#apiKey, this.#managementKey]);
   }
@@ -960,23 +1113,59 @@ export class OpenRouterService {
     return formatFailure(this.explain(error));
   }
 
+  safePanelMessage(error: unknown): string {
+    const failure = this.explain(error);
+    if (failure.kind === "cancelled") return "OpenRouter request was cancelled.";
+    if (failure.kind === "unknown") return "OpenRouter request failed.";
+    return failure.action
+      ? `${failure.message} ${failure.action}`
+      : failure.message;
+  }
+
   async request(
     path: string,
-    bearerKey = this.requireKey(),
-    signal?: AbortSignal,
+    bearerKey: string,
+    signal: AbortSignal | undefined,
+    requestScope: "inference" | "management" | "candidate",
   ): Promise<Record<string, unknown>> {
-    const response = await this.#send(
-      `${API_BASE}${path}`,
-      {
-        headers: {
-          Authorization: `Bearer ${bearerKey}`,
-          "Content-Type": "application/json",
-          "X-OpenRouter-Title": APP_TITLE,
+    const scope = requestScope;
+    let response: Response;
+    try {
+      response = await this.#send(
+        `${API_BASE}${path}`,
+        {
+          headers: {
+            Authorization: `Bearer ${bearerKey}`,
+            "Content-Type": "application/json",
+            "X-OpenRouter-Title": APP_TITLE,
+          },
         },
-      },
-      operationFromPath(path),
-      signal,
-    );
+        operationFromPath(path),
+        signal,
+      );
+    } catch (error) {
+      if (signal?.aborted) {
+        throw abortError(signal);
+      }
+      const failure = describeOpenRouterFailure(error, [
+        this.#apiKey,
+        this.#managementKey,
+        bearerKey,
+      ]);
+      if (scope !== "candidate" && failure.kind !== "cancelled") {
+        if (path === "/credits") {
+          this.#state.credit = "unknown";
+        } else {
+          this.#state.connectivity = "disconnected";
+        }
+      }
+      if (failure.kind === "cancelled") {
+        throw error;
+      }
+      throw new OpenRouterRequestError(failure);
+    }
+
+    this.#recordResponse(response.status, scope, path);
 
     const text = await response.text();
     const payload = parseJson(text);
@@ -992,7 +1181,7 @@ export class OpenRouterService {
         retryAfterMs: retryAfterMs(response),
       });
     }
-    return requireRecord(payload, "OpenRouter lieferte keine gültige JSON-Antwort.");
+    return requireRecord(payload, "OpenRouter did not return a valid JSON response.");
   }
 
   async #send(
@@ -1001,24 +1190,45 @@ export class OpenRouterService {
     operation: string,
     signal?: AbortSignal,
   ): Promise<Response> {
-    try {
-      return await fetchWithReconnect(url, init, {
-        operation,
-        monitor: this.#restMonitor,
-        signal,
-        timeoutMs: RETRY_POLICY.requestTimeoutMs,
-        clock: this.#runtime.clock,
-        fetchImpl: this.#runtime.fetchImpl,
-      });
-    } catch (error) {
-      if (signal?.aborted) {
-        throw abortError(signal);
+    return fetchWithReconnect(url, init, {
+      operation,
+      monitor: this.#restMonitor,
+      signal,
+      timeoutMs: RETRY_POLICY.requestTimeoutMs,
+      clock: this.#runtime.clock,
+      fetchImpl: this.#runtime.fetchImpl,
+    });
+  }
+
+  #recordResponse(
+    status: number,
+    scope: "inference" | "management" | "candidate",
+    path: string,
+  ): void {
+    if (scope === "candidate") return;
+    if (path === "/credits") {
+      if (status === 402) {
+        this.#state.credit = "insufficient";
+      } else if (status === 401 || status === 403) {
+        this.#state.credit = "unavailable";
+      } else if (status < 200 || status >= 300) {
+        this.#state.credit = "unknown";
       }
-      const failure = this.explain(error);
-      if (failure.kind === "cancelled") {
-        throw error;
-      }
-      throw new OpenRouterRequestError(failure);
+      return;
+    }
+    const connectivity = status === 408 || status === 504 || status >= 500
+      ? "disconnected"
+      : "connected";
+    this.#state.connectivity = connectivity;
+    if (status >= 200 && status < 300) {
+      if (scope === "inference") this.#state.inferenceValidity = "valid";
+      else this.#state.managementValidity = "valid";
+    } else if (status === 401) {
+      if (scope === "inference") this.#state.inferenceValidity = "rejected";
+      else this.#state.managementValidity = "rejected";
+    }
+    if (status === 402) {
+      this.#state.credit = "insufficient";
     }
   }
 
@@ -1040,11 +1250,8 @@ export class OpenRouterService {
 // --------------------------------------------------------------------------
 // A3 — Ausfallsicherheit: request fragments and provider-switch notices.
 //
-// BENÖTIGT IN src/agent.ts: the `callModel`/request-building call site must
-// spread `modelsField(this.config.mainModel, this.config.fallbackModels)`
-// into the `models` request field (instead of a bare `model: mainModel`),
-// and `providerField(this.config.provider)` into the request's `provider`
-// field. Neither is wired in from here — agent.ts owns the actual SDK call.
+// `agent.ts` applies these fragments at its one main `callModel` boundary;
+// compressor and panel calls deliberately keep their own routing policies.
 // --------------------------------------------------------------------------
 
 /**
@@ -1069,17 +1276,19 @@ export function modelsField(
 
 /** OpenRouter `provider` preferences field, straight passthrough. */
 export interface ProviderRequestField {
-  sort?: string;
-  dataCollection?: string;
+  sort?: "price" | "throughput" | "latency";
+  dataCollection?: "allow" | "deny";
   only?: string[];
   ignore?: string[];
+  allowFallbacks?: boolean;
 }
 
 export function providerField(config: {
-  sort?: string;
-  dataCollection?: string;
-  only?: string[];
-  ignore?: string[];
+  sort?: "price" | "throughput" | "latency";
+  dataCollection?: "allow" | "deny";
+  only?: readonly string[];
+  ignore?: readonly string[];
+  allowFallbacks?: boolean;
 }): ProviderRequestField {
   const field: ProviderRequestField = {};
   if (config.sort) {
@@ -1094,7 +1303,100 @@ export function providerField(config: {
   if (config.ignore && config.ignore.length > 0) {
     field.ignore = [...config.ignore];
   }
+  if (typeof config.allowFallbacks === "boolean") {
+    field.allowFallbacks = config.allowFallbacks;
+  }
   return field;
+}
+
+/** Provider-neutral projection of the existing OpenRouter service. */
+export function createOpenRouterModelRuntime(
+  service: OpenRouterService,
+  config: {
+    readonly mainModel: string;
+    readonly fallbackModels: readonly string[];
+    readonly provider: {
+      readonly sort?: "price" | "throughput" | "latency";
+      readonly dataCollection?: "allow" | "deny";
+      readonly only?: readonly string[];
+      readonly ignore?: readonly string[];
+      readonly allowFallbacks?: boolean;
+    };
+  },
+  boundRoute: RouteIdentityV1,
+): ModelRuntime {
+  const exactBoundRoute = Object.freeze({
+    version: boundRoute.version,
+    backendId: boundRoute.backendId,
+    accountFingerprint: boundRoute.accountFingerprint,
+    billingRealm: boundRoute.billingRealm,
+    requestedModelId: boundRoute.requestedModelId,
+    canonicalModelId: boundRoute.canonicalModelId,
+    resolutionState: boundRoute.resolutionState,
+  });
+  const requireOpenRouterRoute = (route: RouteIdentityV1): void => {
+    if (route.version !== 1
+      || route.backendId !== "openrouter"
+      || route.accountFingerprint !== exactBoundRoute.accountFingerprint
+      || route.billingRealm !== exactBoundRoute.billingRealm
+      || route.requestedModelId !== exactBoundRoute.requestedModelId
+      || route.canonicalModelId !== exactBoundRoute.canonicalModelId
+      || route.resolutionState !== exactBoundRoute.resolutionState) {
+      throw new Error("OpenRouter runtime route binding changed.");
+    }
+  };
+  requireOpenRouterRoute(exactBoundRoute);
+  return {
+    backendId: "openrouter",
+    createClient({ route, scope }) {
+      requireOpenRouterRoute(route);
+      return service.client({ scope });
+    },
+    async inspectSpend(signal) {
+      return { kind: "known", balance: await service.checkBalance(signal) };
+    },
+    async listModels(search = "", signal) {
+      const models = await service.listModels(search, false, signal);
+      return models.map((model): RuntimeModelInfo => ({
+        id: model.id,
+        name: model.name,
+        contextLength: model.contextLength,
+        reasoning: model.reasoning === undefined
+          ? undefined
+          : {
+            ...model.reasoning,
+            supportedEfforts: model.reasoning.supportedEfforts === null
+              ? null
+              : [...model.reasoning.supportedEfforts],
+          },
+        price: Number.isFinite(model.promptPrice)
+          && Number.isFinite(model.completionPrice)
+          && model.promptPrice >= 0
+          && model.completionPrice >= 0
+          ? {
+              kind: "known",
+              promptUsdPerToken: model.promptPrice,
+              completionUsdPerToken: model.completionPrice,
+            }
+          : { kind: "unknown" },
+      }));
+    },
+    dispatchFields({ route, allowWeb }) {
+      requireOpenRouterRoute(route);
+      return {
+        backendId: "openrouter",
+        models: modelsField(config.mainModel, config.fallbackModels),
+        provider: providerField(config.provider),
+        ...(allowWeb ? { plugins: [{ id: "web" as const, maxResults: 5 as const }] } : {}),
+      };
+    },
+    onConnectionEvent(listener) {
+      return service.onConnectionEvent(listener);
+    },
+    safeMessage(error) {
+      return service.safeMessage(error);
+    },
+  };
 }
 
 /**
@@ -1103,7 +1405,7 @@ export function providerField(config: {
  * one that served the previous response. `null` when there was no switch or
  * either name is unknown.
  *
- * BENÖTIGT IN src/agent.ts: after a model response returns, compare the
+ * REQUIRED IN src/agent.ts: after a model response returns, compare the
  * provider name OpenRouter reports (e.g. `response.provider` /
  * `generation.providerName` from the SDK) against the provider of the
  * previous response in the same run, and — if `providerSwitchNotice`
@@ -1127,18 +1429,15 @@ export function providerSwitchNotice(
   return {
     level: "info",
     code: "provider-switch",
-    message: `Anbieter gewechselt: ${previous} → ${current}.`,
+    message: `Provider switched: ${previous} → ${current}.`,
   };
 }
 
 // --------------------------------------------------------------------------
-// A2 — Websuche: prompt-signal detection and the request fragment.
+// A2 — Web search: prompt-signal detection and the request fragment.
 //
-// BENÖTIGT IN src/agent.ts: the request-building call site must compute
-// `shouldEnableWebSearch(this.config.web, prompt)` and, when true, add
-// `webSearchPlugin(this.config.webMaxResults ?? 5)` to the request's
-// `plugins` array (exact shape verified against
-// `node_modules/@openrouter/agent/node_modules/@openrouter/sdk/esm/models/websearchplugin.d.ts`).
+// `agent.ts` applies this only to a classifier-positive main request (or a
+// forced `web: "on"` request), using the pinned SDK's `plugins` field.
 // --------------------------------------------------------------------------
 
 const URL_PATTERN = /\bhttps?:\/\/[^\s)]+/i;
@@ -1201,7 +1500,7 @@ const PANEL_INSTRUCTIONS =
 export function createPanelCall(service: OpenRouterService): PanelCall {
   return async ({ model, question, context, signal }) => {
     try {
-      const client = service.client();
+      const client = service.client({ scope: "panel" });
       let observedCost = 0;
       let inputTokens = 0;
       let outputTokens = 0;
@@ -1239,13 +1538,33 @@ export function createPanelCall(service: OpenRouterService): PanelCall {
       // Same redaction/translation every other OpenRouter call gets — a
       // panel error column is exactly the kind of place a raw key leak would
       // otherwise end up.
-      throw new Error(service.safeMessage(error));
+      const authenticationRejected = findPanelAuthenticationRejection(error);
+      if (authenticationRejected) throw authenticationRejected;
+      if (statusOf(error) === 401) {
+        throw new PanelAuthenticationRejectedError();
+      }
+      const panelMessage = (service as OpenRouterService & {
+        safePanelMessage?(failure: unknown): string;
+      }).safePanelMessage?.(error) ?? service.safeMessage(error);
+      throw new Error(panelMessage);
     }
   };
 }
 
-/** Rough tokens-per-character ratio for upfront panel cost estimates — same heuristic as the compressor's. */
-const PANEL_CHARS_PER_TOKEN = 4;
+function findPanelAuthenticationRejection(
+  error: unknown,
+): PanelAuthenticationRejectedError | null {
+  const seen = new Set<unknown>();
+  let current = error;
+  for (let depth = 0; depth < 8 && current !== null && current !== undefined; depth += 1) {
+    if (current instanceof PanelAuthenticationRejectedError) return current;
+    if (seen.has(current) || !isRecord(current)) return null;
+    seen.add(current);
+    current = current.cause;
+  }
+  return null;
+}
+
 /** Assumed output budget per panel answer, used only for the upfront estimate. */
 export const PANEL_ESTIMATE_OUTPUT_TOKENS = 1_500;
 
@@ -1263,7 +1582,10 @@ export function estimatePanelModelCostUsd(
   if (capabilities.variablePricing) {
     return null;
   }
-  const inputTokens = Math.ceil(Math.max(0, promptChars) / PANEL_CHARS_PER_TOKEN);
+  // FIX-14 ticket 4: the shared estimator (`utils.ts`), not a second local
+  // ratio — this module used to declare `PANEL_CHARS_PER_TOKEN` beside
+  // `compressor.ts`'s identical `CHARS_PER_TOKEN`.
+  const inputTokens = estimateTokensFromChars(promptChars);
   return (
     (inputTokens / 1_000_000) * capabilities.promptPricePerMillion +
     (PANEL_ESTIMATE_OUTPUT_TOKENS / 1_000_000) * capabilities.completionPricePerMillion
@@ -1325,9 +1647,11 @@ function parseJson(text: string): unknown {
   }
 }
 
+// FIX-14 ticket 7: `ellipsize` (utils.ts) — one truncation rule. This used
+// to append the marker outside the slice, so a cut detail was 201 characters
+// long, and it disagreed with `workspace.ts`'s own copy about that.
 function truncateDetail(text: string): string {
-  const normalized = text.replace(/\s+/g, " ").trim();
-  return normalized.length > 200 ? `${normalized.slice(0, 200)}…` : normalized;
+  return ellipsize(text.replace(/\s+/g, " ").trim(), 200);
 }
 
 function parseModel(value: unknown): ModelInfo | null {
@@ -1415,6 +1739,36 @@ function requireRecord(value: unknown, message: string): Record<string, unknown>
   return value;
 }
 
+function keyInfoFromPayload(payload: Record<string, unknown>): KeyInfo {
+  const data = requireRecord(payload.data, "Invalid key response");
+  return {
+    label: stringOf(data.label),
+    creatorUserId: nullableStringOf(data.creator_user_id),
+    isFreeTier: booleanOf(data.is_free_tier),
+    isManagementKey: booleanOf(data.is_management_key),
+    limit: nullableNumberOf(data.limit),
+    limitRemaining: nullableNumberOf(data.limit_remaining),
+    usage: optionalNumberOf(data.usage),
+    usageDaily: optionalNumberOf(data.usage_daily),
+    usageWeekly: optionalNumberOf(data.usage_weekly),
+    usageMonthly: optionalNumberOf(data.usage_monthly),
+    expiresAt: nullableStringOf(data.expires_at),
+  };
+}
+
+function creditStateFromBalance(balance: BalanceReport): CreditState {
+  if (balance.credits) {
+    return balance.credits.remaining > 0 ? "available" : "insufficient";
+  }
+  if (
+    balance.key.limitRemaining !== null &&
+    balance.key.limitRemaining !== undefined
+  ) {
+    return balance.key.limitRemaining > 0 ? "available" : "insufficient";
+  }
+  return "unavailable";
+}
+
 function stringOf(value: unknown): string | undefined {
   return typeof value === "string" ? value : undefined;
 }
@@ -1424,19 +1778,23 @@ function nullableStringOf(value: unknown): string | null | undefined {
 }
 
 function numberOf(value: unknown): number {
-  const parsed = typeof value === "number" ? value : Number(value ?? 0);
-  return Number.isFinite(parsed) ? parsed : 0;
+  return finiteNumberOf(value) ?? 0;
 }
 
 function nullableNumberOf(value: unknown): number | null {
-  return value === null || value === undefined ? null : numberOf(value);
+  return finiteNumberOf(value) ?? null;
 }
 
 function optionalNumberOf(value: unknown): number | undefined {
-  if (value === null || value === undefined) {
-    return undefined;
-  }
-  const parsed = numberOf(value);
+  return finiteNumberOf(value);
+}
+
+function finiteNumberOf(value: unknown): number | undefined {
+  const parsed = typeof value === "number"
+    ? value
+    : typeof value === "string" && value.trim().length > 0
+      ? Number(value)
+      : Number.NaN;
   return Number.isFinite(parsed) ? parsed : undefined;
 }
 

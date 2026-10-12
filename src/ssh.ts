@@ -20,7 +20,16 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { ensureSecureDirectory } from "./config.js";
 import { findSshHost, type SshHost } from "./ssh-config.js";
+import type { ApprovalSubject } from "./types.js";
+import { errorMessage } from "./utils.js";
 import type { ProcessResult, RunProcessOptions } from "./workspace.js";
+
+export function sshApprovalSubject(
+  host: string,
+  command: string,
+): Extract<ApprovalSubject, { kind: "ssh-command" }> {
+  return { kind: "ssh-command", host, command };
+}
 
 /** Runs `ssh` with the given arguments. `workspace.ts` supplies the real implementation via `runProcess`; tests supply a fake. */
 export type RunSsh = (
@@ -91,12 +100,12 @@ export interface SshCheckResult {
   message: string;
 }
 
-/** German instructions for the one-time key setup — never run automatically, because it is the user typing their password. */
+/** Instructions for the one-time key setup — never run automatically, because it is the user typing their password. */
 export function noAuthMessage(alias: string): string {
   return (
-    `Für „${alias}“ ist keine Schlüssel-Authentifizierung hinterlegt. ` +
-    `Richte sie einmalig ein mit: ssh-copy-id ${alias}\n` +
-    `Danach fragt orcode nie wieder nach Zugangsdaten für diesen Host.`
+    `No key authentication is set up for "${alias}". ` +
+    `Set it up once with: ssh-copy-id ${alias}\n` +
+    `After that, orcode never asks for credentials for this host again.`
   );
 }
 
@@ -106,7 +115,7 @@ const UNREACHABLE_PATTERN =
 
 /** Classifies a failed `ssh` invocation from its exit status and stderr — shared by `checkHost` and `ssh_command`'s own failure handling. */
 export function classifySshFailure(result: {
-  code: number;
+  code: number | null;
   stderr: string;
   timedOut?: boolean;
 }): "no-auth" | "unreachable" {
@@ -117,8 +126,9 @@ export function classifySshFailure(result: {
 }
 
 function unreachableMessage(alias: string, result: ProcessResult): string {
-  const detail = result.stderr.trim() || `ssh endete mit Code ${result.code}.`;
-  return `„${alias}“ ist gerade nicht erreichbar: ${detail}`;
+  const detail = result.launchError || result.stderr.trim() ||
+    (result.code === null ? "ssh could not be started." : `ssh exited with code ${result.code}.`);
+  return `"${alias}" is currently unreachable: ${detail}`;
 }
 
 /**
@@ -136,7 +146,7 @@ export async function checkHost(
   if (!host) {
     return {
       status: "unknown-host",
-      message: `„${alias}“ ist kein bekannter Host aus der SSH-Konfiguration (~/.ssh/config).`,
+      message: `"${alias}" is not a known host from the SSH configuration (~/.ssh/config).`,
     };
   }
   const appHome = options.appHome ?? SSH_APP_HOME;
@@ -150,7 +160,7 @@ export async function checkHost(
   if (result.code === 0) {
     return {
       status: "reachable",
-      message: `„${alias}“ ist erreichbar, Schlüssel-Authentifizierung funktioniert.`,
+      message: `"${alias}" is reachable, key authentication works.`,
     };
   }
   if (classifySshFailure(result) === "no-auth") {
@@ -200,7 +210,7 @@ export async function execSshCommand(
 ): Promise<SshExecResult> {
   const host = findSshHost(alias, hosts);
   if (!host) {
-    throw new Error(`„${alias}“ ist kein bekannter Host aus der SSH-Konfiguration (~/.ssh/config).`);
+    throw new Error(`"${alias}" is not a known host from the SSH configuration (~/.ssh/config).`);
   }
   const runtime = options.runtime ?? {};
   const appHome = runtime.appHome ?? SSH_APP_HOME;
@@ -213,6 +223,9 @@ export async function execSshCommand(
     ...(options.signal ? { signal: options.signal } : {}),
     ...(options.onChunk ? { onChunk: options.onChunk } : {}),
   });
+  if (result.launchError || result.code === null) {
+    throw new Error(result.launchError || "ssh could not be started.");
+  }
   if (result.code !== 0 && classifySshFailure(result) === "no-auth") {
     throw new SshAuthError(alias);
   }
@@ -224,21 +237,41 @@ export async function execSshCommand(
   };
 }
 
-/** `/ssh off`: tears the `ControlMaster` down (`ssh -O exit`) instead of leaving it to `ControlPersist`'s timeout. Best-effort — a socket that is already gone is not an error. */
+export interface SshControlCloseReport {
+  closed: boolean;
+  error?: string;
+}
+
+const MISSING_CONTROL_SOCKET = /control socket.*(?:no such file|not found|does not exist)|no master/i;
+
+/** `/ssh off`: tears the `ControlMaster` down (`ssh -O exit`) instead of leaving it to `ControlPersist`'s timeout. A missing socket stays benign; real failures are returned for visible reporting. */
 export async function closeSshControl(
   alias: string,
   runSsh: RunSsh,
   options: SshRuntimeOptions = {},
-): Promise<void> {
+): Promise<SshControlCloseReport> {
   const appHome = options.appHome ?? SSH_APP_HOME;
   const socket = sshSocketPath(alias, appHome);
   try {
-    await runSsh(["-o", `ControlPath=${socket}`, "-O", "exit", alias], {
+    const result = await runSsh(["-o", `ControlPath=${socket}`, "-O", "exit", alias], {
       cwd: appHome,
       timeoutMs: 5_000,
     });
-  } catch {
-    // No live control socket to close — nothing to do.
+    if (result.code === 0) {
+      return { closed: true };
+    }
+    const detail = result.launchError || result.stderr.trim() ||
+      (result.timedOut
+        ? "Timed out closing the SSH control connection."
+        : `ssh -O exit exited with code ${result.code ?? "unknown"}.`);
+    return MISSING_CONTROL_SOCKET.test(detail)
+      ? { closed: false }
+      : { closed: false, error: detail };
+  } catch (error) {
+    const detail = errorMessage(error);
+    return MISSING_CONTROL_SOCKET.test(detail)
+      ? { closed: false }
+      : { closed: false, error: detail };
   }
 }
 

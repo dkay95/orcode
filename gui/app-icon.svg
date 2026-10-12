@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <!--
+    The app mark is the prompt itself: `❯─●`, the same three glyphs the TUI
+    puts in front of every orientation bar. Amber on the dark ground, one
+    accent, nothing else — V4's rule that a meaning gets exactly one look.
+  -->
+  <rect width="1024" height="1024" rx="224" fill="#14110d"/>
+  <g stroke="#e5a03c" stroke-width="56" fill="none" stroke-linecap="round" stroke-linejoin="round">
+    <polyline points="300,392 420,512 300,632"/>
+    <line x1="512" y1="512" x2="640" y2="512"/>
+  </g>
+  <circle cx="752" cy="512" r="66" fill="#e5a03c"/>
+</svg>

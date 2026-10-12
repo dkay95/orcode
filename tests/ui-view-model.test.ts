@@ -76,9 +76,15 @@ test("tool-error macht den Block rot und hebt die Fehlerzeilen auf", () => {
   const block = tools(model)[0]!;
   assert.equal(block.state, "failed");
   assert.equal(block.tail.some((item) => item.includes("error TS2345")), true);
-  const head = renderBlock(block, 80, theme)[0]!;
-  assert.equal(head.spans[0]?.role, "danger");
-  assert.equal(plainText(head).startsWith("✗"), true);
+  // Controller decision C: the head bullet is constant (accent) now —
+  // failure shows up one line down, on the `⎿` outcome line instead.
+  const lines = renderBlock(block, 80, theme);
+  const head = lines[0]!;
+  assert.equal(head.spans[0]?.role, "accent");
+  assert.equal(plainText(head).startsWith("●"), true);
+  const outcome = lines[1]!;
+  assert.equal(outcome.spans[1]?.role, "danger");
+  assert.equal(plainText(outcome).startsWith("⎿ ✗"), true);
 });
 
 test("Exit ungleich 0 ist ein Fehler, alles andere Erfolgreiche bleibt unverifiziert", () => {
@@ -108,7 +114,9 @@ test("Exit ungleich 0 ist ein Fehler, alles andere Erfolgreiche bleibt unverifiz
     timestamp: AT + 12,
   });
   assert.equal(tools(second)[0]!.state, "unverified");
-  assert.equal(plainText(renderBlock(tools(second)[0]!, 80, theme)[0]!).startsWith("~"), true);
+  const lines = renderBlock(tools(second)[0]!, 80, theme);
+  assert.equal(plainText(lines[0]!).startsWith("●"), true);
+  assert.equal(plainText(lines[1]!).startsWith("⎿ ~"), true);
 });
 
 test("Live-Ausgabe füllt einen Ringpuffer und lässt den Block nicht wachsen", () => {
@@ -182,10 +190,12 @@ test("Abbruch markiert laufende Blöcke als abgebrochen", () => {
   });
   assert.equal(tools(model)[0]!.state, "cancelled");
   assert.equal(model.activeSpinnerId, null);
-  assert.equal(plainText(renderBlock(tools(model)[0]!, 80, theme)[0]!).startsWith("⚠"), true);
+  const lines = renderBlock(tools(model)[0]!, 80, theme);
+  assert.equal(plainText(lines[0]!).startsWith("●"), true);
+  assert.equal(plainText(lines[1]!).startsWith("⎿ ⚠"), true);
 });
 
-test("Meldungen werden zu Notice-Blöcken mit Aktionen", () => {
+test("Meldungen werden zu Notice-Blöcken", () => {
   const model = new RunViewModel();
   model.apply({
     type: "notice",
@@ -193,7 +203,6 @@ test("Meldungen werden zu Notice-Blöcken mit Aktionen", () => {
     code: "http-429",
     message: "OpenRouter HTTP 429",
     hint: "Der Lauf endete nach Schritt 3.",
-    actions: [{ key: "r", label: "erneut" }],
     timestamp: AT,
   });
   const block = model.blocks[0]! as Extract<ChatBlock, { kind: "notice" }>;
@@ -201,8 +210,52 @@ test("Meldungen werden zu Notice-Blöcken mit Aktionen", () => {
   assert.equal(block.level, "error");
   assert.equal(block.cause[0], "Der Lauf endete nach Schritt 3.");
   const lines = renderBlock(block, 80, theme, { last: true }).map(plainText);
-  assert.equal(lines.length >= 3, true, "eine Fehlerkarte hat drei Teile");
-  assert.equal(lines.at(-1)!.includes("r erneut"), true);
+  assert.equal(lines.length >= 2, true, "eine Fehlerkarte hat Titel und Ursache");
+  assert.match(lines.at(-1)!, /Der Lauf endete nach Schritt 3\./);
+});
+
+test("D3: an identical consecutive notice collapses into the prior block instead of appending", () => {
+  const model = new RunViewModel();
+  model.pushNotice("warn", "Cross · Blocked", ["Task or context invalid"], AT);
+  model.pushNotice("warn", "Cross · Blocked", ["Task or context invalid"], AT + 10);
+  model.pushNotice("warn", "Cross · Blocked", ["Task or context invalid"], AT + 20);
+
+  assert.equal(model.blocks.length, 1, "no duplicate blocks — one collapsed notice");
+  const block = model.blocks[0]! as Extract<ChatBlock, { kind: "notice" }>;
+  assert.equal(block.repeatCount, 3);
+  assert.equal(block.at, AT + 20, "the timestamp moves to the latest occurrence");
+
+  const lines = renderBlock(block, 80, theme).map(plainText);
+  assert.match(lines[0]!, /Cross · Blocked × 3/, "a muted counter suffix, not three stacked lines");
+});
+
+test("D3: a different notice in between resets the repeat streak", () => {
+  const model = new RunViewModel();
+  model.pushNotice("warn", "Cross · Blocked", ["Task or context invalid"]);
+  model.pushNotice("info", "Cross mode: armed for this chat", []);
+  model.pushNotice("warn", "Cross · Blocked", ["Task or context invalid"]);
+
+  assert.equal(model.blocks.length, 3, "an intervening different line starts a fresh streak");
+  for (const block of model.blocks) {
+    assert.equal((block as Extract<ChatBlock, { kind: "notice" }>).repeatCount ?? 1, 1);
+  }
+});
+
+test("D3: a single (non-repeated) notice renders with no counter suffix", () => {
+  const model = new RunViewModel();
+  model.pushNotice("info", "Cross mode activated · claude + gpt-5", []);
+  const block = model.blocks[0]! as Extract<ChatBlock, { kind: "notice" }>;
+  const lines = renderBlock(block, 80, theme).map(plainText);
+  assert.doesNotMatch(lines[0]!, /×/);
+});
+
+test("D3: D3 never touches non-notice blocks — a repeated identical tool call still appends", () => {
+  const model = new RunViewModel();
+  model.apply(toolStart("a", 1, "npm test"));
+  model.apply(toolEnd("a", 1, 0));
+  model.apply(toolStart("b", 2, "npm test"));
+  model.apply(toolEnd("b", 2, 0));
+  assert.equal(tools(model).length, 2, "identical tool blocks are never collapsed");
 });
 
 test("Nutzer- und Antwortblöcke wechseln sich sauber ab", () => {
@@ -234,8 +287,111 @@ test("Diffblöcke kommen aus diffText und zählen versteckte Hunks", () => {
   assert.equal(block.hiddenHunks > 0, true);
   assert.equal(block.added > 0, true);
   const foot = plainText(renderBlock(block, 80, theme, { last: true }).at(-1)!);
-  assert.equal(foot.includes("weitere Hunks"), true);
-  assert.equal(foot.includes("u rückgängig"), true);
+  assert.equal(foot.includes("more hunks"), true);
+  // FIX-3: the foot names only reachable mechanisms. `u` was never bound —
+  // the hint now points at the real command, and at `/diff` for what was cut.
+  assert.equal(foot.includes("u undo"), false);
+  assert.equal(foot.includes("/undo reverts the run"), true);
+  assert.equal(foot.includes("/diff"), true);
+});
+
+test("FIX-3: an applied edit becomes a diff block — path, whole-file counts, hunks", () => {
+  const model = new RunViewModel();
+  const before = ["alpha", "beta", "gamma"].join("\n");
+  const after = ["alpha", "BETA", "gamma", "delta"].join("\n");
+  const source = diffText(before, after);
+
+  model.apply({
+    type: "file-change",
+    path: "src/foo.ts",
+    tool: "replace_text",
+    created: false,
+    added: source.added,
+    removed: source.removed,
+    diff: source.text,
+    truncated: source.truncated,
+    timestamp: AT,
+  });
+
+  const block = model.blocks.at(-1) as Extract<ChatBlock, { kind: "diff" }>;
+  assert.equal(block.kind, "diff");
+  assert.equal(block.path, "src/foo.ts");
+  assert.equal(block.added, source.added);
+  assert.equal(block.removed, source.removed);
+  assert.equal(block.truncated, false);
+  assert.equal(block.undoable, true);
+  assert.equal(block.at, AT);
+
+  const text = renderBlock(block, 80, theme, { last: true }).map(plainText);
+  assert.equal(text[0]!.includes("src/foo.ts"), true);
+  assert.equal(text[0]!.includes(`+${source.added}`), true);
+  assert.equal(text[0]!.includes(`-${source.removed}`), true);
+  // The changed lines themselves are on screen, not only the counts.
+  assert.equal(text.some((line) => line.includes("+") && line.includes("BETA")), true);
+  assert.equal(text.some((line) => line.includes("-") && line.includes("beta")), true);
+  assert.equal(text.at(-1)!.includes("applied"), true);
+});
+
+test("FIX-3: a capped diff says so and names /diff, and the counts stay the file's own", () => {
+  const model = new RunViewModel();
+  const before = Array.from({ length: 1_000 }, (_, index) => `line ${index}`).join("\n");
+  const after = before
+    .split("\n")
+    .map((line, index) => (index % 15 === 0 ? `${line} changed` : line))
+    .join("\n");
+  const source = diffText(before, after);
+  assert.equal(source.truncated, true, "fixture must exceed the differ's changed-line budget");
+
+  model.apply({
+    type: "file-change",
+    path: "src/big.ts",
+    tool: "write_file",
+    created: false,
+    added: source.added,
+    removed: source.removed,
+    diff: source.text,
+    truncated: source.truncated,
+    timestamp: AT,
+  });
+
+  const block = model.blocks.at(-1) as Extract<ChatBlock, { kind: "diff" }>;
+  assert.equal(block.hunks.length, 3, "the approval preview's cap, shared");
+  assert.equal(block.hiddenHunks > 0, true);
+  assert.equal(block.truncated, true);
+  // The head still tells the truth about the whole file (134 changed lines
+  // here), even though only three hunks are drawn.
+  assert.equal(block.added, source.added);
+  assert.equal(block.removed, source.removed);
+
+  const foot = plainText(renderBlock(block, 80, theme, { last: true }).at(-1)!);
+  assert.equal(foot.includes("more hunks"), true);
+  assert.equal(foot.includes("truncated"), true);
+  assert.equal(foot.includes("/diff"), true);
+});
+
+test("FIX-3: a created file reports +N with no phantom removal", () => {
+  const model = new RunViewModel();
+  const content = "one\ntwo";
+  const source = diffText("", content);
+  assert.equal(source.added, 2);
+  assert.equal(source.removed, 0);
+
+  model.apply({
+    type: "file-change",
+    path: "src/new.ts",
+    tool: "write_file",
+    created: true,
+    added: source.added,
+    removed: source.removed,
+    diff: source.text,
+    truncated: source.truncated,
+    timestamp: AT,
+  });
+
+  const block = model.blocks.at(-1) as Extract<ChatBlock, { kind: "diff" }>;
+  const head = plainText(renderBlock(block, 80, theme, { last: true })[0]!);
+  assert.equal(head.includes("+2"), true);
+  assert.equal(head.includes("-0"), true);
 });
 
 test("Freigabeblöcke verschwinden wieder, sobald sie beantwortet sind", () => {
@@ -299,7 +455,7 @@ test("pushPanel legt bei jedem Aufruf einen frischen Block an, statt einen beste
   assert.equal(second.expandedIndex, 1);
 
   const lines = renderBlock(second, 80, theme).map(plainText);
-  assert.ok(lines.some((line) => line.includes("vollständig")));
+  assert.ok(lines.some((line) => line.includes("full")));
 });
 
 test("selectTail bevorzugt bei Fehlern die Fehlerzeilen, sonst die letzten", () => {

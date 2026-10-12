@@ -20,6 +20,9 @@ import {
 import type { CredentialStoreLike } from "../src/credentials.js";
 import { RuleStore } from "../src/rules.js";
 import type { RunSsh } from "../src/ssh.js";
+import { buildDashboardFrame, type DashboardState } from "../src/ui/dashboard-frame.js";
+import { plainText } from "../src/ui/spans.js";
+import { createTheme } from "../src/ui/theme.js";
 import type { ProcessResult } from "../src/workspace.js";
 
 function collectOutput(): { out: CommandOutput; lines: string[] } {
@@ -125,7 +128,7 @@ test("/ssh with no config file reports no hosts, not an error", async () => {
     context.sshConfigPath = join(appHome, "missing-ssh-config");
     const outcome = await handleSlashCommand("/ssh", context);
     assert.equal(outcome, "continue");
-    assert.ok(lines.some((line) => /Keine benannten Hosts/.test(line)));
+    assert.ok(lines.some((line) => /No named hosts/.test(line)));
   } finally {
     await rm(appHome, { recursive: true, force: true });
   }
@@ -143,7 +146,7 @@ test("/ssh lists hosts from the injected config path and marks the active one", 
     await handleSlashCommand("/ssh", context);
     const listing = lines.join("\n");
     assert.match(listing, /vps → 203\.0\.113\.5 \(deploy\)/);
-    assert.match(listing, /produktion.*\(aktiv\).*198\.51\.100\.9/s);
+    assert.match(listing, /produktion.*\(active\).*198\.51\.100\.9/s);
   } finally {
     await rm(appHome, { recursive: true, force: true });
   }
@@ -156,8 +159,8 @@ test("/ssh <alias> on a reachable host remembers it as the ssh_command target", 
     context.sshConfigPath = await writeSshConfig(appHome, "Host vps\n  HostName 203.0.113.5\n");
     await handleSlashCommand("/ssh vps", context);
     assert.equal(context.sshSession?.active, "vps");
-    assert.ok(lines.some((line) => /erreichbar/.test(line)));
-    assert.ok(lines.some((line) => /SSH-Ziel gesetzt: vps/.test(line)));
+    assert.ok(lines.some((line) => /reachable/.test(line)));
+    assert.ok(lines.some((line) => /SSH target set: vps/.test(line)));
     assert.ok(runner.calls[0]?.includes("BatchMode=yes"));
   } finally {
     await rm(appHome, { recursive: true, force: true });
@@ -197,19 +200,19 @@ test("/ssh <unknown-alias> reports unknown host and does not spawn ssh", async (
   try {
     context.sshConfigPath = await writeSshConfig(appHome, "Host vps\n  HostName 203.0.113.5\n");
     await handleSlashCommand("/ssh ghost", context);
-    assert.ok(lines.some((line) => /kein bekannter Host/.test(line)));
+    assert.ok(lines.some((line) => /not a known host/.test(line)));
     assert.equal(runner.calls.length, 0);
   } finally {
     await rm(appHome, { recursive: true, force: true });
   }
 });
 
-test("/ssh status without an active target says so instead of probing anything", async () => {
+test("/ssh status without an active target says so instead of probing anything, and names the one next action (D5 invitation grammar)", async () => {
   const runner = recordingRunner(okResult());
   const { context, lines, appHome } = await harness({ runSsh: runner.runSsh });
   try {
     await handleSlashCommand("/ssh status", context);
-    assert.ok(lines.some((line) => /Kein aktives SSH-Ziel/.test(line)));
+    assert.ok(lines.some((line) => /No active SSH target .* \/ssh <alias> connects one\.$/.test(line)));
     assert.equal(runner.calls.length, 0);
   } finally {
     await rm(appHome, { recursive: true, force: true });
@@ -223,7 +226,7 @@ test("/ssh status with an active target re-checks it", async () => {
     context.sshConfigPath = await writeSshConfig(appHome, "Host vps\n  HostName 203.0.113.5\n");
     context.sshSession = { active: "vps" };
     await handleSlashCommand("/ssh status", context);
-    assert.ok(lines.some((line) => /Aktives SSH-Ziel: vps/.test(line)));
+    assert.ok(lines.some((line) => /Active SSH target: vps/.test(line)));
     assert.equal(runner.calls.length, 1);
   } finally {
     await rm(appHome, { recursive: true, force: true });
@@ -237,8 +240,50 @@ test("/ssh off tears the control connection down and clears the remembered targe
     context.sshSession = { active: "vps" };
     await handleSlashCommand("/ssh off", context);
     assert.equal(context.sshSession.active, null);
-    assert.ok(lines.some((line) => /getrennt/.test(line)));
+    assert.ok(lines.some((line) => /disconnected/.test(line)));
     assert.ok(runner.calls[0]?.includes("-O"));
+  } finally {
+    await rm(appHome, { recursive: true, force: true });
+  }
+});
+
+test("/ssh off disables the shared target before awaiting close and never erases a newer selection", async () => {
+  let markCloseStarted!: () => void;
+  const closeStarted = new Promise<void>((resolve) => { markCloseStarted = resolve; });
+  let releaseClose!: () => void;
+  const closeGate = new Promise<void>((resolve) => { releaseClose = resolve; });
+  const runSsh: RunSsh = async () => {
+    markCloseStarted();
+    await closeGate;
+    return okResult();
+  };
+  const { context, appHome } = await harness({ runSsh });
+  context.sshSession = { active: "vps" };
+  const pending = handleSlashCommand("/ssh off", context);
+  try {
+    await closeStarted;
+    assert.equal(context.sshSession.active, null, "active stayed stale while close was pending");
+    context.sshSession.active = "produktion";
+    releaseClose();
+    await pending;
+    assert.equal(context.sshSession.active, "produktion");
+  } finally {
+    releaseClose();
+    await pending.catch(() => undefined);
+    await rm(appHome, { recursive: true, force: true });
+  }
+});
+
+test("/ssh off reports a real close failure after disabling the shared target", async () => {
+  const runSsh: RunSsh = async () => {
+    throw new Error("spawn ssh ENOENT: no such file or directory");
+  };
+  const { context, lines, appHome } = await harness({ runSsh });
+  try {
+    context.sshSession = { active: "vps" };
+    await handleSlashCommand("/ssh off", context);
+    assert.equal(context.sshSession.active, null);
+    assert.match(lines.join("\n"), /disabled.*spawn ssh ENOENT/is);
   } finally {
     await rm(appHome, { recursive: true, force: true });
   }
@@ -249,7 +294,7 @@ test("/ssh off with nothing active says so and does not touch ssh", async () => 
   const { context, lines, appHome } = await harness({ runSsh: runner.runSsh });
   try {
     await handleSlashCommand("/ssh off", context);
-    assert.ok(lines.some((line) => /Keine aktive SSH-Sitzung/.test(line)));
+    assert.ok(lines.some((line) => /No active SSH session/.test(line)));
     assert.equal(runner.calls.length, 0);
   } finally {
     await rm(appHome, { recursive: true, force: true });
@@ -261,4 +306,103 @@ test("/ssh appears in the plain command output helper without throwing (smoke te
   // same way other commands expect — not SSH-specific, just cheap insurance.
   const out = createPlainCommandOutput();
   assert.equal(typeof out.text, "function");
+});
+
+// --- Phase 3b, Part D.3: the host listing adopts the standard numbered-list
+// look (zero behavior change — still selected by alias, never by number). ---
+
+test("/ssh with no active target lists every host numbered, in file order", async () => {
+  const { context, lines, appHome } = await harness();
+  try {
+    context.sshConfigPath = await writeSshConfig(
+      appHome,
+      "Host vps\n  HostName 203.0.113.5\n\nHost produktion\n  HostName 198.51.100.9\n",
+    );
+    await handleSlashCommand("/ssh", context);
+    const listing = lines.join("\n");
+    assert.match(listing, /1\. vps → 203\.0\.113\.5/);
+    assert.match(listing, /2\. produktion → 198\.51\.100\.9/);
+  } finally {
+    await rm(appHome, { recursive: true, force: true });
+  }
+});
+
+// --- Phase 3b, Part D.1: the status line's muted `ssh:<host>` segment
+// (Terminal-Look spec principles 5/9 — fix round 1, Critical 3 replaced the
+// original "SSH: HOST" danger/bold format with this; see
+// tests/ui-ssh-header.test.ts and task-3b-report.md's fix-round section)
+// tracks `context.sshSession.active` end to end: this is the exact glue
+// expression src/cli.ts's dashboard `getState()` closure evaluates on every
+// frame. ---
+
+function stateWithSshHost(sshHost: string | undefined): DashboardState {
+  return {
+    workspace: "/home/user/projekt",
+    model: "vendor/model",
+    approval: "ask",
+    reasoning: "auto",
+    maxCost: "$1.00",
+    maxSteps: 10,
+    sshHost,
+  };
+}
+
+test("the status line's SSH segment appears exactly while /ssh has a remembered target and disappears on /ssh off", async () => {
+  const runner = recordingRunner(okResult());
+  const { context, appHome } = await harness({ runSsh: runner.runSsh });
+  try {
+    context.sshConfigPath = await writeSshConfig(appHome, "Host vps\n  HostName 203.0.113.5\n");
+    const theme = createTheme({ level: 0 });
+
+    const before = buildDashboardFrame({
+      width: 100,
+      height: 24,
+      theme,
+      // cli.ts's exact expression: `context.sshSession.active ?? undefined`.
+      state: stateWithSshHost(context.sshSession?.active ?? undefined),
+      blocks: [],
+      mode: "input",
+      input: "",
+      cursor: 0,
+      status: "",
+    });
+    assert.doesNotMatch(plainText(before.lines[before.lines.length - 2]!), /ssh:/);
+
+    await handleSlashCommand("/ssh vps", context);
+    assert.equal(context.sshSession?.active, "vps");
+    const during = buildDashboardFrame({
+      width: 100,
+      height: 24,
+      theme,
+      state: stateWithSshHost(context.sshSession?.active ?? undefined),
+      blocks: [],
+      mode: "input",
+      input: "",
+      cursor: 0,
+      status: "",
+    });
+    // Fix round 1, Critical 3 (controller ruling: the spec wins) — the
+    // muted, lowercase `ssh:<host>` segment (Terminal-Look spec principles
+    // 5/9), not the earlier danger/bold "SSH: HOST" alert. Controller
+    // decision B (composition phase) then moved it off the header entirely,
+    // onto the always-on bottom status line alongside approval/model/branch.
+    assert.match(plainText(during.lines[during.lines.length - 2]!), /ssh:vps/);
+
+    await handleSlashCommand("/ssh off", context);
+    assert.equal(context.sshSession?.active, null);
+    const after = buildDashboardFrame({
+      width: 100,
+      height: 24,
+      theme,
+      state: stateWithSshHost(context.sshSession?.active ?? undefined),
+      blocks: [],
+      mode: "input",
+      input: "",
+      cursor: 0,
+      status: "",
+    });
+    assert.doesNotMatch(plainText(after.lines[after.lines.length - 2]!), /ssh:/);
+  } finally {
+    await rm(appHome, { recursive: true, force: true });
+  }
 });

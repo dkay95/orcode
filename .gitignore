@@ -1,9 +1,38 @@
-node_modules/
+# Slash-less on purpose: `node_modules/` matches only a DIRECTORY, so a
+# worktree that reaches its dependencies through a SYMLINK named
+# `node_modules` (the PTY-provider setup) was never ignored at all — and one
+# such link, whose target is an absolute machine-local path, reached a
+# commit. Without the slash this rule covers both shapes.
+node_modules
+.superpowers/
+.remember/
+.claude/
+.codex/
+.agents/
+DESIGN-IS-*/
+docs/superpowers/
 dist/
 .routercode/
 .ai-collab/
+.worktrees/
 .env
 *.log
 *.jpg
 *.png
 !.env.example
+.DS_Store
+
+# The desktop shell (gui/).
+# `dist/` above already covers the WebView bundle; these are the rest.
+gui/src-tauri/target/
+gui/src-tauri/gen/
+# The staged runtime `npm run gui:package` builds into the bundle: a node
+# binary, dist/, and production node_modules. Every byte of it is generated.
+gui/src-tauri/resources/
+# A live orcode app home the dev loop writes into — never the owner's real
+# one, and never a thing to commit.
+gui/.devhome/
+gui/preview-dist/
+# `*.png` above is a blanket ignore for screenshots; the app's icons are
+# generated build inputs and have to travel with the repo.
+!gui/src-tauri/icons/*.png

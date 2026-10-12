@@ -11,8 +11,9 @@ import type { Theme } from "./theme.js";
 const INLINE =
   /(`+)([^`]*?)\1|\*\*([^*]+?)\*\*|__([^_]+?)__|\*([^*\s][^*]*?)\*|(?<![A-Za-z0-9])_([^_\s][^_]*?)_(?![A-Za-z0-9])|\[([^\]]+?)\]\(([^)\s]+)\)/g;
 
-/** Inline markup of a single logical line. */
-export function inlineSpans(text: string, role: Span["role"] = "text"): Span[] {
+// Inline markup of a single logical line. Not exported (F6 dead-layer
+// sweep): only this file's own block-level markdownToLines below calls it.
+function inlineSpans(text: string, role: Span["role"] = "text"): Span[] {
   const out: Span[] = [];
   let cursor = 0;
   INLINE.lastIndex = 0;

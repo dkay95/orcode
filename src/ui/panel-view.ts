@@ -14,9 +14,12 @@ import { composeLine, fitSpans, type Segment } from "./compose.js";
 import { markdownToLines } from "./markdown.js";
 import { span, type Line, type Span } from "./spans.js";
 import type { Theme } from "./theme.js";
+import { formatUsd } from "../utils.js";
 
-/** Cap on one expanded answer or judgment so a single huge reply cannot swallow the screen. */
-export const PANEL_EXPANDED_MAX_LINES = 40;
+// Cap on one expanded answer or judgment so a single huge reply cannot
+// swallow the screen. Not exported (F6 dead-layer sweep): only this file's
+// own expandedLines below reads it.
+const PANEL_EXPANDED_MAX_LINES = 40;
 
 export interface PanelViewOptions {
   /** Index into `result.answers` currently shown in full; `null`/unset collapses every answer to its one-line teaser. */
@@ -29,8 +32,15 @@ function durationText(ms: number): string {
   return ms < 1000 ? `${Math.max(0, ms)}ms` : `${(ms / 1000).toFixed(1)}s`;
 }
 
+/**
+ * FIX-14 ticket 3: the one exact-USD formatter (`formatUsd`, utils.ts).
+ * This used to be a third named dollar rule (5 decimals under a cent, else
+ * 4). The `Math.max(0, …)` clamp stays local — a panel answer's cost is
+ * never negative, and clamping is a statement about this datum, not about
+ * how money is spelled.
+ */
 function costText(value: number): string {
-  return `$${Math.max(0, value).toFixed(value < 0.01 ? 5 : 4)}`;
+  return formatUsd(Math.max(0, value));
 }
 
 function body(theme: Theme, width: number, text: string, role: Span["role"] = "text"): Line {
@@ -51,7 +61,7 @@ function answerGlyph(theme: Theme, answer: PanelAnswer): { text: string; role: S
 
 function headLine(theme: Theme, width: number, result: PanelResult): Line {
   const question = result.question.replace(/\s+/g, " ").trim();
-  const modelWord = result.answers.length === 1 ? "Modell" : "Modelle";
+  const modelWord = result.answers.length === 1 ? "model" : "models";
   const segments: Segment[] = [
     {
       spans: [
@@ -93,9 +103,9 @@ function answerHeadLine(
   const label = `${index + 1}. ${answer.model}`;
   const rightRole: Span["role"] = answer.error ? "danger" : "muted";
   const rightText = answer.error
-    ? `Fehler${theme.glyph("separator")}${answer.error}`
+    ? `Error${theme.glyph("separator")}${answer.error}`
     : `${costText(answer.costUsd)}${theme.glyph("separator")}${durationText(answer.durationMs)}${
-        expanded ? `${theme.glyph("separator")}vollständig` : ""
+        expanded ? `${theme.glyph("separator")}full` : ""
       }`;
   const segments: Segment[] = [
     {
@@ -106,7 +116,7 @@ function answerHeadLine(
     {
       spans: [span(rightText, rightRole)],
       compact: answer.error
-        ? [span("Fehler", "danger")]
+        ? [span("Error", "danger")]
         : [span(costText(answer.costUsd), "muted")],
       align: "right",
       priority: 60,
@@ -116,9 +126,9 @@ function answerHeadLine(
 }
 
 function judgeHeadLine(theme: Theme, width: number, judgment: PanelJudgment): Line {
-  const label = `Richter${theme.glyph("separator")}${judgment.judgeModel}`;
+  const label = `Judge${theme.glyph("separator")}${judgment.judgeModel}`;
   const right: Span[] = judgment.error
-    ? [span("Fehler", "danger")]
+    ? [span("Error", "danger")]
     : [
         span(
           `${costText(judgment.costUsd)}${theme.glyph("separator")}${durationText(judgment.durationMs)}`,
@@ -150,7 +160,7 @@ function expandedLines(theme: Theme, width: number, text: string): Line[] {
 
 /**
  * The judge's synthesis, clearly separated from the model answers above it:
- * its own head line, labelled "Richter" (never a bare model name like the
+ * its own head line, labelled "Judge" (never a bare model name like the
  * answers get), always shown in full — it is one recommendation, not one of
  * several to browse.
  */
@@ -162,7 +172,7 @@ function judgmentLines(theme: Theme, width: number, judgment: PanelJudgment): Li
   }
   const clean = judgment.text.trim();
   if (!clean) {
-    lines.push(body(theme, width, "(keine Auswertung erhalten)", "muted"));
+    lines.push(body(theme, width, "(no evaluation received)", "muted"));
     return lines;
   }
   lines.push(...expandedLines(theme, width, judgment.text));
@@ -194,7 +204,7 @@ export function renderPanel(
     }
     const clean = answer.text.replace(/\s+/g, " ").trim();
     if (!clean) {
-      lines.push(body(theme, usable, "(leere Antwort)", "muted"));
+      lines.push(body(theme, usable, "(empty reply)", "muted"));
       return;
     }
     if (expanded) {

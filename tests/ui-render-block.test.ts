@@ -56,6 +56,7 @@ function sampleBlocks(): ChatBlock[] {
       removed: diff.removed,
       hunks: splitHunks(diff.lines),
       hiddenHunks: 4,
+      truncated: diff.truncated,
       state: "unverified",
       undoable: true,
     },
@@ -68,6 +69,7 @@ function sampleBlocks(): ChatBlock[] {
       details: ["rm -rf build dist", "in ~/projekt/routercode"],
       waitingSince: AT,
       rememberHint: "keine gemerkte Regel für „rm“",
+      expanded: false,
     },
     {
       kind: "notice",
@@ -76,10 +78,6 @@ function sampleBlocks(): ChatBlock[] {
       level: "error",
       title: "OpenRouter HTTP 429 rate limited",
       cause: ["Anbieter anthropic, Modell claude-sonnet-4.5. Der Lauf endete nach Schritt 3."],
-      actions: [
-        { key: "r", label: "erneut" },
-        { key: "m", label: "Modell wechseln" },
-      ],
     },
     {
       kind: "panel",
@@ -104,7 +102,7 @@ function sampleBlocks(): ChatBlock[] {
             durationMs: 900,
             inputTokens: 0,
             outputTokens: 0,
-            error: "OpenRouter HTTP 429: Rate-Limit erreicht.",
+            error: "OpenRouter HTTP 429: Rate limit reached.",
           },
         ],
         totalCostUsd: 0.004,
@@ -157,7 +155,7 @@ test("ein laufender Toolblock ist immer exakt vier Zeilen hoch", () => {
   }
 });
 
-test("Erfolg kollabiert, Fehler bleibt offen", () => {
+test("Erfolg zeigt Kopf + eine Ergebniszeile, Fehler bleibt offen", () => {
   const base = {
     kind: "tool" as const,
     id: "t2",
@@ -173,34 +171,72 @@ test("Erfolg kollabiert, Fehler bleibt offen", () => {
     expanded: false,
   };
   const green = renderBlock({ ...base, state: "ok", exitCode: 0 }, 80, theme);
-  assert.equal(green.length, 1);
+  // Controller decision C: success no longer collapses to the head alone —
+  // the outcome (✓) moved off the head onto its own `⎿` result line, so
+  // NO_COLOR still shows it even for a successful, collapsed call.
+  assert.equal(green.length, 2);
+  assert.equal(plainText(green[0]!).startsWith("● Shell(npm test)"), true);
+  assert.equal(plainText(green[1]!).startsWith("⎿ ✓ eine Ausgabezeile"), true);
   const red = renderBlock({ ...base, state: "failed", exitCode: 1 }, 80, theme, { last: true });
-  assert.equal(red.length > 1, true);
-  assert.equal(plainText(red[red.length - 1]!).includes("weitere Zeilen"), true);
+  assert.equal(red.length > 2, true);
+  assert.equal(plainText(red[0]!).startsWith("● Shell(npm test)"), true);
+  assert.equal(plainText(red[1]!).startsWith("⎿ ✗ eine Ausgabezeile"), true);
+  assert.equal(plainText(red[red.length - 1]!).includes("more lines"), true);
 });
 
-test("Barrierefreiheit: bei Stufe 0 beginnt jede Zustandszeile mit einem eindeutigen Glyph", () => {
+test("a finished reasoning block reads its head line in English — thought/tokens/Ctrl+O expand·collapse", () => {
+  const base = {
+    kind: "reasoning" as const,
+    id: "r9",
+    at: AT,
+    text: "irrelevant to the head line under test",
+    tokens: 912,
+    estimated: true,
+    live: false,
+    truncated: false,
+  };
+  const collapsed = plainText(renderBlock({ ...base, expanded: false }, 80, theme)[0]!);
+  const expanded = plainText(renderBlock({ ...base, expanded: true }, 80, theme)[0]!);
+  assert.equal(collapsed, "● thought · ~912 tokens · Ctrl+O expand");
+  assert.equal(expanded, "● thought · ~912 tokens · Ctrl+O collapse");
+});
+
+function toolBlockForState(state: BlockState): ChatBlock {
+  return {
+    kind: "tool",
+    id: `s-${state}`,
+    at: AT,
+    tool: "run_command",
+    label: "SHELL",
+    title: "Shell-Befehl",
+    input: "npm test",
+    state,
+    durationMs: 1200,
+    tail: [],
+    totalLines: 0,
+    step: 1,
+    expanded: false,
+  };
+}
+
+test("Barrierefreiheit: bei Stufe 0 trägt jede Zustandszeile ein eindeutiges Glyph — am Kopf während des Laufs, sonst in der Ergebniszeile", () => {
+  // Controller decision C: the head bullet is constant (`●`, accent) for
+  // every state but "running" — the per-state, NO_COLOR-safe glyph moved to
+  // the first result line (`⎿ <outcome> …`) instead.
   const glyphs = new Map<BlockState, string>();
   for (const state of BLOCK_STATES) {
-    const block: ChatBlock = {
-      kind: "tool",
-      id: `s-${state}`,
-      at: AT,
-      tool: "run_command",
-      label: "SHELL",
-      title: "Shell-Befehl",
-      input: "npm test",
-      state,
-      durationMs: 1200,
-      tail: [],
-      totalLines: 0,
-      step: 1,
-      expanded: false,
-    };
-    const first = plainText(renderBlock(block, 80, theme, { now: AT })[0]!);
-    const glyph = Array.from(first)[0] ?? "";
-    assert.equal(glyph.trim().length > 0, true, `${state} beginnt mit Leerraum`);
-    assert.equal(/[A-Za-z0-9]/.test(glyph), false, `${state} beginnt ohne Glyph`);
+    const lines = renderBlock(toolBlockForState(state), 80, theme, { now: AT });
+    if (state === "running") {
+      const head = plainText(lines[0]!);
+      glyphs.set(state, Array.from(head)[0] ?? "");
+      continue;
+    }
+    assert.equal(plainText(lines[0]!).startsWith("● "), true, `${state} head must be the constant bullet`);
+    const outcomeLine = plainText(lines[1]!);
+    assert.equal(outcomeLine.startsWith("⎿ "), true, `${state} must have an outcome result line`);
+    const glyph = Array.from(outcomeLine)[2] ?? "";
+    assert.equal(glyph.trim().length > 0, true, `${state} outcome glyph is blank`);
+    assert.equal(/[A-Za-z0-9]/.test(glyph), false, `${state} outcome starts without a glyph`);
     glyphs.set(state, glyph);
   }
   assert.equal(new Set(glyphs.values()).size, BLOCK_STATES.length, [...glyphs].join(" "));
@@ -233,6 +269,80 @@ test("ASCII-Theme kommt ohne Nicht-ASCII aus", () => {
       }
     }
   }
+});
+
+// F6 fix round 1: the sweep above deliberately excludes "user" blocks from
+// its strict ASCII check (free user-typed text may carry umlauts) — which
+// means it can never catch a raw non-ASCII literal in *chrome* a "user"
+// block also renders, like the interjection-accepted footer. That exact
+// gap let one through: `foot(theme, usable, "Interjection accepted —
+// feeds into the next step")` carried a raw em dash with no ASCII branch.
+// This test targets that one footer line directly, in both glyph modes.
+test("the interjection-accepted footer is theme-driven, not a raw em dash", () => {
+  const block: ChatBlock = {
+    kind: "user",
+    id: "u1",
+    at: AT,
+    text: "Bitte auch die Tests prüfen",
+    attachmentCount: 0,
+    interjected: true,
+  };
+  const unicode = createTheme({ level: 0 });
+  const unicodeFoot = plainText(renderBlock(block, 60, unicode, { last: true, now: AT }).at(-1)!);
+  assert.match(unicodeFoot, /⎿ Interjection accepted — feeds into the next step/u);
+
+  const ascii = createTheme({ level: 0, ascii: true });
+  const asciiFoot = plainText(renderBlock(block, 60, ascii, { last: true, now: AT }).at(-1)!);
+  // FIX-21 finding 3: the elbow's ASCII pair is a corner shape now, not the
+  // backtick that read as debris.
+  assert.match(asciiFoot, /L Interjection accepted - feeds into the next step/u);
+  assert.doesNotMatch(asciiFoot, /[^\x00-\x7f]/u, asciiFoot);
+});
+
+// FIX-3: the diff block was implemented but unreachable — every production
+// edit now renders one, so its glyph pairs and its foot have to hold up in
+// both modes, colorless included.
+test("FIX-3: the applied-edit block keeps its meaning in ascii and without color", () => {
+  const block = sampleBlocks()[4]!;
+  const unicode = plainText(renderBlock(block, 80, createTheme({ level: 0 }), { last: true, now: AT })[0]!);
+  assert.equal(unicode.startsWith("±"), true);
+
+  const ascii = createTheme({ level: 0, ascii: true });
+  const lines = renderBlock(block, 80, ascii, { last: true, now: AT }).map(plainText);
+  assert.equal(lines[0]!.startsWith("~"), true, lines[0]);
+  assert.match(lines[0]!, /src\/session\.ts/);
+  // +/- stay literal signs in both modes, so a colorless terminal can still
+  // tell an added line from a removed one.
+  assert.equal(lines.slice(1, -1).some((line) => /\|\s+\d+ \+ /.test(line)), true, lines.join("\n"));
+  assert.equal(lines.slice(1, -1).some((line) => /\|\s+\d+ - /.test(line)), true, lines.join("\n"));
+  const foot = lines.at(-1)!;
+  assert.match(foot, /more hunks/);
+  assert.match(foot, /applied/);
+  assert.match(foot, /\/undo reverts the run/);
+  for (const line of lines) {
+    assert.doesNotMatch(line, /[^\x00-\x7f]/u, line);
+  }
+});
+
+// Keyboard-audit addendum: the tool block's expand hint named a bare `o`
+// nothing ever bound. It names the key the dispatch really carries now, and
+// follows the block's own state exactly like the reasoning line does.
+test("FIX-3 addendum: the tool block's more-lines hint names Ctrl+O, never a bare o", () => {
+  const failed = sampleBlocks()[3]! as Extract<ChatBlock, { kind: "tool" }>;
+  const collapsed = plainText(renderBlock(failed, 80, theme, { last: true, now: AT }).at(-1)!);
+  assert.match(collapsed, /more lines/);
+  assert.match(collapsed, /Ctrl\+O expand/);
+  assert.doesNotMatch(collapsed, /(^|[^+])\bo open\b/);
+
+  const expanded = plainText(
+    renderBlock({ ...failed, expanded: true }, 80, theme, { last: true, now: AT }).at(-1)!,
+  );
+  assert.match(expanded, /Ctrl\+O collapse/);
+
+  // Not the last block: no key hint at all, only the honest line count.
+  const middle = plainText(renderBlock(failed, 80, theme, { now: AT }).at(-1)!);
+  assert.match(middle, /more lines/);
+  assert.doesNotMatch(middle, /Ctrl\+O/);
 });
 
 test("renderDiff hält die Breite, kürzt hart und bleibt ohne Farbe unterscheidbar", () => {
@@ -294,7 +404,7 @@ test("buildFrame verankert den Stream unten und hält Breite und Höhe ein", () 
         blocks,
         inputText: "npm test",
         inputCursor: 8,
-        header: { model: "sonnet-4.5", approvalMode: "ask", costUsd: 0.31, workspace: "~/projekt/routercode" },
+        header: { workspace: "~/projekt/routercode" },
         status: { phase: "läuft", spinning: true, elapsedMs: 7000 },
         help: "? Tasten",
         now: AT + 7000,
@@ -311,7 +421,7 @@ test("buildFrame verankert den Stream unten und hält Breite und Höhe ein", () 
 
 test("buildFrame meldet zu kleine Terminals statt zu rendern", () => {
   const frame = buildFrame({ width: 39, height: 24, theme, blocks: [], inputText: "", inputCursor: 0 });
-  assert.equal(plainText(frame.lines[0]!).startsWith("Terminal zu klein"), true);
+  assert.equal(plainText(frame.lines[0]!).startsWith("Terminal too small"), true);
   assert.equal(frame.lines.length, 1);
 });
 
@@ -322,11 +432,11 @@ test("Chrome im Ruhezustand sind drei Zeilen", () => {
     theme,
     blocks: [],
     inputText: "", inputCursor: 0,
-    header: { model: "sonnet-4.5", approvalMode: "ask", costUsd: 0 },
+    header: { workspace: "~/projekt/routercode" },
   });
   assert.equal(frame.chatHeight, 24 - 3);
   assert.equal(plainText(frame.lines[frame.lines.length - 2]!).startsWith("─"), true);
-  assert.equal(plainText(frame.lines[frame.lines.length - 1]!).startsWith("▌"), true);
+  assert.equal(plainText(frame.lines[frame.lines.length - 1]!).startsWith(">"), true);
 });
 
 test("zurückgescrollt zeigt der Rahmen den Scroll-Indikator", () => {
@@ -346,10 +456,9 @@ test("zurückgescrollt zeigt der Rahmen den Scroll-Indikator", () => {
     true,
   );
   assert.equal(
-    frame.lines.some((item) => plainText(item).includes("12 neue Zeilen")),
+    frame.lines.some((item) => plainText(item).includes("12 new lines")),
     true,
   );
-  assert.equal(frame.maxScrollOffset > 0, true);
 });
 
 test("a huge pending change never crowds out the approval question", () => {
@@ -366,6 +475,7 @@ test("a huge pending change never crowds out the approval question", () => {
     details: Array.from({ length: 600 }, (_, i) => `<div class="z-${i}">Inhalt ${i}</div>`),
     waitingSince: AT,
     rememberHint: "keine gemerkte Regel für diese Aktion",
+    expanded: false,
   };
 
   const lines = renderBlock(block, 100, theme, { last: true });
@@ -375,6 +485,34 @@ test("a huge pending change never crowds out the approval question", () => {
     `approval block grew to ${lines.length} lines`,
   );
   const text = lines.map((line) => plainText(line)).join("\n");
-  assert.match(text, /… 590 weitere Zeilen/);
+  assert.match(text, /… 590 more lines/);
+  assert.match(text, /Ctrl\+O shows all/);
   assert.match(text, /Datei schreiben: index\.html/);
+});
+
+// Audit FIX-1 (2026-08-28): the "Ctrl+O shows all" hint above must be TRUE —
+// an expanded approval renders every detail line, and the hint flips to the
+// file's established collapse wording.
+test("an expanded approval shows every detail line and offers Ctrl+O collapse", () => {
+  const theme = createTheme({ level: 0 });
+  const block: ChatBlock = {
+    kind: "approval",
+    id: "ap2",
+    at: AT,
+    risk: "edit",
+    summary: "Datei schreiben: index.html",
+    details: Array.from({ length: 600 }, (_, i) => `<div class="z-${i}">Inhalt ${i}</div>`),
+    waitingSince: AT,
+    rememberHint: "keine gemerkte Regel für diese Aktion",
+    expanded: true,
+  };
+
+  const lines = renderBlock(block, 100, theme, { last: true });
+  const text = lines.map((line) => plainText(line)).join("\n");
+
+  assert.ok(lines.length >= 600, `expanded approval rendered only ${lines.length} lines`);
+  assert.match(text, /z-599/);
+  assert.match(text, /Ctrl\+O collapse/);
+  assert.doesNotMatch(text, /more lines/);
+  assert.doesNotMatch(text, /Ctrl\+O shows all/);
 });

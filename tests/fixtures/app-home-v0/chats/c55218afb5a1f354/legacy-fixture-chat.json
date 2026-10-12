@@ -1,0 +1,38 @@
+{
+  "version": 2,
+  "id": "legacy-fixture-chat",
+  "title": "Historischer Fixture-Chat",
+  "workspace": "/fixture/workspace",
+  "summary": "Historischer Stand vor der Umbenennung.",
+  "turns": [
+    {
+      "role": "user",
+      "content": "Bitte prüfe den historischen Fixture-Stand.",
+      "createdAt": "2024-08-20T10:00:00.000Z"
+    },
+    {
+      "role": "assistant",
+      "content": "Der historische Stand wurde erfasst.",
+      "createdAt": "2024-08-20T10:01:00.000Z"
+    }
+  ],
+  "costs": {
+    "mainUsd": 0.12,
+    "compressorUsd": 0.005,
+    "voiceUsd": 0,
+    "totalUsd": 0.125
+  },
+  "model": "synthetic/main-v0",
+  "reasoning": {
+    "mode": "effort",
+    "effort": "high"
+  },
+  "revision": 3,
+  "checkpoints": [],
+  "toolCalls": [],
+  "dailySpendUsd": {
+    "2024-08-20": 0.125
+  },
+  "createdAt": "2024-08-20T09:59:00.000Z",
+  "updatedAt": "2024-08-20T10:01:00.000Z"
+}

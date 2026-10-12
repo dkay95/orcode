@@ -1,0 +1,27 @@
+{
+  "name": "orcode-gui",
+  "private": true,
+  "version": "0.7.0",
+  "description": "orcode's desktop shell: a Tauri v2 window over the unchanged core, spoken to through the GUI sidecar protocol.",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit -p tsconfig.json && vite build",
+    "test": "vitest run",
+    "test:browser": "vitest run --config vitest.browser.config.ts",
+    "tauri": "tauri"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^2.11.1"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.11.4",
+    "@types/node": "^24.13.3",
+    "@vitest/browser": "3.2.7",
+    "jsdom": "^29.1.1",
+    "playwright": "1.55.1",
+    "typescript": "^5.9.3",
+    "vite": "^7.1.5",
+    "vitest": "3.2.7"
+  }
+}

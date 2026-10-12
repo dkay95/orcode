@@ -84,11 +84,3 @@ export function spansWidth(spans: readonly Span[]): number {
   }
   return total;
 }
-
-export function spansText(spans: readonly Span[]): string {
-  let out = "";
-  for (const item of spans) {
-    out += item.text;
-  }
-  return out;
-}

@@ -1,42 +1,190 @@
 name: Release
 
-# Triggered by pushing a tag like v0.4.0. Building and testing happens again
-# here (not just trusted from CI on main) so a release can never ship from an
-# untested tree, and `prepublishOnly` in package.json is a second, local
-# enforcement of the same rule for anyone publishing by hand.
+# This workflow only names the npm-production environment. Before first use,
+# repository settings must add the owner as a Required Reviewer, prevent
+# self-review, and use a distinct trusted maintainer or restricted release bot
+# to dispatch. Restrict deployment refs to protected `v*` tags. Use two separate
+# tag rulesets: one creation rule with only the owner as bypass actor, and one
+# update/delete rule with no bypass actors. The dispatch ref, workflow ref,
+# event commit, and tag are bound below.
 on:
-  push:
-    tags:
-      - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing release tag to publish (for example v0.7.0)"
+        required: true
+        type: string
 
 permissions:
   contents: read
 
+concurrency:
+  group: npm-release-${{ inputs.tag }}
+  cancel-in-progress: false
+
 jobs:
-  publish:
-    name: Build, verify, and publish to npm
+  verify:
+    name: Verify the selected tag without OIDC authority
+    if: >-
+      github.ref_protected &&
+      github.ref == format('refs/tags/{0}', inputs.tag) &&
+      github.workflow_ref == format('dkay95/orcode/.github/workflows/release.yml@refs/tags/{0}', inputs.tag)
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      id-token: write # required for npm provenance
+    env:
+      ORCODE_RELEASE_TAG: ${{ inputs.tag }}
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Set up Node.js 22
-        uses: actions/setup-node@v4
+      - name: Checkout the immutable dispatch commit without persisting credentials
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          node-version: 22
-          registry-url: "https://registry.npmjs.org"
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Bind the checkout to the dispatch event commit
+        shell: bash
+        run: test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+
+      - name: Set up the pinned release runtime
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "24.17.0"
           cache: npm
+
+      - name: Verify pinned Node and bundled npm
+        shell: bash
+        run: |
+          test "$(node --version)" = "v24.17.0"
+          test "$(npm --version)" = "11.13.0"
 
       - name: Install dependencies
         run: npm ci
 
-      - name: Build and verify
-        run: npm run build && npm run check
+      - name: Verify source, metadata, migration, regressions, and real PTY
+        run: |
+          npm run check
+          npm run build
+          npm run check:release
+          npm run test:migration
+          npm run test:release-regressions
+          npm run test:pty
+          npm audit --omit=dev --audit-level=high
+          git diff --check
+          git diff --exit-code
 
-      - name: Publish to npm
-        run: npm publish --provenance --access public
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+      - name: Produce the exact inspected release tarball
+        run: npm run check:package -- --output release-artifact
+
+      - name: Upload only the inspected release artifact
+        id: upload
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: orcode-release-candidate
+          path: release-artifact
+          if-no-files-found: error
+          include-hidden-files: false
+          compression-level: 0
+          retention-days: 1
+
+  publish:
+    name: Publish the inspected tarball through npm OIDC
+    if: >-
+      github.ref_protected &&
+      github.ref == format('refs/tags/{0}', inputs.tag) &&
+      github.workflow_ref == format('dkay95/orcode/.github/workflows/release.yml@refs/tags/{0}', inputs.tag)
+    needs: verify
+    runs-on: ubuntu-latest
+    environment: npm-production
+    permissions:
+      actions: read
+      contents: read
+      id-token: write
+    env:
+      ORCODE_RELEASE_TAG: ${{ inputs.tag }}
+    steps:
+      - name: Set up the pinned OIDC-capable runtime
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "24.17.0"
+
+      - name: Download the verified candidate
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: orcode-release-candidate
+          path: release-artifact
+
+      - name: Validate the artifact without executing repository code
+        id: artifact
+        shell: bash
+        run: |
+          test "$(node --version)" = "v24.17.0"
+          test "$(npm --version)" = "11.13.0"
+          node --input-type=module <<'NODE'
+          import { execFileSync } from "node:child_process";
+          import { createHash } from "node:crypto";
+          import { appendFileSync, lstatSync, readFileSync, realpathSync } from "node:fs";
+          import { dirname, join, resolve } from "node:path";
+
+          const tag = process.env.ORCODE_RELEASE_TAG ?? "";
+          if (!/^v(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)$/.test(tag)) {
+            throw new Error("Unkanonischer Release-Tag.");
+          }
+          const root = realpathSync(resolve("release-artifact"));
+          const manifestPath = join(root, "release-manifest.json");
+          const manifestInfo = lstatSync(manifestPath);
+          if (!manifestInfo.isFile() || manifestInfo.isSymbolicLink()) {
+            throw new Error("Release-Manifest ist keine reguläre Datei.");
+          }
+          const manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
+          const expectedFilename = `orcode-${tag.slice(1)}.tgz`;
+          if (manifest.filename !== expectedFilename) {
+            throw new Error("Tarball-Dateiname und Release-Tag weichen ab.");
+          }
+          const tarball = realpathSync(join(root, manifest.filename));
+          const tarballInfo = lstatSync(tarball);
+          if (
+            dirname(tarball) !== root ||
+            !tarballInfo.isFile() ||
+            tarballInfo.isSymbolicLink()
+          ) {
+            throw new Error("Release-Tarball ist kein gebundenes reguläres Artefakt.");
+          }
+          const bytes = readFileSync(tarball);
+          const sha512Hex = createHash("sha512").update(bytes).digest("hex");
+          const sha512Base64 = createHash("sha512").update(bytes).digest("base64");
+          if (
+            manifest.size !== bytes.byteLength ||
+            manifest.sha512 !== sha512Hex ||
+            manifest.integrity !== `sha512-${sha512Base64}`
+          ) {
+            throw new Error("Release-Tarball stimmt nicht mit seinem geprüften Manifest überein.");
+          }
+          const packedManifest = JSON.parse(execFileSync(
+            "/usr/bin/tar",
+            ["-xOf", tarball, "package/package.json"],
+            { encoding: "utf8", maxBuffer: 65_536 },
+          ));
+          const binNames = Object.keys(packedManifest.bin ?? {}).sort();
+          const forbiddenLifecycleScripts = ["preinstall", "install", "postinstall", "prepare"];
+          if (
+            manifest.name !== "orcode" ||
+            manifest.version !== tag.slice(1) ||
+            manifest.bin?.orcode !== "./dist/cli.js" ||
+            manifest.bin?.routercode !== "./dist/cli.js" ||
+            packedManifest.name !== "orcode" ||
+            packedManifest.version !== tag.slice(1) ||
+            packedManifest.repository?.type !== "git" ||
+            packedManifest.repository?.url !== "git+https://github.com/dkay95/orcode.git" ||
+            (packedManifest.private !== undefined && packedManifest.private !== false) ||
+            binNames.join(",") !== "orcode,routercode" ||
+            packedManifest.bin?.orcode !== "./dist/cli.js" ||
+            packedManifest.bin?.routercode !== "./dist/cli.js" ||
+            forbiddenLifecycleScripts.some((name) => name in (packedManifest.scripts ?? {}))
+          ) {
+            throw new Error("Interne Paketidentität oder Lifecycle-Grenze stimmt nicht mit dem Release überein.");
+          }
+          appendFileSync(process.env.GITHUB_OUTPUT, `tarball=${tarball}\n`);
+          NODE
+
+      - name: Publish only the verified tarball
+        run: npm publish "${{ steps.artifact.outputs.tarball }}" --access public

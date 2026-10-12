@@ -9,9 +9,16 @@ import {
   PermissionDeniedError,
   approvalDescription,
   approvalRiskLabel,
+  riskLabel,
 } from "../src/approval.js";
+import { createTheme } from "../src/ui/theme.js";
 import type { ApprovalDecision, ApprovalRequest } from "../src/approval.js";
-import { RuleStore, rulesPath } from "../src/rules.js";
+import {
+  RuleStore,
+  approvalSubjectDisplay,
+  rulesPath,
+  shellApprovalSubject,
+} from "../src/rules.js";
 import type { ApprovalMode, ToolCallPreview } from "../src/types.js";
 
 interface Harness {
@@ -81,6 +88,16 @@ const protectedWrite: ApprovalRequest = {
   policyRule: "git-metadata",
 };
 
+function localShellSubject(command: string) {
+  return shellApprovalSubject({
+    platform: "linux",
+    executable: "/bin/sh",
+    mode: ["-c"],
+    cwd: ".",
+    command,
+  });
+}
+
 test("read-only blocks writes and shell commands", async () => {
   const { approvals, asked } = harness("read-only", true);
   await approvals.authorize(plainRead);
@@ -99,7 +116,7 @@ test("read-only still asks before a secret is read", async () => {
   assert.equal(denying.asked.length, 1);
   assert.match(
     denying.asked[0]?.details ?? "",
-    /Vertraulicher Pfad/,
+    /Confidential path/,
     "der Nutzer muss erfahren, warum ein Lesezugriff nachfragt",
   );
 
@@ -156,8 +173,7 @@ test("auto-edit never waves shell commands through", async () => {
 const remoteShell: ApprovalRequest = {
   name: "ssh_command",
   risk: "remote-shell",
-  host: "vps",
-  command: "systemctl restart nginx",
+  subject: { kind: "ssh-command", host: "vps", command: "systemctl restart nginx" },
   summary: "SSH-ZIEL: VPS — systemctl restart nginx",
 };
 
@@ -184,7 +200,7 @@ test("remote-shell is the one thing allow-all is allowed to wave through", async
 test("remote-shell preview always names the host, in caps, regardless of the caller's summary wording", async () => {
   const { approvals, asked } = harness("ask", true);
   await approvals.authorize({ ...remoteShell, summary: "ein Befehl", details: undefined });
-  assert.match(asked[0]?.details ?? "", /SSH-ZIEL \(NICHT LOKAL\): VPS/);
+  assert.match(asked[0]?.details ?? "", /SSH TARGET \(NOT LOCAL\): VPS/);
 });
 
 test("a remembered rule for one SSH host never applies to another", async () => {
@@ -196,8 +212,7 @@ test("a remembered rule for one SSH host never applies to another", async () => 
     await approvals.authorize({
       name: "ssh_command",
       risk: "remote-shell",
-      host: "vps",
-      command: "uptime",
+      subject: { kind: "ssh-command", host: "vps", command: "uptime" },
       summary: "SSH-ZIEL: VPS — uptime",
     });
 
@@ -211,8 +226,7 @@ test("a remembered rule for one SSH host never applies to another", async () => 
     await approvals.authorize({
       name: "ssh_command",
       risk: "remote-shell",
-      host: "produktion",
-      command: "uptime",
+      subject: { kind: "ssh-command", host: "produktion", command: "uptime" },
       summary: "SSH-ZIEL: PRODUKTION — uptime",
     });
     assert.equal(asked.length, 1, "eine vps-Regel darf nicht für produktion gelten");
@@ -226,8 +240,7 @@ test("a remembered rule for one SSH host never applies to another", async () => 
     await approvals.authorize({
       name: "ssh_command",
       risk: "remote-shell",
-      host: "vps",
-      command: "uptime",
+      subject: { kind: "ssh-command", host: "vps", command: "uptime" },
       summary: "SSH-ZIEL: VPS — uptime",
     });
     assert.equal(askedAgain.length, 0, "die vps-Regel muss weiterhin greifen");
@@ -252,14 +265,14 @@ test("a tool is locked after repeated rejections in the same run", async () => {
   approvals.beginRun();
 
   for (let attempt = 1; attempt < MAX_DENIALS_PER_RUN; attempt += 1) {
-    await assert.rejects(approvals.authorize(shell), /abgelehnt/);
+    await assert.rejects(approvals.authorize(shell), /denied/);
   }
-  await assert.rejects(approvals.authorize(shell), /gesperrt/);
+  await assert.rejects(approvals.authorize(shell), /locked/);
   assert.equal(asked.length, MAX_DENIALS_PER_RUN);
   assert.deepEqual(approvals.lockedTools, ["run_command"]);
 
   // Further attempts do not even reach the user any more.
-  await assert.rejects(approvals.authorize(shell), /gesperrt/);
+  await assert.rejects(approvals.authorize(shell), /locked/);
   assert.equal(asked.length, MAX_DENIALS_PER_RUN);
 
   // Other tools keep their own budget.
@@ -267,21 +280,21 @@ test("a tool is locked after repeated rejections in the same run", async () => {
     .authorize(edit)
     .then(() => "erlaubt")
     .catch((error: unknown) => (error as Error).message);
-  assert.match(String(other), /abgelehnt/);
+  assert.match(String(other), /denied/);
 
   approvals.beginRun();
   assert.deepEqual(approvals.lockedTools, []);
-  await assert.rejects(approvals.authorize(shell), /abgelehnt/);
+  await assert.rejects(approvals.authorize(shell), /denied/);
 });
 
 test("mode descriptions and risk labels stay honest", () => {
-  assert.match(approvalDescription("read-only"), /Nur lesen/);
-  assert.match(approvalDescription("ask"), /fragen/);
-  assert.match(approvalDescription("auto-edit"), /Dateiänderungen automatisch/);
-  assert.match(approvalDescription("auto-edit"), /Geschützte Pfade/);
-  assert.match(approvalDescription("allow-all"), /Gefährlich/);
+  assert.match(approvalDescription("read-only"), /Read only/);
+  assert.match(approvalDescription("ask"), /ask/i);
+  assert.match(approvalDescription("auto-edit"), /File changes happen automatically/);
+  assert.match(approvalDescription("auto-edit"), /Protected paths/);
+  assert.match(approvalDescription("allow-all"), /Dangerous/);
 
-  assert.equal(approvalRiskLabel("secret-read"), "GEHEIMNIS");
+  assert.equal(approvalRiskLabel("secret-read"), "SECRET");
   assert.equal(approvalRiskLabel("shell"), "SHELL");
   assert.equal(approvalRiskLabel("remote-shell"), "SSH");
 });
@@ -294,13 +307,13 @@ const npmTest: ApprovalRequest = {
   name: "run_command",
   risk: "shell",
   summary: "npm test ausführen",
-  command: "npm test",
+  subject: localShellSubject("npm test"),
 };
 const npmPublish: ApprovalRequest = {
   name: "run_command",
   risk: "shell",
   summary: "npm publish ausführen",
-  command: "npm publish",
+  subject: localShellSubject("npm publish"),
 };
 
 test("K6.1 — ask + abgelehnt wirft PermissionDeniedError mit der Begründung", async () => {
@@ -331,7 +344,7 @@ test("K6.2 — gemerkte allow-Regel überspringt die Nachfrage, ein anderer Befe
     await approvals.authorize(npmTest);
     assert.equal(asked.length, 1);
 
-    // Second call with the same prefix: no question asked.
+    // Second call with the same exact subject: no question asked.
     await approvals.authorize(npmTest);
     assert.equal(asked.length, 1, "eine gemerkte Regel darf kein zweites Mal fragen");
 
@@ -354,7 +367,7 @@ test("K6.3 — gemerkte deny-Regel schlägt allow-all", async () => {
     await ruleStore.remember({
       workspace: "/ws",
       tool: "run_command",
-      match: { kind: "command-prefix", value: "rm" },
+      subject: localShellSubject("rm -rf build"),
       decision: "deny",
     });
     const asked: ToolCallPreview[] = [];
@@ -367,7 +380,7 @@ test("K6.3 — gemerkte deny-Regel schlägt allow-all", async () => {
       name: "run_command",
       risk: "shell",
       summary: "rm -rf build ausführen",
-      command: "rm -rf build",
+      subject: localShellSubject("rm -rf build"),
     };
     await assert.rejects(approvals.authorize(rmRequest), PermissionDeniedError);
     assert.equal(asked.length, 0, "eine deny-Regel darf nicht einmal fragen");
@@ -383,7 +396,7 @@ test("K6.4 — gemerkte allow-Regel hebt alwaysAsk (policy.ts) niemals auf", asy
     await ruleStore.remember({
       workspace: "/ws",
       tool: "write_file",
-      match: { kind: "path-glob", value: ".git/config" },
+      subject: { kind: "selected-path", path: ".git/config" },
       decision: "allow",
     });
     const asked: ToolCallPreview[] = [];
@@ -396,7 +409,7 @@ test("K6.4 — gemerkte allow-Regel hebt alwaysAsk (policy.ts) niemals auf", asy
       name: "write_file",
       risk: "edit",
       summary: ".git/config überschreiben",
-      path: ".git/config",
+      subject: { kind: "selected-path", path: ".git/config" },
       alwaysAsk: true,
       policyRule: "git-metadata",
     };
@@ -418,7 +431,7 @@ test("K6.5 — RuleStore schreibt mit Modus 0600 und übersteht einen Neustart",
     await store.remember({
       workspace: "/ws",
       tool: "run_command",
-      match: { kind: "command-prefix", value: "npm test" },
+      subject: localShellSubject("npm test"),
       decision: "allow",
     });
 
@@ -430,7 +443,7 @@ test("K6.5 — RuleStore schreibt mit Modus 0600 und übersteht einen Neustart",
     }
 
     const reopened = await RuleStore.load(appHome);
-    assert.equal(reopened.decide("/ws", "run_command", "npm test"), "allow");
+    assert.equal(reopened.decide("/ws", "run_command", localShellSubject("npm test")), "allow");
     assert.equal(reopened.list("/ws").length, 1);
 
     const raw = await readFile(rulesPath(appHome), "utf8");
@@ -438,4 +451,116 @@ test("K6.5 — RuleStore schreibt mit Modus 0600 und übersteht einen Neustart",
   } finally {
     await rm(appHome, { recursive: true, force: true });
   }
+});
+
+test("remembering is unavailable without a safe derived subject and a forged remember result is ignored", async () => {
+  const appHome = await tempAppHome();
+  try {
+    const ruleStore = await RuleStore.load(appHome);
+    const approvals = new ApprovalManager("ask", { ruleStore, workspace: "/ws" });
+    const previews: ToolCallPreview[] = [];
+    approvals.setPromptHandler(async (preview) => {
+      previews.push(preview);
+      return { accepted: true, remember: "allow" };
+    });
+
+    await approvals.authorize({ name: "custom_action", risk: "shell", summary: "Aktion ohne Subject" });
+    await approvals.authorize({ name: "custom_action", risk: "shell", summary: "Aktion ohne Subject" });
+
+    assert.equal(previews.length, 2, "ohne Subject darf keine Regel gespeichert werden");
+    assert.equal(previews[0]?.rememberAvailable, false);
+    assert.equal(previews[0]?.subject, undefined);
+    assert.deepEqual(ruleStore.list("/ws"), []);
+  } finally {
+    await rm(appHome, { recursive: true, force: true });
+  }
+});
+
+test("rememberable false keeps the exact subject visible but ignores and cannot change stored rules", async () => {
+  const appHome = await tempAppHome();
+  try {
+    const subject = localShellSubject("git diff --");
+    const ruleStore = await RuleStore.load(appHome);
+    await ruleStore.remember({
+      workspace: "/ws",
+      tool: "git_diff",
+      subject,
+      decision: "allow",
+    });
+    const before = await readFile(rulesPath(appHome), "utf8");
+    const approvals = new ApprovalManager("ask", { ruleStore, workspace: "/ws" });
+    const previews: ToolCallPreview[] = [];
+    approvals.setPromptHandler(async (preview) => {
+      previews.push(preview);
+      return { accepted: true, remember: "deny" };
+    });
+
+    await approvals.authorize({
+      name: "git_diff",
+      risk: "shell",
+      summary: "Hardened Git diff",
+      subject,
+      rememberable: false,
+    });
+
+    assert.equal(previews.length, 1, "stored allow must not bypass a non-rememberable prompt");
+    assert.equal(previews[0]?.subject, approvalSubjectDisplay(subject));
+    assert.equal(previews[0]?.rememberAvailable, false);
+    assert.equal(await readFile(rulesPath(appHome), "utf8"), before);
+    assert.equal(ruleStore.decide("/ws", "git_diff", subject), "allow");
+  } finally {
+    await rm(appHome, { recursive: true, force: true });
+  }
+});
+
+test("the preview shows the exact canonical subject used by policy before remember is offered", async () => {
+  const subject = localShellSubject("printf '  α  ' | sed 's/α/β/'");
+  const { approvals, asked } = harness("ask", true);
+  await approvals.authorize({
+    name: "run_command",
+    risk: "shell",
+    summary: "Unicode ausgeben",
+    subject,
+  });
+  assert.equal(asked[0]?.subject, approvalSubjectDisplay(subject));
+  assert.equal(asked[0]?.rememberAvailable, true);
+});
+
+// F5 (V3 audit principle 3): approval.ts's per-file spot pin + NO_COLOR/
+// level-0 parity check — `riskLabel` is exported (see its doc) purely so
+// this can call the real migrated function directly with an explicit
+// `Theme`, without mocking `console.log`/`confirm` to reach it through
+// `authorize()`. Deterministic (no env vars, no chalk auto-detect caching
+// concerns): passes a level 1 and a level 0 theme straight in.
+test("riskLabel (F5 pin): every risk keeps its exact bracketed text at level 0, and colours it at level 1", () => {
+  const plain = createTheme({ level: 0 });
+  const colored = createTheme({ level: 1 });
+  const esc = String.fromCharCode(27);
+
+  // Ruling 1's default mapping: red/yellow/green survive unchanged in
+  // meaning (danger/warn/ok).
+  assert.equal(riskLabel("shell", plain), "[SHELL]");
+  assert.equal(riskLabel("shell", colored), `${esc}[31m[SHELL]${esc}[39m`);
+  assert.equal(riskLabel("edit", plain), "[EDIT]");
+  assert.equal(riskLabel("edit", colored), `${esc}[33m[EDIT]${esc}[39m`);
+  assert.equal(riskLabel("read", plain), "[READ]");
+  assert.equal(riskLabel("read", colored), `${esc}[32m[READ]${esc}[39m`);
+
+  // Ruling 1's documented magenta judgment: secret-read is a confidentiality
+  // caution, not a destructive action — `warn`, not `danger`.
+  assert.equal(riskLabel("secret-read", plain), "[SECRET]");
+  assert.equal(riskLabel("secret-read", colored), `${esc}[33m[SECRET]${esc}[39m`);
+
+  // Ruling 2: the two background-colour banners map to `inverse` (+bold) —
+  // the one sanctioned high-attention treatment — and gain brackets so the
+  // safety signal survives once inverse degrades to plain text at level 0.
+  assert.equal(riskLabel("remote-shell", plain), "[SSH]");
+  assert.equal(riskLabel("network-fetch", plain), "[NETWORK]");
+  const coloredSsh = riskLabel("remote-shell", colored);
+  assert.equal(coloredSsh.includes(`${esc}[7m`), true, "remote-shell must use the inverse role");
+  assert.equal(coloredSsh.includes(`${esc}[1m`), true, "remote-shell keeps its bold emphasis");
+  assert.equal(coloredSsh.includes("[SSH]"), true);
+  const coloredNetwork = riskLabel("network-fetch", colored);
+  assert.equal(coloredNetwork.includes(`${esc}[7m`), true, "network-fetch must use the inverse role");
+  assert.equal(coloredNetwork.includes("[NETWORK]"), true);
 });

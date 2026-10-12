@@ -1,0 +1,25 @@
+{
+  "mainModel": "synthetic/main-v0",
+  "compressorModel": "synthetic/compressor-v0",
+  "compressionMode": "auto",
+  "compressionThresholdChars": 12000,
+  "approvalMode": "ask",
+  "maxSteps": 9,
+  "maxCostUsd": 0.75,
+  "compressorMaxCostUsd": 0.03,
+  "reasoningByModel": {
+    "synthetic/main-v0": {
+      "mode": "effort",
+      "effort": "high"
+    }
+  },
+  "transcriptionModel": "synthetic/transcription-v0",
+  "voiceConsentGiven": false,
+  "verify": {
+    "commands": [
+      "npm test -- --fixture"
+    ],
+    "mode": "on-edit",
+    "maxRounds": 2
+  }
+}

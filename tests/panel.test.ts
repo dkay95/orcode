@@ -16,6 +16,7 @@ import test from "node:test";
 import { ApprovalManager } from "../src/approval.js";
 import {
   handleSlashCommand,
+  panelAutoSuggestNotice,
   type CommandContext,
   type CommandOutput,
 } from "../src/commands.js";
@@ -41,6 +42,7 @@ import {
   askPanel,
   buildJudgePrompt,
   estimatePanelCost,
+  estimatePanelRun,
   synthesize,
   type PanelAnswer,
   type PanelCall,
@@ -296,7 +298,7 @@ test("askPanel rejects too few or too many models with a clear message", async (
     askPanel({ question: "Frage", models: ["only/one"], callModel: call }),
     (error: unknown) => {
       assert.ok(error instanceof PanelValidationError);
-      assert.match(error.message, /zwischen 2 und 5/);
+      assert.match(error.message, /between 2 and 5/);
       return true;
     },
   );
@@ -306,7 +308,7 @@ test("askPanel rejects too few or too many models with a clear message", async (
       models: ["a", "b", "c", "d", "e", "f"],
       callModel: call,
     }),
-    /zwischen 2 und 5/,
+    /between 2 and 5/,
   );
 });
 
@@ -314,7 +316,7 @@ test("askPanel rejects an empty question", async () => {
   const { call } = fakePanelCall(async () => ({ text: "x", costUsd: 0, inputTokens: 0, outputTokens: 0 }));
   await assert.rejects(
     askPanel({ question: "   ", models: ["a/one", "b/two"], callModel: call }),
-    /Frage/,
+    /question/i,
   );
 });
 
@@ -336,7 +338,7 @@ test("synthesize needs at least two successful answers", async () => {
       judgeModel: "judge/model",
       callModel: call,
     }),
-    /mindestens zwei/,
+    /at least two/,
   );
 });
 
@@ -417,6 +419,57 @@ test("estimatePanelCost sums known estimates, clamps negatives, and reports unkn
 });
 
 // ---------------------------------------------------------------------------
+// FIX-10 H2 (money honesty): estimatePanelRun — the /panel confirm's
+// estimate includes the judge round whenever panelJudge is on.
+// ---------------------------------------------------------------------------
+
+test("H2: with the judge off, estimatePanelRun is exactly estimatePanelCost — no judge entry, no extra cost", () => {
+  const priceOf = (m: string): number | null => (m === "a" ? 0.1 : 0.2);
+  const run = estimatePanelRun(["a", "b"], null, priceOf);
+  assert.deepEqual(run, estimatePanelCost(["a", "b"], priceOf));
+  assert.equal(run.judge, undefined);
+});
+
+test("H2: with the judge on, the judging call is priced by the same estimator and included in the total", () => {
+  const priceOf = (m: string): number | null => {
+    if (m === "a") return 0.1;
+    if (m === "b") return 0.2;
+    if (m === "judge/main") return 0.05;
+    return null;
+  };
+  const run = estimatePanelRun(["a", "b"], "judge/main", priceOf);
+  assert.ok(Math.abs(run.totalUsd - 0.35) < 1e-12);
+  assert.equal(run.unknownCount, 0);
+  assert.deepEqual(run.judge, { model: "judge/main", usd: 0.05 });
+  // The panelist rows are untouched — the judge rides alongside, never
+  // silently merged into the N-model list.
+  assert.deepEqual(run.perModelUsd.map((entry) => entry.model), ["a", "b"]);
+});
+
+test("H2: an unpriced judge counts into unknownCount — never silently priced at \$0", () => {
+  const priceOf = (m: string): number | null => (m === "judge/main" ? null : 0.1);
+  const run = estimatePanelRun(["a", "b"], "judge/main", priceOf);
+  assert.ok(Math.abs(run.totalUsd - 0.2) < 1e-12);
+  assert.equal(run.unknownCount, 1);
+  assert.deepEqual(run.judge, { model: "judge/main", usd: null });
+});
+
+test("F4: the judge is priced through its own estimator seam (larger judge input), never the panelists' prompt-length estimate", () => {
+  const via: string[] = [];
+  const run = estimatePanelRun(
+    ["a", "b"],
+    "judge/main",
+    (m) => { via.push(`panelist:${m}`); return 0.1; },
+    (m) => { via.push(`judge:${m}`); return 0.7; },
+  );
+  assert.deepEqual(run.judge, { model: "judge/main", usd: 0.7 });
+  assert.ok(Math.abs(run.totalUsd - 0.9) < 1e-12);
+  // The judge went through the judge seam exactly once and never through
+  // the panelists' estimator; the panelists never went through the judge's.
+  assert.deepEqual(via, ["panelist:a", "panelist:b", "judge:judge/main"]);
+});
+
+// ---------------------------------------------------------------------------
 // openrouter.ts helpers — pure, no network
 // ---------------------------------------------------------------------------
 
@@ -454,26 +507,26 @@ test("proposePanelModels picks at most one model per provider family, ranked by 
 test("validatePanelModelSelection rejects too few models with a clear message", () => {
   assert.throws(
     () => validatePanelModelSelection(["only/one"], ["only/one", "other/model"]),
-    /mindestens 2/,
+    /at least 2/,
   );
 });
 
 test("validatePanelModelSelection rejects too many models with a clear message", () => {
   const known = ["a", "b", "c", "d", "e", "f"];
-  assert.throws(() => validatePanelModelSelection(known, known), /höchstens 5/);
+  assert.throws(() => validatePanelModelSelection(known, known), /at most 5/);
 });
 
 test("validatePanelModelSelection rejects an unknown model id, naming it", () => {
   assert.throws(
     () => validatePanelModelSelection(["a/one", "z/ghost"], ["a/one", "b/two"]),
-    /Unbekannte.*z\/ghost/i,
+    /Unknown.*z\/ghost/i,
   );
 });
 
 test("validatePanelModelSelection dedupes before checking the count", () => {
   assert.throws(
     () => validatePanelModelSelection(["a/one", "a/one"], ["a/one", "b/two"]),
-    /mindestens 2/,
+    /at least 2/,
   );
 });
 
@@ -524,7 +577,7 @@ function sampleResult(): PanelResult {
       ),
       failedAnswer(
         "openai/gpt-5.1-codex-mini",
-        "OpenRouter HTTP 429: Rate-Limit erreicht, bitte später erneut versuchen.",
+        "OpenRouter HTTP 429: Rate limit reached, please try again later.",
       ),
       { ...successAnswer("google/gemini-3-pro", ""), text: "" },
     ],
@@ -586,10 +639,10 @@ test("a judge synthesis is clearly labelled and separated from the model answers
   const judgment = sampleJudgment();
   const lines = renderPanel(result, 100, theme, { judgment });
   const plain = lines.map(plainText).join("\n");
-  assert.match(plain, /Richter/);
+  assert.match(plain, /Judge/);
   assert.match(plain, /gründlichsten/);
-  const richterLines = lines.filter((line) => plainText(line).includes("Richter"));
-  assert.equal(richterLines.length, 1, "„Richter“ darf nur auf der Kopfzeile des Richterblocks stehen");
+  const richterLines = lines.filter((line) => plainText(line).includes("Judge"));
+  assert.equal(richterLines.length, 1, "\"Judge\" must appear only on the judge block's head line");
 });
 
 test("an expanded answer is marked distinctly from its collapsed teaser", () => {
@@ -598,7 +651,7 @@ test("an expanded answer is marked distinctly from its collapsed teaser", () => 
   const collapsed = plainText(renderPanel(result, 100, theme, { expandedIndex: null })[1]!);
   const expanded = plainText(renderPanel(result, 100, theme, { expandedIndex: 0 })[1]!);
   assert.notEqual(collapsed, expanded);
-  assert.match(expanded, /vollständig/);
+  assert.match(expanded, /full/);
 });
 
 // ---------------------------------------------------------------------------
@@ -679,6 +732,7 @@ async function panelHarness(
     models?: ModelInfo[];
     panelModels?: string[];
     panelJudge?: boolean;
+    glyphMode?: OrcodeConfigWithBudget["appearance"]["glyphMode"];
   } = {},
 ): Promise<Harness> {
   const appHome = await mkdtemp(join(tmpdir(), "routercode-panel-cmd-"));
@@ -701,6 +755,9 @@ async function panelHarness(
     config: freshConfig({
       panelModels: options.panelModels ?? [],
       panelJudge: options.panelJudge ?? false,
+      ...(options.glyphMode
+        ? { appearance: { ...DEFAULT_CONFIG.appearance, glyphMode: options.glyphMode } }
+        : {}),
     }),
     approvals: new ApprovalManager("allow-all"),
     openRouter: fakeOpenRouter(options.models ?? sampleCatalog()),
@@ -721,8 +778,8 @@ test("/panel with no arguments shows status, including the unconfigured case", a
   const { context, lines, appHome } = await panelHarness();
   try {
     await handleSlashCommand("/panel", context);
-    assert.ok(lines.some((line) => /keine konfiguriert/.test(line)));
-    assert.ok(lines.some((line) => /Panel-Richter: aus/.test(line)));
+    assert.ok(lines.some((line) => /none configured/.test(line)));
+    assert.ok(lines.some((line) => /Panel judge: off/.test(line)));
   } finally {
     await rm(appHome, { recursive: true, force: true });
   }
@@ -746,7 +803,7 @@ test("/panel models rejects an unknown model id and does not persist anything", 
   try {
     await assert.rejects(
       handleSlashCommand("/panel models a/one,ghost/model", context),
-      /Unbekannte.*ghost\/model/i,
+      /Unknown.*ghost\/model/i,
     );
     assert.deepEqual(context.config.panelModels, []);
   } finally {
@@ -757,7 +814,7 @@ test("/panel models rejects an unknown model id and does not persist anything", 
 test("/panel models rejects a single model (too few)", async () => {
   const { context, appHome } = await panelHarness();
   try {
-    await assert.rejects(handleSlashCommand("/panel models a/one", context), /mindestens 2/);
+    await assert.rejects(handleSlashCommand("/panel models a/one", context), /at least 2/);
   } finally {
     await rm(appHome, { recursive: true, force: true });
   }
@@ -773,12 +830,25 @@ test("/panel models with no arguments reports the current selection instead of e
   }
 });
 
+test("/panel models with no arguments and none configured names the one next action, mirroring /panel's own wording (D5 invitation grammar)", async () => {
+  const { context, lines, appHome } = await panelHarness();
+  try {
+    await handleSlashCommand("/panel models", context);
+    const theme = createTheme();
+    assert.deepEqual(lines, [
+      `No panel models configured ${theme.glyph("emdash")} /panel <question> suggests some from the catalog.`,
+    ]);
+  } finally {
+    await rm(appHome, { recursive: true, force: true });
+  }
+});
+
 test("/panel judge toggles and persists the judge setting", async () => {
   const { context, lines, appHome } = await panelHarness();
   try {
     await handleSlashCommand("/panel judge on", context);
     assert.equal(context.config.panelJudge, true);
-    assert.ok(lines.some((line) => /Panel-Richter: an/.test(line)));
+    assert.ok(lines.some((line) => /Panel judge: on/.test(line)));
 
     await handleSlashCommand("/panel judge off", context);
     assert.equal(context.config.panelJudge, false);
@@ -799,11 +869,111 @@ test("/panel judge rejects anything other than on|off", async () => {
   }
 });
 
-test("/panel show without a prior run explains itself instead of throwing", async () => {
+// ---------------------------------------------------------------------------
+// FIX-10 fix round 1 (F5): the /panel consent-point copy itself, via the
+// the shared `confirm` seam — judge-on and judge-off, preview and confirm title.
+// ---------------------------------------------------------------------------
+
+test("F5/H2: with the judge on, /panel's preview and confirm name the judging call on config.mainModel and include it in the total", async () => {
+  const { context, lines, appHome } = await panelHarness({
+    panelModels: ["a/one", "b/two"],
+    panelJudge: true,
+  });
+  context.config.mainModel = "c/three";
+  const confirmTitles: string[] = [];
+  context.confirm = async (request) => {
+    confirmTitles.push(request.title);
+    return false; // cancel — this test pins the consent-point copy only
+  };
+  try {
+    await handleSlashCommand("/panel what is the answer", context);
+
+    // Preview line: judge named, "≈ … total" carries the estimate (F9
+    // wording), and the judge is the JUDGE-priced call — F4: its estimate
+    // must exceed a bare panelist estimate for the same model.
+    const preview = lines.find((line) => line.includes("2 models"));
+    assert.ok(preview, lines.join("\n"));
+    assert.match(preview!, /^2 models \+ 1 judging call on c\/three ≈ \$\d/);
+    const judgeRow = lines.find((line) => line.includes("c/three (judge)"));
+    assert.ok(judgeRow, "the judge breakdown row must render");
+    assert.match(judgeRow!, /\$\d/);
+    // F4: the judge row's estimate is priced at the larger judge input
+    // (question + 2 × output allowance), so it must be strictly greater
+    // than the panelists' own per-call estimate on identical pricing.
+    const panelistRow = lines.find((line) => /^ {2}a\/one\s+\$\d/.test(line));
+    assert.ok(panelistRow, lines.join("\n"));
+    const usdOf = (row: string): number => Number(/\$(\d+\.\d+)/.exec(row)![1]);
+    assert.ok(
+      usdOf(judgeRow!) > usdOf(panelistRow!),
+      `judge estimate (${judgeRow}) must exceed a panelist's (${panelistRow})`,
+    );
+    // Confirm title: the consent-point copy names the judge round.
+    assert.equal(confirmTitles.length, 1);
+    assert.match(confirmTitles[0]!, /^Query 2 models in parallel \+ 1 judging call on c\/three \(≈ \$\d/);
+    // Cancel-never-success: nothing ran.
+    assert.ok(lines.some((line) => /Panel cancelled/.test(line)));
+  } finally {
+    await rm(appHome, { recursive: true, force: true });
+  }
+});
+
+test("F5/H2: with the judge off, /panel's preview and confirm are the pre-H2 copy — no judge suffix, no judge row", async () => {
+  const { context, lines, appHome } = await panelHarness({
+    panelModels: ["a/one", "b/two"],
+    panelJudge: false,
+  });
+  const confirmTitles: string[] = [];
+  context.confirm = async (request) => {
+    confirmTitles.push(request.title);
+    return false;
+  };
+  try {
+    await handleSlashCommand("/panel what is the answer", context);
+
+    const preview = lines.find((line) => line.includes("2 models"));
+    assert.ok(preview, lines.join("\n"));
+    assert.match(preview!, /^2 models × estimated ≈ \$\d/);
+    assert.ok(!lines.some((line) => line.includes("judging call")), lines.join("\n"));
+    assert.ok(!lines.some((line) => line.includes("(judge)")), lines.join("\n"));
+    assert.equal(confirmTitles.length, 1);
+    assert.match(confirmTitles[0]!, /^Query 2 models in parallel \(≈ \$\d/);
+  } finally {
+    await rm(appHome, { recursive: true, force: true });
+  }
+});
+
+test("F5/H2: an accepted judge-on run really synthesizes on config.mainModel — the model the confirm promised", async () => {
+  const { context, lines, appHome } = await panelHarness({
+    panelModels: ["a/one", "b/two"],
+    panelJudge: true,
+  });
+  context.config.mainModel = "c/three";
+  context.confirm = async () => true;
+  const calls: Array<{ model: string; question: string }> = [];
+  context.panelCall = async ({ model, question }) => {
+    calls.push({ model, question });
+    return { text: `answer from ${model}`, costUsd: 0.001, inputTokens: 10, outputTokens: 5 };
+  };
+  try {
+    await handleSlashCommand("/panel what is the answer", context);
+
+    assert.deepEqual(calls.map((call) => call.model), ["a/one", "b/two", "c/three"]);
+    const judgeCall = calls.at(-1)!;
+    // The judge input really is question + every panel answer — the larger
+    // input F4 prices, not the bare question.
+    assert.match(judgeCall.question, /answer from a\/one/);
+    assert.match(judgeCall.question, /answer from b\/two/);
+  } finally {
+    await rm(appHome, { recursive: true, force: true });
+  }
+});
+
+test("/panel show without a prior run explains itself instead of throwing, naming the one next action (D5 invitation grammar)", async () => {
   const { context, lines, appHome } = await panelHarness();
   try {
     await handleSlashCommand("/panel show 1", context);
-    assert.ok(lines.some((line) => /Noch kein Panel-Lauf/.test(line)));
+    const theme = createTheme();
+    assert.ok(lines.some((line) => line === `No panel run yet this session ${theme.glyph("emdash")} /panel <question> starts one.`));
   } finally {
     await rm(appHome, { recursive: true, force: true });
   }
@@ -821,7 +991,7 @@ test("/panel show renders the requested answer once a panel has run", async () =
     await handleSlashCommand("/panel show 2", context);
     const joined = lines.join("\n");
     assert.match(joined, /b\/two/);
-    assert.match(joined, /vollständig/);
+    assert.match(joined, /full/);
   } finally {
     await rm(appHome, { recursive: true, force: true });
   }
@@ -840,6 +1010,76 @@ test("/panel show rejects an out-of-range index with a clear message", async () 
   } finally {
     await rm(appHome, { recursive: true, force: true });
   }
+});
+
+// F6 ASCII sweep: `commandTheme` (src/commands.ts) reads the plain-CLI theme
+// from `context.config.appearance.glyphMode` (the F5 accessor fix — F4
+// review's ascii gap, ruling 5) instead of always defaulting to Unicode.
+// This drives `renderPanel`'s glyphs end-to-end through the real `/panel
+// show` command path, not just a directly-constructed ascii theme, so it
+// actually locks in that accessor wiring rather than `renderPanel`'s own
+// glyph correctness (already covered above).
+test('/panel show under glyphMode: "ascii" renders no Unicode glyphs (locks in the F5 accessor fix)', async () => {
+  const { context, lines, appHome } = await panelHarness({ glyphMode: "ascii" });
+  try {
+    // Every string here is deliberately plain ASCII, unlike this file's usual
+    // German example content (`sampleResult`/`sampleJudgment`) — the point of
+    // this test is to catch a glyph-mode leak, not to flag incidental
+    // non-ASCII fixture prose that was never in scope.
+    context.lastPanelResult = {
+      question: "Test question",
+      answers: [
+        successAnswer("a/one", "Short answer A"),
+        failedAnswer("b/two", "boom"),
+        { ...successAnswer("c/three", ""), text: "" },
+      ],
+      totalCostUsd: 0.002,
+      durationMs: 500,
+    };
+    context.lastPanelJudgment = {
+      judgeModel: "a/one",
+      text: "Answer 1 is the most thorough.",
+      costUsd: 0.004,
+      durationMs: 1_800,
+      error: null,
+    };
+    await handleSlashCommand("/panel show 1", context);
+    // Strips ANSI SGR codes first so this stays meaningful regardless of
+    // whether the test environment's chalk level is 0 — the assertion is
+    // about glyph shapes, not about color escapes leaking through.
+    const rendered = lines.join("\n").replace(/\x1b\[[0-9;]*m/g, "");
+    assert.doesNotMatch(
+      rendered,
+      /[^\x09\x0a\x20-\x7e]/,
+      `glyphMode: "ascii" must never leak a Unicode glyph: ${JSON.stringify(rendered)}`,
+    );
+  } finally {
+    await rm(appHome, { recursive: true, force: true });
+  }
+});
+
+// D5 fix round 1: `panelAskCommand`'s own auto-suggestion notice (the
+// mirror of the ascii-mode pin above, for the one code path in this family
+// that can't be driven end to end here — see `panelAutoSuggestNotice`'s own
+// doc comment in commands.ts for why `/panel <question>` itself isn't
+// exercised through `handleSlashCommand` in this suite: its unconditional
+// `confirm()` call needs a real or injected-stdin TTY, exactly like `/clear`
+// and `/allow allow-all` above).
+test('panelAutoSuggestNotice under glyphMode: "ascii" renders no Unicode glyphs, and under unicode renders the theme emdash, never a raw literal', () => {
+  const unicode = createTheme();
+  assert.equal(
+    panelAutoSuggestNotice(unicode, ["a/one", "b/two", "c/three"]),
+    `No panel configured ${unicode.glyph("emdash")} suggestion from different providers: a/one, b/two, c/three`,
+  );
+
+  const ascii = createTheme({ ascii: true, level: 0 });
+  const rendered = panelAutoSuggestNotice(ascii, ["a/one", "b/two", "c/three"]);
+  assert.doesNotMatch(
+    rendered,
+    /[^\x09\x0a\x20-\x7e]/,
+    `glyphMode: "ascii" must never leak a Unicode glyph: ${JSON.stringify(rendered)}`,
+  );
+  assert.equal(rendered, "No panel configured - suggestion from different providers: a/one, b/two, c/three");
 });
 
 test("/panel show renders as a block via onPanelResult instead of plain text, when the hook is set", async () => {
@@ -874,11 +1114,12 @@ test("/panel show renders as a block via onPanelResult instead of plain text, wh
 // seed.
 // ---------------------------------------------------------------------------
 
-test("/panel use without a prior run explains itself instead of throwing", async () => {
+test("/panel use without a prior run explains itself instead of throwing, naming the one next action (D5 invitation grammar)", async () => {
   const { context, lines, appHome } = await panelHarness();
   try {
     await handleSlashCommand("/panel use 1", context);
-    assert.ok(lines.some((line) => /Noch kein Panel-Lauf/.test(line)));
+    const theme = createTheme();
+    assert.ok(lines.some((line) => line === `No panel run yet this session ${theme.glyph("emdash")} /panel <question> starts one.`));
   } finally {
     await rm(appHome, { recursive: true, force: true });
   }
@@ -908,8 +1149,8 @@ test("/panel use rejects an answer that failed or came back empty", async () => 
       totalCostUsd: 0,
       durationMs: 500,
     };
-    await assert.rejects(handleSlashCommand("/panel use 1", context), /keinen verwendbaren Text/);
-    await assert.rejects(handleSlashCommand("/panel use 2", context), /keinen verwendbaren Text/);
+    await assert.rejects(handleSlashCommand("/panel use 1", context), /has no usable text/);
+    await assert.rejects(handleSlashCommand("/panel use 2", context), /has no usable text/);
   } finally {
     await rm(appHome, { recursive: true, force: true });
   }
@@ -928,10 +1169,10 @@ test("/panel use seeds the answer, labelled by its model, into the next message 
     context.seedNextMessage = (text) => seeded.push(text);
     await handleSlashCommand("/panel use 2", context);
     assert.equal(seeded.length, 1);
-    assert.match(seeded[0]!, /^Antwort von b\/two/);
+    assert.match(seeded[0]!, /^Answer from b\/two/);
     assert.match(seeded[0]!, /Kurze Antwort B/);
     // Confirms the seam was used, not a silent no-op.
-    assert.ok(lines.some((line) => /wird der nächsten Nachricht vorangestellt/.test(line)));
+    assert.ok(lines.some((line) => /will be prepended to the next message/.test(line)));
   } finally {
     await rm(appHome, { recursive: true, force: true });
   }
@@ -947,7 +1188,7 @@ test("/panel use prints the labelled answer directly when seedNextMessage is uns
       durationMs: 500,
     };
     await handleSlashCommand("/panel use 1", context);
-    assert.ok(lines.some((line) => /^Antwort von a\/one/.test(line) && /Kurze Antwort A/.test(line)));
+    assert.ok(lines.some((line) => /^Answer from a\/one/.test(line) && /Kurze Antwort A/.test(line)));
   } finally {
     await rm(appHome, { recursive: true, force: true });
   }

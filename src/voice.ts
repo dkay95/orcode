@@ -84,17 +84,17 @@ export class NoAudioRecorderAvailableError extends Error {
 
 function buildNoRecorderMessage(checked: readonly string[], platform: NodeJS.Platform): string {
   const tried = checked.length
-    ? `Geprüft: ${checked.join(", ")}.`
-    : "Es stand kein Aufnahmeweg zur Auswahl.";
+    ? `Checked: ${checked.join(", ")}.`
+    : "No recording path was available to choose from.";
   const hint =
     platform === "darwin"
-      ? "Installiere ffmpeg mit: brew install ffmpeg"
+      ? "Install ffmpeg with: brew install ffmpeg"
       : platform === "linux"
-        ? "Installiere ffmpeg mit: sudo apt install ffmpeg (Alternative: alsa-utils oder pulseaudio-utils für arecord/parecord)"
+        ? "Install ffmpeg with: sudo apt install ffmpeg (alternative: alsa-utils or pulseaudio-utils for arecord/parecord)"
         : platform === "win32"
-          ? "Installiere ffmpeg mit: winget install ffmpeg"
-          : "Installiere ffmpeg für dieses System.";
-  return `Kein Weg gefunden, das Mikrofon aufzunehmen. ${tried} ${hint}`;
+          ? "Install ffmpeg with: winget install ffmpeg"
+          : "Install ffmpeg for this system.";
+  return `No way found to record the microphone. ${tried} ${hint}`;
 }
 
 /** Tries every provider in order; the first one that reports itself available wins. */
@@ -214,7 +214,7 @@ async function startProcessRecording(options: ProcessRecorderOptions): Promise<R
   } catch (error) {
     await rm(dir, { recursive: true, force: true }).catch(() => {});
     throw new Error(
-      `Aufnahmeprozess (${executable}) konnte nicht gestartet werden: ${errorMessage(error)}`,
+      `Recording process (${executable}) could not be started: ${errorMessage(error)}`,
     );
   }
 
@@ -319,14 +319,14 @@ async function startProcessRecording(options: ProcessRecorderOptions): Promise<R
     autoStopped,
     async stop(): Promise<RecordedAudio> {
       if (phase !== "recording") {
-        throw new Error("Die Aufnahme wurde bereits beendet.");
+        throw new Error("The recording has already ended.");
       }
       phase = "settling";
       clearInterval(monitor);
       const audio = await finalize("SIGINT", false);
       phase = "done";
       if (!audio) {
-        throw new Error("Aufnahme konnte nicht gespeichert werden.");
+        throw new Error("Recording could not be saved.");
       }
       return audio;
     },
@@ -343,18 +343,18 @@ async function startProcessRecording(options: ProcessRecorderOptions): Promise<R
 }
 
 const MICROPHONE_PERMISSION_HINT =
-  "Kein Zugriff aufs Mikrofon. Erteile orcode die Berechtigung unter " +
-  "Systemeinstellungen → Datenschutz & Sicherheit → Mikrofon, und versuche es erneut.";
+  "No access to the microphone. Grant orcode permission under " +
+  "System Settings → Privacy & Security → Microphone, and try again.";
 
 const NO_MICROPHONE_HINT =
-  "Es wurde kein Mikrofon gefunden. Schließe ein Mikrofon an (oder aktiviere das eingebaute) und versuche es erneut.";
+  "No microphone was found. Connect a microphone (or enable the built-in one) and try again.";
 
 /**
  * Enriches a generic "file was never created" failure with what the
  * recorder actually reported on stderr — most importantly the Swift
  * program's `ORCODE_ERROR:PERMISSION_DENIED` and
  * `ORCODE_ERROR:RECORDER_INIT_FAILED` markers, which become specific,
- * actionable German messages instead of a bare "no file" error.
+ * actionable messages instead of a bare "no file" error.
  */
 function translateRecorderFailure(error: unknown, stderrText: string): Error {
   if (stderrText.includes("ORCODE_ERROR:PERMISSION_DENIED")) {
@@ -365,9 +365,9 @@ function translateRecorderFailure(error: unknown, stderrText: string): Error {
   }
   const base = error instanceof Error ? error.message : errorMessage(error);
   if (stderrText.includes("ORCODE_ERROR:")) {
-    return new Error(`Aufnahmeprogramm konnte nicht starten: ${truncate(stderrText.trim(), 400)}`);
+    return new Error(`Recording program could not start: ${truncate(stderrText.trim(), 400)}`);
   }
-  if (stderrText.trim() && /nicht erzeugt/.test(base)) {
+  if (stderrText.trim() && /was not created/.test(base)) {
     return new Error(`${base} (${truncate(stderrText.trim(), 400)})`);
   }
   return error instanceof Error ? error : new Error(base);
@@ -378,19 +378,19 @@ async function finalizeRecording(outputPath: string, startedAt: number): Promise
   try {
     info = await stat(outputPath);
   } catch (error) {
-    throw new Error(`Aufnahmedatei wurde nicht erzeugt: ${errorMessage(error)}`);
+    throw new Error(`Recording file was not created: ${errorMessage(error)}`);
   }
   if (info.size <= 44) {
     // A bare WAV header (44 bytes) with no sample data at all.
     throw new Error(
-      "Die Aufnahme ist leer. Bitte sprich, bevor du die Aufnahme stoppst, und versuche es erneut.",
+      "The recording is empty. Please speak before stopping the recording, and try again.",
     );
   }
   const buffer = await readFile(outputPath);
   const wav = analyzeWav(buffer);
   if (wav.sampleCount === 0 || wav.durationMs < MIN_USABLE_DURATION_MS) {
     throw new Error(
-      "Die Aufnahme ist leer oder zu kurz. Bitte sprich, bevor du die Aufnahme stoppst, und versuche es erneut.",
+      "The recording is empty or too short. Please speak before stopping the recording, and try again.",
     );
   }
   return {
@@ -531,7 +531,7 @@ import Foundation
 
 let commandLineArguments = CommandLine.arguments
 guard commandLineArguments.count > 1 else {
-    FileHandle.standardError.write("ORCODE_ERROR:USAGE Kein Ausgabepfad angegeben.\\n".data(using: .utf8)!)
+    FileHandle.standardError.write("ORCODE_ERROR:USAGE No output path given.\\n".data(using: .utf8)!)
     exit(64)
 }
 let outputURL = URL(fileURLWithPath: commandLineArguments[1])
@@ -644,9 +644,9 @@ export async function ensureSwiftRecorderCommand(
   }
 
   throw new Error(
-    `Swift-Aufnahmeprogramm konnte nicht vorbereitet werden: weder "swiftc" (Kompilierung) noch "swift" (Interpreter) sind lauffähig.${
+    `Swift recording program could not be prepared: neither "swiftc" (compiler) nor "swift" (interpreter) is runnable.${
       compiled.stderr ? ` Details: ${truncate(compiled.stderr, 400)}` : ""
-    } Prüfe, ob die Kommandozeilen-Tools installiert sind (xcode-select --install).`,
+    } Check whether the command-line tools are installed (xcode-select --install).`,
   );
 }
 
@@ -749,11 +749,11 @@ async function resolveFfmpegCommand(
   if (deps.platform === "win32") {
     const device = await resolveWindowsAudioDevice(deps);
     if (!device) {
-      throw new Error("Kein Audiogerät für ffmpeg (dshow) unter Windows gefunden.");
+      throw new Error("No audio device found for ffmpeg (dshow) on Windows.");
     }
     return { executable: "ffmpeg", args: ["-y", "-f", "dshow", "-i", `audio=${device}`, ...tail] };
   }
-  throw new Error(`ffmpeg-Aufnahme wird auf dieser Plattform nicht unterstützt: ${deps.platform}`);
+  throw new Error(`ffmpeg recording is not supported on this platform: ${deps.platform}`);
 }
 
 export function createFfmpegAudioRecorder(deps: FfmpegRecorderDependencies): AudioRecorder {

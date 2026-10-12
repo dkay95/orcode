@@ -1,6 +1,6 @@
 {
   "name": "orcode",
-  "version": "0.4.0",
+  "version": "0.7.0",
   "description": "A local, terminal-based coding agent CLI that runs against any tool-capable model on OpenRouter, with per-workspace cost tracking, explicit approval modes, and a separate compressor model for long context.",
   "keywords": [
     "openrouter",
@@ -24,22 +24,41 @@
   "author": "Dogancan Kaya <dogancan.kaya424@gmail.com>",
   "type": "module",
   "bin": {
-    "orcode": "./dist/cli.js"
+    "orcode": "./dist/cli.js",
+    "routercode": "./dist/cli.js"
   },
   "files": [
     "dist",
+    "!dist/**/*.js.map",
+    "!dist/**/*.d.ts",
+    "assets",
     "README.md",
     "LICENSE",
-    "NOTICE"
+    "NOTICE",
+    "CHANGELOG.md",
+    "scripts/install-user.mjs",
+    "scripts/check-package.mjs"
   ],
   "scripts": {
-    "build": "tsc -p tsconfig.json && node -e \"require('node:fs').chmodSync('dist/cli.js', 0o755)\"",
+    "build": "node -e \"require('node:fs').rmSync('dist', { recursive: true, force: true })\" && tsc -p tsconfig.json && node -e \"require('node:fs').chmodSync('dist/cli.js', 0o755)\"",
     "dev": "tsx src/cli.ts",
     "start": "node dist/cli.js",
     "test": "node --import tsx --test tests/*.test.ts",
     "check": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.tests.json --noEmit && npm test",
-    "install:user": "npm run build && node scripts/install-user.mjs",
-    "prepublishOnly": "npm run check && npm run build"
+    "check:package": "node scripts/check-package.mjs",
+    "check:release": "node scripts/check-release-metadata.mjs",
+    "test:migration": "node --import tsx --test tests/app-home-migration.test.ts tests/private-store.test.ts tests/private-store-identity-races.test.ts",
+    "test:release-regressions": "node --import tsx --test tests/cli.test.ts tests/commands.test.ts tests/openrouter.test.ts tests/models.test.ts tests/session.test.ts tests/attachments.test.ts tests/voice.test.ts tests/agent.test.ts tests/tui.test.ts",
+    "test:pty": "node scripts/check-pty.mjs && node scripts/check-pty-esc-split.mjs && node scripts/check-provider-setup-cli-pty.mjs",
+    "test:gui-dist": "node scripts/check-gui-dist.mjs",
+    "gui:dev": "node scripts/gui.mjs dev",
+    "gui:build": "node scripts/gui.mjs build",
+    "gui:package": "node scripts/gui.mjs package",
+    "gui:gate": "node scripts/gui-gate.mjs",
+    "test:gui": "npm --prefix gui test",
+    "test:journeys": "node scripts/check-journeys.mjs",
+    "install:user": "node scripts/install-user.mjs",
+    "prepublishOnly": "npm run check && npm run check:package"
   },
   "engines": {
     "node": ">=22"
@@ -48,6 +67,7 @@
     "@inquirer/prompts": "^8.5.2",
     "@napi-rs/keyring": "1.3.0",
     "@openrouter/agent": "0.8.0",
+    "@openrouter/sdk": "0.13.67",
     "chalk": "^5.6.2",
     "fast-glob": "^3.3.3",
     "zod": "^4.3.6"

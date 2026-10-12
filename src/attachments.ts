@@ -21,20 +21,20 @@ export async function inspectImageAttachment(
   const path = resolveAttachmentPath(rawPath, workspace);
   const info = await stat(path);
   if (!info.isFile()) {
-    throw new Error(`Bildpfad ist keine reguläre Datei: ${path}`);
+    throw new Error(`Image path is not a regular file: ${path}`);
   }
   if (info.size <= 0) {
-    throw new Error(`Bilddatei ist leer: ${path}`);
+    throw new Error(`Image file is empty: ${path}`);
   }
   if (info.size > MAX_IMAGE_BYTES) {
     throw new Error(
-      `Bild ist größer als ${formatBytes(MAX_IMAGE_BYTES)}: ${formatBytes(info.size)}`,
+      `Image is larger than ${formatBytes(MAX_IMAGE_BYTES)}: ${formatBytes(info.size)}`,
     );
   }
   const mimeType = await detectImageMimeType(path);
   if (!mimeType) {
     throw new Error(
-      "Nicht unterstütztes Bildformat. Erlaubt sind PNG, JPEG, GIF und WebP.",
+      "Unsupported image format. Allowed: PNG, JPEG, GIF, and WebP.",
     );
   }
   return {
@@ -71,7 +71,7 @@ export async function imageAttachmentDataUrls(
       total += entry.size;
       if (total > MAX_TOTAL_IMAGE_BYTES) {
         throw new Error(
-          `Alle Bilder zusammen dürfen höchstens ${formatBytes(MAX_TOTAL_IMAGE_BYTES)} groß sein (aktuell ${formatBytes(total)}).`,
+          `All images together may be at most ${formatBytes(MAX_TOTAL_IMAGE_BYTES)} (currently ${formatBytes(total)}).`,
         );
       }
     }
@@ -80,7 +80,7 @@ export async function imageAttachmentDataUrls(
       const data = await entry.handle.readFile();
       if (data.length !== entry.size) {
         throw new Error(
-          `Bilddatei wurde während des Sendens verändert: ${entry.attachment.path}`,
+          `Image file was changed while sending: ${entry.attachment.path}`,
         );
       }
       urls.push(
@@ -146,7 +146,7 @@ export function attachmentPromptSummary(
   if (!attachments.length) {
     return "";
   }
-  return `Angehängte Bilder: ${attachments
+  return `Attached images: ${attachments
     .map((attachment) => `${attachment.name} (${attachment.mimeType})`)
     .join(", ")}`;
 }
@@ -164,7 +164,7 @@ export function formatBytes(value: number): string {
 function assertAttachmentCount(attachments: readonly ImageAttachment[]): void {
   if (attachments.length > MAX_IMAGE_ATTACHMENTS) {
     throw new Error(
-      `Maximal ${MAX_IMAGE_ATTACHMENTS} Bilder können gleichzeitig angehängt werden.`,
+      `At most ${MAX_IMAGE_ATTACHMENTS} images can be attached at the same time.`,
     );
   }
 }
@@ -172,7 +172,7 @@ function assertAttachmentCount(attachments: readonly ImageAttachment[]): void {
 function assertTotalSize(total: number): void {
   if (total > MAX_TOTAL_IMAGE_BYTES) {
     throw new Error(
-      `Alle Bilder zusammen dürfen höchstens ${formatBytes(MAX_TOTAL_IMAGE_BYTES)} groß sein (aktuell ${formatBytes(total)}).`,
+      `All images together may be at most ${formatBytes(MAX_TOTAL_IMAGE_BYTES)} (currently ${formatBytes(total)}).`,
     );
   }
 }
@@ -184,17 +184,17 @@ async function verifyOpenAttachment(
 ): Promise<number> {
   const info = await handle.stat();
   if (!info.isFile() || info.size <= 0) {
-    throw new Error(`Bilddatei ist nicht mehr verwendbar: ${attachment.path}`);
+    throw new Error(`Image file is no longer usable: ${attachment.path}`);
   }
   if (info.size > MAX_IMAGE_BYTES) {
     throw new Error(
-      `Bild ist größer als ${formatBytes(MAX_IMAGE_BYTES)}: ${formatBytes(info.size)} (${attachment.path})`,
+      `Image is larger than ${formatBytes(MAX_IMAGE_BYTES)}: ${formatBytes(info.size)} (${attachment.path})`,
     );
   }
   const mimeType = await readImageMimeType(handle);
   if (mimeType !== attachment.mimeType) {
     throw new Error(
-      `Bilddatei wurde seit dem Anhängen verändert: ${attachment.path}`,
+      `Image file was changed since it was attached: ${attachment.path}`,
     );
   }
   return info.size;
@@ -219,7 +219,7 @@ function resolveAttachmentPath(rawPath: string, workspace: string): string {
     value = join(homedir(), value.slice(2));
   }
   if (!value) {
-    throw new Error("Kein Bildpfad angegeben.");
+    throw new Error("No image path given.");
   }
   return isAbsolute(value) ? resolve(value) : resolve(workspace, value);
 }

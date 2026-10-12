@@ -17,8 +17,9 @@ import {
 import { redactSensitive } from "../src/session.js";
 import type { ModelInfo } from "../src/types.js";
 
-const INFERENCE_KEY = "sk-or-v1-this-is-a-test-secret";
-const MANAGEMENT_KEY = "sk-or-v1-this-is-a-management-secret";
+const TEST_KEY_PREFIX = `${["sk", "or", "v1"].join("-")}-`;
+const INFERENCE_KEY = `${TEST_KEY_PREFIX}this-is-a-test-secret`;
+const MANAGEMENT_KEY = `${TEST_KEY_PREFIX}this-is-a-management-secret`;
 
 interface RecordedCall {
   url: string;
@@ -99,19 +100,19 @@ function model(overrides: Partial<ModelInfo> & { id: string }): ModelInfo {
 
 test("API key is required and short keys are rejected", () => {
   const service = new OpenRouterService();
-  assert.throws(() => service.requireKey(), /Kein OpenRouter API-Key/);
-  assert.throws(() => service.setKey("short"), /ungültig/);
+  assert.throws(() => service.requireKey(), /No OpenRouter API key/);
+  assert.throws(() => service.setKey("short"), /invalid/);
 });
 
 test("key origins track keychain loading, replacement, and forgetting", () => {
   const service = new OpenRouterService(
-    "sk-or-v1-this-is-a-keychain-test-secret",
+    `${TEST_KEY_PREFIX}this-is-a-keychain-test-secret`,
     undefined,
     { inference: "keychain" },
   );
   assert.equal(service.keyOrigin, "keychain");
 
-  service.setKey("sk-or-v1-this-is-an-interactive-test-secret");
+  service.setKey(`${TEST_KEY_PREFIX}this-is-an-interactive-test-secret`);
   assert.equal(service.keyOrigin, "interactive");
 
   service.forgetKey();
@@ -131,16 +132,451 @@ test("errors redact the in-memory key", () => {
 test("management key has separate in-memory lifecycle", () => {
   const service = new OpenRouterService(INFERENCE_KEY);
   assert.equal(service.hasManagementKey, false);
-  assert.throws(() => service.setManagementKey("short"), /ungültig/);
+  assert.throws(() => service.setManagementKey("short"), /invalid/);
   service.setManagementKey(MANAGEMENT_KEY);
   assert.equal(service.hasManagementKey, true);
   service.forgetManagementKey();
   assert.equal(service.hasManagementKey, false);
 });
 
+test("credential validity, connectivity, and credit remain independent runtime states", async () => {
+  const service = new OpenRouterService(
+    INFERENCE_KEY,
+    MANAGEMENT_KEY,
+    { inference: "keychain", management: "keychain" },
+    {
+      fetchImpl: async (url) =>
+        url.endsWith("/credits")
+          ? creditsResponse()
+          : keyResponse({ is_management_key: false }),
+    },
+  );
+
+  assert.deepEqual(service.runtimeState, {
+    inferenceValidity: "unknown",
+    managementValidity: "unknown",
+    connectivity: "unknown",
+    credit: "unknown",
+  });
+
+  await service.checkBalance();
+  assert.deepEqual(service.runtimeState, {
+    inferenceValidity: "valid",
+    managementValidity: "unknown",
+    connectivity: "connected",
+    credit: "available",
+  });
+
+  const leaked = service.runtimeState as { connectivity: string };
+  leaked.connectivity = "disconnected";
+  assert.equal(service.runtimeState.connectivity, "connected");
+});
+
+for (const fixture of [
+  {
+    name: "HTTP 503",
+    response: jsonResponse({ error: { message: "credits unavailable" } }, { status: 503 }),
+  },
+  {
+    name: "DNS failure",
+    failure: Object.assign(new TypeError("credits fetch failed"), {
+      cause: { code: "ENOTFOUND" },
+    }),
+  },
+] as const) {
+  test(`active-scope credits ${fixture.name} preserves successful key connectivity and validity`, async () => {
+    const service = new OpenRouterService(INFERENCE_KEY, undefined, {}, {
+      clock: { sleep: async () => undefined },
+      fetchImpl: async () => {
+        if ("failure" in fixture) throw fixture.failure;
+        return fixture.response.clone();
+      },
+    });
+    service.activateValidatedKey(INFERENCE_KEY, "keychain", {
+      key: { limitRemaining: 5 },
+      credits: { totalCredits: 10, totalUsage: 4, remaining: 6 },
+    });
+
+    await assert.rejects(service.getCredits(INFERENCE_KEY, undefined, "inference"));
+
+    assert.equal(service.runtimeState.inferenceValidity, "valid");
+    assert.equal(service.runtimeState.connectivity, "connected");
+    assert.equal(service.runtimeState.credit, "unknown");
+    assert.equal(service.hasKey, true);
+  });
+}
+
+test("active-scope credits caller abort preserves successful key connectivity and validity", async () => {
+  const controller = new AbortController();
+  controller.abort(new DOMException("caller cancelled credits", "AbortError"));
+  const service = new OpenRouterService(INFERENCE_KEY);
+  service.activateValidatedKey(INFERENCE_KEY, "keychain", {
+    key: { limitRemaining: 5 },
+    credits: { totalCredits: 10, totalUsage: 4, remaining: 6 },
+  });
+
+  await assert.rejects(
+    service.getCredits(INFERENCE_KEY, controller.signal, "inference"),
+    (error: unknown) => error instanceof DOMException && error.name === "AbortError",
+  );
+
+  assert.equal(service.runtimeState.inferenceValidity, "valid");
+  assert.equal(service.runtimeState.connectivity, "connected");
+  assert.equal(service.runtimeState.credit, "available");
+  assert.equal(service.hasKey, true);
+});
+
+test("only a genuine active-scope 401 rejects a credential while permission and credit stay orthogonal", async (t) => {
+  const fixtures = [
+    {
+      name: "inference 401",
+      response: jsonResponse({ error: { message: "unauthorized" } }, { status: 401 }),
+      expectedValidity: "rejected",
+      expectedConnectivity: "connected",
+      expectedCredit: "unknown",
+    },
+    {
+      name: "permission 403",
+      response: jsonResponse({ error: { message: "forbidden" } }, { status: 403 }),
+      expectedValidity: "unknown",
+      expectedConnectivity: "connected",
+      expectedCredit: "unknown",
+    },
+    {
+      name: "insufficient credit 402",
+      response: jsonResponse({ error: { message: "payment required" } }, { status: 402 }),
+      expectedValidity: "unknown",
+      expectedConnectivity: "connected",
+      expectedCredit: "insufficient",
+    },
+    {
+      name: "final provider 503",
+      response: jsonResponse({ error: { message: "provider unavailable" } }, { status: 503 }),
+      expectedValidity: "unknown",
+      expectedConnectivity: "disconnected",
+      expectedCredit: "unknown",
+    },
+  ] as const;
+
+  for (const fixture of fixtures) {
+    await t.test(fixture.name, async () => {
+      const service = new OpenRouterService(INFERENCE_KEY, undefined, {}, {
+        clock: { sleep: async () => undefined },
+        fetchImpl: async () => fixture.response.clone(),
+      });
+      await assert.rejects(service.getCurrentKey());
+      assert.equal(service.hasKey, true);
+      assert.equal(service.runtimeState.inferenceValidity, fixture.expectedValidity);
+      assert.equal(service.runtimeState.connectivity, fixture.expectedConnectivity);
+      assert.equal(service.runtimeState.credit, fixture.expectedCredit);
+    });
+  }
+});
+
+test("management candidate failures redact the candidate and never mutate active runtime state", async () => {
+  const candidate = `${TEST_KEY_PREFIX}${["candidate", "transport", "secret"].join("-")}`;
+  let candidateCall = false;
+  const service = new OpenRouterService(
+    INFERENCE_KEY,
+    MANAGEMENT_KEY,
+    { inference: "keychain", management: "keychain" },
+    {
+      clock: { sleep: async () => undefined },
+      fetchImpl: async (url, init) => {
+        if (bearerOf(init) === `Bearer ${candidate}`) {
+          candidateCall = true;
+          throw Object.assign(new TypeError(`transport failed for ${candidate}`), {
+            cause: { code: "ENOTFOUND" },
+          });
+        }
+        return url.endsWith("/credits")
+          ? creditsResponse()
+          : keyResponse({ is_management_key: false });
+      },
+    },
+  );
+  await service.checkBalance();
+  const before = service.runtimeState;
+
+  await assert.rejects(service.validateManagementKey(candidate), (error: unknown) => {
+    assert.doesNotMatch(String(error), new RegExp(candidate));
+    assert.doesNotMatch(service.safeMessage(error), new RegExp(candidate));
+    assert.match(service.safeMessage(error), /internet connection|DNS/i);
+    return true;
+  });
+
+  assert.equal(candidateCall, true);
+  assert.deepEqual(service.runtimeState, before);
+  assert.equal(service.requireKey(), INFERENCE_KEY);
+  assert.equal(service.hasManagementKey, true);
+});
+
+test("inference candidate validation uses the candidate scope without replacing active state", async () => {
+  const candidate = `${TEST_KEY_PREFIX}${["inference", "candidate", "secret"].join("-")}`;
+  const service = new OpenRouterService(
+    INFERENCE_KEY,
+    undefined,
+    { inference: "keychain" },
+    {
+      fetchImpl: async (_url, init) => {
+        assert.equal(bearerOf(init), `Bearer ${candidate}`);
+        return keyResponse({
+          is_management_key: false,
+          limit: 25,
+          limit_remaining: 20,
+        });
+      },
+    },
+  );
+  const before = service.runtimeState;
+
+  const balance = await service.validateInferenceKey(candidate);
+
+  assert.equal(balance.key.limitRemaining, 20);
+  assert.equal(balance.capabilities?.creditsSource, "none");
+  assert.deepEqual(service.runtimeState, before);
+  assert.equal(service.requireKey(), INFERENCE_KEY);
+  assert.equal(service.keyOrigin, "keychain");
+});
+
+test("candidate validation stays isolated even when candidate bytes equal an active key", async (t) => {
+  await t.test("inference candidate", async () => {
+    let reject = false;
+    const service = new OpenRouterService(
+      INFERENCE_KEY,
+      undefined,
+      { inference: "keychain" },
+      {
+        fetchImpl: async () => reject
+          ? jsonResponse({ error: { message: "candidate unauthorized" } }, { status: 401 })
+          : keyResponse({ is_management_key: false, limit: 10, limit_remaining: 9 }),
+      },
+    );
+    await service.checkBalance();
+    assert.equal(service.runtimeState.inferenceValidity, "valid");
+    reject = true;
+
+    await assert.rejects(service.validateInferenceKey(INFERENCE_KEY));
+
+    assert.equal(service.runtimeState.inferenceValidity, "valid");
+    assert.equal(service.runtimeState.connectivity, "connected");
+  });
+
+  await t.test("management candidate", async () => {
+    let reject = false;
+    const service = new OpenRouterService(
+      INFERENCE_KEY,
+      MANAGEMENT_KEY,
+      { inference: "keychain", management: "keychain" },
+      {
+        fetchImpl: async (url) => {
+          if (url.endsWith("/credits")) {
+            return reject
+              ? jsonResponse({ error: { message: "candidate unauthorized" } }, { status: 401 })
+              : creditsResponse();
+          }
+          return keyResponse({ is_management_key: false });
+        },
+      },
+    );
+    await service.checkBalance();
+    assert.equal(service.runtimeState.managementValidity, "unknown");
+    reject = true;
+
+    await assert.rejects(service.validateManagementKey(MANAGEMENT_KEY));
+
+    assert.equal(service.runtimeState.managementValidity, "unknown");
+    assert.equal(service.runtimeState.connectivity, "connected");
+  });
+});
+
+test("candidate-safe key inspection preserves missing identity and usage as unknown", async () => {
+  const candidate = `${TEST_KEY_PREFIX}${["inspection", "candidate", "secret"].join("-")}`;
+  const service = new OpenRouterService(INFERENCE_KEY, MANAGEMENT_KEY, {
+    inference: "keychain",
+    management: "keychain",
+  }, {
+    fetchImpl: async (_url, init) => {
+      assert.equal(bearerOf(init), `Bearer ${candidate}`);
+      return jsonResponse({
+        data: {
+          label: "Sparse documented response",
+          is_management_key: false,
+          expires_at: null,
+        },
+      });
+    },
+  });
+  service.activateValidatedKey(INFERENCE_KEY, "keychain", {
+    key: { limitRemaining: 5 },
+    credits: { totalCredits: 10, totalUsage: 4, remaining: 6 },
+  });
+  service.activateValidatedManagementKey(MANAGEMENT_KEY, "keychain", {
+    totalCredits: 10,
+    totalUsage: 4,
+    remaining: 6,
+  });
+  const before = service.runtimeState;
+
+  const inspected = await service.inspectKey(candidate);
+
+  assert.equal(inspected.creatorUserId, undefined);
+  assert.equal(inspected.usage, undefined);
+  assert.equal(inspected.usageDaily, undefined);
+  assert.equal(inspected.usageWeekly, undefined);
+  assert.equal(inspected.usageMonthly, undefined);
+  assert.equal(inspected.limit, null);
+  assert.equal(inspected.limitRemaining, null);
+  assert.equal(inspected.expiresAt, null);
+  assert.deepEqual(service.runtimeState, before);
+  assert.equal(service.requireKey(), INFERENCE_KEY);
+});
+
+test("candidate-safe key inspection parses documented creator identity without exposing it to active state", async () => {
+  const candidate = `${TEST_KEY_PREFIX}${["identity", "candidate", "secret"].join("-")}`;
+  const creator = ["documented", "creator", "fixture"].join("_");
+  const service = new OpenRouterService(INFERENCE_KEY, undefined, { inference: "keychain" }, {
+    fetchImpl: async () => keyResponse({ creator_user_id: creator }),
+  });
+  const before = service.runtimeState;
+
+  const inspected = await service.inspectKey(candidate);
+
+  assert.equal(inspected.creatorUserId, creator);
+  assert.deepEqual(service.runtimeState, before);
+  assert.equal(service.requireKey(), INFERENCE_KEY);
+});
+
+test("candidate-safe key inspection never coerces malformed numeric metadata to zero", async () => {
+  const candidate = `${TEST_KEY_PREFIX}${["numeric", "candidate", "secret"].join("-")}`;
+  const service = new OpenRouterService(INFERENCE_KEY, undefined, {}, {
+    fetchImpl: async () => keyResponse({
+      limit: "not-a-number",
+      limit_remaining: "not-a-number",
+      usage: "not-a-number",
+      usage_daily: "not-a-number",
+      usage_weekly: "not-a-number",
+      usage_monthly: "not-a-number",
+    }),
+  });
+
+  const inspected = await service.inspectKey(candidate);
+
+  assert.equal(inspected.limit, null);
+  assert.equal(inspected.limitRemaining, null);
+  assert.equal(inspected.usage, undefined);
+  assert.equal(inspected.usageDaily, undefined);
+  assert.equal(inspected.usageWeekly, undefined);
+  assert.equal(inspected.usageMonthly, undefined);
+});
+
+test("inspection model loading does not populate or replace the active model cache", async () => {
+  const service = new OpenRouterService(INFERENCE_KEY, undefined, {}, {
+    fetchImpl: async () => jsonResponse(MODEL_PAYLOAD),
+  });
+  assert.equal(service.modelCacheAgeMs(), null);
+
+  const models = await service.inspectModels();
+
+  assert.equal(models.length, 3);
+  assert.equal(service.modelCacheAgeMs(), null);
+});
+
+test("active inference and management scopes never collide when their key bytes are equal", async () => {
+  const shared = `${TEST_KEY_PREFIX}same-bytes-two-active-slots-123`;
+  let rejectInference = false;
+  const service = new OpenRouterService(
+    shared,
+    shared,
+    { inference: "keychain", management: "keychain" },
+    {
+      fetchImpl: async (url) => {
+        if (url.endsWith("/credits")) return creditsResponse();
+        return rejectInference
+          ? jsonResponse({ error: { message: "inference unauthorized" } }, { status: 401 })
+          : keyResponse({ is_management_key: false });
+      },
+    },
+  );
+
+  await service.checkBalance();
+  assert.equal(service.runtimeState.inferenceValidity, "valid");
+  assert.equal(service.runtimeState.managementValidity, "unknown");
+  assert.equal(service.runtimeState.credit, "available");
+
+  rejectInference = true;
+  await assert.rejects(service.getCurrentKey());
+  assert.equal(service.runtimeState.inferenceValidity, "rejected");
+  assert.equal(service.runtimeState.managementValidity, "unknown");
+});
+
+test("a management 401 rejects only the management credential and keeps the inference key active", async () => {
+  let rejectManagement = false;
+  const service = new OpenRouterService(
+    INFERENCE_KEY,
+    MANAGEMENT_KEY,
+    { inference: "keychain", management: "keychain" },
+    {
+      fetchImpl: async (url) => {
+        if (url.endsWith("/credits")) {
+          return rejectManagement
+            ? jsonResponse({ error: { message: "management unauthorized" } }, { status: 401 })
+            : creditsResponse();
+        }
+        return keyResponse({ is_management_key: false });
+      },
+    },
+  );
+
+  await service.checkBalance();
+  rejectManagement = true;
+  const fallback = await service.checkBalance();
+
+  assert.equal(fallback.credits, undefined);
+  assert.equal(service.runtimeState.inferenceValidity, "valid");
+  assert.equal(service.runtimeState.managementValidity, "unknown");
+  assert.equal(service.runtimeState.connectivity, "connected");
+  assert.equal(service.runtimeState.credit, "unavailable");
+  assert.equal(service.hasKey, true);
+  assert.equal(service.hasManagementKey, true);
+});
+
+test("permission, limits, expiry metadata, and offline failures never erase last-known credential validity", async () => {
+  let mode: "valid" | "forbidden" | "limited" | "offline" = "valid";
+  const service = new OpenRouterService(INFERENCE_KEY, undefined, {}, {
+    clock: { sleep: async () => undefined },
+    fetchImpl: async () => {
+      if (mode === "forbidden") {
+        return jsonResponse({ error: { message: "forbidden" } }, { status: 403 });
+      }
+      if (mode === "limited") {
+        return jsonResponse({ error: { message: "slow down" } }, { status: 429 });
+      }
+      if (mode === "offline") {
+        throw Object.assign(new TypeError("fetch failed after HTTP 401 text"), {
+          cause: { code: "ENETUNREACH" },
+        });
+      }
+      return keyResponse({ expires_at: "2000-01-01T00:00:00.000Z" });
+    },
+  });
+
+  await service.getCurrentKey();
+  assert.equal(service.runtimeState.inferenceValidity, "valid");
+
+  for (const failureMode of ["forbidden", "limited", "offline"] as const) {
+    mode = failureMode;
+    await assert.rejects(service.getCurrentKey());
+    assert.equal(service.runtimeState.inferenceValidity, "valid", failureMode);
+    assert.equal(service.hasKey, true, failureMode);
+  }
+  assert.equal(service.runtimeState.connectivity, "disconnected");
+});
+
 test("session redaction removes pasted API keys", () => {
+  const genericKey = `${["sk", ""].join("-")}${"abcdefghijklmnopqrstuv"}`;
   const redacted = redactSensitive(
-    "one sk-or-v1-abcdefghijklmnopqrstuvwxyz and sk-abcdefghijklmnopqrstuv",
+    `one ${TEST_KEY_PREFIX}abcdefghijklmnopqrstuvwxyz and ${genericKey}`,
   );
   assert.doesNotMatch(redacted, /abcdefghijklmnopqrstuvwxyz/);
   assert.match(redacted, /\[REDACTED_OPENROUTER_KEY\]/);
@@ -163,7 +599,7 @@ test("reiner Inference-Key spart sich die nutzlose /credits-Runde", async () => 
     assert.equal(balance.credits, undefined);
     assert.equal(balance.capabilities?.creditsSource, "none");
     assert.equal(balance.capabilities?.accountCredits, false);
-    assert.match(balance.creditsUnavailableReason ?? "", /Management-Key/);
+    assert.match(balance.creditsUnavailableReason ?? "", /management key/i);
   } finally {
     stub.restore();
   }
@@ -203,7 +639,7 @@ test("gesetzter Management-Key wird für /credits benutzt", async () => {
     assert.equal(bearerOf(stub.calls[0]!.init), `Bearer ${INFERENCE_KEY}`);
     assert.equal(bearerOf(stub.calls[1]!.init), `Bearer ${MANAGEMENT_KEY}`);
     assert.equal(balance.capabilities?.creditsSource, "management-key");
-    assert.match(balance.capabilities?.summary ?? "", /Management-Key/);
+    assert.match(balance.capabilities?.summary ?? "", /management key/i);
   } finally {
     stub.restore();
   }
@@ -220,7 +656,7 @@ test("abgelehnter Management-Key fällt auf das Key-Limit zurück", async () => 
     const balance = await service.checkBalance();
     assert.equal(balance.credits, undefined);
     assert.equal(balance.capabilities?.accountCredits, false);
-    assert.match(balance.creditsUnavailableReason ?? "", /abgelehnt/);
+    assert.match(balance.creditsUnavailableReason ?? "", /rejected/);
   } finally {
     stub.restore();
   }
@@ -255,14 +691,14 @@ test("HTTP-Fehler werden in klare deutsche Handlungsanweisungen übersetzt", () 
     message: RegExp;
     action: RegExp;
   }> = [
-    { status: 401, kind: "auth", message: /abgelehnt/, action: /\/key set/ },
-    { status: 402, kind: "credits", message: /Guthaben/, action: /credits/ },
-    { status: 403, kind: "permission", message: /verweigert/, action: /Management-Key/ },
-    { status: 404, kind: "not-found", message: /kennt dieses Modell/, action: /\/model/ },
-    { status: 408, kind: "timeout", message: /Zeitüberschreitung/, action: /erneut/ },
-    { status: 429, kind: "rate-limit", message: /Rate-Limit/, action: /erneut/ },
-    { status: 500, kind: "provider", message: /Störung/, action: /warten/ },
-    { status: 400, kind: "invalid-request", message: /abgelehnt/, action: /Modell-ID/ },
+    { status: 401, kind: "auth", message: /rejected/, action: /\/key set/ },
+    { status: 402, kind: "credits", message: /credit/i, action: /credits/ },
+    { status: 403, kind: "permission", message: /denied/, action: /management key/i },
+    { status: 404, kind: "not-found", message: /doesn't know this model/, action: /\/model/ },
+    { status: 408, kind: "timeout", message: /timeout/i, action: /again/i },
+    { status: 429, kind: "rate-limit", message: /rate limit/i, action: /again/i },
+    { status: 500, kind: "provider", message: /outage/i, action: /wait/i },
+    { status: 400, kind: "invalid-request", message: /rejected/, action: /model ID/i },
   ];
   for (const expectation of cases) {
     const failure = describeOpenRouterFailure(
@@ -281,7 +717,7 @@ test("Rate-Limit nennt die Wartezeit aus Retry-After", () => {
     new OpenRouterHttpError(429, "slow down", { retryAfterMs: 30_000 }),
   );
   assert.equal(failure.retryAfterMs, 30_000);
-  assert.match(failure.action, /30 Sekunden/);
+  assert.match(failure.action, /30 seconds/);
 });
 
 test("Netz-, DNS-, Timeout- und Abbruchfehler werden unterschieden", () => {
@@ -299,21 +735,21 @@ test("Netz-, DNS-, Timeout- und Abbruchfehler werden unterschieden", () => {
     }),
   );
   assert.equal(refused.kind, "network");
-  assert.match(refused.action, /Proxy/);
+  assert.match(refused.action, /proxy/i);
 
   const timeout = describeOpenRouterFailure(
     Object.assign(new Error("The operation timed out"), { name: "TimeoutError" }),
   );
   assert.equal(timeout.kind, "timeout");
-  assert.match(timeout.message, /Zeitüberschreitung/);
+  assert.match(timeout.message, /timeout/i);
 
   const cancelled = describeOpenRouterFailure(
-    Object.assign(new Error("Der aktuelle Lauf wurde abgebrochen."), {
+    Object.assign(new Error("The current run was cancelled."), {
       name: "AbortError",
     }),
   );
   assert.equal(cancelled.kind, "cancelled");
-  assert.equal(cancelled.message, "Der aktuelle Lauf wurde abgebrochen.");
+  assert.equal(cancelled.message, "The current run was cancelled.");
 });
 
 test("ungültiger Key liefert Klartext statt rohem HTTP 401 und bleibt redigiert", async () => {
@@ -329,7 +765,7 @@ test("ungültiger Key liefert Klartext statt rohem HTTP 401 und bleibt redigiert
       assert.ok(error instanceof OpenRouterHttpError);
       assert.equal(error.status, 401);
       const safe = service.safeMessage(error);
-      assert.match(safe, /OpenRouter hat den API-Key abgelehnt/);
+      assert.match(safe, /OpenRouter rejected the API key/);
       assert.match(safe, /openrouter\.ai\/keys/);
       assert.match(safe, /Details: /);
       assert.match(safe, /\[REDACTED\]/);
@@ -351,7 +787,7 @@ test("Netzfehler der REST-Schicht wird übersetzt weitergereicht", async () => {
     const service = new OpenRouterService(INFERENCE_KEY);
     await assert.rejects(service.getCurrentKey(), (error: unknown) => {
       assert.match(String(error), /DNS/);
-      assert.match(service.safeMessage(error), /Internetverbindung/);
+      assert.match(service.safeMessage(error), /internet connection/i);
       return true;
     });
   } finally {
@@ -572,7 +1008,7 @@ test("Modellfilter arbeiten auf Kontext, Preis, Fähigkeiten und Text", () => {
 // Reconnect as a real operation
 // --------------------------------------------------------------------------
 
-test("reconnect baut Verbindung neu auf, prüft den Key und leert den Modellcache", async () => {
+test("invalidateModelCache erzwingt beim nächsten listModels einen frischen Katalog-Abruf", async () => {
   let modelFetches = 0;
   const stub = stubFetch((url) => {
     if (url.endsWith("/models")) {
@@ -590,17 +1026,17 @@ test("reconnect baut Verbindung neu auf, prüft den Key und leert den Modellcach
     await service.listModels();
     assert.equal(modelFetches, 1);
 
-    const report = await service.reconnect();
-    assert.equal(report.clientRebuilt, true);
-    assert.equal(report.modelCacheCleared, true);
-    assert.equal(report.credits?.remaining, 6);
-    assert.equal(report.capabilities?.creditsSource, "inference-key");
+    // FIX-15 fix round 1 (F2c): `OpenRouterService.reconnect()` is gone —
+    // the retired `/reconnect` was its only production caller, and a layer
+    // kept alive by its own tests is the definition of a dead one. What the
+    // owner-facing path must still guarantee is what this test now pins
+    // directly: invalidating the cache really does force a refetch, and the
+    // provider runtime's reconnect calls exactly this (cli.ts, F2b).
+    service.invalidateModelCache();
     assert.equal(service.modelCacheAgeMs(), null);
-    assert.match(report.message, /Modell-Cache/);
-    assert.equal(report.steps.length, 3);
 
     await service.listModels();
-    assert.equal(modelFetches, 2, "nach /reconnect wird die Liste neu geladen");
+    assert.equal(modelFetches, 2, "after a reconnect the catalogue is fetched again");
   } finally {
     stub.restore();
   }
@@ -611,7 +1047,7 @@ test("Schlüsselwechsel verwirft zwischengespeicherte Clients", () => {
   const first = service.client({ scope: "main" });
   assert.equal(service.client({ scope: "main" }), first);
   assert.notEqual(service.client({ scope: "compressor" }), first);
-  service.setKey("sk-or-v1-this-is-another-test-secret");
+  service.setKey(`${TEST_KEY_PREFIX}this-is-another-test-secret`);
   assert.notEqual(service.client({ scope: "main" }), first);
 });
 
@@ -637,8 +1073,8 @@ test("providerField reicht nur gesetzte Felder durch", () => {
     dataCollection: "deny",
   });
   assert.deepEqual(
-    providerField({ sort: "price", only: ["anthropic"], ignore: [] }),
-    { sort: "price", only: ["anthropic"] },
+    providerField({ sort: "price", only: ["anthropic"], ignore: [], allowFallbacks: false }),
+    { sort: "price", only: ["anthropic"], allowFallbacks: false },
   );
   assert.deepEqual(providerField({}), {});
 });
@@ -652,7 +1088,7 @@ test("providerSwitchNotice meldet nur einen tatsächlichen Wechsel", () => {
   assert.deepEqual(notice, {
     level: "info",
     code: "provider-switch",
-    message: "Anbieter gewechselt: anthropic → openai.",
+    message: "Provider switched: anthropic → openai.",
   });
 });
 

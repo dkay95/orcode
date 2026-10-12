@@ -1,11 +1,12 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readdir } from "node:fs/promises";
+import { existsSync } from "node:fs";
+import { mkdtemp, readdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test, { mock } from "node:test";
 import { ApprovalManager } from "../src/approval.js";
 import { RuleStore, rulesPath } from "../src/rules.js";
-import { WorkspaceGuard } from "../src/workspace.js";
+import { WorkspaceGuard, type ProcessResult } from "../src/workspace.js";
 import {
   DEFAULT_VERIFY_CONFIG,
   VERIFY_MAX_ROUNDS,
@@ -138,6 +139,35 @@ test("aborting between two commands cancels before the second one runs", needsPo
   assert.equal(events[0]?.command, "echo first");
 });
 
+test("abort synchronously from onProcessEnd wins over verifier exit 0 and exit 1", needsPosixShell, async (t) => {
+  for (const exitCode of [0, 1] as const) {
+    await t.test(`exit ${exitCode}`, async () => {
+      const guard = await tempWorkspace();
+      const controller = new AbortController();
+      const { onEvent, events } = collect();
+      const lifecycle: string[] = [];
+
+      const outcome = await runVerify(
+        [`exit ${exitCode}`],
+        guard,
+        controller.signal,
+        onEvent,
+        {
+          onProcessStart: () => lifecycle.push("start"),
+          onProcessEnd: () => {
+            lifecycle.push("end");
+            controller.abort();
+          },
+        },
+      );
+
+      assert.deepEqual(outcome, { status: "cancelled" });
+      assert.deepEqual(events, []);
+      assert.deepEqual(lifecycle, ["start", "end"]);
+    });
+  }
+});
+
 // ---------------------------------------------------------------------------
 // Behaviour: sequential execution, stop-at-first-failure, event shape.
 // ---------------------------------------------------------------------------
@@ -154,6 +184,62 @@ test("runVerify passes when every command exits 0", needsPosixShell, async () =>
   assert.equal(events[1]?.exitCode, 0);
   assert.ok(events.every((event) => typeof event.durationMs === "number" && event.durationMs >= 0));
   assert.ok(events.every((event) => typeof event.timestamp === "number"));
+});
+
+test("runVerify streams separated output while the child is alive with one stable operation terminal", needsPosixShell, async () => {
+  const guard = await tempWorkspace();
+  const marker = join(tmpdir(), `routercode-verify-live-${Date.now()}-${Math.random()}`);
+  const { onEvent } = collect();
+  const lifecycle: Array<{ kind: string; id: string; stream?: string; text?: string }> = [];
+  let firstChunkWasLive = false;
+  const script = [
+    "const fs=require('node:fs')",
+    `fs.writeFileSync(${JSON.stringify(marker)}, 'alive')`,
+    "process.stdout.write('verify-out\\n')",
+    "setTimeout(() => process.stderr.write('verify-err\\n'), 30)",
+    `setTimeout(() => fs.unlinkSync(${JSON.stringify(marker)}), 80)`,
+  ].join(";");
+
+  const outcome = await runVerify(
+    [`${JSON.stringify(process.execPath)} -e ${JSON.stringify(script)}`],
+    guard,
+    undefined,
+    onEvent,
+    {
+      onProcessStart: (operation: { id: string }) => lifecycle.push({ kind: "start", id: operation.id }),
+      onProcessChunk: (operation: { id: string }, stream: string, text: string) => {
+        if (!lifecycle.some((event) => event.kind === "chunk")) firstChunkWasLive = existsSync(marker);
+        lifecycle.push({ kind: "chunk", id: operation.id, stream, text });
+      },
+      onProcessEnd: (operation: { id: string }) => lifecycle.push({ kind: "end", id: operation.id }),
+    } as never,
+  );
+
+  assert.deepEqual(outcome, { status: "passed" });
+  assert.equal(firstChunkWasLive, true);
+  assert.deepEqual(lifecycle.map((event) => event.kind), ["start", "chunk", "chunk", "end"]);
+  assert.equal(new Set(lifecycle.map((event) => event.id)).size, 1);
+  assert.deepEqual(lifecycle.filter((event) => event.kind === "chunk").map((event) => [event.stream, event.text]), [
+    ["stdout", "verify-out\n"],
+    ["stderr", "verify-err\n"],
+  ]);
+  await rm(marker, { force: true });
+});
+
+test("repeated verification commands receive distinct operation IDs", needsPosixShell, async () => {
+  const guard = await tempWorkspace();
+  const ids: string[] = [];
+  const { onEvent } = collect();
+  const outcome = await runVerify(
+    ["printf repeated", "printf repeated"],
+    guard,
+    undefined,
+    onEvent,
+    { onProcessStart: (operation: { id: string }) => ids.push(operation.id) } as never,
+  );
+  assert.deepEqual(outcome, { status: "passed" });
+  assert.equal(ids.length, 2);
+  assert.equal(new Set(ids).size, 2);
 });
 
 test("runVerify stops at the first failing command and does not run the rest", needsPosixShell, async () => {
@@ -213,8 +299,685 @@ test("a failed command with no error-shaped lines falls back to the tail", needs
   }
 });
 
+test("timeout is typed and cannot masquerade as an ordinary repairable exit", async () => {
+  const guard = await tempWorkspace();
+  const lifecycle: string[] = [];
+  const outcome = await runVerify(
+    ["synthetic timeout"],
+    guard,
+    undefined,
+    () => undefined,
+    {
+      onProcessStart: () => lifecycle.push("start"),
+      onProcessEnd: () => lifecycle.push("end"),
+    },
+    {
+      execute: async (): Promise<ProcessResult> => ({
+        code: 124,
+        stdout: "",
+        stderr: "Zeitlimit erreicht",
+        truncated: false,
+        timedOut: true,
+        aborted: false,
+      }),
+    },
+  );
+
+  assert.deepEqual(outcome, { status: "timed-out", command: "synthetic timeout" });
+  assert.deepEqual(lifecycle, ["start", "end"]);
+});
+
+test("spawn or shell resolution failure is typed and keeps one terminal process lifecycle", async () => {
+  const guard = await tempWorkspace();
+  const lifecycle: Array<{ type: string; error?: string }> = [];
+  const outcome = await runVerify(
+    ["synthetic spawn"],
+    guard,
+    undefined,
+    () => undefined,
+    {
+      onProcessStart: () => lifecycle.push({ type: "start" }),
+      onProcessEnd: (_operation, completion) => lifecycle.push({
+        type: "end",
+        ...(completion.error ? { error: completion.error } : {}),
+      }),
+    },
+    {
+      execute: async () => {
+        throw new Error("synthetic spawn failure");
+      },
+    },
+  );
+
+  assert.equal(outcome.status, "spawn-failed");
+  if (outcome.status === "spawn-failed") {
+    assert.equal(outcome.command, "synthetic spawn");
+    assert.match(outcome.error, /synthetic spawn failure/);
+  }
+  assert.deepEqual(lifecycle.map((event) => event.type), ["start", "end"]);
+  assert.match(lifecycle[1]?.error ?? "", /synthetic spawn failure/);
+});
+
+test("real POSIX signal termination is typed and never becomes a repairable exit", needsPosixShell, async () => {
+  const guard = await tempWorkspace();
+  const events: VerifyCommandEvent[] = [];
+  const completions: Array<{ exitCode: number | null; signal?: NodeJS.Signals }> = [];
+
+  const outcome = await runVerify(
+    ["kill -TERM $$"],
+    guard,
+    undefined,
+    (event) => events.push(event),
+    {
+      onProcessEnd: (_operation, completion) => completions.push({
+        exitCode: completion.exitCode,
+        ...(completion.signal ? { signal: completion.signal } : {}),
+      }),
+    },
+  );
+
+  assert.deepEqual(outcome, {
+    status: "terminated",
+    command: "kill -TERM $$",
+    signal: "SIGTERM",
+  });
+  assert.deepEqual(events, []);
+  assert.deepEqual(completions, [{ exitCode: null, signal: "SIGTERM" }]);
+});
+
+test("real POSIX command-not-found is typed and never becomes repairable exit 127", needsPosixShell, async () => {
+  const guard = await tempWorkspace();
+  const events: VerifyCommandEvent[] = [];
+  const ends: Array<{ exitCode: number | null; error?: string }> = [];
+  const command = "routercode_task9_command_that_does_not_exist";
+
+  const outcome = await runVerify(
+    [command],
+    guard,
+    undefined,
+    (event) => events.push(event),
+    {
+      onProcessEnd: (_operation, completion) => ends.push({
+        exitCode: completion.exitCode,
+        ...(completion.error ? { error: completion.error } : {}),
+      }),
+    },
+  );
+
+  assert.equal(outcome.status, "spawn-failed");
+  if (outcome.status === "spawn-failed") {
+    assert.match(outcome.error, /not found|nicht.*gefunden|resolved/i);
+  }
+  assert.deepEqual(events, []);
+  assert.equal(ends.length, 1);
+  assert.equal(ends[0]?.exitCode, null);
+  assert.match(ends[0]?.error ?? "", /not found|nicht.*gefunden|resolved|PATH/i);
+});
+
+test("an ordinary explicit exit 127 stays repairable without command-resolution evidence", needsPosixShell, async () => {
+  const guard = await tempWorkspace();
+  const events: VerifyCommandEvent[] = [];
+
+  const outcome = await runVerify(
+    ["exit 127"],
+    guard,
+    undefined,
+    (event) => events.push(event),
+  );
+
+  assert.equal(outcome.status, "failed");
+  if (outcome.status === "failed") assert.equal(outcome.exitCode, 127);
+  assert.equal(events.length, 1);
+  assert.equal(events[0]?.exitCode, 127);
+});
+
+test("ordinary failures cannot spoof command resolution through their output", async (t) => {
+  const fixtures = [
+    {
+      name: "exit 127 mentioning not found",
+      result: {
+        code: 127,
+        stdout: "",
+        stderr: "AssertionError: fixture not found",
+        truncated: false,
+        timedOut: false,
+        aborted: false,
+        signal: null,
+      },
+    },
+    {
+      name: "exit 1 mentioning PowerShell documentation",
+      result: {
+        code: 1,
+        stdout: "",
+        stderr: "AssertionError: expected CommandNotFoundException documentation",
+        truncated: false,
+        timedOut: false,
+        aborted: false,
+        signal: null,
+      },
+    },
+  ] as const;
+
+  for (const fixture of fixtures) {
+    await t.test(fixture.name, async () => {
+      const guard = await tempWorkspace();
+      const events: VerifyCommandEvent[] = [];
+      const outcome = await runVerify(
+        ["ordinary-test-fixture"],
+        guard,
+        undefined,
+        (event) => events.push(event),
+        {},
+        { execute: async () => fixture.result },
+      );
+
+      assert.equal(outcome.status, "failed");
+      assert.equal(events.length, 1);
+      assert.equal(events[0]?.exitCode, fixture.result.code);
+    });
+  }
+});
+
+test("structured Windows launch causes are deterministically nonrepairable", async (t) => {
+  const cases = [
+    {
+      name: "Windows launch error",
+      result: {
+        code: null,
+        stdout: "",
+        stderr: "",
+        truncated: false,
+        timedOut: false,
+        aborted: false,
+        signal: null,
+        launchError: "spawn UNKNOWN",
+      },
+    },
+  ] as const;
+
+  for (const item of cases) {
+    await t.test(item.name, async () => {
+      const guard = await tempWorkspace();
+      const events: VerifyCommandEvent[] = [];
+      const outcome = await runVerify(
+        ["windows fixture"],
+        guard,
+        undefined,
+        (event) => events.push(event),
+        {},
+        { execute: async () => item.result },
+      );
+
+      assert.equal(outcome.status, "spawn-failed");
+      assert.deepEqual(events, []);
+    });
+  }
+});
+
+test("cmd and PowerShell use structured simple-command preflight instead of output heuristics", async (t) => {
+  for (const shell of ["cmd.exe", "powershell.exe"] as const) {
+    await t.test(shell, async () => {
+      const guard = await tempWorkspace();
+      const lifecycle: Array<{ type: "start" | "end"; exitCode?: number | null }> = [];
+      let executions = 0;
+      const outcome = await runVerify(
+        ["routercode_missing_windows_command"],
+        guard,
+        undefined,
+        () => undefined,
+        {
+          onProcessStart: () => lifecycle.push({ type: "start" }),
+          onProcessEnd: (_operation, completion) => lifecycle.push({
+            type: "end",
+            exitCode: completion.exitCode,
+          }),
+        },
+        {
+          environment: { ORCODE_SHELL: shell, Path: "C:\\Windows\\System32" },
+          platform: "win32",
+          resolveExecutable: async (requested) => {
+            if (requested === shell) return `C:\\Windows\\System32\\${shell}`;
+            throw new Error(`Ausführbare Datei nicht in PATH gefunden: ${requested}`);
+          },
+          execute: async (_executable, args) => {
+            if (args.includes("-EncodedCommand")) {
+              return {
+                code: 1,
+                stdout: "",
+                stderr: "Get-Command failed",
+                truncated: false,
+                timedOut: false,
+                aborted: false,
+                signal: null,
+              };
+            }
+            executions += 1;
+            return {
+              code: 0,
+              stdout: "",
+              stderr: "",
+              truncated: false,
+              timedOut: false,
+              aborted: false,
+              signal: null,
+            };
+          },
+        },
+      );
+
+      assert.equal(outcome.status, "spawn-failed");
+      assert.equal(executions, 0);
+      assert.deepEqual(lifecycle, [
+        { type: "start" },
+        { type: "end", exitCode: null },
+      ]);
+    });
+  }
+});
+
+test("shell-native POSIX, cmd and PowerShell commands are never rejected by executable preflight", async (t) => {
+  const fixtures = [
+    { shell: "/bin/sh", command: "builtin true", platform: "linux" },
+    { shell: "cmd.exe", command: "dir", platform: "win32" },
+    { shell: "cmd.exe", command: "C:", platform: "win32" },
+    { shell: "cmd.exe", command: "cd..", platform: "win32" },
+    { shell: "cmd.exe", command: "cd\\", platform: "win32" },
+    { shell: "cmd.exe", command: "dir/w", platform: "win32" },
+    { shell: "cmd.exe", command: ":: harmless comment", platform: "win32" },
+    { shell: "powershell.exe", command: "Get-ChildItem", platform: "win32" },
+  ] as const;
+
+  for (const fixture of fixtures) {
+    await t.test(fixture.shell, async () => {
+      const guard = await tempWorkspace();
+      let executions = 0;
+      const outcome = await runVerify(
+        [fixture.command],
+        guard,
+        undefined,
+        () => undefined,
+        {},
+        {
+          environment: fixture.platform === "win32"
+            ? { ORCODE_SHELL: fixture.shell, Path: "C:\\Windows\\System32" }
+            : { ORCODE_SHELL: fixture.shell, PATH: "/usr/bin:/bin" },
+          platform: fixture.platform,
+          resolveExecutable: async (requested) => {
+            if (requested === fixture.shell) {
+              return fixture.platform === "win32"
+                ? `C:\\Windows\\System32\\${fixture.shell}`
+                : fixture.shell;
+            }
+            throw new Error(`Ausführbare Datei nicht in PATH gefunden: ${requested}`);
+          },
+          execute: async (_executable, args) => {
+            if (args.includes("-EncodedCommand") || args.includes("orcode-verify-preflight")) {
+              return {
+                code: 0,
+                stdout: "",
+                stderr: "",
+                truncated: false,
+                timedOut: false,
+                aborted: false,
+                signal: null,
+              };
+            }
+            executions += 1;
+            return {
+              code: 0,
+              stdout: "",
+              stderr: "",
+              truncated: false,
+              timedOut: false,
+              aborted: false,
+              signal: null,
+            };
+          },
+        },
+      );
+
+      assert.equal(outcome.status, "passed");
+      assert.equal(executions, 1);
+    });
+  }
+});
+
+test("compound and wrapped POSIX commands keep the shell's actual final result", async (t) => {
+  const missing = "routercode_missing_wrapped_command";
+  const fixtures = [
+    { command: `${missing} || true`, code: 0, status: "passed" },
+    { command: `true && ${missing}`, code: 127, status: "failed" },
+    { command: `VALUE=ok ${missing}`, code: 127, status: "failed" },
+    { command: `env VALUE=ok ${missing}`, code: 127, status: "failed" },
+  ] as const;
+
+  for (const fixture of fixtures) {
+    await t.test(fixture.command, async () => {
+      const guard = await tempWorkspace();
+      let executions = 0;
+      const outcome = await runVerify(
+        [fixture.command],
+        guard,
+        undefined,
+        () => undefined,
+        {},
+        {
+          environment: { ORCODE_SHELL: "/bin/sh", PATH: "/usr/bin:/bin" },
+          platform: "linux",
+          resolveExecutable: async (requested) => {
+            if (requested === "/bin/sh") return "/bin/sh";
+            if (requested === "env") return "/usr/bin/env";
+            throw new Error(`Ausführbare Datei nicht in PATH gefunden: ${requested}`);
+          },
+          execute: async (_executable, args) => {
+            if (args.includes("orcode-verify-preflight")) {
+              return {
+                code: 0,
+                stdout: "",
+                stderr: "",
+                truncated: false,
+                timedOut: false,
+                aborted: false,
+                signal: null,
+              };
+            }
+            executions += 1;
+            return {
+              code: fixture.code,
+              stdout: "",
+              stderr: "fixture not found",
+              truncated: false,
+              timedOut: false,
+              aborted: false,
+              signal: null,
+            };
+          },
+        },
+      );
+
+      assert.equal(outcome.status, fixture.status);
+      assert.equal(executions, 1);
+    });
+  }
+});
+
+test("PowerShell language constructs stay ordinary shell results instead of fake launch failures", async (t) => {
+  const fixtures = [
+    { command: "exit 127", code: 127, status: "failed" },
+    { command: 'throw "ordinary failure"', code: 1, status: "failed" },
+    { command: '"plain value"', code: 0, status: "passed" },
+    { command: ". .\\fixture.ps1", code: 1, status: "failed" },
+  ] as const;
+
+  for (const fixture of fixtures) {
+    await t.test(fixture.command, async () => {
+      const guard = await tempWorkspace();
+      let probes = 0;
+      let executions = 0;
+      const outcome = await runVerify(
+        [fixture.command],
+        guard,
+        undefined,
+        () => undefined,
+        {},
+        {
+          environment: { ORCODE_SHELL: "powershell.exe", Path: "C:\\Windows\\System32" },
+          platform: "win32",
+          resolveExecutable: async (requested) => {
+            if (requested === "powershell.exe") return "C:\\Windows\\System32\\powershell.exe";
+            throw new Error(`Ausführbare Datei nicht in PATH gefunden: ${requested}`);
+          },
+          execute: async (_executable, args) => {
+            if (args.includes("-EncodedCommand")) {
+              probes += 1;
+              return {
+                code: 1,
+                stdout: "",
+                stderr: "Get-Command cannot resolve language syntax",
+                truncated: false,
+                timedOut: false,
+                aborted: false,
+                signal: null,
+              };
+            }
+            executions += 1;
+            return {
+              code: fixture.code,
+              stdout: "",
+              stderr: fixture.code === 0 ? "" : "ordinary PowerShell result",
+              truncated: false,
+              timedOut: false,
+              aborted: false,
+              signal: null,
+            };
+          },
+        },
+      );
+
+      assert.equal(outcome.status, fixture.status);
+      assert.equal(probes, 0);
+      assert.equal(executions, 1);
+    });
+  }
+});
+
+test("a simple missing command is still preflighted when only its arguments contain harmless syntax", async (t) => {
+  const fixtures = [
+    {
+      name: "POSIX quoted glob argument",
+      shell: "/bin/sh",
+      platform: "linux",
+      command: 'missing-runner "*.test.ts"',
+    },
+    {
+      name: "POSIX unquoted glob argument",
+      shell: "/bin/sh",
+      platform: "linux",
+      command: "missing-runner *.test.ts",
+    },
+    {
+      name: "POSIX escaped-space argument",
+      shell: "/bin/sh",
+      platform: "linux",
+      command: "missing-runner path\\ with\\ spaces",
+    },
+    {
+      name: "PowerShell Windows path argument",
+      shell: "powershell.exe",
+      platform: "win32",
+      command: "Missing-Cmdlet C:\\work",
+    },
+    {
+      name: "cmd Windows path argument",
+      shell: "cmd.exe",
+      platform: "win32",
+      command: "missing.exe C:\\work",
+    },
+  ] as const;
+
+  for (const fixture of fixtures) {
+    await t.test(fixture.name, async () => {
+      const guard = await tempWorkspace();
+      let mainExecutions = 0;
+      const outcome = await runVerify(
+        [fixture.command],
+        guard,
+        undefined,
+        () => undefined,
+        {},
+        {
+          environment: fixture.platform === "win32"
+            ? { ORCODE_SHELL: fixture.shell, Path: "C:\\Windows\\System32" }
+            : { ORCODE_SHELL: fixture.shell, PATH: "/usr/bin:/bin" },
+          platform: fixture.platform,
+          resolveExecutable: async (requested) => {
+            if (requested === fixture.shell) {
+              return fixture.platform === "win32"
+                ? `C:\\Windows\\System32\\${fixture.shell}`
+                : fixture.shell;
+            }
+            throw new Error(`Ausführbare Datei nicht in PATH gefunden: ${requested}`);
+          },
+          execute: async (_executable, args) => {
+            if (args.includes("orcode-verify-preflight") || args.includes("-EncodedCommand")) {
+              return {
+                code: 1,
+                stdout: "",
+                stderr: "structured resolution miss",
+                truncated: false,
+                timedOut: false,
+                aborted: false,
+                signal: null,
+              };
+            }
+            mainExecutions += 1;
+            return {
+              code: 127,
+              stdout: "",
+              stderr: "ordinary shell failure",
+              truncated: false,
+              timedOut: false,
+              aborted: false,
+              signal: null,
+            };
+          },
+        },
+      );
+
+      assert.equal(outcome.status, "spawn-failed");
+      assert.equal(mainExecutions, 0);
+    });
+  }
+});
+
+test("cmd relative executable preflight resolves from the verification workspace", async () => {
+  const guard = await tempWorkspace();
+  let requestedCwd: string | undefined;
+  let mainExecutions = 0;
+  const outcome = await runVerify(
+    [".\\tools\\check.cmd"],
+    guard,
+    undefined,
+    () => undefined,
+    {},
+    {
+      environment: { ORCODE_SHELL: "cmd.exe", Path: "C:\\Windows\\System32" },
+      platform: "win32",
+      resolveExecutable: async (requested, _environment, _platform, cwd) => {
+        if (requested === "cmd.exe") return "C:\\Windows\\System32\\cmd.exe";
+        requestedCwd = cwd;
+        if (cwd !== guard.root) {
+          throw new Error(`Falscher Auflösungspfad: ${cwd ?? "launcher cwd"}`);
+        }
+        return "C:\\workspace\\tools\\check.cmd";
+      },
+      execute: async () => {
+        mainExecutions += 1;
+        return {
+          code: 0,
+          stdout: "",
+          stderr: "",
+          truncated: false,
+          timedOut: false,
+          aborted: false,
+          signal: null,
+        };
+      },
+    },
+  );
+
+  assert.equal(outcome.status, "passed");
+  assert.equal(requestedCwd, guard.root);
+  assert.equal(mainExecutions, 1);
+});
+
+test("successful output that only mentions a Windows resolution diagnostic still passes", async () => {
+  const guard = await tempWorkspace();
+  const outcome = await runVerify(
+    ["diagnostic fixture"],
+    guard,
+    undefined,
+    () => undefined,
+    {},
+    {
+      execute: async () => ({
+        code: 0,
+        stdout: "CommandNotFoundException is documented here",
+        stderr: "",
+        truncated: false,
+        timedOut: false,
+        aborted: false,
+        signal: null,
+      }),
+    },
+  );
+
+  assert.deepEqual(outcome, { status: "passed" });
+});
+
+test("invalid ORCODE_SHELL owns one redacted visible start/end lifecycle", async (t) => {
+  const guard = await tempWorkspace();
+  const secret = `${["sk", "or", "v1"].join("-")}-${"s".repeat(40)}`;
+  const missingShell = join(guard.root, `missing-${secret}`);
+  const previous = process.env.ORCODE_SHELL;
+  process.env.ORCODE_SHELL = missingShell;
+  t.after(() => {
+    if (previous === undefined) delete process.env.ORCODE_SHELL;
+    else process.env.ORCODE_SHELL = previous;
+  });
+  const lifecycle: Array<{ type: "start" | "end"; id: string; error?: string }> = [];
+
+  const outcome = await runVerify(
+    ["echo unreachable"],
+    guard,
+    undefined,
+    () => undefined,
+    {
+      onProcessStart: (operation) => lifecycle.push({ type: "start", id: operation.id }),
+      onProcessEnd: (operation, completion) => lifecycle.push({
+        type: "end",
+        id: operation.id,
+        ...(completion.error ? { error: completion.error } : {}),
+      }),
+    },
+  );
+
+  assert.equal(outcome.status, "spawn-failed");
+  if (outcome.status === "spawn-failed") {
+    assert.doesNotMatch(outcome.error, new RegExp(secret));
+    assert.match(outcome.error, /REDACTED/);
+  }
+  assert.deepEqual(lifecycle.map((event) => event.type), ["start", "end"]);
+  assert.equal(new Set(lifecycle.map((event) => event.id)).size, 1);
+  assert.doesNotMatch(lifecycle[1]?.error ?? "", new RegExp(secret));
+  assert.match(lifecycle[1]?.error ?? "", /REDACTED/);
+});
+
+test("repair failure reports are centrally redacted and compacted to fixed small bounds", needsPosixShell, async () => {
+  const guard = await tempWorkspace();
+  const secret = `${["sk", "or", "v1"].join("-")}-${"q".repeat(40)}`;
+  const noisy = Array.from(
+    { length: 40 },
+    (_, index) => `ERROR ${String(index).padStart(2, "0")} ${"x".repeat(500)}`,
+  ).join("\n");
+  const script = `${JSON.stringify(process.execPath)} -e ${JSON.stringify(
+    `console.error(${JSON.stringify(`ERROR credential ${secret}\n${noisy}`)}); process.exit(1)`,
+  )}`;
+
+  const outcome = await runVerify([script], guard, undefined, () => undefined);
+
+  assert.equal(outcome.status, "failed");
+  if (outcome.status === "failed") {
+    assert.doesNotMatch(outcome.distilled, new RegExp(secret));
+    assert.match(outcome.distilled, /REDACTED/);
+    assert.ok(outcome.distilled.length <= 4_000, `got ${outcome.distilled.length} chars`);
+    assert.ok(outcome.distilled.split("\n").length <= 12);
+  }
+});
+
 // ---------------------------------------------------------------------------
-// Config data model: verify { commands; mode; maxRounds } with validation.
+// Config data model: verify { commands; mode; maxRepairRounds } with validation.
 // ---------------------------------------------------------------------------
 
 test("validateVerifyConfig falls back to defaults for garbage input", () => {
@@ -228,12 +991,12 @@ test("validateVerifyConfig keeps valid fields and drops invalid ones", () => {
   const result = validateVerifyConfig({
     commands: ["npm run check", "", 42, "npm test"],
     mode: "off",
-    maxRounds: 2,
+    maxRepairRounds: 2,
   });
   assert.deepEqual(result, {
     commands: ["npm run check", "npm test"],
     mode: "off",
-    maxRounds: 2,
+    maxRepairRounds: 2,
   });
 });
 
@@ -242,27 +1005,31 @@ test("validateVerifyConfig rejects an unknown mode", () => {
   assert.equal(result.mode, DEFAULT_VERIFY_CONFIG.mode);
 });
 
-test("validateVerifyConfig caps maxRounds at VERIFY_MAX_ROUNDS (2)", () => {
+test("validateVerifyConfig uses the canonical zero-through-two repair bound", () => {
   assert.equal(VERIFY_MAX_ROUNDS, 2);
-  assert.equal(validateVerifyConfig({ maxRounds: 2 }).maxRounds, 2);
-  assert.equal(validateVerifyConfig({ maxRounds: 3 }).maxRounds, 2);
-  assert.equal(validateVerifyConfig({ maxRounds: 1_000 }).maxRounds, 2);
+  assert.equal(validateVerifyConfig({ maxRepairRounds: 0 }).maxRepairRounds, 0);
+  assert.equal(validateVerifyConfig({ maxRepairRounds: 2 }).maxRepairRounds, 2);
+  assert.equal(validateVerifyConfig({ maxRepairRounds: 3 }).maxRepairRounds, 1);
+  assert.equal(validateVerifyConfig({ maxRepairRounds: 1_000 }).maxRepairRounds, 1);
 });
 
-test("validateVerifyConfig floors maxRounds at 1", () => {
-  assert.equal(validateVerifyConfig({ maxRounds: 0 }).maxRounds, 1);
-  assert.equal(validateVerifyConfig({ maxRounds: -5 }).maxRounds, 1);
-  assert.equal(validateVerifyConfig({ maxRounds: "not a number" }).maxRounds, 1);
+test("validateVerifyConfig migrates legacy total passes and prefers the explicit new field", () => {
+  assert.equal(validateVerifyConfig({ maxRounds: 1 }).maxRepairRounds, 0);
+  assert.equal(validateVerifyConfig({ maxRounds: 2 }).maxRepairRounds, 1);
+  assert.equal(
+    validateVerifyConfig({ maxRounds: 1, maxRepairRounds: 2 }).maxRepairRounds,
+    2,
+  );
 });
 
-test("validateVerifyConfig truncates a fractional maxRounds", () => {
-  assert.equal(validateVerifyConfig({ maxRounds: 1.9 }).maxRounds, 1);
+test("validateVerifyConfig rejects invalid repair-round values to the default", () => {
+  assert.equal(validateVerifyConfig({ maxRepairRounds: -5 }).maxRepairRounds, 1);
+  assert.equal(validateVerifyConfig({ maxRepairRounds: "not a number" }).maxRepairRounds, 1);
+  assert.equal(validateVerifyConfig({ maxRepairRounds: 1.9 }).maxRepairRounds, 1);
 });
 
-// Mutation-test guard: if `.max(120)`-style bound above were loosened from 2
-// to something larger (e.g. 3), this test goes red.
-test("mutation guard: maxRounds 3 is rejected down to the 2-round ceiling", () => {
-  assert.notEqual(validateVerifyConfig({ maxRounds: 3 }).maxRounds, 3);
+test("mutation guard: maxRepairRounds 3 never widens the two-repair ceiling", () => {
+  assert.notEqual(validateVerifyConfig({ maxRepairRounds: 3 }).maxRepairRounds, 3);
 });
 
 // ---------------------------------------------------------------------------

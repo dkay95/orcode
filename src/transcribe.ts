@@ -54,14 +54,14 @@ export interface TranscribeAudioOptions {
 /**
  * Validates that `modelId` exists and can accept audio input, then sends the
  * recording and returns the plain transcription text. Rejects with a clear
- * German message for every failure mode: unknown model, no audio capability,
- * or a failed model call.
+ * message for every failure mode: unknown model, no audio capability, or a
+ * failed model call.
  */
 export async function transcribeAudio(options: TranscribeAudioOptions): Promise<TranscriptionResult> {
   const modelId = options.modelId.trim();
   if (!modelId) {
     throw new Error(
-      "Kein Transkriptionsmodell konfiguriert. Setze `transcriptionModel` in der Konfiguration.",
+      "No transcription model configured. Set `transcriptionModel` in the configuration.",
     );
   }
 
@@ -69,18 +69,18 @@ export async function transcribeAudio(options: TranscribeAudioOptions): Promise<
   try {
     model = await options.openRouter.findModel(modelId, options.signal);
   } catch (error) {
-    throw new Error(`Transkriptionsmodell "${modelId}" konnte nicht geprüft werden: ${errorMessage(error)}`);
+    throw new Error(`Transcription model "${modelId}" could not be checked: ${errorMessage(error)}`);
   }
   if (!model) {
     throw new Error(
-      `Transkriptionsmodell "${modelId}" wurde bei OpenRouter nicht gefunden. Prüfe die Modell-ID in der Konfiguration.`,
+      `Transcription model "${modelId}" was not found on OpenRouter. Check the model ID in the configuration.`,
     );
   }
   if (!modelCapabilities(model).audioInput) {
     const suggestion = await suggestAudioModel(options.openRouter, options.signal);
     throw new Error(
-      `Transkriptionsmodell "${modelId}" unterstützt laut OpenRouter keine Audio-Eingabe. ` +
-        `Wähle ein Modell mit Audio-Fähigkeit.${suggestion ? ` Vorschlag: ${suggestion}.` : ""}`,
+      `Transcription model "${modelId}" does not support audio input according to OpenRouter. ` +
+        `Choose a model with audio capability.${suggestion ? ` Suggestion: ${suggestion}.` : ""}`,
     );
   }
 
@@ -89,7 +89,7 @@ export async function transcribeAudio(options: TranscribeAudioOptions): Promise<
   try {
     bytes = await read(options.audio.path);
   } catch (error) {
-    throw new Error(`Aufnahmedatei konnte nicht gelesen werden: ${errorMessage(error)}`);
+    throw new Error(`Recording file could not be read: ${errorMessage(error)}`);
   }
   const base64 = bytes.toString("base64");
 
@@ -130,7 +130,7 @@ export async function transcribeAudio(options: TranscribeAudioOptions): Promise<
   try {
     text = (await call.getText()).trim();
   } catch (error) {
-    throw new Error(`Transkription fehlgeschlagen: ${errorMessage(error)}`);
+    throw new Error(`Transcription failed: ${errorMessage(error)}`);
   }
   let costUsd = observedCost;
   try {

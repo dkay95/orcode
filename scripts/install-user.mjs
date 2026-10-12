@@ -1,34 +1,112 @@
 import { chmod, lstat, mkdir, readlink, symlink } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
-const projectRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
-const target = join(projectRoot, "dist", "cli.js");
-const binDirectory = join(homedir(), ".local", "bin");
-const link = join(binDirectory, "routercode");
+const defaultFileSystem = { chmod, lstat, mkdir, readlink, symlink };
+const defaultProjectRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 
-await mkdir(binDirectory, { recursive: true, mode: 0o755 });
-await chmod(target, 0o755);
+export function isInstallerEntrypoint(
+  moduleUrl,
+  argvEntry = process.argv[1],
+  resolvePath = resolve,
+) {
+  if (!argvEntry) return false;
+  try {
+    return pathToFileURL(resolvePath(argvEntry)).href === moduleUrl;
+  } catch {
+    return false;
+  }
+}
 
-try {
-  const info = await lstat(link);
-  if (!info.isSymbolicLink()) {
-    throw new Error(`${link} existiert und ist kein Symlink. Es wurde nichts überschrieben.`);
+export async function installUserAliases(options = {}) {
+  const fileSystem = options.fileSystem ?? defaultFileSystem;
+  const projectRoot = resolve(options.projectRoot ?? defaultProjectRoot);
+  const homeDirectory = resolve(options.homeDirectory ?? homedir());
+  const log = options.log ?? console.log;
+  const target = join(projectRoot, "dist", "cli.js");
+  const binDirectory = join(homeDirectory, ".local", "bin");
+  const aliases = ["orcode", "routercode"].map((name) => ({
+    name,
+    link: join(binDirectory, name),
+  }));
+
+  const preflight = [];
+  let firstFailure;
+  for (const alias of aliases) {
+    try {
+      const info = await fileSystem.lstat(alias.link);
+      if (!info.isSymbolicLink()) {
+        throw new Error(
+          `${alias.link} existiert und ist kein Symlink. Es wurde nichts überschrieben.`,
+        );
+      }
+      const current = resolve(dirname(alias.link), await fileSystem.readlink(alias.link));
+      if (current !== target) {
+        throw new Error(
+          `${alias.link} zeigt bereits auf ${current}. Es wurde nichts überschrieben.`,
+        );
+      }
+      preflight.push({ ...alias, exists: true });
+    } catch (error) {
+      if (hasCode(error, "ENOENT")) {
+        preflight.push({ ...alias, exists: false });
+      } else {
+        firstFailure ??= error;
+      }
+    }
   }
-  const current = resolve(dirname(link), await readlink(link));
-  if (current !== target) {
-    throw new Error(`${link} zeigt bereits auf ${current}. Es wurde nichts überschrieben.`);
+
+  if (firstFailure) throw firstFailure;
+
+  await fileSystem.mkdir(binDirectory, { recursive: true, mode: 0o755 });
+  await fileSystem.chmod(target, 0o755);
+
+  const created = [];
+  try {
+    for (const alias of preflight) {
+      if (alias.exists) continue;
+      await fileSystem.symlink(target, alias.link);
+      created.push(alias);
+      const info = await fileSystem.lstat(alias.link);
+      if (!info.isSymbolicLink()) {
+        throw new Error(`${alias.link} wurde nicht als Symlink angelegt.`);
+      }
+      const current = resolve(dirname(alias.link), await fileSystem.readlink(alias.link));
+      if (current !== target) {
+        throw new Error(`${alias.link} wurde mit einem unerwarteten Ziel angelegt.`);
+      }
+    }
+  } catch (installError) {
+    if (created.length > 0) {
+      throw new Error(
+        `Alias-Installation wurde teilweise abgeschlossen. Es wurde kein Pfad gelöscht ` +
+          `oder ersetzt. Du kannst den Installer sicher erneut ausführen; vorhandene ` +
+          `eigene Links werden erkannt und fremde Pfade abgelehnt. Ursache: ` +
+          `${errorMessage(installError)}`,
+        { cause: installError },
+      );
+    }
+    throw installError;
   }
-  console.log(`RouterCode ist bereits installiert: ${link}`);
-} catch (error) {
-  if (!hasCode(error, "ENOENT")) {
-    throw error;
+
+  for (const alias of preflight) {
+    log(
+      alias.exists
+        ? `${alias.name} ist bereits installiert: ${alias.link}`
+        : `${alias.name} installiert: ${alias.link}`,
+    );
   }
-  await symlink(target, link);
-  console.log(`RouterCode installiert: ${link}`);
 }
 
 function hasCode(error, code) {
   return typeof error === "object" && error !== null && "code" in error && error.code === code;
+}
+
+function errorMessage(error) {
+  return error instanceof Error ? error.message : String(error);
+}
+
+if (isInstallerEntrypoint(import.meta.url)) {
+  await installUserAliases();
 }

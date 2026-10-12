@@ -57,12 +57,12 @@ test("Retry-Zähler startet für jeden logischen Request neu", () => {
 
   const retrying = events.filter((event) => event.phase === "retrying");
   assert.equal(retrying.at(-1)?.attempt, 2);
-  assert.match(formatConnectionEvent(retrying.at(-1)!), /Reconnect-Versuch 2/);
+  assert.match(formatConnectionEvent(retrying.at(-1)!), /Reconnect attempt 2/);
 
   const restored = events.at(-1)!;
   assert.equal(restored.phase, "restored");
   assert.equal(restored.attempt, 2);
-  assert.match(formatConnectionEvent(restored), /2 Versuche/);
+  assert.match(formatConnectionEvent(restored), /2 attempts/);
 });
 
 test("endgültig gescheiterter Request meldet keine Wiederherstellung", () => {
@@ -98,8 +98,8 @@ test("Kompressor und Hauptlauf sind unterscheidbare Kontexte", () => {
     retrying.map((event) => event.attempt),
     [2, 2],
   );
-  assert.match(formatConnectionEvent(retrying[0]!), /Hauptlauf/);
-  assert.match(formatConnectionEvent(retrying[1]!), /Kompressor/);
+  assert.match(formatConnectionEvent(retrying[0]!), /Main run/);
+  assert.match(formatConnectionEvent(retrying[1]!), /Compressor/);
 });
 
 test("Backoff wächst exponentiell, jittert injizierbar und bleibt gedeckelt", () => {
@@ -172,7 +172,7 @@ test("fetchWithReconnect wiederholt idempotente Anfragen höchstens dreimal", as
     ["retry-scheduled", "retrying", "retry-scheduled", "retrying"],
   );
   assert.equal(events[0]?.delayMs, 500);
-  assert.match(formatConnectionEvent(events[0]!), /neuer Versuch in 0,5 s/);
+  assert.match(formatConnectionEvent(events[0]!), /retrying in 0.5 s/);
 });
 
 test("fetchWithReconnect deckelt Retry-After des Servers auf 5 s", async () => {
@@ -269,20 +269,20 @@ test("Abbruchsignal beendet die Wartezeit sofort", async () => {
     },
   );
   setTimeout(() => {
-    controller.abort(new Error("Die Prüfung wurde abgebrochen."));
+    controller.abort(new Error("The check was cancelled."));
   }, 10);
 
-  await assert.rejects(pending, /abgebrochen/);
+  await assert.rejects(pending, /cancelled/);
   assert.ok(
     Date.now() - startedAt < 2_000,
     "der gedeckelte 5-Sekunden-Delay muss vorzeitig enden",
   );
 });
 
-test("bereits abgebrochene Läufe senden gar nicht erst", async () => {
+test("already cancelled runs never even send", async () => {
   const { monitor } = collector();
   const controller = new AbortController();
-  controller.abort(new Error("Vorher abgebrochen."));
+  controller.abort(new Error("Already cancelled."));
   let calls = 0;
   await assert.rejects(
     fetchWithReconnect(
@@ -298,7 +298,7 @@ test("bereits abgebrochene Läufe senden gar nicht erst", async () => {
         },
       },
     ),
-    /Vorher abgebrochen/,
+    /Already cancelled/,
   );
   assert.equal(calls, 0);
 });

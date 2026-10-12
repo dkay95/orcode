@@ -20,7 +20,7 @@ function headerSegments(): Segment[] {
     { spans: [span("anthropic/claude-sonnet-4.5", "text")], align: "left", priority: 100 },
     { spans: [span("· ask", "warn")], align: "left", priority: 95 },
     { spans: [span("$0.31", "muted")], align: "right", priority: 90 },
-    { spans: [span("Kontext 42%", "muted")], align: "left", priority: 80 },
+    { spans: [span("Context 42%", "muted")], align: "left", priority: 80 },
     {
       spans: [span("~/projekt/routercode", "muted")],
       compact: [span("routercode", "muted")],
@@ -36,7 +36,7 @@ test("composeLine überschreitet nie die Breite und lässt ganze Segmente weg", 
     const text = plainText(result);
     assert.equal(lineWidth(result) <= width, true, `Breite ${width}: ${text}`);
 
-    const parts = ["anthropic/claude-sonnet-4.5", "· ask", "$0.31", "Kontext 42%"];
+    const parts = ["anthropic/claude-sonnet-4.5", "· ask", "$0.31", "Context 42%"];
     for (const part of parts) {
       if (text.includes(part.slice(0, 3))) {
         assert.equal(text.includes(part), true, `${part} steht halb da (${width})`);

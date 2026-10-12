@@ -74,7 +74,7 @@ test("non-images and too many pending images are rejected", async () => {
     await writeFile(join(directory, "not-image.png"), "nur text");
     await assert.rejects(
       inspectImageAttachment("not-image.png", directory),
-      /Nicht unterstütztes Bildformat/,
+      /Unsupported image format/,
     );
     const fake = {
       path: "/tmp/image.png",
@@ -84,7 +84,7 @@ test("non-images and too many pending images are rejected", async () => {
     };
     assert.throws(
       () => validateImageAttachmentSet([fake, fake, fake, fake, fake]),
-      /Maximal 4 Bilder/,
+      /At most 4 images/,
     );
   } finally {
     await rm(directory, { recursive: true, force: true });
@@ -119,11 +119,11 @@ test("the total size is checked when sending, not when attaching", async () => {
     // ... but the send-time gate sees the real files.
     await assert.rejects(
       imageAttachmentDataUrls(attachments),
-      /Alle Bilder zusammen dürfen höchstens/,
+      /All images together may be at most/,
     );
     await assert.rejects(
       refreshImageAttachments(attachments),
-      /Alle Bilder zusammen dürfen höchstens/,
+      /All images together may be at most/,
     );
   } finally {
     await rm(directory, { recursive: true, force: true });
@@ -139,7 +139,7 @@ test("a single image that grew past the limit is rejected when sending", async (
     assert.equal(attachment.sizeBytes, 64);
 
     await writeFile(path, pngOfSize(MAX_IMAGE_BYTES + 1024));
-    await assert.rejects(imageAttachmentDataUrl(attachment), /ist größer als/);
+    await assert.rejects(imageAttachmentDataUrl(attachment), /is larger than/);
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
@@ -171,7 +171,7 @@ test("an image replaced by another format is refused when sending", async () => 
     await writeFile(path, Buffer.from("GIF89a und mehr text"));
     await assert.rejects(
       imageAttachmentDataUrls([attachment]),
-      /wurde seit dem Anhängen verändert/,
+      /was changed since it was attached/,
     );
   } finally {
     await rm(directory, { recursive: true, force: true });

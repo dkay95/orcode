@@ -6,83 +6,46 @@
  */
 
 import type { PanelJudgment, PanelResult } from "../panel.js";
-import type { AgentRunEvent, ToolRisk } from "../types.js";
+import type { AgentRunEvent, NoticeKind, ToolRisk } from "../types.js";
+import {
+  classifyToolOutcome,
+  estimateReasoningTokens,
+  outputLines,
+  selectTail,
+  textLines,
+} from "../utils.js";
 import { toolMetadata, type TextDiff } from "../workspace.js";
 import {
+  REASONING_MAX_LINES,
   RUNNING_TAIL_LINES,
   TAIL_CAPACITY,
   type BlockState,
   type ChatBlock,
 } from "./blocks.js";
-import { splitHunks, type DiffHunkView } from "./diff-view.js";
-
-const ERROR_LINE = /(^|\s)(error|ERROR|FAIL|Fail|✗|panic|Traceback|error TS\d+)/;
+import { parseUnifiedDiff, splitHunks, type DiffHunkView } from "./diff-view.js";
 
 /**
- * Rough live estimate while reasoning streams in. Providers only report the
- * real count when the model call ends, so without this the panel would sit at
- * "0 Tokens" for its entire lifetime. Deliberately coarse — the UI marks the
- * value as an estimate rather than pretending to be exact.
+ * How many hunks a diff ever puts on screen — the approval preview's own
+ * long-standing cap, now shared with the applied-edit block (FIX-3) so both
+ * halves of the same change are cut at exactly the same place.
  */
-export function estimateTokens(text: string): number {
-  const trimmed = text.trim();
-  // Whitespace-only deltas are not thoughts. Reporting "1 token" for them
-  // would invent content the model never produced.
-  if (trimmed.length === 0) return 0;
-  return Math.max(1, Math.round(trimmed.length / 4));
-}
-
-function textLines(value: string): string[] {
-  return value
-    .replace(/\r\n?/g, "\n")
-    .split("\n")
-    .map((item) => item.replace(/\s+$/, ""))
-    .filter((item) => item.trim().length > 0);
-}
+const MAX_DIFF_HUNKS = 3;
 
 /**
- * Which lines survive in a collapsed block: on failure the first lines that
- * look like the actual error, on success the last ones.
+ * G3 (the G2 debt list): `selectTail`, `outputLines` and the reasoning-token
+ * estimate moved to `utils.ts` — the one module with no imports, so the
+ * desktop window applies the identical rules instead of its own. Re-exported
+ * so every existing importer of this file is unchanged.
  */
-export function selectTail(lines: readonly string[], failed: boolean, keep: number): string[] {
-  if (lines.length <= keep) return [...lines];
-  if (failed) {
-    const hits = lines.filter((item) => ERROR_LINE.test(item));
-    if (hits.length > 0) return hits.slice(0, keep);
-    return lines.slice(0, keep);
-  }
-  return lines.slice(-keep);
-}
-
-function asRecord(value: unknown): Record<string, unknown> | null {
-  return typeof value === "object" && value !== null && !Array.isArray(value)
-    ? (value as Record<string, unknown>)
-    : null;
-}
+export { selectTail } from "../utils.js";
 
 /**
- * `✓` only when a process exited with 0. Everything else that merely worked
- * gets `~` (unverified) — Bauplan 2.5.
+ * The grading rule moved to `utils.ts` (G2 fix round 1) so the desktop
+ * window applies the identical one — it had forked, and defaulted a
+ * finished `write_file` to "done" where this said "unverified". Same
+ * behaviour here, one definition.
  */
-function outcomeOf(output: unknown): { state: BlockState; exitCode?: number } {
-  const data = asRecord(output);
-  const exitCode = data && typeof data.exitCode === "number" ? data.exitCode : undefined;
-  if (exitCode === undefined) return { state: "unverified" };
-  return { state: exitCode === 0 ? "ok" : "failed", exitCode };
-}
-
-function outputLines(output: unknown): string[] {
-  const data = asRecord(output);
-  if (!data) return [];
-  const parts: string[] = [];
-  for (const key of ["stdout", "stderr", "diff", "content", "matches"] as const) {
-    const value = data[key];
-    if (typeof value === "string" && value.trim().length > 0) {
-      parts.push(...textLines(value));
-    }
-  }
-  return parts;
-}
+const outcomeOf = classifyToolOutcome;
 
 export interface ApprovalInput {
   id?: string;
@@ -122,6 +85,17 @@ export class RunViewModel {
     return null;
   }
 
+  /**
+   * True while the model is actively streaming reasoning for the current
+   * step (Phase 3b, Part C: the state `esc` branches on — end thinking vs.
+   * abort the run). Mirrors the `model-end` handler below, which is the sole
+   * place `live` flips back to false.
+   */
+  get reasoningLive(): boolean {
+    const current = this.#reasoningId ? this.#index.get(this.#reasoningId) : undefined;
+    return current?.kind === "reasoning" && current.live === true;
+  }
+
   find(id: string): ChatBlock | undefined {
     return this.#index.get(id);
   }
@@ -139,7 +113,10 @@ export class RunViewModel {
   toggle(id: string): boolean {
     const block = this.#index.get(id);
     if (!block) return false;
-    if (block.kind === "tool" || block.kind === "reasoning") {
+    // Audit FIX-1: "approval" joined the toggleable kinds — Ctrl+O inside
+    // confirm mode expands a truncated approval's full detail so the
+    // "Ctrl+O shows all" hint it renders is actually true.
+    if (block.kind === "tool" || block.kind === "reasoning" || block.kind === "approval") {
       block.expanded = !block.expanded;
       return true;
     }
@@ -169,6 +146,23 @@ export class RunViewModel {
     });
   }
 
+  /**
+   * A mid-run interjection (Phase 3b, Part B): a "user" block flagged for the
+   * `↪` glyph + acceptance footer, deliberately NOT clearing `#assistantId`/
+   * `#reasoningId` — the run this interjects into keeps streaming into its
+   * existing assistant/reasoning blocks right after this one.
+   */
+  pushInterjection(text: string, at = Date.now()): ChatBlock {
+    return this.#push({
+      kind: "user",
+      id: this.#id("interjection"),
+      at,
+      text,
+      attachmentCount: 0,
+      interjected: true,
+    });
+  }
+
   appendAssistant(delta: string, at = Date.now()): ChatBlock {
     const current = this.#assistantId ? this.#index.get(this.#assistantId) : undefined;
     if (current && current.kind === "assistant") {
@@ -193,14 +187,39 @@ export class RunViewModel {
     this.#assistantId = null;
   }
 
+  /**
+   * D3 (owner design batch, calm-chrome principle): a notice identical to
+   * the one immediately before it — same title and cause, the observable
+   * content a human would compare — collapses into that block instead of
+   * appending a new one: its repeat counter increments and its timestamp
+   * moves to this latest occurrence, so the transcript shows one line with
+   * a muted `× N` suffix instead of N stacked duplicates. Only ever compares
+   * against the LAST block, and only when that block is itself a notice —
+   * a different block kind or an intervening line always starts a fresh
+   * streak. Persisted session history is untouched by this (nothing here
+   * writes to `SessionStore`); it is a purely render-layer behavior.
+   */
   pushNotice(
-    level: "info" | "warn" | "error",
+    // FIX-14 ticket 5: the shared vocabulary, narrowed to what a transcript
+    // block can mean (see `ChatBlock`'s `notice` variant, blocks.ts).
+    level: Exclude<NoticeKind, "busy" | "success">,
     title: string,
     cause: string[] = [],
-    actions: Array<{ key: string; label: string }> = [],
     at = Date.now(),
   ): ChatBlock {
     this.#assistantId = null;
+    const last = this.#blocks[this.#blocks.length - 1];
+    if (
+      last
+      && last.kind === "notice"
+      && last.title === title
+      && last.cause.length === cause.length
+      && last.cause.every((line, index) => line === cause[index])
+    ) {
+      last.repeatCount = (last.repeatCount ?? 1) + 1;
+      last.at = at;
+      return last;
+    }
     return this.#push({
       kind: "notice",
       id: this.#id("notice"),
@@ -208,7 +227,6 @@ export class RunViewModel {
       level,
       title,
       cause,
-      actions,
     });
   }
 
@@ -218,7 +236,7 @@ export class RunViewModel {
     options: { state?: BlockState; undoable?: boolean; maxHunks?: number; at?: number } = {},
   ): ChatBlock {
     const hunks = splitHunks(diff.lines);
-    const maxHunks = options.maxHunks ?? 3;
+    const maxHunks = options.maxHunks ?? MAX_DIFF_HUNKS;
     this.#assistantId = null;
     return this.#push({
       kind: "diff",
@@ -229,6 +247,11 @@ export class RunViewModel {
       removed: diff.removed,
       hunks: hunks.slice(0, maxHunks),
       hiddenHunks: Math.max(0, hunks.length - maxHunks),
+      // Size honesty: `diff.added`/`diff.removed` above are the whole file's
+      // counts, but `diff.lines` itself already stops at the differ's
+      // changed-line budget. The block says so instead of letting the last
+      // shown hunk pass for the end of the change.
+      truncated: diff.truncated,
       state: options.state ?? "unverified",
       undoable: options.undoable ?? false,
     });
@@ -238,7 +261,7 @@ export class RunViewModel {
     const at = input.at ?? Date.now();
     let diff: DiffHunkView[] | undefined;
     if (input.diff) {
-      diff = splitHunks(input.diff.lines).slice(0, 3);
+      diff = splitHunks(input.diff.lines).slice(0, MAX_DIFF_HUNKS);
     }
     this.#assistantId = null;
     const block: ChatBlock = {
@@ -250,6 +273,7 @@ export class RunViewModel {
       details: input.details ?? [],
       waitingSince: at,
       rememberHint: input.rememberHint ?? "",
+      expanded: false,
     };
     if (diff) block.diff = diff;
     return this.#push(block);
@@ -296,6 +320,24 @@ export class RunViewModel {
       }
       case "model-start": {
         this.#step = event.step;
+        // Fix round 1, Critical 2: a new model phase — including the
+        // continuation `esc`-during-thinking starts after ending the
+        // previous phase's thinking — supersedes any reasoning block still
+        // marked live from an earlier, now-abandoned call. That call's own
+        // "model-end" never fires when the request was aborted mid-stream
+        // rather than completed, so without this, `live` (and hence
+        // `reasoningLive`) would stay stuck true forever: the "Thinking …
+        // Ns" header would keep ticking through the continuation, and a
+        // second `esc` would wrongly re-arm end-thinking instead of
+        // routing to run-abort (src/tui.ts's state-dependent esc split).
+        // In the normal (non-aborted) multi-round flow this is a no-op:
+        // each round's own "model-end" already clears `#reasoningId` before
+        // the next round's "model-start" ever fires.
+        const stale = this.#reasoningId ? this.#index.get(this.#reasoningId) : undefined;
+        if (stale && stale.kind === "reasoning") {
+          stale.live = false;
+        }
+        this.#reasoningId = null;
         return;
       }
       case "model-end": {
@@ -321,7 +363,7 @@ export class RunViewModel {
           // The real count only arrives with `model-end`, i.e. after the
           // thinking is over. Without an estimate the header would read
           // "0 Tokens" for the entire time the panel is actually live.
-          current.tokens = estimateTokens(current.text);
+          current.tokens = estimateReasoningTokens(current.text);
           current.estimated = true;
           return;
         }
@@ -330,7 +372,7 @@ export class RunViewModel {
           id: this.#id("reasoning"),
           at: event.timestamp,
           text: event.delta,
-          tokens: estimateTokens(event.delta),
+          tokens: estimateReasoningTokens(event.delta),
           estimated: true,
           live: true,
           expanded: false,
@@ -388,10 +430,41 @@ export class RunViewModel {
         if (outcome.exitCode !== undefined) block.exitCode = outcome.exitCode;
         block.durationMs = event.durationMs;
         block.totalLines = Math.max(block.totalLines, lines.length);
-        block.tail = selectTail(lines, failed, failed ? RUNNING_TAIL_LINES : 1);
+        // Keyboard-audit addendum: a failed block keeps as many lines as an
+        // EXPANDED block can draw (`REASONING_MAX_LINES`, render-block's own
+        // limit), not just the three the collapsed form shows. Without this,
+        // expanding revealed nothing — the extra lines had already been
+        // thrown away — which is what made its `N more lines` hint hollow.
+        // The collapsed rendering is untouched: it slices the same first
+        // three lines off the front of this list.
+        block.tail = selectTail(lines, failed, failed ? REASONING_MAX_LINES : 1);
         const summary = meta.summarizeOutput(event.output);
         if (summary) block.input = `${block.input} — ${summary}`;
         this.#tools.delete(event.id);
+        return;
+      }
+      case "file-change": {
+        // FIX-3, the audit's Critical: in auto-edit/allow-all the owner never
+        // saw WHAT changed. The diff block is that record, and it renders in
+        // every approval mode — ask included, where the pre-execution preview
+        // lived in an approval block the transcript deletes again the moment
+        // it is answered (`dropApproval`), so nothing double-prints.
+        //
+        // `parseUnifiedDiff` is the same reader `/diff` uses; the counts come
+        // from the event, because the parser can only count the lines that
+        // survived the differ's budget while the event carries the file's real
+        // `+N/-M`.
+        const parsed = parseUnifiedDiff(event.diff);
+        this.pushDiff(
+          event.path,
+          {
+            ...parsed,
+            added: event.added,
+            removed: event.removed,
+            truncated: event.truncated,
+          },
+          { undoable: true, at: event.timestamp },
+        );
         return;
       }
       case "tool-error": {
@@ -402,7 +475,8 @@ export class RunViewModel {
         block.state = "failed";
         block.durationMs = event.durationMs;
         block.totalLines = Math.max(block.totalLines, lines.length);
-        block.tail = selectTail(lines, true, RUNNING_TAIL_LINES);
+        // Same reason as `tool-end` above: keep what an expanded block can draw.
+        block.tail = selectTail(lines, true, REASONING_MAX_LINES);
         this.#tools.delete(event.id);
         return;
       }
@@ -414,8 +488,8 @@ export class RunViewModel {
           at: event.timestamp,
           tool: "verify",
           label: "VERIFY",
-          title: "Prüflauf",
-          input: `${event.command} — Runde ${event.round}`,
+          title: "Verification run",
+          input: `${event.command} — Round ${event.round}`,
           state: failed ? "failed" : "ok",
           exitCode: event.exitCode,
           durationMs: event.durationMs,
@@ -429,7 +503,7 @@ export class RunViewModel {
       }
       case "notice": {
         const cause = event.hint ? [event.hint] : [];
-        this.pushNotice(event.level, event.message, cause, event.actions ?? [], event.timestamp);
+        this.pushNotice(event.level, event.message, cause, event.timestamp);
         return;
       }
       case "run-end": {

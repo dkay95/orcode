@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 460 130" width="460" height="130" role="img" aria-labelledby="route-core-title route-core-description">
+  <title id="route-core-title">ORCODE Route Core</title>
+  <desc id="route-core-description">An open hexagonal Route Core with one filled upper endpoint, one outlined lower endpoint, and the ORCODE wordmark.</desc>
+  <style>
+    .core,.wordmark{fill:none;stroke:#ece5da}
+    .route,.endpoint-outline{fill:none;stroke:#e8a33d}
+    .endpoint-filled{fill:#e8a33d;stroke:#e8a33d}
+    @media (prefers-color-scheme: light){
+      .core,.wordmark{stroke:#141210}
+      .route,.endpoint-outline{stroke:#8a6423}
+      .endpoint-filled{fill:#8a6423;stroke:#8a6423}
+    }
+  </style>
+  <path class="core" data-route-core="open-hexagon" d="M106 37 L69 16 L28 40 L28 88 L69 113 L106 91" stroke-width="10" stroke-linecap="round" stroke-linejoin="round"/>
+  <path class="route" d="M95 48 H119 M95 82 H119" stroke-width="7" stroke-linecap="round"/>
+  <circle class="endpoint-filled" data-route-endpoint="upper" data-endpoint-style="filled" cx="132" cy="48" r="9" stroke-width="3"/>
+  <circle class="endpoint-outline" data-route-endpoint="lower" data-endpoint-style="outline" cx="132" cy="82" r="9" stroke-width="5"/>
+  <g data-wordmark="ORCODE" aria-label="ORCODE">
+    <path class="wordmark" d="M174 40 C158 40 151 50 151 65 C151 80 158 90 174 90 C190 90 197 80 197 65 C197 50 190 40 174 40 M174 49 C184 49 187 56 187 65 C187 74 184 81 174 81 C164 81 161 74 161 65 C161 56 164 49 174 49 M210 90 V40 H231 C244 40 251 47 251 57 C251 65 247 70 240 72 L253 90 H241 L230 74 H220 V90 M220 49 V65 H230 C237 65 241 62 241 57 C241 52 237 49 230 49 M289 51 C285 44 279 40 269 40 C254 40 247 50 247 65 C247 80 254 90 269 90 C279 90 286 86 290 78 L281 73 C278 78 275 81 269 81 C261 81 257 75 257 65 C257 55 261 49 269 49 C275 49 278 52 281 56 M320 40 C304 40 297 50 297 65 C297 80 304 90 320 90 C336 90 343 80 343 65 C343 50 336 40 320 40 M320 49 C330 49 333 56 333 65 C333 74 330 81 320 81 C310 81 307 74 307 65 C307 56 310 49 320 49 M354 90 V40 H372 C389 40 398 49 398 65 C398 81 389 90 372 90 M364 49 V81 H372 C382 81 388 76 388 65 C388 54 382 49 372 49 M409 90 V40 H447 M409 65 H441 M409 90 H447" stroke-width="8" stroke-linecap="round" stroke-linejoin="round"/>
+  </g>
+</svg>

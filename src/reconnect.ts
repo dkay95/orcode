@@ -43,10 +43,10 @@ export const SDK_RECONNECT_POLICY = {
   retryConnectionErrors: true,
 } as const;
 
-export const NETWORK_REASON = "Verbindung unterbrochen oder Zeitüberschreitung";
+export const NETWORK_REASON = "Connection interrupted or timed out";
 
 /** Which logical part of the app produced a request. */
-export type ConnectionScope = "main" | "compressor" | "voice" | "rest";
+export type ConnectionScope = "main" | "compressor" | "voice" | "panel" | "rest";
 
 export type ConnectionEventPhase =
   | "retry-scheduled"
@@ -335,15 +335,15 @@ export function formatConnectionEvent(event: ConnectionEvent): string {
   const target = operationLabel(event.operation, event.scope);
   if (event.phase === "retry-scheduled") {
     const wait = event.delayMs
-      ? `neuer Versuch in ${formatSeconds(event.delayMs)}`
-      : "Reconnect wird vorbereitet";
-    return `${event.reason ?? "Verbindung unterbrochen"} · ${target} · ${wait}`;
+      ? `retrying in ${formatSeconds(event.delayMs)}`
+      : "preparing to reconnect";
+    return `${event.reason ?? "Connection interrupted"} · ${target} · ${wait}`;
   }
   if (event.phase === "retrying") {
-    return `Reconnect-Versuch ${event.attempt} · ${target}`;
+    return `Reconnect attempt ${event.attempt} · ${target}`;
   }
-  const attempts = event.attempt === 1 ? "1 Versuch" : `${event.attempt} Versuche`;
-  return `Verbindung wiederhergestellt · ${target} · ${attempts}`;
+  const attempts = event.attempt === 1 ? "1 attempt" : `${event.attempt} attempts`;
+  return `Connection restored · ${target} · ${attempts}`;
 }
 
 export function throwIfAborted(signal?: AbortSignal): void {
@@ -356,7 +356,7 @@ export function abortError(signal?: AbortSignal): Error {
   if (signal?.reason instanceof Error) {
     return signal.reason;
   }
-  return new Error("Der aktuelle Lauf wurde abgebrochen.");
+  return new Error("The current run was cancelled.");
 }
 
 function attemptSignal(external: AbortSignal | undefined, timeoutMs: number): AbortSignal {
@@ -390,29 +390,29 @@ function operationLabel(
 ): string {
   const base = baseOperationLabel(operation);
   if (scope === "compressor") {
-    return `${base} · Kompressor`;
+    return `${base} · Compressor`;
   }
   if (scope === "main") {
-    return `${base} · Hauptlauf`;
+    return `${base} · Main run`;
   }
   if (scope === "voice") {
-    return `${base} · Transkription`;
+    return `${base} · Transcription`;
   }
   return base;
 }
 
 function baseOperationLabel(operation: string): string {
   if (operation === "createResponses") {
-    return "Modellstream";
+    return "Model stream";
   }
   if (operation === "models") {
-    return "Modellliste";
+    return "Model list";
   }
   if (operation === "key") {
-    return "Key-Prüfung";
+    return "Key check";
   }
   if (operation === "credits") {
-    return "Guthabenprüfung";
+    return "Balance check";
   }
   return operation || "OpenRouter";
 }
@@ -420,5 +420,5 @@ function baseOperationLabel(operation: string): string {
 function formatSeconds(milliseconds: number): string {
   const seconds = milliseconds / 1_000;
   const rendered = seconds >= 10 ? seconds.toFixed(0) : seconds.toFixed(1);
-  return `${rendered.replace(".", ",")} s`;
+  return `${rendered} s`;
 }

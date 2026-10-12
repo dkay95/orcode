@@ -1,13 +1,60 @@
 import assert from "node:assert/strict";
-import { appendFile, mkdtemp, readdir, readFile, stat } from "node:fs/promises";
+import { appendFile, mkdtemp, readdir, readFile, stat, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { createRunId, runLogPath, runsDir, RunLog } from "../src/runlog.js";
+import {
+  createRunId,
+  runLogPath,
+  runsDir,
+  RunLog,
+  type RunLogEnvelope,
+} from "../src/runlog.js";
+import { findInterruptedRun, summarizeRun } from "../src/resume.js";
+import { redactRunEvent } from "../src/redaction.js";
 import type { AgentRunEvent } from "../src/types.js";
 
 async function appHome(prefix: string): Promise<string> {
   return mkdtemp(join(tmpdir(), `routercode-runlog-${prefix}-`));
+}
+
+function syntheticCredential(): string {
+  return `${["sk", "or", "v1"].join("-")}-${"z".repeat(40)}`;
+}
+
+function streamingCredentialFixtures(): Array<{ name: string; secret: string; sensitive: string }> {
+  const awsSecret = "A".repeat(40);
+  const bearer = `token9${"b".repeat(24)}`;
+  const privateBody = "QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVo=";
+  const privateLabel = ["PRIVATE", "KEY"].join(" ");
+  return [
+    { name: "openrouter", secret: `${["sk", "or", "v1"].join("-")}-${"o".repeat(24)}`, sensitive: "o".repeat(24) },
+    { name: "anthropic", secret: `${["sk", "ant"].join("-")}-${"a".repeat(24)}`, sensitive: "a".repeat(24) },
+    { name: "generic-sk", secret: `${["sk", "generic"].join("-")}-${"g".repeat(24)}`, sensitive: "g".repeat(24) },
+    { name: "aws-access", secret: `${["AK", "IA"].join("")}${"C".repeat(16)}`, sensitive: "C".repeat(16) },
+    { name: "aws-secret", secret: `aws_secret_access_key=${awsSecret}`, sensitive: awsSecret },
+    { name: "github", secret: `${["gh", "p_"].join("")}${"H".repeat(24)}`, sensitive: "H".repeat(24) },
+    { name: "gitlab", secret: `${["glpat", ""].join("-")}${"L".repeat(24)}`, sensitive: "L".repeat(24) },
+    { name: "slack", secret: `${["xox", "b-"].join("")}${"1".repeat(16)}`, sensitive: "1".repeat(16) },
+    { name: "google", secret: `${["AI", "za"].join("")}${"Q".repeat(35)}`, sensitive: "Q".repeat(35) },
+    { name: "npm", secret: `${["npm", "_"].join("")}${"N".repeat(36)}`, sensitive: "N".repeat(36) },
+    { name: "bearer", secret: `Bearer ${bearer}`, sensitive: bearer },
+    { name: "jwt", secret: `eyJ${"j".repeat(10)}.${"k".repeat(10)}.${"m".repeat(10)}`, sensitive: `${"j".repeat(10)}.${"k".repeat(10)}.${"m".repeat(10)}` },
+    {
+      name: "private-key",
+      secret: `-----BEGIN ${privateLabel}-----\n${privateBody}\n-----END ${privateLabel}-----`,
+      sensitive: privateBody,
+    },
+  ];
+}
+
+function awsCaptureLabels(): Array<{ name: string; label: string }> {
+  return [
+    { name: "bare-equals", label: "aws_secret_access_key=" },
+    { name: "spaced-double-value", label: 'aws_secret_access_key =  "' },
+    { name: "double-quoted-json", label: 'aws_secret_access_key" : "' },
+    { name: "single-quoted-tabbed", label: "AWS-SECRET-ACCESS-KEY'\t=\t'" },
+  ];
 }
 
 const SAMPLE_EVENTS: AgentRunEvent[] = [
@@ -70,6 +117,39 @@ const SAMPLE_EVENTS: AgentRunEvent[] = [
     timestamp: 8,
   },
   {
+    type: "process-start",
+    id: "process-1",
+    name: "run_command",
+    input: { command: "npm test" },
+    toolId: "t1",
+    toolNumber: 1,
+    timestamp: 8.1,
+  },
+  {
+    type: "process-output",
+    id: "process-1",
+    name: "run_command",
+    stream: "stderr",
+    text: "live error\n",
+    toolId: "t1",
+    toolNumber: 1,
+    timestamp: 8.2,
+  },
+  {
+    type: "process-end",
+    id: "process-1",
+    name: "run_command",
+    input: { command: "npm test" },
+    exitCode: 0,
+    durationMs: 200,
+    truncated: false,
+    timedOut: false,
+    aborted: false,
+    toolId: "t1",
+    toolNumber: 1,
+    timestamp: 8.3,
+  },
+  {
     type: "verify",
     command: "npm test",
     round: 1,
@@ -83,7 +163,6 @@ const SAMPLE_EVENTS: AgentRunEvent[] = [
     code: "cache-miss",
     message: "Kein Cache-Treffer",
     hint: "Präfix instabil",
-    actions: [{ key: "r", label: "Wiederholen" }],
     timestamp: 10,
   },
   {
@@ -124,6 +203,747 @@ test("RunLog write/close/read round-trips every sample event in order", async ()
     read.push(event);
   }
   assert.deepEqual(read, SAMPLE_EVENTS);
+});
+
+test("automatic verification persists only process lifecycle events and one root unverified terminal", async () => {
+  const home = await appHome("task9-auto-verify");
+  const chatId = "chat-task9-auto-verify";
+  const runId = createRunId();
+  const log = await RunLog.open(home, chatId, runId);
+  log.write({
+    type: "process-start",
+    id: "verify-1",
+    name: "verify",
+    input: { command: "npm test" },
+    timestamp: 1,
+  });
+  log.write({
+    type: "process-output",
+    id: "verify-1",
+    name: "verify",
+    stream: "stderr",
+    text: "ERROR failed\n",
+    timestamp: 2,
+  });
+  log.write({
+    type: "process-end",
+    id: "verify-1",
+    name: "verify",
+    input: { command: "npm test" },
+    exitCode: 1,
+    durationMs: 10,
+    truncated: false,
+    timedOut: false,
+    aborted: false,
+    timestamp: 3,
+  });
+  log.write({
+    type: "run-end",
+    outcome: "unverified",
+    durationMs: 20,
+    toolCount: 0,
+    timestamp: 4,
+  });
+  await log.close();
+
+  const events: AgentRunEvent[] = [];
+  for await (const event of RunLog.read(home, chatId, runId)) {
+    events.push(event);
+  }
+  assert.deepEqual(events.map((event) => event.type), [
+    "process-start",
+    "process-output",
+    "process-end",
+    "run-end",
+  ]);
+  assert.equal(events.filter((event) => event.type === "verify").length, 0);
+  assert.equal(events.filter((event) => event.type === "run-end").length, 1);
+  assert.equal(events.find((event) => event.type === "run-end")?.outcome, "unverified");
+});
+
+test("a tool-bound null-exit launch failure keeps one redacted process and root lifecycle", async () => {
+  const home = await appHome("task9-bound-launch");
+  const chatId = "chat-task9-bound-launch";
+  const runId = createRunId();
+  const secret = syntheticCredential();
+  const cause = `spawn shell ENOENT ${secret}`;
+  const events: AgentRunEvent[] = [
+    {
+      type: "tool-start",
+      id: "tool-launch",
+      invocationId: "invocation-launch",
+      number: 1,
+      name: "run_command",
+      input: { command: "task9-bound-command" },
+      timestamp: 1,
+    },
+    {
+      type: "process-start",
+      id: "process-launch",
+      invocationId: "invocation-launch",
+      name: "run_command",
+      input: { command: "task9-bound-command" },
+      toolId: "tool-launch",
+      toolNumber: 1,
+      timestamp: 2,
+    },
+    {
+      type: "process-end",
+      id: "process-launch",
+      invocationId: "invocation-launch",
+      name: "run_command",
+      input: { command: "task9-bound-command" },
+      toolId: "tool-launch",
+      toolNumber: 1,
+      exitCode: null,
+      durationMs: 2,
+      truncated: false,
+      timedOut: false,
+      aborted: false,
+      error: cause,
+      timestamp: 3,
+    },
+    {
+      type: "tool-error",
+      id: "tool-launch",
+      invocationId: "invocation-launch",
+      number: 1,
+      name: "run_command",
+      input: { command: "task9-bound-command" },
+      error: cause,
+      durationMs: 3,
+      timestamp: 4,
+    },
+    { type: "run-end", outcome: "error", durationMs: 4, toolCount: 1, timestamp: 5 },
+  ];
+
+  const log = await RunLog.open(home, chatId, runId);
+  for (const event of events) log.write(event);
+  await log.close();
+
+  const persisted: AgentRunEvent[] = [];
+  for await (const event of RunLog.read(home, chatId, runId)) persisted.push(event);
+  assert.deepEqual(persisted.map((event) => event.type), [
+    "tool-start",
+    "process-start",
+    "process-end",
+    "tool-error",
+    "run-end",
+  ]);
+  const processEnd = persisted.find((event) => event.type === "process-end");
+  assert.equal(processEnd?.type === "process-end" ? processEnd.exitCode : 1, null);
+  assert.equal(persisted.filter((event) => event.type === "process-end").length, 1);
+  assert.equal(persisted.filter((event) => event.type === "tool-error").length, 1);
+  assert.equal(persisted.filter((event) => event.type === "run-end").length, 1);
+  const raw = await readFile(runLogPath(home, chatId, runId), "utf8");
+  assert.doesNotMatch(raw, new RegExp(secret));
+  assert.match(raw, /REDACTED/);
+});
+
+test("new writes use a versioned envelope and redact a clone of the live event", async () => {
+  const home = await appHome("envelope-redaction");
+  const chatId = "chat-envelope";
+  const runId = createRunId();
+  const secret = syntheticCredential();
+  const event: AgentRunEvent = {
+    type: "tool-end",
+    id: "t1",
+    number: 1,
+    name: "run_command",
+    input: { command: `deploy ${secret}` },
+    output: { stdout: secret, exitCode: 0 },
+    durationMs: 17,
+    timestamp: 23,
+  };
+  const liveBefore = structuredClone(event);
+
+  const log = await RunLog.open(home, chatId, runId);
+  log.write(event);
+  await log.close();
+
+  assert.deepEqual(event, liveBefore);
+  const raw = await readFile(runLogPath(home, chatId, runId), "utf8");
+  assert.doesNotMatch(raw, new RegExp(secret));
+  const envelope = JSON.parse(raw) as RunLogEnvelope;
+  assert.equal(envelope.version, 1);
+  assert.equal(envelope.event.type, "tool-end");
+  assert.equal(envelope.event.timestamp, 23);
+  assert.equal(envelope.event.durationMs, 17);
+});
+
+test("appendRunEvent redacts a clone and writes the same versioned envelope", async () => {
+  const home = await appHome("append-redaction");
+  const chatId = "chat-append-redaction";
+  const runId = createRunId();
+  const seed = await RunLog.open(home, chatId, runId);
+  await seed.close();
+  const secret = syntheticCredential();
+  const event: AgentRunEvent = {
+    type: "notice",
+    level: "error",
+    code: "synthetic",
+    message: `failed with ${secret}`,
+    hint: secret,
+    timestamp: 31,
+  };
+  const liveBefore = structuredClone(event);
+
+  await RunLog.appendRunEvent(home, chatId, runId, event);
+
+  assert.deepEqual(event, liveBefore);
+  const raw = await readFile(runLogPath(home, chatId, runId), "utf8");
+  assert.doesNotMatch(raw, new RegExp(secret));
+  const envelope = JSON.parse(raw) as RunLogEnvelope;
+  assert.equal(envelope.version, 1);
+  assert.equal(envelope.event.type, "notice");
+});
+
+test("process output is redacted at RunLog persistence without mutating the volatile event", async () => {
+  const home = await appHome("process-output-redaction");
+  const secret = syntheticCredential();
+  const event = {
+    type: "process-output",
+    id: "process-secret",
+    name: "verify",
+    stream: "stdout",
+    text: `live ${secret}`,
+    timestamp: 44,
+  } as AgentRunEvent;
+  const before = structuredClone(event);
+  const log = await RunLog.open(home, "chat-process", "run-process");
+  log.write(event);
+  await log.close();
+
+  assert.deepEqual(event, before);
+  assert.doesNotMatch(await readFile(runLogPath(home, "chat-process", "run-process"), "utf8"), new RegExp(secret));
+});
+
+test("RunLog hides every registered credential family at every process chunk split and flushes benign suffixes", async () => {
+  const home = await appHome("all-process-splits");
+  const chatId = "chat-all-process-splits";
+  const runId = createRunId();
+  const log = await RunLog.open(home, chatId, runId);
+  const fixtures = streamingCredentialFixtures();
+  let timestamp = 1;
+
+  for (const fixture of fixtures) {
+    for (let split = 1; split < fixture.secret.length; split += 1) {
+      const id = `${fixture.name}-${split}`;
+      log.write({ type: "process-start", id, name: "verify", input: {}, timestamp: timestamp++ });
+      log.write({ type: "process-output", id, name: "verify", stream: "stdout", text: fixture.secret.slice(0, split), timestamp: timestamp++ });
+      log.write({ type: "process-output", id, name: "verify", stream: "stdout", text: `${fixture.secret.slice(split)}\n`, timestamp: timestamp++ });
+      log.write({
+        type: "process-end",
+        id,
+        name: "verify",
+        input: {},
+        exitCode: 0,
+        durationMs: 1,
+        truncated: false,
+        timedOut: false,
+        aborted: false,
+        timestamp: timestamp++,
+      });
+    }
+  }
+  log.write({ type: "process-start", id: "benign-suffix", name: "verify", input: {}, timestamp: timestamp++ });
+  log.write({ type: "process-output", id: "benign-suffix", name: "verify", stream: "stdout", text: "ordinary trailing s", timestamp: timestamp++ });
+  log.write({
+    type: "process-end",
+    id: "benign-suffix",
+    name: "verify",
+    input: {},
+    exitCode: 0,
+    durationMs: 1,
+    truncated: false,
+    timedOut: false,
+    aborted: false,
+    timestamp: timestamp++,
+  });
+  await log.close();
+
+  const outputById = new Map<string, string>();
+  for await (const event of RunLog.read(home, chatId, runId)) {
+    if (event.type === "process-output") {
+      outputById.set(event.id, `${outputById.get(event.id) ?? ""}${event.text}`);
+    }
+  }
+  for (const fixture of fixtures) {
+    for (let split = 1; split < fixture.secret.length; split += 1) {
+      assert.equal(
+        outputById.get(`${fixture.name}-${split}`)?.includes(fixture.sensitive),
+        false,
+        `${fixture.name} leaked at split ${split}`,
+      );
+    }
+  }
+  assert.equal(outputById.get("benign-suffix"), "ordinary trailing s");
+});
+
+test("RunLog keeps later stderr behind an earlier ambiguous stdout prefix", async () => {
+  const home = await appHome("cross-stream-order");
+  const chatId = "chat-cross-stream-order";
+  const runId = createRunId();
+  const log = await RunLog.open(home, chatId, runId);
+  const id = "cross-stream-order";
+  log.write({ type: "process-start", id, name: "run_command", input: { command: "order" }, timestamp: 10 });
+  log.write({ type: "process-output", id, name: "run_command", stream: "stdout", text: "eyJ", timestamp: 11 });
+  log.write({ type: "process-output", id, name: "run_command", stream: "stderr", text: "ERR-LATER\n", timestamp: 12 });
+  log.write({
+    type: "process-end",
+    id,
+    name: "run_command",
+    input: { command: "order" },
+    exitCode: 1,
+    durationMs: 3,
+    truncated: false,
+    timedOut: false,
+    aborted: false,
+    timestamp: 13,
+  });
+  await log.close();
+
+  const output: Array<{ stream: "stdout" | "stderr"; text: string; timestamp: number }> = [];
+  for await (const event of RunLog.read(home, chatId, runId)) {
+    if (event.type === "process-output") {
+      output.push({ stream: event.stream, text: event.text, timestamp: event.timestamp });
+    }
+  }
+  assert.deepEqual(output, [
+    { stream: "stdout", text: "eyJ", timestamp: 11 },
+    { stream: "stderr", text: "ERR-LATER\n", timestamp: 12 },
+  ]);
+});
+
+test("RunLog preserves retained stdout provenance when a same-stream chunk resolves mid-process", async () => {
+  const home = await appHome("cross-stream-provenance");
+  const chatId = "chat-cross-stream-provenance";
+  const runId = createRunId();
+  const log = await RunLog.open(home, chatId, runId);
+  const id = "cross-stream-provenance";
+  log.write({ type: "process-start", id, name: "run_command", input: { command: "order" }, timestamp: 10 });
+  log.write({ type: "process-output", id, name: "run_command", stream: "stdout", text: "eyJ", timestamp: 11 });
+  log.write({ type: "process-output", id, name: "run_command", stream: "stderr", text: "ERR-LATER\n", timestamp: 12 });
+  log.write({ type: "process-output", id, name: "run_command", stream: "stdout", text: " benign\n", timestamp: 13 });
+  log.write({
+    type: "process-end",
+    id,
+    name: "run_command",
+    input: { command: "order" },
+    exitCode: 1,
+    durationMs: 4,
+    truncated: false,
+    timedOut: false,
+    aborted: false,
+    timestamp: 14,
+  });
+  await log.close();
+
+  const output: Array<{ stream: "stdout" | "stderr"; text: string; timestamp: number }> = [];
+  for await (const event of RunLog.read(home, chatId, runId)) {
+    if (event.type === "process-output") {
+      output.push({ stream: event.stream, text: event.text, timestamp: event.timestamp });
+    }
+  }
+  assert.deepEqual(output, [
+    { stream: "stdout", text: "eyJ", timestamp: 11 },
+    { stream: "stderr", text: "ERR-LATER\n", timestamp: 12 },
+    { stream: "stdout", text: " benign\n", timestamp: 13 },
+  ]);
+});
+
+test("RunLog emits one redaction marker while preserving AWS label provenance", async () => {
+  const home = await appHome("aws-provenance");
+  const chatId = "chat-aws-provenance";
+  const runId = createRunId();
+  const log = await RunLog.open(home, chatId, runId);
+  const id = "aws-provenance";
+  const label = "aws_secret_access_key=";
+  const sensitive = "A".repeat(40);
+  log.write({ type: "process-start", id, name: "verify", input: {}, timestamp: 20 });
+  log.write({ type: "process-output", id, name: "verify", stream: "stdout", text: label, timestamp: 21 });
+  log.write({ type: "process-output", id, name: "verify", stream: "stderr", text: "ERR-LATER\n", timestamp: 22 });
+  log.write({ type: "process-output", id, name: "verify", stream: "stdout", text: `${sensitive}\n`, timestamp: 23 });
+  log.write({
+    type: "process-end",
+    id,
+    name: "verify",
+    input: {},
+    exitCode: 1,
+    durationMs: 4,
+    truncated: false,
+    timedOut: false,
+    aborted: false,
+    timestamp: 24,
+  });
+  await log.close();
+
+  const output: Array<{ stream: "stdout" | "stderr"; text: string; timestamp: number }> = [];
+  for await (const event of RunLog.read(home, chatId, runId)) {
+    if (event.type === "process-output") {
+      output.push({ stream: event.stream, text: event.text, timestamp: event.timestamp });
+    }
+  }
+  assert.deepEqual(output, [
+    { stream: "stdout", text: `${label}[REDACTED_AWS_SECRET]`, timestamp: 21 },
+    { stream: "stderr", text: "ERR-LATER\n", timestamp: 22 },
+    { stream: "stdout", text: "\n", timestamp: 23 },
+  ]);
+  assert.doesNotMatch(JSON.stringify(output), new RegExp(sensitive));
+});
+
+test("RunLog emits exactly one AWS marker with original frame provenance across every capture split", async () => {
+  const home = await appHome("aws-capture-boundaries");
+  const chatId = "chat-aws-capture-boundaries";
+  const runId = createRunId();
+  const log = await RunLog.open(home, chatId, runId);
+  const sensitive = "S".repeat(40);
+  const metadataSecret = `${["sk", "or", "v1"].join("-")}-${"M".repeat(24)}`;
+  const marker = "[REDACTED_AWS_SECRET]";
+  const expected = new Map<string, {
+    label: string;
+    split: number;
+    oldTag: string;
+    errorTag: string;
+    currentTag: string;
+    oldTimestamp: number;
+    errorTimestamp: number;
+    currentTimestamp: number;
+  }>();
+  let timestamp = 100;
+
+  for (const variant of awsCaptureLabels()) {
+    for (let split = 1; split <= variant.label.length; split += 1) {
+      const id = `aws-${variant.name}-${split}`;
+      const oldTag = `OLD-${variant.name}-${split}|`;
+      const errorTag = `ERR-${variant.name}-${split}`;
+      const currentTag = `|CURRENT-${variant.name}-${split}`;
+      const oldTimestamp = timestamp + 1;
+      const errorTimestamp = timestamp + 2;
+      const currentTimestamp = timestamp + 3;
+      expected.set(id, {
+        label: variant.label,
+        split,
+        oldTag,
+        errorTag,
+        currentTag,
+        oldTimestamp,
+        errorTimestamp,
+        currentTimestamp,
+      });
+      log.write({ type: "process-start", id, name: "verify", input: {}, timestamp });
+      log.write({
+        type: "process-output",
+        id,
+        name: `verify-${metadataSecret}`,
+        stream: "stdout",
+        text: `${oldTag}${variant.label.slice(0, split)}`,
+        timestamp: oldTimestamp,
+      });
+      log.write({
+        type: "process-output",
+        id,
+        name: "verify",
+        stream: "stderr",
+        text: `${errorTag}\n`,
+        timestamp: errorTimestamp,
+      });
+      log.write({
+        type: "process-output",
+        id,
+        name: `verify-${metadataSecret}`,
+        stream: "stdout",
+        text: `${variant.label.slice(split)}${sensitive}${currentTag}\n`,
+        timestamp: currentTimestamp,
+      });
+      log.write({
+        type: "process-end",
+        id,
+        name: "verify",
+        input: {},
+        exitCode: 1,
+        durationMs: 4,
+        truncated: false,
+        timedOut: false,
+        aborted: false,
+        timestamp: timestamp + 4,
+      });
+      timestamp += 5;
+    }
+  }
+  await log.close();
+
+  const outputById = new Map<string, Array<Extract<AgentRunEvent, { type: "process-output" }>>>();
+  for await (const event of RunLog.read(home, chatId, runId)) {
+    if (event.type !== "process-output") continue;
+    const events = outputById.get(event.id) ?? [];
+    events.push(event);
+    outputById.set(event.id, events);
+  }
+
+  for (const [id, fixture] of expected) {
+    const events = outputById.get(id) ?? [];
+    const visible = events.map((event) => event.text).join("");
+    assert.equal(
+      visible.split(marker).length - 1,
+      1,
+      `${id} emitted more than one marker: ${JSON.stringify(events)}`,
+    );
+    assert.doesNotMatch(visible, new RegExp(sensitive), `${id} leaked secret bytes`);
+    const oldText = events
+      .filter((event) => event.stream === "stdout" && event.timestamp === fixture.oldTimestamp)
+      .map((event) => event.text)
+      .join("");
+    const errorText = events
+      .filter((event) => event.stream === "stderr" && event.timestamp === fixture.errorTimestamp)
+      .map((event) => event.text)
+      .join("");
+    const currentText = events
+      .filter((event) => event.stream === "stdout" && event.timestamp === fixture.currentTimestamp)
+      .map((event) => event.text)
+      .join("");
+    const markerIsOld = fixture.split === fixture.label.length;
+    assert.equal(
+      oldText,
+      `${fixture.oldTag}${fixture.label.slice(0, fixture.split)}${markerIsOld ? marker : ""}`,
+      `${id} changed old-frame provenance`,
+    );
+    assert.equal(errorText, `${fixture.errorTag}\n`, `${id} changed stderr provenance`);
+    assert.equal(
+      currentText,
+      `${fixture.label.slice(fixture.split)}${markerIsOld ? "" : marker}${fixture.currentTag}\n`,
+      `${id} changed current-frame provenance`,
+    );
+    assert.ok(
+      events.findIndex((event) => event.timestamp === fixture.oldTimestamp) <
+        events.findIndex((event) => event.timestamp === fixture.errorTimestamp),
+      `${id} reordered old stdout behind stderr`,
+    );
+    assert.ok(
+      events.findIndex((event) => event.timestamp === fixture.errorTimestamp) <
+        events.findIndex((event) => event.timestamp === fixture.currentTimestamp),
+      `${id} reordered current stdout before stderr`,
+    );
+    for (const event of events.filter((candidate) => candidate.stream === "stdout")) {
+      assert.equal(event.name, "verify-[REDACTED_OPENROUTER_KEY]");
+    }
+  }
+
+  const raw = await readFile(runLogPath(home, chatId, runId), "utf8");
+  assert.doesNotMatch(raw, new RegExp(sensitive));
+  assert.doesNotMatch(raw, new RegExp(metadataSecret));
+});
+
+test("read accepts versioned and legacy events while isolating future versions", async () => {
+  const home = await appHome("mixed-versions");
+  const chatId = "chat-mixed";
+  const runId = createRunId();
+  const path = runLogPath(home, chatId, runId);
+  const log = await RunLog.open(home, chatId, runId);
+  await log.close();
+  const legacy: AgentRunEvent = {
+    type: "run-start",
+    model: "legacy-model",
+    maxSteps: 7,
+    prompt: "legacy prompt",
+    timestamp: 10,
+  };
+  const modern: AgentRunEvent = {
+    type: "model-end",
+    model: "modern-model",
+    step: 2,
+    durationMs: 80,
+    inputTokens: 100,
+    outputTokens: 20,
+    reasoningTokens: 5,
+    cachedTokens: 40,
+    costUsd: 0.125,
+    timestamp: 20,
+  };
+  const terminal: AgentRunEvent = {
+    type: "run-end",
+    outcome: "cost-limit",
+    durationMs: 900,
+    toolCount: 3,
+    timestamp: 30,
+  };
+  const envelope: RunLogEnvelope = { version: 1, event: modern };
+  await writeFile(
+    path,
+    [
+      JSON.stringify(legacy),
+      JSON.stringify(envelope),
+      JSON.stringify({ version: 99, event: { type: "text", delta: "future", timestamp: 25 } }),
+      JSON.stringify({ version: 1, event: terminal }),
+      "",
+    ].join("\n"),
+  );
+
+  const read: AgentRunEvent[] = [];
+  await assert.doesNotReject(async () => {
+    for await (const event of RunLog.read(home, chatId, runId)) {
+      read.push(event);
+    }
+  });
+  assert.deepEqual(read, [legacy, modern, terminal]);
+});
+
+test("model-end unknown cost knowledge survives the versioned run-log envelope", async () => {
+  const home = await appHome("unknown-cost");
+  const chatId = "chat-unknown-cost";
+  const runId = createRunId();
+  const log = await RunLog.open(home, chatId, runId);
+  const event: AgentRunEvent = {
+    type: "model-end",
+    model: "k3",
+    step: 1,
+    durationMs: 50,
+    inputTokens: 12,
+    outputTokens: 4,
+    reasoningTokens: 2,
+    cachedTokens: 0,
+    costUsd: 0,
+    costKnowledge: "unknown",
+    timestamp: 20,
+  };
+  log.write(event);
+  await log.close();
+
+  const read: AgentRunEvent[] = [];
+  for await (const persisted of RunLog.read(home, chatId, runId)) read.push(persisted);
+  assert.deepEqual(read, [event]);
+  const raw = await readFile(runLogPath(home, chatId, runId), "utf8");
+  assert.match(raw, /"costKnowledge":"unknown"/);
+  assert.doesNotMatch(raw, /kostenlos|free/i);
+});
+
+test("resume reads a mixed legacy and envelope log without losing timing or cost", async () => {
+  const home = await appHome("resume-mixed");
+  const chatId = "chat-resume-mixed";
+  const runId = "2026-08-22T10-00-00-000-resume";
+  const path = runLogPath(home, chatId, runId);
+  const log = await RunLog.open(home, chatId, runId);
+  await log.close();
+  const legacy: AgentRunEvent = {
+    type: "run-start",
+    model: "legacy-model",
+    maxSteps: 5,
+    prompt: "continue safely",
+    timestamp: 100,
+  };
+  const modelEnd: AgentRunEvent = {
+    type: "model-end",
+    model: "legacy-model",
+    step: 1,
+    durationMs: 75,
+    inputTokens: 12,
+    outputTokens: 8,
+    reasoningTokens: 2,
+    cachedTokens: 4,
+    costUsd: 0.25,
+    timestamp: 200,
+  };
+  const partial: AgentRunEvent = {
+    type: "text",
+    delta: "partial answer",
+    timestamp: 300,
+  };
+  await writeFile(
+    path,
+    [
+      JSON.stringify(legacy),
+      JSON.stringify({ version: 1, event: modelEnd } satisfies RunLogEnvelope),
+      JSON.stringify({ version: 1, event: partial } satisfies RunLogEnvelope),
+      "",
+    ].join("\n"),
+  );
+
+  const interrupted = await findInterruptedRun(home, chatId);
+  assert.ok(interrupted);
+  assert.deepEqual(interrupted.events, [legacy, modelEnd, partial]);
+  const summary = summarizeRun(interrupted.events);
+  assert.equal(summary.startedAt, 100);
+  assert.equal(summary.costUsd, 0.25);
+  assert.equal(summary.partialAnswerText, "partial answer");
+  assert.match(summary.brokeOffAt, /composing the response/);
+});
+
+test("recognizable credential prefixes split across stream events cannot be reconstructed", async () => {
+  const home = await appHome("split-stream");
+  const chatId = "chat-split";
+  const runId = createRunId();
+  const prefix = `${["sk", "or", "v1"].join("-")}-`;
+  const body = "q".repeat(40);
+  const events: AgentRunEvent[] = [
+    { type: "reasoning", model: "m", step: 1, delta: prefix, timestamp: 1 },
+    { type: "text", delta: body, timestamp: 2 },
+    {
+      type: "tool-output",
+      id: "t",
+      number: 1,
+      stream: "stdout",
+      text: prefix,
+      timestamp: 3,
+    },
+    { type: "text", delta: body, timestamp: 4 },
+  ];
+  const log = await RunLog.open(home, chatId, runId);
+  for (const event of events) {
+    log.write(event);
+  }
+  await log.close();
+
+  const raw = await readFile(runLogPath(home, chatId, runId), "utf8");
+  const persisted = raw
+    .trim()
+    .split("\n")
+    .map((line) => (JSON.parse(line) as RunLogEnvelope).event);
+  const persistedContent = persisted
+    .map((event) =>
+      event.type === "reasoning"
+        ? event.delta
+        : event.type === "text"
+          ? event.delta
+          : event.type === "tool-output"
+            ? event.text
+            : "",
+    )
+    .join("");
+  assert.ok(!persistedContent.includes(`${prefix}${body}`));
+  assert.deepEqual(
+    persisted.map((event) => event.type),
+    events.map((event) => event.type),
+  );
+  assert.deepEqual(
+    persisted.map((event) => event.timestamp),
+    events.map((event) => event.timestamp),
+  );
+});
+
+test("generic sk credential prefixes split across deltas cannot be reconstructed", () => {
+  const prefix = `${["sk", "proj"].join("-")}-`;
+  const body = "g".repeat(32);
+  const events: AgentRunEvent[] = [
+    { type: "reasoning", model: "m", step: 1, delta: prefix, timestamp: 1 },
+    { type: "text", delta: body, timestamp: 2 },
+  ];
+  const before = structuredClone(events);
+  const persisted = events.map((event) => redactRunEvent(event));
+  assert.deepEqual(events, before);
+  const persistedContent = persisted
+    .map((event) =>
+      event.type === "reasoning"
+        ? event.delta
+        : event.type === "text"
+          ? event.delta
+          : "",
+    )
+    .join("");
+  assert.ok(!persistedContent.includes(`${prefix}${body}`));
+  assert.deepEqual(
+    persisted.map((event) => event.type),
+    events.map((event) => event.type),
+  );
 });
 
 test("RunLog.open creates the chat directory with mode 0700 and the file with mode 0600", async () => {
@@ -171,6 +991,83 @@ test("RunLog.prune with 60 files keeps exactly the 50 most recent", async () => 
 test("RunLog.prune on a chat with no runs directory does nothing", async () => {
   const home = await appHome("prune-empty");
   await assert.doesNotReject(RunLog.prune(home, "no-such-chat", 50));
+});
+
+test("RunLog retention clamps age and per-chat configuration downward while excluding an active run", async () => {
+  const home = await appHome("retention-ceilings");
+  const chatId = "chat-retention";
+  const now = Date.parse("2026-08-22T12:00:00.000Z");
+  const activeRunId = "2026-06-01T00-00-00-000-active";
+  const staleRunId = "2026-07-01T00-00-00-000-stale";
+
+  for (const [runId, terminal] of [[activeRunId, false], [staleRunId, true]] as const) {
+    const log = await RunLog.open(home, chatId, runId);
+    log.write({ type: "run-start", model: "vendor/model", maxSteps: 1, prompt: runId, timestamp: now });
+    if (terminal) {
+      log.write({ type: "run-end", outcome: "complete", durationMs: 1, toolCount: 0, timestamp: now + 1 });
+    }
+    await log.close();
+    await utimes(runLogPath(home, chatId, runId), new Date(now - 40 * 86_400_000), new Date(now - 40 * 86_400_000));
+  }
+
+  for (let index = 0; index < 101; index += 1) {
+    const runId = `2026-08-01T00-00-${String(index).padStart(3, "0")}-000-terminal`;
+    const log = await RunLog.open(home, chatId, runId);
+    log.write({ type: "run-end", outcome: "complete", durationMs: 1, toolCount: 0, timestamp: now + index });
+    await log.close();
+    await utimes(runLogPath(home, chatId, runId), new Date(now - (101 - index) * 1_000), new Date(now - (101 - index) * 1_000));
+  }
+
+  await RunLog.prune(home, {
+    now,
+    maxAgeDays: 365,
+    maxRunsPerChat: 1_000,
+    maxBytesGlobal: Number.MAX_SAFE_INTEGER,
+  });
+
+  const remaining = await readdir(runsDir(home, chatId));
+  assert.ok(remaining.includes(`${activeRunId}.ndjson`), "active run must survive age and count pruning");
+  assert.ok(!remaining.includes(`${staleRunId}.ndjson`), "age cannot be configured above 30 days");
+  assert.equal(
+    remaining.filter((name) => name.endsWith("-terminal.ndjson")).length,
+    100,
+    "per-chat retention cannot be configured above 100 terminal runs",
+  );
+});
+
+test("RunLog retention enforces a downward global byte limit oldest first across chats", async () => {
+  const home = await appHome("retention-global");
+  const now = Date.parse("2026-08-22T12:00:00.000Z");
+  const paths: string[] = [];
+  for (let index = 0; index < 3; index += 1) {
+    const chatId = `chat-global-${index}`;
+    const runId = `2026-08-22T00-00-0${index}-000-run`;
+    const log = await RunLog.open(home, chatId, runId);
+    log.write({
+      type: "notice",
+      level: "info",
+      code: "payload",
+      message: `${index}-${"x".repeat(900)}`,
+      timestamp: now + index,
+    });
+    log.write({ type: "run-end", outcome: "complete", durationMs: 1, toolCount: 0, timestamp: now + index + 1 });
+    await log.close();
+    const path = runLogPath(home, chatId, runId);
+    paths.push(path);
+    await utimes(path, new Date(now - (3 - index) * 1_000), new Date(now - (3 - index) * 1_000));
+  }
+
+  const sizes = await Promise.all(paths.map(async (path) => (await stat(path)).size));
+  await RunLog.prune(home, {
+    now,
+    maxAgeDays: 30,
+    maxRunsPerChat: 100,
+    maxBytesGlobal: sizes[1]! + sizes[2]!,
+  });
+
+  await assert.rejects(readFile(paths[0]!, "utf8"), /ENOENT/);
+  assert.match(await readFile(paths[1]!, "utf8"), /run-end/);
+  assert.match(await readFile(paths[2]!, "utf8"), /run-end/);
 });
 
 // --- resilience: a crash can leave a half-written last line ---------------
@@ -243,4 +1140,157 @@ test("RunLog.appendRunEvent appends to an already-closed log without a live RunL
 
   const raw = await readFile(runLogPath(home, chatId, runId), "utf8");
   assert.equal(raw.split("\n").filter(Boolean).length, 2);
+});
+
+// --- FIX-16/2: the bounded "did this run end?" probe ----------------------
+
+const RUN_END_EVENT: AgentRunEvent = {
+  type: "run-end",
+  outcome: "complete",
+  durationMs: 1,
+  toolCount: 0,
+  timestamp: 7,
+};
+
+async function seedRunLog(
+  home: string,
+  chatId: string,
+  runId: string,
+  options: { padBytes?: number; terminal: boolean; trailing?: AgentRunEvent },
+): Promise<void> {
+  const log = await RunLog.open(home, chatId, runId);
+  log.write({ type: "run-start", model: "vendor/model", maxSteps: 1, prompt: runId, timestamp: 1 });
+  let written = 0;
+  while (written < (options.padBytes ?? 0)) {
+    const message = "p".repeat(900);
+    log.write({ type: "notice", level: "info", code: "pad", message, timestamp: 2 });
+    written += message.length;
+  }
+  if (options.terminal) log.write(RUN_END_EVENT);
+  if (options.trailing) log.write(options.trailing);
+  await log.close();
+}
+
+test("hasRunEnd finds the terminal event from the tail without reading the whole log", async () => {
+  const home = await appHome("tail-terminal");
+  const chatId = "chat-tail";
+  const runId = createRunId();
+  // Far more than one tail window of events ahead of the run-end.
+  await seedRunLog(home, chatId, runId, { padBytes: 400 * 1_024, terminal: true });
+
+  const size = (await stat(runLogPath(home, chatId, runId))).size;
+  assert.ok(size > 128 * 1_024, "fixture must be larger than one tail window");
+  assert.equal(await RunLog.hasRunEnd(home, chatId, runId), true);
+});
+
+test("hasRunEnd still sees a run-end behind a later appended review marker", async () => {
+  const home = await appHome("tail-behind-marker");
+  const chatId = "chat-tail-marker";
+  const runId = createRunId();
+  await seedRunLog(home, chatId, runId, { padBytes: 200 * 1_024, terminal: true });
+  // `appendRunEvent`'s real use: marking an interrupted run reviewed, i.e.
+  // a line written *after* the terminal one.
+  await RunLog.appendRunEvent(home, chatId, runId, {
+    type: "notice",
+    level: "info",
+    code: "reviewed",
+    message: "reviewed",
+    timestamp: 9,
+  });
+
+  assert.equal(await RunLog.hasRunEnd(home, chatId, runId), true);
+});
+
+test("hasRunEnd reads a short non-terminal log to its start and answers no", async () => {
+  const home = await appHome("tail-short");
+  const chatId = "chat-tail-short";
+  const runId = createRunId();
+  await seedRunLog(home, chatId, runId, { terminal: false });
+
+  assert.equal(await RunLog.hasRunEnd(home, chatId, runId), false);
+});
+
+test("an ambiguous tail falls back to the full scan rather than guessing", async () => {
+  const home = await appHome("tail-ambiguous");
+  const chatId = "chat-tail-ambiguous";
+
+  // A run-end that a tiny window provably cannot see: the fallback must find
+  // it, because reporting "not ended" would let retention delete a log the
+  // interrupted-run flow still needs to be able to recognise.
+  const buried = createRunId();
+  await seedRunLog(home, chatId, buried, { terminal: true });
+  await RunLog.appendRunEvent(home, chatId, buried, {
+    type: "notice",
+    level: "info",
+    code: "after",
+    message: "z".repeat(4_000),
+    timestamp: 9,
+  });
+  assert.equal(await RunLog.hasRunEnd(home, chatId, buried, { tailBytes: 64 }), true);
+
+  // The same tiny window over a genuinely interrupted log: the fallback
+  // reads it out and still answers no.
+  const interrupted = createRunId();
+  await seedRunLog(home, chatId, interrupted, { padBytes: 8_000, terminal: false });
+  assert.equal(await RunLog.hasRunEnd(home, chatId, interrupted, { tailBytes: 64 }), false);
+});
+
+test("hasRunEnd ignores a half-written trailing line and an empty log", async () => {
+  const home = await appHome("tail-corrupt");
+  const chatId = "chat-tail-corrupt";
+
+  const crashed = createRunId();
+  await seedRunLog(home, chatId, crashed, { terminal: true });
+  await appendFile(runLogPath(home, chatId, crashed), '{"version":1,"event":{"type":"noti');
+  assert.equal(await RunLog.hasRunEnd(home, chatId, crashed), true);
+
+  const garbage = createRunId();
+  await seedRunLog(home, chatId, garbage, { terminal: false });
+  await appendFile(runLogPath(home, chatId, garbage), '{"version":1,"event":{"type":"run-en');
+  assert.equal(await RunLog.hasRunEnd(home, chatId, garbage), false);
+
+  const empty = createRunId();
+  const log = await RunLog.open(home, chatId, empty);
+  await log.close();
+  assert.equal(await RunLog.hasRunEnd(home, chatId, empty), false);
+});
+
+test("hasRunEnd accepts a legacy pre-envelope run-end line", async () => {
+  const home = await appHome("tail-legacy");
+  const chatId = "chat-tail-legacy";
+  const runId = createRunId();
+  await seedRunLog(home, chatId, runId, { terminal: false });
+  await appendFile(runLogPath(home, chatId, runId), `${JSON.stringify(RUN_END_EVENT)}\n`);
+
+  assert.equal(await RunLog.hasRunEnd(home, chatId, runId), true);
+});
+
+test("retention keeps a non-terminal log the tail probe could only read in part", async () => {
+  const home = await appHome("tail-retention");
+  const chatId = "chat-tail-retention";
+  const now = Date.parse("2026-08-22T12:00:00.000Z");
+  // Large enough that no tail window covers it, and never ended: exactly the
+  // shape `findInterruptedRun` recovers from, so retention must not touch it
+  // no matter how old it is.
+  const interrupted = "2026-06-01T00-00-00-000-crash";
+  await seedRunLog(home, chatId, interrupted, { padBytes: 300 * 1_024, terminal: false });
+  await utimes(
+    runLogPath(home, chatId, interrupted),
+    new Date(now - 400 * 86_400_000),
+    new Date(now - 400 * 86_400_000),
+  );
+  const ended = "2026-06-02T00-00-00-000-ended";
+  await seedRunLog(home, chatId, ended, { padBytes: 300 * 1_024, terminal: true });
+  await utimes(
+    runLogPath(home, chatId, ended),
+    new Date(now - 400 * 86_400_000),
+    new Date(now - 400 * 86_400_000),
+  );
+
+  await RunLog.prune(home, { now });
+
+  const remaining = await readdir(runsDir(home, chatId));
+  assert.deepEqual(remaining.sort(), [`${interrupted}.ndjson`]);
+  const recovered = await findInterruptedRun(home, chatId);
+  assert.equal(recovered?.runId, interrupted);
 });

@@ -1,0 +1,3 @@
+{"type":"run-start","model":"synthetic/main-v0","maxSteps":9,"prompt":"Historischen Fixture-Stand prüfen.","timestamp":1724148000000}
+{"type":"model-end","model":"synthetic/main-v0","step":1,"durationMs":450,"inputTokens":120,"outputTokens":45,"reasoningTokens":12,"cachedTokens":8,"costUsd":0.125,"timestamp":1724148000450}
+{"type":"run-end","outcome":"complete","durationMs":500,"toolCount":0,"timestamp":1724148000500}

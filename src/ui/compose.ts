@@ -3,7 +3,7 @@
  * place that turns lines into ANSI (Bauplan 2.4, rules R2 and R3).
  */
 
-import type { Line, Span } from "./spans.js";
+import { spansWidth, type Line, type Span } from "./spans.js";
 import { paintSpan, type Theme } from "./theme.js";
 
 const ZERO_WIDTH = new Set([0x200b, 0x200c, 0x200d, 0xfeff]);
@@ -108,12 +108,33 @@ function cutText(value: string, width: number): { text: string; used: number } {
   return { text, used };
 }
 
-export function spansWidth(spans: readonly Span[]): number {
-  let total = 0;
-  for (const item of spans) {
-    total += displayWidth(item.text);
+/**
+ * Cuts `value` to at most `width` cells by dropping its MIDDLE and joining
+ * the two surviving ends with `ellipsis` — the shape a filesystem path wants
+ * (`~/projekt/…/routercode` keeps both the root and the folder that names
+ * it, where a tail cut would keep neither). Cluster-safe like `cutText`
+ * above, and never wider than `width`: below the ellipsis' own width it
+ * degrades to a plain head cut rather than returning something too long.
+ */
+export function middleEllipsis(value: string, width: number, ellipsis = "…"): string {
+  if (width <= 0) return "";
+  if (displayWidth(value) <= width) return value;
+  const markWidth = displayWidth(ellipsis);
+  if (width <= markWidth) return cutText(value, width).text;
+  const budget = width - markWidth;
+  const headBudget = Math.ceil(budget / 2);
+  const head = cutText(value, headBudget);
+  const tailBudget = budget - head.used;
+  const items = clusters(value);
+  let tail = "";
+  let used = 0;
+  for (let index = items.length - 1; index >= 0; index -= 1) {
+    const cluster = items[index]!;
+    if (used + cluster.width > tailBudget) break;
+    tail = `${cluster.text}${tail}`;
+    used += cluster.width;
   }
-  return total;
+  return `${head.text}${ellipsis}${tail}`;
 }
 
 /**

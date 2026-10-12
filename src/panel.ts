@@ -60,6 +60,8 @@ export interface PanelAnswer {
   outputTokens: number;
   /** German, user facing. `null` on success. */
   error: string | null;
+  /** Fixed structural marker; never contains provider response data. */
+  failureCode?: "authentication-rejected";
 }
 
 export interface PanelResult {
@@ -115,6 +117,15 @@ export class PanelValidationError extends Error {
   }
 }
 
+export class PanelAuthenticationRejectedError extends Error {
+  readonly code = "provider-authentication-rejected";
+
+  constructor(readonly partialResult?: PanelResult) {
+    super("Provider authentication was rejected.");
+    this.name = "PanelAuthenticationRejectedError";
+  }
+}
+
 export class PanelBudgetExceededError extends Error {
   readonly estimatedCostUsd: number;
   readonly maxCostUsd: number;
@@ -122,7 +133,7 @@ export class PanelBudgetExceededError extends Error {
 
   constructor(estimatedCostUsd: number, maxCostUsd: number, modelCount: number) {
     super(
-      `Geschätzte Panel-Kosten für ${modelCount} Modelle: ${formatUsd(estimatedCostUsd)} · Limit: ${formatUsd(maxCostUsd)}. Panel wird nicht gestartet.`,
+      `Estimated panel cost for ${modelCount} models: ${formatUsd(estimatedCostUsd)} · Limit: ${formatUsd(maxCostUsd)}. Panel will not start.`,
     );
     this.name = "PanelBudgetExceededError";
     this.estimatedCostUsd = estimatedCostUsd;
@@ -168,6 +179,49 @@ export function estimatePanelCost(
   return { totalUsd, perModelUsd, unknownCount };
 }
 
+/**
+ * FIX-10 H2 (money honesty): `estimatePanelCost` plus the judge round.
+ * Absent judge (`judge` undefined) this is exactly `estimatePanelCost`.
+ */
+export interface PanelRunEstimate extends PanelCostEstimate {
+  /** The judging model and its per-call estimate (`null` = price unknown). Only present when the judge is on. */
+  judge?: { model: string; usd: number | null };
+}
+
+/**
+ * FIX-10 H2 (money honesty): the `/panel` confirm's estimate covers every
+ * call an accepted run actually books — the N panel models AND, when the
+ * judge is on, the one `synthesize()` call on the judging model
+ * (`config.mainModel` at the command layer). The judge is priced through
+ * the SAME per-model estimator as the panelists — never a second ratio —
+ * and a judge with unknown pricing counts into `unknownCount` instead of
+ * silently pricing the round at $0.
+ *
+ * Fix round 1 (F4): the judge's actual input is `buildJudgePrompt`
+ * (question + every panel answer), several multiples larger than the bare
+ * question — `estimateJudgeCostUsd` lets the caller price the judge at
+ * that larger input through the same underlying estimator (the command
+ * layer passes question chars + N × the panelists' own output allowance).
+ * Defaults to `estimateCostUsd` for callers without a judge-input figure.
+ */
+export function estimatePanelRun(
+  models: readonly string[],
+  judgeModel: string | null,
+  estimateCostUsd: (model: string) => number | null,
+  estimateJudgeCostUsd: (model: string) => number | null = estimateCostUsd,
+): PanelRunEstimate {
+  const base = estimatePanelCost(models, estimateCostUsd);
+  if (judgeModel === null) return base;
+  const raw = estimateJudgeCostUsd(judgeModel);
+  const judgeUsd = raw === null || !Number.isFinite(raw) ? null : Math.max(0, raw);
+  return {
+    ...base,
+    totalUsd: base.totalUsd + (judgeUsd ?? 0),
+    unknownCount: base.unknownCount + (judgeUsd === null ? 1 : 0),
+    judge: { model: judgeModel, usd: judgeUsd },
+  };
+}
+
 // ---------------------------------------------------------------------------
 // askPanel
 // ---------------------------------------------------------------------------
@@ -175,7 +229,7 @@ export function estimatePanelCost(
 function validateModelCount(models: readonly string[]): void {
   if (models.length < PANEL_MIN_MODELS || models.length > PANEL_MAX_MODELS) {
     throw new PanelValidationError(
-      `Panel braucht zwischen ${PANEL_MIN_MODELS} und ${PANEL_MAX_MODELS} Modellen, erhalten: ${models.length}.`,
+      `Panel needs between ${PANEL_MIN_MODELS} and ${PANEL_MAX_MODELS} models, got: ${models.length}.`,
     );
   }
 }
@@ -237,6 +291,7 @@ async function runOneModel(
   } catch (error) {
     // A failing or slow model must never take the others down with it — its
     // place in the result carries the error instead of rejecting the panel.
+    const authenticationRejected = error instanceof PanelAuthenticationRejectedError;
     return {
       model,
       text: "",
@@ -244,7 +299,12 @@ async function runOneModel(
       durationMs: Date.now() - start,
       inputTokens: 0,
       outputTokens: 0,
-      error: errorMessage(error),
+      error: authenticationRejected
+        ? "Provider authentication was rejected."
+        : errorMessage(error),
+      ...(authenticationRejected
+        ? { failureCode: "authentication-rejected" as const }
+        : {}),
     };
   }
 }
@@ -259,7 +319,7 @@ export async function askPanel(options: AskPanelOptions): Promise<PanelResult> {
   const { question, context, models, callModel, signal, maxCostUsd, estimateCostUsd } =
     options;
   if (!question.trim()) {
-    throw new PanelValidationError("Panel braucht eine Frage.");
+    throw new PanelValidationError("Panel needs a question.");
   }
   validateModelCount(models);
   throwIfAborted(signal);
@@ -275,13 +335,17 @@ export async function askPanel(options: AskPanelOptions): Promise<PanelResult> {
   const answers = await Promise.all(
     models.map((model) => runOneModel(model, question, context, callModel, signal)),
   );
-  return {
+  const result: PanelResult = {
     question,
     ...(context !== undefined ? { context } : {}),
     answers,
     totalCostUsd: answers.reduce((sum, answer) => sum + answer.costUsd, 0),
     durationMs: Date.now() - start,
   };
+  if (answers.some((answer) => answer.failureCode === "authentication-rejected")) {
+    throw new PanelAuthenticationRejectedError(result);
+  }
+  return result;
 }
 
 // ---------------------------------------------------------------------------
@@ -343,7 +407,7 @@ export async function synthesize(options: SynthesizeOptions): Promise<PanelJudgm
   );
   if (usable.length < 2) {
     throw new PanelValidationError(
-      "Für eine Auswertung werden mindestens zwei erfolgreiche Panel-Antworten benötigt.",
+      "An evaluation needs at least two successful panel answers.",
     );
   }
   throwIfAborted(signal);
@@ -362,6 +426,7 @@ export async function synthesize(options: SynthesizeOptions): Promise<PanelJudgm
       error: null,
     };
   } catch (error) {
+    if (error instanceof PanelAuthenticationRejectedError) throw error;
     return {
       judgeModel,
       text: "",

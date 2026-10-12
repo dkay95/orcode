@@ -1,0 +1,19 @@
+<!doctype html>
+<html lang="de">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>orcode · Workbench-Vorschau</title>
+    <style>
+      .preview-banner { height: 38px; display: flex; align-items: center; padding: 0 20px;
+        gap: 12px; background: #e8a33d; color: #1b1611; font: 12px/1.4 system-ui; }
+      .preview-banner strong { font-weight: 700; }
+      #app.workbench-shell { height: calc(100vh - 38px); }
+    </style>
+  </head>
+  <body>
+    <div class="preview-banner"><strong>DESIGN-VORSCHAU</strong><span>Demodaten · keine echten Konten, Dateizugriffe oder Modellaufrufe.</span></div>
+    <div id="preview-app"></div>
+    <script type="module" src="/preview/workbench-demo.js"></script>
+  </body>
+</html>

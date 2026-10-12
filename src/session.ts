@@ -9,28 +9,78 @@ import {
   writeFile,
 } from "node:fs/promises";
 import { hostname } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
+import { isDeepStrictEqual } from "node:util";
 import {
   APP_HOME,
   ensureSecureDirectory,
+  isAtomicFilePostPublicationError,
   SECURE_FILE_MODE,
   writeFileAtomicSecure,
 } from "./config.js";
+import type { ConfigWriteOwnership } from "./config-write-lock.js";
+import {
+  configBytesDigest,
+  readConfigFileSnapshot,
+  sameConfigFileSnapshot,
+  type ConfigFileSnapshot,
+} from "./config-file.js";
 import {
   REASONING_EFFORTS,
   type ChatSummary,
   type ChatTurn,
+  type CostKnowledge,
   type CostLedger,
+  type CrossModeV1,
+  type LastCrossRunV1,
   type ReasoningSetting,
   type SessionData,
 } from "./types.js";
-import { formatUsd, hasCode, isRecord } from "./utils.js";
+import { redactText, redactValue } from "./redaction.js";
+import { PrivateStore } from "./private-store.js";
+import {
+  CHAT_ARTIFACT_REGISTRY,
+  deleteChatOwnedArtifacts,
+  type ChatDeletionReport,
+  workspaceStorageHash,
+} from "./storage.js";
+import { MAX_RETAINED_TURNS, formatUsd, hasCode, isRecord } from "./utils.js";
+import type { RouteIdentityV1 } from "./backends.js";
+import {
+  isProviderStateIssue,
+  mapLegacyOpenRouterModel,
+  credentialBindingForConnection,
+  validateRouteIdentityV1,
+  type ProviderConnectionStateV3,
+  type ProviderSetupState,
+} from "./provider-state.js";
 
-const MAX_TURNS = 80;
+// FIX-10 H4 (retention honesty): the cap is defined in utils.ts next to the
+// one message-count formatter that discloses it ("80+ messages"), so the
+// retention slice below and its rendering can never drift apart.
+const MAX_TURNS = MAX_RETAINED_TURNS;
 const MAX_CHECKPOINTS = 50;
 const MAX_TOOL_CALLS = 200;
 const SPEND_HISTORY_DAYS = 90;
-const DEFAULT_TITLE = "Neuer Chat";
+/**
+ * D9 (`/goal <text>`): the one length cap for `SessionData.goal`, shared by
+ * `normalizeGoal` (load/merge, fail-closed) and `SessionStore.setGoal` (the
+ * interactive setter, which refuses an over-limit value with an honest error
+ * naming this exact number instead of silently truncating it).
+ */
+export const MAX_GOAL_CHARS = 2000;
+const DEFAULT_TITLE = "New Chat";
+/**
+ * The pre-English-migration default title. Chats saved before that migration
+ * carry this literal string on disk; `normalizeTitle` maps it to
+ * `DEFAULT_TITLE` on load so `addTurn`'s `title === DEFAULT_TITLE` check
+ * (the trigger for auto-renaming a chat from its first message) still fires
+ * for them instead of leaving them permanently untitled in German.
+ */
+const LEGACY_DEFAULT_TITLE = "Neuer Chat";
+/** Fixed copy: never echoes route fields, so no fingerprint or model reaches an error. */
+const ROUTE_INVALID_MESSAGE = "Chat route is incomplete or unknown.";
+const ROUTE_MODEL_MISMATCH_MESSAGE = "Chat route does not match the selected model.";
 
 /** A lock older than this belongs to a process that died mid-write. */
 const LOCK_STALE_MS = 30_000;
@@ -47,6 +97,8 @@ export interface SessionCheckpoint {
   /** Number of turns that existed when the checkpoint was taken. */
   turnIndex: number;
   costUsd: number;
+  /** Missing in legacy checkpoints means known. */
+  costKnowledge?: CostKnowledge;
   createdAt: string;
 }
 
@@ -69,6 +121,8 @@ export interface PersistedSessionData extends SessionData {
   toolCalls: SessionToolCall[];
   /** local day (YYYY-MM-DD) -> USD spent on that day in this chat. */
   dailySpendUsd: Record<string, number>;
+  /** Explicit tombstone: this model was deliberately detached from its route. */
+  routeCleared?: true;
 }
 
 export interface SaveOutcome {
@@ -79,10 +133,307 @@ export interface SaveOutcome {
   revision: number;
 }
 
+export interface SessionRunSnapshot {
+  data: PersistedSessionData;
+}
+
+/** Exact stored session bytes plus the strictly parsed value they contain. */
+export interface SessionEditSnapshot {
+  readonly path: string;
+  readonly data: PersistedSessionData;
+  readonly file: ConfigFileSnapshot & { readonly kind: "file" };
+}
+
+export interface SessionPreferenceEdit {
+  readonly requestedModelId: string;
+  readonly reasoning: ReasoningSetting;
+  readonly route: RouteIdentityV1;
+  /** Explicit route-transaction intent; never inferred by reasoning-only edits. */
+  readonly disarmCrossModeForKimi?: true;
+}
+
+export interface PreparedSessionPreferencePublication {
+  /** Prevalidated idempotent live adoption; this method never throws. */
+  publish(): void;
+}
+
+export class SessionEditConflictError extends Error {
+  readonly code = "session-edit-conflict" as const;
+
+  constructor() {
+    super("Session target changed since the edit snapshot was taken.");
+    this.name = "SessionEditConflictError";
+  }
+}
+
+export class SessionEditUnavailableError extends Error {
+  readonly code = "session-edit-unavailable" as const;
+
+  constructor() {
+    super("Session cannot be edited in its current stored state.");
+    this.name = "SessionEditUnavailableError";
+  }
+}
+
+export class SessionEditUnverifiedError extends Error {
+  readonly code = "session-edit-unverified" as const;
+
+  constructor() {
+    super("Session publication could not be verified after it was reached.");
+    this.name = "SessionEditUnverifiedError";
+  }
+}
+
+/** Reads and strictly binds one current session file without mutating its live owner. */
+export async function readSessionEditSnapshot(path: string): Promise<SessionEditSnapshot> {
+  let file: ConfigFileSnapshot;
+  try {
+    file = await readConfigFileSnapshot(path);
+  } catch {
+    throw new SessionEditUnavailableError();
+  }
+  if (file.kind !== "file") throw new SessionEditUnavailableError();
+  return freezeSessionEditSnapshot(resolve(path), parseSessionEditBytes(file.raw), file);
+}
+
+/** Builds only the model/reasoning/route delta on a clone of an exact snapshot. */
+export function prepareSessionPreferenceEdit(
+  expected: SessionEditSnapshot,
+  preference: SessionPreferenceEdit,
+): PersistedSessionData {
+  const currentRoute = persistableSessionRoute(expected.data.route);
+  const nextRoute = persistableSessionRoute(preference.route);
+  const requestedModelId = preference.requestedModelId.trim();
+  if (!currentRoute
+    || currentRoute.resolutionState !== "resolved"
+    || currentRoute.canonicalModelId === null
+    || !nextRoute
+    || nextRoute.resolutionState !== "resolved"
+    || nextRoute.canonicalModelId === null
+    || !requestedModelId
+    || !routeOwnsModel(nextRoute, requestedModelId)
+    || nextRoute.requestedModelId !== requestedModelId
+    || (preference.disarmCrossModeForKimi !== undefined
+      && (preference.disarmCrossModeForKimi !== true || nextRoute.backendId !== "kimi-code"))
+    || !isReasoningSetting(preference.reasoning)) {
+    throw new Error("Session model route is invalid.");
+  }
+  const candidate = structuredClone(expected.data);
+  candidate.model = requestedModelId;
+  candidate.reasoning = structuredClone(preference.reasoning);
+  candidate.route = structuredClone(nextRoute);
+  // Cross cannot execute on a Kimi Code route. Make that invariant part of
+  // the exact session preference candidate so the journal/CAS transaction
+  // persists and later publishes one indivisible route + Cross state.
+  if (preference.disarmCrossModeForKimi === true) delete candidate.crossMode;
+  delete candidate.routeCleared;
+  candidate.revision = expected.data.revision + 1;
+  candidate.updatedAt = new Date().toISOString();
+  return deepFreezeSessionEdit(candidate);
+}
+
+/** Exact session CAS under the already-held shared config/session writer locks. */
+export async function saveSessionEditUnderLock(
+  ownership: ConfigWriteOwnership,
+  expected: SessionEditSnapshot,
+  candidate: PersistedSessionData,
+): Promise<SessionEditSnapshot> {
+  const validated = validateSessionEditCandidate(expected, candidate);
+  const path = ownership.canonicalPath;
+  if (path !== expected.path) throw new SessionEditConflictError();
+  await ownership.assertHeld();
+  let current: ConfigFileSnapshot;
+  try {
+    current = await readConfigFileSnapshot(path);
+  } catch {
+    throw new SessionEditConflictError();
+  }
+  await ownership.assertHeld();
+  if (current.kind !== "file" || !sameConfigFileSnapshot(current, expected.file)) {
+    throw new SessionEditConflictError();
+  }
+  parseSessionEditBytes(current.raw);
+  const content = `${JSON.stringify(validated, null, 2)}\n`;
+  const digest = configBytesDigest(content);
+  try {
+    await writeFileAtomicSecure(path, content, async () => {
+      await ownership.assertHeld();
+      const fenced = await readConfigFileSnapshot(path);
+      if (fenced.kind !== "file" || !sameConfigFileSnapshot(fenced, expected.file)) {
+        throw new SessionEditConflictError();
+      }
+      await ownership.assertHeld();
+    });
+  } catch (error) {
+    if (!isAtomicFilePostPublicationError(error)) throw error;
+  }
+  await ownership.assertHeld().catch(() => undefined);
+  try {
+    const readback = await readConfigFileSnapshot(path);
+    if (readback.kind === "file" && readback.digest === digest) {
+      const data = parseSessionEditBytes(readback.raw);
+      if (isDeepStrictEqual(data, validated)) {
+        return freezeSessionEditSnapshot(path, data, readback);
+      }
+    }
+  } catch {
+    // Publication was reached; only exact readback may classify success.
+  }
+  throw new SessionEditUnverifiedError();
+}
+
+function parseSessionEditBytes(raw: string): PersistedSessionData {
+  let value: unknown;
+  try {
+    value = JSON.parse(raw);
+  } catch {
+    throw new SessionEditUnavailableError();
+  }
+  if (!isRecord(value)
+    || typeof value.workspace !== "string"
+    || value.workspace.length === 0
+    || typeof value.id !== "string"
+    || value.id.length === 0) {
+    throw new SessionEditUnavailableError();
+  }
+  const parsed = normalizeSession(value, value.workspace, value.id);
+  if (parsed === null || !isDeepStrictEqual(parsed, value)) {
+    throw new SessionEditUnavailableError();
+  }
+  return parsed;
+}
+
+/** Strict canonical parser used only by the private model-preference recovery journal. */
+export function validateSessionEditBytes(raw: string): PersistedSessionData {
+  return deepFreezeSessionEdit(structuredClone(parseSessionEditBytes(raw)));
+}
+
+function freezeSessionEditSnapshot(
+  path: string,
+  data: PersistedSessionData,
+  file: ConfigFileSnapshot & { readonly kind: "file" },
+): SessionEditSnapshot {
+  return deepFreezeSessionEdit({
+    path,
+    data: structuredClone(data),
+    file,
+  });
+}
+
+function validateSessionEditCandidate(
+  expected: SessionEditSnapshot,
+  candidate: PersistedSessionData,
+): PersistedSessionData {
+  let exactExpected: PersistedSessionData;
+  try {
+    exactExpected = parseSessionEditBytes(expected.file.raw);
+  } catch {
+    throw new SessionEditUnavailableError();
+  }
+  if (!isDeepStrictEqual(exactExpected, expected.data)
+    || expected.path !== resolve(expected.path)
+    || !Number.isSafeInteger(exactExpected.revision)
+    || exactExpected.revision < 0) {
+    throw new SessionEditUnavailableError();
+  }
+  const normalized = normalizeSession(candidate, exactExpected.workspace, exactExpected.id);
+  const currentRoute = persistableSessionRoute(exactExpected.route);
+  const nextRoute = persistableSessionRoute(candidate.route);
+  if (normalized === null
+    || !isDeepStrictEqual(normalized, candidate)
+    || !isDeepStrictEqual(redactValue(candidate), candidate)
+    || currentRoute === null
+    || currentRoute.resolutionState !== "resolved"
+    || currentRoute.canonicalModelId === null
+    || nextRoute === null
+    || nextRoute.resolutionState !== "resolved"
+    || nextRoute.canonicalModelId === null
+    || typeof candidate.model !== "string"
+    || candidate.model.length === 0
+    || candidate.model !== candidate.model.trim()
+    || candidate.model !== nextRoute.requestedModelId
+    || !routeOwnsModel(nextRoute, candidate.model)
+    || !isStrictReasoningSetting(candidate.reasoning)
+    || candidate.routeCleared !== undefined
+    || candidate.revision !== exactExpected.revision + 1
+    || !Number.isSafeInteger(candidate.revision)
+    || validDate(candidate.updatedAt) !== candidate.updatedAt
+    || !sameSessionOutsidePreference(exactExpected, candidate)) {
+    throw new Error("Session model route is invalid.");
+  }
+  return deepFreezeSessionEdit(structuredClone(candidate));
+}
+
+function sameSessionOutsidePreference(
+  left: PersistedSessionData,
+  right: PersistedSessionData,
+): boolean {
+  const nextRoute = persistableSessionRoute(right.route);
+  const exactKimiCrossDisarm = nextRoute !== null
+    && nextRoute.resolutionState === "resolved"
+    && nextRoute.canonicalModelId !== null
+    && nextRoute.backendId === "kimi-code"
+    && left.crossMode !== undefined
+    && right.crossMode === undefined;
+  const strip = (value: PersistedSessionData): Record<string, unknown> => {
+    const clone = structuredClone(value) as unknown as Record<string, unknown>;
+    for (const key of [
+      "model",
+      "reasoning",
+      "route",
+      "routeCleared",
+      "revision",
+      "updatedAt",
+    ]) {
+      delete clone[key];
+    }
+    if (exactKimiCrossDisarm) delete clone.crossMode;
+    return clone;
+  };
+  return isDeepStrictEqual(strip(left), strip(right));
+}
+
+function isStrictReasoningSetting(value: unknown): value is ReasoningSetting {
+  if (!isReasoningSetting(value) || !isRecord(value)) return false;
+  const keys = Object.keys(value).sort();
+  if (value.mode === "auto") return isDeepStrictEqual(keys, ["mode"]);
+  if (value.mode === "effort") return isDeepStrictEqual(keys, ["effort", "mode"]);
+  return isDeepStrictEqual(keys, ["maxTokens", "mode"]);
+}
+
+function deepFreezeSessionEdit<T>(value: T): T {
+  if (value !== null && typeof value === "object" && !Object.isFrozen(value)) {
+    for (const item of Object.values(value as Record<string, unknown>)) {
+      deepFreezeSessionEdit(item);
+    }
+    Object.freeze(value);
+  }
+  return value;
+}
+
+/**
+ * Returns the one still-legacy OpenRouter connection that may project model
+ * preferences from historical chats. Once activation moves the connection to
+ * a versioned slot, old chats must no longer infer a route from it.
+ */
+export function migratedOpenRouterSessionConnection(
+  providerSetup: ProviderSetupState,
+): ProviderConnectionStateV3 | undefined {
+  if (isProviderStateIssue(providerSetup)) {
+    return undefined;
+  }
+  const matches = providerSetup.connections.filter(
+    isActiveMigratedOpenRouterConnection,
+  );
+  return matches.length === 1 ? matches[0] : undefined;
+}
+
 export class SessionStore {
   #data: PersistedSessionData;
   /** Last state known to be on disk; the base of the three-way merge. */
   #base: PersistedSessionData;
+  /** A legacy route derived at read time but not yet owned by the chat file. */
+  #pendingLegacyRouteProjection = false;
   readonly appHome: string;
   readonly path: string;
 
@@ -96,13 +447,14 @@ export class SessionStore {
   static async open(
     workspace: string,
     appHome = APP_HOME,
+    providerConnection?: ProviderConnectionStateV3,
   ): Promise<SessionStore> {
     // The one explicit place where a v1 file is imported; list()/search() stay
     // read only (B15).
     await migrateLegacySession(workspace, appHome);
-    const chats = await SessionStore.list(workspace, appHome);
+    const chats = await SessionStore.list(workspace, appHome, providerConnection);
     if (chats[0]) {
-      return SessionStore.openById(workspace, chats[0].id, appHome);
+      return SessionStore.openById(workspace, chats[0].id, appHome, providerConnection);
     }
     return SessionStore.create(workspace, appHome);
   }
@@ -125,27 +477,38 @@ export class SessionStore {
     workspace: string,
     id: string,
     appHome = APP_HOME,
+    providerConnection?: ProviderConnectionStateV3,
   ): Promise<SessionStore> {
     assertChatId(id);
     const path = chatPath(appHome, workspace, id);
     try {
+      const raw = JSON.parse(await readFile(path, "utf8"));
       const parsed = normalizeSession(
-        JSON.parse(await readFile(path, "utf8")),
+        raw,
         workspace,
         id,
+        providerConnection,
       );
       if (parsed) {
-        return new SessionStore(appHome, path, parsed);
+        const store = new SessionStore(appHome, path, parsed);
+        if (
+          validateRouteIdentityV1(raw?.route) === null
+          && parsed.route?.resolutionState === "legacy-unverified"
+        ) {
+          store.#pendingLegacyRouteProjection = true;
+          delete store.#base.route;
+        }
+        return store;
       }
     } catch (error) {
       if (hasCode(error, "ENOENT")) {
-        throw new Error(`Chat nicht gefunden: ${id}`);
+        throw new Error(`Chat not found: ${id}`);
       }
       if (!(error instanceof SyntaxError)) {
         throw error;
       }
     }
-    throw new Error(`Chat-Datei ist ungültig: ${id}`);
+    throw new Error(`Chat file is invalid: ${id}`);
   }
 
   /**
@@ -156,32 +519,18 @@ export class SessionStore {
     workspace: string,
     id: string,
     appHome = APP_HOME,
-  ): Promise<void> {
+  ): Promise<ChatDeletionReport> {
     assertChatId(id);
-    const path = chatPath(appHome, workspace, id);
-    try {
-      await unlink(path);
-    } catch (error) {
-      if (hasCode(error, "ENOENT")) {
-        throw new Error(`Chat nicht gefunden: ${id}`);
-      }
-      throw error;
-    }
-    try {
-      await unlink(chatLockPath(path));
-    } catch (error) {
-      if (!hasCode(error, "ENOENT")) {
-        throw error;
-      }
-    }
+    return deleteChatOwnedArtifacts(appHome, workspace, id);
   }
 
   /** Read only: listing chats never writes to disk (B15). */
   static async list(
     workspace: string,
     appHome = APP_HOME,
+    providerConnection?: ProviderConnectionStateV3,
   ): Promise<ChatSummary[]> {
-    const sessions = await loadAllSessions(workspace, appHome);
+    const sessions = await loadAllSessions(workspace, appHome, providerConnection);
     return sessions.map(toSummary);
   }
 
@@ -190,12 +539,13 @@ export class SessionStore {
     workspace: string,
     query: string,
     appHome = APP_HOME,
+    providerConnection?: ProviderConnectionStateV3,
   ): Promise<ChatSearchHit[]> {
     const normalized = query.trim().toLowerCase();
     if (!normalized) {
       return [];
     }
-    const sessions = await loadAllSessions(workspace, appHome);
+    const sessions = await loadAllSessions(workspace, appHome, providerConnection);
     const hits: ChatSearchHit[] = [];
     for (const data of sessions) {
       const titleMatch = data.title.toLowerCase().includes(normalized);
@@ -223,18 +573,199 @@ export class SessionStore {
     return this.#data;
   }
 
+  /**
+   * True for a session in exactly the state `SessionStore.create()` leaves
+   * it in and nothing has touched since: no turns, no cost, still the
+   * default title. Controller ruling 3 (D8c): a plain launch now always
+   * starts one of these (the hub's fresh chat context), so the exit-time
+   * save both interactive loops run unconditionally today (`runPlainLoop`,
+   * `runDashboard`) must skip a session in this state — otherwise a mere
+   * "launch, look, quit" with zero messages sent would still write a ghost
+   * "New Chat" file to disk on every start. `SessionStore.create()` never
+   * writes on its own (lazy by construction); this predicate is what lets
+   * the exit-time save keep honoring that laziness instead of undoing it.
+   * A session any command explicitly saved before quitting (a setting
+   * change, an armed Cross mode, …) already has its own immediate `save()`
+   * call at the point of that change — skipping the redundant exit-time
+   * save for it here changes nothing for those, since the meaningful state
+   * is already on disk.
+   */
+  get isUntouched(): boolean {
+    return (
+      this.#data.turns.length === 0
+      && this.#data.costs.totalUsd === 0
+      && this.#data.title === DEFAULT_TITLE
+    );
+  }
+
+  /**
+   * Prepares the only live-session mutation used after a verified preference
+   * transaction. Validation and cloning happen up front; `publish()` performs
+   * assignments only, updates the merge base to the exact durable candidate,
+   * and is an idempotent no-op after its first call.
+   */
+  preparePreferencePublication(
+    expected: SessionEditSnapshot,
+    candidate: PersistedSessionData,
+  ): PreparedSessionPreferencePublication {
+    if (this.path !== expected.path
+      || !isDeepStrictEqual(this.#data, expected.data)
+      || !isDeepStrictEqual(this.#base, expected.data)
+      || this.#pendingLegacyRouteProjection) {
+      throw new SessionEditConflictError();
+    }
+    const validated = validateSessionEditCandidate(expected, candidate);
+    const nextData = structuredClone(validated);
+    const nextBase = structuredClone(validated);
+    let published = false;
+    return Object.freeze({
+      publish: () => {
+        if (published) return;
+        published = true;
+        this.#data = nextData;
+        this.#base = nextBase;
+        this.#pendingLegacyRouteProjection = false;
+      },
+    });
+  }
+
+  /**
+   * Startup-only adoption after the private model-preference journal has
+   * already converged this exact file. It never writes and refuses to replace
+   * dirty live state or a different session owner.
+   */
+  adoptRecoveredPreferenceSnapshot(snapshot: SessionEditSnapshot): void {
+    this.prepareRecoveredPreferencePublication(snapshot).publish();
+  }
+
+  prepareRecoveredPreferencePublication(
+    snapshot: SessionEditSnapshot,
+  ): PreparedSessionPreferencePublication {
+    if (snapshot.path !== this.path
+      || !isDeepStrictEqual(this.#data, this.#base)
+      || this.#pendingLegacyRouteProjection
+      || snapshot.data.workspace !== this.#data.workspace
+      || snapshot.data.id !== this.#data.id) {
+      throw new SessionEditConflictError();
+    }
+    const nextData = structuredClone(snapshot.data);
+    const nextBase = structuredClone(snapshot.data);
+    let published = false;
+    return Object.freeze({
+      publish: () => {
+        if (published) return;
+        published = true;
+        this.#data = nextData;
+        this.#base = nextBase;
+        this.#pendingLegacyRouteProjection = false;
+      },
+    });
+  }
+
   addTurn(role: ChatTurn["role"], content: string): void {
     this.#data.turns.push({
       role,
-      content: redactSensitive(content),
+      content,
       createdAt: new Date().toISOString(),
+      id: randomUUID(),
     });
     if (role === "user" && this.#data.title === DEFAULT_TITLE) {
       this.#data.title = titleFromPrompt(content);
     }
     if (this.#data.turns.length > MAX_TURNS) {
       this.#data.turns = this.#data.turns.slice(-MAX_TURNS);
+      // A turn evicted by the 80-cap is gone for good; a pin naming it would
+      // be a dangling reference, not a "never-compress" instruction anyone
+      // can still act on — prune it rather than let it accumulate silently.
+      this.#pruneDanglingPins();
     }
+    this.#data.updatedAt = new Date().toISOString();
+  }
+
+  /** Drops any `pinnedTurns` id that no longer names a turn in `this.#data.turns`. */
+  #pruneDanglingPins(): void {
+    if (!this.#data.pinnedTurns?.length) return;
+    const live = new Set(
+      this.#data.turns
+        .map((turn) => turn.id)
+        .filter((id): id is string => typeof id === "string"),
+    );
+    const pruned = this.#data.pinnedTurns.filter((id) => live.has(id));
+    if (pruned.length === this.#data.pinnedTurns.length) return;
+    if (pruned.length > 0) {
+      this.#data.pinnedTurns = pruned;
+    } else {
+      delete this.#data.pinnedTurns;
+    }
+  }
+
+  /**
+   * Marks a turn as never-compress (Phase 13, `/context pin <n>`). A no-op
+   * (returns `false`) when `id` does not name a turn currently in `turns` —
+   * pinning something that does not exist would be a silent lie, not a
+   * refusal the caller could report honestly. Idempotent: pinning an
+   * already-pinned turn returns `true` without changing the stored order.
+   */
+  pinTurn(id: string): boolean {
+    if (!this.#data.turns.some((turn) => turn.id === id)) {
+      return false;
+    }
+    const current = this.#data.pinnedTurns ?? [];
+    if (current.includes(id)) {
+      return true;
+    }
+    this.#data.pinnedTurns = [...current, id];
+    this.#data.updatedAt = new Date().toISOString();
+    return true;
+  }
+
+  /**
+   * Removes a pin (`/context unpin <n>`). Returns `false` when `id` was not
+   * pinned — the caller (commands.ts) uses this to tell the user nothing
+   * changed instead of claiming an unpin that did not happen.
+   */
+  unpinTurn(id: string): boolean {
+    const current = this.#data.pinnedTurns;
+    if (!current?.includes(id)) {
+      return false;
+    }
+    const next = current.filter((candidate) => candidate !== id);
+    if (next.length > 0) {
+      this.#data.pinnedTurns = next;
+    } else {
+      delete this.#data.pinnedTurns;
+    }
+    this.#data.updatedAt = new Date().toISOString();
+    return true;
+  }
+
+  /**
+   * `/goal <text>` (D9): sets this chat's persistent standing goal, injected
+   * into every run's context (`standingGoalInstruction`, agent.ts) and into
+   * the Cross context packet's `projectInstructions` field
+   * (cli.ts's `createCrossRuntimeForContext`) — one wording, reused, never
+   * duplicated. Unlike `normalizeGoal`'s silent drop-on-load, this REFUSES an
+   * empty or over-`MAX_GOAL_CHARS` value with an honest error naming the
+   * limit — the goal must never be silently truncated (D9 ruling).
+   */
+  setGoal(goal: string): void {
+    const trimmed = goal.trim();
+    if (!trimmed) {
+      throw new Error("Goal text must not be empty.");
+    }
+    if (trimmed.length > MAX_GOAL_CHARS) {
+      throw new Error(
+        `Goal is too long: ${trimmed.length} characters (the limit is ${MAX_GOAL_CHARS}).`,
+      );
+    }
+    this.#data.goal = trimmed;
+    this.#data.updatedAt = new Date().toISOString();
+  }
+
+  /** `/goal off` (D9): clears the standing goal. A no-op when none is set. */
+  clearGoal(): void {
+    if (this.#data.goal === undefined) return;
+    delete this.#data.goal;
     this.#data.updatedAt = new Date().toISOString();
   }
 
@@ -243,10 +774,171 @@ export class SessionStore {
     this.#data.updatedAt = new Date().toISOString();
   }
 
-  setPreferences(model: string, reasoning: ReasoningSetting): void {
-    this.#data.model = model.trim();
+  /**
+   * Persists the model preference together with the exact route that owns it.
+   * A route is stored complete or not at all: an incomplete, future, or
+   * foreign-shaped route and a model that does not belong to the route are
+   * rejected with fixed copy, so the chat never carries a cross-bound identity.
+   */
+  setPreferences(model: string, reasoning: ReasoningSetting, route?: RouteIdentityV1): void {
+    const trimmedModel = model.trim();
+    if (route !== undefined) {
+      const persistable = persistableSessionRoute(route);
+      if (persistable === null) {
+        throw new Error(ROUTE_INVALID_MESSAGE);
+      }
+      if (!routeOwnsModel(persistable, trimmedModel)) {
+        throw new Error(ROUTE_MODEL_MISMATCH_MESSAGE);
+      }
+      this.#data.route = persistable;
+      delete this.#data.routeCleared;
+      this.#pendingLegacyRouteProjection = false;
+    } else if (this.#data.route === undefined || !routeOwnsModel(this.#data.route, trimmedModel)) {
+      // A route-less update keeps the exact current route as long as it owns
+      // the model (requested or canonical id); it never synthesizes one.
+      const detachedOwnedRoute = this.#data.route !== undefined;
+      delete this.#data.route;
+      if (detachedOwnedRoute) this.#data.routeCleared = true;
+      this.#pendingLegacyRouteProjection = false;
+    }
+    this.#data.model = trimmedModel;
     this.#data.reasoning = structuredClone(reasoning);
     this.#data.updatedAt = new Date().toISOString();
+  }
+
+  /**
+   * Arms persistent Cross mode for this chat (Phase 10): the exact pair the
+   * gate's "Keep Cross active for this chat" choice just confirmed and
+   * published. Plain, ordinary mutation like `rename`/`setPreferences` above
+   * — the caller is responsible for `save()`. Distinctness between the two
+   * roles is the gate's own `canStart` business rule (cross-gate.ts), not
+   * re-validated here; only structural route validity is enforced, matching
+   * `setPreferences`'s own minimal contract.
+   */
+  armCrossMode(pair: CrossModeV1): void {
+    const lead = persistableSessionRoute(pair.lead);
+    const challenger = persistableSessionRoute(pair.challenger);
+    if (!lead || !challenger) {
+      throw new Error(ROUTE_INVALID_MESSAGE);
+    }
+    this.#data.crossMode = { lead, challenger, ...(pair.oneShot ? { oneShot: true as const } : {}) };
+    this.#data.updatedAt = new Date().toISOString();
+  }
+
+  /** `/cross off`, or a route switch onto Kimi Code while armed — immediate, no confirmation. A no-op when already disarmed. */
+  disarmCrossMode(): void {
+    if (this.#data.crossMode === undefined) return;
+    delete this.#data.crossMode;
+    this.#data.updatedAt = new Date().toISOString();
+  }
+
+  /**
+   * Records that a Cross run just published into this chat (see
+   * `SessionData.lastCrossRunAt`). `leadIdentity` is P10b's addition: pass it
+   * whenever this dispatch actually created a lead sidecar (whatever its
+   * outcome — completed, partial, blocked, even cancelled; the sidecar's own
+   * run-end/undone semantics are what `/undo` ultimately trusts, not this
+   * call) so `lastCrossRun` is recorded alongside the stamp. Omitted (not
+   * merely `undefined`-typed but actually absent from the call), any
+   * existing `lastCrossRun` is explicitly cleared — never left pointing at
+   * an OLDER dispatch's sidecar once a newer, identity-less stamp has been
+   * written over it (the exact stale-reference bug this guards against: a
+   * newer `lastCrossRunAt` must never resolve to an older run's identity).
+   */
+  noteCrossRun(leadIdentity?: { readonly sidecarId: string; readonly chatId: string }): void {
+    const now = new Date().toISOString();
+    this.#data.lastCrossRunAt = now;
+    if (leadIdentity) {
+      this.#data.lastCrossRun = { at: now, sidecarId: leadIdentity.sidecarId, chatId: leadIdentity.chatId };
+    } else {
+      delete this.#data.lastCrossRun;
+    }
+    this.#data.updatedAt = now;
+  }
+
+  /**
+   * D2 doc fix (Phase-10 re-review Minor, carried): this method itself has
+   * no notion of "a run finished" — it only re-checks, at the moment it is
+   * called, that the chat is STILL marked as a pending one-shot before
+   * disarming, so a concurrent re-arm to persistent "Keep Cross active"
+   * mode (or to a new one-shot) is never silently undone by a stale run's
+   * own cleanup. `withOneShotClearing` (cli.ts) is the sole caller and owns
+   * the actual timing — it calls this once a pending one-shot's single run
+   * reaches any terminal phase (completed, blocked, partial, or cancelled).
+   */
+  clearCrossModeOneShotIfPending(): void {
+    if (this.#data.crossMode?.oneShot !== true) return;
+    this.disarmCrossMode();
+  }
+
+  /** Atomically clears only the exact resolved durable route named by a provider lifecycle action. */
+  async clearRouteIfExact(expectedRoute: RouteIdentityV1): Promise<boolean> {
+    const expected = persistableSessionRoute(expectedRoute);
+    if (!expected || !sameExactResolvedRoute(this.#data.route, expected)) return false;
+    return enqueueWrite(this.path, () => this.#clearRouteIfExactNow(expected));
+  }
+
+  async #clearRouteIfExactNow(expected: RouteIdentityV1): Promise<boolean> {
+    if (!sameExactResolvedRoute(this.#data.route, expected)) return false;
+    await ensureSecureDirectory(this.appHome);
+    await ensureSecureDirectory(dirname(this.path));
+    const release = await acquireChatLock(this.path);
+    try {
+      if (!sameExactResolvedRoute(this.#data.route, expected)) return false;
+      const foreign = await readForeign(
+        this.path,
+        this.#data.workspace,
+        this.#data.id,
+      );
+      if (!sameExactResolvedRoute(this.#data.route, expected)) return false;
+      if (foreign.kind === "unreadable") return false;
+      if (foreign.kind === "missing") {
+        markRouteCleared(this.#data);
+        this.#pendingLegacyRouteProjection = false;
+        return true;
+      }
+      if (!sameExactResolvedRoute(foreign.data.route, expected)) {
+        const reconciled = sameValue(foreign.data, this.#base)
+          ? structuredClone(this.#data)
+          : mergeSessions(this.#base, this.#data, foreign.data);
+        adoptSessionIdentity(reconciled, foreign.data);
+        reconciled.revision = Math.max(reconciled.revision, foreign.revision);
+        this.#data = reconciled;
+        this.#base = structuredClone(foreign.data);
+        this.#pendingLegacyRouteProjection = false;
+        return false;
+      }
+
+      const next = sameValue(foreign.data, this.#base)
+        ? structuredClone(this.#data)
+        : mergeSessions(this.#base, this.#data, foreign.data);
+      markRouteCleared(next);
+      next.revision = Math.max(next.revision, foreign.revision) + 1;
+      await writeFileAtomicSecure(
+        this.path,
+        `${JSON.stringify(redactValue(next), null, 2)}\n`,
+      );
+      this.#data = next;
+      this.#base = structuredClone(next);
+      this.#pendingLegacyRouteProjection = false;
+      return true;
+    } finally {
+      await release();
+    }
+  }
+
+  /** Rebinds only a route that was projected lazily and is still unpersisted. */
+  rebindPendingLegacyRoute(providerConnection?: ProviderConnectionStateV3): void {
+    if (!this.#pendingLegacyRouteProjection) return;
+    if (
+      this.#data.model
+      && isActiveMigratedOpenRouterConnection(providerConnection)
+    ) {
+      this.#data.route = mapLegacyOpenRouterModel(this.#data.model, providerConnection);
+      return;
+    }
+    delete this.#data.route;
+    this.#pendingLegacyRouteProjection = false;
   }
 
   async fork(title = `${this.#data.title} (Fork)`): Promise<SessionStore> {
@@ -256,31 +948,93 @@ export class SessionStore {
       title,
     );
     fork.#data.summary = this.#data.summary;
+    fork.#data.summaryUpdatedAt = this.#data.summaryUpdatedAt;
     fork.#data.turns = this.#data.turns.map((turn) => ({ ...turn }));
+    // Phase 13, Ruling 3: unlike `crossMode`/`lastCrossRunAt` below (per-chat
+    // modes, deliberately NOT copied), a pin is a content decision about the
+    // very turns just copied above — same treatment as `route`/`reasoning`.
+    // The copied turns keep their original `id`s (plain spread), so the
+    // pin's references stay valid in the fork without any translation.
+    fork.#data.pinnedTurns = this.#data.pinnedTurns?.length
+      ? [...this.#data.pinnedTurns]
+      : undefined;
+    // D9: same Ruling-3 treatment as `pinnedTurns` above — a goal describes
+    // the chat's own standing instruction, not a per-chat mode, so the fork
+    // inherits it exactly like `route`/`reasoning`/`pinnedTurns`.
+    fork.#data.goal = this.#data.goal;
     fork.#data.checkpoints = this.#data.checkpoints.map((checkpoint) => ({
       ...checkpoint,
     }));
     fork.#data.model = this.#data.model;
+    fork.#data.route = this.#data.route ? structuredClone(this.#data.route) : undefined;
+    fork.#data.routeCleared = this.#data.routeCleared;
     fork.#data.reasoning = this.#data.reasoning
       ? structuredClone(this.#data.reasoning)
       : undefined;
+    // Phase 10, YOLO rule: `crossMode` is deliberately NOT copied here (unlike
+    // `route`/`reasoning` above) — a fork always starts disarmed and requires
+    // its own explicit gate confirmation. `lastCrossRunAt` is likewise
+    // deliberately NOT copied: the fork's runs directory starts empty, so a
+    // carried timestamp would make /undo's Cross guard claim Cross runs that
+    // never happened in the fork. `lastCrossRun` (P10b) is NOT copied for the
+    // exact same reason, doubly so: the fork would otherwise point at the
+    // ORIGINAL chat's lead sidecar, letting the fork's `/undo` revert changes
+    // through a run it never had anything to do with. `fork.#data` already
+    // starts without all three (`emptySession`, via `SessionStore.create`),
+    // so this is intentional omission, not an oversight.
     await fork.save();
     return fork;
   }
 
   setSummary(summary: string): void {
-    this.#data.summary = redactSensitive(summary);
+    this.#data.summary = summary;
+    if (summary.trim()) {
+      this.#data.summaryUpdatedAt = new Date().toISOString();
+    } else {
+      delete this.#data.summaryUpdatedAt;
+    }
     this.#data.updatedAt = new Date().toISOString();
   }
 
+  /**
+   * Drops turns beyond the `keepRecent` tail — except a pinned turn
+   * (Phase 13), which survives regardless of recency: pinning is a
+   * never-compress instruction, and this is the one place compression
+   * actually discards turns (agent.ts calls this right after adopting a
+   * compressed handoff into `summary`). A pinned turn already inside the
+   * recent tail is not duplicated; older pinned turns are prepended ahead of
+   * it, preserving chronological order (both slices come from the same
+   * chronologically-ordered `turns` array).
+   */
   compactTurns(keepRecent = 4): void {
     const keep = Math.max(0, Math.floor(keepRecent));
-    this.#data.turns = keep === 0 ? [] : this.#data.turns.slice(-keep);
+    const recent = keep === 0 ? [] : this.#data.turns.slice(-keep);
+    const pinned = this.#data.pinnedTurns;
+    if (!pinned?.length) {
+      this.#data.turns = recent;
+      this.#data.updatedAt = new Date().toISOString();
+      return;
+    }
+    const pinnedIds = new Set(pinned);
+    const recentIds = new Set(recent.map((turn) => turn.id));
+    const keptPinned = this.#data.turns.filter(
+      (turn) => turn.id !== undefined && pinnedIds.has(turn.id) && !recentIds.has(turn.id),
+    );
+    this.#data.turns = [...keptPinned, ...recent];
     this.#data.updatedAt = new Date().toISOString();
   }
 
-  addCost(kind: "main" | "compressor" | "voice", amount: number): void {
-    if (!Number.isFinite(amount) || amount < 0) {
+  addCost(
+    kind: "main" | "compressor" | "voice",
+    amount: number,
+    knowledge: CostKnowledge = "known",
+  ): void {
+    if (knowledge === "unknown") {
+      this.#data.costs.costKnowledge = "unknown";
+      this.#data.updatedAt = new Date().toISOString();
+      return;
+    }
+    if (!Number.isFinite(amount) || amount <= 0) {
       return;
     }
     if (kind === "main") {
@@ -300,18 +1054,29 @@ export class SessionStore {
 
   /**
    * Resets the visible chat. `dailySpendUsd` survives on purpose: budget
-   * accounting must not be resettable with /clear.
+   * accounting must not be resettable with /clear. D9 fix round (controller
+   * ruling): `goal` survives too, alongside `model`/`route`/`reasoning` — a
+   * goal is a standing preference like those, not part of the conversation
+   * `/clear` resets (the same "content decision, not a mode" logic the fork
+   * Ruling 3 doc comment already gives for why fork inherits it). `/goal
+   * off` remains the one explicit removal path, exactly like `route`/
+   * `reasoning` have no `/clear`-triggered reset of their own either.
    */
   clear(): void {
-    const { id, title, workspace, model, reasoning, createdAt } = this.#data;
+    const { id, title, workspace, model, route, routeCleared, reasoning, goal, createdAt } = this.#data;
+    const costKnowledge = knowledgeOf(this.#data.costs);
     this.#data = {
       ...emptySession(workspace, id, title),
       model,
+      route,
+      routeCleared,
       reasoning,
+      goal,
       createdAt,
       revision: this.#data.revision,
       dailySpendUsd: { ...this.#data.dailySpendUsd },
     };
+    this.#data.costs.costKnowledge = costKnowledge;
   }
 
   recentTurns(count = 8): ChatTurn[] {
@@ -319,15 +1084,57 @@ export class SessionStore {
   }
 
   transcript(): string {
-    return this.#data.turns
-      .map((turn) => `${turn.role === "user" ? "USER" : "ASSISTANT"}:\n${turn.content}`)
-      .join("\n\n");
+    return redactText(this.#data.turns
+      .map((turn) => chatTurnTranscriptText(turn))
+      .join("\n\n"));
+  }
+
+  snapshotRunState(): SessionRunSnapshot {
+    return { data: structuredClone(this.#data) };
+  }
+
+  /** Restores staged chat data while retaining provider charges incurred after the snapshot. */
+  restoreRunState(snapshot: SessionRunSnapshot): void {
+    const current = this.#data;
+    const restored = structuredClone(snapshot.data);
+    const mainDelta = Math.max(0, current.costs.mainUsd - restored.costs.mainUsd);
+    const compressorDelta = Math.max(
+      0,
+      current.costs.compressorUsd - restored.costs.compressorUsd,
+    );
+    const voiceDelta = Math.max(0, current.costs.voiceUsd - restored.costs.voiceUsd);
+    restored.costs.mainUsd += mainDelta;
+    restored.costs.compressorUsd += compressorDelta;
+    restored.costs.voiceUsd += voiceDelta;
+    restored.costs.totalUsd =
+      restored.costs.mainUsd + restored.costs.compressorUsd + restored.costs.voiceUsd;
+    restored.costs.costKnowledge = knowledgeOf(current.costs) === "unknown"
+      || knowledgeOf(restored.costs) === "unknown"
+      ? "unknown"
+      : "known";
+    const days = new Set([
+      ...Object.keys(restored.dailySpendUsd),
+      ...Object.keys(current.dailySpendUsd),
+    ]);
+    for (const day of days) {
+      const delta = Math.max(
+        0,
+        (current.dailySpendUsd[day] ?? 0) -
+          (snapshot.data.dailySpendUsd[day] ?? 0),
+      );
+      if (delta > 0) {
+        restored.dailySpendUsd[day] =
+          (restored.dailySpendUsd[day] ?? 0) + delta;
+      }
+    }
+    restored.dailySpendUsd = pruneSpend(restored.dailySpendUsd);
+    this.#data = restored;
   }
 
   recordToolCall(name: string, summary = ""): SessionToolCall {
     const call: SessionToolCall = {
-      name: name.trim().slice(0, 80) || "unbekannt",
-      summary: redactSensitive(summary).replace(/\s+/g, " ").trim().slice(0, 300),
+      name: name.trim().slice(0, 80) || "unknown",
+      summary: summary.replace(/\s+/g, " ").trim().slice(0, 300),
       turnIndex: this.#data.turns.length,
       at: new Date().toISOString(),
     };
@@ -344,6 +1151,7 @@ export class SessionStore {
       label: normalizeCheckpointLabel(label, this.#data.turns.length),
       turnIndex: this.#data.turns.length,
       costUsd: this.#data.costs.totalUsd,
+      costKnowledge: knowledgeOf(this.#data.costs),
       createdAt: new Date().toISOString(),
     };
     this.#data.checkpoints.push(checkpoint);
@@ -383,7 +1191,7 @@ export class SessionStore {
   restoreCheckpoint(reference: string): SessionCheckpoint {
     const checkpoint = this.findCheckpoint(reference);
     if (!checkpoint) {
-      throw new Error(`Checkpoint nicht gefunden: ${reference}`);
+      throw new Error(`Checkpoint not found: ${reference}`);
     }
     this.#data.turns = this.#data.turns.slice(0, checkpoint.turnIndex);
     // Turn index alone is ambiguous at the checkpoint's own index, timestamps
@@ -397,6 +1205,10 @@ export class SessionStore {
       (candidate) =>
         Date.parse(candidate.createdAt) <= Date.parse(checkpoint.createdAt),
     );
+    // Same hygiene as the 80-turn cap in addTurn: a pin naming a turn the
+    // rewind just dropped is a dangling reference, not a still-honored
+    // never-compress instruction.
+    this.#pruneDanglingPins();
     this.#data.updatedAt = new Date().toISOString();
     return checkpoint;
   }
@@ -429,6 +1241,41 @@ export class SessionStore {
       let conflictBackupPath: string | null = null;
 
       if (foreign.kind === "data") {
+        if (
+          this.#pendingLegacyRouteProjection
+          && foreign.data.route !== undefined
+          && this.#hasOnlyPendingLegacyRouteProjection()
+        ) {
+          // A real route published by another window is authoritative over a
+          // read-time projection and requires no duplicate write.
+          this.#data = structuredClone(foreign.data);
+          this.#base = structuredClone(foreign.data);
+          this.#pendingLegacyRouteProjection = false;
+          return {
+            merged: false,
+            conflictBackupPath: null,
+            revision: foreign.revision,
+          };
+        }
+        if (this.#pendingLegacyRouteProjection && foreign.data.route !== undefined) {
+          this.#data.route = structuredClone(foreign.data.route);
+          this.#pendingLegacyRouteProjection = false;
+        }
+        if (
+          sameValue(this.#data, this.#base)
+          && !this.#pendingLegacyRouteProjection
+        ) {
+          // A stale but locally unchanged window has nothing to contribute.
+          // Adopt the locked readback exactly instead of merging it into a new
+          // revision and churning an otherwise stable file.
+          this.#data = structuredClone(foreign.data);
+          this.#base = structuredClone(foreign.data);
+          return {
+            merged: false,
+            conflictBackupPath: null,
+            revision: foreign.revision,
+          };
+        }
         if (fingerprint(foreign.data) !== fingerprint(this.#base)) {
           this.#data = mergeSessions(this.#base, this.#data, foreign.data);
           merged = true;
@@ -436,20 +1283,38 @@ export class SessionStore {
       } else if (foreign.kind === "unreadable") {
         // Never overwrite a file we could not understand. Keep it next to the
         // chat so the user can look at it instead of losing it silently.
-        conflictBackupPath = `${this.path}.konflikt-${conflictStamp()}.json`;
-        await rename(this.path, conflictBackupPath);
+        conflictBackupPath = CHAT_ARTIFACT_REGISTRY.resolve("chat-conflict", {
+          appHome: this.appHome,
+          workspace: this.#data.workspace,
+          chatId: this.#data.id,
+          chatFilePath: this.path,
+          conflictId: conflictStamp(),
+        });
+        await new PrivateStore({ root: this.appHome }).writeTextAtomic(
+          conflictBackupPath,
+          foreign.raw,
+        );
       }
 
       this.#data.revision = Math.max(this.#data.revision, foreign.revision) + 1;
+      const persisted = redactValue(this.#data);
       await writeFileAtomicSecure(
         this.path,
-        `${JSON.stringify(this.#data, null, 2)}\n`,
+        `${JSON.stringify(persisted, null, 2)}\n`,
       );
       this.#base = structuredClone(this.#data);
+      this.#pendingLegacyRouteProjection = false;
       return { merged, conflictBackupPath, revision: this.#data.revision };
     } finally {
       await release();
     }
+  }
+
+  #hasOnlyPendingLegacyRouteProjection(): boolean {
+    if (!this.#pendingLegacyRouteProjection) return false;
+    const withoutProjection = structuredClone(this.#data);
+    delete withoutProjection.route;
+    return sameValue(withoutProjection, this.#base);
   }
 }
 
@@ -510,6 +1375,7 @@ export interface WorkspaceSpend {
   day: string;
   dayUsd: number;
   totalUsd: number;
+  costKnowledge: CostKnowledge;
   chatCount: number;
 }
 
@@ -525,14 +1391,17 @@ export async function workspaceSpend(
   const sessions = await loadAllSessions(workspace, appHome);
   let dayUsd = 0;
   let totalUsd = 0;
+  let costKnowledge: CostKnowledge = "known";
   for (const session of sessions) {
     dayUsd += session.dailySpendUsd[day] ?? 0;
     totalUsd += session.costs.totalUsd;
+    if (knowledgeOf(session.costs) === "unknown") costKnowledge = "unknown";
   }
   return {
     day,
     dayUsd: roundUsd(dayUsd),
     totalUsd: roundUsd(totalUsd),
+    costKnowledge,
     chatCount: sessions.length,
   };
 }
@@ -541,49 +1410,64 @@ export type SessionExportInput = SessionData &
   Partial<Omit<PersistedSessionData, keyof SessionData>>;
 
 /** Renders a chat as readable Markdown (used by a later `/export` command). */
+/**
+ * The exact per-turn string `SessionStore.transcript()` joins with `\n\n`
+ * for one entry. Exported so the compressor's pin-aware savings gate
+ * (compressor.ts) and `/context`'s composition estimate (commands.ts) size
+ * a pinned or listed turn identically to what actually reaches the
+ * compressor's own raw context — one measurement, never a second ad hoc one.
+ */
+export function chatTurnTranscriptText(turn: ChatTurn): string {
+  return `${turn.role === "user" ? "USER" : "ASSISTANT"}:\n${turn.content}`;
+}
+
 export function exportSessionMarkdown(data: SessionExportInput): string {
   const checkpoints = data.checkpoints ?? [];
   const toolCalls = data.toolCalls ?? [];
   const lines: string[] = [];
 
   lines.push(`# ${data.title}`, "");
-  lines.push("## Metadaten", "");
-  lines.push(`- Chat-ID: \`${data.id}\``);
+  lines.push("## Metadata", "");
+  lines.push(`- Chat ID: \`${data.id}\``);
   lines.push(`- Workspace: \`${data.workspace}\``);
-  lines.push(`- Modell: ${data.model ?? "nicht festgelegt"}`);
+  lines.push(`- Model: ${data.model ?? "not set"}`);
   lines.push(`- Reasoning: ${describeReasoning(data.reasoning)}`);
-  lines.push(`- Erstellt: ${formatTimestamp(data.createdAt)}`);
-  lines.push(`- Aktualisiert: ${formatTimestamp(data.updatedAt)}`);
-  lines.push(`- Nachrichten: ${data.turns.length}`);
-  lines.push(
-    `- Kosten: gesamt ${formatUsd(data.costs.totalUsd)} (Hauptmodell ${formatUsd(data.costs.mainUsd)}, Kompressor ${formatUsd(data.costs.compressorUsd)}, Transkription ${formatUsd(data.costs.voiceUsd)})`,
-  );
+  lines.push(`- Created: ${formatTimestamp(data.createdAt)}`);
+  lines.push(`- Updated: ${formatTimestamp(data.updatedAt)}`);
+  lines.push(`- Messages: ${data.turns.length}`);
+  if (knowledgeOf(data.costs) === "unknown") {
+    lines.push(`- Cost: ${formatUnknownCost(data.costs.totalUsd)}`);
+  } else {
+    lines.push(
+      `- Cost: total ${formatUsd(data.costs.totalUsd)} (main model ${formatUsd(data.costs.mainUsd)}, compressor ${formatUsd(data.costs.compressorUsd)}, transcription ${formatUsd(data.costs.voiceUsd)})`,
+    );
+  }
   lines.push("");
 
   if (data.summary.trim()) {
-    lines.push("## Zusammenfassung", "", redactSensitive(data.summary.trim()), "");
+    lines.push("## Summary", "", redactSensitive(data.summary.trim()), "");
   }
 
   if (checkpoints.length) {
     lines.push("## Checkpoints", "");
     for (const checkpoint of checkpoints) {
       lines.push(
-        `- **${checkpoint.label}** — nach Nachricht ${checkpoint.turnIndex}, ${formatTimestamp(checkpoint.createdAt)}, ${formatUsd(checkpoint.costUsd)}`,
+        `- **${checkpoint.label}** — after message ${checkpoint.turnIndex}, ${formatTimestamp(checkpoint.createdAt)}, ${knowledgeOf(checkpoint) === "unknown" ? formatUnknownCost(checkpoint.costUsd) : formatUsd(checkpoint.costUsd)}`,
       );
     }
     lines.push("");
   }
 
-  lines.push("## Verlauf", "");
+  lines.push("## History", "");
   if (!data.turns.length) {
-    lines.push("_Keine Nachrichten._", "");
+    lines.push("_No messages._", "");
   }
   data.turns.forEach((turn, index) => {
     appendToolCalls(lines, toolCalls, index);
     lines.push(
-      `### ${index + 1}. ${turn.role === "user" ? "Du" : "Assistent"} — ${formatTimestamp(turn.createdAt)}`,
+      `### ${index + 1}. ${turn.role === "user" ? "You" : "Assistant"} — ${formatTimestamp(turn.createdAt)}`,
       "",
-      redactSensitive(turn.content).trim() || "_leer_",
+      redactSensitive(turn.content).trim() || "_empty_",
       "",
     );
   });
@@ -594,7 +1478,7 @@ export function exportSessionMarkdown(data: SessionExportInput): string {
     true,
   );
 
-  return `${lines.join("\n").trimEnd()}\n`;
+  return redactText(`${lines.join("\n").trimEnd()}\n`);
 }
 
 function appendToolCalls(
@@ -609,7 +1493,7 @@ function appendToolCalls(
   if (!relevant.length) {
     return;
   }
-  lines.push("#### Werkzeugaufrufe", "");
+  lines.push("#### Tool calls", "");
   for (const call of relevant) {
     lines.push(
       `- \`${call.name}\`${call.summary ? ` — ${call.summary}` : ""} (${formatTimestamp(call.at)})`,
@@ -668,8 +1552,7 @@ export async function migrateLegacySession(
   const createdAt = turns[0]?.createdAt ?? updatedAt;
   const data: PersistedSessionData = {
     ...emptySession(workspace, id, titleFromTurns(turns)),
-    summary:
-      typeof raw.summary === "string" ? redactSensitive(raw.summary) : "",
+    summary: typeof raw.summary === "string" ? raw.summary : "",
     turns,
     costs: normalizeCosts(raw.costs),
     createdAt,
@@ -694,7 +1577,7 @@ async function markLegacyMigrated(path: string, marker: string): Promise<void> {
   try {
     await writeFile(
       marker,
-      `Migriert am ${new Date().toISOString()}. Diese Datei verhindert einen erneuten Import.\n`,
+      `Migrated on ${new Date().toISOString()}. This file prevents a repeat import.\n`,
       { encoding: "utf8", mode: SECURE_FILE_MODE, flag: "wx" },
     );
   } catch {
@@ -705,6 +1588,7 @@ async function markLegacyMigrated(path: string, marker: string): Promise<void> {
 async function loadAllSessions(
   workspace: string,
   appHome: string,
+  providerConnection?: ProviderConnectionStateV3,
 ): Promise<PersistedSessionData[]> {
   const directory = chatDirectory(appHome, workspace);
   let files: string[];
@@ -730,6 +1614,7 @@ async function loadAllSessions(
         JSON.parse(await readFile(join(directory, file), "utf8")),
         workspace,
         id,
+        providerConnection,
       );
       if (parsed) {
         sessions.push(parsed);
@@ -741,6 +1626,103 @@ async function loadAllSessions(
   return sessions.sort(
     (left, right) => Date.parse(right.updatedAt) - Date.parse(left.updatedAt),
   );
+}
+
+/**
+ * D8d: the exact `isUntouched` signature above (`SessionStore`), applied to
+ * an already-loaded summary instead of a live session — no turns, no cost,
+ * still the default title. A chat in this state is launch residue from
+ * before D8c (a plain launch now always starts one; `isUntouched` is what
+ * lets the exit-time save skip writing it at all, but a chat created before
+ * that guard shipped can still be sitting on disk) — nothing a user could
+ * meaningfully open, since re-selecting it is indistinguishable from "＋ New
+ * Chat", which is already offered everywhere this predicate applies. The
+ * file itself is left untouched; only listing surfaces skip it.
+ */
+function isGhostChatSummary(chat: Pick<ChatSummary, "turnCount" | "costUsd" | "title">): boolean {
+  return chat.turnCount === 0 && chat.costUsd === 0 && chat.title === DEFAULT_TITLE;
+}
+
+export interface CrossWorkspaceChat extends ChatSummary {
+  /**
+   * False when the chat file's own recorded `workspace` does not hash back to
+   * the directory it was actually found in — a rare corruption/tamper signal
+   * (there is no separate workspace→path index file; each chat's own
+   * required `SessionData.workspace` field, hashed via `workspaceStorageHash`,
+   * *is* the index). The row is still shown honestly (title/stats stand),
+   * but nothing can re-root into it (Controller ruling 5: no folder anyone
+   * can trust to switch into).
+   */
+  readonly workspaceVerified: boolean;
+}
+
+/**
+ * Enumerates every chat across every known workspace — the global `/chats`
+ * index and the start workbench's cross-folder Continue source (Phase F1b).
+ * Read only, like `SessionStore.list`/`.search` (B15): it walks
+ * `appHome/chats/<hash>` directly and recovers each hash's human path from
+ * the chats already inside it, reusing the exact same parse/validate path
+ * `loadAllSessions` uses for a single workspace. Sorted most-recent-first
+ * across every folder.
+ *
+ * D8d, additive: a ghost chat (`isGhostChatSummary` above) is excluded here,
+ * at the one source both consumers share, rather than in each of them —
+ * the hub's "Recent" section (`refreshDashboardRecentChats`, cli.ts) and the
+ * `/chats` picker (both the dashboard and plain-mode builds) call this
+ * function and nothing else for their listing, so filtering it out here
+ * removes it from every listing surface at once. `SessionStore.list` (the
+ * single-workspace listing used by deletion/search flows, which legitimately
+ * still need to see an untouched chat to offer cleaning it up) is
+ * deliberately untouched.
+ */
+export async function listChatsAcrossWorkspaces(
+  appHome: string = APP_HOME,
+  providerConnection?: ProviderConnectionStateV3,
+): Promise<CrossWorkspaceChat[]> {
+  const root = join(appHome, "chats");
+  let hashDirs: string[];
+  try {
+    hashDirs = await readdir(root);
+  } catch (error) {
+    if (hasCode(error, "ENOENT")) return [];
+    throw error;
+  }
+  const out: CrossWorkspaceChat[] = [];
+  for (const hash of hashDirs) {
+    let files: string[];
+    try {
+      files = await readdir(join(root, hash));
+    } catch {
+      continue;
+    }
+    for (const file of files) {
+      if (!file.endsWith(".json")) continue;
+      const id = file.slice(0, -5);
+      let raw: unknown;
+      try {
+        raw = JSON.parse(await readFile(join(root, hash, file), "utf8"));
+      } catch {
+        continue;
+      }
+      if (!isRecord(raw) || typeof raw.workspace !== "string") continue;
+      try {
+        assertChatId(id);
+        const parsed = normalizeSession(raw, raw.workspace, id, providerConnection);
+        if (parsed) {
+          const summary = toSummary(parsed);
+          if (!isGhostChatSummary(summary)) {
+            out.push({
+              ...summary,
+              workspaceVerified: workspaceHash(raw.workspace) === hash,
+            });
+          }
+        }
+      } catch {
+        // A damaged chat must not make every other chat (or workspace) inaccessible.
+      }
+    }
+  }
+  return out.sort((left, right) => Date.parse(right.updatedAt) - Date.parse(left.updatedAt));
 }
 
 function buildSnippet(
@@ -781,6 +1763,7 @@ function emptySession(
       compressorUsd: 0,
       voiceUsd: 0,
       totalUsd: 0,
+      costKnowledge: "known",
     },
     revision: 0,
     checkpoints: [],
@@ -795,6 +1778,7 @@ function withPersistenceFields(data: SessionData): PersistedSessionData {
   const candidate = data as Partial<PersistedSessionData> & SessionData;
   return {
     ...data,
+    costs: normalizeCosts(data.costs),
     revision: nonNegativeInteger(candidate.revision),
     checkpoints: normalizeCheckpoints(candidate.checkpoints),
     toolCalls: normalizeToolCalls(candidate.toolCalls),
@@ -806,38 +1790,186 @@ function normalizeSession(
   value: unknown,
   workspace: string,
   id: string,
+  providerConnection?: ProviderConnectionStateV3,
 ): PersistedSessionData | null {
   if (!isRecord(value) || value.version !== 2) {
     return null;
   }
-  if (value.workspace !== workspace || value.id !== id) {
+  if (
+    (value.workspace !== workspace && value.workspace !== redactText(workspace)) ||
+    value.id !== id
+  ) {
     return null;
   }
   const turns = normalizeTurns(value.turns);
   const updatedAt = validDate(value.updatedAt) ?? new Date().toISOString();
   const createdAt = validDate(value.createdAt) ?? turns[0]?.createdAt ?? updatedAt;
+  const model = typeof value.model === "string" && value.model.trim()
+    ? value.model.trim()
+    : null;
+  if (value.routeCleared !== undefined && value.routeCleared !== true) {
+    return null;
+  }
+  const routeCleared = value.routeCleared === true;
+  let route: RouteIdentityV1 | null;
+  if (value.route !== undefined) {
+    // A chat that carries a route key owns exactly that identity. A partial,
+    // future, or foreign-shaped route — or a model the route does not own —
+    // is corrupt state: fail closed rather than drop the route and let the
+    // model string be re-bound to whatever backend is the current default.
+    route = persistableSessionRoute(value.route);
+    if (routeCleared || route === null || model === null || !routeOwnsModel(route, model)) {
+      return null;
+    }
+  } else {
+    route = !routeCleared
+      && model !== null
+      && isActiveMigratedOpenRouterConnection(providerConnection)
+      ? mapLegacyOpenRouterModel(model, providerConnection)
+      : null;
+  }
+  const crossMode = parseCrossModeV1(value.crossMode);
+  const lastCrossRunAtValid = typeof value.lastCrossRunAt === "string"
+    && !Number.isNaN(Date.parse(value.lastCrossRunAt));
+  const parsedLastCrossRun = parseLastCrossRunV1(value.lastCrossRun);
+  // Defense in depth (P10b): both fields are always written together by
+  // `noteCrossRun`, so a hand-edited/corrupt file where they disagree — an
+  // identity timestamped for a different stamp than the one on record — is
+  // exactly the "stamp says one run, identity says another" corruption
+  // `/undo`'s Cross branch must never trust. Fails closed to "no identity",
+  // the same honest refusal as a chat with no identity at all.
+  const lastCrossRun = parsedLastCrossRun && lastCrossRunAtValid && parsedLastCrossRun.at === value.lastCrossRunAt
+    ? parsedLastCrossRun
+    : null;
+  const summary = typeof value.summary === "string" ? value.summary : "";
+  const pinnedTurns = normalizePinnedTurns(value.pinnedTurns, turns);
+  const goal = normalizeGoal(value.goal);
   return {
     version: 2,
     id,
     title: normalizeTitle(value.title),
     workspace,
-    summary:
-      typeof value.summary === "string" ? redactSensitive(value.summary) : "",
+    summary,
     turns,
     costs: normalizeCosts(value.costs),
     revision: nonNegativeInteger(value.revision),
     checkpoints: normalizeCheckpoints(value.checkpoints),
     toolCalls: normalizeToolCalls(value.toolCalls),
     dailySpendUsd: normalizeSpend(value.dailySpendUsd),
-    ...(typeof value.model === "string" && value.model.trim()
-      ? { model: value.model.trim() }
+    ...(model !== null
+      ? { model }
       : {}),
+    ...(route !== null ? { route } : {}),
+    ...(routeCleared ? { routeCleared: true as const } : {}),
     ...(isReasoningSetting(value.reasoning)
       ? { reasoning: structuredClone(value.reasoning) }
+      : {}),
+    ...(crossMode !== null ? { crossMode } : {}),
+    ...(lastCrossRunAtValid ? { lastCrossRunAt: value.lastCrossRunAt as string } : {}),
+    ...(lastCrossRun !== null ? { lastCrossRun } : {}),
+    ...(pinnedTurns ? { pinnedTurns } : {}),
+    ...(goal !== undefined ? { goal } : {}),
+    // Fail-closed like everything else here: `summaryUpdatedAt` is only ever
+    // trusted alongside a non-empty `summary` it actually describes — a
+    // timestamp surviving a since-cleared summary, or one that never was a
+    // valid date, is silently dropped rather than shown as a lie.
+    ...(summary.trim() && typeof value.summaryUpdatedAt === "string" && validDate(value.summaryUpdatedAt)
+      ? { summaryUpdatedAt: validDate(value.summaryUpdatedAt)! }
       : {}),
     createdAt,
     updatedAt,
   };
+}
+
+/**
+ * Fail-closed validation for `SessionData.pinnedTurns` (Phase 13): a
+ * non-array or non-string-array value normalizes to "no pins" rather than
+ * throwing (a corrupt session file must not become entirely unreadable over
+ * one bad field), duplicates collapse, and — same hygiene as
+ * `SessionStore.#pruneDanglingPins` — an id that does not name any turn in
+ * the given (already-normalized) `turns` is dropped rather than carried
+ * forward as a dangling reference. Returns `undefined` (never `[]`) when
+ * nothing survives, matching every other optional field's "absent, not
+ * empty" convention in this module.
+ */
+function normalizePinnedTurns(
+  value: unknown,
+  turns: readonly ChatTurn[],
+): string[] | undefined {
+  if (!Array.isArray(value)) {
+    return undefined;
+  }
+  const live = new Set(
+    turns.map((turn) => turn.id).filter((turnId): turnId is string => typeof turnId === "string"),
+  );
+  const result: string[] = [];
+  for (const candidate of value) {
+    if (typeof candidate === "string" && live.has(candidate) && !result.includes(candidate)) {
+      result.push(candidate);
+    }
+  }
+  return result.length > 0 ? result : undefined;
+}
+
+/**
+ * Fail-closed validation for `SessionData.goal` (D9), mirroring
+ * `normalizePinnedTurns`/`parseCrossModeV1`: a non-string, blank, or
+ * over-`MAX_GOAL_CHARS` value normalizes to "no goal" rather than throwing —
+ * a corrupt session file must not become entirely unreadable over one bad
+ * field. Unlike the interactive setter (`SessionStore.setGoal`), this never
+ * reports the refusal to anyone; it is the same silent-drop contract every
+ * other optional field here already has on load/merge.
+ */
+function normalizeGoal(value: unknown): string | undefined {
+  if (typeof value !== "string") {
+    return undefined;
+  }
+  const trimmed = value.trim();
+  return trimmed && trimmed.length <= MAX_GOAL_CHARS ? trimmed : undefined;
+}
+
+/** The closed own-key set of `RouteIdentityV1`; nothing else may enter a chat file. */
+const ROUTE_IDENTITY_V1_KEYS: ReadonlySet<string> = new Set<keyof RouteIdentityV1>([
+  "version",
+  "backendId",
+  "accountFingerprint",
+  "billingRealm",
+  "requestedModelId",
+  "canonicalModelId",
+  "resolutionState",
+]);
+
+/**
+ * A route the chat file may own. Beyond the shared shape check, the route must
+ * carry exactly the known own keys (an extra future or credential-like field is
+ * never persisted, reopened, or echoed), and only the migrated OpenRouter
+ * connection ever produces a `legacy-unverified` route; any other backend must
+ * be fully resolved or it is not a runnable identity.
+ */
+function persistableSessionRoute(value: unknown): RouteIdentityV1 | null {
+  const route = validateRouteIdentityV1(value);
+  if (route === null) {
+    return null;
+  }
+  if (Object.keys(route).some((key) => !ROUTE_IDENTITY_V1_KEYS.has(key))) {
+    return null;
+  }
+  if (route.backendId !== "openrouter" && route.resolutionState !== "resolved") {
+    return null;
+  }
+  return route;
+}
+
+function routeOwnsModel(route: RouteIdentityV1, model: string): boolean {
+  return model === route.requestedModelId || model === route.canonicalModelId;
+}
+
+function isActiveMigratedOpenRouterConnection(
+  value: ProviderConnectionStateV3 | undefined,
+): value is ProviderConnectionStateV3 {
+  if (value?.backendId !== "openrouter" || !value.enabled) return false;
+  const binding = credentialBindingForConnection(value);
+  return binding.kind === "orcode-keychain" && binding.pointer === "legacy:inference";
 }
 
 function normalizeTurns(value: unknown): ChatTurn[] {
@@ -852,11 +1984,54 @@ function normalizeTurns(value: unknown): ChatTurn[] {
         typeof turn.content === "string",
     )
     .slice(-MAX_TURNS)
-    .map((turn) => ({
-      role: turn.role as ChatTurn["role"],
-      content: redactSensitive(String(turn.content)),
-      createdAt: validDate(turn.createdAt) ?? new Date().toISOString(),
-    }));
+    .map((turn) => {
+      const role = turn.role as ChatTurn["role"];
+      const content = String(turn.content);
+      const createdAt = validDate(turn.createdAt) ?? new Date().toISOString();
+      return {
+        role,
+        content,
+        createdAt,
+        // Phase 13 migration: a turn saved before `id` existed (or with a
+        // corrupt/missing one) is backfilled right here, on load — the same
+        // "additive optional field, normalized on the way in" precedent
+        // `route`/`reasoning` already use elsewhere in this module. This
+        // MUST be deterministic (never `randomUUID()`): `SessionStore.save()`
+        // itself re-reads and re-normalizes the file on disk (the foreign-
+        // write conflict check) before the backfilled id is ever persisted,
+        // so a random id would already disagree with itself inside one
+        // `save()` call, let alone across reloads. Deriving it from the
+        // turn's own (createdAt, role, content) — the exact same triple
+        // `turnKey` already treats as this turn's merge identity — makes
+        // repeated normalization of the same bytes always agree.
+        id: typeof turn.id === "string" && turn.id.trim()
+          ? turn.id.trim().slice(0, 80)
+          : derivedTurnId(role, content, createdAt),
+      };
+    });
+}
+
+/**
+ * Deterministic id for a turn loaded without one — see `normalizeTurns`.
+ *
+ * Deliberately hashes the RAW `content`, unlike `turnKey` below (merge
+ * dedup), which hashes `redactText(content)`. `turnKey`'s job tolerates a
+ * false-positive dedup match — its output never leaves this module. This
+ * id is different: it becomes the actual persisted, pin-referenced
+ * `ChatTurn.id`, so two turns whose raw content differs only in a secret
+ * substring (e.g. two different OpenRouter keys, both of which
+ * `redactText` collapses to the identical `[REDACTED_OPENROUTER_KEY]`
+ * placeholder) must still get two different ids — hashing the redacted
+ * form here would silently collide them into one id, letting a pin on one
+ * turn resolve ambiguously to the other. A one-way hash of raw content
+ * reveals nothing the id's own consumers (pin lookups) need to see, so
+ * there is no redaction requirement working the other way either.
+ */
+function derivedTurnId(role: ChatTurn["role"], content: string, createdAt: string): string {
+  return createHash("sha256")
+    .update(`${createdAt}|${role}|${content}`)
+    .digest("hex")
+    .slice(0, 32);
 }
 
 function normalizeCheckpoints(value: unknown): SessionCheckpoint[] {
@@ -880,6 +2055,7 @@ function normalizeCheckpoints(value: unknown): SessionCheckpoint[] {
       ),
       turnIndex: nonNegativeInteger(candidate.turnIndex),
       costUsd: nonNegativeNumber(candidate.costUsd),
+      costKnowledge: candidate.costKnowledge === "unknown" ? "unknown" : "known",
       createdAt,
     });
   }
@@ -901,9 +2077,7 @@ function normalizeToolCalls(value: unknown): SessionToolCall[] {
     }
     result.push({
       name: candidate.name.slice(0, 80),
-      summary: redactSensitive(
-        typeof candidate.summary === "string" ? candidate.summary : "",
-      ).slice(0, 300),
+      summary: (typeof candidate.summary === "string" ? candidate.summary : "").slice(0, 300),
       turnIndex: nonNegativeInteger(candidate.turnIndex),
       at,
     });
@@ -950,6 +2124,7 @@ function normalizeCosts(value: unknown): CostLedger {
     compressorUsd,
     voiceUsd,
     totalUsd: mainUsd + compressorUsd + voiceUsd,
+    costKnowledge: costs.costKnowledge === "unknown" ? "unknown" : "known",
   };
 }
 
@@ -960,7 +2135,9 @@ function toSummary(data: PersistedSessionData): ChatSummary {
     workspace: data.workspace,
     turnCount: data.turns.length,
     costUsd: data.costs.totalUsd,
+    costKnowledge: knowledgeOf(data.costs),
     model: data.model,
+    route: data.route ? structuredClone(data.route) : undefined,
     reasoning: data.reasoning,
     createdAt: data.createdAt,
     updatedAt: data.updatedAt,
@@ -972,16 +2149,20 @@ function chatDirectory(appHome: string, workspace: string): string {
 }
 
 function chatPath(appHome: string, workspace: string, id: string): string {
-  return join(chatDirectory(appHome, workspace), `${id}.json`);
+  return CHAT_ARTIFACT_REGISTRY.resolve("chat", {
+    appHome,
+    workspace,
+    chatId: id,
+  });
 }
 
 function workspaceHash(workspace: string): string {
-  return createHash("sha256").update(workspace).digest("hex").slice(0, 16);
+  return workspaceStorageHash(workspace);
 }
 
 function assertChatId(id: string): void {
   if (!/^[a-zA-Z0-9-]{8,80}$/.test(id)) {
-    throw new Error("Ungültige Chat-ID.");
+    throw new Error("Invalid chat ID.");
   }
 }
 
@@ -989,17 +2170,20 @@ function normalizeTitle(value: unknown): string {
   if (typeof value !== "string") {
     return DEFAULT_TITLE;
   }
-  const clean = redactSensitive(value).replace(/\s+/g, " ").trim();
+  const clean = value.replace(/\s+/g, " ").trim();
+  if (clean === LEGACY_DEFAULT_TITLE) {
+    return DEFAULT_TITLE;
+  }
   return clean ? clean.slice(0, 80) : DEFAULT_TITLE;
 }
 
 function normalizeCheckpointLabel(value: string, turnIndex: number): string {
-  const clean = redactSensitive(value).replace(/\s+/g, " ").trim();
-  return clean ? clean.slice(0, 60) : `Checkpoint bei Nachricht ${turnIndex}`;
+  const clean = value.replace(/\s+/g, " ").trim();
+  return clean ? clean.slice(0, 60) : `Checkpoint at message ${turnIndex}`;
 }
 
 function titleFromPrompt(prompt: string): string {
-  const clean = redactSensitive(prompt)
+  const clean = prompt
     .replace(/[`*_#>[\]]/g, "")
     .replace(/\s+/g, " ")
     .trim();
@@ -1008,7 +2192,7 @@ function titleFromPrompt(prompt: string): string {
 
 function titleFromTurns(turns: ChatTurn[]): string {
   const firstUser = turns.find((turn) => turn.role === "user");
-  return firstUser ? titleFromPrompt(firstUser.content) : "Bisheriger Chat";
+  return firstUser ? titleFromPrompt(firstUser.content) : "Previous chat";
 }
 
 function validDate(value: unknown): string | null {
@@ -1032,17 +2216,27 @@ function roundUsd(value: number): number {
   return Math.round(value * 1e6) / 1e6;
 }
 
+function knowledgeOf(value: { readonly costKnowledge?: unknown }): CostKnowledge {
+  return value.costKnowledge === "unknown" ? "unknown" : "known";
+}
+
+function formatUnknownCost(knownAmount: number): string {
+  return knownAmount > 0
+    ? `at least ${formatUsd(knownAmount)}; further provider-managed costs are unknown`
+    : "provider-managed / unknown";
+}
+
 function describeReasoning(reasoning: ReasoningSetting | undefined): string {
   if (!reasoning) {
-    return "nicht festgelegt";
+    return "not set";
   }
   if (reasoning.mode === "auto") {
-    return "automatisch";
+    return "auto";
   }
   if (reasoning.mode === "effort") {
-    return `Aufwand ${reasoning.effort}`;
+    return `${reasoning.effort}`;
   }
-  return `Budget ${reasoning.maxTokens} Tokens`;
+  return `${reasoning.maxTokens} tokens`;
 }
 
 function formatTimestamp(value: string): string {
@@ -1081,6 +2275,50 @@ function isReasoningSetting(value: unknown): value is ReasoningSetting {
     Number(value.maxTokens) > 0 &&
     Number(value.maxTokens) <= 1_000_000
   );
+}
+
+/**
+ * Phase 10 (fix round 1, MINOR 5): both roles must be complete, resolved
+ * routes carrying exactly the closed `RouteIdentityV1` key set
+ * (`persistableSessionRoute`, the same guard `route` itself is loaded
+ * through) — a corrupt or foreign-shaped pair loads as disarmed rather than
+ * partially trusted. Returns a clean `{lead, challenger}` object built from
+ * the two validated routes, not the raw wrapper — an extra own key on the
+ * wrapper itself (`value.crossMode`, as opposed to on either role) must not
+ * silently survive load/save, the same closed-shape discipline `route`
+ * already gets. `oneShot` (fix round 1, owner direction) is the one
+ * additional own key this closed shape allows, and only as the literal
+ * `true` — anything else (including a bare `false`) fails closed exactly
+ * like `routeCleared`'s own strict-boolean check.
+ */
+function parseCrossModeV1(value: unknown): CrossModeV1 | null {
+  if (!isRecord(value)) return null;
+  const lead = persistableSessionRoute(value.lead);
+  const challenger = persistableSessionRoute(value.challenger);
+  if (!lead || !challenger) return null;
+  if (value.oneShot !== undefined && value.oneShot !== true) return null;
+  return { lead, challenger, ...(value.oneShot === true ? { oneShot: true as const } : {}) };
+}
+
+/**
+ * The same closed-shape, fail-closed discipline as `parseCrossModeV1`:
+ * `sidecarId`/`chatId` reuse `assertChatId`'s exact charset/length rule
+ * (P10b — no path separators, no `..`, so `join(appHome, "cross-sidecars",
+ * sidecarId)` at `/undo` time can never escape that directory), and
+ * `sidecarId` must carry the `-lead` suffix `cli.ts`'s Cross worker adapter
+ * always writes — a foreign or hand-edited value fails closed to "no
+ * identity recorded" (the honest pre-P10b refusal) rather than a
+ * wrong-journal revert.
+ */
+const CROSS_SIDECAR_ID_PATTERN = /^[a-zA-Z0-9-]{8,80}-lead$/;
+const CROSS_SIDECAR_CHAT_ID_PATTERN = /^[a-zA-Z0-9-]{8,80}$/;
+
+function parseLastCrossRunV1(value: unknown): LastCrossRunV1 | null {
+  if (!isRecord(value)) return null;
+  if (typeof value.at !== "string" || Number.isNaN(Date.parse(value.at))) return null;
+  if (typeof value.sidecarId !== "string" || !CROSS_SIDECAR_ID_PATTERN.test(value.sidecarId)) return null;
+  if (typeof value.chatId !== "string" || !CROSS_SIDECAR_CHAT_ID_PATTERN.test(value.chatId)) return null;
+  return { at: value.at, sidecarId: value.sidecarId, chatId: value.chatId };
 }
 
 /* ------------------------------------------------------------------ *
@@ -1155,7 +2393,7 @@ async function acquireChatLock(
     await delay(LOCK_POLL_MS);
   }
   throw new Error(
-    `Chatdatei ist dauerhaft gesperrt: ${lockPath}. Bitte die Datei prüfen und ggf. löschen.`,
+    `Chat file is permanently locked: ${lockPath}. Please check the file and delete it if needed.`,
   );
 }
 
@@ -1218,7 +2456,7 @@ function delay(ms: number): Promise<void> {
 
 type ForeignState =
   | { kind: "missing"; revision: number }
-  | { kind: "unreadable"; revision: number }
+  | { kind: "unreadable"; revision: number; raw: string }
   | { kind: "data"; revision: number; data: PersistedSessionData };
 
 async function readForeign(
@@ -1243,20 +2481,22 @@ async function readForeign(
   } catch {
     // handled below
   }
-  return { kind: "unreadable", revision: 0 };
+  return { kind: "unreadable", revision: 0, raw };
 }
 
 /** Cheap change detector; covers files written by builds without `revision`. */
 function fingerprint(data: PersistedSessionData): string {
+  const projected = redactValue(data);
   return [
-    data.revision,
-    data.turns.length,
-    data.costs.totalUsd,
-    data.updatedAt,
-    data.checkpoints.length,
-    data.toolCalls.length,
-    data.title,
-    data.summary.length,
+    projected.revision,
+    projected.turns.length,
+    projected.costs.totalUsd,
+    knowledgeOf(projected.costs),
+    projected.updatedAt,
+    projected.checkpoints.length,
+    projected.toolCalls.length,
+    projected.title,
+    projected.summary.length,
   ].join("|");
 }
 
@@ -1275,12 +2515,17 @@ export function mergeSessions(
   theirs: PersistedSessionData,
 ): PersistedSessionData {
   const turns = mergeTurns(base.turns, mine.turns, theirs.turns);
+  // `setSummary` always moves `summary` and `summaryUpdatedAt` together —
+  // one `pickSide` call for both, see its own doc comment.
+  const summarySide = pickSide(base.summary, mine.summary, theirs.summary);
+  const summary = summarySide === "mine" ? mine.summary : theirs.summary;
+  const summaryUpdatedAt = summarySide === "mine" ? mine.summaryUpdatedAt : theirs.summaryUpdatedAt;
   return {
     version: 2,
     id: mine.id,
     workspace: mine.workspace,
     title: pickField(base.title, mine.title, theirs.title),
-    summary: pickField(base.summary, mine.summary, theirs.summary),
+    summary,
     turns,
     costs: mergeCosts(base.costs, mine.costs, theirs.costs),
     revision: Math.max(mine.revision, theirs.revision),
@@ -1296,7 +2541,8 @@ export function mergeSessions(
       base.toolCalls,
       mine.toolCalls,
       theirs.toolCalls,
-      (call) => `${call.at}|${call.name}|${call.turnIndex}|${call.summary}`,
+      (call) =>
+        `${call.at}|${redactText(call.name)}|${call.turnIndex}|${redactText(call.summary)}`,
       (call) => Date.parse(call.at),
       MAX_TOOL_CALLS,
     ),
@@ -1305,23 +2551,169 @@ export function mergeSessions(
       mine.dailySpendUsd,
       theirs.dailySpendUsd,
     ),
-    ...(pickField(base.model, mine.model, theirs.model) !== undefined
-      ? { model: pickField(base.model, mine.model, theirs.model) }
-      : {}),
+    ...mergeSessionIdentity(base, mine, theirs),
     ...(pickField(base.reasoning, mine.reasoning, theirs.reasoning) !== undefined
       ? { reasoning: pickField(base.reasoning, mine.reasoning, theirs.reasoning) }
       : {}),
+    // Phase 10: same `pickField` treatment as `reasoning` above — a change
+    // (armed here, disarmed there, or a different pair) from either window
+    // wins over the unchanged base; two genuinely concurrent changes fall
+    // back to `mine` like every other `pickField` use in this merge.
+    ...(pickField(base.crossMode, mine.crossMode, theirs.crossMode) !== undefined
+      ? { crossMode: pickField(base.crossMode, mine.crossMode, theirs.crossMode) }
+      : {}),
+    // Phase 13: same atomic `pickField` treatment as `reasoning`/`crossMode`
+    // above (a compound value, not merged per-element) — then re-validated
+    // against the merge's own final `turns` (`normalizePinnedTurns`, the
+    // same guard `normalizeSession` uses on load) so a pin naming a turn
+    // that lost the union above never survives as a dangling reference.
+    ...((): { pinnedTurns?: string[] } => {
+      const picked = normalizePinnedTurns(
+        pickField(base.pinnedTurns, mine.pinnedTurns, theirs.pinnedTurns),
+        turns,
+      );
+      return picked ? { pinnedTurns: picked } : {};
+    })(),
+    // D9: same atomic `pickField` treatment as `reasoning`/`crossMode` above,
+    // then re-validated through `normalizeGoal` (the same fail-closed guard
+    // `normalizeSession` uses on load) so a merge can never resurrect a value
+    // that was already invalid or over the length cap in one window.
+    ...((): { goal?: string } => {
+      const picked = normalizeGoal(pickField(base.goal, mine.goal, theirs.goal));
+      return picked !== undefined ? { goal: picked } : {};
+    })(),
+    ...(summaryUpdatedAt !== undefined ? { summaryUpdatedAt } : {}),
     createdAt: earlier(mine.createdAt, theirs.createdAt),
     updatedAt: later(mine.updatedAt, theirs.updatedAt),
   };
 }
 
+interface SessionIdentity {
+  model?: string;
+  route?: RouteIdentityV1;
+  routeCleared?: true;
+}
+
+/**
+ * Model and route are one identity: the route owns the model, so the merge
+ * must never combine one window's model with another window's route.
+ */
+function sessionIdentity(data: PersistedSessionData): SessionIdentity {
+  return {
+    ...(data.model !== undefined ? { model: data.model } : {}),
+    ...(data.route !== undefined ? { route: data.route } : {}),
+    ...(data.routeCleared ? { routeCleared: true as const } : {}),
+  };
+}
+
+/**
+ * An exact-route lifecycle tombstone defeats a stale window that still owns
+ * the route from its base. A genuinely different explicit route remains a
+ * valid concurrent rebind and is not swallowed by clearing the old tuple.
+ */
+function mergeSessionIdentity(
+  base: PersistedSessionData,
+  mine: PersistedSessionData,
+  theirs: PersistedSessionData,
+): SessionIdentity {
+  if (base.route !== undefined) {
+    const mineRetainsBaseRoute = samePersistableSessionRoute(mine.route, base.route);
+    const theirsRetainsBaseRoute = samePersistableSessionRoute(theirs.route, base.route);
+    if (theirs.routeCleared && mineRetainsBaseRoute) return sessionIdentity(theirs);
+    if (mine.routeCleared && theirsRetainsBaseRoute) return sessionIdentity(mine);
+    if (mine.routeCleared && theirs.route !== undefined && !theirsRetainsBaseRoute) {
+      return sessionIdentity(theirs);
+    }
+    if (theirs.routeCleared && mine.route !== undefined && !mineRetainsBaseRoute) {
+      return sessionIdentity(mine);
+    }
+  }
+  return pickField(sessionIdentity(base), sessionIdentity(mine), sessionIdentity(theirs));
+}
+
+/** Replaces the complete provider/model identity without mixing either side. */
+function adoptSessionIdentity(
+  target: PersistedSessionData,
+  authoritative: PersistedSessionData,
+): void {
+  delete target.model;
+  delete target.route;
+  delete target.routeCleared;
+  if (authoritative.model !== undefined) target.model = authoritative.model;
+  if (authoritative.route !== undefined) {
+    target.route = structuredClone(authoritative.route);
+  }
+  if (authoritative.routeCleared) target.routeCleared = true;
+}
+
+/** Preserves the user's model label while durably blocking legacy/default rebinding. */
+function markRouteCleared(data: PersistedSessionData): void {
+  delete data.route;
+  data.routeCleared = true;
+}
+
 function pickField<T>(base: T, mine: T, theirs: T): T {
-  return JSON.stringify(mine) === JSON.stringify(base) ? theirs : mine;
+  return pickSide(base, mine, theirs) === "mine" ? mine : theirs;
+}
+
+/**
+ * `pickField`'s own decision, exposed as a side rather than a value —
+ * for `summary`/`summaryUpdatedAt` (Phase 13), which `setSummary` always
+ * changes together: picking each independently could resolve them to two
+ * different windows' writes on the rare occasion `summary`'s *content*
+ * happens not to change while `summaryUpdatedAt` still does (an identical
+ * handoff string set twice). Reading both from the one side `pickField`
+ * would have picked for `summary` keeps them describing the same fold.
+ */
+function pickSide<T>(base: T, mine: T, theirs: T): "mine" | "theirs" {
+  if (!sameValue(mine, base)) {
+    return "mine";
+  }
+  return sameRedactedProjection(theirs, base) ? "mine" : "theirs";
+}
+
+function sameExactResolvedRoute(
+  candidate: unknown,
+  expected: RouteIdentityV1,
+): boolean {
+  const current = persistableSessionRoute(candidate);
+  const exact = persistableSessionRoute(expected);
+  return current?.resolutionState === "resolved"
+    && current.canonicalModelId !== null
+    && exact?.resolutionState === "resolved"
+    && exact.canonicalModelId !== null
+    && samePersistableSessionRoute(current, exact);
+}
+
+/** Closed, insertion-order-independent equality for the seven route fields. */
+function samePersistableSessionRoute(left: unknown, right: unknown): boolean {
+  const current = persistableSessionRoute(left);
+  const expected = persistableSessionRoute(right);
+  return current !== null
+    && expected !== null
+    && current.version === expected.version
+    && current.backendId === expected.backendId
+    && current.accountFingerprint === expected.accountFingerprint
+    && current.billingRealm === expected.billingRealm
+    && current.requestedModelId === expected.requestedModelId
+    && current.canonicalModelId === expected.canonicalModelId
+    && current.resolutionState === expected.resolutionState;
+}
+
+function sameValue(left: unknown, right: unknown): boolean {
+  return JSON.stringify(left) === JSON.stringify(right);
+}
+
+function sameRedactedProjection(left: unknown, right: unknown): boolean {
+  return JSON.stringify(redactValue(left)) === JSON.stringify(redactValue(right));
 }
 
 function turnKey(turn: ChatTurn): string {
-  return `${turn.createdAt} ${turn.role} ${turn.content}`;
+  return JSON.stringify([
+    turn.createdAt,
+    turn.role,
+    redactText(turn.content),
+  ]);
 }
 
 function mergeTurns(
@@ -1330,15 +2722,13 @@ function mergeTurns(
   theirs: readonly ChatTurn[],
 ): ChatTurn[] {
   const baseCount = countKeys(base, turnKey);
-  const mineCount = countKeys(mine, turnKey);
   const seen = new Map<string, number>();
   const extras: ChatTurn[] = [];
   for (const turn of theirs) {
     const key = turnKey(turn);
     const index = (seen.get(key) ?? 0) + 1;
     seen.set(key, index);
-    const known = Math.max(baseCount.get(key) ?? 0, mineCount.get(key) ?? 0);
-    if (index > known) {
+    if (index > (baseCount.get(key) ?? 0)) {
       extras.push({ ...turn });
     }
   }
@@ -1370,7 +2760,18 @@ function mergeCosts(
     roundUsd(theirs.compressorUsd + (mine.compressorUsd - base.compressorUsd)),
   );
   const voiceUsd = Math.max(0, roundUsd(theirs.voiceUsd + (mine.voiceUsd - base.voiceUsd)));
-  return { mainUsd, compressorUsd, voiceUsd, totalUsd: roundUsd(mainUsd + compressorUsd + voiceUsd) };
+  const costKnowledge = knowledgeOf(base) === "unknown"
+    || knowledgeOf(mine) === "unknown"
+    || knowledgeOf(theirs) === "unknown"
+    ? "unknown"
+    : "known";
+  return {
+    mainUsd,
+    compressorUsd,
+    voiceUsd,
+    totalUsd: roundUsd(mainUsd + compressorUsd + voiceUsd),
+    costKnowledge,
+  };
 }
 
 function mergeSpend(
@@ -1403,11 +2804,14 @@ function mergeKeyed<T>(
   order: (item: T) => number,
   limit: number,
 ): T[] {
-  const mineKeys = new Set(mine.map(key));
-  const baseKeys = new Set(base.map(key));
-  const extras = theirs.filter(
-    (item) => !mineKeys.has(key(item)) && !baseKeys.has(key(item)),
-  );
+  const baseCount = countKeys(base, key);
+  const seen = new Map<string, number>();
+  const extras = theirs.filter((item) => {
+    const value = key(item);
+    const index = (seen.get(value) ?? 0) + 1;
+    seen.set(value, index);
+    return index > (baseCount.get(value) ?? 0);
+  });
   return [...mine, ...extras]
     .map((item) => ({ ...item }))
     .sort((left, right) => order(left) - order(right))
@@ -1431,80 +2835,21 @@ async function exists(path: string): Promise<boolean> {
   }
 }
 
-/* ------------------------------------------------------------------ *
- * Redaction (N4)
- * ------------------------------------------------------------------ */
-
-interface RedactionRule {
-  pattern: RegExp;
-  replacement: string;
+export function redactSensitive(value: string): string {
+  return redactText(value);
 }
 
-/**
- * Ordered from most specific to most generic. Every rule requires enough
- * entropy/length that ordinary prose ("Bearer token", "sk-test", "AKIA")
- * survives untouched.
- */
-const REDACTION_RULES: RedactionRule[] = [
-  {
-    pattern:
-      /-----BEGIN (?:[A-Z0-9 ]+ )?PRIVATE KEY-----[\s\S]*?-----END (?:[A-Z0-9 ]+ )?PRIVATE KEY-----/g,
-    replacement: "[REDACTED_PRIVATE_KEY]",
-  },
-  {
-    pattern: /\bsk-or-v1-[A-Za-z0-9_-]{12,}(?![A-Za-z0-9_-])/g,
-    replacement: "[REDACTED_OPENROUTER_KEY]",
-  },
-  {
-    pattern: /\bsk-ant-[A-Za-z0-9_-]{16,}(?![A-Za-z0-9_-])/g,
-    replacement: "[REDACTED_ANTHROPIC_KEY]",
-  },
-  {
-    pattern: /\bsk-[A-Za-z0-9_-]{20,}(?![A-Za-z0-9_-])/g,
-    replacement: "[REDACTED_API_KEY]",
-  },
-  {
-    pattern: /\bgh[pousr]_[A-Za-z0-9]{20,}(?![A-Za-z0-9_])/g,
-    replacement: "[REDACTED_GITHUB_TOKEN]",
-  },
-  {
-    pattern: /\bgithub_pat_[A-Za-z0-9_]{20,}(?![A-Za-z0-9_])/g,
-    replacement: "[REDACTED_GITHUB_TOKEN]",
-  },
-  {
-    pattern: /\b(?:AKIA|ASIA|ABIA|ACCA)[A-Z0-9]{16}(?![A-Za-z0-9])/g,
-    replacement: "[REDACTED_AWS_KEY_ID]",
-  },
-  {
-    pattern:
-      /\b(aws[_-]?secret[_-]?access[_-]?key["']?\s*[:=]\s*["']?)[A-Za-z0-9/+=]{40}/gi,
-    replacement: "$1[REDACTED_AWS_SECRET]",
-  },
-  {
-    pattern: /\bAIza[A-Za-z0-9_-]{35}(?![A-Za-z0-9_-])/g,
-    replacement: "[REDACTED_GOOGLE_KEY]",
-  },
-  {
-    pattern: /\bxox[baprs]-[A-Za-z0-9-]{10,}(?![A-Za-z0-9-])/g,
-    replacement: "[REDACTED_SLACK_TOKEN]",
-  },
-  {
-    // Only tokens that actually look like tokens: 20+ chars including a digit.
-    pattern:
-      /\bBearer[ \t]+(?=[A-Za-z0-9._~+/=-]*\d)[A-Za-z0-9._~+/=-]{20,}(?![A-Za-z0-9._~+/=-])/g,
-    replacement: "Bearer [REDACTED_TOKEN]",
-  },
-  {
-    pattern:
-      /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}(?![A-Za-z0-9._-])/g,
-    replacement: "[REDACTED_JWT]",
-  },
-];
-
-export function redactSensitive(value: string): string {
-  let result = value;
-  for (const rule of REDACTION_RULES) {
-    result = result.replace(rule.pattern, rule.replacement);
-  }
-  return result;
+/** Stable identity of the exact redacted summary and transcript covered by SDK state. */
+export function conversationHistoryDigest(
+  data: Pick<SessionData, "summary" | "turns">,
+): string {
+  const canonical = {
+    summary: redactText(data.summary),
+    turns: data.turns.map((turn) => ({
+      role: turn.role,
+      content: redactText(turn.content),
+      createdAt: turn.createdAt,
+    })),
+  };
+  return createHash("sha256").update(JSON.stringify(canonical)).digest("hex");
 }
