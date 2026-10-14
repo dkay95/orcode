@@ -49,14 +49,16 @@ const token: Validator = (value) => typeof value === "string" && /^[A-Za-z0-9_-]
 const digest: Validator = (value) => typeof value === "string" && /^[0-9a-f]{64}$/.test(value) ? value : invalid("hash invalid");
 const oneOf = (...values: readonly string[]): Validator => (value) => typeof value === "string" && values.includes(value) ? value : invalid("choice invalid");
 const array = (element: Validator, max: number): Validator => (value) => {
-  if (!Array.isArray(value) || value.length > max) invalid("array invalid");
+  if (!Array.isArray(value) || Object.getPrototypeOf(value) !== Array.prototype || value.length > max) invalid("array invalid");
   // No holes, attached properties or getters; map alone would silently skip holes.
   if (Reflect.ownKeys(value).length !== value.length + 1) invalid("array properties invalid");
+  const output: unknown[] = [];
   for (let index = 0; index < value.length; index++) {
     const descriptor = Object.getOwnPropertyDescriptor(value, String(index));
-    if (!descriptor || !("value" in descriptor)) invalid("array property invalid");
+    if (!descriptor?.enumerable || !("value" in descriptor)) invalid("array property invalid");
+    output.push(element(descriptor.value));
   }
-  return Object.freeze(value.map(element));
+  return Object.freeze(output);
 };
 const lease: Validator = (value) => shape(value, { ref: token, runId: text(256), epoch: integer(1), generation: token });
 const env: Validator = (value) => {

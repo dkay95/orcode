@@ -99,6 +99,7 @@ impl PrivatePipeServer {
                 _ => return Err(io::Error::last_os_error()),
             }
         }
+        operation.check_before_start(cancel, deadline)?;
         drop(operation);
         Ok(ConnectedPipe::new(self.handle))
     }

@@ -50,6 +50,22 @@ test("RPC frames reject duplicate JSON, oversized messages and accessor bodies",
     spec: { executableRef: root, argv: [], cwdRef: root, env: { TOKEN: "not-allowed\0" }, timeoutMs: 1000 } }));
 });
 
+test("array canonicalization cannot invoke inherited methods or skip element validation", () => {
+  let mapCalls = 0;
+  const argv: unknown[] = [];
+  Object.setPrototypeOf(argv, { map() { mapCalls++; return [42]; } });
+  const request = { ...base, operation: "execute-tool", lease,
+    spec: { executableRef: root, argv, cwdRef: root, env: {}, timeoutMs: 1000 } };
+  assert.throws(() => canonicalNativePlatformRequest(request));
+  assert.equal(mapCalls, 0);
+  assert.throws(() => canonicalNativePlatformRequest({ ...request, spec: { ...request.spec, argv: Array(1) } }));
+  let getterCalls = 0;
+  const getter: unknown[] = ["safe"];
+  Object.defineProperty(getter, "0", { get() { getterCalls++; return "unsafe"; } });
+  assert.throws(() => canonicalNativePlatformRequest({ ...request, spec: { ...request.spec, argv: getter } }));
+  assert.equal(getterCalls, 0);
+});
+
 function receiver(data: Uint8Array, purpose: "staging-file" | "tree" | "journal" | "interactive-read" = "staging-file") {
   return new NativeTransferReceiver({ transferId: root, childGeneration: 7, purpose,
     totalBytes: data.byteLength, sha256: createHash("sha256").update(data).digest("hex"), entries: 1 });

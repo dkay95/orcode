@@ -391,6 +391,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn verified_fixture_retains_the_canonical_team_identifier() {
         let verified = verified_packaged_app_fixture(
@@ -404,6 +405,16 @@ mod tests {
         )
         .expect("fixture");
         assert_eq!(verified.team_identifier, "ABCDE12345");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn mac_volume_fixture_cannot_mint_windows_native_authority() {
+        assert!(verified_packaged_app_fixture(
+            "/Volumes/Orcode/Orcode.app/Contents/MacOS/orcode-gui",
+            1, 2, 3, "ABCDE12345", [1; 32], [2; 32],
+        ).is_err());
+        assert!(verify_without_policy().is_err());
     }
 }
 

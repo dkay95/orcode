@@ -62,6 +62,7 @@ fn native_child_fixture() {
         "marker" => {
             std::fs::write(root.join("started"), b"started").unwrap();
         }
+        "exit259" => std::process::exit(259),
         "inheritance" => {
             let raw: usize = std::env::var("ORCODE_TEST_SENTINEL")
                 .unwrap()
@@ -374,4 +375,69 @@ fn windows_retire_fences_a_write_before_submission() {
             .kind(),
         std::io::ErrorKind::TimedOut
     );
+}
+
+#[test]
+fn windows_native_argument_and_environment_roundtrip() {
+    let parent = temporary_directory();
+    let root = parent.join("project with spaces ü");
+    std::fs::create_dir(&root).unwrap();
+    let node = PathBuf::from(
+        std::env::var_os("ORCODE_TEST_NODE")
+            .expect("ORCODE_TEST_NODE must name the fixture runtime"),
+    );
+    let expected = vec![
+        "",
+        "two words",
+        "trailing\\",
+        "embedded\"quote",
+        "slashes\\\\\"quote",
+        "Grüße 日本語",
+        "line\nbreak",
+    ];
+    let mut arguments = vec![
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/windows-native-child.mjs")
+            .into_os_string(),
+        "record-args".into(),
+        root.as_os_str().to_owned(),
+    ];
+    arguments.extend(expected.iter().map(|value| std::ffi::OsString::from(*value)));
+    let mut environment = vec![("ORCODE_TEST_UNICODE".into(), "Grüße 日本語".into())];
+    if let Some(value) = std::env::var_os("SystemRoot") {
+        environment.push(("SystemRoot".into(), value));
+    }
+    let spec = WindowsLaunchSpec {
+        executable: node,
+        arguments,
+        directory: root.clone(),
+        environment,
+    };
+    let job = EngineJob::new().unwrap();
+    let mut child = job
+        .create_suspended(&spec, &WindowsStdio::null().unwrap())
+        .unwrap();
+    child.resume().unwrap();
+    assert_eq!(child.wait(Duration::from_secs(10)).unwrap(), Some(0));
+    let result: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(root.join("arguments.json")).unwrap()).unwrap();
+    assert_eq!(result["args"], serde_json::json!(expected));
+    assert_eq!(result["value"], "Grüße 日本語");
+    std::fs::remove_dir_all(parent).unwrap();
+}
+
+#[test]
+fn windows_exit_code_259_is_not_confused_with_a_live_process() {
+    let root = temporary_directory();
+    let job = EngineJob::new().unwrap();
+    let mut child = job
+        .create_suspended(
+            &launch_spec("exit259", &root),
+            &WindowsStdio::null().unwrap(),
+        )
+        .unwrap();
+    child.resume().unwrap();
+    assert_eq!(child.wait(Duration::from_secs(5)).unwrap(), Some(259));
+    assert_eq!(child.try_wait().unwrap(), Some(259));
+    std::fs::remove_dir_all(root).unwrap();
 }

@@ -2483,6 +2483,7 @@ mod task_4a_tests {
         )
     }
 
+    #[cfg(unix)]
     #[test]
     fn verified_packaged_startup_writes_one_bound_attestation_and_replay_revokes() {
         let pid = 4242_u32;
