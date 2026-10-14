@@ -43,4 +43,4 @@ jobs:
       - name: Run shared native contracts and fail-closed Windows tests
         run: cargo test --manifest-path gui/src-tauri/Cargo.toml --locked --lib --test engine_lifecycle --test windows_native
       - name: Run native protocol contracts
-        run: node --import tsx --test tests/native-owner-bootstrap.test.ts tests/native-sidecar-channel.test.ts tests/native-shell-parent*.test.ts
+        run: node --import tsx --test tests/native-owner-bootstrap.test.ts tests/native-platform-protocol.test.ts tests/native-sidecar-channel.test.ts tests/native-shell-action.test.ts tests/official-cli-native-action.test.ts

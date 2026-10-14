@@ -1,6 +1,10 @@
 //! Deliberately unavailable until native Job ownership and private IPC are proven.
 //! In particular, a successful std::process::Command spawn is not a safe fallback.
 
+pub(crate) mod identity;
+pub(crate) mod job;
+pub(crate) mod pipe;
+
 use crate::engine::{ControlPipeWriter, NativeActionReader, NativeChannelError, ProcessSpawnGuard};
 
 pub struct NativeSidecarChannels {
