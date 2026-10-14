@@ -18,6 +18,7 @@
 
 pub mod engine;
 pub mod packaged_app_trust;
+mod platform;
 mod manufacturer_cli;
 
 use std::collections::{HashMap, HashSet};
@@ -377,7 +378,7 @@ fn plan_launch(app: &AppHandle) -> Result<EngineLaunch, EngineError> {
     // The staged runtime a packaged build carries (`npm run gui:package`).
     // Absent in a dev build, which is why every fallback below still exists.
     let resources = app.path().resource_dir().ok();
-    let bundled_node = resources.as_ref().map(|dir| dir.join("orcode/node"));
+    let bundled_node = resources.as_ref().map(|dir| dir.join("orcode").join(platform::NODE_BINARY_NAME));
     let node = resolve_node(
         std::env::var("ORCODE_GUI_NODE").ok().as_deref(),
         bundled_node.as_deref(),
@@ -430,7 +431,7 @@ fn plan_launch(app: &AppHandle) -> Result<EngineLaunch, EngineError> {
 
     let fixture_home = repo_root().join("gui/.devhome");
     let home = if real_home {
-        dirs_home().ok_or_else(|| EngineError::Io("HOME is not set.".into()))?
+        dirs_home().ok_or_else(|| EngineError::Io("The user home directory is unavailable.".into()))?
     } else {
         fixture_home.clone()
     };
@@ -458,7 +459,7 @@ fn plan_launch(app: &AppHandle) -> Result<EngineLaunch, EngineError> {
 }
 
 fn dirs_home() -> Option<PathBuf> {
-    std::env::var("HOME").ok().map(PathBuf::from)
+    platform::home_from_env(|key| std::env::var_os(key))
 }
 
 /* =========================================================================
@@ -2981,6 +2982,7 @@ mod task_4a_tests {
         assert!(!coordinator.state.lock().unwrap().active);
     }
 
+    #[cfg(unix)]
     fn spawn_real_pipe_runtime(
         close_action_fd: bool,
         generation: u64,
@@ -3034,6 +3036,7 @@ setInterval(() => {}, 1000);
         (raw, runtime, prompt, control)
     }
 
+    #[cfg(unix)]
     fn wait_for_prompt(prompt: &FakePrompt) {
         let deadline = std::time::Instant::now() + Duration::from_millis(500);
         while prompt.presentations.lock().unwrap().is_empty()
@@ -3044,6 +3047,7 @@ setInterval(() => {}, 1000);
         assert_eq!(prompt.presentations.lock().unwrap().len(), 1);
     }
 
+    #[cfg(unix)]
     #[test]
     fn real_pipe_runtime_gates_activation_and_eof_cannot_cross_replacement() {
         let (old_raw, mut old_runtime, old_prompt, old_control) =

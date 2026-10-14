@@ -23,9 +23,17 @@
 //! The shutdown sequence is written against a small trait so it can be
 //! `cargo test`ed for ORDER without a window, a WebView or a real child.
 
+#[cfg(unix)]
+pub use crate::platform::unix::{
+    create_native_sidecar_channels, probe_fixed_fd_collision_matrix, NativeSidecarChannels,
+};
+#[cfg(unix)]
+use crate::platform::unix::{pipe_available_bytes, set_nonblocking, write_nonblocking};
+#[cfg(windows)]
+pub use crate::platform::windows::{create_native_sidecar_channels, NativeSidecarChannels};
 use std::io::{Read, Write};
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
-use std::os::unix::process::{CommandExt, ExitStatusExt};
+#[cfg(unix)]
+use std::os::fd::{AsRawFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
@@ -75,7 +83,9 @@ pub fn try_acquire_process_spawn_guard() -> Option<ProcessSpawnGuard> {
 // legitimately reuse a closed fd 3/4 before fixture code can inspect it. The
 // high pair makes immediate EBADF a meaningful inheritance assertion while
 // remaining below macOS's conservative default soft limit.
+#[cfg(unix)]
 pub const NATIVE_ACTION_CHILD_FD: RawFd = 198;
+#[cfg(unix)]
 pub const NATIVE_CONTROL_CHILD_FD: RawFd = 199;
 pub const ACTION_FRAME_TAG: u8 = 0xA1;
 pub const CONTROL_FRAME_TAG: u8 = 0xC1;
@@ -113,77 +123,6 @@ impl From<std::io::Error> for NativeChannelError {
     fn from(error: std::io::Error) -> Self {
         Self::Io(error)
     }
-}
-
-fn set_cloexec(fd: RawFd) -> Result<(), NativeChannelError> {
-    let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
-    if flags < 0 {
-        return Err(std::io::Error::last_os_error().into());
-    }
-    if unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) } < 0 {
-        return Err(std::io::Error::last_os_error().into());
-    }
-    Ok(())
-}
-
-fn has_cloexec(fd: RawFd) -> Result<bool, NativeChannelError> {
-    let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
-    if flags < 0 {
-        return Err(std::io::Error::last_os_error().into());
-    }
-    Ok(flags & libc::FD_CLOEXEC != 0)
-}
-
-fn set_nonblocking(fd: RawFd) -> Result<(), NativeChannelError> {
-    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-    if flags < 0 {
-        return Err(std::io::Error::last_os_error().into());
-    }
-    if unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
-        return Err(std::io::Error::last_os_error().into());
-    }
-    Ok(())
-}
-
-fn pipe_available_bytes(fd: RawFd) -> std::io::Result<usize> {
-    let mut available: libc::c_int = 0;
-    let result = unsafe { libc::ioctl(fd, libc::FIONREAD, &mut available) };
-    if result < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    if available < 0 {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "negative pipe byte count",
-        ));
-    }
-    Ok(available as usize)
-}
-
-fn pipe_cloexec() -> Result<(OwnedFd, OwnedFd), NativeChannelError> {
-    let mut fds = [-1; 2];
-    if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
-        return Err(std::io::Error::last_os_error().into());
-    }
-    let read = unsafe { OwnedFd::from_raw_fd(fds[0]) };
-    let write = unsafe { OwnedFd::from_raw_fd(fds[1]) };
-    set_cloexec(read.as_raw_fd())?;
-    set_cloexec(write.as_raw_fd())?;
-    Ok((read, write))
-}
-
-fn duplicate_above_fixed(fd: RawFd) -> Result<OwnedFd, NativeChannelError> {
-    let duplicated = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, NATIVE_CONTROL_CHILD_FD + 1) };
-    if duplicated < 0 {
-        return Err(std::io::Error::last_os_error().into());
-    }
-    Ok(unsafe { OwnedFd::from_raw_fd(duplicated) })
-}
-
-fn relocate_owned_above_fixed(source: OwnedFd) -> Result<OwnedFd, NativeChannelError> {
-    let moved = duplicate_above_fixed(source.as_raw_fd())?;
-    drop(source);
-    Ok(moved)
 }
 
 pub fn read_private_frame<R: Read>(
@@ -237,6 +176,11 @@ pub struct NativeActionReader {
 }
 
 impl NativeActionReader {
+    #[cfg(unix)]
+    pub(crate) fn from_file(file: std::fs::File) -> Self {
+        Self { file: Some(file) }
+    }
+
     pub fn read_frame(&mut self) -> Result<Vec<u8>, NativeChannelError> {
         let Some(file) = self.file.as_mut() else {
             return Err(NativeChannelError::Io(std::io::Error::new(
@@ -295,46 +239,9 @@ pub struct ControlPipeWriter {
     grace: Duration,
 }
 
-fn write_nonblocking(
-    file: &mut std::fs::File,
-    bytes: &[u8],
-    grace: Duration,
-) -> Result<(), ControlPipeError> {
-    let deadline = Instant::now() + grace;
-    let mut offset = 0usize;
-    while offset < bytes.len() {
-        let result = unsafe {
-            libc::write(
-                file.as_raw_fd(),
-                bytes[offset..].as_ptr().cast::<libc::c_void>(),
-                bytes.len() - offset,
-            )
-        };
-        if result > 0 {
-            offset += result as usize;
-            continue;
-        }
-        if result == 0 {
-            return Err(ControlPipeError::Gone);
-        }
-        let error = std::io::Error::last_os_error();
-        match error.kind() {
-            std::io::ErrorKind::Interrupted => continue,
-            std::io::ErrorKind::WouldBlock if Instant::now() < deadline => {
-                std::thread::sleep(Duration::from_millis(2));
-            }
-            std::io::ErrorKind::WouldBlock => return Err(ControlPipeError::Stalled),
-            std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::NotConnected => {
-                return Err(ControlPipeError::Gone)
-            }
-            _ => return Err(ControlPipeError::Failed),
-        }
-    }
-    Ok(())
-}
-
 impl ControlPipeWriter {
-    fn spawn(mut file: std::fs::File) -> Result<Self, NativeChannelError> {
+    #[cfg(unix)]
+    pub(crate) fn spawn(mut file: std::fs::File) -> Result<Self, NativeChannelError> {
         set_nonblocking(file.as_raw_fd())?;
         let (commands, incoming) = std::sync::mpsc::sync_channel(CONTROL_QUEUE_DEPTH);
         std::thread::spawn(move || {
@@ -392,205 +299,10 @@ impl Drop for ControlPipeWriter {
     }
 }
 
-pub struct NativeSidecarChannels {
-    pub child_action_write_fd: RawFd,
-    pub child_control_read_fd: RawFd,
-    pub action_reader: NativeActionReader,
-    pub control_writer: ControlPipeWriter,
-    child_action_write: Option<OwnedFd>,
-    child_control_read: Option<OwnedFd>,
-    originals_cloexec: bool,
-}
-
-pub fn create_native_sidecar_channels(
-    _guard: &ProcessSpawnGuard,
-) -> Result<NativeSidecarChannels, NativeChannelError> {
-    let (action_read, action_write) = pipe_cloexec()?;
-    let (control_read, control_write) = pipe_cloexec()?;
-    let originals = [
-        action_read.as_raw_fd(),
-        action_write.as_raw_fd(),
-        control_read.as_raw_fd(),
-        control_write.as_raw_fd(),
-    ];
-    let originals_cloexec = originals
-        .iter()
-        .try_fold(true, |all, fd| has_cloexec(*fd).map(|flag| all && flag))?;
-    let action_reader = NativeActionReader {
-        file: Some(action_read.into()),
-    };
-    let control_writer = ControlPipeWriter::spawn(control_write.into())?;
-    Ok(NativeSidecarChannels {
-        child_action_write_fd: action_write.as_raw_fd(),
-        child_control_read_fd: control_read.as_raw_fd(),
-        action_reader,
-        control_writer,
-        child_action_write: Some(action_write),
-        child_control_read: Some(control_read),
-        originals_cloexec,
-    })
-}
-
-impl NativeSidecarChannels {
-    pub fn all_four_original_pipe_ends_were_cloexec_before_command(&self) -> bool {
-        self.originals_cloexec
-    }
-
-    pub fn prepare_command(&mut self, command: &mut Command) -> Result<(), NativeChannelError> {
-        let action = self.child_action_write.take().ok_or_else(|| {
-            NativeChannelError::Io(std::io::Error::new(
-                std::io::ErrorKind::BrokenPipe,
-                "action child end closed",
-            ))
-        })?;
-        let control = self.child_control_read.take().ok_or_else(|| {
-            NativeChannelError::Io(std::io::Error::new(
-                std::io::ErrorKind::BrokenPipe,
-                "control child end closed",
-            ))
-        })?;
-        // Always move both sources above both fixed targets. This is stronger
-        // than branching on the usual pipe allocation and makes own-target,
-        // other-target and swapped-source cases share one safe path.
-        let moved_action = relocate_owned_above_fixed(action)?;
-        let moved_control = relocate_owned_above_fixed(control)?;
-        self.child_action_write = Some(moved_action);
-        self.child_control_read = Some(moved_control);
-        self.child_action_write_fd = self.child_action_write.as_ref().unwrap().as_raw_fd();
-        self.child_control_read_fd = self.child_control_read.as_ref().unwrap().as_raw_fd();
-        let action_source = self.child_action_write_fd;
-        let control_source = self.child_control_read_fd;
-        unsafe {
-            command.pre_exec(move || {
-                // Only async-signal-safe operations occur after fork.
-                if libc::dup2(action_source, NATIVE_ACTION_CHILD_FD) < 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                if libc::dup2(control_source, NATIVE_CONTROL_CHILD_FD) < 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                if action_source != NATIVE_ACTION_CHILD_FD {
-                    libc::close(action_source);
-                }
-                if control_source != NATIVE_CONTROL_CHILD_FD {
-                    libc::close(control_source);
-                }
-                Ok(())
-            });
-        }
-        Ok(())
-    }
-
-    /// Closes exactly the two child ends in Rust. Retained action/control ends
-    /// remain private to the shell.
-    pub fn parent_after_spawn(&mut self) {
-        self.child_action_write.take();
-        self.child_control_read.take();
-    }
-
-    pub fn into_parent_ends(
-        self,
-    ) -> Result<(NativeActionReader, ControlPipeWriter), NativeChannelError> {
-        if self.child_action_write.is_some() || self.child_control_read.is_some() {
-            return Err(NativeChannelError::Io(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "child private ends are still retained by the parent",
-            )));
-        }
-        Ok((self.action_reader, self.control_writer))
-    }
-}
-
 #[derive(Debug)]
 pub struct CollisionProbe {
     pub case: &'static str,
     pub safe: bool,
-}
-
-pub fn probe_fixed_fd_collision_matrix(
-    _guard: &ProcessSpawnGuard,
-) -> Result<Vec<CollisionProbe>, NativeChannelError> {
-    fn identity(fd: RawFd) -> Result<(libc::dev_t, libc::ino_t), NativeChannelError> {
-        let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
-        if unsafe { libc::fstat(fd, stat.as_mut_ptr()) } != 0 {
-            return Err(std::io::Error::last_os_error().into());
-        }
-        let stat = unsafe { stat.assume_init() };
-        Ok((stat.st_dev, stat.st_ino))
-    }
-    fn move_to(source: OwnedFd, target: RawFd) -> Result<OwnedFd, NativeChannelError> {
-        if unsafe { libc::dup2(source.as_raw_fd(), target) } < 0 {
-            return Err(std::io::Error::last_os_error().into());
-        }
-        set_cloexec(target)?;
-        drop(source);
-        Ok(unsafe { OwnedFd::from_raw_fd(target) })
-    }
-
-    let rows = [
-        (
-            "source-equals-own-target",
-            Some(NATIVE_ACTION_CHILD_FD),
-            None,
-        ),
-        (
-            "source-equals-other-target",
-            Some(NATIVE_CONTROL_CHILD_FD),
-            None,
-        ),
-        (
-            "swapped-sources",
-            Some(NATIVE_CONTROL_CHILD_FD),
-            Some(NATIVE_ACTION_CHILD_FD),
-        ),
-        ("ordinary-sources", None, None),
-    ];
-    let mut probes = Vec::new();
-    for (case, action_target, control_target) in rows {
-        // Distinct kernel pipe identities prove direction, not merely that a
-        // descriptor number happened to be open after the mapping.
-        let (action_read, action_write) = pipe_cloexec()?;
-        let (control_read, control_write) = pipe_cloexec()?;
-        let action_identity = identity(action_write.as_raw_fd())?;
-        let control_identity = identity(control_read.as_raw_fd())?;
-        // Establish authoritative sources above the fixed pair first, then
-        // release every original owner before creating a collision-shaped
-        // descriptor at 198/199. A target number therefore has exactly one
-        // OwnedFd owner even when the allocator handed an original pipe end
-        // that exact number.
-        let action_high = duplicate_above_fixed(action_write.as_raw_fd())?;
-        let control_high = duplicate_above_fixed(control_read.as_raw_fd())?;
-        drop((action_read, action_write, control_read, control_write));
-        let action_source = match action_target {
-            Some(target) => move_to(action_high, target)?,
-            None => action_high,
-        };
-        let control_source = match control_target {
-            Some(target) => move_to(control_high, target)?,
-            None => control_high,
-        };
-        let sources_were_cloexec =
-            has_cloexec(action_source.as_raw_fd())? && has_cloexec(control_source.as_raw_fd())?;
-        // This is the same pre-Command relocation used by production.
-        let moved_action = relocate_owned_above_fixed(action_source)?;
-        let moved_control = relocate_owned_above_fixed(control_source)?;
-        let mapped = unsafe {
-            libc::dup2(moved_action.as_raw_fd(), NATIVE_ACTION_CHILD_FD) >= 0
-                && libc::dup2(moved_control.as_raw_fd(), NATIVE_CONTROL_CHILD_FD) >= 0
-        };
-        let safe = mapped
-            && sources_were_cloexec
-            && identity(NATIVE_ACTION_CHILD_FD)? == action_identity
-            && identity(NATIVE_CONTROL_CHILD_FD)? == control_identity
-            && !has_cloexec(NATIVE_ACTION_CHILD_FD)?
-            && !has_cloexec(NATIVE_CONTROL_CHILD_FD)?;
-        unsafe {
-            libc::close(NATIVE_ACTION_CHILD_FD);
-            libc::close(NATIVE_CONTROL_CHILD_FD);
-        }
-        probes.push(CollisionProbe { case, safe });
-    }
-    Ok(probes)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -608,7 +320,13 @@ pub enum DesktopNativeActionCapability {
 /// Descriptor/lifecycle proof is only a candidate for Task 5's packaged
 /// attestation. It is intentionally not a public provider-ready signal.
 pub fn desktop_kimi_private_channel_status() -> DesktopKimiPrivateChannelStatus {
-    DesktopKimiPrivateChannelStatus::CandidateReady
+    if cfg!(unix) {
+        DesktopKimiPrivateChannelStatus::CandidateReady
+    } else {
+        DesktopKimiPrivateChannelStatus::Unavailable {
+            reason: "native-local-action-unavailable",
+        }
+    }
 }
 
 pub fn desktop_native_action_capability() -> DesktopNativeActionCapability {
@@ -701,12 +419,16 @@ impl std::fmt::Display for EngineError {
 /// and never gets this far; these are what a DEV build (`npm run gui:build`,
 /// no staged runtime) falls back to, and what a packaged app would fall back
 /// to if its own runtime were somehow missing.
+#[cfg(unix)]
 pub const NODE_FALLBACKS: &[&str] = &[
     "/opt/homebrew/bin/node",
     "/usr/local/bin/node",
     "/usr/bin/node",
     "/opt/local/bin/node",
 ];
+
+#[cfg(windows)]
+pub const NODE_FALLBACKS: &[&str] = &[];
 
 /// Resolves the node binary: an explicit override, then the BUNDLED runtime,
 /// then `PATH`, then the well-known locations. `exists` is injected so the
@@ -739,12 +461,10 @@ pub fn resolve_node(
         }
         looked_in.push(bundled.display().to_string());
     }
-    for entry in path_var
-        .unwrap_or_default()
-        .split(':')
-        .filter(|entry| !entry.is_empty())
+    for entry in std::env::split_paths(path_var.unwrap_or_default())
+        .filter(|entry| !entry.as_os_str().is_empty())
     {
-        let candidate = Path::new(entry).join("node");
+        let candidate = entry.join(crate::platform::NODE_BINARY_NAME);
         if exists(&candidate) {
             return Ok(candidate);
         }
@@ -1394,7 +1114,7 @@ impl RawProcessOwnership {
                 Ok(Some(status)) => {
                     let record = ExitRecord {
                         code: status.code(),
-                        signal: status.signal(),
+                        signal: crate::platform::exit_signal(&status),
                     };
                     let (lock, changed) = &*exit_for_thread;
                     lock.lock().unwrap_or_else(|p| p.into_inner()).record = Some(record);
@@ -1411,7 +1131,7 @@ impl RawProcessOwnership {
                     let (lock, changed) = &*exit_for_thread;
                     lock.lock().unwrap_or_else(|p| p.into_inner()).record = Some(ExitRecord {
                         code: status.as_ref().and_then(std::process::ExitStatus::code),
-                        signal: status.as_ref().and_then(ExitStatusExt::signal),
+                        signal: status.as_ref().and_then(crate::platform::exit_signal),
                     });
                     changed.notify_all();
                     break;
@@ -1426,7 +1146,7 @@ impl RawProcessOwnership {
                         Ok(Some(status)) => {
                             let record = ExitRecord {
                                 code: status.code(),
-                                signal: status.signal(),
+                                signal: crate::platform::exit_signal(&status),
                             };
                             let (lock, changed) = &*exit_for_thread;
                             lock.lock().unwrap_or_else(|p| p.into_inner()).record = Some(record);
@@ -1562,6 +1282,7 @@ fn send_raw_cancellable(
     }
 }
 
+#[cfg(unix)]
 fn spawn_reader<R: Read + AsRawFd + Send + 'static>(
     mut reader: R,
     stderr: bool,
@@ -1664,6 +1385,7 @@ pub fn spawn_raw_engine(
     spawn_raw_engine_after(_guard, command, || {})
 }
 
+#[cfg(unix)]
 pub fn spawn_raw_engine_after<F: FnOnce()>(
     _guard: &ProcessSpawnGuard,
     mut command: Command,
@@ -1755,6 +1477,17 @@ pub fn spawn_raw_engine_after<F: FnOnce()>(
         drain,
         detached: false,
     })
+}
+
+#[cfg(windows)]
+pub fn spawn_raw_engine_after<F: FnOnce()>(
+    _guard: &ProcessSpawnGuard,
+    _command: Command,
+    _after_spawn: F,
+) -> Result<RawEngine, EngineError> {
+    Err(EngineError::Spawn(
+        "windows-native-engine-unavailable".into(),
+    ))
 }
 
 impl RawEngine {
@@ -1937,6 +1670,7 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
 
+    #[cfg(unix)]
     #[test]
     fn task_1_fix_fionread_failure_is_explicit() {
         let error =
@@ -2064,60 +1798,69 @@ mod tests {
 
     #[test]
     fn node_resolution_prefers_the_override_then_the_bundle_then_path() {
-        let bundled = PathBuf::from("/App.app/Contents/Resources/orcode/node");
+        #[cfg(unix)]
+        let (override_path, bundled_path, search_path, path_node, fallback) = (
+            "/custom/node",
+            "/App.app/Contents/Resources/orcode/node",
+            "/missing:/from/path",
+            "/from/path/node",
+            "/usr/local/bin/node",
+        );
+        #[cfg(windows)]
+        let (override_path, bundled_path, search_path, path_node, fallback) = (
+            r"C:\Custom\node.exe",
+            r"C:\App\orcode\node.exe",
+            r"C:\Missing;C:\From Path",
+            r"C:\From Path\node.exe",
+            r"C:\Fallback\node.exe",
+        );
+        let bundled = PathBuf::from(bundled_path);
         let exists = |path: &Path| {
-            matches!(
-                path.to_str().unwrap_or_default(),
-                "/custom/node"
-                    | "/from/path/node"
-                    | "/usr/local/bin/node"
-                    | "/App.app/Contents/Resources/orcode/node"
-            )
+            [override_path, bundled_path, path_node, fallback]
+                .iter()
+                .any(|value| path == Path::new(value))
         };
+        let fallbacks = &[fallback];
         assert_eq!(
             resolve_node(
-                Some("/custom/node"),
+                Some(override_path),
                 Some(&bundled),
-                Some("/from/path"),
-                NODE_FALLBACKS,
+                Some(search_path),
+                fallbacks,
                 &exists
             )
             .unwrap(),
-            PathBuf::from("/custom/node"),
-        );
-        // THE SHIP RULE: a packaged app runs the runtime it was tested with,
-        // never whichever node the target machine happens to have first.
-        assert_eq!(
-            resolve_node(
-                None,
-                Some(&bundled),
-                Some("/from/path"),
-                NODE_FALLBACKS,
-                &exists
-            )
-            .unwrap(),
-            bundled,
+            PathBuf::from(override_path)
         );
         assert_eq!(
-            resolve_node(None, None, Some("/from/path"), NODE_FALLBACKS, &exists).unwrap(),
-            PathBuf::from("/from/path/node"),
+            resolve_node(None, Some(&bundled), Some(search_path), fallbacks, &exists).unwrap(),
+            bundled
         );
-        // A GUI launched from Finder has no useful PATH — this row is the
-        // one that keeps a DEV build working there.
         assert_eq!(
-            resolve_node(None, None, None, NODE_FALLBACKS, &exists).unwrap(),
-            PathBuf::from("/usr/local/bin/node"),
+            resolve_node(None, None, Some(search_path), fallbacks, &exists).unwrap(),
+            PathBuf::from(path_node)
+        );
+        assert_eq!(
+            resolve_node(None, None, None, fallbacks, &exists).unwrap(),
+            PathBuf::from(fallback)
         );
     }
 
     #[test]
     fn a_missing_node_names_every_place_it_looked() {
-        let bundled = PathBuf::from("/App.app/Contents/Resources/orcode/node");
+        #[cfg(unix)]
+        let (bundled_path, fallback) = (
+            "/App.app/Contents/Resources/orcode/node",
+            "/usr/local/bin/node",
+        );
+        #[cfg(windows)]
+        let (bundled_path, fallback) = (r"C:\App\orcode\node.exe", r"C:\Fallback\node.exe");
+        let bundled = PathBuf::from(bundled_path);
         let error = resolve_node(
-            Some("/nope/node"),
+            Some("missing-explicit-runtime"),
             Some(&bundled),
-            Some("/also/nope"),
-            NODE_FALLBACKS,
+            None,
+            &[fallback],
             &|_| false,
         )
         .unwrap_err();
@@ -2126,11 +1869,8 @@ mod tests {
                 assert!(looked_in
                     .iter()
                     .any(|entry| entry.contains("ORCODE_GUI_NODE")));
-                // A packaged app whose own runtime is gone says so by name.
-                assert!(looked_in
-                    .iter()
-                    .any(|entry| entry.contains("Contents/Resources/orcode/node")));
-                assert!(looked_in.iter().any(|entry| entry == "/usr/local/bin/node"));
+                assert!(looked_in.iter().any(|entry| entry == bundled_path));
+                assert!(looked_in.iter().any(|entry| entry == fallback));
             }
             other => panic!("expected NodeMissing, got {other:?}"),
         }

@@ -41,11 +41,14 @@ import {
   writeFileSync,
 } from "node:fs";
 import { dirname, join } from "node:path";
+import { homedir } from "node:os";
 import { fileURLToPath } from "node:url";
+import {guiPlatform,resolveNpmInvocation,withGuiPath} from './gui-platform.mjs';
 
 const projectRoot = join(dirname(fileURLToPath(import.meta.url)), "..");
 const guiRoot = join(projectRoot, "gui");
-const cargoBin = join(process.env.HOME ?? "", ".cargo", "bin");
+const cargoBin = join(homedir(), ".cargo", "bin");
+const platform = guiPlatform(process.platform,process.arch,homedir(),process.env.PATH ?? process.env.Path ?? '');
 
 const mode = process.argv[2];
 if (mode !== "dev" && mode !== "build" && mode !== "package") {
@@ -56,11 +59,25 @@ const flags = process.argv.slice(3);
 const skipEngineBuild = flags.includes("--no-build");
 const realHome = flags.includes("--real-home");
 
+if (!platform.runtimeSupported) {
+  console.error(`gui: ${process.platform}/${process.arch} is not a supported desktop build target.`);
+  process.exit(1);
+}
+if (process.platform === 'win32' && mode === 'package') {
+  console.error('gui: Windows packaging is not enabled until its bundled runtime and native protection gates pass.');
+  process.exit(1);
+}
+
 function run(command, args, options = {}) {
-  const result = spawnSync(command, args, {
+  const invocation = command === 'npm'
+    ? resolveNpmInvocation(process.execPath,process.env.npm_execpath,
+      path => existsSync(path) && statSync(path).isFile(),process.platform)
+    : {command,args:[]};
+  const environment = {...process.env,...options.env};
+  const result = spawnSync(invocation.command, [...invocation.args,...args], {
     stdio: "inherit",
     cwd: options.cwd ?? projectRoot,
-    env: { ...process.env, ...options.env },
+    env: withGuiPath(environment,environment.PATH ?? environment.Path ?? '',process.platform),
   });
   if (result.error) {
     console.error(`${command} could not be started: ${result.error.message}`);
@@ -78,7 +95,7 @@ if (!existsSync(cargoBin)) {
 
 if (!existsSync(join(guiRoot, "node_modules"))) {
   console.log("gui: installing the window's own dependencies …");
-  run("npm", ["install"], { cwd: guiRoot });
+  run("npm", ["ci"], { cwd: guiRoot });
 }
 
 if (!skipEngineBuild) {
@@ -91,7 +108,7 @@ if (!existsSync(join(projectRoot, "dist", "gui-server.js"))) {
 }
 
 const env = {
-  PATH: `${cargoBin}:${process.env.PATH ?? ""}`,
+  PATH: platform.pathValue,
   ...(realHome ? { ORCODE_GUI_REAL_HOME: "1" } : {}),
 };
 
@@ -107,9 +124,11 @@ if (mode === "dev") {
   // seconds rather than minutes; it is unsigned, it bundles no runtime, and
   // it therefore resolves node from the machine it runs on. That is the DEV
   // shape — `package` below is the one that ships.
-  run("npm", ["run", "tauri", "--", "build", "--debug", "--bundles", "app"], { cwd: guiRoot, env });
+  run("npm", ["run", "tauri", "--", "build", "--debug",
+    ...(process.platform === 'win32' ? ['--no-bundle'] : ['--bundles','app'])], { cwd: guiRoot, env });
   console.log(
-    `gui: built ${join(guiRoot, "src-tauri/target/debug/bundle/macos/orcode.app")}`,
+    `gui: built ${join(guiRoot, process.platform === 'win32'
+      ? 'src-tauri/target/debug/orcode-gui.exe' : 'src-tauri/target/debug/bundle/macos/orcode.app')}`,
   );
 } else {
   stageRuntime();
