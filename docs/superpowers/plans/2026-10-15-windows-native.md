@@ -897,7 +897,7 @@ or tag is part of this plan.
 
 ## Plan review
 
-Architecture approved; this implementation plan awaits review. Recommended
-execution: Native in this chat, with bounded independent security review and
-one whole-branch review. Approval of the plan does not authorize account login,
+Architecture and implementation plan approved on 15.10.2026; execution started.
+Chosen execution: Native in this chat, with bounded independent security review
+and one whole-branch review. Approval of the plan does not authorize account login,
 paid inference, new remote hosts, certificate purchases or public release.

@@ -136,12 +136,14 @@ function inventory(file,source){
   }
   return out
 }
+function relativeFile(root,file,paths=path){return paths.relative(root,file).split(paths.sep).join('/')}
 function files(dir){return fs.readdirSync(dir,{withFileTypes:true}).flatMap(e=>e.isDirectory()?files(path.join(dir,e.name)):e.name.endsWith('.ts')?[path.join(dir,e.name)]:[])}
-const root=process.argv[1], src=path.join(root,'src'); let real=files(src).flatMap(f=>{const source=fs.readFileSync(f,'utf8');return source.includes('child_process')?inventory(path.relative(root,f),source):[]}); real.sort((a,b)=>a.file.localeCompare(b.file)||a.line-b.line);
+const root=process.argv[1], src=path.join(root,'src'); let real=files(src).flatMap(f=>{const source=fs.readFileSync(f,'utf8');return source.includes('child_process')?inventory(relativeFile(root,f),source):[]}); real.sort((a,b)=>a.file.localeCompare(b.file)||a.line-b.line);
 const synthetic='import { spawn as namedSpawn } from "node:child_process";\nimport * as cp from "child_process";\nconst required=require("child_process");\nconst {spawn: requiredSpawn}=require("node:child_process");\n// cp.spawn("comment")\nconst text="required.spawn(\\\"string\\\")";\n/* requiredSpawn("block") */\nnamedSpawn("0",[],{stdio:"ignore"});\ncp.spawn("1",[],{stdio:"ignore"});\nrequired.spawn("2",[],{stdio:"ignore"});\nrequiredSpawn("3",[],{stdio:"ignore"});\nnamedSpawn("4",[],{stdio:"ignore"});\ncp.spawn("5",[],{stdio:"ignore"});';
 let rejectedUnknown=false;try{inventory('unknown.ts','import childProcess from "node:child_process";\nchildProcess.spawn("x");')}catch{rejectedUnknown=true}
 let rejectedMember=false;try{inventory('member.ts','const spawn=require("node:child_process").spawn;\nspawn("x");')}catch{rejectedMember=true}
-process.stdout.write(JSON.stringify({real,synthetic:inventory('synthetic.ts',synthetic),rejectedUnknown,rejectedMember}));
+process.stdout.write(JSON.stringify({real,synthetic:inventory('synthetic.ts',synthetic),rejectedUnknown,rejectedMember,
+  windowsRelative:relativeFile(String.raw`C:\repo`,String.raw`C:\repo\src\synthetic.ts`,path.win32)}));
 "#;
     let guard = acquire_process_spawn_guard();
     let output = Command::new(node())
@@ -160,6 +162,7 @@ process.stdout.write(JSON.stringify({real,synthetic:inventory('synthetic.ts',syn
     assert_eq!(report["synthetic"].as_array().map(Vec::len), Some(6));
     assert_eq!(report["rejectedUnknown"].as_bool(), Some(true));
     assert_eq!(report["rejectedMember"].as_bool(), Some(true));
+    assert_eq!(report["windowsRelative"].as_str(), Some("src/synthetic.ts"));
     let actual: Vec<_> = report["real"]
         .as_array()
         .expect("real inventory")

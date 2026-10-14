@@ -38,3 +38,5 @@ jobs:
         run: |
           cargo --version
           cargo check --manifest-path gui/src-tauri/Cargo.toml --locked --target x86_64-pc-windows-msvc --tests
+      - name: Run shared native contracts and fail-closed Windows tests
+        run: cargo test --manifest-path gui/src-tauri/Cargo.toml --locked --lib --test engine_lifecycle
