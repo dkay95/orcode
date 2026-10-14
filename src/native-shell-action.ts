@@ -1,5 +1,6 @@
 import type { NativeSidecarChannel } from "./native-sidecar-channel.js";
-import { createKimiRequestId, type CodexNativeActionRequest } from "./native-sidecar-channel.js";
+import { createKimiRequestId, canonicalCodexNativeActionRequest, type CodexNativeActionRequest } from "./native-sidecar-channel.js";
+import type { OfficialCliId } from "./official-cli-state.js";
 
 export const CODEX_OAUTH_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann" as const;
 export const CODEX_OAUTH_SCOPE = "openid profile email offline_access" as const;
@@ -48,6 +49,78 @@ export class CodexNativeShellActions {
     this.#generationAbort.abort(new Error("Codex child generation changed."));
     this.#generationAbort = new AbortController();
     this.#childGeneration = next;
+  }
+
+  /** Closed manufacturer setup handoff; receipt means presented, never installed/logged in. */
+  async beginManufacturerAction(request: Readonly<{
+    provider: OfficialCliId;
+    action: "install" | "login" | "open-external";
+  }>, signal?: AbortSignal): Promise<"presented"> {
+    if (this.#loginPending) throw new Error("A native setup presentation is already pending.");
+    if (!isPlainObject(request) || Object.keys(request).length !== 2
+      || !Object.hasOwn(request, "provider") || !Object.hasOwn(request, "action")) {
+      throw new TypeError("Native manufacturer action is invalid.");
+    }
+    const childGeneration = this.#childGeneration;
+    const generationSignal = this.#generationAbort.signal;
+    const requestId = this.#requestId();
+    const deadlineAt = this.#now() + this.#timeoutMs;
+    const native = canonicalCodexNativeActionRequest({kind:"manufacturer-cli-prepare",
+      requestId, childGeneration, deadlineAt, provider:request.provider, action:request.action});
+    this.#assertCurrent(childGeneration, signal, deadlineAt);
+    this.#loginPending = true;
+    const resultAbort = new AbortController();
+    let prepareSettled = false;
+    let writeStarted = false;
+    try {
+      const resultPromise = this.#channel.waitForCodexControl(requestId, resultAbort.signal);
+      void resultPromise.catch(() => undefined);
+      writeStarted = true;
+      const prepare = this.#channel.writeCodexAction(native);
+      void prepare.catch(() => undefined);
+      await this.#awaitPrivateWrite(prepare, deadlineAt, signal, generationSignal);
+      prepareSettled = true;
+      this.#assertCurrent(childGeneration, signal, deadlineAt);
+      const commit = this.#channel.writeCodexAction({kind:"codex-native-action-commit",
+        requestId, childGeneration, deadlineAt});
+      void commit.catch(() => undefined);
+      await this.#awaitPrivateWrite(commit, deadlineAt, signal, generationSignal);
+      this.#assertCurrent(childGeneration, signal, deadlineAt);
+      const result = await this.#awaitNativeResult(resultPromise, deadlineAt, AbortSignal.any(
+        [generationSignal, ...(signal ? [signal] : [])]));
+      this.#assertCurrent(childGeneration, signal, deadlineAt);
+      if (result?.status !== "presented" || result.requestId !== requestId
+        || result.childGeneration !== childGeneration) throw new Error("Native manufacturer presentation failed.");
+      // The owner may still be looking at a native consent dialog after this
+      // receipt. Keep its lease revocable until the native deadline.
+      this.#retainManufacturerConsent({requestId,childGeneration,deadlineAt},signal,generationSignal);
+      return "presented";
+    } catch {
+      if (prepareSettled) await this.#revokeNativeBounded({requestId, childGeneration, deadlineAt});
+      else if (writeStarted) this.#channel.close();
+      throw new Error("Native manufacturer presentation failed.");
+    } finally {
+      resultAbort.abort(new Error("Native manufacturer presentation retired."));
+      this.#loginPending = false;
+    }
+  }
+
+  #retainManufacturerConsent(record: Readonly<{requestId:string;childGeneration:number;deadlineAt:number}>,
+    signal: AbortSignal | undefined, generationSignal: AbortSignal): void {
+    let retired = false;
+    const retire = () => {
+      if (retired) return;
+      retired = true;
+      clearTimeout(timer);
+      signal?.removeEventListener('abort',retire);
+      generationSignal.removeEventListener('abort',retire);
+      void this.#revokeNativeBounded(record);
+    };
+    const timer = setTimeout(retire,Math.max(0,record.deadlineAt-this.#now()));
+    timer.unref();
+    signal?.addEventListener('abort',retire,{once:true});
+    generationSignal.addEventListener('abort',retire,{once:true});
+    if (signal?.aborted || generationSignal.aborted) retire();
   }
 
   async beginLogin(request: Readonly<{ type: LoginType }>, signal?: AbortSignal): Promise<Readonly<{ loginId: string; type: LoginType }>> {

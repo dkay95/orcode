@@ -14,10 +14,11 @@ test("the standalone demo mounts the production UI without a native engine or re
     const input = document.querySelector("textarea")!;
     input.value = "Eine Demo-Aufgabe";
     input.dispatchEvent(new InputEvent("input", { bubbles: true }));
-    await vi.waitFor(() => expect(document.querySelector<HTMLButtonElement>(".task-action")!.disabled).toBe(false));
-    document.querySelector<HTMLButtonElement>(".task-action")!.click();
-    await vi.waitFor(() => expect(input.value).toBe("Eine Demo-Aufgabe"));
-    await vi.waitFor(() => expect(document.querySelector(".stream")?.textContent).toContain("Hier wird nichts ausgeführt"));
+    const send=()=>[...document.querySelectorAll<HTMLButtonElement>('button')].find(b=>b.textContent==='Aufgabe starten')!;
+    await vi.waitFor(() => expect(send().disabled).toBe(false));
+    send().click();
+    await vi.waitFor(() => expect(input.value).toBe(""));
+    await vi.waitFor(() => expect(document.querySelector(".stream")?.textContent).toContain("Vorschau"));
   } finally {
     demoMount.dispose(); vi.unstubAllGlobals(); document.body.replaceChildren();
   }

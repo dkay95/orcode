@@ -36,7 +36,7 @@ class ManagedTransport implements CodexAppServerTransport {
     const f = JSON.parse(line); this.frames.push(f);
     if (f.method === "initialize") {
       this.emit({ id: f.id, result: {
-        codexHome: this.home, platformFamily: "unix", platformOs: "macos", userAgent: "codex_cli_rs/0.142.5" } });
+        codexHome: this.home, platformFamily: "unix", platformOs: "macos", userAgent: "codex_cli_rs/0.159.1" } });
       this.emit({ method: "remoteControl/status/changed", params: {
         status: "disabled", installationId: "private-installation", serverName: "private-device", environmentId: null } });
     }
@@ -48,7 +48,7 @@ class ManagedTransport implements CodexAppServerTransport {
       this.emit({ id: f.id, result: {
         thread: { id: "thread-1", sessionId: "session-1", forkedFromId: null, parentThreadId: null,
           preview: "", ephemeral: true, modelProvider: "openai", createdAt: 1, updatedAt: 1, recencyAt: 1,
-          status: { type: "idle" }, path: null, cwd: f.params.cwd, cliVersion: "0.142.5", source: "appServer",
+          status: { type: "idle" }, path: null, cwd: f.params.cwd, cliVersion: "0.159.1", source: "appServer",
           threadSource: null, agentNickname: null, agentRole: null, gitInfo: null, name: null, turns: [] },
         model: f.params.model, modelProvider: "openai", serviceTier: null, cwd: f.params.cwd,
         instructionSources: [], approvalPolicy: "untrusted", approvalsReviewer: "user",

@@ -3162,3 +3162,15 @@ button:disabled:hover {
   background: var(--card);
   color: var(--text);
 }
+
+.execution-controls { display:flex; align-items:end; gap:12px; flex-wrap:wrap; width:100%; padding-top:12px; }
+.execution-control { display:grid; gap:4px; font-size:11px; color:var(--muted); }
+.execution-control select { color:var(--text); background:var(--card); border:1px solid var(--line); border-radius:8px; padding:7px 10px; font:inherit; font-size:12px; }
+.execution-controls .danger { margin-left:auto; }
+.candidate-panel { display:grid; gap:6px; padding:12px 14px; margin-bottom:12px; border:1px solid var(--line); border-radius:10px; background:var(--card); font-size:12px; }
+.candidate-panel[hidden] { display:none; }
+.candidate-panel .actions { margin-top:4px; }
+.manufacturer-panel { display:grid; gap:12px; margin-top:22px; border-top:1px solid var(--line); padding-top:18px; }
+.manufacturer-panel h3,.manufacturer-panel p { margin:0; }
+.manufacturer-row { display:grid; gap:7px; padding:12px; border:1px solid var(--line); border-radius:9px; font-size:12px; }
+.manufacturer-row .actions { flex-wrap:wrap; gap:6px; }

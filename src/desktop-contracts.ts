@@ -14,7 +14,7 @@ export interface DesktopDisabledPresentation {
 export type DesktopCommandDisabledReasonCode =
   | "run-active" | "cross-run-active" | "question-pending"
   | "command-in-flight" | "settings-open" | "no-run"
-  | "terminal-only-picker" | "route-stale" | "provider-unavailable";
+  | "terminal-only-picker" | "route-stale" | "provider-unavailable" | "local-flow-required";
 export interface DesktopCommandDisabledPresentation {
   readonly code: DesktopCommandDisabledReasonCode;
   readonly label: string;
@@ -28,7 +28,7 @@ export interface DesktopCommandPresentation {
 }
 export type DesktopSetupMethod =
   | "openrouter-owner-connect" | "codex-browser-login"
-  | "codex-device-login" | "kimi-owner-connect";
+  | "codex-device-login" | "kimi-owner-connect" | "nanogpt-owner-connect";
 export type DesktopProviderState =
   | "disconnected" | "connecting" | "ready" | "degraded" | "disabled" | "blocked";
 export type DesktopModelCapability = "text" | "image-input" | "tools" | "reasoning" | "patch";

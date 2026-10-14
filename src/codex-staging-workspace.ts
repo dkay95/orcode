@@ -548,12 +548,25 @@ export async function snapshotCodexTree(root: string): Promise<CodexTreeSnapshot
   return Object.freeze({ entries: Object.freeze(entries), digest });
 }
 
+/** Shared verified copy primitive; generic local runs retain their own journal/lifecycle. */
+export async function copyLocalWorkspace(input: {source:WorkspaceGuard;destination:string;appHome:string}):
+  Promise<ReadonlyMap<string,{readonly bytes:Buffer;readonly mode:number}>> {
+  await input.source.assertCurrent();
+  const destination = await requireOwnedLocalDirectory(resolve(input.destination),'Local working copy');
+  return copyVerifiedWorkspace(input.source.canonicalRoot,destination,await realpath(input.appHome));
+}
+export async function readLocalWorkspaceBaseline(input:{source:WorkspaceGuard;appHome:string}):
+  Promise<ReadonlyMap<string,{readonly bytes:Buffer;readonly mode:number}>> {
+  await input.source.assertCurrent();
+  return copyVerifiedWorkspace(input.source.canonicalRoot,null,await realpath(input.appHome));
+}
+
 async function copyVerifiedWorkspace(
   sourceRoot: string,
-  destinationRoot: string,
+  destinationRoot: string|null,
   appHomeCanonical: string,
 ): Promise<ReadonlyMap<string, SourceFileEntry>> {
-  assertDisjointTrees(sourceRoot, destinationRoot);
+  if(destinationRoot!==null)assertDisjointTrees(sourceRoot, destinationRoot);
   const sourceInfo = await lstat(sourceRoot, { bigint: true });
   if (sourceInfo.isSymbolicLink() || !sourceInfo.isDirectory()) {
     throw new Error("The verified workspace root is not a real directory.");
@@ -568,7 +581,7 @@ async function copyVerifiedWorkspace(
 
   const visit = async (
     sourceDirectory: string,
-    destinationDirectory: string,
+    destinationDirectory: string|null,
     expectedDirectory: BigIntStats,
   ): Promise<void> => {
     await assertStableDirectory(sourceDirectory, expectedDirectory, sourceRoot, sourceInfo.dev);
@@ -594,9 +607,9 @@ async function copyVerifiedWorkspace(
       const protectedRead = classifyPath(rel, "read").verdict !== "allow";
       if (privatePath || ignored || protectedRead) continue;
 
-      const destinationPath = join(destinationDirectory, dirent.name);
+      const destinationPath = destinationDirectory===null?null:join(destinationDirectory, dirent.name);
       if (info.isDirectory()) {
-        await mkdir(destinationPath, { mode: 0o700 });
+        if(destinationPath!==null)await mkdir(destinationPath, { mode: 0o700 });
         await visit(sourcePath, destinationPath, info);
         continue;
       }
@@ -610,7 +623,7 @@ async function copyVerifiedWorkspace(
       bytesSeen += bytes.byteLength;
       if (bytesSeen > MAX_STAGING_TREE_BYTES) throw new Error("Codex staging tree is too large.");
       const destinationMode = (Number(info.mode & 0o100n) !== 0) ? 0o700 : 0o600;
-      await writeExclusiveFile(destinationPath, bytes, destinationMode);
+      if(destinationPath!==null)await writeExclusiveFile(destinationPath, bytes, destinationMode);
       sourceFiles.set(rel, Object.freeze({ bytes: Buffer.from(bytes), mode: Number(info.mode & 0o777n) }));
     }
     await assertStableDirectory(sourceDirectory, expectedDirectory, sourceRoot, sourceInfo.dev);

@@ -15,9 +15,12 @@ import type {
   DesktopProviderState,
 } from "./protocol.js";
 import { routePicker } from "./route-picker.js";
+import {officialCliPanel,type Manufacturer,type ManufacturerAction,type ManufacturerObservation} from './official-cli-panel.js';
 
 export interface OnboardingViewHandlers {
   dispatch(intent: DesktopOnboardingIntent): void;
+  manufacturer?: {states:Partial<Record<Manufacturer,ManufacturerObservation>>;nativeAvailable:boolean;busy:boolean;
+    action(provider:Manufacturer,action:ManufacturerAction):void};
 }
 
 const STATE_LABELS: Readonly<Record<DesktopProviderState, string>> = {
@@ -132,7 +135,12 @@ function providerStep(
     list.append(row);
   }
   if (view.providers.length === 0) list.append(el("p", { class: "empty", text: "Keine Provider verfügbar." }));
-  card.append(list, actionBar(view, handlers));
+  card.append(list);
+  if (handlers.manufacturer) {
+    const cli = handlers.manufacturer;
+    card.append(officialCliPanel(cli.states,cli.nativeAvailable,cli.busy,cli.action));
+  }
+  card.append(actionBar(view, handlers));
   return card;
 }
 

@@ -202,7 +202,7 @@ export interface RecoverModelPreferenceTransactionsInput {
     /** Existing Runtime -> Provider lease fence; recovery owns no coordinator. */
     assertHeld(): Promise<void>;
   };
-  readonly allowedBackendIds?: readonly ("openrouter" | "kimi-code")[];
+  readonly allowedBackendIds?: readonly ("openrouter" | "kimi-code" | "nano-gpt")[];
 }
 
 export interface RecoveredModelPreferenceOwner {

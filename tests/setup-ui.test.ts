@@ -213,6 +213,111 @@ class Adapter implements BackendAdapter {
   async activate(): Promise<CandidateProviderState> { throw new Error("not used"); }
 }
 
+function nanoSetupFixture(surface: ScriptedSurface, mode: "subscription" | "payg") {
+  const stateStore = new ProviderStateStore(createNeverConfiguredProviderState());
+  const nanoModel: BackendModelDescriptor = { ...MODEL, backendId: "nano-gpt", requestedModelId: "vendor/manual", canonicalModelId: "vendor/manual" };
+  const nano: BackendAdapter = {
+    backendId: "nano-gpt",
+    async connect(request) {
+      assert.deepEqual(request.candidate, { apiKey: "fixture-nano-key", billingMode: mode });
+      return { candidateId: "nano-candidate", backendId: "nano-gpt", connectionId: "nano-main", accountFingerprint: "acct_nano_fixture", billingRealm: mode === "subscription" ? "nanogpt-subscription" : "nanogpt-payg", health: { credential: "valid", connectivity: "connected", spend: "unknown", runtime: "not-applicable", observedAt: 1, generation: request.generation } };
+    },
+    async listModels() { return [nanoModel, MODEL]; },
+    async discardCandidate() {}, async logout() {},
+    async inspect() { throw new Error("unused"); }, async reconnect() { throw new Error("unused"); }, async activate() { throw new Error("unused"); },
+  };
+  const registry = new BackendRegistry([{ descriptor: { ...KIMI, id: "nano-gpt", displayName: "Nano-GPT" }, adapter: nano }]);
+  const activations: ProviderActivationRequest[] = [];
+  const orchestrator = new SetupOrchestrator({ registry, stateStore, activationCoordinator: { async activate(request) {
+    activations.push(request);
+    const route = { version: 1 as const, backendId: "nano-gpt" as const, accountFingerprint: "acct_nano_fixture", billingRealm: mode === "subscription" ? "nanogpt-subscription" as const : "nanogpt-payg" as const, requestedModelId: request.expectedRequestedModelId, canonicalModelId: request.selectedCanonicalModelId, resolutionState: "resolved" as const };
+    const previous = stateStore.read();
+    const id = request.targetConnectionId ?? "nano-main";
+    const state = stateStore.replace({ ...previous, lifecycle: "configured", connections: [...previous.connections.filter((connection) => connection.id !== id), { id, backendId: "nano-gpt", maturity: "preview", enabled: true, credentialBinding: { kind: "orcode-keychain", pointer: "v1:nano-gpt:018f8d77-2d52-7cc0-8f6a-9fb1f3fc0711" }, accountFingerprint: route.accountFingerprint, accountFingerprintState: "verified", billingRealm: route.billingRealm, lastHealth: null }], defaultRoute: route }, previous.revision);
+    return { persisted: true, route, state, warnings: [] };
+  } } });
+  return { surface, registry, stateStore, orchestrator, activations };
+}
+
+function retainNanoSetupMode(fixture: ReturnType<typeof nanoSetupFixture>, mode: "subscription" | "payg") {
+  const previous = fixture.stateStore.read();
+  const connection = { id: `nano-${mode}-existing`, backendId: "nano-gpt" as const, maturity: "preview" as const, enabled: true, credentialBinding: { kind: "orcode-keychain" as const, pointer: `v1:nano-gpt:018f8d77-2d52-7cc0-8f6a-9fb1f3fc07${mode === "subscription" ? "12" : "13"}` }, accountFingerprint: `acct_nano_${mode}_existing`, accountFingerprintState: "verified" as const, billingRealm: mode === "subscription" ? "nanogpt-subscription" as const : "nanogpt-payg" as const, lastHealth: null };
+  fixture.stateStore.replace({ ...previous, lifecycle: "configured", connections: [...previous.connections, connection] }, previous.revision);
+  return connection;
+}
+
+test("Nano-GPT adding PAYG preserves the saved subscription connection instead of replacing it", async () => {
+  const surface = new ScriptedSurface(["nano-gpt", "nano-gpt:payg"], ["fixture-nano-key"], ["vendor/manual"]);
+  const fixture = nanoSetupFixture(surface, "payg");
+  const subscription = retainNanoSetupMode(fixture, "subscription");
+  assert.deepEqual(await runSetupHub(fixture), { kind: "ready" });
+  assert.equal(fixture.activations[0]?.targetConnectionId, undefined);
+  assert.deepEqual(fixture.stateStore.read().connections.find((connection) => connection.id === subscription.id), subscription);
+  assert.equal(fixture.stateStore.read().connections.length, 2);
+});
+
+test("Nano-GPT cannot replace a subscription owner through an explicit PAYG target", async () => {
+  const surface = new ScriptedSurface(["nano-gpt", "nano-gpt:payg"], ["fixture-nano-key"], ["vendor/manual"]);
+  const fixture = nanoSetupFixture(surface, "payg");
+  const subscription = retainNanoSetupMode(fixture, "subscription");
+  assert.deepEqual(await runSetupHub({ ...fixture, targetConnectionId: subscription.id }), { kind: "cancelled", mode: "setup-required" });
+  assert.equal(fixture.activations.length, 0);
+  assert.deepEqual(surface.calls, ["hub", "hub"]);
+});
+
+for (const mode of ["subscription", "payg"] as const) {
+  test(`Nano-GPT with both saved billing modes replaces only the selected ${mode} connection`, async () => {
+    const surface = new ScriptedSurface(["nano-gpt", `nano-gpt:${mode}`], ["fixture-nano-key"], ["vendor/manual"]);
+    const fixture = nanoSetupFixture(surface, mode);
+    const subscription = retainNanoSetupMode(fixture, "subscription");
+    const payg = retainNanoSetupMode(fixture, "payg");
+    assert.deepEqual(await runSetupHub(fixture), { kind: "ready" });
+    assert.equal(fixture.activations[0]?.targetConnectionId, mode === "subscription" ? subscription.id : payg.id);
+    const untouched = mode === "subscription" ? payg : subscription;
+    assert.deepEqual(fixture.stateStore.read().connections.find((connection) => connection.id === untouched.id), untouched);
+    assert.equal(fixture.stateStore.read().connections.length, 2);
+  });
+}
+
+for (const mode of ["subscription", "payg"] as const) {
+  test(`Nano-GPT setup requires explicit ${mode} billing before key and manual model selection`, async () => {
+    const surface = new ScriptedSurface(["nano-gpt", `nano-gpt:${mode}`], ["fixture-nano-key"], ["vendor/manual"]);
+    const fixture = nanoSetupFixture(surface, mode);
+    const result = await runSetupHub(fixture);
+    assert.deepEqual(result, { kind: "ready" });
+    assert.deepEqual(surface.calls, ["hub", "hub", "secret", "model"]);
+    assert.equal(surface.entries[0]![0]?.label, "Nano-GPT");
+    assert.deepEqual(surface.entries[1]!.map((entry) => entry.id), ["nano-gpt:subscription", "nano-gpt:payg"]);
+    assert.equal(surface.modelRequests[0]?.backendId, "nano-gpt");
+    assert.deepEqual(surface.modelRequests[0]?.models.map((model) => model.canonicalModelId), ["vendor/manual"]);
+    assert.equal(fixture.activations.length, 1);
+    assert.equal(fixture.activations[0]?.billingMode, mode);
+    assert.equal(fixture.activations[0]?.candidate, "fixture-nano-key");
+    assert.equal(fixture.activations[0]?.persistence, "persisted");
+    assert.equal(fixture.activations[0]?.environmentEligibility, "forbidden");
+  });
+}
+
+test("Nano-GPT setup cancelled at billing choice reads no secret and activates nothing", async () => {
+  const surface = new ScriptedSurface(["nano-gpt", null, null]);
+  const fixture = nanoSetupFixture(surface, "subscription");
+  assert.deepEqual(await runSetupHub(fixture), { kind: "cancelled", mode: "setup-required" });
+  assert.deepEqual(surface.calls, ["hub", "hub", "hub"]);
+  assert.equal(fixture.activations.length, 0);
+});
+
+test("an explicit Nano-GPT setup selection cannot be preempted by OpenRouter environment discovery", async () => {
+  const surface = new ScriptedSurface(["nano-gpt:subscription"], ["fixture-nano-key"], ["vendor/manual"]);
+  const fixture = nanoSetupFixture(surface, "subscription");
+  const foreign = new Adapter();
+  const registry = new BackendRegistry([{ descriptor: { ...KIMI, id: "nano-gpt", displayName: "Nano-GPT" }, adapter: fixture.registry.adapter("nano-gpt") }, { descriptor: OPENROUTER, adapter: foreign }]);
+  assert.deepEqual(await runSetupHub({ ...fixture, registry, initialBackendId: "nano-gpt", environmentSecret: "fixture-foreign-openrouter-env" }), { kind: "ready" });
+  assert.deepEqual(foreign.calls, []);
+  assert.deepEqual(surface.calls, ["hub", "secret", "model"]);
+  assert.equal(fixture.activations.length, 1);
+  assert.equal(fixture.activations[0]?.backendId, "nano-gpt");
+});
+
 function fixture(surface: SetupSurface, options: { processOnlyNullState?: boolean } = {}) {
   const adapter = new Adapter();
   const stateStore = new ProviderStateStore(createNeverConfiguredProviderState());

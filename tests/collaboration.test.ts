@@ -72,6 +72,33 @@ function startCross(
   return coordinator.start({ ...request, repairBudget });
 }
 
+test("Cross accepts explicitly selected Nano-GPT Abo and PAYG routes without changing billing", async () => {
+  for (const billingRealm of ["nanogpt-subscription", "nanogpt-payg"] as const) {
+    const nanoRoute: RouteIdentityV1 = {
+      ...leadRoute,
+      backendId: "nano-gpt",
+      billingRealm,
+      accountFingerprint: "acct_nano_fixture",
+    };
+    const selected: RouteIdentityV1[] = [];
+    const worker = happyWorker();
+    const originalAnalyze = worker.analyze;
+    worker.analyze = async (input) => {
+      selected.push(input.route);
+      return originalAnalyze(input);
+    };
+    const coordinator = new CrossCoordinator({ worker, verification: passingVerification() });
+    const result = await startCross(coordinator, {
+      task: "owner-selected Nano coding route",
+      lead: nanoRoute,
+      challenger: challengerRoute,
+    });
+    assert.equal(result.phase, "completed");
+    assert.equal(result.reason, null);
+    assert.ok(selected.some((route) => route.backendId === "nano-gpt" && route.billingRealm === billingRealm));
+  }
+});
+
 test("repair budget zero stops after the exact four literal coordinator stages", async () => {
   const stages: CrossProviderStage[] = [];
   const worker: CrossWorkerPort = {

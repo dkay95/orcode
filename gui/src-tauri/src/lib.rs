@@ -18,6 +18,7 @@
 
 pub mod engine;
 pub mod packaged_app_trust;
+mod manufacturer_cli;
 
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
@@ -758,6 +759,13 @@ fn validate_native_action(record: &NativeActionRecord, actual_pid: u32, now: u64
     deny_unknown_fields
 )]
 enum CodexNativeActionRecord {
+    ManufacturerCliPrepare {
+        request_id: String,
+        child_generation: u64,
+        provider: manufacturer_cli::Provider,
+        action: manufacturer_cli::Action,
+        deadline_at: u64,
+    },
     CodexBrowserLoginPrepare {
         request_id: String,
         child_generation: u64,
@@ -789,6 +797,7 @@ impl CodexNativeActionRecord {
     fn request_id(&self) -> &str {
         match self {
             Self::CodexBrowserLoginPrepare { request_id, .. }
+            | Self::ManufacturerCliPrepare { request_id, .. }
             | Self::CodexDeviceLoginPrepare { request_id, .. }
             | Self::CodexNativeActionCommit { request_id, .. }
             | Self::CodexNativeActionRevoke { request_id, .. } => request_id,
@@ -800,6 +809,7 @@ impl CodexNativeActionRecord {
             Self::CodexBrowserLoginPrepare {
                 child_generation, ..
             }
+            | Self::ManufacturerCliPrepare { child_generation, .. }
             | Self::CodexDeviceLoginPrepare {
                 child_generation, ..
             }
@@ -815,6 +825,7 @@ impl CodexNativeActionRecord {
     fn deadline_at(&self) -> u64 {
         match self {
             Self::CodexBrowserLoginPrepare { deadline_at, .. }
+            | Self::ManufacturerCliPrepare { deadline_at, .. }
             | Self::CodexDeviceLoginPrepare { deadline_at, .. }
             | Self::CodexNativeActionCommit { deadline_at, .. }
             | Self::CodexNativeActionRevoke { deadline_at, .. } => *deadline_at,
@@ -823,6 +834,9 @@ impl CodexNativeActionRecord {
 
     fn presentation(&self) -> Option<CodexNativeLoginPresentation> {
         match self {
+            Self::ManufacturerCliPrepare {provider, action, ..} => Some(CodexNativeLoginPresentation::Manufacturer {
+                provider: *provider, action: *action,
+            }),
             Self::CodexBrowserLoginPrepare { auth_url, .. } => {
                 Some(CodexNativeLoginPresentation::Browser {
                     auth_url: auth_url.clone(),
@@ -843,7 +857,7 @@ impl CodexNativeActionRecord {
     fn is_prepare(&self) -> bool {
         matches!(
             self,
-            Self::CodexBrowserLoginPrepare { .. } | Self::CodexDeviceLoginPrepare { .. }
+            Self::CodexBrowserLoginPrepare { .. } | Self::CodexDeviceLoginPrepare { .. } | Self::ManufacturerCliPrepare { .. }
         )
     }
 
@@ -858,6 +872,7 @@ impl CodexNativeActionRecord {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum CodexNativeLoginPresentation {
+    Manufacturer {provider:manufacturer_cli::Provider, action:manufacturer_cli::Action},
     Browser {
         auth_url: String,
     },
@@ -960,6 +975,20 @@ fn present_codex_login_on_main(
     authorization: CodexPresentationAuthorization,
 ) -> bool {
     match presentation {
+        CodexNativeLoginPresentation::Manufacturer {provider, action} => {
+            let approval = authorization.clone();
+            let body = manufacturer_cli::instructions(provider, action);
+            authorization.run_if_current(|| {
+                app.dialog().message(body).title("Hersteller-CLI einrichten")
+                    .buttons(MessageDialogButtons::OkCancelCustom("Im Terminal öffnen".into(), "Abbrechen".into()))
+                    .show(move |accepted| {
+                        if accepted {
+                            approval.run_if_current(|| manufacturer_cli::open_terminal(provider, action));
+                        }
+                    });
+                true
+            })
+        }
         CodexNativeLoginPresentation::Browser { auth_url } => {
             let source = NSString::from_str(&auth_url);
             let Some(url) = NSURL::URLWithString(&source) else {
@@ -1027,6 +1056,7 @@ fn parse_codex_native_action(
         return Err(());
     }
     let valid = match &record {
+        CodexNativeActionRecord::ManufacturerCliPrepare { .. } => true,
         CodexNativeActionRecord::CodexBrowserLoginPrepare {
             login_id, auth_url, ..
         } => bounded_text(login_id) && valid_codex_browser_url(auth_url),
@@ -2324,6 +2354,15 @@ fn shell_error_for_pipe(error: engine::PipeError) -> ShellError {
 }
 
 #[tauri::command]
+async fn project_choose(app:AppHandle)->Result<Option<String>,String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        app.dialog().file().set_title("Projektordner öffnen").blocking_pick_folder()
+            .map(|selected| selected.into_path().map(|path|path.to_string_lossy().into_owned())
+                .map_err(|_|"Der ausgewählte Ordner ist kein lokaler Pfad.".to_string())).transpose()
+    }).await.map_err(|_|"Der Ordnerdialog konnte nicht geöffnet werden.".to_string())?
+}
+
+#[tauri::command]
 async fn engine_stop() -> Result<String, String> {
     dispatch_lifecycle_off_main(engine_stop_blocking).await?
 }
@@ -3199,6 +3238,25 @@ mod task_3_codex_native_tests {
         browser_json(generation, deadline)
     }
 
+    #[test]
+    fn manufacturer_cli_prepare_is_closed_and_generation_bound() {
+        for provider in ["codex", "claude", "kimi"] {
+            for action in ["install", "login", "open-external"] {
+                let value = serde_json::json!({
+                    "kind":"manufacturer-cli-prepare", "requestId":"C".repeat(32),
+                    "childGeneration":4, "provider":provider, "action":action, "deadlineAt":2_000
+                });
+                let bytes = serde_json::to_vec(&value).unwrap();
+                assert!(parse_codex_native_action(&bytes, 4, 1_000).is_ok());
+                assert!(parse_codex_native_action(&bytes, 5, 1_000).is_err());
+                assert!(parse_codex_native_action(&bytes, 4, 2_000).is_err());
+                let mut arbitrary = value;
+                arbitrary["command"] = serde_json::json!("curl arbitrary | sh");
+                assert!(parse_codex_native_action(&serde_json::to_vec(&arbitrary).unwrap(), 4, 1_000).is_err());
+            }
+        }
+    }
+
     fn codex_decision_json(kind: &str, request_id: &str, generation: u64, deadline: u64) -> String {
         format!(
             r#"{{"kind":"{kind}","requestId":"{request_id}","childGeneration":{generation},"deadlineAt":{deadline}}}"#
@@ -3603,6 +3661,7 @@ pub fn run() {
             engine_start,
             engine_send,
             engine_stop
+            ,project_choose
         ])
         .on_window_event(|window, event| {
             // On macOS closing the window is NOT quitting: the process stays

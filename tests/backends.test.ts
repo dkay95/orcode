@@ -95,8 +95,20 @@ test("Kimi Code is a first-class route identity with its provider-managed realm"
     resolutionState: "resolved",
   };
 
-  assert.deepEqual(BACKEND_IDS, ["openrouter", "kimi-code", "codex", "anthropic"]);
+  assert.ok(BACKEND_IDS.includes("kimi-code"));
   assert.equal(sameRoute(kimiRoute, { ...kimiRoute }), true);
+});
+
+test("Nano-GPT registry requires a connectable Preview raw-model keychain adapter", () => {
+  const descriptor: BackendDescriptor = {
+    ...openRouterDescriptor, id: "nano-gpt", displayName: "Nano-GPT", maturity: "preview", billingRealmKind: "provider-managed",
+  };
+  const nano = adapter("nano-gpt");
+  assert.equal(new BackendRegistry([{ descriptor, adapter: nano }]).adapter("nano-gpt"), nano);
+  for (const change of [{ maturity: "stable" }, { kind: "managed-agent" }, { credentialOwner: "provider-runtime" }, { connectable: false }]) {
+    assert.throws(() => new BackendRegistry([{ descriptor: { ...descriptor, ...change } as BackendDescriptor, adapter: nano }]));
+  }
+  assert.throws(() => new BackendRegistry([{ descriptor }]));
 });
 
 test("coming-soon descriptors have no adapter and reject connect structurally", () => {

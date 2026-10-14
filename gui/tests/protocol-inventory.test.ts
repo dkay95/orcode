@@ -30,12 +30,12 @@ const desktopContractSource = readFileSync(
 const EXPECTED_REQUEST_TYPES = [
   "hello-ack", "submit", "cancel", "interject", "end-thinking", "command", "catalog.level", "catalog.search",
   "chats.list", "chat.open", "chat.new", "chat.delete", "status.get", "cost.forecast", "settings.open",
-  "settings.dispatch", "desktop.snapshot.get", "onboarding.dispatch", "settings.close", "answer", "shutdown",
+  "settings.dispatch", "desktop.snapshot.get", "official-cli.action", "local-run.action", "execution-policy.set", "project.open", "onboarding.dispatch", "settings.close", "answer", "shutdown",
 ];
 
 const EXPECTED_EVENT_NAMES = [
   "run", "assistant", "status", "transcript", "suggestions", "context-percent", "attachments", "draft",
-  "command-output", "cross", "settings.view", "settings.closed", "desktop.snapshot", "onboarding.view",
+  "command-output", "cross", "settings.view", "settings.closed", "desktop.snapshot", "local-run.state", "onboarding.view",
   "activity", "native-local-action-required", "setup.present", "chat.opened", "chat.reset", "notice", "fatal",
 ];
 

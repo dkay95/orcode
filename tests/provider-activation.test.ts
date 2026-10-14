@@ -32,12 +32,49 @@ import {
   type ProviderSetupStateV3,
 } from "../src/provider-state.js";
 import type {
+  BackendAdapter,
   BackendModelDescriptor,
   CandidateProviderState,
   ProviderCandidate,
   ProviderHealth,
   RouteIdentityV1,
 } from "../src/backends.js";
+
+for (const billingMode of ["subscription", "payg"] as const) {
+  test(`Nano-GPT explicit ${billingMode} activation persists only its selected realm and dedicated slot`, async () => {
+    const appHome = await mkdtemp(join(tmpdir(), "orcode-nano-activation-"));
+    const configPath = join(appHome, "config.json");
+    const oldState = createNeverConfiguredProviderState();
+    await saveConfig({ ...structuredClone(DEFAULT_CONFIG), providerSetup: oldState }, configPath);
+    const credentials = new FakeCredentials(null);
+    const model: BackendModelDescriptor = { ...MODEL, backendId: "nano-gpt", requestedModelId: "vendor/manual", canonicalModelId: "vendor/manual" };
+    const billingRealm = billingMode === "subscription" ? "nanogpt-subscription" : "nanogpt-payg";
+    const route: RouteIdentityV1 = { version: 1, backendId: "nano-gpt", accountFingerprint: "acct_nano_fixture", billingRealm, requestedModelId: model.requestedModelId, canonicalModelId: model.canonicalModelId, resolutionState: "resolved" };
+    let connects = 0;
+    const adapter: BackendAdapter = {
+      backendId: "nano-gpt",
+      async connect(request) {
+        assert.deepEqual(request.candidate, { apiKey: "fixture-nano-secret", billingMode });
+        connects += 1;
+        return { candidateId: `nano-${connects}`, backendId: "nano-gpt", connectionId: "nano-main", accountFingerprint: route.accountFingerprint, billingRealm, health: { credential: "valid", connectivity: "connected", spend: "unknown", runtime: "not-applicable", observedAt: 10000, generation: request.generation } };
+      },
+      async listModels() { return [model]; },
+      async activate(request) { return { candidateId: request.candidateId, backendId: "nano-gpt", connectionId: "nano-main", accountFingerprint: route.accountFingerprint, billingRealm, route }; },
+      async inspect() { throw new Error("unused"); }, async reconnect() { throw new Error("unused"); }, async logout() {}, async discardCandidate() {},
+    };
+    const coordinator = new ProviderActivationCoordinator({ appHome, configPath, privateStore: new PrivateStore({ root: appHome }), credentials, adapterResolver: () => adapter, stateStore: new ProviderStateStore(oldState), runtimeGuard: new FakeRuntimeGuard(), now: () => 10000, createUuid: sequentialUuid(), leaseDurationMs: 100 });
+    const result = await coordinator.activate({ backendId: "nano-gpt", candidate: "fixture-nano-secret", billingMode, expectedRevision: 0, generation: 4, expectedRequestedModelId: model.requestedModelId, selectedCanonicalModelId: model.canonicalModelId, signal: new AbortController().signal, deadlineAt: Number.MAX_SAFE_INTEGER, persistence: "persisted", environmentEligibility: "forbidden", targetConnectionId: "nano-main" });
+    assert.equal(result.persisted, true);
+    assert.deepEqual(result.route, route);
+    assert.equal(connects, 2);
+    const loaded = await loadConfigDetailed(configPath);
+    const state = loaded.config.providerSetup as ProviderSetupStateV3;
+    assert.deepEqual(state.defaultRoute, route);
+    const pointer = requireKeychainCredentialPointer(state.connections[0]!);
+    assert.ok(pointer.startsWith("v1:nano-gpt:"));
+    assert.equal(credentials.slots.get(pointer), "fixture-nano-secret");
+  });
+}
 import type {
   CredentialKind,
   CredentialSlotRef,

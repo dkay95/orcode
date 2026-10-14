@@ -55,7 +55,7 @@ function fixture(control: unknown | null = {
   requestId: "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC",
   childGeneration: 4,
   status: "presented",
-}) {
+}, keepOpen = false) {
   const writes: CodexNativeActionRequest[] = [];
   const controls = control === null ? [] : [encodeControlFrame(control as never)];
   const transport: NativeSidecarTransport = {
@@ -64,7 +64,10 @@ function fixture(control: unknown | null = {
       while (!writes.some(({ kind }) => kind === "codex-native-action-commit")) {
         await new Promise<void>((resolve) => setImmediate(resolve));
       }
-      return controls.shift() ?? null;
+      const next = controls.shift();
+      if (next) return next;
+      if (keepOpen) return new Promise<Buffer | null>(() => {});
+      return null;
     },
     close() {},
   };
@@ -98,6 +101,43 @@ test("keeps a validated browser URL off every public transport and uses the priv
     deadlineAt: 1_025,
   }]);
   assert.doesNotMatch(JSON.stringify(appServer.calls), /auth\.openai\.com|userCode|deviceCode/i);
+});
+
+test("manufacturer CLI setup privately prepares and commits without any account API request", async () => {
+  const {actions, appServer, writes} = fixture();
+  const result = await actions.beginManufacturerAction({provider:'claude', action:'install'});
+  assert.equal(result, 'presented');
+  assert.deepEqual(writes, [{kind:'manufacturer-cli-prepare',
+    requestId:'CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC', childGeneration:4,
+    provider:'claude', action:'install', deadlineAt:1_025},
+    {kind:'codex-native-action-commit', requestId:'CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC',
+      childGeneration:4, deadlineAt:1_025}]);
+  assert.deepEqual(appServer.calls, []);
+});
+
+test("manufacturer consent is revoked even after the dialog was presented", async () => {
+  const {actions,writes} = fixture(undefined,true);
+  const abort = new AbortController();
+  await actions.beginManufacturerAction({provider:'claude',action:'login'},abort.signal);
+  abort.abort();
+  await new Promise<void>(resolve => setImmediate(resolve));
+  assert.equal(writes.at(-1)?.kind,'codex-native-action-revoke');
+});
+
+test("cancelled manufacturer setup never reaches the private pipe", async () => {
+  const {actions, appServer, writes} = fixture();
+  const signal = new AbortController();
+  signal.abort(new Error('owner cancelled'));
+  await assert.rejects(actions.beginManufacturerAction({provider:'kimi', action:'login'}, signal.signal));
+  assert.deepEqual(writes, []);
+  assert.deepEqual(appServer.calls, []);
+});
+
+test("manufacturer setup has no arbitrary command or custom-provider escape", async () => {
+  const {actions, writes} = fixture();
+  await assert.rejects(actions.beginManufacturerAction({provider:'custom', action:'install'} as never));
+  await assert.rejects(actions.beginManufacturerAction({provider:'claude', action:'exec'} as never));
+  assert.deepEqual(writes, []);
 });
 
 test("keeps device URL and code private and discards provider-only deviceCode", async () => {

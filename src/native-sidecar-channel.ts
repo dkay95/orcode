@@ -112,6 +112,14 @@ export type KimiDesktopControlRecord =
 
 export type CodexNativeActionRequest =
   | Readonly<{
+      kind: "manufacturer-cli-prepare";
+      requestId: string;
+      childGeneration: number;
+      provider: "codex" | "claude" | "kimi";
+      action: "install" | "login" | "open-external";
+      deadlineAt: number;
+    }>
+  | Readonly<{
       kind: "codex-browser-login-prepare";
       requestId: string;
       childGeneration: number;
@@ -378,6 +386,18 @@ export function canonicalKimiDesktopControlRecord(value: unknown): KimiDesktopCo
 
 export function canonicalCodexNativeActionRequest(value: unknown): CodexNativeActionRequest {
   if (!isPlainObject(value)) invalid("Native Codex action is invalid.");
+  if (value.kind === "manufacturer-cli-prepare") {
+    exactKeys(value, ["kind", "requestId", "childGeneration", "provider", "action", "deadlineAt"]);
+    const requestId = boundedString(value.requestId, "request ID");
+    if (!REQUEST_ID.test(requestId)
+      || (value.provider !== "codex" && value.provider !== "claude" && value.provider !== "kimi")
+      || (value.action !== "install" && value.action !== "login" && value.action !== "open-external")) {
+      invalid("Native manufacturer action is invalid.");
+    }
+    return Object.freeze({kind:"manufacturer-cli-prepare", requestId,
+      childGeneration:nonNegativeInteger(value.childGeneration, "child generation"),
+      provider:value.provider, action:value.action, deadlineAt:positiveInteger(value.deadlineAt, "deadline")});
+  }
   if (value.kind === "codex-browser-login-prepare") {
     exactKeys(value, [
       "kind", "requestId", "childGeneration", "loginId", "authUrl", "deadlineAt",
@@ -442,6 +462,8 @@ export function canonicalCodexNativeActionResult(value: unknown): CodexNativeAct
 
 function canonicalNativeActionRecord(value: unknown): NativeActionRecord {
   if (isPlainObject(value) && (
+    value.kind === "manufacturer-cli-prepare"
+    ||
     value.kind === "codex-browser-login-prepare"
     || value.kind === "codex-device-login-prepare"
     || value.kind === "codex-native-action-commit"

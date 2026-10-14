@@ -16,9 +16,10 @@ class FixtureBridge implements DesktopWindowBridge {
   handlers!: BridgeHandlers;
   requests: Array<Record<string, unknown>> = [];
   commandResult: Promise<unknown> | null = null;
+  constructor(readonly silent=false){}
   async start(handlers: BridgeHandlers) {
     this.handlers = handlers;
-    queueMicrotask(() => handlers.onFrame({ t: "hello", v: PROTOCOL_VERSION,
+    if(!this.silent)queueMicrotask(() => handlers.onFrame({ t: "hello", v: PROTOCOL_VERSION,
       protocol: PROTOCOL_VERSION, orcode: "0.7.0", node: "fixture", pid: 1, capabilities: [] }));
     return { node: "fixture", script: "fixture", workspace: status.workspace,
       home: "/tmp/workbench-home", realHome: false, pid: 1 };
@@ -28,7 +29,7 @@ class FixtureBridge implements DesktopWindowBridge {
     if (t === "status.get") return status as T;
     if (t === "chats.list") return { chats: [] } as T;
     if (t === "desktop.snapshot.get") this.snapshot(false);
-    if (t === "command" && this.commandResult) return await this.commandResult as T;
+    if ((t === "command" || t === 'submit') && this.commandResult) return await this.commandResult as T;
     return {} as T;
   }
   async write(): Promise<void> {}
@@ -50,7 +51,7 @@ beforeEach(() => {
   vi.stubGlobal("requestAnimationFrame", (callback: FrameRequestCallback) => window.setTimeout(() => callback(0), 0));
   vi.stubGlobal("cancelAnimationFrame", (id: number) => window.clearTimeout(id));
 });
-afterEach(() => { mount?.dispose(); mount = null; vi.unstubAllGlobals(); document.body.replaceChildren(); });
+afterEach(() => { mount?.dispose(); mount = null; vi.useRealTimers(); vi.unstubAllGlobals(); document.body.replaceChildren(); });
 async function openWindow(): Promise<FixtureBridge> {
   const root = document.createElement("div"); root.id = "app"; document.body.append(root);
   const bridge = new FixtureBridge(); mount = mountDesktopWindow({ bridge, root });
@@ -63,32 +64,57 @@ async function draft(text: string): Promise<void> {
   await new Promise((resolve) => setTimeout(resolve, 10));
 }
 
-test.each([["Plan erstellen", "/architect"], ["Mit zwei Modellen", "/cross"]])(
-  "%s transfers the draft once without automatically selecting a model", async (name, raw) => {
+test('a silent native engine has a bounded actionable startup failure, not an endless spinner',async()=>{
+  vi.useFakeTimers();
+  const root=document.createElement('div');document.body.append(root);
+  const bridge=new FixtureBridge(true);mount=mountDesktopWindow({bridge,root});
+  await vi.advanceTimersByTimeAsync(12000);
+  expect(document.body.textContent).toContain('Die Engine antwortet nicht');
+  expect(document.body.textContent).toContain('Dateizugriff');
+  bridge.emit('status',{text:'late status',busy:false});
+  await vi.advanceTimersByTimeAsync(20);
+  expect(document.body.textContent).toContain('Die Engine antwortet nicht');
+  expect(bridge.requests.some(request=>request.t==='submit')).toBe(false);
+});
+
+test('primary local task transfers the draft once without automatically selecting a model', async () => {
     const bridge = await openWindow(); await draft("  Login verständlicher machen  ");
-    expect(button(name)).toBeDefined(); expect(button(name).disabled).toBe(false);
+    expect(button('Aufgabe starten')).toBeDefined(); expect(button('Aufgabe starten').disabled).toBe(false);
     let resolve!: (value: unknown) => void;
     bridge.commandResult = new Promise((done) => { resolve = done; });
-    button(name).click(); button(name).click();
-    await vi.waitFor(() => expect(bridge.requests.filter((request) => request.t === "command")).toEqual([
-      { t: "command", raw, draft: "Login verständlicher machen" },
+    button('Aufgabe starten').click(); button('Aufgabe starten').click();
+    await vi.waitFor(() => expect(bridge.requests.filter((request) => request.t === "submit")).toEqual([
+      { t: "submit", text: "Login verständlicher machen" },
     ]));
     expect(document.querySelector("textarea")!.value).toBe("");
     expect(bridge.requests.some((request) => /route\.select|model\.select/.test(String(request.t)))).toBe(false);
     resolve({});
-  },
-);
+  });
+
+test('a stopped candidate and a busy verification disable task submission without losing the draft',async()=>{
+  const bridge=await openWindow();await draft('Mein nächster Auftrag');
+  const candidate={id:'run',candidateHandle:'handle',phase:'stopped',originalWorkspace:status.workspace,changes:[],tested:false};
+  const policy={aiProcess:'manual',permissions:'ask',revision:1};
+  bridge.emit('local-run.state',{policy,candidate,active:false});
+  await vi.waitFor(()=>expect(button('Aufgabe starten').disabled).toBe(true));
+  expect(button('Fortsetzen')).toBeDefined();
+  bridge.emit('local-run.state',{policy,candidate:{...candidate,phase:'review'},active:true});
+  await vi.waitFor(()=>expect(button('Aufgabe starten').disabled).toBe(true));
+  expect(document.querySelector('textarea')!.value).toBe('Mein nächster Auftrag');
+  bridge.emit('local-run.state',{policy,candidate:{...candidate,phase:'review'},active:false});
+  await vi.waitFor(()=>expect(button('Aufgabe starten').disabled).toBe(false));
+});
 
 test("refused task action restores the draft but does not replace newer typing", async () => {
   const bridge = await openWindow(); await draft("Mein Plan");
   let reject!: (reason: unknown) => void;
   bridge.commandResult = new Promise((_resolve, fail) => { reject = fail; });
-  expect(button("Plan erstellen")).toBeDefined(); button("Plan erstellen").click();
+  expect(button("Aufgabe starten")).toBeDefined(); button("Aufgabe starten").click();
   reject(new RequestFailed({ code: "fixture-refusal", message: "fixture command refused" }));
   await vi.waitFor(() => expect(document.querySelector("textarea")!.value).toBe("Mein Plan"));
   await draft("Alter Entwurf");
   bridge.commandResult = new Promise((_resolve, fail) => { reject = fail; });
-  button("Plan erstellen").click(); await draft("Schon etwas Neues");
+  button("Aufgabe starten").click(); await draft("Schon etwas Neues");
   reject(new RequestFailed({ code: "fixture-refusal", message: "fixture command refused again" }));
   await vi.waitFor(() => expect(document.body.textContent).toContain("fixture command refused again"));
   expect(document.querySelector("textarea")!.value).toBe("Schon etwas Neues");
@@ -136,7 +162,7 @@ test.each(["Neu getippte Aufgabe", ""])("an authoritative restore does not overw
   const bridge = await openWindow(); await draft("Alter Plan");
   let resolve!: (value: unknown) => void;
   bridge.commandResult = new Promise((done) => { resolve = done; });
-  button("Plan erstellen").click(); await draft(newText);
+  button("Aufgabe starten").click(); await draft(newText);
   bridge.emit("draft", { text: "Alter Plan", reason: "restore" });
   await new Promise((done) => setTimeout(done, 20));
   expect(document.querySelector("textarea")!.value).toBe(newText);
@@ -147,7 +173,7 @@ test("a pending task command allows interjection once the engine reports an acti
   const bridge = await openWindow(); await draft("Mein Plan");
   let resolve!: (value: unknown) => void;
   bridge.commandResult = new Promise((done) => { resolve = done; });
-  button("Plan erstellen").click();
+  button("Aufgabe starten").click();
   bridge.emit("run", { event: { type: "run-start", model: "fixture" } });
   await draft("Bitte auch den Fehlerfall beachten");
   expect(button("Ergänzen").disabled).toBe(false); button("Ergänzen").click();
@@ -173,10 +199,9 @@ test("keeps secondary actions in an explicit menu and starts only the owner's wr
   expect(more).not.toBeNull();
   expect(more.open).toBe(false);
   expect(more.querySelector("summary")?.textContent).toBe("Weitere Aktionen");
-  expect(more.contains(button("Plan erstellen"))).toBe(true);
-  expect(more.contains(button("Mit zwei Modellen"))).toBe(true);
-  expect(more.querySelector('button[aria-label="Plan erstellen"]')).toBe(button("Plan erstellen"));
-  expect(more.querySelector('button[aria-label="Mit zwei Modellen"]')).toBe(button("Mit zwei Modellen"));
+  expect(more.querySelectorAll('.task-action')).toHaveLength(0);
+  expect(document.querySelector('select[name="aiProcess"]')).not.toBeNull();
+  expect(document.querySelector('select[name="permissions"]')).not.toBeNull();
   expect(more.querySelector('button[aria-label="Befehle"]')).toBe(button("Befehle"));
   expect(button("Aufgabe starten").disabled).toBe(true);
   await draft("Login verständlicher machen");

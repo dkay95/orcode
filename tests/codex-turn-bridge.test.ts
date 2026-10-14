@@ -47,7 +47,7 @@ class TurnHarnessTransport implements CodexAppServerTransport {
     }
     if (frame.method === "initialized") return;
     if (frame.method === "initialize") this.#emit({ id: frame.id, result: {
-      codexHome: this.codexHome, platformFamily: "unix", platformOs: "macos", userAgent: "codex_cli_rs/0.142.5",
+      codexHome: this.codexHome, platformFamily: "unix", platformOs: "macos", userAgent: "codex_cli_rs/0.159.1",
     } });
     else if (frame.method === "account/read") this.#emit({ id: frame.id, result: {
       account: { type: "chatgpt", email: null, planType: "pro" }, requiresOpenaiAuth: true,
@@ -59,7 +59,7 @@ class TurnHarnessTransport implements CodexAppServerTransport {
         updatedAt: 1, recencyAt: 1,
         status: this.malformedThread ? { type: "active", activeFlags: ["unknown"] } : { type: "idle" },
         path: null,
-        cwd: frame.params?.cwd, cliVersion: "0.142.5", source: "appServer",
+        cwd: frame.params?.cwd, cliVersion: "0.159.1", source: "appServer",
         threadSource: null, agentNickname: null, agentRole: null,
         gitInfo: this.malformedThread ? { sha: 7, branch: null, originUrl: null } : null,
         name: null, turns: [] },
@@ -291,7 +291,7 @@ test("rejects malformed nullable and union fields in an exact-key Turn", () => {
   }
 });
 
-test("accepts representative generated 0.142.5 nested ThreadItem shapes", () => {
+test("accepts representative generated 0.159.1 nested ThreadItem shapes", () => {
   const items = [
     { type: "userMessage", id: "i1", clientId: null, content: [{ type: "text", text: "x",
       text_elements: [{ byteRange: { start: 0, end: 1 }, placeholder: null }] }] },

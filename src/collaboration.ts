@@ -1113,6 +1113,8 @@ function validateCrossRoute(route: RouteIdentityV1): RouteIdentityV1 | null {
     ? validated.billingRealm === "openrouter-payg"
     : validated.backendId === "kimi-code"
     ? validated.billingRealm === "kimi-code-membership-provider-managed-overage"
+    : validated.backendId === "nano-gpt"
+    ? validated.billingRealm === "nanogpt-subscription" || validated.billingRealm === "nanogpt-payg"
     : validated.backendId === "codex"
     ? validated.billingRealm === "chatgpt-subscription-provider-managed-overage"
       || validated.billingRealm === "chatgpt-account-provider-managed-limits"

@@ -165,6 +165,38 @@ test("lists models only for the explicitly selected current-generation Codex pro
   assert.equal(clients.get("codex-a")?.taskBytes, 0);
 });
 
+test("official 0.159 model metadata preserves manual catalog selection without publishing runtime extras", async (t) => {
+  const appHome = await mkdtemp(join(tmpdir(), 'orcode-codex-catalog-'));
+  t.after(() => rm(appHome, {recursive:true, force:true}));
+  const stateStore = new ProviderStateStore(codexState([codexConnection('codex-a', HOME_A, 'acct_a')]));
+  const runtime = new CodexProfileRouteRuntime({appHome, stateStore,
+    createClient:async () => new FakeCodexClient('codex-a', {
+      modelSpecialty:null, multiAgentVersion:'v2', availableAccessPrograms:{cyber:['standard']},
+    }),
+  });
+  const models = await runtime.listModelsForProfile({connectionId:'codex-a', stateRevision:1,
+    generation:4, signal:new AbortController().signal});
+  assert.equal(models.length, 1);
+  assert.equal(models[0].canonicalModelId, 'gpt-5.6-codex');
+  assert.equal(stateStore.read().defaultRoute, null, 'catalog discovery is not model selection');
+  assert.doesNotMatch(JSON.stringify(models), /availableAccessPrograms|multiAgentVersion|modelSpecialty/);
+});
+
+test("malformed new model metadata still fails closed", async (t) => {
+  const appHome = await mkdtemp(join(tmpdir(), 'orcode-codex-invalid-catalog-'));
+  t.after(() => rm(appHome, {recursive:true, force:true}));
+  for (const extras of [{multiAgentVersion:'unexpected'}, {modelSpecialty:42},
+    {availableAccessPrograms:{cyber:['unapproved']}}, {availableAccessPrograms:{cyber:[], token:'private'}}]) {
+    const stateStore = new ProviderStateStore(codexState([codexConnection('codex-a', HOME_A, 'acct_a')]));
+    const runtime = new CodexProfileRouteRuntime({appHome, stateStore,
+      createClient:async () => new FakeCodexClient('codex-a', extras),
+    });
+    await assert.rejects(runtime.listModelsForProfile({connectionId:'codex-a', stateRevision:1,
+      generation:4, signal:new AbortController().signal}), /model response/i);
+    assert.equal(stateStore.read().defaultRoute, null);
+  }
+});
+
 test("atomically activates a provider-runtime Codex route without any keychain reservation", async (t) => {
   const appHome = await mkdtemp(join(tmpdir(), "orcode-codex-route-activation-"));
   t.after(() => rm(appHome, { recursive: true, force: true }));
@@ -338,7 +370,7 @@ class FakeCodexClient implements CodexAccountModelClient {
   readonly taskBytes = 0;
   readonly #listeners = new Set<(params: unknown) => void>();
 
-  constructor(readonly connectionId: string) {}
+  constructor(readonly connectionId: string, readonly modelExtras: Record<string, unknown> = {}) {}
 
   onNotification(_method: "account/updated", listener: (params: unknown) => void): () => void {
     this.#listeners.add(listener);
@@ -368,6 +400,7 @@ class FakeCodexClient implements CodexAccountModelClient {
           defaultReasoningEffort: "medium",
           supportedReasoningEfforts: [{ reasoningEffort: "medium", description: "Medium" }],
           inputModalities: ["text", "image"],
+          ...this.modelExtras,
         }],
         nextCursor: null,
       } as T;

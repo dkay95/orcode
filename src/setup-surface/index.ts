@@ -149,7 +149,7 @@ export interface SetupHubOptions {
   registry: BackendRegistry;
   stateStore: ProviderStateStore;
   executionMode?: ProviderExecutionMode;
-  initialBackendId?: "openrouter" | "kimi-code";
+  initialBackendId?: "openrouter" | "kimi-code" | "nano-gpt";
   /** A saved credential, if one was authoritatively loaded for this startup. */
   savedSecret?: string | null;
   /**
@@ -307,7 +307,8 @@ async function runSetupHubAttempt(options: SetupHubOptions): Promise<SetupHubRes
     return { kind: "cancelled", mode: "setup-required" };
   };
   const savedSecret = nonEmpty(options.savedSecret);
-  let pendingEnvironment = savedSecret ? null : nonEmpty(options.environmentSecret);
+  let pendingEnvironment = savedSecret || options.initialBackendId === "nano-gpt"
+    ? null : nonEmpty(options.environmentSecret);
   let savedAvailable = savedSecret !== null;
   let environmentOffered = false;
   // FIX-18 (F4): the keyless-configured cause is stated exactly once, at the
@@ -403,6 +404,49 @@ async function runSetupHubAttempt(options: SetupHubOptions): Promise<SetupHubRes
         ? ANTHROPIC_DIRECT_BACKEND_NOTICE
         : "This provider selection is unavailable and was not used."));
       return { kind: "cancelled", mode: "setup-required" };
+    }
+
+    if (descriptor.id === "nano-gpt") {
+      const selectedState = stateStore.read();
+      surface.present(notice("Wähle die Nano-GPT-Abrechnung ausdrücklich. Abo und Guthaben werden als getrennte Verbindungen gespeichert. Im Abo müssen Ausgaben aus dem Guthaben im API-Schlüssel deaktiviert sein; es gibt keinen automatischen Guthaben-Fallback."));
+      const billingChoice = await awaitSetupInput(surface.chooseHub([
+        { id: "nano-gpt:subscription", label: "Abo · kein Guthaben-Fallback", description: "Abo-Schlüssel: Guthaben-Ausgaben deaktiviert · Getrennte Verbindung", disabled: false, current: false, generation: selectedState.revision },
+        { id: "nano-gpt:payg", label: "Guthaben · Pay-as-you-go", description: "Ausdrücklich aus dem Nano-GPT-Guthaben bezahlen · Getrennte Verbindung", disabled: false, current: false, generation: selectedState.revision },
+      ]), options.signal);
+      if (billingChoice === SETUP_CALLER_ABORTED || options.signal?.aborted) return cancelOnce("hub", options.signal?.reason);
+      if (billingChoice === null) continue;
+      if (billingChoice !== "nano-gpt:subscription" && billingChoice !== "nano-gpt:payg") {
+        surface.present(outcomeNotice("The billing choice is unavailable and was not used."));
+        return { kind: "cancelled", mode: "setup-required" };
+      }
+      const billingMode = billingChoice === "nano-gpt:subscription" ? "subscription" : "payg";
+      const billingRealm = billingMode === "subscription" ? "nanogpt-subscription" : "nanogpt-payg";
+      const existing = selectedState.connections.filter((connection) => connection.backendId === "nano-gpt" && connection.billingRealm === billingRealm);
+      const explicitTarget = options.targetConnectionId
+        ? selectedState.connections.find((connection) => connection.id === options.targetConnectionId) : undefined;
+      if (explicitTarget && (explicitTarget.backendId !== "nano-gpt" || explicitTarget.billingRealm !== billingRealm)) {
+        surface.present(outcomeNotice("The selected connection belongs to another billing mode and was not replaced."));
+        return { kind: "cancelled", mode: "setup-required" };
+      }
+      if (existing.length > 1 && !explicitTarget) {
+        surface.present(outcomeNotice("Multiple Nano-GPT connections exist for this billing mode. Select an exact connection before replacing a key."));
+        return { kind: "cancelled", mode: "setup-required" };
+      }
+      const selectedExisting = explicitTarget ?? existing[0];
+      const replacement = selectedExisting
+        ? "Ein neuer Schlüssel ersetzt nur diese Nano-GPT-Verbindung im gewählten Abrechnungsmodus; Esc behält sie unverändert. " : "";
+      surface.present(notice(`${replacement}Nano-GPT ${billingMode === "subscription" ? "Abo: Guthaben-Ausgaben müssen in den Schlüssel-Einstellungen deaktiviert sein" : "Guthaben: Pay-as-you-go wird ausdrücklich aus deinem Guthaben bezahlt"}. Der Schlüssel wird erst nach deiner Modellwahl sicher gespeichert. Die Verbindung des anderen Abrechnungsmodus bleibt unverändert.`));
+      const secret = await awaitSetupInput(surface.readSecret({ backendId: "nano-gpt", message: "Nano-GPT API-Schlüssel" }), options.signal);
+      if (secret === SETUP_CALLER_ABORTED || options.signal?.aborted) return cancelOnce("secret", options.signal?.reason);
+      if (secret === null) continue;
+      const outcome = await activateProvider("nano-gpt", secret, "persisted", false, null, false, {
+        ...options, expectedRevision: selectedState.revision,
+        targetConnectionId: selectedExisting?.id ?? options.targetConnectionId,
+      }, billingMode);
+      if (outcome.kind === "ready") return { kind: "ready" };
+      if (outcome.kind === "cancelled") return cancelOnce(outcome.phase, outcome.reason);
+      if (outcome.kind === "blocked") return blockedExit(outcome.reason);
+      continue;
     }
 
     if (descriptor.id === "kimi-code") {
@@ -605,13 +649,14 @@ type ActivationFlow =
   };
 
 async function activateProvider(
-  backendId: "openrouter" | "kimi-code",
+  backendId: "openrouter" | "kimi-code" | "nano-gpt",
   rawSecret: string,
   persistence: "persisted" | "process-only",
   askPersistence: boolean,
   credentialPermit: ProviderCandidateCredentialPermit | null,
   requireCredentialPermit: boolean,
   options: SetupHubOptions,
+  billingMode?: "subscription" | "payg",
 ): Promise<ActivationFlow> {
   // Phase 7 (E-VIS-02): connect() and listModels() below are both real
   // network calls with no prior presentation — until this, the terminal
@@ -624,6 +669,7 @@ async function activateProvider(
     return activateKimiProvider(rawSecret, options);
   }
   const { surface, registry, orchestrator, stateStore } = options;
+  const providerName = backendId === "nano-gpt" ? "Nano-GPT" : "OpenRouter";
   const signal = options.signal ?? new AbortController().signal;
   let adapter: BackendAdapter | null = null;
   let candidateId: string | null = null;
@@ -650,7 +696,7 @@ async function activateProvider(
     const candidateDeadlineAt = options.deadlineAt
       ?? options.resolveProviderDeadline?.()
       ?? Date.now() + MANUAL_PROVIDER_CONTACT_MAX_MS;
-    const activeAdapter = registry.adapter("openrouter");
+    const activeAdapter = registry.adapter(backendId);
     adapter = activeAdapter;
     const connectAndList = async (
       authorityLease?: ProviderCandidateAuthorityLease,
@@ -677,7 +723,7 @@ async function activateProvider(
       const candidate = await abortableSetupAction(() => {
         const pending = connect({
           connectionId: options.targetConnectionId,
-          candidate: secret,
+          candidate: backendId === "nano-gpt" ? { apiKey: secret, billingMode } : secret,
           generation: options.generation ?? 0,
           deadlineAt: candidateDeadlineAt,
           signal,
@@ -704,12 +750,14 @@ async function activateProvider(
           : new DOMException("The operation was aborted.", "AbortError");
       }
       if (
-        candidate.backendId !== "openrouter"
+        candidate.backendId !== backendId
+        || (backendId === "nano-gpt"
+          && candidate.billingRealm !== (billingMode === "subscription" ? "nanogpt-subscription" : "nanogpt-payg"))
         || candidate.health.credential !== "valid"
         || candidate.health.connectivity !== "connected"
       ) {
         assertSetupAttemptCurrent(signal);
-        surface.present(outcomeNotice("OpenRouter could not validate the API key."));
+        surface.present(outcomeNotice(`${providerName} could not validate the API key.`));
         return candidate.health.credential === "rejected"
           ? { kind: "rejected" }
           : { kind: "retry" };
@@ -726,7 +774,7 @@ async function activateProvider(
       if (candidate.health.spend === "limit-reached") {
         assertSetupAttemptCurrent(signal);
         surface.present(outcomeNotice(
-          "OpenRouter validated the API key, but the account's spend limit is already reached.",
+          `${providerName} validated the API key, but the account's spend limit is already reached.`,
           "Spend limit reached",
         ));
         return { kind: "retry" };
@@ -734,7 +782,7 @@ async function activateProvider(
       if (!candidate.accountFingerprint) {
         assertSetupAttemptCurrent(signal);
         surface.present(outcomeNotice(
-          "OpenRouter validated the API key but did not identify the account, so setup cannot finish. Try again or use a different key.",
+          `${providerName} validated the API key but did not identify the account, so setup cannot finish. Try again or use a different key.`,
           "Account identity missing",
         ));
         return { kind: "retry" };
@@ -743,7 +791,7 @@ async function activateProvider(
         await assertCandidateAuthority();
       }
       const models = compatibleMainModels(
-        "openrouter",
+        backendId,
         await abortableSetupAction(
           () => activeAdapter.listModels({ candidateId: candidate.candidateId, signal }),
           signal,
@@ -754,7 +802,7 @@ async function activateProvider(
       }
       if (!models.length) {
         assertSetupAttemptCurrent(signal);
-        surface.present(outcomeNotice("OpenRouter did not return a compatible main model."));
+        surface.present(outcomeNotice(`${providerName} did not return a compatible main model.`));
         return { kind: "retry" };
       }
       return { kind: "models", models };
@@ -799,7 +847,7 @@ async function activateProvider(
     if (catalog.kind !== "models") return catalog;
     const { models } = catalog;
     const selectedCanonicalModelId = await awaitSetupInput(
-      surface.chooseModel({ backendId: "openrouter", models }),
+      surface.chooseModel({ backendId, models }),
       signal,
     );
     if (selectedCanonicalModelId === SETUP_CALLER_ABORTED) {
@@ -836,7 +884,8 @@ async function activateProvider(
       if (!accepted) return { kind: "cancelled", phase: "persistence" };
     }
     const activationPromise = orchestrator.activateCandidate({
-      backendId: "openrouter",
+      backendId,
+      ...(backendId === "nano-gpt" ? { billingMode, environmentEligibility: "forbidden" as const } : {}),
       expectedRevision: options.expectedRevision ?? stateStore.read().revision,
       candidate: secret,
       expectedRequestedModelId: selectedModel.requestedModelId,
@@ -851,7 +900,7 @@ async function activateProvider(
     });
     const activation = await activationPromise;
     if (!signal.aborted && options.isCurrent?.() !== false) {
-      surface.present(outcomeNotice("OpenRouter account is ready."));
+      surface.present(outcomeNotice(`${providerName} account is ready.`));
     }
     return { kind: "ready", route: activation.route, state: activation.state, models };
   } catch {
@@ -859,7 +908,7 @@ async function activateProvider(
       return { kind: "cancelled", phase: "model", reason: signal.reason };
     }
     // This boundary must never reveal credential bytes or provider error text.
-    surface.present(outcomeNotice("OpenRouter setup failed. Try again."));
+    surface.present(outcomeNotice(`${providerName} setup failed. Try again.`));
     return { kind: "retry" };
   } finally {
     signal.removeEventListener("abort", onAbort);
@@ -1201,12 +1250,13 @@ export function setupModelRowLabel(model: BackendModelDescriptor): string {
 }
 
 function compatibleMainModels(
-  backendId: "openrouter" | "kimi-code",
+  backendId: "openrouter" | "kimi-code" | "nano-gpt",
   models: readonly BackendModelDescriptor[],
 ): BackendModelDescriptor[] {
   return models.filter((model) =>
     model.backendId === backendId
     && isSetupMainModelCandidate(model),
+  ).filter((model) => backendId !== "nano-gpt" || model.requestedModelId === model.canonicalModelId
   ).filter((model) => backendId !== "kimi-code" || (
     KIMI_SETUP_MODEL_IDS.has(model.requestedModelId)
     && model.requestedModelId === model.canonicalModelId
@@ -1218,8 +1268,8 @@ function compatibleMainModels(
  * working route. `runSetupHub`'s selection guard and `hubEntries` both go
  * through it, so the hub can never list a row the flow below would refuse.
  */
-function isRunnableSetupBackend(id: BackendId): id is "openrouter" | "kimi-code" {
-  return id === "openrouter" || id === "kimi-code";
+function isRunnableSetupBackend(id: BackendId): id is "openrouter" | "kimi-code" | "nano-gpt" {
+  return id === "openrouter" || id === "kimi-code" || id === "nano-gpt";
 }
 
 function hubEntries(
@@ -1262,6 +1312,8 @@ function hubEntries(
       ? savedCredentialUnavailable
         ? { label: "OpenRouter", description: "Key missing — enter it again" }
         : { label: "OpenRouter", description: "API key · Pay as you go · Many models" }
+      : descriptor.id === "nano-gpt"
+        ? { label: "Nano-GPT", description: "API-Schlüssel · Abo oder Guthaben ausdrücklich wählen · Preview" }
       : {
         label: "Kimi Code membership",
         // FIX-12: the trailing "· OAuth coming soon" is gone — no OAuth

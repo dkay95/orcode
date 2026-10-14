@@ -82,7 +82,7 @@ function fakeStore(options: {
   return { store, values, calls, createEntry };
 }
 
-type SlotKind = "inference" | "management" | "kimi-code";
+type SlotKind = "inference" | "management" | "kimi-code" | "nano-gpt";
 type SlotRef = { version: 1; kind: SlotKind; id: string };
 type FutureCredentialStore = CredentialStore & {
   reserveSlot(kind: SlotKind): SlotRef;
@@ -95,6 +95,18 @@ type FutureCredentialStore = CredentialStore & {
 function versioned(store: CredentialStore): FutureCredentialStore {
   return store as FutureCredentialStore;
 }
+
+test("Nano-GPT keys roundtrip only through a dedicated versioned slot", async () => {
+  const { store, values } = fakeStore();
+  const slot = versioned(store).reserveSlot("nano-gpt");
+  await versioned(store).writeSlot(slot, "  fixture-nano-key-not-real  ");
+  assert.deepEqual(parseCredentialSlotRef(slot.id), slot);
+  assert.equal(await versioned(store).readSlot(slot), "fixture-nano-key-not-real");
+  assert.equal(await store.get("inference"), null);
+  assert.equal(values.size, 1);
+  assert.equal(await versioned(store).deleteSlot(slot), true);
+  assert.equal(values.size, 0);
+});
 
 function normalizeProviderSecret(value: string): string {
   return (credentialsModule as typeof credentialsModule & {

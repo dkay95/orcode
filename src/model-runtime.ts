@@ -100,10 +100,14 @@ export type ModelDispatchFields =
   | {
       readonly backendId: "kimi-code";
       readonly model: KimiCodeModelId;
+    }
+  | {
+      readonly backendId: "nano-gpt";
+      readonly model: string;
     };
 
 export interface ModelRuntime {
-  readonly backendId: Extract<BackendId, "openrouter" | "kimi-code">;
+  readonly backendId: Extract<BackendId, "openrouter" | "kimi-code" | "nano-gpt">;
   createClient(request: { readonly route: RouteIdentityV1; readonly scope: "main" | "compressor" }): OpenRouter;
   inspectSpend(signal?: AbortSignal): Promise<RuntimeSpend>;
   listModels(modelId: string, signal?: AbortSignal): Promise<RuntimeModelInfo[]>;
@@ -1074,7 +1078,8 @@ function validateCodexAccountEvent(value: unknown): CodexProfileSession["account
 }
 
 function validateCodexAccount(value: unknown, expectedPlan?: CodexPlanType): CodexPlanType {
-  if (!isPlainCodexRecord(value) || !hasExactCodexKeys(value, ["account", "requiresOpenaiAuth"])
+  if (!isPlainCodexRecord(value) || !hasAllowedCodexKeys(value, ["account", "requiresOpenaiAuth"], ["workspaceRouting"])
+    || (Object.hasOwn(value, "workspaceRouting") && value.workspaceRouting !== null)
     || value.requiresOpenaiAuth !== true || !isPlainCodexRecord(value.account)
     || !hasExactCodexKeys(value.account, ["type", "email", "planType"])
     || value.account.type !== "chatgpt" || !isCodexPlanType(value.account.planType)
@@ -1116,6 +1121,7 @@ function validateCodexModel(value: unknown): BackendModelDescriptor | null {
   const optional = [
     "additionalSpeedTiers", "availabilityNux", "defaultServiceTier", "inputModalities",
     "serviceTiers", "supportsPersonality", "upgrade", "upgradeInfo",
+    "modelSpecialty", "multiAgentVersion", "availableAccessPrograms",
   ];
   if (!isPlainCodexRecord(value) || !hasAllowedCodexKeys(value, required, optional)
     || !safeCodexText(value.id) || !safeCodexText(value.model)
@@ -1160,6 +1166,12 @@ function validOptionalCodexModelFields(value: Record<string, unknown>): value is
       && hasExactCodexKeys(tier, ["description", "id", "name"])
       && typeof tier.description === "string" && safeCodexText(tier.id) && safeCodexText(tier.name)));
   const rawUpgradeInfo = value.upgradeInfo;
+  const programs = value.availableAccessPrograms;
+  const accessPrograms = programs === undefined || programs === null
+    || (isPlainCodexRecord(programs) && hasExactCodexKeys(programs, ["cyber"])
+      && Array.isArray(programs.cyber) && programs.cyber.length <= 3
+      && new Set(programs.cyber).size === programs.cyber.length
+      && programs.cyber.every((entry) => entry === "standard" || entry === "daybreakBlue" || entry === "daybreakRed"));
   const upgradeInfo = rawUpgradeInfo === undefined || rawUpgradeInfo === null
     || (isPlainCodexRecord(rawUpgradeInfo)
       && hasAllowedCodexKeys(rawUpgradeInfo, ["model"], ["migrationMarkdown", "modelLink", "upgradeCopy"])
@@ -1167,7 +1179,10 @@ function validOptionalCodexModelFields(value: Record<string, unknown>): value is
       && ["migrationMarkdown", "modelLink", "upgradeCopy"].every((key) =>
         rawUpgradeInfo[key] === undefined || rawUpgradeInfo[key] === null
         || typeof rawUpgradeInfo[key] === "string"));
-  return modalities && nux && tiers && upgradeInfo
+  return modalities && nux && tiers && upgradeInfo && accessPrograms
+    && (value.modelSpecialty === undefined || value.modelSpecialty === null || safeCodexText(value.modelSpecialty))
+    && (value.multiAgentVersion === undefined || value.multiAgentVersion === null
+      || ["disabled", "v1", "v2"].includes(value.multiAgentVersion as string))
     && (value.additionalSpeedTiers === undefined || stringArray(value.additionalSpeedTiers))
     && (value.defaultServiceTier === undefined || value.defaultServiceTier === null || safeCodexText(value.defaultServiceTier))
     && (value.supportsPersonality === undefined || typeof value.supportsPersonality === "boolean")

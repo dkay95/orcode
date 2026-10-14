@@ -107,6 +107,22 @@ test("read-only blocks writes and shell commands", async () => {
   assert.deepEqual(asked, [], "read-only darf für blockierte Aktionen nicht fragen");
 });
 
+test('the planner fence overrides saved allows until explicitly released',async()=>{
+  const appHome=await tempAppHome();
+  try{
+    const ruleStore=await RuleStore.load(appHome),subject=localShellSubject('npm test');
+    await ruleStore.remember({workspace:'/ws',tool:'run_command',subject,decision:'allow'});
+    const {approvals,asked}=harness('allow-all',true,{ruleStore,workspace:'/ws'});
+    const request={...shell,subject};
+    approvals.setReadOnlyExecutionFence(true);
+    await approvals.authorize(plainRead);
+    for(const action of [request,edit,secretRead])await assert.rejects(approvals.authorize(action),PermissionDeniedError);
+    assert.equal(asked.length,0);
+    approvals.setReadOnlyExecutionFence(false);
+    await approvals.authorize(request);
+  }finally{await rm(appHome,{recursive:true,force:true});}
+});
+
 test("read-only still asks before a secret is read", async () => {
   const denying = harness("read-only", false);
   await assert.rejects(

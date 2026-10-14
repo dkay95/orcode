@@ -844,6 +844,7 @@ test("a true empty home retains honest connectable provider placeholders", async
 
   assert.deepEqual(snapshot.providers.map((provider) => [provider.providerId, provider.connectionId, provider.state]), [
     ["openrouter", null, "disconnected"],
+    ["nano-gpt", null, "disconnected"],
     ["kimi-code", null, "disabled"],
     ["codex", null, "disabled"],
   ]);

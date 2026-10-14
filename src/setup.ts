@@ -1945,7 +1945,7 @@ export function normalizeModelList(value: unknown): readonly BackendModelDescrip
       return null;
     }
     if (
-      !includes(["openrouter", "kimi-code", "codex", "anthropic"] as const, backendId)
+      !includes(["openrouter", "kimi-code", "nano-gpt", "codex", "anthropic"] as const, backendId)
       || typeof requestedModelId !== "string"
       || requestedModelId.length === 0
       || typeof canonicalModelId !== "string"
@@ -1959,6 +1959,7 @@ export function normalizeModelList(value: unknown): readonly BackendModelDescrip
       backendId === "kimi-code"
       && !isExactKimiCatalogBinding(requestedModelId, canonicalModelId)
     ) continue;
+    if (backendId === "nano-gpt" && requestedModelId !== canonicalModelId) continue;
     normalized.push({
       backendId,
       requestedModelId,
@@ -1997,11 +1998,13 @@ function safeRouteIdentity(value: unknown): RouteIdentityV1 | null {
   }
   if (
     version !== 1
-    || !includes(["openrouter", "kimi-code", "codex", "anthropic"] as const, backendId)
+    || !includes(["openrouter", "kimi-code", "nano-gpt", "codex", "anthropic"] as const, backendId)
     || typeof accountFingerprint !== "string"
     || accountFingerprint.length === 0
     || !includes([
       "openrouter-payg",
+      "nanogpt-subscription",
+      "nanogpt-payg",
       "kimi-code-membership-provider-managed-overage",
       "chatgpt-subscription-provider-managed-overage",
       "chatgpt-account-provider-managed-limits",
@@ -2021,6 +2024,12 @@ function safeRouteIdentity(value: unknown): RouteIdentityV1 | null {
       || !isExactKimiCatalogBinding(requestedModelId, canonicalModelId)
     ) return null;
   } else if (billingRealm === "kimi-code-membership-provider-managed-overage") {
+    return null;
+  }
+  if (backendId === "nano-gpt") {
+    if ((billingRealm !== "nanogpt-subscription" && billingRealm !== "nanogpt-payg")
+      || resolutionState !== "resolved" || requestedModelId !== canonicalModelId) return null;
+  } else if (billingRealm === "nanogpt-subscription" || billingRealm === "nanogpt-payg") {
     return null;
   }
   const safeCanonicalModelId = resolutionState === "resolved"

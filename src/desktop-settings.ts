@@ -42,7 +42,7 @@ export type DesktopSettingsNavigation = Readonly<{
   /** Internal semantic focus identity, never sent over the public GUI wire. */
   focusItemId?: SettingsItemId;
   /** Exact provider deep link for safe, non-destructive account actions. */
-  providerId?: "openrouter" | "kimi-code";
+  providerId?: "openrouter" | "kimi-code" | "nano-gpt";
 }>;
 export interface DesktopSettingsEditorPort { edit(request: SettingsEditorRequest): Promise<SettingsEditorResult>; }
 export interface DesktopSettingsCorePort {
@@ -120,12 +120,12 @@ export class DesktopSettingsController {
     }
     if (binding.itemId === "main-model") return { kind: "model" };
     if (binding.itemId === "provider-setup") return { kind: "provider" };
-    const providerAction = /^provider-action:(openrouter|kimi-code):(connect|reconnect|models)$/.exec(binding.itemId);
+    const providerAction = /^provider-action:(openrouter|kimi-code|nano-gpt):(connect|reconnect|models)$/.exec(binding.itemId);
     if (providerAction) {
       return {
         kind: "provider",
         focusItemId: binding.itemId,
-        providerId: providerAction[1] as "openrouter" | "kimi-code",
+        providerId: providerAction[1] as "openrouter" | "kimi-code" | "nano-gpt",
       };
     }
     return null;

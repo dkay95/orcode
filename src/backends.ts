@@ -1,8 +1,10 @@
-export const BACKEND_IDS = ["openrouter", "kimi-code", "codex", "anthropic"] as const;
+export const BACKEND_IDS = ["openrouter", "kimi-code", "nano-gpt", "codex", "anthropic"] as const;
 export type BackendId = (typeof BACKEND_IDS)[number];
 export type BackendMaturity = "stable" | "preview" | "coming-soon";
 export type BillingRealm =
   | "openrouter-payg"
+  | "nanogpt-subscription"
+  | "nanogpt-payg"
   | "kimi-code-membership-provider-managed-overage"
   | "chatgpt-subscription-provider-managed-overage"
   | "chatgpt-account-provider-managed-limits"
@@ -10,8 +12,8 @@ export type BillingRealm =
 
 /** Fixed trust boundary for the first supported official Codex App Server. */
 export const CODEX_APP_SERVER_RUNTIME_POLICY = Object.freeze({
-  cliVersion: "0.142.5",
-  versionOutput: "codex-cli 0.142.5",
+  cliVersion: "0.159.1",
+  versionOutput: "codex-cli 0.159.1",
   teamIdentifier: "2DC432GLL2",
 } as const);
 
@@ -252,6 +254,14 @@ export class BackendRegistry {
         )
       ) {
         throw new Error("Backend kimi-code must remain an explicitly connectable Preview adapter.");
+      }
+      if (
+        descriptor.id === "nano-gpt"
+        && (descriptor.maturity !== "preview" || !descriptor.connectable || !adapter
+          || descriptor.kind !== "raw-model" || descriptor.credentialOwner !== "orcode-keychain"
+          || descriptor.billingRealmKind !== "provider-managed")
+      ) {
+        throw new Error("Backend nano-gpt must remain an explicitly connectable Preview keychain adapter.");
       }
       if (
         descriptor.id === "anthropic"

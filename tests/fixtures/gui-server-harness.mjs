@@ -24,6 +24,7 @@ import { join } from "node:path";
 const guiModuleUrl = process.env.ORCODE_GUI_SERVER_MODULE;
 if (!guiModuleUrl) throw new Error("ORCODE_GUI_SERVER_MODULE is missing.");
 const scenario = process.argv[2] ?? "default";
+const desktopNanoScenario = scenario.startsWith("desktop-empty-nanogpt");
 const desktopSettingsProviderGuidanceScenario = scenario === "desktop-empty-settings-provider-guidance";
 const desktopSettingsConnectedProviderGuidanceScenario = scenario === "desktop-connected-settings-provider-guidance";
 const desktopKimiProofScenario = desktopSettingsProviderGuidanceScenario
@@ -171,6 +172,7 @@ SessionStore.prototype.save = function countedSave(...args) {
 
 const root = await mkdtemp(join(tmpdir(), "orcode-gui-"));
 const workspace = join(root, "workspace");
+let localAgentWorkspace=workspace;
 const appHome = join(root, "app");
 const configPath = join(appHome, "config.json");
 // A SECOND real folder on disk, so opening its chat exercises the real
@@ -186,6 +188,7 @@ const MODEL_ID = "vendor/gui-main";
 const ALT_MODEL_ID = "vendor/gui-alternate";
 const modelTransitions = [];
 const persisted = structuredClone(config.DEFAULT_CONFIG);
+if(scenario==='local-workcopy')persisted.verify.commands=[`${JSON.stringify(process.execPath)} -e ${JSON.stringify("if(require('fs').readFileSync('notes.md','utf8')!=='local candidate\\n')process.exit(1)")}`];
 persisted.mainModel = MODEL_ID;
 persisted.maxSteps = 7;
 // The fixture catalog holds exactly one model, so nothing else may be
@@ -231,6 +234,12 @@ const desktopProvider = (candidate = null, state = "ready") => Object.freeze({
   setupMethods: ["openrouter-owner-connect"],
   multiProfile: { enabled: false },
   routes: candidate ? [candidate] : [],
+});
+const desktopNanoProvider = (ready = false, mode = "subscription") => ({
+  providerId: "nano-gpt", providerLabel: "Nano-GPT", connectionId: ready ? "desktop-nano-connection" : null,
+  accountLabel: ready ? `Nano-GPT ${mode}` : null, state: ready ? "ready" : "disconnected",
+  setupMethods: ["nanogpt-owner-connect"], multiProfile: { enabled: false },
+  routes: ready ? [{ handle: "nano-route-ready", providerId: "nano-gpt", connectionId: "desktop-nano-connection", accountLabel: `Nano-GPT ${mode}`, canonicalModelId: "vendor/nano-manual", displayName: "Nano manual", reasoning: "unknown", capabilities: ["text", "tools"], cost: { kind: "unknown", label: "Kosten unbekannt" }, dataPolicy: { kind: "unknown", label: "Datenrichtlinie unbekannt" }, runnable: true }] : [],
 });
 const disabledKimiProvider = Object.freeze({
   providerId: "kimi-code",
@@ -324,12 +333,18 @@ let desktopSnapshot = scenario === "desktop-connected" || desktopSettingsConnect
         activeRoute: null,
         providers: [
           desktopProvider(null, "disconnected"),
+          ...(desktopNanoScenario ? [desktopNanoProvider()] : []),
           disabledKimiProvider,
           ...(desktopSettingsProviderGuidanceScenario ? [disabledCodexProvider] : []),
         ],
       }
     : readyDesktopSnapshot();
 let desktopSetupCalls = 0;
+let desktopNanoSetupCalls = 0;
+let desktopNanoBillingMode = null;
+let desktopNanoSelectedModel = null;
+let desktopNanoSecretLength = 0;
+let desktopNanoCommitAccepted = 0;
 let desktopCodexLoginCalls = 0;
 let desktopCodexLoginMethod = null;
 if (scenario === "desktop-codex-login" || scenario === "desktop-codex-login-durable-cancel") {
@@ -1203,6 +1218,36 @@ const runtime = {
       process.stderr.write("ORCODE_GUI_GATE:setup-settled\n");
     }
   },
+  async runDesktopNanoGptSetup(surface, signal) {
+    desktopNanoSetupCalls += 1;
+    if (!desktopNanoScenario || signal.aborted) return { kind: "cancelled", mode: "setup-required" };
+    const billing = await surface.chooseHub([
+      { id: "nano-gpt:subscription", label: "Abo · kein Guthaben-Fallback", description: "Abo-Schlüssel: Guthaben-Ausgaben deaktiviert · Getrennte Verbindung", disabled: false, current: false, generation: desktopSnapshot.generation },
+      { id: "nano-gpt:payg", label: "Guthaben · Pay-as-you-go", description: "Ausdrücklich aus dem Nano-GPT-Guthaben bezahlen · Getrennte Verbindung", disabled: false, current: false, generation: desktopSnapshot.generation },
+    ]);
+    if (signal.aborted || (billing !== "nano-gpt:subscription" && billing !== "nano-gpt:payg")) return { kind: "cancelled", mode: "setup-required" };
+    desktopNanoBillingMode = billing === "nano-gpt:subscription" ? "subscription" : "payg";
+    const secret = await surface.readSecret({ backendId: "nano-gpt", message: "Nano-GPT API-Schlüssel" });
+    if (signal.aborted || secret === null) return { kind: "cancelled", mode: "setup-required" };
+    desktopNanoSecretLength = secret.length;
+    const selected = await surface.chooseModel({ backendId: "nano-gpt", models: [{ backendId: "nano-gpt", requestedModelId: "vendor/nano-manual", canonicalModelId: "vendor/nano-manual", displayName: "Nano manual", capabilities: { textInput: true, textOutput: true, tools: true, reasoning: false } }] });
+    if (signal.aborted || selected !== "vendor/nano-manual") return { kind: "cancelled", mode: "setup-required" };
+    desktopNanoSelectedModel = selected;
+    desktopSnapshot = { ...desktopSnapshot, revision: desktopSnapshot.revision + 1, generation: desktopSnapshot.generation + 1,
+      routeRunnable: true, activeRoute: { routeHandle: "nano-route-ready", providerLabel: "Nano-GPT", modelLabel: "Nano manual", accountLabel: `Nano-GPT ${desktopNanoBillingMode}` },
+      providers: desktopSnapshot.providers.map((provider) => provider.providerId === "nano-gpt" ? desktopNanoProvider(true, desktopNanoBillingMode) : provider),
+    };
+    const result = { kind: "ready" };
+    desktopSetupCommitProofs.set(result, { routeHandle: "nano-route-ready", revision: desktopSnapshot.revision, generation: desktopSnapshot.generation });
+    return result;
+  },
+  reconcileDesktopNanoGptSetupCommit(settlement) {
+    const proof = settlement && typeof settlement === "object" ? desktopSetupCommitProofs.get(settlement) : null;
+    if (settlement && typeof settlement === "object") desktopSetupCommitProofs.delete(settlement);
+    if (!proof || !desktopSnapshot.routeRunnable || desktopSnapshot.activeRoute?.routeHandle !== proof.routeHandle || desktopSnapshot.revision !== proof.revision || desktopSnapshot.generation !== proof.generation) return null;
+    desktopNanoCommitAccepted += 1;
+    return structuredClone(proof);
+  },
   reconcileDesktopOpenRouterSetupCommit(settlement) {
     desktopSetupProofReconciliations += 1;
     if ((typeof settlement !== "object" || settlement === null) && typeof settlement !== "function") return null;
@@ -1895,6 +1940,12 @@ const longRun = async (prompt, observer = {}) => {
 
 /** The scripted run every "a run streams" pin drives. */
 const scriptedRun = async (prompt, observer = {}) => {
+  if(scenario==='local-workcopy'){
+    const {WorkspaceGuard,ChangeJournal,createCodingTools}=await import(new URL('./workspace.js',guiModuleUrl));
+    const tools=createCodingTools(await WorkspaceGuard.create(localAgentWorkspace),approvals,
+      new ChangeJournal({appHome,chatId:freshSession.data.id}),{signal:observer.signal});
+    await tools.find(item=>item.function.name==='write_file').function.execute({path:'notes.md',content:'local candidate\n'});
+  }
   if (scenario === "cancel-on-eof" || scenario === "hanging-balance") {
     return longRun(prompt, observer);
   }
@@ -2030,6 +2081,7 @@ try {
       }),
       createProviderRuntime: async () => runtime,
       createAgent: async (input) => {
+        localAgentWorkspace=input.workspace;
         approvals = input.approvals ?? null;
         return agent;
       },
@@ -2142,6 +2194,11 @@ try {
     ownerKimiRunnableBaseline,
     legacyRouteCatalogCalls,
     desktopSetupCalls,
+    desktopNanoSetupCalls,
+    desktopNanoBillingMode,
+    desktopNanoSelectedModel,
+    desktopNanoSecretLength,
+    desktopNanoCommitAccepted,
     desktopSetupEntered,
     desktopSetupSettled,
     desktopSetupAborted,

@@ -48,7 +48,7 @@ const home=process.argv[1]; const rl=readline.createInterface({input:process.std
 const send=(v)=>process.stdout.write(JSON.stringify(v)+"\\n");
 rl.on("line",(line)=>{const f=JSON.parse(line); if(f.method==="initialized")return;
 if(!f.method)return;
-if(f.method==="initialize")return send({id:f.id,result:{codexHome:home,platformFamily:"unix",platformOs:"macos",userAgent:"codex_cli_rs/0.142.5"}});
+if(f.method==="initialize")return send({id:f.id,result:{codexHome:home,platformFamily:"unix",platformOs:"macos",userAgent:"codex_cli_rs/0.159.1"}});
 if(f.method==="account/read")return send({id:f.id,result:{account:{type:"chatgpt",email:null,planType:"pro"},requiresOpenaiAuth:true}});
 if(f.method==="turn/start"){send({id:f.id,result:{turn:{id:"turn-1",items:[],itemsView:"full",status:"inProgress",error:null,startedAt:1,completedAt:null,durationMs:null}}});${emitApproval ? `send({id:777,method:"item/commandExecution/requestApproval",params:{threadId:"thread-1",turnId:"turn-1",itemId:"auto-command",startedAtMs:1,command:"npm test",cwd:${JSON.stringify(stagingPath)},environmentId:"blocked"}});` : ""}return;}
 if(f.method==="turn/interrupt")${interruptMode === "silent" ? "return;" : interruptMode === "error"

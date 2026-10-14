@@ -41,6 +41,7 @@ import {
   type ProviderConnectionBindingV2,
   type ProviderCredentialRequest,
   selectProviderBinding,
+  providerCredentialPolicy,
 } from "../src/provider-authority.js";
 
 const NOW = 1_000_000;
@@ -58,6 +59,41 @@ const KIMI_MANUAL_SECRET = "fixture-kimi-manual-membership-key-not-real";
 const KIMI_MANUAL_FOREIGN_SECRET = "fixture-kimi-manual-membership-key-foreign";
 const KIMI_MANUAL_CONNECTION = "kimi-manual-main";
 const KIMI_MANUAL_FINGERPRINT = "acct_kimi_manual_fixture";
+
+for (const billingRealm of ["nanogpt-subscription", "nanogpt-payg"] as const) {
+  test(`Nano-GPT authority preserves ${billingRealm} and never reads environment or legacy credentials`, async () => {
+    const slot = "v1:nano-gpt:018f8d77-2d52-7cc0-8f6a-9fb1f3fc0711";
+    const state = structuredClone(kimiState()) as unknown as ProviderSetupStateV3;
+    Object.assign(state.connections[0]!, { backendId: "nano-gpt", billingRealm, credentialBinding: { kind: "orcode-keychain", pointer: slot } });
+    Object.assign(state.defaultRoute!, { backendId: "nano-gpt", billingRealm, requestedModelId: "vendor/manual", canonicalModelId: "vendor/manual" });
+    const credentials = new AuthorityCredentials({}, { [slot]: "fixture-nano-secret" });
+    const authority = realAuthority({
+      stateStore: new ProviderStateStore(state), credentials,
+      environment: new Proxy({}, { get() { throw new Error("Nano environment lookup is forbidden"); } }),
+    });
+    const result = await authority.withCredential({
+      backendId: "nano-gpt", connectionId: "kimi-main", purpose: "retained-model-preference",
+      environmentEligibility: "forbidden", signal: new AbortController().signal, deadlineAt: NOW + 5000,
+    }, async (secret, context) => {
+      assert.equal(secret, "fixture-nano-secret");
+      assert.equal(context.binding.billingRealm, billingRealm);
+      assert.equal(context.binding.backendId, "nano-gpt");
+      assert.equal(context.source, "saved");
+      const reused = await authority.withCandidateAuthority!({
+        credentialPermit: context.candidatePermit, requireCredentialPermit: true,
+        signal: new AbortController().signal, deadlineAt: NOW + 5000,
+      }, async (lease) => { await lease.assertCurrent(); return "reused"; });
+      assert.deepEqual(reused, { kind: "ready", value: "reused" });
+      return "used";
+    });
+    assert.deepEqual(result, { kind: "available", value: "used" });
+    assert.ok(credentials.effects.every((effect) => effect === `read:${slot}`));
+    const policy = providerCredentialPolicy("nano-gpt");
+    assert.equal(policy?.legacyInferenceAllowed, false);
+    assert.equal(policy?.environmentVariable, null);
+    assert.equal(policy?.secretFingerprintDomain, "orcode-nanogpt-credential/v1\0");
+  });
+}
 
 type ManualKimiPermit = { readonly version: 1 };
 type ManualKimiAttemptToken = { readonly version: 1 };

@@ -38,7 +38,7 @@ input.on("line", (line) => {
         codexHome: scenario === "wrong-home" ? "/wrong/codex-home" : expectedCodexHome,
         platformFamily: "unix",
         platformOs: "macos",
-        userAgent: scenario === "unsupported" ? "codex_cli_rs/0.141.0" : "codex_cli_rs/0.142.5",
+        userAgent: scenario === "unsupported" ? "codex_cli_rs/0.141.0" : "codex_cli_rs/0.159.1",
         ...(scenario === "extra-initialize-field" ? { futureProtocol: true } : {}),
       },
     });

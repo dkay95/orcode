@@ -36,6 +36,10 @@ export const REQUEST_TYPES = [
   "settings.open",
   "settings.dispatch",
   "desktop.snapshot.get",
+  "official-cli.action",
+  "local-run.action",
+  "execution-policy.set",
+  "project.open",
   "onboarding.dispatch",
   "settings.close",
   "answer",
@@ -57,6 +61,7 @@ export const EVENT_NAMES = [
   "settings.view",
   "settings.closed",
   "desktop.snapshot",
+  "local-run.state",
   "onboarding.view",
   "activity",
   "native-local-action-required",
@@ -170,7 +175,7 @@ export interface DesktopDisabledPresentation {
 }
 export type DesktopCommandDisabledReasonCode =
   | "run-active" | "cross-run-active" | "question-pending" | "command-in-flight"
-  | "settings-open" | "no-run" | "terminal-only-picker" | "route-stale" | "provider-unavailable";
+  | "settings-open" | "no-run" | "terminal-only-picker" | "route-stale" | "provider-unavailable" | "local-flow-required";
 export interface DesktopCommandDisabledPresentation {
   readonly code: DesktopCommandDisabledReasonCode; readonly label: string; readonly recoveryLabel: string;
 }
@@ -178,7 +183,7 @@ export interface DesktopCommandPresentation {
   readonly description: string; readonly actionLabel: "Ausführen" | "Einfügen" | "Öffnen";
   readonly currentLabel?: string; readonly disabled?: DesktopCommandDisabledPresentation;
 }
-export type DesktopSetupMethod = "openrouter-owner-connect" | "codex-browser-login" | "codex-device-login" | "kimi-owner-connect";
+export type DesktopSetupMethod = "openrouter-owner-connect" | "codex-browser-login" | "codex-device-login" | "kimi-owner-connect" | "nanogpt-owner-connect";
 export type DesktopProviderState = "disconnected" | "connecting" | "ready" | "degraded" | "disabled" | "blocked";
 export type DesktopModelCapability = "text" | "image-input" | "tools" | "reasoning" | "patch";
 export type DesktopCostKnowledge =

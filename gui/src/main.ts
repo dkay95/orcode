@@ -50,6 +50,8 @@ import {
   type OverlayHandle,
 } from "./overlay-manager.js";
 import { onboardingView } from "./onboarding-view.js";
+import type {Manufacturer,ManufacturerAction,ManufacturerObservation} from './official-cli-panel.js';
+import {executionControls,candidatePanel,type LocalWorkbenchState} from './execution-controls.js';
 import {
   emptyPalette,
   movePalette,
@@ -94,6 +96,7 @@ import {
 } from "./views.js";
 
 export interface DesktopWindowBridge {
+  chooseProject?():Promise<string|null>;
   start(handlers: BridgeHandlers): Promise<EngineInfo>;
   request<T = unknown>(t: string, payload?: Record<string, unknown>): Promise<T>;
   write(frame: Record<string, unknown>): Promise<void>;
@@ -115,6 +118,7 @@ function createProductionBridge(): DesktopWindowBridge {
     return engineBridge;
   };
   return {
+    chooseProject:()=>current().chooseProject(),
     async start(handlers) {
       engineBridge ??= new EngineBridge(handlers);
       return await engineBridge.start();
@@ -264,6 +268,48 @@ let navigationShade!: HTMLButtonElement;
 let workspaceName!: HTMLElement;
 let toolbarBrand!: HTMLElement;
 let workbenchRequestPending = false;
+let manufacturerStates:Partial<Record<Manufacturer,ManufacturerObservation>> = {};
+let manufacturerNativeAvailable = false;
+let manufacturerBusy = false;
+let localWorkbench:LocalWorkbenchState={policy:{aiProcess:'manual',permissions:'ask',revision:1},candidate:null};
+async function changeExecutionPolicy(key:'aiProcess'|'permissions',value:string):Promise<void> {
+  const context=captureMountContext();if(!context||workbenchBusy())return;
+  try{const result=await context.bridge.request<LocalWorkbenchState>('execution-policy.set',
+    {key,value,revision:localWorkbench.policy.revision});
+    if(isCurrentMountContext(context)){localWorkbench=result;headSignature='';schedule();}}
+  catch(error){if(isCurrentMountContext(context))reportEngineError(error);}
+}
+async function localCandidateAction(action:'test'|'apply'|'resume'):Promise<void> {
+  const context=captureMountContext(),candidate=localWorkbench.candidate;
+  if(!context||!candidate||workbenchBusy())return;
+  workbenchRequestPending=true;schedule();
+  try{await context.bridge.request('local-run.action',{action,candidateHandle:candidate.candidateHandle});}
+  catch(error){if(isCurrentMountContext(context))reportEngineError(error);}
+  finally{if(isCurrentMountContext(context)){workbenchRequestPending=false;headSignature='';barSignature='';schedule();}}
+}
+async function openNativeProject():Promise<void> {
+  const context=captureMountContext();if(!context||workbenchBusy())return;
+  if(!context.bridge.chooseProject){dispatchCommand('/folder');return;}
+  try{const path=await context.bridge.chooseProject();
+    if(!path||!isCurrentMountContext(context))return;
+    await context.bridge.request('project.open',{path});await refreshStatus(context);}
+  catch(error){if(isCurrentMountContext(context))reportEngineError(error);}
+}
+async function manufacturerAction(provider:Manufacturer,action:ManufacturerAction):Promise<void> {
+  const context = captureMountContext(), snapshot = desktop.snapshot;
+  if (!context || !snapshot || manufacturerBusy) return;
+  manufacturerBusy = true; schedule();
+  try {
+    const result = await context.bridge.request<ManufacturerObservation|{kind:'presented';nativeAvailable:boolean}>(
+      'official-cli.action',{provider,action,revision:snapshot.revision,generation:snapshot.generation});
+    if (!isCurrentMountContext(context) || desktop.snapshot?.revision !== snapshot.revision
+      || desktop.snapshot?.generation !== snapshot.generation) return;
+    manufacturerNativeAvailable = result.nativeAvailable;
+    if (result.kind === 'checked') manufacturerStates = {...manufacturerStates,[provider]:result};
+    else pushShellNotice('info','Herstellerfenster geöffnet. Nach Installation oder Anmeldung erneut „Prüfen“ wählen.');
+  } catch (error) {if (isCurrentMountContext(context)) reportEngineError(error);}
+  finally {if (isCurrentMountContext(context)) {manufacturerBusy=false; overlayKey=null; schedule();}}
+}
 let workbenchDraftCapture: { text: string; editGeneration: number } | null = null;
 
 interface ShellLayoutState {
@@ -379,6 +425,9 @@ export function mountDesktopWindow(
 }
 
 function resetDesktopWindowState(): void {
+  clearEngineHelloDeadline();
+  localWorkbench={policy:{aiProcess:'manual',permissions:'ask',revision:1},candidate:null};
+  manufacturerStates={};manufacturerNativeAvailable=false;manufacturerBusy=false;
   if (frameRequestId !== null) {
     window.cancelAnimationFrame(frameRequestId);
     frameRequestId = null;
@@ -479,6 +528,7 @@ function closeCompactNavigation(): void {
 function handleFrame(frame: ServerFrame): void {
   engine = reduceEngine(engine, { kind: "frame", frame });
   if (frame.t === "hello") {
+    clearEngineHelloDeadline();
     if (engine.phase !== "failed" && !handshakeStarted) {
       handshakeStarted = true;
       void handshake();
@@ -492,6 +542,10 @@ function handleFrame(frame: ServerFrame): void {
 }
 
 function applyEvent(frame: EventFrame): void {
+  if(frame.e==='local-run.state'){
+    localWorkbench={policy:frame.policy as LocalWorkbenchState['policy'],candidate:frame.candidate as LocalWorkbenchState['candidate'],active:frame.active===true};
+    headSignature='';barSignature='';
+  }
   chat.apply(frame);
   if (frame.e === "cross") {
     crossSnapshotRevision += 1;
@@ -500,6 +554,10 @@ function applyEvent(frame: EventFrame): void {
     }
   }
   if (frame.e === "desktop.snapshot") {
+    const incoming=frame.snapshot as DesktopCapabilitySnapshot;
+    if(desktop.snapshot && (desktop.snapshot.revision!==incoming.revision||desktop.snapshot.generation!==incoming.generation)) {
+      manufacturerStates={};manufacturerNativeAvailable=false;
+    }
     const hadOnboarding = desktop.onboarding !== null;
     const next = reduceDesktopState(desktop, {
       kind: "snapshot",
@@ -637,6 +695,10 @@ function applyEvent(frame: EventFrame): void {
  * an empty chat would be showing a transcript that does not exist.
  */
 let openChatId: string | null = null;
+let engineHelloTimer:number|null=null;
+function clearEngineHelloDeadline():void {
+  if(engineHelloTimer!==null){window.clearTimeout(engineHelloTimer);engineHelloTimer=null;}
+}
 
 async function boot(options: { restart?: boolean } = {}): Promise<void> {
   const context = captureMountContext();
@@ -658,6 +720,15 @@ async function boot(options: { restart?: boolean } = {}): Promise<void> {
   surface.reset();
   settings = null;
   resetSettingsClientState();
+  clearEngineHelloDeadline();
+  engineHelloTimer=window.setTimeout(()=>{
+    engineHelloTimer=null;
+    if(!isCurrentMountContext(context)||engine.phase!=='starting')return;
+    engine=reduceEngine(engine,{kind:'spawn-failed',code:'engine-start-timeout',
+      message:'Die Engine antwortet nicht. Es wurde kein Auftrag gestartet.',
+      hint:'Prüfe den Dateizugriff der App auf den Projektordner und starte die Engine erneut. Es werden keine Zugriffsrechte automatisch geändert.'});
+    schedule();
+  },10000);
   schedule();
   try {
     const nextInfo = await context.bridge.start(activeBridgeHandlers);
@@ -665,6 +736,7 @@ async function boot(options: { restart?: boolean } = {}): Promise<void> {
     info = nextInfo;
   } catch (error) {
     if (!isCurrentMountContext(context)) return;
+    clearEngineHelloDeadline();
     engine = reduceEngine(engine, startFailure(error));
     schedule();
     return;
@@ -896,11 +968,13 @@ async function submit(): Promise<void> {
   const text = composer.value.trim();
   if (!text) return;
   const route = routeComposerLine(text, chat.runActive);
+  if(route==='submit'&&(workbenchBusy()||localWorkbench.candidate?.phase==='stopped'))return;
   composer.value = "";
   invalidateForecast();
   slashCompletion = null;
   slashCompletionRequestGeneration += 1;
   const submittedClearGeneration = ++composerEditGeneration;
+  if(route==='submit'){workbenchRequestPending=true;workbenchDraftCapture={text,editGeneration:submittedClearGeneration};}
   autosize();
   schedule();
   try {
@@ -924,6 +998,7 @@ async function submit(): Promise<void> {
     }
     reportEngineError(error);
   }
+  if(route==='submit')workbenchRequestPending=false;
   schedule();
 }
 
@@ -1002,7 +1077,7 @@ function dispatchCommand(raw: string): void {
 
 /** These are real engine commands, not a second client-side task workflow. */
 function workbenchBusy(): boolean {
-  return workbenchRequestPending || chat.runActive || chat.cross?.active === true
+  return workbenchRequestPending || localWorkbench.active===true || chat.runActive || chat.cross?.active === true
     || crossPreflight !== null || asks.current !== null;
 }
 
@@ -1019,41 +1094,6 @@ async function runWorkbenchCommand(raw: string): Promise<void> {
   } finally {
     if (isCurrentMountContext(context)) {
       workbenchRequestPending = false;
-      schedule();
-    }
-  }
-}
-
-async function startTaskAction(raw: "/architect" | "/cross"): Promise<void> {
-  const context = captureMountContext();
-  const draft = composer.value.trim();
-  if (!context || !draft || engine.phase !== "ready" || workbenchBusy()
-    || surface.settingsOpen || desktop.snapshot?.routeRunnable !== true) return;
-  const field = composer;
-  field.value = "";
-  pendingCommandDraft = null;
-  const clearedGeneration = ++composerEditGeneration;
-  workbenchDraftCapture = { text: draft, editGeneration: clearedGeneration };
-  slashCompletion = null;
-  slashCompletionRequestGeneration += 1;
-  invalidateForecast();
-  autosize();
-  workbenchRequestPending = true;
-  schedule();
-  try {
-    await runCommand(raw, context, draft);
-  } catch (error) {
-    if (!isCurrentMountContext(context)) return;
-    if (composerEditGeneration === clearedGeneration && field.value === "") {
-      field.value = draft;
-      autosize();
-      scheduleForecast();
-    }
-    reportEngineError(error);
-  } finally {
-    if (isCurrentMountContext(context)) {
-      workbenchRequestPending = false;
-      workbenchDraftCapture = null;
       schedule();
     }
   }
@@ -1440,7 +1480,7 @@ function renderSidebar(
       newChat: () => { closeCompactNavigation(); surface.run(() => void newChat()); },
       // Through the one command path, so `/provider setup`'s asks and
       // `/folder`'s D4 confirm arrive as the asks they already are.
-      run: (command) => { closeCompactNavigation(); dispatchCommand(command); },
+      run: (command) => { closeCompactNavigation(); if(command==='/folder')void openNativeProject();else dispatchCommand(command); },
       connect: () => { closeCompactNavigation(); openRoutePicker("chat"); },
       openSettings: () => { closeCompactNavigation(); void openSettings(); },
     },
@@ -1479,6 +1519,8 @@ function renderChatHead(segments: StatusSegments | null, title: string): void {
     routeRunnable,
     showHeaderMark,
     inspectorOpen,
+    localWorkbench,
+    workbenchBusy(),
   ]);
   if (signature === headSignature) return;
   headSignature = signature;
@@ -1496,6 +1538,8 @@ function renderChatHead(segments: StatusSegments | null, title: string): void {
   });
   toggle.addEventListener("click", () => setInspectorOpen(!inspectorOpen, true));
   header.append(toggle);
+  header.append(executionControls(localWorkbench,workbenchBusy(),{
+    change:(key,value)=>void changeExecutionPolicy(key,value),stop:()=>void bridge.request('cancel').catch(reportEngineError)}));
   replace(headSlot, [header]);
 }
 
@@ -1538,11 +1582,14 @@ function renderComposerBar(): void {
   const running = chat.runActive;
   const thinking = chat.reasoningLive;
   const hasDraft = Boolean(composer.value.trim());
-  const taskDisabled = workbenchBusy() || desktop.snapshot?.routeRunnable !== true || !hasDraft;
-  const signature = JSON.stringify([running, thinking, forecast, chat.attachments, hasDraft, taskDisabled, workbenchRequestPending]);
+  const taskDisabled = workbenchBusy() || localWorkbench.candidate?.phase==='stopped'
+    || desktop.snapshot?.routeRunnable !== true || !hasDraft;
+  const signature = JSON.stringify([running, thinking, forecast, chat.attachments, hasDraft, taskDisabled, workbenchRequestPending,localWorkbench]);
   if (signature === barSignature) return;
   barSignature = signature;
   composerBox.querySelector(".composer-attachments")?.remove();
+  composerBox.querySelector('.candidate-panel')?.remove();
+  composerBox.prepend(candidatePanel(localWorkbench,workbenchBusy(),action=>void localCandidateAction(action)));
   if (chat.attachments.length > 0) {
     const attachmentList = el("div", {
       class: "composer-attachments", role: "region", "aria-label": "Anhänge für die nächste Nachricht",
@@ -1562,20 +1609,6 @@ function renderComposerBar(): void {
   if (!previousMenu) more.append(el("summary", { text: "Weitere Aktionen" }));
   const menu = more.querySelector<HTMLElement>(".composer-action-menu")
     ?? el("div", { class: "composer-action-menu", "aria-label": "Zusätzliche Aufgabenaktionen" });
-  for (const [label, raw, hint] of [
-    ["Plan erstellen", "/architect", "Die Aufgabe erst planen – mit dem von dir gewählten Modell."],
-    ["Mit zwei Modellen", "/cross", "Du wählst das Coding-Modell und das Prüfmodell selbst."],
-  ] as const) {
-    let action = menu.querySelector<HTMLButtonElement>(`[data-task-command="${raw}"]`);
-    if (!action) {
-      action = el("button", { class: "iconbtn task-action", type: "button", text: label,
-        "data-task-command": raw, "aria-label": label }) as HTMLButtonElement;
-      action.addEventListener("click", () => { more.open = false; void startTaskAction(raw); });
-      menu.append(action);
-    }
-    action.title = !hasDraft ? "Beschreibe zuerst deine Aufgabe." : hint;
-    action.disabled = taskDisabled;
-  }
   if (!menu.querySelector(".palette-action")) {
     const palette = el("button", { class: "iconbtn palette-action", type: "button", text: "Befehle", "aria-label": "Befehle", title: "Alle Befehle durchsuchen (⌘P)" });
     palette.addEventListener("click", () => { more.open = false; void openPalette(); });
@@ -1600,7 +1633,7 @@ function renderComposerBar(): void {
     class: "send",
     type: "button",
     text: running ? "Ergänzen" : "Aufgabe starten",
-    disabled: !hasDraft || (!running && (workbenchRequestPending || desktop.snapshot?.routeRunnable !== true)),
+    disabled: running?!hasDraft:taskDisabled,
   });
   send.addEventListener("click", () => void submit());
   parts.push(send);
@@ -1987,7 +2020,9 @@ function renderOverlay(): void {
       labelId,
       initialFocus: "safe-action",
       onDismiss: () => dismissOnboarding(activeOnboarding),
-      render: () => onboardingView(activeOnboarding, { dispatch: dispatchOnboarding }),
+      render: () => onboardingView(activeOnboarding, { dispatch: dispatchOnboarding,
+        manufacturer:{states:manufacturerStates,nativeAvailable:manufacturerNativeAvailable,
+          busy:manufacturerBusy,action:(provider,action)=>void manufacturerAction(provider,action)}}),
     });
     return;
   }

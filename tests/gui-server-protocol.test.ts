@@ -4,6 +4,7 @@ import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { createInterface } from "node:readline";
 import { dirname, join } from "node:path";
 import { PassThrough } from "node:stream";
+import {readFile} from 'node:fs/promises';
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 import { GUI_PROTOCOL_VERSION } from "../src/gui-protocol.js";
@@ -50,6 +51,7 @@ test("every desktop command gate has German copy and every unknown key fails clo
 
 interface Frame {
   readonly t: string;
+  readonly error?: {code:string;message?:string;hint?:string};
   readonly [key: string]: unknown;
 }
 
@@ -699,6 +701,61 @@ test("historical setup turns stay byte-for-byte stable across Desktop navigation
   assert.equal(client.result()?.priorChatTurnBytesStable, true, JSON.stringify(client.result()));
   assert.equal(client.result()?.priorChatTurnCountBefore, 4);
   assert.equal(client.result()?.priorChatTurnCountAfter, 4);
+});
+
+for (const mode of ["subscription", "payg"] as const) {
+  test(`fresh Nano GUI setup chooses ${mode}, masks the local key and commits its exact manual route`, async () => {
+    const client = await withClient(`desktop-empty-nanogpt-${mode}`, async (client) => {
+      await client.handshake();
+      const initial = (await client.await((frame) => frame.t === "event" && frame.e === "desktop.snapshot")).snapshot as { revision: number; generation: number; providers: { providerId: string; setupMethods: string[] }[] };
+      assert.deepEqual(initial.providers.find((provider) => provider.providerId === "nano-gpt")?.setupMethods, ["nanogpt-owner-connect"]);
+      assert.equal((await client.request("submit", { text: "too early" })).ok, false);
+      const setup = client.request("onboarding.dispatch", { intent: { kind: "choose-provider", providerId: "nano-gpt", revision: initial.revision, generation: initial.generation } });
+      const first = await Promise.race([setup, client.await((frame) => frame.t === "ask" && frame.kind === "choose-hub", 2000)]);
+      assert.equal(first.t, "ask", `fresh Nano provider must enter its explicit billing picker; received ${JSON.stringify(first)}`);
+      assert.equal(first.kind, "choose-hub");
+      client.send({ t: "answer", askId: first.askId, id: `nano-gpt:${mode}` });
+      const secret = await client.await((frame) => frame.t === "ask" && frame.kind === "secret");
+      client.send({ t: "answer", askId: secret.askId, value: "NANO_GUI_KEY_CANARY" });
+      const model = await client.await((frame) => frame.t === "ask" && frame.kind === "choose-model");
+      client.send({ t: "answer", askId: model.askId, id: "vendor/nano-manual" });
+      const response = await setup;
+      assert.equal(response.ok, true);
+      assert.equal((response.result as { kind: string }).kind, "ready");
+      const final = client.events("desktop.snapshot").at(-1)?.snapshot as { routeRunnable: boolean; activeRoute: { routeHandle: string; providerLabel: string; modelLabel: string } };
+      assert.equal(final.routeRunnable, true);
+      assert.deepEqual(final.activeRoute, { routeHandle: "nano-route-ready", providerLabel: "Nano-GPT", modelLabel: "Nano manual", accountLabel: `Nano-GPT ${mode}` });
+      assert.equal(client.events("transcript").length, 0);
+      assert.equal(client.frames.filter((frame) => frame.t === "ask" && frame.kind === "choose-hub").length, 1);
+      assert.equal(`${client.stdout}\n${client.stderr}`.includes("NANO_GUI_KEY_CANARY"), false);
+    });
+    assert.equal(client.result()?.desktopNanoSetupCalls, 1);
+    assert.equal(client.result()?.desktopSetupCalls, 0);
+    assert.equal(client.result()?.desktopNanoBillingMode, mode);
+    assert.equal(client.result()?.desktopNanoSelectedModel, "vendor/nano-manual");
+    assert.equal(client.result()?.desktopNanoCommitAccepted, 1);
+    assert.equal(client.result()?.agentCalls, 0);
+  });
+}
+
+test("fresh Nano GUI billing cancellation activates no route and never falls back to OpenRouter", async () => {
+  const client = await withClient("desktop-empty-nanogpt-cancel", async (client) => {
+    await client.handshake();
+    const initial = (await client.await((frame) => frame.t === "event" && frame.e === "desktop.snapshot")).snapshot as { revision: number; generation: number };
+    const setup = client.request("onboarding.dispatch", { intent: { kind: "choose-provider", providerId: "nano-gpt", ...initial } });
+    const first = await Promise.race([setup, client.await((frame) => frame.t === "ask" && frame.kind === "choose-hub", 2000)]);
+    assert.equal(first.t, "ask");
+    client.send({ t: "answer", askId: first.askId, cancel: true });
+    assert.equal((await setup).ok, true);
+    assert.equal((client.events("desktop.snapshot").at(-1)?.snapshot as { routeRunnable: boolean }).routeRunnable, false);
+    assert.equal((await client.request("submit", { text: "must stay gated" })).ok, false);
+    assert.equal(client.frames.some((frame) => frame.t === "ask" && (frame.kind === "secret" || frame.kind === "choose-model")), false);
+  });
+  assert.equal(client.result()?.desktopNanoSetupCalls, 1);
+  assert.equal(client.result()?.desktopSetupCalls, 0);
+  assert.equal(client.result()?.desktopNanoCommitAccepted, 0);
+  assert.equal(client.result()?.desktopNanoSecretLength, 0);
+  assert.equal(client.result()?.agentCalls, 0);
 });
 
 test("true empty Desktop setup uses the preselected OpenRouter seam and submit stays fail-closed", async () => {
@@ -1480,6 +1537,8 @@ test("run command Settings and chat lanes refuse onboarding before provider effe
     await client.await((frame) => frame.t === "event" && frame.e === "run"
       && (frame.event as { type: string }).type === "run-end");
 
+    await client.await(frame=>frame.t==='event'&&frame.e==='local-run.state'&&frame.active===false
+      &&(frame.candidate as {phase?:string})?.phase==='review');
     const command = client.request("command", { raw: "/model" });
     const picker = await client.await((frame) => frame.t === "ask" && frame.kind === "choice");
     const duringCommand = await client.request("onboarding.dispatch", onboarding());
@@ -1505,6 +1564,7 @@ test("run command Settings and chat lanes refuse onboarding before provider effe
       && (frame.view as { notice?: { code?: string } }).notice?.code === "saved");
     await client.request("settings.close");
 
+    await client.request('cancel');
     const rows = ((await client.request("chats.list")).result as {
       chats: { id: string; title: string }[];
     }).chats;
@@ -2788,427 +2848,109 @@ test("a slash line on an ARMED chat cannot launch the two-model run", async () =
   assert.deepEqual(client.result()?.crossModeAfter, { oneShot: false });
 });
 
-test("an armed chat routes a plain message through the Cross pair, echoed once", async () => {
-  const client = new GuiClient("cross-armed");
-  try {
+test("an armed GUI chat refuses unisolated Cross work before echo, workers or spending",async()=>{
+  const client=await withClient("cross-armed",async client=>{
     await client.handshake();
-    const started = await client.request("submit", { text: "make the parser strict" });
-    assert.equal(started.ok, true);
-    // The armed branch answers with its own shape, so a client can tell a
-    // Cross dispatch from a single-model run.
-    assert.deepEqual(started.result, { started: true, cross: true });
-
-    const crossCatalog = await client.request("catalog.search", { query: "cross" });
-    const crossRows = (crossCatalog.result as {
-      rows: Array<{ command?: string; presentation: { disabled?: { code: string } } }>;
-    }).rows;
-    const disabledCode = (command: string): string | undefined =>
-      crossRows.find((row) => row.command === command)?.presentation.disabled?.code;
-    for (const command of ["/cross status", "/cross stop", "/cross off"]) {
-      assert.equal(disabledCode(command), undefined, `${command} must remain available`);
+    for(const text of ["make the parser strict","and again"]){
+      const refused=await client.request("submit",{text});
+      assert.equal(refused.ok,false);assert.equal(refused.error?.code,"cross-local-copy-unavailable");
     }
-    for (const command of ["/cross run", "/cross models", "/cross swap"]) {
-      assert.equal(disabledCode(command), "cross-run-active", `${command} must stay blocked`);
+    assert.equal(client.events("transcript").filter(frame=>frame.role==="user").length,0);
+    assert.equal(client.events("run").length,0);
+    assert.equal(((await client.request("status.get")).result as {sessionUsd:number}).sessionUsd,0);
+  });
+  assert.equal(client.result()?.agentCalls,0);assert.equal(client.result()?.crossWorkersStarted,0);
+});
+test("an armed GUI Kimi pair is refused repeatedly before private claims or draft effects",async()=>{
+  const client=await withClient("cross-kimi-missing-claim",async client=>{
+    await client.handshake();
+    for(let attempt=0;attempt<2;attempt++){
+      const refused=await client.request("submit",{text:"keep this exact Kimi draft"});
+      assert.equal(refused.ok,false);assert.equal(refused.error?.code,"cross-local-copy-unavailable");
     }
-    const quitCatalog = await client.request("catalog.search", { query: "quit" });
-    const quitRow = (quitCatalog.result as {
-      rows: Array<{ command?: string; presentation: { disabled?: { code: string } } }>;
-    }).rows.find((row) => row.command === "/quit");
-    assert.equal(quitRow?.presentation.disabled, undefined, "/quit must remain available");
-
-    // FIX-19 finding 6: the message is echoed on the SUBMIT, once — a
-    // multi-model run the owner is paying for must not be invisible until it
-    // lands, and a blocked run publishes a notice rather than a turn.
-    const echoes = client.events("transcript")
-      .filter((frame) => frame.role === "user" && frame.content === "make the parser strict");
-    assert.equal(echoes.length, 1);
-
-    // While it runs, the lane is held: the same exclusion a single-model run
-    // gets, named for what actually blocks it.
-    const blocked = await client.request("submit", { text: "and again" });
-    assert.equal(blocked.ok, false);
-    assert.equal((blocked.error as { code: string }).code, "cross-run-active");
-    const wrongCommand = await client.request("command", { raw: "/diff", draft: "" });
-    assert.equal(wrongCommand.ok, false);
-    assert.equal((wrongCommand.error as { code: string }).code, "cross-run-active");
-    assert.match(
-      (wrongCommand.error as { message: string }).message,
-      /^Cross is already running\. Only \/cross status, \/cross stop, \/cross off, and \/quit are available while it runs\.$/,
-    );
-    // And the four that survive are reachable rather than refused generically.
-    const survivor = await client.request("command", { raw: "/cross status", draft: "" });
-    assert.equal(survivor.ok, true);
-
-    // Fix round 1: the shell goes away mid-Cross. A Cross run is not
-    // `state.runActive`, so teardown used to walk straight past it and the
-    // two workers kept spending into a pipe nobody reads. EOF must stop it
-    // and the process must end inside the drain bound — measured, because
-    // this exact case hung the first draft of this pin.
-    const began = Date.now();
-    const code = await client.endInput();
-    const elapsed = Date.now() - began;
-    assert.equal(code, 0, `exit code ${code} after ${elapsed}ms`);
-    assert.ok(elapsed < 15_000, `EOF took ${elapsed}ms to end a Cross run`);
-  } finally {
-    await client.stop();
-  }
+    assert.equal(client.events("draft").length,0);
+    assert.equal(client.events("transcript").filter(frame=>frame.role==="user").length,0);
+    assert.equal(client.frames.filter(frame=>frame.t==="ask").length,0);
+    assert.equal(client.events("native-local-action-required").length,0);
+  });
+  for(const key of ["agentCalls","crossWorkersStarted","providerCredentialCalls","genericCredentialCalls","sessionCostUsd"])
+    assert.equal(client.result()?.[key],0,key);
 });
-
-test("an armed GUI Kimi pair denied before its private claim restores its draft without an echo", async () => {
-  const client = new GuiClient("cross-kimi-missing-claim");
-  try {
+test("a bare /cross cannot reuse the preceding local task",async()=>{
+  const client=await withClient("cross",async client=>{
+    await client.handshake();await client.request("submit",{text:"message A"});
+    await client.await(frame=>frame.t==="event"&&frame.e==="local-run.state"&&frame.active===false
+      &&(frame.candidate as {phase?:string})?.phase==="review");
+    const mark=client.mark(),before=client.events("run").length;
+    const refused=await client.request("command",{raw:"/cross",draft:""});
+    assert.equal(refused.ok,false);assert.equal(refused.error?.code,"local-flow-required");
+    assert.equal(client.frames.slice(mark).some(frame=>frame.t==="ask"),false);
+    assert.equal(client.events("run").length,before);assert.equal(client.events("draft").length,0);
+  });
+  assert.equal(client.result()?.agentCalls,1);assert.equal(client.result()?.crossWorkersStarted,0);
+});
+test("refused legacy Cross entry does not consume or synthesize a captured draft",async()=>{
+  const client=await withClient("cross",async client=>{
     await client.handshake();
-    const task = "keep this exact Kimi draft";
-
-    for (let attempt = 1; attempt <= 2; attempt += 1) {
-      const mark = client.mark();
-      const started = await client.request("submit", { text: task });
-      assert.deepEqual(started.result, { started: true, cross: true });
-      const restored = await client.awaitAfter(mark, (frame) =>
-        frame.t === "event" && frame.e === "draft" && frame.text === task);
-      assert.deepEqual(
-        { text: restored.text, reason: restored.reason },
-        { text: task, reason: "fallback" },
-      );
-      await client.awaitAfter(mark, (frame) =>
-        frame.t === "event" && frame.e === "transcript" && frame.role === "error");
-      assert.equal(
-        client.frames.slice(mark).filter((frame) =>
-          frame.t === "event" && frame.e === "transcript"
-          && frame.role === "user" && frame.content === task).length,
-        0,
-        `attempt ${attempt} must not retain or consume a stale echo marker`,
-      );
+    for(const draft of ["rewrite the parser",""]){
+      const refused=await client.request("command",{raw:"/cross",draft});
+      assert.equal(refused.ok,false);assert.equal(refused.error?.code,"local-flow-required");
     }
-
-    assert.equal(client.events("draft").filter((frame) => frame.text === task).length, 2);
-    assert.equal(client.events("native-local-action-required").length, 0);
-    assert.equal(client.frames.filter((frame) => frame.t === "ask").length, 0);
-    await client.endInput();
-  } finally {
-    await client.stop();
-  }
-
-  assert.equal(client.result()?.agentCalls, 0);
-  assert.equal(client.result()?.crossWorkersStarted, 0);
-  assert.equal(client.result()?.providerCredentialCalls, 0);
-  assert.equal(client.result()?.genericCredentialCalls, 0);
-  assert.equal(client.result()?.sessionCostUsd, 0);
+    assert.equal(client.events("draft").length,0);assert.equal(client.frames.some(frame=>frame.t==="ask"),false);
+  });
+  assert.equal(client.result()?.agentCalls,0);assert.equal(client.result()?.crossWorkersStarted,0);
 });
-
-test("a bare /cross never presents the last message as the task", async () => {
-  await withClient("cross", async (client) => {
+test("a refused multiline command cannot arm a later Cross draft",async()=>{
+  await withClient("cross",async client=>{
     await client.handshake();
-    // A plain message, answered. In the terminal this writes NO draft: the
-    // draft slot is one-shot and only the palette fills it.
-    await client.request("submit", { text: "message A" });
-    await client.await((frame) =>
-      frame.t === "event" && frame.e === "run"
-      && (frame.event as { type?: string }).type === "run-end");
-
-    // Now a bare `/cross`, typed — the composer held the command itself, so
-    // there is no separate draft.
-    const opening = client.request("command", { raw: "/cross", draft: "" });
-    const gate = await client.await((frame) => frame.t === "ask" && frame.kind === "choice");
-    const items = gate.items as { value: string; description: string }[];
-    const everything = items.map((item) => item.description).join(" | ");
-    // The defect this pins: the gate priced and offered to re-run the
-    // message the model had already answered.
-    assert.equal(everything.includes("message A"), false, everything);
-    // What the terminal shows instead: an EMPTY draft, treated as one — the
-    // continuation task where there is history, the pending one-shot preview
-    // where there is not. Either is the honest reading; the message text is
-    // not.
-    assert.match(String(gate.task), /continue the current chat|waiting for your first message/);
-
-    client.send({ t: "answer", askId: gate.askId, value: null });
-    assert.equal((await opening).ok, true);
-    // Nothing to put back — there was nothing captured and nothing typed.
-    assert.equal(client.events("draft").length, 0);
+    const multiline=await client.request("command",{raw:"/diff\nand more",draft:"keep me"});
+    assert.equal(multiline.ok,false);assert.equal(multiline.error?.code,"multiline-command");
+    const refused=await client.request("command",{raw:"/cross",draft:""});
+    assert.equal(refused.ok,false);assert.equal(refused.error?.code,"local-flow-required");
+    assert.equal(client.events("draft").length,0);assert.equal(client.frames.some(frame=>frame.t==="ask"),false);
   });
 });
-
-test("a captured draft is consumed once and handed back when the gate is abandoned", async () => {
-  await withClient("cross", async (client) => {
+test("legacy GUI task aliases cannot bypass the local-copy flow",async()=>{
+  const client=await withClient("cross",async client=>{
     await client.handshake();
-    // What the palette does: it replaces the composer with `/cross` and
-    // carries the bytes that were there. One capture, one read.
-    const opening = client.request("command", { raw: "/cross", draft: "rewrite the parser" });
-    const gate = await client.await((frame) => frame.t === "ask" && frame.kind === "choice");
-    // With a real task there is no continuation preview — the owner can see
-    // what they typed.
-    assert.equal(gate.task, "rewrite the parser");
-
-    client.send({ t: "answer", askId: gate.askId, value: null });
-    assert.equal((await opening).ok, true);
-    // Abandoned: the captured text comes back, exactly as
-    // `restoreCrossCommandDraft` puts it back in the terminal.
-    const restored = client.events("draft").at(-1);
-    assert.equal(restored?.text, "rewrite the parser");
-    assert.equal(restored?.reason, "restore");
-
-    // ONE-SHOT: a second bare `/cross` must not see it again.
-    const again = client.request("command", { raw: "/cross", draft: "" });
-    const second = await client.await(
-      (frame) => frame.t === "ask" && frame.kind === "choice" && frame.askId !== gate.askId,
-    );
-    assert.equal(String(second.task).includes("rewrite the parser"), false);
-    client.send({ t: "answer", askId: second.askId, value: null });
-    assert.equal((await again).ok, true);
-  });
-});
-
-test("a refused command leaves the draft slot exactly as it found it", async () => {
-  await withClient("cross", async (client) => {
-    await client.handshake();
-    // A multi-line slash line is refused — and the refusal must not have
-    // armed the slot on its way out (the guard runs first).
-    const refused = await client.request("command", {
-      raw: "/cross\nand more",
-      draft: "keep me",
-    });
-    assert.equal(refused.ok, false);
-    assert.equal((refused.error as { code: string }).code, "multiline-command");
-
-    const opening = client.request("command", { raw: "/cross", draft: "" });
-    const gate = await client.await((frame) => frame.t === "ask" && frame.kind === "choice");
-    assert.equal(String(gate.task).includes("keep me"), false, String(gate.task));
-    client.send({ t: "answer", askId: gate.askId, value: null });
-    assert.equal((await opening).ok, true);
-  });
-});
-
-test("the Desktop Cross preflight starts with no implicit route, duration or price claim", async () => {
-  const client = await withClient("cross", async (client) => {
-    await client.handshake();
-    // G1 left `/cross` refused because no Cross runtime was wired. It is the
-    // dashboard's own runtime now, through the dashboard's own gate surface.
-    const opening = client.request("command", { raw: "/cross", draft: "rewrite the parser" });
-    const gate = await client.await((frame) => frame.t === "ask" && frame.kind === "choice");
-    assert.equal(gate.title, "Cross einrichten");
-    assert.equal(gate.presentation, "cross-preflight");
-    const items = gate.items as {
-      value: string;
-      label: string;
-      description: string;
-      descriptionParts?: string[];
-    }[];
-    assert.deepEqual(items.map((item) => item.value), [
-      "coding",
-      "review",
-      "swap",
-      "duration-one-task",
-      "duration-chat",
-      "start",
-    ]);
-    // Task 5B: even valid saved preferences do not become an implicit choice.
-    assert.equal(items[0]?.label, "Lead auswählen");
-    assert.equal(items[0]?.description, "Nicht ausgewählt");
-    assert.equal(items[1]?.label, "Challenger auswählen");
-    assert.equal(items[1]?.description, "Nicht ausgewählt");
-    const projected = await client.await((frame) => frame.t === "event" && frame.e === "cross"
-      && (frame.preflight as { duration?: unknown } | null)?.duration === null);
-    assert.deepEqual(projected.preflight, {
-      lead: null,
-      challenger: null,
-      duration: null,
-      estimatedCalls: { min: 4, max: 6 },
-      cost: { kind: "unknown", label: "Kosten unbekannt" },
-      startDisabled: {
-        code: "cross-selection-incomplete",
-        label: "Lead, Challenger und Dauer auswählen",
-        recoveryLabel: "Beide Modelle und Dauer wählen",
-      },
-    });
-
-    // Cancelling the gate hands the task text back rather than eating it
-    // (FIX-20 finding 6) — and nothing was started.
-    client.send({ t: "answer", askId: gate.askId, value: null });
-    assert.equal((await opening).ok, true);
-    const restored = client.events("draft").at(-1);
-    assert.equal(restored?.text, "rewrite the parser");
-  });
-  // The gate rendered model names; no fingerprint reached the wire.
-  assert.equal(client.stdout.includes("acct_or_SECRETCROSS"), false);
-});
-
-test("Desktop Cross keeps duration explicit, confirms both roles, then starts the exact pair", async () => {
-  const client = await withClient("cross-preflight", async (client) => {
-    await client.handshake();
-    const runEventsBefore = client.events("run").length;
-    const opening = client.request("command", { raw: "/cross", draft: "rewrite the parser" });
-    let gate = await client.await((frame) => frame.t === "ask" && frame.kind === "choice"
-      && frame.presentation === "cross-preflight");
-
-    let mark = client.mark();
-    client.send({ t: "answer", askId: gate.askId, value: "duration-one-task" });
-    gate = await client.awaitAfter(mark, (frame) => frame.t === "ask" && frame.kind === "choice"
-      && frame.presentation === "cross-preflight");
-    const durationOnly = await client.awaitAfter(mark, (frame) => frame.t === "event"
-      && frame.e === "cross"
-      && (frame.preflight as { duration?: unknown } | null)?.duration === "one-task");
-    assert.equal((durationOnly.preflight as { startDisabled: { code: string } }).startDisabled.code, "cross-selection-incomplete");
-
-    mark = client.mark();
-    client.send({ t: "answer", askId: gate.askId, value: "coding" });
-    const leadPicker = await client.awaitAfter(mark, (frame) => frame.t === "ask"
-      && frame.kind === "choice" && frame.presentation !== "cross-preflight");
-    const leadItem = (leadPicker.items as Array<{ value: string; label: string; description: string }>)[0]!;
-    const leadHandle = leadItem.value;
-    mark = client.mark();
-    client.send({ t: "answer", askId: leadPicker.askId, value: leadHandle });
-    gate = await client.awaitAfter(mark, (frame) => frame.t === "ask" && frame.kind === "choice"
-      && frame.presentation === "cross-preflight");
-
-    mark = client.mark();
-    client.send({ t: "answer", askId: gate.askId, value: "review" });
-    const challengerPicker = await client.awaitAfter(mark, (frame) => frame.t === "ask"
-      && frame.kind === "choice" && frame.presentation !== "cross-preflight");
-    const challengerItem = (challengerPicker.items as Array<{ value: string; label: string; description: string }>)
-      .find((item) => item.label !== leadItem.label);
-    assert.ok(challengerItem, "the challenger must be an explicit different route");
-    const challengerHandle = challengerItem.value;
-    mark = client.mark();
-    client.send({ t: "answer", askId: challengerPicker.askId, value: challengerHandle });
-    gate = await client.awaitAfter(mark, (frame) => frame.t === "ask" && frame.kind === "choice"
-      && frame.presentation === "cross-preflight");
-    const ready = await client.awaitAfter(mark, (frame) => frame.t === "event" && frame.e === "cross"
-      && frame.preflight !== null);
-    const preflight = ready.preflight as {
-      lead: {
-        providerLabel: string;
-        displayName: string;
-        accountLabel: string;
-        canonicalModelId: string;
-        reasoning: string;
-        capabilities: string[];
-      };
-      challenger: {
-        providerLabel: string;
-        displayName: string;
-        accountLabel: string;
-        canonicalModelId: string;
-        reasoning: string;
-        capabilities: string[];
-      };
-      duration: string;
-      startDisabled: unknown;
-    };
-    assert.equal(preflight.startDisabled, null);
-    assert.equal(preflight.duration, "one-task");
-    assert.equal(
-      preflight.lead.displayName,
-      preflight.challenger.displayName,
-      "display copy alone is deliberately ambiguous in this fixture",
-    );
-    assert.notEqual(
-      preflight.lead.canonicalModelId,
-      preflight.challenger.canonicalModelId,
-      "the exact chosen models still differ",
-    );
-    const leadPresentation = `${preflight.lead.providerLabel} · ${preflight.lead.accountLabel} · ${preflight.lead.displayName} · ${preflight.lead.canonicalModelId}`;
-    const challengerPresentation = `${preflight.challenger.providerLabel} · ${preflight.challenger.accountLabel} · ${preflight.challenger.displayName} · ${preflight.challenger.canonicalModelId}`;
-    assert.equal(leadItem.label, leadPresentation);
-    assert.equal(challengerItem.label, challengerPresentation);
-    assert.match(String(leadItem.description), /Denkmodus: unterstützt/);
-    assert.match(String(leadItem.description), /Fähigkeiten: Text · Werkzeuge/);
-
-    mark = client.mark();
-    client.send({ t: "answer", askId: gate.askId, value: "start" });
-    const confirm = await client.awaitAfter(mark, (frame) => frame.t === "ask" && frame.kind === "confirm");
-    assert.equal(confirm.title, "Cross starten?");
-    assert.match(String(confirm.consequence), new RegExp(`Lead: ${leadPresentation.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`));
-    assert.match(String(confirm.consequence), new RegExp(`Challenger: ${challengerPresentation.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`));
-    assert.match(String(confirm.consequence), /Denkmodus: unterstützt/);
-    assert.match(String(confirm.consequence), /Fähigkeiten: Text · Werkzeuge/);
-    assert.match(String(confirm.consequence), /Dauer: Nur diese Aufgabe/);
-    assert.match(String(confirm.consequence), /4–6 Modellaufrufe je Aufgabe/);
-    assert.match(String(confirm.consequence), /Kosten unbekannt|Mindestens \$/);
-    assert.equal(confirm.defaultAccept, false);
-
-    mark = client.mark();
-    client.send({ t: "answer", askId: confirm.askId, accepted: true });
-    assert.equal((await opening).ok, true);
-    const active = await client.awaitAfter(mark, (frame) => frame.t === "event" && frame.e === "cross"
-      && (frame.state as { active?: boolean } | null)?.active === true);
-    const activeState = active.state as {
-      active: boolean;
-      lead: typeof preflight.lead;
-      challenger: typeof preflight.challenger;
-      phase: string;
-    };
-    assert.equal(activeState.active, true);
-    assert.deepEqual(activeState.lead, {
-      providerLabel: preflight.lead.providerLabel,
-      accountLabel: preflight.lead.accountLabel,
-      displayName: preflight.lead.displayName,
-      canonicalModelId: preflight.lead.canonicalModelId,
-      reasoning: preflight.lead.reasoning,
-      capabilities: preflight.lead.capabilities,
-    });
-    assert.deepEqual(activeState.challenger, {
-      providerLabel: preflight.challenger.providerLabel,
-      accountLabel: preflight.challenger.accountLabel,
-      displayName: preflight.challenger.displayName,
-      canonicalModelId: preflight.challenger.canonicalModelId,
-      reasoning: preflight.challenger.reasoning,
-      capabilities: preflight.challenger.capabilities,
-    });
-    assert.notEqual(activeState.phase, "", "the live panel carries the coordinator's current phase");
-    const activeJson = JSON.stringify(activeState);
-    for (const privateField of ["providerId", "connectionId", "accountFingerprint", "backendId", "billingRealm"]) {
-      assert.equal(activeJson.includes(`\"${privateField}\"`), false, `${privateField} must not cross the wire`);
+    for(const raw of ["/cross","/cross models","  /cross task","/collab cross run","/collab cross models","/architect task","  /architect task"]){
+      const refused=await client.request("command",{raw,draft:"rewrite the parser"});
+      assert.equal(refused.ok,false,raw);assert.equal(refused.error?.code,"local-flow-required",raw);
     }
-    assert.equal(client.events("run").length, runEventsBefore, "Cross uses its coordinator lane, not a single-model run");
+    assert.equal(client.frames.some(frame=>frame.t==="ask"),false);
+    assert.equal(client.events("cross").some(frame=>frame.preflight!=null),false);
+    const catalog=await client.request('catalog.search',{query:'cross'});
+    const rows=(catalog.result as {rows:{command?:string;presentation:{disabled?:{code:string}}}[]}).rows;
+    for(const command of ['/cross run','/cross models'])
+      assert.equal(rows.find(row=>row.command===command)?.presentation.disabled?.code,'local-flow-required',command);
   });
-  assert.equal(client.result()?.crossPreferencePublishes, 1);
-  assert.equal(client.result()?.crossWorkersStarted, 2, "both confirmed routes reached the coordinator");
+  assert.equal(client.result()?.crossWorkersStarted,0);assert.equal(client.result()?.sessionArmCalls,0);
+  assert.equal(client.stdout.includes("acct_or_SECRETCROSS"),false);
 });
-
-test("declining the final Desktop Cross confirmation restores the draft with zero effects", async () => {
-  const client = await withClient("cross-preflight", async (client) => {
+test("legacy GUI Cross cannot publish preferences, arm or launch either model",async()=>{
+  const client=await withClient("cross-preflight",async client=>{
     await client.handshake();
-    const draft = "keep this exact draft";
-    const opening = client.request("command", { raw: "/cross", draft });
-    let gate = await client.await((frame) => frame.t === "ask" && frame.kind === "choice"
-      && frame.presentation === "cross-preflight");
-
-    let mark = client.mark();
-    client.send({ t: "answer", askId: gate.askId, value: "duration-chat" });
-    gate = await client.awaitAfter(mark, (frame) => frame.t === "ask" && frame.kind === "choice"
-      && frame.presentation === "cross-preflight");
-
-    let leadLabel: string | null = null;
-    for (const role of ["coding", "review"] as const) {
-      mark = client.mark();
-      client.send({ t: "answer", askId: gate.askId, value: role });
-      const picker = await client.awaitAfter(mark, (frame) => frame.t === "ask"
-        && frame.kind === "choice" && frame.presentation !== "cross-preflight");
-      const selected = (picker.items as Array<{ value: string; label: string }>).find((item) =>
-        role === "coding" || item.label !== leadLabel);
-      assert.ok(selected);
-      if (role === "coding") leadLabel = selected.label;
-      mark = client.mark();
-      client.send({ t: "answer", askId: picker.askId, value: selected.value });
-      gate = await client.awaitAfter(mark, (frame) => frame.t === "ask" && frame.kind === "choice"
-        && frame.presentation === "cross-preflight");
-    }
-
-    mark = client.mark();
-    client.send({ t: "answer", askId: gate.askId, value: "start" });
-    const confirm = await client.awaitAfter(mark, (frame) => frame.t === "ask" && frame.kind === "confirm");
-    mark = client.mark();
-    client.send({ t: "answer", askId: confirm.askId, accepted: false });
-    assert.equal((await opening).ok, true);
-    const restored = await client.awaitAfter(mark, (frame) => frame.t === "event"
-      && frame.e === "draft" && frame.text === draft);
-    assert.equal(restored.reason, "restore");
+    const refused=await client.request("command",{raw:"/cross",draft:"rewrite the parser"});
+    assert.equal(refused.ok,false);assert.equal(refused.error?.code,"local-flow-required");
+    assert.equal(client.frames.some(frame=>frame.t==="ask"),false);
+    assert.equal(client.events("cross").some(frame=>(frame.state as {active?:boolean})?.active),false);
+    assert.equal(client.events("run").length,0);
   });
-  assert.equal(client.result()?.crossPreferencePublishes, 0);
-  assert.equal(client.result()?.sessionArmCalls, 0);
-  assert.equal(client.result()?.crossWorkersStarted, 0);
+  for(const key of ["crossPreferencePublishes","sessionArmCalls","crossWorkersStarted","providerCredentialCalls"])
+    assert.equal(client.result()?.[key],0,key);
 });
-
+test("a forged confirmation after refused Cross cannot create execution authority",async()=>{
+  const client=await withClient("cross-preflight",async client=>{
+    await client.handshake();
+    const refused=await client.request("command",{raw:"/cross",draft:"keep this exact draft"});
+    assert.equal(refused.ok,false);assert.equal(refused.error?.code,"local-flow-required");
+    const mark=client.mark();client.send({t:"answer",askId:"no-such-confirmation",accepted:true});
+    await client.awaitAfter(mark,frame=>frame.t==='event'&&frame.e==='notice'&&frame.kind==='warn');
+    assert.equal(client.events("draft").length,0);assert.equal(client.frames.some(frame=>frame.t==="ask"),false);
+  });
+  assert.equal(client.result()?.crossPreferencePublishes,0);assert.equal(client.result()?.sessionArmCalls,0);
+  assert.equal(client.result()?.crossWorkersStarted,0);
+});
 test("chat.delete asks the command's own danger question, and a decline keeps the chat", async () => {
   await withClient("default", async (client) => {
     await client.handshake();
@@ -3741,19 +3483,16 @@ test("Settings GUI rejects a stale canonical picker epoch without mutation", asy
   assert.equal(client.result()?.legacyRouteCatalogCalls, 0);
 });
 
-test("GUI Cross is bound to the Desktop authority and opening then cancelling is passive", async () => {
-  const client = await withClient("cross", async (client) => {
+test("refused GUI Cross entry does not consult route pickers or credentials",async()=>{
+  const client=await withClient("cross",async client=>{
     await client.handshake();
-    const command = client.request("command", { raw: "/cross" });
-    const gate = await client.await((frame) => frame.t === "ask" && frame.kind === "choice");
-    client.send({ t: "answer", askId: gate.askId, value: null });
-    assert.equal((await command).ok, true);
+    const refused=await client.request("command",{raw:"/cross"});
+    assert.equal(refused.ok,false);assert.equal(refused.error?.code,"local-flow-required");
+    assert.equal(client.frames.some(frame=>frame.t==="ask"),false);
   });
-  assert.ok(Number(client.result()?.routePickerCaptureCalls) >= 2);
-  assert.equal(client.result()?.legacyRouteCatalogCalls, 0);
-  assert.equal(client.result()?.providerCredentialCalls, 0);
+  assert.equal(client.result()?.legacyRouteCatalogCalls,0);assert.equal(client.result()?.providerCredentialCalls,0);
+  assert.equal(client.result()?.crossWorkersStarted,0);
 });
-
 test("Settings keeps the onboarding authority while Cross fails closed without its route-picker authority", async () => {
   const client = await withClient("route-picker-missing-desktop", async (client) => {
     await client.handshake();
@@ -3764,7 +3503,8 @@ test("Settings keeps the onboarding authority while Cross fails closed without i
     const restored = await cancelSharedSettingsPicker(client, picker);
     assert.equal(restored.selectedCategoryId, "model");
     await client.request("settings.close");
-    await client.request("command", { raw: "/cross absent desktop" });
+    const refused=await client.request("command", { raw: "/cross absent desktop" });
+    assert.equal(refused.ok,false);assert.equal(refused.error?.code,'local-flow-required');
   });
   assert.equal(client.result()?.terminalOwnerAuthorityCalls, 0);
   assert.equal(client.result()?.terminalOwnerViewCalls, 0);
@@ -3774,33 +3514,21 @@ test("Settings keeps the onboarding authority while Cross fails closed without i
   assert.deepEqual(client.result()?.modelTransitions, []);
 });
 
-test("GUI Cross refuses a malicious disabled Kimi answer without consulting owner policy or effects", async () => {
-  const client = await withClient("cross-kimi-desktop", async (client) => {
+test("refused GUI Cross rejects a forged Kimi picker answer without owner effects",async()=>{
+  const client=await withClient("cross-kimi-desktop",async client=>{
     await client.handshake();
-    const command = client.request("command", { raw: "/cross" });
-    const gate = await client.await((frame) => frame.t === "ask" && frame.kind === "choice");
-    const afterGate = client.mark();
-    client.send({ t: "answer", askId: gate.askId, value: "coding" });
-    const models = await client.awaitAfter(afterGate, (frame) => frame.t === "ask" && frame.kind === "choice");
-    const kimi = (models.items as Array<{ value: string; label: string; disabled?: string }>)
-      .find((item) => item.label.includes("Kimi K3"))!;
-    assert.ok(kimi, `Desktop authority must expose the disabled Kimi row: ${JSON.stringify(models.items)}`);
-    const afterModels = client.mark();
-    client.send({ t: "answer", askId: models.askId, value: kimi.value });
-    const returnedGate = await client.awaitAfter(afterModels, (frame) => frame.t === "ask" && frame.kind === "choice");
-    client.send({ t: "answer", askId: returnedGate.askId, value: null });
-    assert.equal((await command).ok, true);
+    const refused=await client.request("command",{raw:"/cross"});
+    assert.equal(refused.ok,false);assert.equal(refused.error?.code,"local-flow-required");
+    const mark=client.mark();client.send({t:"answer",askId:"no-such-picker",value:"Kimi K3"});
+    await client.awaitAfter(mark,frame=>frame.t==='event'&&frame.e==='notice'&&frame.kind==='warn');
+    assert.equal(client.frames.some(frame=>frame.t==="ask"),false);
   });
-  assert.equal(client.result()?.ownerKimiRunnableBaseline, true);
-  assert.equal(client.result()?.terminalOwnerAuthorityCalls, 0);
-  assert.equal(client.result()?.terminalOwnerViewCalls, 0);
-  assert.equal(client.result()?.terminalOwnerResolveCalls, 0);
-  assert.equal(client.result()?.providerCredentialCalls, 0);
-  assert.equal(client.result()?.legacyRouteCatalogCalls, 0);
-  assert.deepEqual(client.result()?.modelTransitions, []);
-  assert.doesNotMatch(client.stdout + client.stderr, /accountFingerprint|billingRealm|credentialSlot|credentialBinding|pointer|homeId|codexHome|KIMI_OWNER_PRIVATE_CANARY/i);
+  assert.equal(client.result()?.ownerKimiRunnableBaseline,true);
+  for(const key of ["terminalOwnerAuthorityCalls","terminalOwnerViewCalls","terminalOwnerResolveCalls","providerCredentialCalls","legacyRouteCatalogCalls"])
+    assert.equal(client.result()?.[key],0,key);
+  assert.deepEqual(client.result()?.modelTransitions,[]);
+  assert.doesNotMatch(client.stdout+client.stderr,/accountFingerprint|billingRealm|credentialSlot|credentialBinding|pointer|homeId|codexHome|KIMI_OWNER_PRIVATE_CANARY/i);
 });
-
 test("GUI main uses canonical picker capabilities while compressor rechecks its current owner", async () => {
   const main = await withClient("route-picker-main-no-tools", async (client) => {
     await client.handshake();
@@ -3922,6 +3650,51 @@ test("no frame the server emits carries a fingerprint, a slot or an account id",
   }
 });
 
+test('local GUI journey uses real copy, real tools, real tests and confirmed Apply',async()=>{
+  await withClient('local-workcopy',async client=>{
+    await client.handshake();
+    const status=(await client.request('status.get')).result as {workspace:string};
+    await client.request('execution-policy.set',{key:'permissions',value:'automatic',revision:1});
+    const started=await client.request('submit',{text:'Write the local notes'});assert.equal(started.ok,true);
+    const settled=await client.await(frame=>frame.t==='event'&&frame.e==='local-run.state'&&frame.active===false
+      &&(frame.candidate as {phase?:string})?.phase==='review');
+    const candidate=settled.candidate as {candidateHandle:string;changes:unknown[]};assert.equal(candidate.changes.length,1);
+    await assert.rejects(readFile(join(status.workspace,'notes.md')));
+    const tested=await client.request('local-run.action',{action:'test',candidateHandle:candidate.candidateHandle});
+    assert.equal(tested.ok,true);assert.equal((tested.result as {verification:string}).verification,'passed');
+    const state=(await client.request('local-run.action',{action:'state'})).result as {candidate:{candidateHandle:string;tested:boolean}};
+    assert.equal(state.candidate.tested,true);
+    const applying=client.request('local-run.action',{action:'apply',candidateHandle:state.candidate.candidateHandle});
+    const confirm=await client.await(frame=>frame.t==='ask'&&frame.kind==='confirm');
+    client.send({t:'answer',askId:confirm.askId,accepted:true});
+    const applied=await applying;assert.equal(applied.ok,true,JSON.stringify(applied)+'\n'+client.stderr);
+    assert.equal(await readFile(join(status.workspace,'notes.md'),'utf8'),'local candidate\n');
+  });
+});
+
+test('Stop in the first submit batch starts no late worker',async()=>{
+  const client=await withClient('default',async client=>{
+    await client.handshake();
+    const [submitted,cancelled]=client.requestBatch([{t:'submit',payload:{text:'must not start'}},{t:'cancel'}]);
+    await submitted;assert.equal((await cancelled).ok,true);
+  });
+  assert.equal(client.result()?.agentCalls,0);
+});
+
+test('a stopped working copy refuses submit before starting another turn',async()=>{
+  const client=await withClient('local-workcopy',async client=>{
+    await client.handshake();
+    await client.request('execution-policy.set',{key:'permissions',value:'automatic',revision:1});
+    await client.request('submit',{text:'Write local notes'});
+    await client.await(frame=>frame.t==='event'&&frame.e==='local-run.state'&&frame.active===false
+      &&(frame.candidate as {phase?:string})?.phase==='review');
+    await client.request('cancel');
+    const refused=await client.request('submit',{text:'Must wait for explicit resume'});
+    assert.equal(refused.ok,false);assert.equal(refused.error?.code,'local-run-stopped');
+  });
+  assert.equal(client.result()?.agentCalls,1);
+});
+
 test("nothing but protocol lines ever reaches stdout", async () => {
   const client = await withClient("default", async (client) => {
     await client.handshake();
@@ -3929,6 +3702,8 @@ test("nothing but protocol lines ever reaches stdout", async () => {
     await client.await((frame) =>
       frame.t === "event" && frame.e === "run"
       && (frame.event as { type: string }).type === "run-end");
+    await client.await(frame=>frame.t==='event'&&frame.e==='local-run.state'&&frame.active===false
+      &&(frame.candidate as {phase?:string})?.phase==='review');
     // A command whose output `commands.ts` builds with `console.log` in the
     // plain sink — it must arrive as a `command-output` event, not as bytes.
     await client.request("command", { raw: "/help" });
@@ -5104,8 +4879,8 @@ test("describeRunFailure: the dashboard keeps safeMessage, the sidecar replaces 
   );
   assert.match(
     gui,
-    /const describeError = \(error: unknown\): string =>\s*\n?\s*context\.openRouter\.safePanelMessage\(error\);/,
-    "the wire describer is the detail-dropping renderer",
+    /const describeError = \(error: unknown\): string =>\s*\n?\s*localFailure\(error\)\?\.message\?\?context\.openRouter\.safePanelMessage\(error\);/,
+    "closed local codes have fixed copy; all other errors use the detail-dropping renderer",
   );
 });
 
@@ -5156,190 +4931,29 @@ test("non-exact GUI provider commands stay on the legacy command dispatcher", as
 // exists to tell apart are actually different states.
 // ---------------------------------------------------------------------------
 
-test("EOF stops a Cross run that is still running, and its workers die with it", async () => {
-  const client = new GuiClient("cross-slow");
-  try {
+test("EOF after a refused GUI Cross launch leaves no workers to orphan",async()=>{
+  const client=new GuiClient("cross-slow");
+  try{
     await client.handshake();
-    const started = await client.request("submit", { text: "make the parser strict" });
-    assert.deepEqual(started.result, { started: true, cross: true });
-    assert.equal(
-      client.events("transcript").filter((frame) =>
-        frame.role === "user" && frame.content === "make the parser strict").length,
-      1,
-      "the committed armed task is echoed exactly once before its live workers",
-    );
-
-    // Both workers are alive and holding a detached child each — the
-    // "two model workers spending into a pipe nobody reads" state itself.
-    await client.await(
-      (frame) => frame.t === "event"
-        && frame.e === "status"
-        && /cross/i.test(String(frame.text ?? "")),
-      10_000,
-    ).catch(() => undefined);
-    const held = await client.request("command", { raw: "/cross status", draft: "" });
-    assert.equal(held.ok, true);
-    // The lane is held, which is only true while the run really is in flight.
-    assert.equal((await client.request("submit", { text: "again" })).ok, false);
-
-    const began = Date.now();
-    const code = await client.endInput();
-    const elapsed = Date.now() - began;
-    assert.equal(code, 0, `exit code ${code} after ${elapsed}ms`);
-    assert.ok(elapsed < 15_000, `EOF took ${elapsed}ms to end a live Cross run`);
-  } finally {
-    await client.stop();
-  }
-
-  const summary = client.result();
-  // The discriminating facts: the workers really ran, and the stop path is
-  // what ended them. Without `stopAndDrainCrossRun` neither is true — the
-  // process does not reach this line at all, because nothing aborts them.
-  assert.equal(summary?.crossWorkersStarted, 2, "both roles reached a worker");
-  assert.equal(summary?.crossWorkersAborted, 2, "both were aborted, not abandoned");
-  // And the OS agrees: a worker's own detached child is gone, so a SIGKILLed
-  // sidecar's orphan story never starts.
-  for (const pid of summary?.crossWorkerPids as number[]) {
-    assert.throws(
-      () => process.kill(pid, 0),
-      /ESRCH/,
-      `a Cross worker's tool child (${pid}) outlived the engine`,
-    );
-  }
+    const refused=await client.request("submit",{text:"make the parser strict"});
+    assert.equal(refused.ok,false);assert.equal(refused.error?.code,"cross-local-copy-unavailable");
+    const began=Date.now();assert.equal(await client.endInput(),0);
+    assert.ok(Date.now()-began<15000);
+  }finally{await client.stop();}
+  assert.equal(client.result()?.crossWorkersStarted,0);assert.deepEqual(client.result()?.crossWorkerPids,[]);
 });
-
-test("an already-armed Cross run keeps exact safe route facts and exposes settled catalog actions", async () => {
-  const client = new GuiClient("cross-slow");
-  try {
+// Active Cross stop/drain remains covered by cross-runtime and coordinator tests.
+test("an armed GUI chat keeps safe status and off actions but cannot start legacy work",async()=>{
+  const client=await withClient("cross-slow",async client=>{
     await client.handshake();
-    await client.request("submit", { text: "make the parser strict" });
-    const frame = await client.await(
-      (candidate) => candidate.t === "event"
-        && candidate.e === "cross"
-        && (candidate.state as { active?: boolean } | null)?.active === true,
-      10_000,
-    );
-    const state = frame.state as Record<string, unknown>;
-    assert.deepEqual(
-      Object.keys(state).sort(),
-      ["active", "challenger", "lead", "phase", "reason", "sequence", "updatedAt", "verification"],
-    );
-    assert.ok((state.sequence as number) > 0);
-    assert.equal(typeof state.phase, "string");
-    assert.notEqual(state.phase, "", "the live Cross journey exposes its current phase");
-    assert.deepEqual(state.lead, {
-      providerLabel: "OpenRouter",
-      accountLabel: "Persönliches OpenRouter",
-      displayName: "GUI Main",
-      canonicalModelId: "vendor/gui-main",
-      reasoning: "supported",
-      capabilities: ["text", "tools"],
-    });
-    assert.deepEqual(state.challenger, {
-      providerLabel: "OpenRouter",
-      accountLabel: "Persönliches OpenRouter",
-      displayName: "GUI Main",
-      canonicalModelId: "vendor/gui-alternate",
-      reasoning: "supported",
-      capabilities: ["text", "tools"],
-    });
-    const liveJson = JSON.stringify(state);
-    for (const privateField of ["providerId", "connectionId", "accountFingerprint", "backendId", "billingRealm"]) {
-      assert.equal(liveJson.includes(`\"${privateField}\"`), false, `${privateField} must not cross the wire`);
-    }
-
-    // While active the real catalog still locks route mutation and leaves
-    // Stop/Status available. This is the same availability the panel uses.
-    const activeCatalog = await client.request("catalog.search", { query: "cross" });
-    const activeRows = (activeCatalog.result as {
-      rows: Array<{ command?: string; presentation: { disabled?: { code: string } } }>;
-    }).rows;
-    const activeCode = (raw: string): string | undefined =>
-      activeRows.find((row) => row.command === raw)?.presentation.disabled?.code;
-    assert.equal(activeCode("/cross models"), "cross-run-active");
-    assert.equal(activeCode("/cross swap"), "cross-run-active");
-    assert.equal(activeCode("/cross status"), undefined);
-    assert.equal(activeCode("/cross stop"), undefined);
-    assert.equal(
-      activeRows.filter((row) => row.command === "/cross stop").length,
-      1,
-      "the active panel exposes exactly one canonical Stop action",
-    );
-
-    let mark = client.mark();
-    const stopped = await client.request("command", { raw: "/cross stop", draft: "" });
-    assert.equal(stopped.ok, true);
-    assert.equal(client.frames.slice(mark).filter((candidate) => candidate.t === "response").length, 1);
-    const settled = await client.awaitAfter(mark, (candidate) => candidate.t === "event"
-      && candidate.e === "cross"
-      && (candidate.state as { active?: boolean } | null)?.active === false);
-    const settledState = settled.state as Record<string, unknown>;
-    assert.deepEqual(settledState.lead, state.lead);
-    assert.deepEqual(settledState.challenger, state.challenger);
-    assert.deepEqual(settledState.selection, {
-      lead: state.lead,
-      challenger: state.challenger,
-    });
-    assert.ok((settledState.sequence as number) >= (state.sequence as number));
-
-    const settledCatalog = await client.request("catalog.search", { query: "cross" });
-    const settledRows = (settledCatalog.result as {
-      rows: Array<{ command?: string; presentation: { disabled?: { code: string } } }>;
-    }).rows;
-    for (const raw of ["/cross models", "/cross swap", "/cross status"]) {
-      assert.equal(
-        settledRows.find((row) => row.command === raw)?.presentation.disabled,
-        undefined,
-        `${raw} must be actionable from the settled panel`,
-      );
-    }
-
-    // Each direct panel action enters the existing command catalog exactly
-    // once. `/cross models` is cancelled at its first real gate, proving the
-    // command reached the shared preflight without arming or starting again.
-    mark = client.mark();
-    const models = client.request("command", { raw: "/cross models", draft: "" });
-    const modelsGate = await client.awaitAfter(mark, (candidate) => candidate.t === "ask"
-      && candidate.kind === "choice" && candidate.presentation === "cross-preflight");
-    assert.equal(client.frames.slice(mark).filter((candidate) => candidate.t === "ask"
-      && candidate.kind === "choice" && candidate.presentation === "cross-preflight").length, 1);
-    client.send({ t: "answer", askId: modelsGate.askId, value: null });
-    assert.equal((await models).ok, true);
-    assert.equal(client.frames.slice(mark).filter((candidate) => candidate.t === "response").length, 1);
-
-    mark = client.mark();
-    const swapped = await client.request("command", { raw: "/cross swap", draft: "" });
-    assert.equal(swapped.ok, true);
-    assert.equal(client.frames.slice(mark).filter((candidate) => candidate.t === "response").length, 1);
-    const swappedPanel = await client.awaitAfter(mark, (candidate) => candidate.t === "event"
-      && candidate.e === "cross"
-      && (candidate.state as { selection?: { lead?: { canonicalModelId?: string } } } | null)
-        ?.selection?.lead?.canonicalModelId === "vendor/gui-alternate");
-    const swappedState = swappedPanel.state as {
-      lead: unknown;
-      challenger: unknown;
-      selection: { lead: unknown; challenger: unknown };
-    };
-    assert.deepEqual(swappedState.lead, state.lead, "the last run must not be relabelled by a later swap");
-    assert.deepEqual(swappedState.challenger, state.challenger, "the last run must not be relabelled by a later swap");
-    assert.deepEqual(swappedState.selection, {
-      lead: state.challenger,
-      challenger: state.lead,
-    }, "the current selection must make the swap visible");
-
-    mark = client.mark();
-    const status = await client.request("command", { raw: "/cross status", draft: "" });
-    assert.equal(status.ok, true);
-    assert.equal(client.frames.slice(mark).filter((candidate) => candidate.t === "response").length, 1);
-    assert.equal(client.frames.slice(mark).filter((candidate) => candidate.t === "event"
-      && candidate.e === "transcript" && candidate.role === "system" && candidate.meta === "Cross").length, 1);
-  } finally {
-    await client.stop();
-  }
-  assert.equal(client.result()?.crossWorkersStarted, 2);
-  assert.equal(client.result()?.crossWorkersAborted, 2);
-  assert.equal(client.result()?.crossPreferencePublishes, 1, "the one swap command publishes once");
-  // No private route identity reached the wire in either live or settled state.
-  assert.ok(!client.stdout.includes("SECRETCROSSLEADCANARY"));
-  assert.ok(!client.stdout.includes("SECRETCROSSCHALLENGERCANARY"));
+    const refused=await client.request("submit",{text:"make the parser strict"});
+    assert.equal(refused.ok,false);assert.equal(refused.error?.code,"cross-local-copy-unavailable");
+    const models=await client.request("command",{raw:"/cross models",draft:""});
+    assert.equal(models.ok,false);assert.equal(models.error?.code,"local-flow-required");
+    for(const raw of ["/cross status","/cross stop","/cross off"])
+      assert.equal((await client.request("command",{raw,draft:""})).ok,true,raw);
+    assert.equal(client.events("cross").some(frame=>(frame.state as {active?:boolean})?.active),false);
+  });
+  assert.equal(client.result()?.crossWorkersStarted,0);
+  assert.ok(!client.stdout.includes("SECRETCROSSLEADCANARY"));assert.ok(!client.stdout.includes("SECRETCROSSCHALLENGERCANARY"));
 });

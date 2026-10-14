@@ -21,6 +21,7 @@ import {
   type ProviderSetupStateV1,
   type ProviderStateCommitRequest,
   validateProviderSetupState,
+  validateRouteIdentityV1,
 } from "../src/provider-state.js";
 import { DEFAULT_CONFIG, saveConfig } from "../src/config.js";
 
@@ -37,6 +38,15 @@ function legacyConnectionFixture(): ProviderConnectionStateV1 {
     lastHealth: null,
   };
 }
+
+test("Nano-GPT route decoding rejects cross-provider realms, aliases and unverified defaults", () => {
+  const route = { version: 1, backendId: "nano-gpt", accountFingerprint: "acct_nano_fixture", billingRealm: "nanogpt-subscription", requestedModelId: "vendor/manual", canonicalModelId: "vendor/manual", resolutionState: "resolved" };
+  assert.deepEqual(validateRouteIdentityV1(route), route);
+  assert.equal(validateRouteIdentityV1({ ...route, billingRealm: "openrouter-payg" }), null);
+  assert.equal(validateRouteIdentityV1({ ...route, canonicalModelId: "vendor/other" }), null);
+  assert.equal(validateRouteIdentityV1({ ...route, canonicalModelId: null, resolutionState: "legacy-unverified" }), null);
+  assert.equal(validateRouteIdentityV1({ ...route, backendId: "openrouter" }), null);
+});
 
 function currentConnectionFixture(
   overrides: Partial<ProviderConnectionStateV3> = {},
@@ -66,6 +76,37 @@ function legacyConfigFixture() {
       "vendor/a/b": { mode: "effort", effort: "high" as const },
     },
   };
+}
+
+for (const billingRealm of ["nanogpt-subscription", "nanogpt-payg"] as const) {
+  test(`Nano-GPT V3 state roundtrips ${billingRealm} and rejects foreign credential slots`, () => {
+    const state = {
+      ...createNeverConfiguredProviderState(),
+      lifecycle: "configured" as const,
+      connections: [{
+        ...currentConnectionFixture(),
+        backendId: "nano-gpt",
+        maturity: "preview",
+        credentialBinding: { kind: "orcode-keychain", pointer: "v1:nano-gpt:018f8d77-2d52-7cc0-8f6a-9fb1f3fc0711" },
+        accountFingerprint: "acct_nano_fixture",
+        accountFingerprintState: "verified",
+        billingRealm,
+      }],
+      defaultRoute: {
+        version: 1, backendId: "nano-gpt", accountFingerprint: "acct_nano_fixture", billingRealm,
+        requestedModelId: "vendor/manual-model", canonicalModelId: "vendor/manual-model", resolutionState: "resolved",
+      },
+    };
+    assert.deepEqual(validateProviderSetupState(JSON.parse(JSON.stringify(state))), state);
+    for (const kind of ["inference", "management", "kimi-code"]) {
+      const foreign = structuredClone(state);
+      foreign.connections[0]!.credentialBinding.pointer = `v1:${kind}:018f8d77-2d52-7cc0-8f6a-9fb1f3fc0711`;
+      assert.deepEqual(validateProviderSetupState(foreign), { kind: "corrupt" });
+    }
+    const wrongRealm = structuredClone(state);
+    wrongRealm.connections[0]!.billingRealm = "openrouter-payg" as typeof billingRealm;
+    assert.deepEqual(validateProviderSetupState(wrongRealm), { kind: "corrupt" });
+  });
 }
 
 test("a missing nested state in an existing config migrates OpenRouter without network or key reads", () => {

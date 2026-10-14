@@ -137,6 +137,10 @@ export class EngineBridge {
     return await invoke<string>("engine_stop");
   }
 
+  async chooseProject():Promise<string|null> {
+    return await invoke<string|null>('project_choose');
+  }
+
   /** One request, one response. Rejects with the engine's own error body. */
   request<T = unknown>(t: string, payload: Record<string, unknown> = {}): Promise<T> {
     this.#sequence += 1;

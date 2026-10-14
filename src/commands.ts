@@ -378,10 +378,10 @@ export interface ProviderRouteIntentPort {
   ): Promise<void>;
 }
 
-export type ProviderCommandBackendId = "openrouter" | "kimi-code" | "anthropic";
+export type ProviderCommandBackendId = "openrouter" | "kimi-code" | "nano-gpt" | "anthropic";
 
 /** Backends the pure command domain can address with account mutations today. */
-export type ProviderCommandConnectableBackendId = "openrouter" | "kimi-code";
+export type ProviderCommandConnectableBackendId = "openrouter" | "kimi-code" | "nano-gpt";
 
 export type ProviderCommandIntent =
   | { kind: "setup" }
@@ -407,7 +407,7 @@ export interface ProviderCommandStatusEntry {
    */
   configuration: "enabled" | "disabled" | "not-connected";
   maturity: "stable" | "preview" | "coming-soon";
-  billingRealm: "openrouter-payg" | "kimi-code-membership-provider-managed-overage" | "none";
+  billingRealm: "openrouter-payg" | "kimi-code-membership-provider-managed-overage" | "nanogpt-subscription" | "nanogpt-payg" | "none";
   accountFingerprintSuffix: string | null;
   headline: string | null;
   health: {
@@ -945,13 +945,18 @@ export async function handleSlashCommand(
     command === "compress"
     && (args[0] ?? "").toLowerCase() === "model"
   );
+  const activeBackend = kimiOnlyUnsupported || command === "think"
+    ? currentCommandBackend(dispatchContext) : null;
   if (
     kimiOnlyUnsupported
-    && currentCommandBackend(dispatchContext) === "kimi-code"
+    && (activeBackend === "kimi-code" || activeBackend === "nano-gpt")
   ) {
     throw new Error(
-      `${command === "image" ? "Images" : command === "whisper" ? "Voice and transcription" : command === "panel" ? "Panel" : command === "web" ? "Web" : command === "compress" ? "Summarizer model choice" : command === "fallback" ? "Fallback models" : "This OpenRouter feature"} isn't available yet in orcode with a Kimi Code subscription.`,
+      `${command === "image" ? "Images" : command === "whisper" ? "Voice and transcription" : command === "panel" ? "Panel" : command === "web" ? "Web" : command === "compress" ? "Summarizer model choice" : command === "fallback" ? "Fallback models" : "This OpenRouter feature"} isn't available yet in orcode with ${activeBackend === "nano-gpt" ? "Nano-GPT" : "a Kimi Code subscription"}.`,
     );
+  }
+  if (activeBackend === "nano-gpt" && command === "think") {
+    throw new Error("Nano-GPT reasoning overrides are not supported yet; choose the model explicitly with /model.");
   }
 
   switch (command) {
@@ -2210,18 +2215,19 @@ async function modelCommand(args: string[], context: CommandContext): Promise<vo
     if (crossDisarmNotice) context.out.text(theme.color("warn")(crossDisarmNotice));
     return;
   }
-  const kimiRoute = currentCommandBackend(context) === "kimi-code";
-  if (kimiRoute) {
-    if (!context.providerCommands) throw new Error("Kimi Code provider control is not available.");
+  const modelBackend = currentCommandBackend(context);
+  if (modelBackend === "kimi-code" || modelBackend === "nano-gpt") {
+    const label = providerDisplayName(modelBackend);
+    if (!context.providerCommands) throw new Error(`${label} provider control is not available.`);
     if (!id) {
       const result = await context.providerCommands.execute(
-        { kind: "models", backendId: "kimi-code" },
+        { kind: "models", backendId: modelBackend },
         context.providerRouteSurface ?? "plain",
       );
-      if (result.kind !== "models") throw new Error("Kimi Code models are not available.");
+      if (result.kind !== "models" || result.backendId !== modelBackend) throw new Error(`${label} models are not available.`);
       context.out.text(result.models.length
         ? result.models.map((model) => `${model.displayName} · ${model.canonicalModelId}`).join("\n")
-        : "No usable Kimi Code models available.");
+        : `No usable ${label} models available.`);
       return;
     }
     if (id.toLowerCase() === "current") {
@@ -2402,13 +2408,15 @@ function runTransitionCatalog<T>(
 
 async function modelsCommand(args: string[], context: CommandContext): Promise<void> {
   const query = args.join(" ");
-  if (currentCommandBackend(context) === "kimi-code") {
-    if (!context.providerCommands) throw new Error("Kimi Code provider control is not available.");
+  const backend = currentCommandBackend(context);
+  if (backend === "kimi-code" || backend === "nano-gpt") {
+    const label = providerDisplayName(backend);
+    if (!context.providerCommands) throw new Error(`${label} provider control is not available.`);
     const result = await context.providerCommands.execute(
-      { kind: "models", backendId: "kimi-code" },
+      { kind: "models", backendId: backend },
       context.providerRouteSurface ?? "plain",
     );
-    if (result.kind !== "models") throw new Error("Kimi Code models are not available.");
+    if (result.kind !== "models" || result.backendId !== backend) throw new Error(`${label} models are not available.`);
     const wanted = query.trim().toLowerCase();
     const models = result.models.filter((model) => !wanted
       || `${model.displayName} ${model.requestedModelId} ${model.canonicalModelId}`
@@ -2422,8 +2430,8 @@ async function modelsCommand(args: string[], context: CommandContext): Promise<v
       // a provider fact, not a search miss — no command hint would be honest
       // there, so it stays a plain statement.
       : wanted
-        ? `No Kimi Code models matched "${query}" ${commandTheme(context).glyph("emdash")} /models with no search shows them all.`
-        : "No usable Kimi Code models available.");
+        ? `No ${label} models matched "${query}" ${commandTheme(context).glyph("emdash")} /models with no search shows them all.`
+        : `No usable ${label} models available.`);
     return;
   }
   const models = mainModelCandidates(
@@ -4934,6 +4942,10 @@ async function webCommand(args: string[], context: CommandContext): Promise<void
 
 async function providerCommand(args: string[], context: CommandContext): Promise<void> {
   const action = (args[0] ?? "").toLowerCase();
+  if (action && !isProviderAccountAction(PROVIDER_ACTION_ALIASES[action] ?? action)
+    && currentCommandBackend(context) === "nano-gpt") {
+    throw new Error("OpenRouter routing options are not available with Nano-GPT; use /provider setup or /model.");
+  }
   if (!action) {
     printProviderStatus(context);
     return;
@@ -5047,6 +5059,7 @@ const PROVIDER_BACKEND_ACTION_ORDER = [
 const PROVIDER_DISPLAY_NAMES: Readonly<Record<ProviderCommandBackendId, string>> = Object.freeze({
   openrouter: "OpenRouter",
   "kimi-code": "Kimi Code",
+  "nano-gpt": "Nano-GPT",
   anthropic: "Anthropic",
 });
 
@@ -5065,6 +5078,9 @@ export const PROVIDER_BACKEND_ACTIONS: Readonly<Record<ProviderCommandBackendId,
   ]),
   "kimi-code": immutableReadonlySet<ProviderBackendAction>([
     "connect", "enable", "disable", "reconnect", "models", "logout",
+  ]),
+  "nano-gpt": immutableReadonlySet<ProviderBackendAction>([
+    "connect", "enable", "disable", "disconnect", "reconnect", "models", "logout",
   ]),
   anthropic: immutableReadonlySet<ProviderBackendAction>([
     "connect", "enable", "disable", "disconnect", "reconnect", "models", "logout",
@@ -5100,7 +5116,7 @@ function isProviderAccountAction(value: string): value is ProviderAccountAction 
 }
 
 function isProviderCommandBackendId(value: string | undefined): value is ProviderCommandBackendId {
-  return value === "openrouter" || value === "kimi-code" || value === "anthropic";
+  return value === "openrouter" || value === "kimi-code" || value === "nano-gpt" || value === "anthropic";
 }
 
 async function providerAccountCommand(
@@ -5348,7 +5364,7 @@ function renderProviderStatusList(
     // OpenRouter's `selectedModel` can be non-null too, but showing it here
     // was never part of OpenRouter's status line before this rewrite, and
     // F4 is a copy/format pass, not a scope change to what gets shown.
-    if (provider.backendId === "kimi-code" && provider.selectedModel) {
+    if ((provider.backendId === "kimi-code" || provider.backendId === "nano-gpt") && provider.selectedModel) {
       lines.push({
         spans: [
           span("    Model: ", "muted"),
@@ -5396,7 +5412,7 @@ function renderProviderCommandResult(
   if (result.kind === "setup") {
     // OpenRouter output stays byte-identical; a Kimi setup/connect result is
     // rendered under its own name and never relabeled as OpenRouter.
-    const prefix = result.backendId === "kimi-code" ? "Kimi Code · " : "";
+    const prefix = result.backendId !== "openrouter" ? `${providerDisplayName(result.backendId)} · ` : "";
     out.text(`${prefix}Provider setup: ${result.outcome}`);
     return;
   }
@@ -5410,9 +5426,7 @@ function renderProviderCommandResult(
       ? result.models.map((model) =>
           `${model.displayName} · ${model.requestedModelId} · ${model.canonicalModelId}`
         ).join("\n")
-      : result.backendId === "kimi-code"
-        ? "No usable Kimi Code models available."
-        : "No usable OpenRouter models available.");
+      : `No usable ${providerDisplayName(result.backendId)} models available.`);
     return;
   }
   if (result.kind === "reconnected") {

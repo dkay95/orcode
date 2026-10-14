@@ -189,6 +189,8 @@ export interface SettingsRouteProjection {
   readonly billingRealm:
     | "openrouter-payg"
     | "kimi-code-membership-provider-managed-overage"
+    | "nanogpt-subscription"
+    | "nanogpt-payg"
     | "none";
 }
 
@@ -236,6 +238,8 @@ export interface SettingsProviderProjection {
   readonly billingRealm:
     | "openrouter-payg"
     | "kimi-code-membership-provider-managed-overage"
+    | "nanogpt-subscription"
+    | "nanogpt-payg"
     | "none";
   readonly headline: SettingsProviderHeadline | null;
   readonly health: SettingsProviderHealthProjection | null;
@@ -337,6 +341,7 @@ export interface SettingsAuthoritativeSnapshot {
 const PROVIDER_BACKEND_ORDER = [
   "openrouter",
   "kimi-code",
+  "nano-gpt",
   "anthropic",
 ] as const satisfies readonly ProviderCommandBackendId[];
 
@@ -405,6 +410,12 @@ const GLYPH_MODE_CHOICES = [
 const READONLY_EDITOR = Object.freeze({ kind: "readonly" } as const);
 const KIMI_EXTERNAL_MODEL_ROLE_UNSUPPORTED =
   "Kimi Code doesn't support this external model role; an OpenRouter route is required";
+const NANO_UNSUPPORTED_CONTROL = "Nano-GPT does not support this control; choose the main model manually";
+const NANO_UNSUPPORTED_CONTROLS: ReadonlySet<SettingsItemId> = new Set([
+  "compressor-model", "reasoning", "reasoning-compressor", "panel-models", "panel-judge",
+  "transcription-model", "web-mode", "provider-sort", "provider-fallback",
+  "provider-data-collection", "provider-only", "provider-ignore",
+]);
 const CROSS_ALIASES = ["cross", "lead", "challenger", "review"] as const;
 const CROSS_UNAVAILABLE_FALLBACK = "Cross is unavailable";
 const CROSS_SWAP_INCOMPLETE = "Both roles must be set before swapping";
@@ -1203,7 +1214,9 @@ function item(snapshot: SettingsAuthoritativeSnapshot, input: ItemInput): Settin
     && input.affectsActiveRun
     && editor.kind !== "readonly"
     ? "Run active"
-    : input.disabledReason;
+    : snapshot.route?.backendId === "nano-gpt" && NANO_UNSUPPORTED_CONTROLS.has(input.id)
+      ? NANO_UNSUPPORTED_CONTROL
+      : input.disabledReason;
   return Object.freeze({
     id: input.id,
     categoryId: input.categoryId,
@@ -1449,6 +1462,10 @@ export function billingRealmLabel(billingRealm: SettingsProviderProjection["bill
       return "API Pay-as-you-go";
     case "kimi-code-membership-provider-managed-overage":
       return "Subscription · provider-managed";
+    case "nanogpt-subscription":
+      return "Nano-GPT Abo · kein Guthaben-Fallback";
+    case "nanogpt-payg":
+      return "Nano-GPT Guthaben · Pay-as-you-go";
     case "none":
       return "No billing";
     default:
@@ -1575,6 +1592,8 @@ function providerAliases(backendId: ProviderCommandBackendId): readonly string[]
       return ["openrouter", "api", "payg"];
     case "kimi-code":
       return ["kimi", "kimi code", "abo", "membership"];
+    case "nano-gpt":
+      return ["nano", "nano-gpt", "nanogpt", "abo", "guthaben", "payg"];
     case "anthropic":
       return ["anthropic", "claude"];
     default:

@@ -15,6 +15,8 @@ export const PROVIDER_SETUP_SCHEMA_VERSION = 3 as const;
 
 const BILLING_REALMS: readonly BillingRealm[] = [
   "openrouter-payg",
+  "nanogpt-subscription",
+  "nanogpt-payg",
   "kimi-code-membership-provider-managed-overage",
   "chatgpt-subscription-provider-managed-overage",
   "chatgpt-account-provider-managed-limits",
@@ -748,10 +750,10 @@ function hasValidCredentialSlot(
   credentialSlot: string,
   schemaVersion: 1 | 2,
 ): boolean {
-  if (backendId === "kimi-code") {
+  if (backendId === "kimi-code" || backendId === "nano-gpt") {
     if (schemaVersion !== 2) return false;
     try {
-      return parseCredentialSlotRef(credentialSlot).kind === "kimi-code";
+      return parseCredentialSlotRef(credentialSlot).kind === backendId;
     } catch {
       return false;
     }
@@ -806,6 +808,11 @@ function matchesBackendContract(
       && connection.maturity === "preview"
       && connection.billingRealm === "kimi-code-membership-provider-managed-overage";
   }
+  if (connection.backendId === "nano-gpt") {
+    return schemaVersion !== 1
+      && connection.maturity === "preview"
+      && (connection.billingRealm === "nanogpt-subscription" || connection.billingRealm === "nanogpt-payg");
+  }
   return false;
 }
 
@@ -837,6 +844,10 @@ function isRouteIdentityV1(value: unknown): value is RouteIdentityV1 {
     && nonEmptyString(value.accountFingerprint)
     && isBillingRealm(value.billingRealm)
     && nonEmptyString(value.requestedModelId)
+    && (value.backendId === "nano-gpt"
+      ? (value.billingRealm === "nanogpt-subscription" || value.billingRealm === "nanogpt-payg")
+        && value.resolutionState === "resolved" && value.requestedModelId === value.canonicalModelId
+      : value.billingRealm !== "nanogpt-subscription" && value.billingRealm !== "nanogpt-payg")
     && (value.canonicalModelId === null || nonEmptyString(value.canonicalModelId))
     && (value.resolutionState === "legacy-unverified" || value.resolutionState === "resolved")
     && (value.resolutionState !== "resolved" || value.canonicalModelId !== null)
@@ -890,7 +901,7 @@ const PRIVATE_PROVIDER_STATE_VALUES = [
   /^codex-[0-9a-f]{32}$/,
   /^keychain-pointer-canary$/,
   /^legacy:inference$/,
-  /^v1:(?:inference|kimi-code):[0-9a-f-]{36}$/,
+  /^v1:(?:inference|kimi-code|nano-gpt):[0-9a-f-]{36}$/,
   /(?:^|\/)provider-home(?:-|\/|$)/,
   /(?:^|\/)providers\/codex\/codex-[0-9a-f]{32}\/?$/,
 ];

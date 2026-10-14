@@ -123,6 +123,10 @@ export const GUI_REQUEST_TYPES = Object.freeze([
   "settings.open",
   "settings.dispatch",
   "desktop.snapshot.get",
+  "official-cli.action",
+  "local-run.action",
+  "execution-policy.set",
+  "project.open",
   "onboarding.dispatch",
   "settings.close",
   "answer",
@@ -152,6 +156,7 @@ export const GUI_EVENT_NAMES = Object.freeze([
   "settings.view",
   "settings.closed",
   "desktop.snapshot",
+  "local-run.state",
   "onboarding.view",
   "activity",
   "native-local-action-required",
@@ -628,6 +633,22 @@ export function parseOnboardingIntent(value: unknown): DesktopOnboardingIntent {
   return parseDesktopOnboardingIntent((value as Record<string, unknown>).intent);
 }
 
+export function parseOfficialCliRequest(value: unknown): {
+  provider:'codex'|'claude'|'kimi'; action:'check'|'install'|'login'|'open-external'; revision:number; generation:number;
+} {
+  requireV2Request(value,'official-cli.action');
+  const record = requireRecord(value);
+  if (Object.keys(record).some(key=>!['v','t','id','provider','action','revision','generation'].includes(key))) {
+    throw new Error('invalid-manufacturer-action');
+  }
+  const revision = numberValue(record.revision), generation = numberValue(record.generation);
+  if (!Number.isSafeInteger(revision) || revision < 0 || !Number.isSafeInteger(generation) || generation < 0) {
+    throw new Error('invalid-manufacturer-epoch');
+  }
+  return {provider:enumValue(record.provider,['codex','claude','kimi'] as const),
+    action:enumValue(record.action,['check','install','login','open-external'] as const),revision,generation};
+}
+
 export function parseDesktopOnboardingIntent(value: unknown): DesktopOnboardingIntent {
   const record = requireRecord(value);
   const revision = numberValue(record.revision);
@@ -829,7 +850,7 @@ function parseDesktopProviderCapability(value: unknown) {
     providerId: stringValue(record.providerId), providerLabel: stringValue(record.providerLabel),
     connectionId: nullableString(record.connectionId), accountLabel: nullableString(record.accountLabel),
     state: enumValue(record.state, ["disconnected", "connecting", "ready", "degraded", "disabled", "blocked"] as const),
-    setupMethods: arrayValue(record.setupMethods).map((item) => enumValue(item, ["openrouter-owner-connect", "codex-browser-login", "codex-device-login", "kimi-owner-connect"] as const)),
+    setupMethods: arrayValue(record.setupMethods).map((item) => enumValue(item, ["openrouter-owner-connect", "codex-browser-login", "codex-device-login", "kimi-owner-connect", "nanogpt-owner-connect"] as const)),
     multiProfile: { enabled: booleanValue(multiProfile.enabled), ...(multiProfile.disabled === undefined ? {} : { disabled: parseDesktopDisabledPresentation(multiProfile.disabled) }) },
     routes: arrayValue(record.routes).map(parseDesktopRouteCandidate),
     ...(record.disabled === undefined ? {} : { disabled: parseDesktopDisabledPresentation(record.disabled) }),

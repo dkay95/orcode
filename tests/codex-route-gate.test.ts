@@ -114,6 +114,22 @@ test("a fresh child without unsolicited auth events requires a fresh identity-bo
   assert.deepEqual(client.listenerOrder, ["account/updated", "account/read", "account/read"]);
 });
 
+test("official 0.159 account reads with null workspace routing retain identity-bound dispatch", async () => {
+  const {client, gate, selected, account} = identityFixture();
+  client.queueRead({...account, workspaceRouting:null});
+  const permit = await gate.refreshAndIssueDispatchPermit(selected);
+  assert.equal(gate.consumeDispatchPermit(permit, selected), true);
+  assert.equal(gate.taskBytesSent, 0);
+});
+
+test("unverified backend workspace routing cannot authorize dispatch", async () => {
+  const {client, gate, selected, account} = identityFixture();
+  client.queueRead({...account, workspaceRouting:{backendOrigin:'https://unexpected.invalid',
+    chatgptAccountId:'private-account', accountRoutingOverride:'NO_CONSTRAINT'}});
+  await assert.rejects(gate.refreshAndIssueDispatchPermit(selected), /authentication|routing/i);
+  assert.equal(gate.taskBytesSent, 0);
+});
+
 test("a first account event during the initial read invalidates its result", async () => {
   const { client, gate, selected, account } = identityFixture();
   client.queueRead(async () => {

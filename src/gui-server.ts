@@ -28,6 +28,13 @@
 
 import { createInterface } from "node:readline";
 import { randomUUID } from "node:crypto";
+import { createOfficialCliHostProbe } from './official-cli-host.js';
+import { probeOfficialCli } from './official-cli-probe.js';
+import { cliPresentation } from './official-cli-state.js';
+import { CodexNativeShellActions } from './native-shell-action.js';
+import {LocalProjectRun} from './local-project-run.js';
+import {executeLocalFlow,updateLocalPolicy,assertLocalRunGrant,type LocalExecutionPolicy,type LocalRunGrant} from './local-execution-policy.js';
+import {runVerify} from './verify.js';
 import type { RouteIdentityV1 } from "./backends.js";
 import {
   desktopCrossRouteDetails,
@@ -163,6 +170,7 @@ import {
   parseDesktopSettingsIntent,
   parseNativeLocalActionRequirement,
   parseOnboardingIntent,
+  parseOfficialCliRequest,
   GuiOutputBatcher,
   guardOutboundFrame,
   projectChatRow,
@@ -359,7 +367,28 @@ export function describeRequestFailure(
       ...(error.hint ? { hint: error.hint } : {}),
     };
   }
+  const local=localFailure(error);
+  if(local)return local;
   return { code: "request-failed", message: describe(error) };
+}
+
+/** Closed local codes only; never forward an arbitrary exception message. */
+function localFailure(error:unknown):GuiErrorBody|null {
+  if(!(error instanceof Error))return null;
+  const messages:Record<string,string>={
+    'original-baseline-changed':'Das Original wurde inzwischen geändert. Nichts wurde übernommen. Prüfe die Unterschiede, bevor du die Arbeitskopie aktualisierst.',
+    'candidate-changed':'Die Arbeitskopie wurde seit der Prüfung geändert. Bitte erneut prüfen.',
+    'tested-candidate-changed':'Die Arbeitskopie wurde während der Prüfung geändert. Bitte erneut prüfen.',
+    'candidate-changed-during-scan':'Die Arbeitskopie wurde während der Erfassung geändert. Bitte erneut prüfen.',
+    'apply-needs-tested-confirmed-candidate':'Die Übernahme benötigt einen unveränderten, bestandenen Test und deine Bestätigung.',
+    'candidate-mode-change-unsupported':'Geänderte Ausführungsrechte werden noch nicht übernommen. Bitte diese Rechteänderung separat prüfen.',
+    'local-isolation-unavailable':'Die lokale Ausführungsisolation ist auf diesem System noch nicht verfügbar. Es wurde kein Auftrag gestartet.',
+    'local-isolation-canary-failed':'Die lokale Schutzprüfung ist fehlgeschlagen. Es wurde kein Auftrag gestartet.',
+    'local-start-retired':'Die Arbeitskopie ist gestoppt. Wähle ausdrücklich „Fortsetzen“, bevor du weiterarbeitest.',
+    'local-run-stopped':'Die Arbeitskopie ist gestoppt. Wähle ausdrücklich „Fortsetzen“, bevor du weiterarbeitest.',
+    'local-process-retired':'Die Aktion wurde durch Stop oder eine neue Auswahl verworfen.',
+  };
+  return Object.hasOwn(messages,error.message)?{code:error.message,message:messages[error.message]!}:null;
 }
 
 /* =========================================================================
@@ -805,6 +834,29 @@ export async function runGuiSession(
   transport: GuiTransport,
   io: Pick<GuiTransportIo, "diagnostic"> = { diagnostic: () => {} },
 ): Promise<void> {
+  let manufacturerOperation = new AbortController();
+  let localRun:LocalProjectRun|null=null;
+  let localCandidateHandle=randomUUID();
+  let localCandidateHash='';
+  let localPolicy:LocalExecutionPolicy={aiProcess:'manual',permissions:'ask',revision:1};
+  let localGrant:LocalRunGrant|null=null;
+  let localProcessAbort=new AbortController();
+  let restoredSessionId='';
+  let localRecovery:Promise<void>|null=null;
+  let guiStopEpoch=0;
+  const publishLocal = () => {
+    const view=localRun?.view();
+    if(view && view.candidateHash!==localCandidateHash){localCandidateHash=view.candidateHash;localCandidateHandle=randomUUID();}
+    const result={policy:{...localPolicy},active:state.runActive||state.commandInFlight,candidate:view?{id:view.id,candidateHandle:localCandidateHandle,
+      phase:view.phase,originalWorkspace:view.originalRoot,changes:view.changes,
+      tested:view.testedHash===view.candidateHash}:null};
+    if(transport.handshakeComplete)transport.emit('local-run.state',result);
+    return result;
+  };
+  const manufacturerActions = context.desktopCodexNativeLogin
+    ? new CodexNativeShellActions({...context.desktopCodexNativeLogin,
+      appServer:{async request<T>():Promise<T> {throw new Error('manufacturer-account-method-forbidden');}}})
+    : null;
   const state: GuiSessionState = {
     balance: null,
     resolvedModel: "",
@@ -836,7 +888,7 @@ export async function runGuiSession(
   // keeps `safeMessage` for its OWN rendering. Stderr receives the same safe
   // classification, not raw provider/request detail.
   const describeError = (error: unknown): string =>
-    context.openRouter.safePanelMessage(error);
+    localFailure(error)?.message??context.openRouter.safePanelMessage(error);
   transport.setErrorDescriber(
     describeError,
     describeError,
@@ -2097,6 +2149,7 @@ export async function runGuiSession(
   type OnboardingTarget =
     | { readonly kind: "navigation" }
     | { readonly kind: "empty-openrouter" }
+    | { readonly kind: "empty-nanogpt" }
     | { readonly kind: "empty-codex" }
     | {
         readonly kind: "model";
@@ -2129,7 +2182,7 @@ export async function runGuiSession(
     readonly source: GuiSettingsOperation;
     readonly restore: GuiSettingsRestoreState;
     readonly entry: "model" | "provider" | "account";
-    readonly providerId?: "openrouter" | "kimi-code";
+    readonly providerId?: "openrouter" | "kimi-code" | "nano-gpt";
     readonly suppressOperationOverlay: boolean;
     atEntry: boolean;
   }
@@ -2295,14 +2348,14 @@ export async function runGuiSession(
     if (!active || snapshot.activeRoute.routeHandle === operation.baseline.activeRoute?.routeHandle) {
       return false;
     }
-    if (operation.target.kind === "empty-openrouter") {
+    if (operation.target.kind === "empty-openrouter" || operation.target.kind === "empty-nanogpt") {
       const commit = operation.emptySetupCommit;
       return commit !== null
         && snapshot.revision === commit.revision
         && snapshot.generation === commit.generation
         && snapshot.activeRoute.routeHandle === commit.routeHandle
         && active.handle === commit.routeHandle
-        && active.providerId === "openrouter";
+        && active.providerId === (operation.target.kind === "empty-nanogpt" ? "nano-gpt" : "openrouter");
     }
     if (operation.target.kind !== "model") return false;
     return active.providerId === operation.target.providerId
@@ -2352,10 +2405,16 @@ export async function runGuiSession(
     }
   };
 
-  const desktopSetupSurface = (owner: object): SetupSurface => ({
-    // The Task-3B seam preselects OpenRouter. Reaching a hub here is a closed
-    // failure, never permission to present a second provider choice.
-    chooseHub: async () => null,
+  const desktopSetupSurface = (owner: object, backendId: "openrouter" | "nano-gpt" = "openrouter"): SetupSurface => ({
+    // Provider choice is already bound. Nano exposes only its two billing
+    // choices here; a foreign entry cannot become a second provider picker.
+    chooseHub: async (entries) => {
+      if (backendId !== "nano-gpt" || entries.length !== 2
+        || entries.some((entry) => entry.id !== "nano-gpt:subscription" && entry.id !== "nano-gpt:payg")) return null;
+      return transport.ask("choose-hub", { title: "Nano-GPT · Abrechnung wählen", entries: entries.map((entry) => ({ ...entry, current: false })) },
+        null, (answer) => typeof answer.id === "string"
+          && entries.some((entry) => entry.id === answer.id && !entry.disabled) ? answer.id : null, owner);
+    },
     readSecret: (request) => transport.ask(
       "secret",
       { label: request.message, escHint: "Esc goes back to the provider list" },
@@ -2441,7 +2500,7 @@ export async function runGuiSession(
     return {
       model: context.config.mainModel,
       resolvedModel: state.resolvedModel,
-      workspace: context.workspace,
+      workspace: localRun?.view().originalRoot ?? context.workspace,
       chatId: context.session.data.id,
       chatTitle: context.session.data.title,
       approval: context.approvals.mode,
@@ -2562,7 +2621,8 @@ export async function runGuiSession(
   const commandMenuRuntime = (rows: readonly CommandMenuRow[]): CommandMenuRuntime => {
     const crossActive = context.crossRunActive?.() === true;
     const blockedFor = (id: import("./command-catalog.js").SlashCommandHandlerId) =>
-      state.runActive ? desktopCommandDisabled("run-active")
+      ['architect','collab-cross','collab-cross-run','collab-cross-models'].includes(id) ? desktopCommandDisabled('local-flow-required')
+        : state.runActive ? desktopCommandDisabled("run-active")
         : crossActive && !commandAllowedDuringCrossRun(id) ? desktopCommandDisabled("cross-run-active")
         : transport.pendingAskCount > 0 ? desktopCommandDisabled("question-pending")
         : state.commandInFlight ? desktopCommandDisabled("command-in-flight")
@@ -2723,6 +2783,28 @@ export async function runGuiSession(
   };
 
   const handle = async (request: GuiRequest): Promise<unknown> => {
+    const entryStopEpoch=guiStopEpoch;
+    if(request.t==='cancel'){
+      guiStopEpoch+=1;localProcessAbort.abort();if(localGrant)localGrant.revoked=true;
+      if(localRecovery)return {requested:true};
+    }
+    if(restoredSessionId!==context.session.data.id && !state.runActive && !localRecovery) {
+      const sessionId=context.session.data.id,originalRoot=context.workspace;
+      localRecovery=(async()=>{
+        if(!localRun){
+          const recovered=await LocalProjectRun.restoreLatest({appHome:context.session.appHome,sessionId,originalRoot});
+          if(context.session.data.id!==sessionId||context.workspace!==originalRoot)throw new Error('local-recovery-retired');
+          if(recovered){
+            const rooted=await context.reRootWorkspace?.(recovered.view().workRoot);
+            if(!rooted?.ok||context.session.data.id!==sessionId)throw new GuiRequestRefused('local-recovery-blocked','Die gespeicherte Arbeitskopie konnte nicht geöffnet werden. Sie wurde nicht gestartet.');
+            localRun=recovered;publishLocal();
+          }
+        }
+        restoredSessionId=sessionId;
+      })().finally(()=>{localRecovery=null;});
+    }
+    if(localRecovery)await localRecovery;
+    if(request.t!=='cancel'&&entryStopEpoch!==guiStopEpoch)throw new GuiRequestRefused('local-operation-retired','Die Aktion wurde durch Stop verworfen.');
     switch (request.t) {
       case "submit": {
         const text = typeof request.text === "string" ? request.text.trim() : "";
@@ -2757,7 +2839,13 @@ export async function runGuiSession(
         // such loop, so the exclusions are stated instead — each naming the
         // state that blocked it rather than failing generically.
         assertSessionIdle("submit", { crossMessage: true });
+        if(localRun?.view().phase==='stopped')throw new GuiRequestRefused('local-run-stopped',
+          'Die Arbeitskopie ist gestoppt. Wähle ausdrücklich „Fortsetzen“, bevor du weiterarbeitest.');
         requireRunnableDesktopRoute();
+        if(context.providerRuntime.ensureRunnableRoute().backendId==='codex') {
+          throw new GuiRequestRefused('codex-isolation-unproven',
+            'Codex ist noch nicht für den neuen Arbeitskopie-Ablauf geprüft. Das Hersteller-Terminal bleibt verfügbar.');
+        }
         // Phase 10, on this surface too: while the chat is armed, every plain
         // message routes to the SAME Cross entry the one-shot `/cross`
         // command uses — the same `launchCrossRun`, the same run-active
@@ -2766,24 +2854,50 @@ export async function runGuiSession(
         // reservation have both succeeded.
         const armedPair = context.session.data.crossMode;
         if (armedPair) {
-          launchCrossRun(
-            withOneShotClearing(context.session, armedPair, crossRuntime.start(text, armedPair)),
-          );
-          return { started: true, cross: true };
+          throw new GuiRequestRefused('cross-local-copy-unavailable','Bitte Cross deaktivieren. Parallele Rollen sind noch nicht an diesen lokalen Arbeitskopie-Ablauf gebunden.');
         }
+        localProcessAbort=new AbortController();
+        const processSignal=localProcessAbort.signal;
         state.runActive = true;
         state.runSettled = (async () => {
           const turn = createRunTurnState();
           try {
-            await runSessionTurn({
-              surface,
-              context,
-              deps: guiRunDeps,
-              ports: runPorts,
-              state: turn,
-              setupSurface,
-              text,
-            });
+            if(!localRun || localRun.view().phase==='applied') {
+              localRun=await LocalProjectRun.create({originalRoot:localRun?.view().originalRoot??context.workspace,
+                appHome:context.session.appHome,sessionId:context.session.data.id,signal:processSignal});
+              if(processSignal.aborted){await localRun.stop();publishLocal();throw new Error('local-process-retired');}
+              const reroot=await context.reRootWorkspace?.(localRun.view().workRoot);
+              if(!reroot?.ok)throw new Error('local-workspace-reroot-failed');
+            }
+            const run=localRun,epoch=run.view().stopEpoch,routeHandle=currentDesktop().snapshot.activeRoute!.routeHandle;
+            const policy={...localPolicy};
+            processSignal.throwIfAborted();
+            localGrant={id:randomUUID(),revision:policy.revision,revoked:false,workRoot:run.view().workRoot,
+              allowedRouteHandles:[routeHandle],allowedActions:['read','edit','test'],extraCostLimitUsd:0};
+            await run.start(epoch);publishLocal();
+            const assertCurrent=()=>{
+              run.assertStart(epoch);
+              if(processSignal.aborted||localPolicy.revision!==policy.revision
+                ||currentDesktop().snapshot.activeRoute?.routeHandle!==routeHandle)throw new Error('local-process-retired');
+              assertLocalRunGrant(localGrant!,{revision:policy.revision,workRoot:context.workspace,routeHandle,
+                action:'edit',extraCostUsd:0});
+            };
+            const perform=async(prompt:string,readonly:boolean)=>{
+              assertCurrent();context.approvals.mode=readonly?'read-only':policy.permissions==='automatic'?'auto-edit':'ask';
+              context.approvals.setReadOnlyExecutionFence(readonly);
+              try{
+                const outcome=await runSessionTurn({surface,context,deps:guiRunDeps,ports:runPorts,
+                  state:turn,setupSurface,text:prompt});
+                if(outcome.kind!=='completed'||outcome.result.outcome!=='completed')throw new Error('local-phase-incomplete');
+                return outcome.result.text;
+              }finally{context.approvals.setReadOnlyExecutionFence(false);}
+            };
+            await executeLocalFlow(policy,{assertCurrent,
+              plan:()=>perform(`Erstelle ausschließlich einen kurzen Umsetzungsplan. Keine Änderungen und keine Befehle ausführen. Aufgabe:\n${text}`,true),
+              approve:async(plan)=>askConfirm('Diesen lokalen Plan umsetzen?',
+                `${plan.slice(0,12000)}\n\nNur das von dir gewählte Lead-Modell arbeitet in der Arbeitskopie. Planung verbraucht Kontingent.`,{defaultAccept:false}),
+              work:async(plan)=>{await perform(plan?`Setze den freigegebenen Plan für diese Aufgabe um:\n${text}\n\nPlan als Kontext:\n${plan}`:text,false);}});
+            if(run.view().phase!=='stopped')await run.review();publishLocal();
           } catch (error) {
             applyRunTurnFailure({
               surface,
@@ -2795,13 +2909,21 @@ export async function runGuiSession(
               error,
             });
           } finally {
+            context.approvals.mode=localPolicy.permissions==='automatic'?'auto-edit':'ask';
+            if(localRun && localRun.view().phase==='running') {
+              await localRun.review().catch(()=>localRun?.stop());publishLocal();
+            }
             state.runActive = false;
+            publishLocal();
             flushAll();
           }
         })();
         return { started: true };
       }
       case "cancel": {
+        manufacturerOperation.abort();
+        localProcessAbort.abort();if(localGrant)localGrant.revoked=true;
+        if(localRun||state.runActive){cancelHandler?.();transport.abandonPendingAsks();if(localRun)await localRun.stop();publishLocal();return {requested:true};}
         if (!cancelHandler) {
           throw new GuiRequestRefused("no-run", "Nothing is running.");
         }
@@ -2830,6 +2952,11 @@ export async function runGuiSession(
         return { requested: true };
       }
       case "command": {
+        const rawCommand=String(request.raw??'').trim();
+        const resolvedCommand=resolveSlashCommand(rawCommand);
+        if(['architect','cross','collab-cross','collab-cross-run','collab-cross-models'].includes(resolveCliCommandName(rawCommand))) {
+          throw new GuiRequestRefused('local-flow-required','Nutze für lokale Aufgaben den AI-Prozess-Schalter und „Aufgabe starten“. Parallele Cross-Ausführung ist noch nicht an Arbeitskopien gebunden.');
+        }
         const raw = typeof request.raw === "string" ? request.raw.trim() : "";
         if (!raw.startsWith("/")) {
           throw new GuiRequestRefused("not-a-command", "command needs a slash command.");
@@ -2888,6 +3015,12 @@ export async function runGuiSession(
         guiOut.flush();
         let outcome: "continue" | "exit";
         try {
+          if(resolvedCommand?.handlerId==='folder' && localRun) {
+            if(!['applied','stopped'].includes(localRun.view().phase))throw new GuiRequestRefused('local-work-pending','Arbeitskopie erst übernehmen oder stoppen.');
+            const rooted=await context.reRootWorkspace?.(localRun.view().originalRoot);
+            if(!rooted?.ok)throw new GuiRequestRefused('local-workspace-stale','Der Originalordner konnte nicht geöffnet werden.');
+            localRun=null;publishLocal();
+          }
           outcome = await dispatchCommand(raw);
         } finally {
           const captured = guiOut.flush();
@@ -2960,6 +3093,10 @@ export async function runGuiSession(
         }
         const release = claimChatMutation("chat.open");
         try {
+          if(localRun){
+            if(!['applied','stopped'].includes(localRun.view().phase))throw new GuiRequestRefused('local-work-pending','Arbeitskopie erst übernehmen oder stoppen.');
+            await context.reRootWorkspace?.(localRun.view().originalRoot);localRun=null;publishLocal();
+          }
           if (chatId === context.session.data.id) {
             // Honest rather than a silent no-op: nothing moved, and the client
             // is told which chat it is already on.
@@ -2976,6 +3113,10 @@ export async function runGuiSession(
           ? request.title.trim()
           : undefined;
         try {
+          if(localRun){
+            if(!['applied','stopped'].includes(localRun.view().phase))throw new GuiRequestRefused('local-work-pending','Arbeitskopie erst übernehmen oder stoppen.');
+            await context.reRootWorkspace?.(localRun.view().originalRoot);localRun=null;publishLocal();
+          }
           return await openChat({ kind: "new", ...(title ? { title } : {}) });
         } finally {
           release();
@@ -3080,7 +3221,90 @@ export async function runGuiSession(
             : {}),
         } satisfies GuiCostForecast;
       }
+      case "official-cli.action": {
+        const intent = parseOfficialCliRequest(request);
+        assertSessionIdle('Hersteller-CLI einrichten',{allowSettingsReturn:true});
+        const before = currentDesktop().snapshot;
+        if (intent.revision !== before.revision || intent.generation !== before.generation) {
+          throw new GuiRequestRefused('onboarding-stale','Die Anbieteransicht ist veraltet. Bitte erneut öffnen.');
+        }
+        manufacturerOperation.abort();
+        manufacturerOperation = new AbortController();
+        const signal = manufacturerOperation.signal;
+        if (intent.action !== 'check') {
+          if (!manufacturerActions) throw new GuiRequestRefused('native-local-action-unavailable',
+            'Die Einrichtung benötigt die lokale Desktop-App.');
+          await manufacturerActions.beginManufacturerAction({provider:intent.provider,action:intent.action},signal);
+          return {kind:'presented',nativeAvailable:true};
+        }
+        const port = createOfficialCliHostProbe();
+        const observed = await probeOfficialCli(intent.provider,intent.revision,port,{signal});
+        const after = currentDesktop().snapshot;
+        if (signal.aborted || before.revision !== after.revision || before.generation !== after.generation) {
+          throw new GuiRequestRefused('onboarding-stale','Die Prüfung wurde durch eine neue Auswahl ersetzt.');
+        }
+        return {kind:'checked',state:observed,presentation:cliPresentation(observed),nativeAvailable:manufacturerActions !== null};
+      }
+      case 'execution-policy.set': {
+        assertSessionIdle('Ausführungseinstellung ändern');
+        if(Object.keys(request).some(key=>!['v','t','id','key','value','revision'].includes(key))
+          ||request.v!==GUI_PROTOCOL_VERSION||!['aiProcess','permissions'].includes(String(request.key)))throw new Error('invalid-local-policy-request');
+        localPolicy=updateLocalPolicy(localPolicy,request.key as 'aiProcess'|'permissions',String(request.value),Number(request.revision));
+        if(localGrant)localGrant.revoked=true;
+        context.approvals.mode=localPolicy.permissions==='automatic'?'auto-edit':'ask';
+        return publishLocal();
+      }
+      case 'local-run.action': {
+        if(request.v!==GUI_PROTOCOL_VERSION||Object.keys(request).some(key=>!['v','t','id','action','candidateHandle'].includes(key)))throw new Error('invalid-local-action');
+        if(request.action==='state')return publishLocal();
+        assertSessionIdle('Arbeitskopie prüfen oder übernehmen');
+        if(!localRun)throw new GuiRequestRefused('no-local-run','Es gibt noch keine Arbeitskopie.');
+        if(request.candidateHandle!==localCandidateHandle)throw new GuiRequestRefused('candidate-stale','Der Arbeitsstand wurde geändert. Bitte erneut prüfen.');
+        const run=localRun;
+        if(!['resume','apply','test'].includes(String(request.action)))throw new GuiRequestRefused('invalid-local-action','Diese Arbeitskopie-Aktion ist nicht verfügbar.');
+        state.commandInFlight=true;
+        const actionController=new AbortController();localProcessAbort=actionController;
+        const priorCancelHandler=cancelHandler;cancelHandler=()=>actionController.abort();publishLocal();
+        try{
+        if(request.action==='resume'){
+          const rooted=await context.reRootWorkspace?.(run.view().workRoot);
+          if(!rooted?.ok)throw new GuiRequestRefused('local-workspace-stale','Die Arbeitskopie konnte nicht geöffnet werden.');
+          actionController.signal.throwIfAborted();await run.resume(actionController.signal);return publishLocal();
+        }
+        if(context.workspace!==run.view().workRoot)throw new GuiRequestRefused('local-workspace-stale','Die Arbeitskopie ist nicht mehr der aktive Arbeitsort.');
+        if(request.action==='apply') {
+          if(!await askConfirm('Geprüfte Änderungen ins Original übernehmen?',
+            'Die Übernahme erfolgt manuell. Schließe andere schreibende Programme für dieses Projekt. Bei Basisänderungen wird abgebrochen.',{danger:true}))return publishLocal();
+          await run.apply(localCandidateHash,{confirmed:true});return publishLocal();
+        }
+        if(request.action==='test') {
+          if(!context.config.verify.commands.length)throw new GuiRequestRefused('verify-not-configured','Noch kein Testbefehl hinterlegt. Nutze /verify suggest oder /verify <Befehl>.');
+          const candidate=await run.review();actionController.signal.throwIfAborted();
+            const outcome=await runVerify(context.config.verify.commands,context.localRuntime.guard,actionController.signal,()=>{},
+              {onProcessStart:completion=>emitRunEvent({type:'process-start',...completion,timestamp:Date.now()}),
+                onProcessChunk:(operation,stream,text)=>emitRunEvent({type:'process-output',...operation,stream,text,timestamp:Date.now()}),
+                onProcessEnd:(operation,completion)=>emitRunEvent({type:'process-end',...operation,...completion,timestamp:Date.now()})});
+            if(run.view().phase!=='stopped')await run.markTested(candidate.candidateHash,outcome.status==='passed');
+            return {...publishLocal(),verification:outcome.status};
+        }
+        throw new GuiRequestRefused('invalid-local-action','Diese Arbeitskopie-Aktion ist nicht verfügbar.');
+        }finally{state.commandInFlight=false;cancelHandler=priorCancelHandler;publishLocal();}
+      }
+      case 'project.open': {
+        assertSessionIdle('Projekt öffnen');
+        if(request.v!==GUI_PROTOCOL_VERSION||typeof request.path!=='string'
+          ||Object.keys(request).some(key=>!['v','t','id','path'].includes(key)))throw new Error('invalid-project-open');
+        if(localRun && !['applied','stopped'].includes(localRun.view().phase)) {
+          throw new GuiRequestRefused('local-work-pending','Die Arbeitskopie zuerst übernehmen oder ausdrücklich stoppen. Sie bleibt gespeichert.');
+        }
+        const release=claimChatMutation('project.open');
+        try{
+          const result=await context.reRootWorkspace?.(request.path);if(!result?.ok)throw new GuiRequestRefused('project-open-failed','Der Ordner konnte nicht geöffnet werden.');
+          localRun=null;publishLocal();transport.emit('status',{...await buildStatus()});return {opened:true};
+        }finally{release();publishLocal();}
+      }
       case "desktop.snapshot.get": {
+        publishLocal();
         const snapshot = publishDesktop();
         if (!snapshot) {
           throw new GuiRequestRefused(
@@ -3202,6 +3426,7 @@ export async function runGuiSession(
             );
           }
           if (intent.providerId !== "openrouter" && selected.connectionId === null
+            && !(intent.providerId === "nano-gpt" && context.providerRuntime.runDesktopNanoGptSetup)
             && !(intent.providerId === "codex" && context.providerRuntime.connectDesktopCodex)) {
             throw new GuiRequestRefused(
               "provider-unavailable",
@@ -3212,6 +3437,8 @@ export async function runGuiSession(
 
         const emptyOpenRouter = intent.kind === "choose-provider"
           && intent.providerId === "openrouter"
+          && selectedProviders.every((provider) => provider.connectionId === null && provider.routes.length === 0);
+        const emptyNanoGpt = intent.kind === "choose-provider" && intent.providerId === "nano-gpt"
           && selectedProviders.every((provider) => provider.connectionId === null && provider.routes.length === 0);
         const emptyCodex = intent.kind === "choose-provider" && intent.providerId === "codex"
           && selectedProviders.every((provider) => provider.connectionId === null && provider.routes.length === 0);
@@ -3225,6 +3452,7 @@ export async function runGuiSession(
           : current.controller.snapshot().candidates.find((candidate) => candidate.handle === modelRouteHandle);
         const target: OnboardingTarget = emptyOpenRouter
           ? { kind: "empty-openrouter" }
+          : emptyNanoGpt ? { kind: "empty-nanogpt" }
           : emptyCodex ? { kind: "empty-codex" }
           : modelTarget
             ? {
@@ -3265,11 +3493,12 @@ export async function runGuiSession(
         operation.promise = (async (): Promise<DesktopOnboardingResult> => {
           const runDesktopSetup = emptyOpenRouter
             ? context.providerRuntime.runDesktopOpenRouterSetup
+            : emptyNanoGpt ? context.providerRuntime.runDesktopNanoGptSetup
             : undefined;
-          if (emptyOpenRouter && !runDesktopSetup) {
+          if ((emptyOpenRouter || emptyNanoGpt) && !runDesktopSetup) {
             throw new GuiRequestRefused(
               "provider-unavailable",
-              "OpenRouter setup is unavailable in this engine.",
+              `${emptyNanoGpt ? "Nano-GPT" : "OpenRouter"} setup is unavailable in this engine.`,
             );
           }
           if (intent.kind === "choose-provider" || intent.kind === "open-model-picker") {
@@ -3297,21 +3526,22 @@ export async function runGuiSession(
             return operation.controller.dispatch({ kind: "choose-provider", providerId: "codex",
               revision: fresh.revision, generation: fresh.generation }, operation.abort.signal);
           }
-          if (emptyOpenRouter) {
+          if (emptyOpenRouter || emptyNanoGpt) {
             let legacyError: unknown = null;
             let legacySettlement: unknown = null;
             try {
               legacySettlement = await runDesktopSetup!.call(
                 context.providerRuntime,
-                desktopSetupSurface(operation.askOwner),
+                desktopSetupSurface(operation.askOwner, emptyNanoGpt ? "nano-gpt" : "openrouter"),
                 operation.abort.signal,
               );
             } catch (error) {
               legacyError = error;
               legacySettlement = error;
             }
-            operation.emptySetupCommit = context.providerRuntime
-              .reconcileDesktopOpenRouterSetupCommit?.(legacySettlement) ?? null;
+            operation.emptySetupCommit = (emptyNanoGpt
+              ? context.providerRuntime.reconcileDesktopNanoGptSetupCommit?.(legacySettlement)
+              : context.providerRuntime.reconcileDesktopOpenRouterSetupCommit?.(legacySettlement)) ?? null;
             const fresh = current.authority.snapshot();
             if (operationCommitted(operation, fresh)) {
               return { kind: "ready", routeHandle: fresh.activeRoute!.routeHandle, routeRunnable: true };
@@ -3400,12 +3630,13 @@ export async function runGuiSession(
               ))
               && (
                 navigation.providerId === "openrouter"
+                || (navigation.providerId === "nano-gpt" && context.providerRuntime.runDesktopNanoGptSetup !== undefined)
                 || selectedProvider.some(({ connectionId }) => connectionId !== null)
               );
             const directProviderHasAccount = directProviderAvailable
               && selectedProvider.some(({ connectionId }) => connectionId !== null);
             const directProviderNeedsSecret = directProviderAvailable
-              && navigation.providerId === "openrouter"
+              && (navigation.providerId === "openrouter" || navigation.providerId === "nano-gpt")
               && selectedProvider.every((provider) => (
                 provider.connectionId === null && provider.routes.length === 0
               ));
@@ -3464,6 +3695,7 @@ export async function runGuiSession(
         return { closed: true };
       }
       case "shutdown": {
+        manufacturerOperation.abort();
         // Settings owns a response-bearing FIFO. Settle its exact close lane
         // while the transport is still writable so a pending dispatch/close
         // cannot be silenced by the shutdown response's terminal boundary.

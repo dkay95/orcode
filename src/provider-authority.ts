@@ -12,7 +12,7 @@ import {
   type ProviderSetupStateV3,
   ProviderStateStore,
 } from "./provider-state.js";
-import type { BackendId, ProviderCandidate, RouteIdentityV1 } from "./backends.js";
+import type { BackendId, BillingRealm, ProviderCandidate, RouteIdentityV1 } from "./backends.js";
 
 const CANONICAL_UUID =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
@@ -38,16 +38,27 @@ export type ProviderCredentialPointer =
 export type OpenRouterCredentialPointer = ProviderCredentialPointer;
 
 export interface ProviderCredentialPolicy {
-  backendId: "openrouter" | "kimi-code";
+  backendId: "openrouter" | "kimi-code" | "nano-gpt";
   savedSlotKinds: readonly CredentialSlotKind[];
   legacyInferenceAllowed: boolean;
   environmentVariable: "OPENROUTER_API_KEY" | null;
-  billingRealm: "openrouter-payg" | "kimi-code-membership-provider-managed-overage";
+  billingRealm: "openrouter-payg" | "kimi-code-membership-provider-managed-overage" | null;
+  allowedBillingRealms?: readonly BillingRealm[];
   accountIdentity: "documented-provider-account" | "normalized-secret-hmac";
-  secretFingerprintDomain: "orcode-kimi-code-credential/v1\0" | null;
+  secretFingerprintDomain: "orcode-kimi-code-credential/v1\0" | "orcode-nanogpt-credential/v1\0" | null;
 }
 
 const PROVIDER_CREDENTIAL_POLICIES = {
+  "nano-gpt": Object.freeze({
+    backendId: "nano-gpt",
+    savedSlotKinds: Object.freeze(["nano-gpt"] as const),
+    legacyInferenceAllowed: false,
+    environmentVariable: null,
+    billingRealm: null,
+    allowedBillingRealms: Object.freeze(["nanogpt-subscription", "nanogpt-payg"] as const),
+    accountIdentity: "normalized-secret-hmac",
+    secretFingerprintDomain: "orcode-nanogpt-credential/v1\0",
+  }),
   openrouter: Object.freeze({
     backendId: "openrouter",
     savedSlotKinds: Object.freeze(["inference"] as const),
@@ -74,6 +85,10 @@ export function providerCredentialPolicy(
   return PROVIDER_CREDENTIAL_POLICIES[backendId as ProviderCredentialPolicy["backendId"]] ?? null;
 }
 
+export function matchesProviderBillingRealm(policy: ProviderCredentialPolicy, realm: BillingRealm): boolean {
+  return policy.allowedBillingRealms?.includes(realm) ?? policy.billingRealm === realm;
+}
+
 export interface ProviderConnectionBindingV1 {
   version: 1;
   stateRevision: number;
@@ -90,11 +105,11 @@ export interface ProviderConnectionBindingV2 {
   version: 2;
   stateRevision: number;
   connectionId: string;
-  backendId: "openrouter" | "kimi-code";
+  backendId: "openrouter" | "kimi-code" | "nano-gpt";
   enabled: boolean;
   credentialPointer: ProviderCredentialPointer;
   accountFingerprint: string;
-  billingRealm: "openrouter-payg" | "kimi-code-membership-provider-managed-overage";
+  billingRealm: "openrouter-payg" | "kimi-code-membership-provider-managed-overage" | "nanogpt-subscription" | "nanogpt-payg";
   isDefault: boolean;
 }
 
@@ -120,7 +135,7 @@ export interface ProviderAuthorityCoordinator {
   readAuthority<T>(
     request: {
       signal: AbortSignal;
-      backendId?: "openrouter" | "kimi-code";
+      backendId?: "openrouter" | "kimi-code" | "nano-gpt";
     },
     operation: (lease: ProviderAuthorityReadLease) => Promise<T>,
   ): Promise<T>;
@@ -142,7 +157,7 @@ export type ProviderCredentialRequest =
     environmentEligibility: EnvironmentEligibility;
   })
   | (ProviderCredentialRequestBase & {
-    backendId: "kimi-code";
+    backendId: "kimi-code" | "nano-gpt";
     credentialKind?: "inference";
     environmentEligibility: "forbidden";
   });
@@ -275,7 +290,7 @@ export type ProviderBindingSelector =
   | { kind: "connection"; connectionId: string }
   | { kind: "route"; route: RouteIdentityV1 }
   | { kind: "default" }
-  | { kind: "backend"; backendId: "openrouter" | "kimi-code" };
+  | { kind: "backend"; backendId: "openrouter" | "kimi-code" | "nano-gpt" };
 
 interface CredentialPermit {
   binding: ProviderConnectionBindingV2;
@@ -678,7 +693,7 @@ export class ProviderCredentialAuthority implements ProviderCredentialAuthorityL
     }
     const binding = selected.binding;
     if (binding.backendId !== request.backendId) return { kind: "stale" };
-    if (request.backendId === "kimi-code"
+    if ((request.backendId === "kimi-code" || request.backendId === "nano-gpt")
       && (request.environmentEligibility !== "forbidden"
         || (request as { credentialKind?: CredentialKind }).credentialKind === "management")) {
       return { kind: "invalid-pointer" };
@@ -1233,8 +1248,8 @@ export class ProviderCredentialAuthority implements ProviderCredentialAuthorityL
       deadlineAt: request.deadlineAt,
       signal: request.signal,
     };
-    return expected.binding.backendId === "kimi-code"
-      ? { ...base, backendId: "kimi-code", environmentEligibility: "forbidden" }
+    return expected.binding.backendId !== "openrouter"
+      ? { ...base, backendId: expected.binding.backendId, environmentEligibility: "forbidden" }
       : {
         ...base,
         backendId: "openrouter",
@@ -1485,7 +1500,7 @@ export function parseOpenRouterCredentialPointer(
 }
 
 export function parseProviderCredentialPointer(
-  backendId: "openrouter" | "kimi-code",
+  backendId: "openrouter" | "kimi-code" | "nano-gpt",
   value: string,
 ): ProviderCredentialPointer | null {
   const policy = providerCredentialPolicy(backendId);
@@ -1493,7 +1508,7 @@ export function parseProviderCredentialPointer(
   if (value === "legacy:inference") {
     return policy.legacyInferenceAllowed ? { kind: "legacy", id: value } : null;
   }
-  const match = /^v1:(inference|management|kimi-code):([0-9a-f-]+)$/u.exec(value);
+  const match = /^v1:(inference|management|kimi-code|nano-gpt):([0-9a-f-]+)$/u.exec(value);
   if (!match || !CANONICAL_UUID.test(match[2] ?? "")) return null;
   const kind = match[1] as CredentialSlotKind;
   if (!policy.savedSlotKinds.includes(kind)) return null;
@@ -1530,11 +1545,11 @@ export function selectProviderBinding(
   if (matches.length === 0) return { kind: "none" };
   if (matches.length !== 1) return { kind: "ambiguous" };
   const connection = matches[0]!;
-  if (connection.backendId !== "openrouter" && connection.backendId !== "kimi-code") {
+  if (connection.backendId !== "openrouter" && connection.backendId !== "kimi-code" && connection.backendId !== "nano-gpt") {
     return { kind: "invalid-pointer" };
   }
   const policy = providerCredentialPolicy(connection.backendId);
-  if (!policy || connection.billingRealm !== policy.billingRealm) return { kind: "invalid-pointer" };
+  if (!policy || !matchesProviderBillingRealm(policy, connection.billingRealm)) return { kind: "invalid-pointer" };
   const pointer = parseProviderCredentialPointer(
     connection.backendId,
     requireKeychainCredentialPointer(connection),
@@ -1550,7 +1565,7 @@ export function selectProviderBinding(
       enabled: connection.enabled,
       credentialPointer: pointer,
       accountFingerprint: connection.accountFingerprint,
-      billingRealm: policy.billingRealm,
+      billingRealm: connection.billingRealm as ProviderConnectionBindingV2["billingRealm"],
       isDefault: Boolean(
         state.defaultRoute
         && connection.backendId === state.defaultRoute.backendId

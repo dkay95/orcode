@@ -33,6 +33,16 @@ const model: ModelInfo = {
   },
 };
 
+test("Nano-GPT does not inherit unsupported reasoning overrides from another provider", () => {
+  assert.deepEqual(planRuntimeReasoningRequest({ mode: "auto" }, model, "nano-gpt"), { degraded: false });
+  for (const setting of [{ mode: "effort", effort: "high" }, { mode: "budget", maxTokens: 8000 }] as const) {
+    const plan = planRuntimeReasoningRequest(setting, model, "nano-gpt");
+    assert.equal(plan.request, undefined);
+    assert.equal(plan.degraded, true);
+    assert.match(plan.note!, /Nano-GPT/);
+  }
+});
+
 test("reasoning request omits auto and maps effort or budget", () => {
   assert.equal(buildReasoningRequest({ mode: "auto" }), undefined);
   assert.deepEqual(

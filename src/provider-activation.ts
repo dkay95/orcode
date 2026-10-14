@@ -34,7 +34,7 @@ import type {
   ProviderCredentialAuthorityLike,
   ProviderCredentialPolicy,
 } from "./provider-authority.js";
-import { providerCredentialPolicy } from "./provider-authority.js";
+import { matchesProviderBillingRealm, providerCredentialPolicy } from "./provider-authority.js";
 import {
   PrivateStore,
   type PrivateDirectoryClaim,
@@ -101,7 +101,7 @@ export interface ProviderActivationJournalV2 {
   transactionId: string;
   expectedRevision: number;
   phase: "prepared" | "credential-staged" | "config-committed";
-  backendId: "openrouter" | "kimi-code";
+  backendId: "openrouter" | "kimi-code" | "nano-gpt";
   credentialSlotKind: CredentialSlotKind;
   candidateSlot: CredentialSlotRef;
   previousSlot: CredentialSlotRef | { version: 0; kind: "inference"; id: "legacy:inference" } | null;
@@ -131,7 +131,8 @@ export interface ProviderActivationRuntimeGuard {
 }
 
 export interface ProviderActivationRequest {
-  backendId: "openrouter" | "kimi-code";
+  backendId: "openrouter" | "kimi-code" | "nano-gpt";
+  billingMode?: "subscription" | "payg";
   expectedRevision: number;
   candidate: string;
   expectedRequestedModelId: string;
@@ -719,7 +720,7 @@ export interface ProviderActivationCoordinatorOptions {
   privateStore: PrivateStore;
   credentials: VersionedCredentialStoreLike;
   /** Resolves the exact backend at every operation boundary. */
-  adapterResolver: (backendId: "openrouter" | "kimi-code") => ActivationAdapter | BackendAdapter;
+  adapterResolver: (backendId: "openrouter" | "kimi-code" | "nano-gpt") => ActivationAdapter | BackendAdapter;
   stateStore: ProviderStateStore;
   runtimeGuard: ProviderActivationRuntimeGuard;
   candidateAuthority?: Pick<
@@ -836,7 +837,7 @@ class ProviderPreferenceConfigFenceError extends ProviderActivationError {
 }
 
 export class ProviderActivationCoordinator {
-  readonly #adapterResolver: (backendId: "openrouter" | "kimi-code") => ActivationAdapter | BackendAdapter;
+  readonly #adapterResolver: (backendId: "openrouter" | "kimi-code" | "nano-gpt") => ActivationAdapter | BackendAdapter;
   readonly #options: Required<Pick<
     ProviderActivationCoordinatorOptions,
     "now" | "createUuid" | "leaseDurationMs" | "leaseAttempts" | "waitForLease" | "writeConfigAtomic" | "writeConfigAtomicCreate" | "onBoundary"
@@ -868,6 +869,12 @@ export class ProviderActivationCoordinator {
   }
 
   async activate(request: ProviderActivationRequest): Promise<ProviderActivationResult> {
+    if (request.backendId === "nano-gpt"
+      && ((request.billingMode !== "subscription" && request.billingMode !== "payg")
+        || request.persistence !== "persisted" || request.environmentEligibility !== "forbidden"
+        || request.onPersistenceFailure !== undefined)) {
+      throw new ProviderActivationError("provider-billing-choice-required", "Nano-GPT requires an explicit persisted billing choice.");
+    }
     const originalOwnerSignal = request.signal;
     const activationAttemptToken = Object.freeze({ version: 1 as const });
     const authorityContext: CandidateActivationAuthorityContext = {
@@ -979,8 +986,9 @@ export class ProviderActivationCoordinator {
         request.signal,
         request.targetConnectionId,
         adapter,
+        request.billingMode,
       );
-      if (candidate.backendId !== request.backendId || candidate.billingRealm !== policy.billingRealm) {
+      if (candidate.backendId !== request.backendId || !matchesProviderBillingRealm(policy, candidate.billingRealm)) {
         throw new ProviderActivationError("provider-candidate-backend-mismatch", "Provider candidate backend is invalid.");
       }
       initialCandidateId = candidate.candidateId;
@@ -1119,6 +1127,7 @@ export class ProviderActivationCoordinator {
           request.signal,
           candidate.connectionId,
           adapter,
+          request.billingMode,
         );
         revalidatedCandidateId = revalidated.candidateId;
         assertSameCandidate(candidate, revalidated);
@@ -1861,7 +1870,7 @@ export class ProviderActivationCoordinator {
   }
 
   async #assertAuthorityJournalCompatible(
-    backendId: "openrouter" | "kimi-code" | "codex" | undefined,
+    backendId: "openrouter" | "kimi-code" | "nano-gpt" | "codex" | undefined,
     lease: HeldProviderLease,
   ): Promise<void> {
     const pending = await this.#readAllJournals();
@@ -1908,7 +1917,7 @@ export class ProviderActivationCoordinator {
    * mutation ordering.
    */
   async readAuthority<T>(
-    request: { signal: AbortSignal; backendId?: "openrouter" | "kimi-code" | "codex" },
+    request: { signal: AbortSignal; backendId?: "openrouter" | "kimi-code" | "nano-gpt" | "codex" },
     operation: (lease: ProviderAuthorityReadLease) => Promise<T>,
   ): Promise<T> {
     throwIfAborted(request.signal);
@@ -2138,6 +2147,9 @@ export class ProviderActivationCoordinator {
       request.signal,
       manifest.candidateConnectionId,
       adapter,
+      manifest.backendId === "nano-gpt"
+        ? manifest.candidateRoute.billingRealm === "nanogpt-subscription" ? "subscription" : "payg"
+        : undefined,
     );
     try {
       await assertRuntimeLease(runtimeLease);
@@ -2185,12 +2197,13 @@ export class ProviderActivationCoordinator {
     signal: AbortSignal,
     connectionId: string | undefined,
     adapter: ActivationAdapter | BackendAdapter,
+    billingMode?: "subscription" | "payg",
   ): Promise<ProviderCandidate> {
     try {
       const candidate = await abortableDependency(
         () => adapter.connect({
           ...(connectionId ? { connectionId } : {}),
-          candidate: secret,
+          candidate: adapter.backendId === "nano-gpt" ? { apiKey: secret, billingMode } : secret,
           generation,
           deadlineAt,
           signal,
@@ -2201,12 +2214,14 @@ export class ProviderActivationCoordinator {
           .catch(() => undefined),
       );
       try {
-        const policy = requireActivationPolicy(adapter.backendId as "openrouter" | "kimi-code");
+        const policy = requireActivationPolicy(adapter.backendId as "openrouter" | "kimi-code" | "nano-gpt");
         if (candidate.health.generation !== generation) {
           throw new StaleProviderGenerationError();
         }
         if (candidate.backendId !== adapter.backendId
-          || candidate.billingRealm !== policy.billingRealm
+          || !matchesProviderBillingRealm(policy, candidate.billingRealm)
+          || (adapter.backendId === "nano-gpt"
+            && candidate.billingRealm !== (billingMode === "subscription" ? "nanogpt-subscription" : "nanogpt-payg"))
           || candidate.health.credential !== "valid"
           || candidate.health.connectivity !== "connected"
           || candidate.health.spend === "limit-reached"
@@ -2638,7 +2653,7 @@ export class ProviderActivationCoordinator {
     return value;
   }
 
-  #adapterFor(backendId: "openrouter" | "kimi-code"): ActivationAdapter | BackendAdapter {
+  #adapterFor(backendId: "openrouter" | "kimi-code" | "nano-gpt"): ActivationAdapter | BackendAdapter {
     try {
       const adapter = this.#adapterResolver(backendId);
       if (!adapter || adapter.backendId !== backendId) throw new Error("adapter-mismatch");
@@ -2915,7 +2930,7 @@ function isAvailableProviderPreferenceCommitPort(
   return state !== undefined && !state.used;
 }
 
-function requireActivationPolicy(backendId: "openrouter" | "kimi-code"): ProviderCredentialPolicy {
+function requireActivationPolicy(backendId: "openrouter" | "kimi-code" | "nano-gpt"): ProviderCredentialPolicy {
   const policy = providerCredentialPolicy(backendId);
   if (!policy || policy.savedSlotKinds.length !== 1) {
     throw new ProviderActivationError("provider-credential-policy-invalid", "Provider credential policy is invalid.");
@@ -3063,7 +3078,7 @@ function selectExplicitModel(
   models: readonly BackendModelDescriptor[],
   requestedModelId: string,
   canonicalModelId: string,
-  backendId: "openrouter" | "kimi-code",
+  backendId: "openrouter" | "kimi-code" | "nano-gpt",
 ): BackendModelDescriptor {
   const selected = models.find((model) =>
     model.backendId === backendId
@@ -3384,7 +3399,7 @@ function parseJournal(raw: string, transactionId: string): ProviderActivationJou
     const value = parsed as unknown as Record<string, unknown>;
     const candidateSlot = parseCredentialSlot(value.candidateSlot);
     const backendId = value.backendId;
-    if (backendId !== "openrouter" && backendId !== "kimi-code") return null;
+    if (backendId !== "openrouter" && backendId !== "kimi-code" && backendId !== "nano-gpt") return null;
     const policy = providerCredentialPolicy(backendId);
     if (!policy) return null;
     const previousSlot = parsePreviousSlot(value.previousSlot, backendId);
@@ -3393,7 +3408,7 @@ function parseJournal(raw: string, transactionId: string): ProviderActivationJou
       || !policy.savedSlotKinds.includes(candidateSlot.kind)
       || previousSlot === undefined || !candidateRoute
       || candidateRoute.backendId !== backendId
-      || candidateRoute.billingRealm !== policy.billingRealm) return null;
+      || !matchesProviderBillingRealm(policy, candidateRoute.billingRealm)) return null;
     return {
       version: 2,
       transactionId,
@@ -3549,8 +3564,8 @@ function validateJournalV2(value: unknown, transactionId: string): asserts value
     || value.version !== 2 || value.transactionId !== transactionId || !CANONICAL_UUID.test(transactionId)
     || !Number.isSafeInteger(value.expectedRevision) || Number(value.expectedRevision) < 0 || Number(value.expectedRevision) >= Number.MAX_SAFE_INTEGER
     || (value.phase !== "prepared" && value.phase !== "credential-staged" && value.phase !== "config-committed")
-    || (value.backendId !== "openrouter" && value.backendId !== "kimi-code")
-    || (value.credentialSlotKind !== "inference" && value.credentialSlotKind !== "kimi-code")
+    || (value.backendId !== "openrouter" && value.backendId !== "kimi-code" && value.backendId !== "nano-gpt")
+    || (value.credentialSlotKind !== "inference" && value.credentialSlotKind !== "kimi-code" && value.credentialSlotKind !== "nano-gpt")
     || typeof value.candidateConnectionId !== "string" || value.candidateConnectionId.length === 0 || value.candidateConnectionId.length > 256
     || typeof value.expectedProviderSetupSha256 !== "string" || !/^[0-9a-f]{64}$/.test(value.expectedProviderSetupSha256)
     || typeof value.candidateProviderSetupSha256 !== "string" || !/^[0-9a-f]{64}$/.test(value.candidateProviderSetupSha256)) {
@@ -3567,7 +3582,7 @@ function validateJournalV2(value: unknown, transactionId: string): asserts value
     || previousSlot === undefined
     || !route
     || route.backendId !== value.backendId
-    || route.billingRealm !== policy.billingRealm) {
+    || !matchesProviderBillingRealm(policy, route.billingRealm)) {
     throw new Error("invalid-provider-activation-journal");
   }
 }
@@ -3576,7 +3591,7 @@ function parseCredentialSlot(value: unknown): CredentialSlotRef | null {
   if (!isRecord(value)
     || !exactKeys(value, ["version", "kind", "id"])
     || value.version !== 1
-    || (value.kind !== "inference" && value.kind !== "management" && value.kind !== "kimi-code")
+    || (value.kind !== "inference" && value.kind !== "management" && value.kind !== "kimi-code" && value.kind !== "nano-gpt")
     || typeof value.id !== "string") {
     return null;
   }
@@ -3593,7 +3608,7 @@ function parseCredentialSlot(value: unknown): CredentialSlotRef | null {
 
 function parsePreviousSlot(
   value: unknown,
-  backendId: "openrouter" | "kimi-code",
+  backendId: "openrouter" | "kimi-code" | "nano-gpt",
 ): ProviderActivationJournal["previousSlot"] | undefined {
   if (value === null) return null;
   const current = parseCredentialSlot(value);
@@ -3622,8 +3637,8 @@ function parseStrictRoute(value: unknown): RouteIdentityV1 | null {
     ])) return null;
   const validated = validateRouteIdentityV1(value);
   if (!validated
-    || (validated.backendId !== "openrouter" && validated.backendId !== "kimi-code")
-    || validated.billingRealm !== providerCredentialPolicy(validated.backendId)?.billingRealm
+    || (validated.backendId !== "openrouter" && validated.backendId !== "kimi-code" && validated.backendId !== "nano-gpt")
+    || !matchesProviderBillingRealm(requireActivationPolicy(validated.backendId), validated.billingRealm)
     || validated.resolutionState !== "resolved"
     || validated.accountFingerprint.length > 512
     || validated.requestedModelId.length > 512

@@ -161,11 +161,14 @@ import type { ChatSummary } from "../src/types.js";
 
 test("the protocol's message inventory is pinned, so a silent addition shows up in review", () => {
   assert.equal(GUI_PROTOCOL_VERSION, 2);
-  // 21 requests + 4 server frame kinds + 21 events + 8 asks.
-  assert.equal(GUI_REQUEST_TYPES.length, 21);
-  assert.equal(GUI_EVENT_NAMES.length, 21);
+  // 25 requests + 4 server frame kinds + 22 events + 8 asks.
+  assert.equal(GUI_REQUEST_TYPES.length, 25);
+  assert.equal(GUI_EVENT_NAMES.length, 22);
   assert.equal(GUI_ASK_KINDS.length, 8);
-  assert.equal(GUI_PROTOCOL_MESSAGE_TYPES.length, 54);
+  assert.equal(GUI_PROTOCOL_MESSAGE_TYPES.length, 59);
+  for(const request of ['official-cli.action','local-run.action','execution-policy.set','project.open'])
+    assert.ok((GUI_REQUEST_TYPES as readonly string[]).includes(request));
+  assert.ok(GUI_EVENT_NAMES.includes('local-run.state'));
   // Fix round 1 (m3): a turn-mutating command must be followable by an
   // append-only client, so the transcript reset is part of the protocol.
   assert.ok(GUI_EVENT_NAMES.includes("chat.reset"));
@@ -414,6 +417,14 @@ test("a refusal states itself; anything else is described, never quoted", () => 
   assert.equal(described.message, "The provider request failed.");
   assert.ok(!JSON.stringify(described).includes("req_abc"));
   assert.ok(!JSON.stringify(described).includes("leak"));
+});
+
+test('local conflicts have fixed actionable copy rather than a provider failure',()=>{
+  const result=describeRequestFailure(new Error('original-baseline-changed'),()=> 'OpenRouter request failed.');
+  assert.equal(result.code,'original-baseline-changed');
+  assert.match(result.message,/Original.*geändert/);
+  const untrusted=describeRequestFailure(new Error('original-baseline-changed token=PRIVATE'),()=> 'Safe fallback');
+  assert.equal(untrusted.message,'Safe fallback');
 });
 
 // ---------------------------------------------------------------------------

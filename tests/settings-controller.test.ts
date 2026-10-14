@@ -689,6 +689,34 @@ test("Konten zeigt zu einem problematischen Provider die echte Reparaturaktion d
   });
 });
 
+test("Nano-GPT Settings actions keep their provider identity through core and desktop navigation", async () => {
+  await withTempConfig(async (path) => {
+    const base = completeRuntimeSnapshot();
+    const setup = harness(path, { initialSnapshot: { ...base, providers: [{
+      ...base.providers[0]!, backendId: "nano-gpt", displayName: "Nano-GPT", maturity: "preview",
+      billingRealm: "nanogpt-subscription",
+    }] } });
+    const controller = await SettingsController.open(setup.dependencies);
+    const capture = controller.captureDesktopProjection();
+    assert.deepEqual(capture.rowTruth["provider-action:nano-gpt:connect"], {
+      kind: "provider-action", backendId: "nano-gpt", action: "connect",
+    });
+    const desktop = new DesktopSettingsController(controller);
+    await desktop.dispatch({ kind: "select-category", categoryId: "accounts", revision: desktop.view.revision });
+    const accounts = desktop.view.categories.find((category) => category.id === "accounts")!;
+    const row = [...accounts.commonItems, ...accounts.advancedItems].find((candidate) => candidate.label === "Nano-GPT · Verbinden")!;
+    assert.ok(row);
+    assert.deepEqual(desktop.navigationFor({ kind: "activate-row", handle: row.handle, revision: desktop.view.revision }), {
+      kind: "provider", providerId: "nano-gpt", focusItemId: "provider-action:nano-gpt:connect",
+    });
+    await controller.dispatch({ kind: "select-item", itemId: "provider-action:nano-gpt:connect" });
+    const opened = await controller.dispatch({ kind: "activate" });
+    assert.equal(opened.kind, "edit");
+    if (opened.kind === "edit") await controller.completeEditor(opened.request, { kind: "value", value: true });
+    assert.deepEqual(setup.externalActions, [{ kind: "provider", intent: { kind: "connect", backendId: "nano-gpt" } }]);
+  });
+});
+
 test("ein unsicherer Config-Snapshot hält Settings lesbar und sperrt ausnahmslos jede Mutation", async () => {
   await withTempConfig(async (path) => {
     const setup = harness(path, {

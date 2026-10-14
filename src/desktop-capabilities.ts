@@ -32,7 +32,7 @@ const KIMI_UNAVAILABLE: DesktopDisabledPresentation = Object.freeze({
   label: "Lokale Bestätigung ist nicht verfügbar",
   recoveryLabel: "Signierte Desktop-App verwenden",
 });
-const UNSAFE_PUBLIC_LABEL = /(?:\b(?:https?|wss?):\/\/|\bwww\.|\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b|\b(?:acct_(?:or|kimi|legacy)_[A-Za-z0-9_-]{6,}|v1:(?:inference|management|kimi-code):[A-Za-z0-9-]{8,})|\b[a-f0-9]{24,}\b|canary|\b(?:error|fehler|exception|diagnostic|diagnose|stack(?:trace)?|traceback|http\s*[45]\d{2})\b|[\r\n])/i;
+const UNSAFE_PUBLIC_LABEL = /(?:\b(?:https?|wss?):\/\/|\bwww\.|\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b|\b(?:acct_(?:or|kimi|nano|legacy)_[A-Za-z0-9_-]{6,}|v1:(?:inference|management|kimi-code|nano-gpt):[A-Za-z0-9-]{8,})|\b[a-f0-9]{24,}\b|canary|\b(?:error|fehler|exception|diagnostic|diagnose|stack(?:trace)?|traceback|http\s*[45]\d{2})\b|[\r\n])/i;
 const PROJECTION_REJECTED = "Desktop-Daten konnten nicht sicher dargestellt werden.";
 
 type AuthorityKnowledge = {

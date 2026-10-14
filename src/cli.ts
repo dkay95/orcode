@@ -309,6 +309,9 @@ import {
   KimiCodeService,
   issuedKimiCodeFailure,
 } from "./kimi-code.js";
+import { NANO_GPT_DESCRIPTOR, NanoGptBackendAdapter } from "./nanogpt-backend.js";
+import { NanoGptService, issuedNanoGptFailure } from "./nanogpt.js";
+import { createNanoGptModelRuntime } from "./nanogpt-model-runtime.js";
 import {
   desktopNativeKimiExecutionOrigin,
   isDesktopKimiRuntimeCapability,
@@ -873,8 +876,10 @@ export interface ProviderRuntime extends ProviderRouteIntentPort, ProviderComman
   runSetup(surface: SetupSurface | "plain" | "fullscreen"): Promise<SetupHubResult>;
   /** Desktop-only, caller-abortable OpenRouter setup. Kimi is never surfaced here. */
   runDesktopOpenRouterSetup?(surface: SetupSurface, signal: AbortSignal): Promise<SetupHubResult>;
+  runDesktopNanoGptSetup?(surface: SetupSurface, signal: AbortSignal): Promise<SetupHubResult>;
   /** Consumes at most once the private commit proof bound to that exact setup settlement object. */
   reconcileDesktopOpenRouterSetupCommit?(settlement: unknown): DesktopOnboardingActivationResult | null;
+  reconcileDesktopNanoGptSetupCommit?(settlement: unknown): DesktopOnboardingActivationResult | null;
   /** A cached counter projection; this never acquires a runtime lease. */
   settingsActivity?(): ProviderRuntimeActivity;
   activity?(): ProviderRuntimeActivity;
@@ -1284,7 +1289,7 @@ export function projectSettingsProviderStatus(
         ? "openrouter-payg"
         : entry.backendId === "kimi-code"
           ? "kimi-code-membership-provider-managed-overage"
-          : "none",
+          : entry.backendId === "nano-gpt" && (entry.billingRealm === "nanogpt-subscription" || entry.billingRealm === "nanogpt-payg") ? entry.billingRealm : "none",
       headline: safeSettingsHeadline(entry.headline),
       health: safeSettingsHealth(entry.health),
       isDefault: comingSoon ? false : entry.isDefault,
@@ -1315,7 +1320,7 @@ function projectCachedSettingsRoute(
       ? "openrouter-payg"
       : route.backendId === "kimi-code"
         ? "kimi-code-membership-provider-managed-overage"
-        : "none",
+        : route.backendId === "nano-gpt" ? route.billingRealm : "none",
   };
 }
 
@@ -1488,7 +1493,7 @@ type ProviderConfirmationResult = Extract<
 
 interface ProviderConfirmationBinding {
   operation: ProviderDestructiveOperation;
-  backendId: "openrouter" | "kimi-code";
+  backendId: "openrouter" | "kimi-code" | "nano-gpt";
   providerRevision: number;
   connection: {
     id: string;
@@ -1526,7 +1531,7 @@ interface LegacyLogoutCommittedOutcome {
 function providerUnchangedReason(
   operation: "disable" | "disconnect",
   state: ProviderSetupStateV3,
-  backendId: "openrouter" | "kimi-code",
+  backendId: "openrouter" | "kimi-code" | "nano-gpt",
 ): string {
   const stored = state.connections.some((connection) => connection.backendId === backendId);
   if (!stored) return "no stored connection";
@@ -1544,7 +1549,7 @@ class ProviderConfirmationStaleError extends Error {
 
 type DesktopCatalogEntry = {
   readonly connectionId: string;
-  readonly backendId: "openrouter" | "kimi-code" | "codex";
+  readonly backendId: "openrouter" | "kimi-code" | "nano-gpt" | "codex";
   readonly accountFingerprint: string;
   readonly billingRealm: RouteIdentityV1["billingRealm"];
   readonly revision: number;
@@ -1554,7 +1559,7 @@ type DesktopCatalogEntry = {
 
 type DesktopOnboardingInspectionProof = {
   readonly connectionId: string;
-  readonly backendId: "openrouter" | "codex";
+  readonly backendId: "openrouter" | "nano-gpt" | "codex";
   readonly accountFingerprint: string;
   readonly billingRealm: RouteIdentityV1["billingRealm"];
   readonly revision: number;
@@ -1634,6 +1639,8 @@ export class DefaultProviderRuntime implements ProviderRuntime {
       credentialAuthority: ProviderCredentialAuthority;
       adapter: OpenRouterBackendAdapter;
       kimiAdapter?: KimiCodeBackendAdapter;
+      nanoAdapter?: NanoGptBackendAdapter;
+      nanoService?: NanoGptService;
       codexAdapter?: CodexProfileRouteRuntime;
       forgetJournal: ProviderCredentialForgetJournal;
       recover(context: ProviderStartupStepContext): Promise<void>;
@@ -1813,7 +1820,7 @@ export class DefaultProviderRuntime implements ProviderRuntime {
     if (!candidate) throw new ProviderSetupRequiredError();
     // Other providers retain their native/private catalogue gates. This path
     // cannot turn a Cross navigation action into Codex login or Kimi consent.
-    if (candidate.providerId !== "openrouter") return;
+    if (candidate.providerId !== "openrouter" && candidate.providerId !== "nano-gpt") return;
     await this.#refreshDesktopOnboardingAccount({
       providerId: candidate.providerId,
       connectionId: candidate.connectionId,
@@ -1992,7 +1999,7 @@ export class DefaultProviderRuntime implements ProviderRuntime {
       entry.revision === state.revision && entry.generation === generation
     ));
     const providers: DesktopCapabilityInput["providers"][number][] = [];
-    for (const providerId of ["openrouter", "kimi-code", "codex"] as const) {
+    for (const providerId of ["openrouter", "nano-gpt", "kimi-code", "codex"] as const) {
       const connections = state.connections.filter((connection) => connection.backendId === providerId);
       if (connections.length === 0) {
         const codexUnavailable = {
@@ -2004,7 +2011,7 @@ export class DefaultProviderRuntime implements ProviderRuntime {
           providerId, providerLabel: providerId === "codex" ? "ChatGPT / Codex" : providerDisplayName(providerId),
           connection: null, connectionId: null, accountLabel: null,
           state: providerId === "kimi-code" || (providerId === "codex" && !codexLoginReady) ? "disabled" as const : "disconnected" as const,
-          setupMethods: providerId === "openrouter"
+          setupMethods: providerId === "nano-gpt" ? ["nanogpt-owner-connect"] as const : providerId === "openrouter"
             ? ["openrouter-owner-connect"] as const
             : providerId === "kimi-code"
               ? ["kimi-owner-connect"] as const
@@ -2018,7 +2025,7 @@ export class DefaultProviderRuntime implements ProviderRuntime {
         continue;
       }
       for (const [connectionIndex, connection] of connections.entries()) {
-        const accountLabel = providerId === "openrouter"
+        const accountLabel = providerId === "nano-gpt" ? `Nano-GPT · ${connection.billingRealm === "nanogpt-subscription" ? "Abo" : "PAYG"}${connections.length > 1 ? ` ${connectionIndex + 1}` : ""}` : providerId === "openrouter"
           ? connections.length > 1 ? `Persönliches OpenRouter ${connectionIndex + 1}` : "Persönliches OpenRouter"
           : providerId === "kimi-code"
             ? "Kimi Code"
@@ -2076,7 +2083,7 @@ export class DefaultProviderRuntime implements ProviderRuntime {
             canonicalModelId: route.canonicalModelId, displayName: model.name,
             reasoning: presentation.reasoning,
             capabilities: presentation.capabilities, cost: null, dataPolicy: null,
-            runnable: selectable && (providerId !== "kimi-code" || kimiPackagedReady),
+            runnable: selectable && (providerId !== "kimi-code" || kimiPackagedReady) && (providerId !== "nano-gpt" || (metadataKnown && presentation.capabilities.includes("tools"))),
           }];
         });
         const ready = connection.enabled && (providerId === "codex" || (
@@ -2093,7 +2100,7 @@ export class DefaultProviderRuntime implements ProviderRuntime {
           connectionId: connection.id,
           accountLabel,
           state: providerId === "kimi-code" && !kimiPackagedReady ? "disabled" as const : ready ? "ready" as const : "disconnected" as const,
-          setupMethods: providerId === "openrouter"
+          setupMethods: providerId === "nano-gpt" ? ["nanogpt-owner-connect"] as const : providerId === "openrouter"
             ? ["openrouter-owner-connect"] as const
             : providerId === "kimi-code"
               ? ["kimi-owner-connect"] as const
@@ -2120,7 +2127,7 @@ export class DefaultProviderRuntime implements ProviderRuntime {
         routeHandle: activeCandidate.handle,
         providerLabel: activeCandidate.providerId === "codex"
           ? "ChatGPT / Codex"
-          : providerDisplayName(activeCandidate.providerId as "openrouter" | "kimi-code"),
+          : providerDisplayName(activeCandidate.providerId as "openrouter" | "kimi-code" | "nano-gpt"),
         modelLabel: activeCandidate.displayName,
         accountLabel: activeCandidate.accountLabel,
       } : null,
@@ -2232,15 +2239,18 @@ export class DefaultProviderRuntime implements ProviderRuntime {
         effect.close();
       }
     }
-    if (selection.providerId !== "openrouter"
+    const providerId = selection.providerId;
+    const adapter = providerId === "nano-gpt" ? this.authorityOptions?.nanoAdapter : this.authorityOptions?.adapter;
+    if (!adapter) throw new ProviderSetupRequiredError();
+    if ((selection.providerId !== "openrouter" && selection.providerId !== "nano-gpt")
       || snapshot.revision !== selection.revision
       || snapshot.generation !== selection.generation) throw new ProviderSetupRequiredError();
     const state = this.stateStore.read();
     const connection = state.connections.find((item) => item.id === selection.connectionId);
     const owner = selectProviderBinding(state, { kind: "connection", connectionId: selection.connectionId });
-    if (!connection || connection.backendId !== "openrouter" || !connection.enabled
+    if (!connection || connection.backendId !== providerId || !connection.enabled
       || (connection.lastHealth !== null && !isSelectableConnectionHealth(connection.lastHealth))
-      || owner.kind !== "exact" || owner.binding.backendId !== "openrouter"
+      || owner.kind !== "exact" || owner.binding.backendId !== providerId
       || owner.binding.connectionId !== selection.connectionId || !this.authorityOptions) {
       throw new ProviderSetupRequiredError();
     }
@@ -2251,7 +2261,7 @@ export class DefaultProviderRuntime implements ProviderRuntime {
     const effect = createProviderEffectAttempt(8_000, callerSignal);
     try {
       const models = await this.activationCoordinator.readAuthority(
-        { signal: effect.signal, backendId: "openrouter" },
+        { signal: effect.signal, backendId: providerId },
         async (lease) => {
           await lease.assertHeld();
           const current = this.stateStore.read();
@@ -2260,10 +2270,10 @@ export class DefaultProviderRuntime implements ProviderRuntime {
             kind: "connection", connectionId: selection.connectionId,
           });
           if (current.revision !== selection.revision || currentGeneration !== selection.generation
-            || currentOwner.kind !== "exact" || currentOwner.binding.backendId !== "openrouter"
+            || currentOwner.kind !== "exact" || currentOwner.binding.backendId !== providerId
             || currentOwner.binding.connectionId !== selection.connectionId) throw new ProviderSetupRequiredError();
           const inspection = await abortableProviderAction(
-            () => this.authorityOptions!.adapter.inspectUnderAuthorityLease({
+            () => adapter.inspectUnderAuthorityLease({
               connectionId: selection.connectionId,
               generation: selection.generation,
               deadlineAt: effect.deadlineAt,
@@ -2274,14 +2284,14 @@ export class DefaultProviderRuntime implements ProviderRuntime {
             effect.signal,
           );
           await lease.assertHeld();
-          if (!inspection.routeEligible || inspection.backendId !== "openrouter"
+          if (!inspection.routeEligible || inspection.backendId !== providerId
             || inspection.connectionId !== selection.connectionId
             || inspection.health.generation !== selection.generation
             || inspection.accountFingerprint !== connection.accountFingerprint
             || inspection.billingRealm !== connection.billingRealm
             || !isSelectableConnectionHealth(inspection.health)) throw new ProviderSetupRequiredError();
           const catalog = await abortableProviderAction(
-            () => this.authorityOptions!.adapter.listModels({ connectionId: selection.connectionId, signal: effect.signal }),
+            () => adapter.listModels({ connectionId: selection.connectionId, signal: effect.signal }),
             effect.signal,
           );
           await lease.assertHeld();
@@ -2300,18 +2310,18 @@ export class DefaultProviderRuntime implements ProviderRuntime {
         || !currentConnection.enabled
         || (currentConnection.lastHealth !== null && !isSelectableConnectionHealth(currentConnection.lastHealth))
         || currentOwner.kind !== "exact"
-        || currentOwner.binding.backendId !== "openrouter"
+        || currentOwner.binding.backendId !== providerId
         || currentOwner.binding.connectionId !== selection.connectionId) throw new ProviderSetupRequiredError();
       this.#desktopOnboardingInspections.set(currentConnection.id, Object.freeze({
         connectionId: currentConnection.id,
-        backendId: "openrouter",
+        backendId: providerId === "nano-gpt" ? "nano-gpt" : "openrouter",
         accountFingerprint: currentConnection.accountFingerprint,
         billingRealm: currentConnection.billingRealm,
         revision: current.revision,
         generation: selection.generation,
       }));
       this.#rememberDesktopCatalog(
-        models.filter((model) => model.backendId === "openrouter"
+        models.filter((model) => model.backendId === providerId
           && model.capabilities.textInput && model.capabilities.textOutput).map(cachedModelInfoFromDescriptor),
         currentConnection,
         current.revision,
@@ -2400,7 +2410,7 @@ export class DefaultProviderRuntime implements ProviderRuntime {
       }
     }
     if (!candidate || !candidate.runnable || candidate.disabled || !binding
-      || binding.connectionId !== selection.connectionId || selection.providerId !== "openrouter") {
+      || binding.connectionId !== selection.connectionId || (selection.providerId !== "openrouter" && selection.providerId !== "nano-gpt")) {
       throw new ProviderSetupRequiredError();
     }
     const state = this.stateStore.read();
@@ -2411,6 +2421,12 @@ export class DefaultProviderRuntime implements ProviderRuntime {
       || intendedGeneration !== selection.generation + 1 || !this.authorityOptions) {
       throw new ProviderSetupRequiredError();
     }
+    const ownedSelectedModel = [...this.#providerOwnedSettingsModels.values()].find((entry) =>
+      entry.connectionId === binding.connectionId && entry.backendId === binding.route.backendId
+      && entry.accountFingerprint === binding.route.accountFingerprint && entry.billingRealm === binding.route.billingRealm
+      && entry.revision === selection.revision && entry.generation === selection.generation
+      && entry.model.id === binding.route.requestedModelId
+      && (entry.model.canonicalSlug ?? entry.model.id) === binding.route.canonicalModelId);
     let settleEffect!: (outcome: "cancelled" | "completion-committed") => void;
     const effect: DesktopOnboardingEffect = {
       ...createProviderEffectAttempt(8_000, callerSignal),
@@ -2424,7 +2440,7 @@ export class DefaultProviderRuntime implements ProviderRuntime {
     let committedGeneration: number | null = null;
     try {
       const access = await abortableProviderAction(() => this.authorityOptions!.credentialAuthority.withCredential({
-        backendId: "openrouter",
+        backendId: selection.providerId === "nano-gpt" ? "nano-gpt" : "openrouter",
         connectionId: binding.connectionId,
         credentialKind: "inference",
         purpose: "retained-model-preference",
@@ -2437,7 +2453,8 @@ export class DefaultProviderRuntime implements ProviderRuntime {
         || context.binding.accountFingerprint !== binding.route.accountFingerprint
         || context.binding.billingRealm !== binding.route.billingRealm) throw new ProviderSetupRequiredError();
       const result = await this.orchestrator.activateCandidate({
-        backendId: "openrouter",
+        backendId: selection.providerId === "nano-gpt" ? "nano-gpt" : "openrouter",
+        ...(selection.providerId === "nano-gpt" ? { billingMode: binding.route.billingRealm === "nanogpt-subscription" ? "subscription" as const : "payg" as const } : {}),
         expectedRevision: context.binding.stateRevision,
         candidate: candidateSecret,
         expectedRequestedModelId: binding.route.requestedModelId,
@@ -2445,6 +2462,7 @@ export class DefaultProviderRuntime implements ProviderRuntime {
         signal: effect.signal,
         deadlineAt: effect.deadlineAt,
         persistence: "persisted",
+        environmentEligibility: "forbidden",
         targetConnectionId: binding.connectionId,
         candidatePermit: context.candidatePermit,
         requireCandidatePermit: true,
@@ -2481,6 +2499,28 @@ export class DefaultProviderRuntime implements ProviderRuntime {
       }
       this.#adoptExactSessionRoute(accepted, true, true, true);
       this.#synchronizeAuthoritativeProviderState();
+      if (selection.providerId === "nano-gpt") {
+        const connection = finalState.connections.find((entry) => entry.id === binding.connectionId);
+        // This selected model's real preflight metadata has an exact owner.
+        // Rebind only it after the durable tuple is proven, never other stale routes.
+        if (connection && ownedSelectedModel) {
+          this.#rememberDesktopCatalog([ownedSelectedModel.model], connection, finalState.revision, committedGeneration, true);
+        }
+        if (connection && this.authorityOptions.nanoAdapter && !effect.signal.aborted) {
+          try {
+            const models = await abortableProviderAction(() => this.authorityOptions!.nanoAdapter!.listModels({ connectionId: connection.id, signal: effect.signal }), effect.signal);
+            const current = this.stateStore.read();
+            const owner = selectProviderBinding(current, { kind: "route", route: accepted });
+            if (current.revision === committedRevision && this.orchestrator.currentGeneration() === committedGeneration
+              && current.defaultRoute && sameExactRoute(current.defaultRoute, accepted)
+              && owner.kind === "exact" && owner.binding.connectionId === binding.connectionId && !effect.signal.aborted) {
+              this.#rememberDesktopCatalog(models.map(cachedModelInfoFromDescriptor), connection, current.revision, committedGeneration, true);
+            }
+          } catch {
+            // Metadata refresh is optional after exact durable adoption. It cannot roll back activation.
+          }
+        }
+      }
       const after = this.#desktopOnboardingSnapshot();
       const acceptedHandle = after.activeRoute?.routeHandle;
       // A successful durable activation advances the state epoch. Handles are
@@ -2544,7 +2584,7 @@ export class DefaultProviderRuntime implements ProviderRuntime {
           const model = kimiDashboardModelInfo(candidate.id);
           return model ? [model] : [];
         })
-      : route.backendId === "openrouter"
+      : route.backendId === "openrouter" || route.backendId === "nano-gpt"
         ? [...this.#providerOwnedSettingsModels.values()]
             .filter((entry) => entry.backendId === route.backendId
               && entry.accountFingerprint === route.accountFingerprint
@@ -2568,7 +2608,7 @@ export class DefaultProviderRuntime implements ProviderRuntime {
   readCachedSettingsRoute(): SettingsRouteProjection | null {
     const route = this.#desiredSessionRoute(this.stateStore.read());
     if (!route || route.resolutionState !== "resolved" || !route.canonicalModelId
-      || (route.backendId !== "openrouter" && route.backendId !== "kimi-code"
+      || (route.backendId !== "openrouter" && route.backendId !== "kimi-code" && route.backendId !== "nano-gpt"
         && route.backendId !== "anthropic")) return null;
     const modelLabel = route.backendId === "kimi-code"
       ? KIMI_CODE_MODELS.find((model) => model.id === route.canonicalModelId)?.displayName
@@ -2584,7 +2624,7 @@ export class DefaultProviderRuntime implements ProviderRuntime {
         ? "openrouter-payg"
         : route.backendId === "kimi-code"
           ? "kimi-code-membership-provider-managed-overage"
-          : "none",
+          : route.backendId === "nano-gpt" ? route.billingRealm as "nanogpt-subscription" | "nanogpt-payg" : "none",
     };
   }
 
@@ -2594,24 +2634,24 @@ export class DefaultProviderRuntime implements ProviderRuntime {
   } {
     const state = this.stateStore.read();
     const route = this.#sessionRoute ?? state.defaultRoute;
-    const projectedRoute = route && (route.backendId === "openrouter" || route.backendId === "kimi-code")
+    const projectedRoute = route && (route.backendId === "openrouter" || route.backendId === "kimi-code" || route.backendId === "nano-gpt")
       && route.canonicalModelId
-      && (route.billingRealm === "openrouter-payg" || route.billingRealm === "kimi-code-membership-provider-managed-overage") ? {
+      && (route.billingRealm === "openrouter-payg" || route.billingRealm === "kimi-code-membership-provider-managed-overage" || route.billingRealm === "nanogpt-subscription" || route.billingRealm === "nanogpt-payg") ? {
       backendId: route.backendId,
-      providerLabel: route.backendId === "kimi-code" ? "Kimi Code" : "OpenRouter",
+      providerLabel: providerDisplayName(route.backendId),
       requestedModelId: route.requestedModelId,
       canonicalModelId: route.canonicalModelId,
       modelLabel: route.requestedModelId,
       billingRealm: route.billingRealm,
     } satisfies SettingsRouteProjection : null;
     const providers: SettingsProviderProjection[] = state.connections
-      .filter((connection): connection is typeof connection & { backendId: "openrouter" | "kimi-code" } =>
-        connection.backendId === "openrouter" || connection.backendId === "kimi-code")
-      .filter((connection): connection is typeof connection & { billingRealm: "openrouter-payg" | "kimi-code-membership-provider-managed-overage" } =>
-        connection.billingRealm === "openrouter-payg" || connection.billingRealm === "kimi-code-membership-provider-managed-overage")
+      .filter((connection): connection is typeof connection & { backendId: "openrouter" | "kimi-code" | "nano-gpt" } =>
+        connection.backendId === "openrouter" || connection.backendId === "kimi-code" || connection.backendId === "nano-gpt")
+      .filter((connection): connection is typeof connection & { billingRealm: "openrouter-payg" | "kimi-code-membership-provider-managed-overage" | "nanogpt-subscription" | "nanogpt-payg" } =>
+        connection.billingRealm === "openrouter-payg" || connection.billingRealm === "kimi-code-membership-provider-managed-overage" || connection.billingRealm === "nanogpt-subscription" || connection.billingRealm === "nanogpt-payg")
       .map((connection) => ({
       backendId: connection.backendId,
-      displayName: connection.backendId === "kimi-code" ? "Kimi Code" : "OpenRouter",
+      displayName: providerDisplayName(connection.backendId),
       availability: "connectable",
       configuration: connection.enabled ? "enabled" : "disabled",
       maturity: connection.maturity,
@@ -2703,6 +2743,27 @@ export class DefaultProviderRuntime implements ProviderRuntime {
           route: validated,
         },
       );
+      this.#modelRuntimeCache = { key, runtime };
+      return runtime;
+    }
+    if (validated.backendId === "nano-gpt") {
+      const health = connection?.lastHealth;
+      const authority = this.authorityOptions?.credentialAuthority;
+      const service = this.authorityOptions?.nanoService;
+      if (!authority || !service || !connection || !connection.enabled
+        || connection.backendId !== "nano-gpt" || !health
+        || !isSelectableConnectionHealth(health)
+        || !Number.isSafeInteger(health.generation) || health.generation < 0
+        || (validated.billingRealm !== "nanogpt-subscription" && validated.billingRealm !== "nanogpt-payg")
+        || validated.requestedModelId !== validated.canonicalModelId) throw new ProviderSetupRequiredError();
+      const key = JSON.stringify({ backendId: "nano-gpt", stateRevision: state.revision, generation: health.generation, connectionId: connection.id, route: validated });
+      if (this.#modelRuntimeCache?.key === key) return this.#modelRuntimeCache.runtime;
+      const runtime = bindModelRuntimeIdentity(createNanoGptModelRuntime({
+        route: validated,
+        binding: Object.freeze({ version: 1, stateRevision: state.revision, generation: health.generation, connectionId: connection.id, backendId: "nano-gpt", accountFingerprint: connection.accountFingerprint, billingRealm: validated.billingRealm, canonicalModelId: validated.canonicalModelId }),
+        credentialAuthority: authority, service, now: Date.now,
+        createRequestDeadlineAt: () => Date.now() + 300_000,
+      }), { version: 1, stateRevision: state.revision, generation: health.generation, connectionId: connection.id, backendId: "nano-gpt", route: validated });
       this.#modelRuntimeCache = { key, runtime };
       return runtime;
     }
@@ -2963,7 +3024,7 @@ export class DefaultProviderRuntime implements ProviderRuntime {
           );
           if (exact.length !== 1) throw new ProviderSetupRequiredError();
         }
-        if (provedRoute.backendId === "kimi-code") {
+        if (provedRoute.backendId === "kimi-code" || provedRoute.backendId === "nano-gpt") {
           this.modelRuntime(provedRoute);
         } else {
           if (!routeAdapter.bindRuntime) throw new ProviderSetupRequiredError();
@@ -2997,7 +3058,7 @@ export class DefaultProviderRuntime implements ProviderRuntime {
   async runSetup(
     surface: SetupSurface | "plain" | "fullscreen",
     startupAttempt?: ProviderStartupStepContext,
-    initialBackendId?: "openrouter" | "kimi-code",
+    initialBackendId?: "openrouter" | "kimi-code" | "nano-gpt",
     callerSignal?: AbortSignal,
     captureDesktopCommit?: (proof: DesktopOpenRouterSetupCommitProof) => void,
   ): Promise<SetupHubResult> {
@@ -3055,6 +3116,17 @@ export class DefaultProviderRuntime implements ProviderRuntime {
             providerGeneration = this.orchestrator.currentGeneration();
           } catch {
             // A post-abort persisted reconciliation requires this authority.
+          }
+          if (route.backendId === "nano-gpt" && committedOwner?.kind === "exact" && result.state && providerGeneration !== null) {
+            const connection = result.state.connections.find((entry) => entry.id === committedOwner.binding.connectionId);
+            if (connection && this.authorityOptions?.nanoAdapter && !request.signal.aborted) {
+              try {
+                const models = await this.authorityOptions.nanoAdapter.listModels({ connectionId: connection.id, signal: request.signal });
+                this.#rememberDesktopCatalog(models.map(cachedModelInfoFromDescriptor), connection, result.state.revision, providerGeneration, true);
+              } catch {
+                // Durable activation remains authoritative; absent metadata requires explicit refresh.
+              }
+            }
           }
           if (
             result.persisted
@@ -3268,7 +3340,7 @@ export class DefaultProviderRuntime implements ProviderRuntime {
           ? selectOpenRouterBinding(state, { kind: "default" })
           : selectOpenRouterBinding(state, { kind: "backend", backendId: "openrouter" });
       let result: SetupHubResult;
-      if (initialBackendId === "kimi-code") {
+      if (initialBackendId === "kimi-code" || initialBackendId === "nano-gpt") {
         result = await executeHub(null);
       } else if (this.authorityOptions && savedBinding.kind === "exact") {
         const access = await this.authorityOptions.credentialAuthority.withCredential(
@@ -3380,20 +3452,32 @@ export class DefaultProviderRuntime implements ProviderRuntime {
   }
 
   async runDesktopOpenRouterSetup(surface: SetupSurface, signal: AbortSignal): Promise<SetupHubResult> {
+    return this.#runDesktopRawProviderSetup(surface, signal, "openrouter");
+  }
+
+  async runDesktopNanoGptSetup(surface: SetupSurface, signal: AbortSignal): Promise<SetupHubResult> {
+    return this.#runDesktopRawProviderSetup(surface, signal, "nano-gpt");
+  }
+
+  async #runDesktopRawProviderSetup(surface: SetupSurface, signal: AbortSignal, backendId: "openrouter" | "nano-gpt"): Promise<SetupHubResult> {
     throwIfProviderEffectAborted(signal);
     let secretBack = false;
     const openRouterOnlySurface: SetupSurface = {
       // The desktop flow owns no provider chooser. A retry remains in this
       // OpenRouter path; backing out of the secret prompt cancels it.
-      async chooseHub() { return secretBack ? null : "openrouter"; },
+      async chooseHub(entries) {
+        if (secretBack) return null;
+        if (backendId === "nano-gpt" && entries.some((entry) => entry.id === "nano-gpt:subscription" || entry.id === "nano-gpt:payg")) return surface.chooseHub(entries);
+        return backendId;
+      },
       async readSecret(request) {
-        if (request.backendId !== "openrouter") return null;
+        if (request.backendId !== backendId) return null;
         const value = await surface.readSecret(request);
         if (value === null) secretBack = true;
         return value;
       },
       async chooseModel(request) {
-        if (request.backendId !== "openrouter") return null;
+        if (request.backendId !== backendId) return null;
         return surface.chooseModel(request);
       },
       async confirm(request) { return surface.confirm(request); },
@@ -3414,7 +3498,7 @@ export class DefaultProviderRuntime implements ProviderRuntime {
       const result = await this.runSetup(
         openRouterOnlySurface,
         undefined,
-        "openrouter",
+        backendId,
         signal,
         (proof) => { commitProof = proof; },
       );
@@ -3427,10 +3511,18 @@ export class DefaultProviderRuntime implements ProviderRuntime {
   }
 
   reconcileDesktopOpenRouterSetupCommit(settlement: unknown): DesktopOnboardingActivationResult | null {
+    return this.#reconcileDesktopRawSetupCommit(settlement, "openrouter");
+  }
+
+  reconcileDesktopNanoGptSetupCommit(settlement: unknown): DesktopOnboardingActivationResult | null {
+    return this.#reconcileDesktopRawSetupCommit(settlement, "nano-gpt");
+  }
+
+  #reconcileDesktopRawSetupCommit(settlement: unknown, backendId: "openrouter" | "nano-gpt"): DesktopOnboardingActivationResult | null {
     if (!isWeakMapKey(settlement)) return null;
     const proof = this.#desktopOpenRouterSetupCommits.get(settlement);
     this.#desktopOpenRouterSetupCommits.delete(settlement);
-    if (!proof
+    if (!proof || proof.route.backendId !== backendId
       || proof.setupPublicationGeneration !== this.#setupPublicationGeneration
       || proof.routePublicationGeneration !== this.#processRouteGeneration) return null;
     let providerGeneration: number;
@@ -3543,7 +3635,7 @@ export class DefaultProviderRuntime implements ProviderRuntime {
   prepareSettingsModelPublication(route: RouteIdentityV1): { publish(): void } {
     const next = validateRouteIdentityV1(route);
     if (!next || next.resolutionState !== "resolved" || !next.canonicalModelId
-      || (next.backendId !== "openrouter" && next.backendId !== "kimi-code")) {
+      || (next.backendId !== "openrouter" && next.backendId !== "kimi-code" && next.backendId !== "nano-gpt")) {
       throw new ProviderSetupRequiredError();
     }
     const exact = structuredClone(next);
@@ -3708,7 +3800,7 @@ export class DefaultProviderRuntime implements ProviderRuntime {
         generation: pendingGeneration,
         ready: false,
       };
-      if (validated.backendId === "kimi-code") {
+      if (validated.backendId === "kimi-code" || validated.backendId === "nano-gpt") {
         this.modelRuntime(proved);
       } else {
         await adapter.bindRuntime!({
@@ -3827,7 +3919,7 @@ export class DefaultProviderRuntime implements ProviderRuntime {
         for (const connection of state.connections) {
           if (
             !connection.enabled
-            || (connection.backendId !== "openrouter" && connection.backendId !== "kimi-code")
+            || (connection.backendId !== "openrouter" && connection.backendId !== "kimi-code" && connection.backendId !== "nano-gpt")
             || !isSelectableConnectionHealth(connection.lastHealth)
           ) continue;
           const selected = selectProviderBinding(state, {
@@ -3962,7 +4054,7 @@ export class DefaultProviderRuntime implements ProviderRuntime {
     complete: boolean,
   ): void {
     if (!Array.isArray(value) || (connection.backendId !== "openrouter"
-      && connection.backendId !== "kimi-code" && connection.backendId !== "codex")) return;
+      && connection.backendId !== "kimi-code" && connection.backendId !== "nano-gpt" && connection.backendId !== "codex")) return;
     if (complete) {
       this.#desktopOnboardingCatalogs.set(connection.id, Object.freeze({ revision, generation }));
       for (const [key, entry] of this.#providerOwnedSettingsModels) {
@@ -4007,7 +4099,7 @@ export class DefaultProviderRuntime implements ProviderRuntime {
       !target
       || target.resolutionState !== "resolved"
       || !target.canonicalModelId
-      || (target.backendId !== "openrouter" && target.backendId !== "kimi-code")
+      || (target.backendId !== "openrouter" && target.backendId !== "kimi-code" && target.backendId !== "nano-gpt")
     ) {
       throw new ProviderSetupRequiredError();
     }
@@ -4043,6 +4135,16 @@ export class DefaultProviderRuntime implements ProviderRuntime {
   ): Promise<RouteIdentityV1> {
     const activeRoute = this.ensureRunnableRoute();
     const current = targetRoute ?? activeRoute;
+    if (current.backendId === "nano-gpt") {
+      if ((canonicalModelId ?? modelId) !== modelId) throw new ProviderSetupRequiredError();
+      const route = await this.#transitionKimiModelWithPreference(current, modelId, modelId, preferencePublication, "nano-gpt");
+      if (!preferencePublication) {
+        this.modelRuntime(route);
+        this.#adoptExactSessionRoute(route, true, true, true, true);
+        this.#synchronizeAuthoritativeProviderState();
+      }
+      return route;
+    }
     if (current.backendId === "kimi-code") {
       return this.#transitionKimiModel(
         current,
@@ -4344,23 +4446,24 @@ export class DefaultProviderRuntime implements ProviderRuntime {
     current: RouteIdentityV1,
     modelId: string,
     selectedCanonicalModelId: string,
-    preferencePublication: ProviderPreferenceCommitPort,
+    preferencePublication: ProviderPreferenceCommitPort | undefined,
+    backendId: "kimi-code" | "nano-gpt" = "kimi-code",
   ): Promise<RouteIdentityV1> {
     const authority = this.authorityOptions?.credentialAuthority;
-    if (!authority || !this.authorityOptions?.kimiAdapter) {
+    if (!authority || !(backendId === "nano-gpt" ? this.authorityOptions?.nanoAdapter : this.authorityOptions?.kimiAdapter)) {
       throw new ProviderSetupRequiredError();
     }
     const state = this.stateStore.read();
     const selected = selectProviderBinding(state, { kind: "route", route: current });
     if (selected.kind !== "exact"
-      || selected.binding.backendId !== "kimi-code") {
+      || selected.binding.backendId !== backendId) {
       throw new ProviderSetupRequiredError();
     }
     const effectAttempt = createProviderEffectAttempt();
     let terminalActivation: Promise<RouteIdentityV1> | null = null;
     try {
       const access = await authority.withCredential({
-        backendId: "kimi-code",
+        backendId: backendId,
         connectionId: selected.binding.connectionId,
         credentialKind: "inference",
         purpose: "retained-model-preference",
@@ -4376,7 +4479,8 @@ export class DefaultProviderRuntime implements ProviderRuntime {
         }
         terminalActivation = (async () => {
           const result = await this.orchestrator.activateCandidate({
-            backendId: "kimi-code",
+            backendId,
+            ...(backendId === "nano-gpt" ? { billingMode: current.billingRealm === "nanogpt-subscription" ? "subscription" as const : "payg" as const } : {}),
             expectedRevision: context.binding.stateRevision,
             candidate,
             expectedRequestedModelId: modelId,
@@ -4395,7 +4499,7 @@ export class DefaultProviderRuntime implements ProviderRuntime {
           if (!result.persisted
             || !route
             || route.resolutionState !== "resolved"
-            || route.backendId !== "kimi-code"
+            || route.backendId !== backendId
             || route.accountFingerprint !== current.accountFingerprint
             || route.billingRealm !== current.billingRealm
             || route.requestedModelId !== modelId
@@ -4423,11 +4527,11 @@ export class DefaultProviderRuntime implements ProviderRuntime {
     run: (route: RouteIdentityV1) => Promise<T>,
     surface?: SetupSurface | "plain" | "fullscreen",
   ): Promise<T> {
-    let attemptedBackend: "openrouter" | "kimi-code" = "openrouter";
+    let attemptedBackend: "openrouter" | "kimi-code" | "nano-gpt" = "openrouter";
     return executeProviderModelAction({
       ensureRunnableRoute: () => {
         const route = this.ensureRunnableRoute();
-        if (route.backendId === "kimi-code") attemptedBackend = "kimi-code";
+        if (route.backendId === "kimi-code" || route.backendId === "nano-gpt") attemptedBackend = route.backendId;
         return route;
       },
       beginRun: () => this.runtimeGuard.beginRun(),
@@ -4440,10 +4544,10 @@ export class DefaultProviderRuntime implements ProviderRuntime {
   }
 
   #isAuthenticationFailure(
-    backendId: "openrouter" | "kimi-code",
+    backendId: "openrouter" | "kimi-code" | "nano-gpt",
     error: unknown,
   ): boolean {
-    return backendId === "kimi-code"
+    return backendId === "nano-gpt" ? issuedNanoGptFailure(error)?.code === "nanogpt-auth-rejected" : backendId === "kimi-code"
       ? ["kimi-code-auth-rejected", "kimi-code-access-terminated"].includes(
           issuedKimiCodeFailure(error)?.code ?? "",
         )
@@ -4451,7 +4555,7 @@ export class DefaultProviderRuntime implements ProviderRuntime {
   }
 
   async #invalidateAuthenticationFailure(
-    backendId: "openrouter" | "kimi-code",
+    backendId: "openrouter" | "kimi-code" | "nano-gpt",
   ): Promise<void> {
     const controller = new AbortController();
     const runtimeLease = await this.runtimeGuard.acquire(controller.signal);
@@ -4499,7 +4603,7 @@ export class DefaultProviderRuntime implements ProviderRuntime {
 
   #selectedProviderConnection(
     state: ProviderSetupStateV3,
-    backendId: "openrouter" | "kimi-code",
+    backendId: "openrouter" | "kimi-code" | "nano-gpt",
     allowDisabled = false,
   ) {
     const desiredRoute = this.#desiredSessionRoute(state);
@@ -4516,7 +4620,7 @@ export class DefaultProviderRuntime implements ProviderRuntime {
   #confirmationBinding(
     operation: ProviderDestructiveOperation,
     state: ProviderSetupStateV3,
-    backendId: "openrouter" | "kimi-code" = "openrouter",
+    backendId: "openrouter" | "kimi-code" | "nano-gpt" = "openrouter",
   ): ProviderConfirmationBinding {
     let connection = this.#selectedProviderConnection(state, backendId);
     if (!connection && operation === "logout") {
@@ -4588,7 +4692,7 @@ export class DefaultProviderRuntime implements ProviderRuntime {
   #confirmationRequired(
     operation: ProviderDestructiveOperation,
     state = this.stateStore.read(),
-    backendId: "openrouter" | "kimi-code" = "openrouter",
+    backendId: "openrouter" | "kimi-code" | "nano-gpt" = "openrouter",
   ): ProviderConfirmationResult {
     const confirmationToken = randomUUID();
     this.#providerConfirmations.set(
@@ -4605,8 +4709,8 @@ export class DefaultProviderRuntime implements ProviderRuntime {
       operation,
       backendId,
       message: operation === "logout"
-        ? `Really log out of ${backendId === "kimi-code" ? "Kimi Code" : "OpenRouter"} and remove only its current versioned key?`
-        : `Disable the last usable ${backendId === "kimi-code" ? "Kimi Code" : "OpenRouter"} connection? Model runs stop, the chat stays open.`,
+        ? `Really log out of ${providerDisplayName(backendId)} and remove only its current versioned key?`
+        : `Disable the last usable ${providerDisplayName(backendId)} connection? Model runs stop, the chat stays open.`,
       confirmationToken,
     };
   }
@@ -4615,7 +4719,7 @@ export class DefaultProviderRuntime implements ProviderRuntime {
     token: string,
     operation: ProviderDestructiveOperation,
     state: ProviderSetupStateV3,
-    backendId: "openrouter" | "kimi-code" = "openrouter",
+    backendId: "openrouter" | "kimi-code" | "nano-gpt" = "openrouter",
   ): ProviderConfirmationBinding | null {
     const expected = this.#providerConfirmations.get(token);
     this.#providerConfirmations.delete(token);
@@ -4627,7 +4731,7 @@ export class DefaultProviderRuntime implements ProviderRuntime {
     expected: ProviderConfirmationBinding,
     operation: ProviderDestructiveOperation,
     state: ProviderSetupStateV3,
-    backendId: "openrouter" | "kimi-code" = "openrouter",
+    backendId: "openrouter" | "kimi-code" | "nano-gpt" = "openrouter",
   ): boolean {
     return JSON.stringify(expected) === JSON.stringify(
       this.#confirmationBinding(operation, state, backendId),
@@ -4890,21 +4994,34 @@ export class DefaultProviderRuntime implements ProviderRuntime {
     }
   }
 
-  async #enableRetainedKimi(): Promise<boolean | null> {
-    this.#assertKimiOwnerMode();
-    const kimiAdapter = this.authorityOptions?.kimiAdapter;
-    if (!kimiAdapter) throw new KimiOwnerInteractiveRequiredError();
+  async #enableRetainedKimi(backendId: "kimi-code" | "nano-gpt" = "kimi-code"): Promise<boolean | null> {
+    if (backendId === "kimi-code") this.#assertKimiOwnerMode();
+    const kimiAdapter = backendId === "nano-gpt" ? this.authorityOptions?.nanoAdapter : this.authorityOptions?.kimiAdapter;
+    if (!kimiAdapter) throw new ProviderSetupRequiredError();
     const retainedState = this.stateStore.read();
-    const retained = selectProviderBinding(
+    const desiredRoute = this.#desiredSessionRoute(retainedState);
+    const preferredNanoRoute = desiredRoute?.backendId === "nano-gpt"
+      ? desiredRoute
+      : retainedState.defaultRoute?.backendId === "nano-gpt" ? retainedState.defaultRoute : null;
+    const preferredNanoBinding = backendId === "nano-gpt" && preferredNanoRoute
+      ? selectProviderBinding(retainedState, { kind: "route", route: preferredNanoRoute }, true)
+      : null;
+    const retained = preferredNanoBinding?.kind === "exact" ? preferredNanoBinding : selectProviderBinding(
       retainedState,
-      { kind: "backend", backendId: "kimi-code" },
+      { kind: "backend", backendId: backendId },
       true,
     );
     if (retained.kind !== "exact") return null;
     const wasEnabled = retained.binding.enabled;
+    if (backendId === "nano-gpt") {
+      const desired = preferredNanoRoute;
+      if (!desired || desired.backendId !== "nano-gpt"
+        || desired.accountFingerprint !== retained.binding.accountFingerprint
+        || desired.billingRealm !== retained.binding.billingRealm) return null;
+    }
     if (wasEnabled) {
-      const route = this.#desiredSessionRoute(retainedState);
-      const selected = route?.backendId === "kimi-code"
+      const route = backendId === "nano-gpt" ? preferredNanoRoute : this.#desiredSessionRoute(retainedState);
+      const selected = route?.backendId === backendId
         ? selectProviderBinding(retainedState, { kind: "route", route })
         : null;
       if (
@@ -4931,6 +5048,7 @@ export class DefaultProviderRuntime implements ProviderRuntime {
       }
     };
     const connectionId = retained.binding.connectionId;
+    let verifiedModels: readonly BackendModelDescriptor[] | null = null;
     let committedTuple: { state: ProviderSetupStateV3; route: RouteIdentityV1 } | null = null;
     let committedAdopted = false;
     const adoptCommittedTuple = (): boolean => {
@@ -4939,6 +5057,11 @@ export class DefaultProviderRuntime implements ProviderRuntime {
       if (committedAdopted) return true;
       this.config.providerSetup = requirePersistableProviderState(tuple.state);
       this.modelRuntime(tuple.route);
+      if (backendId === "nano-gpt" && verifiedModels) {
+        const connection = tuple.state.connections.find((entry) => entry.id === connectionId);
+        if (!connection?.lastHealth) throw new ProviderSetupRequiredError();
+        this.#rememberDesktopCatalog(verifiedModels.map(cachedModelInfoFromDescriptor), connection, tuple.state.revision, connection.lastHealth.generation, true);
+      }
       this.#adoptExactSessionRoute(tuple.route, true, true, true, true);
       committedAdopted = true;
       return true;
@@ -4957,7 +5080,7 @@ export class DefaultProviderRuntime implements ProviderRuntime {
             );
             if (
               selected.kind !== "exact"
-              || selected.binding.backendId !== "kimi-code"
+              || selected.binding.backendId !== backendId
               || selected.binding.enabled !== wasEnabled
               || selected.binding.accountFingerprint !== retained.binding.accountFingerprint
               || selected.binding.billingRealm !== retained.binding.billingRealm
@@ -4992,14 +5115,14 @@ export class DefaultProviderRuntime implements ProviderRuntime {
               signal: controller.signal,
             });
             await lease.assertHeld();
-            const desired = this.#desiredSessionRoute(current);
-            const requestedModelId = desired?.backendId === "kimi-code"
+            const desired = backendId === "nano-gpt" ? preferredNanoRoute : this.#desiredSessionRoute(current);
+            const requestedModelId = desired?.backendId === backendId
               ? desired.requestedModelId
-              : KIMI_CODE_MODELS.some((model) => model.id === this.requestedModel)
+              : backendId === "nano-gpt" ? this.requestedModel : KIMI_CODE_MODELS.some((model) => model.id === this.requestedModel)
                 ? this.requestedModel
                 : "k3";
             const exact = models.filter((model) =>
-              model.backendId === "kimi-code"
+              model.backendId === backendId
               && model.requestedModelId === requestedModelId
               && model.canonicalModelId === requestedModelId
               && model.capabilities.textInput
@@ -5007,11 +5130,12 @@ export class DefaultProviderRuntime implements ProviderRuntime {
               && model.capabilities.tools,
             );
             if (exact.length !== 1) return false;
+            verifiedModels = models;
             const route: RouteIdentityV1 = {
               version: 1,
-              backendId: "kimi-code",
+              backendId: backendId,
               accountFingerprint: connection.accountFingerprint,
-              billingRealm: "kimi-code-membership-provider-managed-overage",
+              billingRealm: connection.billingRealm,
               requestedModelId,
               canonicalModelId: requestedModelId,
               resolutionState: "resolved",
@@ -5025,7 +5149,7 @@ export class DefaultProviderRuntime implements ProviderRuntime {
               if (
                 readback.revision !== current.revision
                 || rebound.kind !== "exact"
-                || rebound.binding.backendId !== "kimi-code"
+                || rebound.binding.backendId !== backendId
                 || rebound.binding.connectionId !== connectionId
                 || rebound.binding.accountFingerprint !== connection.accountFingerprint
                 || rebound.binding.billingRealm !== connection.billingRealm
@@ -5064,7 +5188,7 @@ export class DefaultProviderRuntime implements ProviderRuntime {
                 );
                 if (
                   authoritativeBinding.kind !== "exact"
-                  || authoritativeBinding.binding.backendId !== "kimi-code"
+                  || authoritativeBinding.binding.backendId !== backendId
                   || authoritativeBinding.binding.enabled
                   || !authoritativeConnection
                   || !sameProviderCredentialBinding(
@@ -5133,13 +5257,13 @@ export class DefaultProviderRuntime implements ProviderRuntime {
     }
 
     if (intent.kind === "enable") {
-      const retained = intent.backendId === "kimi-code"
-        ? await this.#enableRetainedKimi()
+      const retained = intent.backendId === "kimi-code" || intent.backendId === "nano-gpt"
+        ? await this.#enableRetainedKimi(intent.backendId)
         : await this.#enableRetainedOpenRouter();
       if (retained !== null) {
         return {
           kind: "setup",
-          backendId: intent.backendId === "kimi-code" ? "kimi-code" : "openrouter",
+          backendId: intent.backendId === "kimi-code" || intent.backendId === "nano-gpt" ? intent.backendId : "openrouter",
           outcome: retained ? "ready" : "cancelled",
         };
       }
@@ -5148,8 +5272,8 @@ export class DefaultProviderRuntime implements ProviderRuntime {
     if (intent.kind === "setup" || intent.kind === "connect" || intent.kind === "enable") {
       const backendId = intent.kind === "setup"
         ? "openrouter"
-        : intent.backendId === "kimi-code"
-          ? "kimi-code"
+        : intent.backendId === "kimi-code" || intent.backendId === "nano-gpt"
+          ? intent.backendId
           : "openrouter";
       const result = await this.runSetup(
         surface,
@@ -5168,6 +5292,27 @@ export class DefaultProviderRuntime implements ProviderRuntime {
     }
 
     if (intent.kind === "models") {
+      if (intent.backendId === "nano-gpt") {
+        const state = this.stateStore.read();
+        const selected = this.#selectedProviderConnection(state, "nano-gpt");
+        const adapter = this.authorityOptions?.nanoAdapter;
+        if (!selected || !adapter) return { kind: "models", backendId: "nano-gpt", models: [] };
+        const effect = createProviderEffectAttempt(15_000);
+        try {
+          const models = await this.activationCoordinator.readAuthority({ signal: effect.signal, backendId: "nano-gpt" }, async (lease) => {
+            await lease.assertHeld();
+            const generation = selected.lastHealth?.generation ?? this.orchestrator.currentGeneration();
+            const inspection = await adapter.inspectUnderAuthorityLease({ connectionId: selected.id, generation, deadlineAt: effect.deadlineAt, signal: effect.signal, purpose: "explicit-repair", environmentEligibility: "forbidden" }, lease);
+            await lease.assertHeld();
+            if (!inspection.routeEligible || inspection.accountFingerprint !== selected.accountFingerprint || inspection.billingRealm !== selected.billingRealm) return [];
+            const catalog = await adapter.listModels({ connectionId: selected.id, signal: effect.signal });
+            await lease.assertHeld();
+            this.#rememberDesktopCatalog(catalog.map(cachedModelInfoFromDescriptor), selected, state.revision, generation, true);
+            return catalog;
+          });
+          return { kind: "models", backendId: "nano-gpt", models: models.map((model) => ({ requestedModelId: model.requestedModelId, canonicalModelId: model.canonicalModelId, displayName: model.displayName })) };
+        } finally { effect.close(); }
+      }
       if (intent.backendId === "kimi-code") {
         const state = this.stateStore.read();
         const selected = this.#selectedProviderConnection(state, "kimi-code");
@@ -5276,7 +5421,7 @@ export class DefaultProviderRuntime implements ProviderRuntime {
     }
 
     if (intent.kind === "reconnect") {
-      const backendId = intent.backendId === "kimi-code" ? "kimi-code" : "openrouter";
+      const backendId = intent.backendId === "kimi-code" || intent.backendId === "nano-gpt" ? intent.backendId : "openrouter";
       const reconnectState = this.stateStore.read();
       const selected = this.#selectedProviderConnection(reconnectState, backendId);
       if (!selected) {
@@ -5349,8 +5494,8 @@ export class DefaultProviderRuntime implements ProviderRuntime {
         } else {
           provedRoute = null;
         }
-        if ((adapter.bindRuntime || backendId === "kimi-code") && provedRoute) {
-          if (backendId === "kimi-code") {
+        if ((adapter.bindRuntime || backendId === "kimi-code" || backendId === "nano-gpt") && provedRoute) {
+          if (backendId === "kimi-code" || backendId === "nano-gpt") {
             this.modelRuntime(provedRoute);
           } else if (adapter.bindRuntime) {
             await adapter.bindRuntime({
@@ -5407,8 +5552,8 @@ export class DefaultProviderRuntime implements ProviderRuntime {
     }
 
     if (intent.kind === "logout") {
-      return intent.backendId === "kimi-code"
-        ? this.#logoutKimiProvider(intent.confirmationToken)
+      return intent.backendId === "kimi-code" || intent.backendId === "nano-gpt"
+        ? this.#logoutKimiProvider(intent.confirmationToken, intent.backendId)
         : this.#logoutProvider(intent.confirmationToken);
     }
 
@@ -5417,7 +5562,7 @@ export class DefaultProviderRuntime implements ProviderRuntime {
     }
     return this.#disableProvider({
       kind: intent.kind,
-      backendId: intent.backendId === "kimi-code" ? "kimi-code" : "openrouter",
+      backendId: intent.backendId === "kimi-code" || intent.backendId === "nano-gpt" ? intent.backendId : "openrouter",
       ...(intent.confirmationToken ? { confirmationToken: intent.confirmationToken } : {}),
     });
   }
@@ -5427,9 +5572,9 @@ export class DefaultProviderRuntime implements ProviderRuntime {
     const desiredSessionRoute = this.#desiredSessionRoute(state);
     const descriptors = this.registry.entries().filter(
       (descriptor): descriptor is BackendDescriptor & {
-        id: "openrouter" | "kimi-code" | "anthropic";
+        id: "openrouter" | "kimi-code" | "nano-gpt" | "anthropic";
       } => descriptor.id === "openrouter"
-        || descriptor.id === "kimi-code"
+        || descriptor.id === "kimi-code" || descriptor.id === "nano-gpt"
         || descriptor.id === "anthropic",
     );
     const providers: ProviderCommandStatusEntry[] = descriptors.map((descriptor) => {
@@ -5503,7 +5648,7 @@ export class DefaultProviderRuntime implements ProviderRuntime {
               ? "disabled"
               : "not-connected",
         maturity: descriptor.maturity,
-        billingRealm: descriptor.id === "kimi-code"
+        billingRealm: descriptor.id === "nano-gpt" ? (connection?.billingRealm ?? selectedRoute?.billingRealm) === "nanogpt-subscription" ? "nanogpt-subscription" : (connection?.billingRealm ?? selectedRoute?.billingRealm) === "nanogpt-payg" ? "nanogpt-payg" : "none" : descriptor.id === "kimi-code"
           ? "kimi-code-membership-provider-managed-overage"
           : "openrouter-payg",
         accountFingerprintSuffix: descriptor.id === "openrouter"
@@ -5543,7 +5688,7 @@ export class DefaultProviderRuntime implements ProviderRuntime {
   async #disableProvider(
     intent: {
       kind: "disable" | "disconnect";
-      backendId: "openrouter" | "kimi-code";
+      backendId: "openrouter" | "kimi-code" | "nano-gpt";
       confirmationToken?: string;
     },
   ): Promise<ProviderCommandResult> {
@@ -5770,28 +5915,28 @@ export class DefaultProviderRuntime implements ProviderRuntime {
     );
   }
 
-  async #logoutKimiProvider(confirmationToken?: string): Promise<ProviderCommandResult> {
-    this.#assertKimiOwnerMode();
+  async #logoutKimiProvider(confirmationToken?: string, backendId: "kimi-code" | "nano-gpt" = "kimi-code"): Promise<ProviderCommandResult> {
+    if (backendId === "kimi-code") this.#assertKimiOwnerMode();
     const currentBinding = this.#confirmationBinding(
       "logout",
       this.stateStore.read(),
-      "kimi-code",
+      backendId,
     );
     if (!currentBinding.connection) {
       if (confirmationToken) this.#providerConfirmations.delete(confirmationToken);
-      return { kind: "unchanged", backendId: "kimi-code", reason: "already logged out" };
+      return { kind: "unchanged", backendId: backendId, reason: "already logged out" };
     }
     if (!confirmationToken) {
-      return this.#confirmationRequired("logout", this.stateStore.read(), "kimi-code");
+      return this.#confirmationRequired("logout", this.stateStore.read(), backendId);
     }
     const expected = this.#providerConfirmations.get(confirmationToken);
-    if (expected?.operation !== "logout" || expected.backendId !== "kimi-code") {
+    if (expected?.operation !== "logout" || expected.backendId !== backendId) {
       this.#providerConfirmations.delete(confirmationToken);
-      return this.#confirmationRequired("logout", this.stateStore.read(), "kimi-code");
+      return this.#confirmationRequired("logout", this.stateStore.read(), backendId);
     }
     const journal = this.authorityOptions?.forgetJournal;
-    const adapter = this.authorityOptions?.kimiAdapter;
-    if (!journal || !adapter) throw new KimiOwnerInteractiveRequiredError();
+    const adapter = backendId === "nano-gpt" ? this.authorityOptions?.nanoAdapter : this.authorityOptions?.kimiAdapter;
+    if (!journal || !adapter) throw new ProviderSetupRequiredError();
     try {
       const settled = await this.activationCoordinator.recoverAndRun(
         { signal: new AbortController().signal, inspectCommitted: false },
@@ -5802,16 +5947,16 @@ export class DefaultProviderRuntime implements ProviderRuntime {
             confirmationToken,
             "logout",
             state,
-            "kimi-code",
+            backendId,
           );
           if (!authorization?.connection) {
             throw new ProviderConfirmationStaleError(
-              this.#confirmationRequired("logout", state, "kimi-code"),
+              this.#confirmationRequired("logout", state, backendId),
             );
           }
           const connection = state.connections.find((candidate) =>
             candidate.id === authorization.connection!.id
-            && candidate.backendId === "kimi-code"
+            && candidate.backendId === backendId
             && candidate.enabled === authorization.connection!.enabled
             && sameProviderCredentialBinding(
               credentialBindingForConnection(candidate),
@@ -5826,10 +5971,10 @@ export class DefaultProviderRuntime implements ProviderRuntime {
           if (
             !connection
             || !credentialPointer
-            || !/^v1:kimi-code:[0-9a-f-]{36}$/.test(credentialPointer)
+            || !new RegExp("^v1:" + backendId + ":[0-9a-f-]{36}$").test(credentialPointer)
           ) {
             throw new ProviderConfirmationStaleError(
-              this.#confirmationRequired("logout", state, "kimi-code"),
+              this.#confirmationRequired("logout", state, backendId),
             );
           }
           const persistedSessionRoute = validateRouteIdentityV1(this.session?.data.route);
@@ -5846,13 +5991,13 @@ export class DefaultProviderRuntime implements ProviderRuntime {
             : false;
           await lease.assertHeld();
           const transaction = await journal.begin({
-            backendId: "kimi-code",
+            backendId: backendId,
             connectionId: connection.id,
             target: {
               kind: "versioned",
               slot: {
                 version: 1,
-                kind: "kimi-code",
+                kind: backendId,
                 id: credentialPointer,
               },
             },
@@ -5869,7 +6014,7 @@ export class DefaultProviderRuntime implements ProviderRuntime {
             },
             onAuthoritativeMismatch: (authoritative) => {
               throw new ProviderConfirmationStaleError(
-                this.#confirmationRequired("logout", authoritative, "kimi-code"),
+                this.#confirmationRequired("logout", authoritative, backendId),
               );
             },
           });
@@ -5877,7 +6022,7 @@ export class DefaultProviderRuntime implements ProviderRuntime {
           await adapter.logout({ signal: new AbortController().signal });
           await lease.assertHeld();
           const after = this.stateStore.read();
-          const routedToForgotten = this.#sessionRoute?.backendId === "kimi-code"
+          const routedToForgotten = this.#sessionRoute?.backendId === backendId
             && this.#sessionRoute.accountFingerprint === connection.accountFingerprint
             && this.#sessionRoute.billingRealm === connection.billingRealm
             || sessionRouteCleared;
@@ -5898,7 +6043,7 @@ export class DefaultProviderRuntime implements ProviderRuntime {
       return {
         kind: "changed",
         operation: "logout",
-        backendId: "kimi-code",
+        backendId: backendId,
         setupRequired: settled.value.after.defaultRoute === null,
         defaultCleared: settled.value.before.defaultRoute !== null
           && settled.value.after.defaultRoute === null,
@@ -6095,9 +6240,9 @@ interface ProviderCredentialForgetManifestV1 {
 interface ProviderCredentialForgetManifestV2 {
   version: 2;
   phase: "prepared" | "credential-deleted";
-  backendId: "kimi-code";
+  backendId: "kimi-code" | "nano-gpt";
   connectionId: string;
-  target: { kind: "versioned"; slot: CredentialSlotRef & { kind: "kimi-code" } };
+  target: { kind: "versioned"; slot: CredentialSlotRef & { kind: "kimi-code" | "nano-gpt" } };
 }
 
 type ProviderCredentialForgetManifest =
@@ -6123,13 +6268,13 @@ export class ProviderCredentialForgetJournal {
   async begin(input: {
     connectionId: string | null;
     target: ProviderCredentialForgetTarget;
-    backendId?: "openrouter" | "kimi-code";
+    backendId?: "openrouter" | "kimi-code" | "nano-gpt";
   }): Promise<ProviderCredentialForgetTransaction> {
-    const manifest = validateProviderForgetManifest(input.backendId === "kimi-code"
+    const manifest = validateProviderForgetManifest(input.backendId === "kimi-code" || input.backendId === "nano-gpt"
       ? {
           version: 2,
           phase: "prepared",
-          backendId: "kimi-code",
+          backendId: input.backendId,
           connectionId: input.connectionId,
           target: input.target,
         }
@@ -6247,7 +6392,7 @@ function validateProviderForgetManifest(value: unknown): ProviderCredentialForge
   if (value.version === 2) {
     if (
       keys.join(",") !== "backendId,connectionId,phase,target,version"
-      || value.backendId !== "kimi-code"
+      || (value.backendId !== "kimi-code" && value.backendId !== "nano-gpt")
       || (value.phase !== "prepared" && value.phase !== "credential-deleted")
       || typeof value.connectionId !== "string"
       || value.connectionId.length === 0
@@ -6258,18 +6403,18 @@ function validateProviderForgetManifest(value: unknown): ProviderCredentialForge
       || !isRecord(value.target.slot)
       || Object.keys(value.target.slot).sort().join(",") !== "id,kind,version"
       || value.target.slot.version !== 1
-      || value.target.slot.kind !== "kimi-code"
+      || value.target.slot.kind !== value.backendId
       || typeof value.target.slot.id !== "string"
-      || !/^v1:kimi-code:[0-9a-f-]{36}$/.test(value.target.slot.id)
+      || !new RegExp("^v1:" + value.backendId + ":[0-9a-f-]{36}$").test(value.target.slot.id)
     ) throw new Error("Provider credential cleanup journal is invalid.");
     return {
       version: 2,
       phase: value.phase,
-      backendId: "kimi-code",
+      backendId: value.backendId,
       connectionId: value.connectionId,
       target: {
         kind: "versioned",
-        slot: { version: 1, kind: "kimi-code", id: value.target.slot.id },
+        slot: { version: 1, kind: value.backendId, id: value.target.slot.id },
       },
     };
   }
@@ -6313,7 +6458,7 @@ function validateProviderForgetManifest(value: unknown): ProviderCredentialForge
 
 function providerForgetBackend(
   manifest: ProviderCredentialForgetManifest,
-): "openrouter" | "kimi-code" {
+): "openrouter" | "kimi-code" | "nano-gpt" {
   return manifest.version === 2 ? manifest.backendId : "openrouter";
 }
 
@@ -6335,7 +6480,7 @@ export async function recoverProviderCredentialForget(input: {
   };
   assertHeld?(): void | Promise<void>;
   onStatePublished?(state: ProviderSetupStateV3): void;
-  allowedBackendIds?: readonly ("openrouter" | "kimi-code")[];
+  allowedBackendIds?: readonly ("openrouter" | "kimi-code" | "nano-gpt")[];
 }): Promise<{ cleanupPending: boolean }> {
   try {
     await input.assertHeld?.();
@@ -7200,6 +7345,8 @@ export async function createDefaultProviderRuntime(
           credentialAuthority,
         })
       : new KimiExecutionPolicyAdapter();
+  const nanoService = new NanoGptService();
+  const nanoAdapter = new NanoGptBackendAdapter({ service: nanoService, credentials, credentialAuthority });
   // Construction has no account or network effect. The retained profile child
   // starts only after the owner explicitly chooses that existing profile.
   const codexAdapter = new CodexProfileRouteRuntime({
@@ -7210,6 +7357,7 @@ export async function createDefaultProviderRuntime(
   const registry = new BackendRegistry([
     { descriptor: OPENROUTER_DESCRIPTOR, adapter },
     { descriptor: KIMI_CODE_DESCRIPTOR, adapter: kimiAdapter },
+    { descriptor: NANO_GPT_DESCRIPTOR, adapter: nanoAdapter },
     { descriptor: CODEX_DESCRIPTOR, adapter: codexAdapter },
     { descriptor: ANTHROPIC_COMING_SOON_DESCRIPTOR },
   ]);
@@ -7270,13 +7418,15 @@ export async function createDefaultProviderRuntime(
       credentialAuthority,
       adapter,
       forgetJournal,
+      nanoAdapter,
+      nanoService,
       ...(kimiAdapter instanceof KimiCodeBackendAdapter ? { kimiAdapter } : {}),
       codexAdapter,
       recover: async (context) => {
         const allowedBackendIds = input.executionMode === "local-interactive-owner"
           || desktopKimiCapability !== undefined
           ? undefined
-          : (["openrouter"] as const);
+          : (["openrouter", "nano-gpt"] as const);
         await activationCoordinator!.recoverAndRun(
           {
             signal: context.signal,
@@ -8068,6 +8218,8 @@ export async function runSettingsVerifySuggestion(input: {
 }
 
 export interface DashboardRunInput extends PlainRunInput {
+  /** Attested private shell authority; never supplied by public protocol. */
+  desktopCodexNativeLogin?: CodexNativeLoginAuthority;
   /**
    * Whether the provider still needs setup before this session can run.
    *
@@ -8594,6 +8746,7 @@ export async function runCli(
   if (useTui) {
     await dependencies.runDashboard({
       ...common,
+      ...(dependencies.desktopCodexNativeLogin ? {desktopCodexNativeLogin:dependencies.desktopCodexNativeLogin} : {}),
       // FIX-16/3: not known yet on purpose — the dashboard resolves it right
       // after its first frame, which is where it already needed the answer.
       setupRequired: async () => {
@@ -10794,7 +10947,7 @@ export function createSettingsEditorResolver(context: RuntimeContext): SettingsE
   return {
     searchModels(request, query) {
       const route = context.providerRuntime.readCachedSettingsRoute?.();
-      if (route?.backendId === "kimi-code"
+      if ((route?.backendId === "kimi-code" || route?.backendId === "nano-gpt")
         && request.editor.kind === "model"
         && request.editor.filter !== "main") return [];
       const cached = readProviderAwareSettingsModels(context).filter((model, index, models) => models.findIndex((candidate) =>
@@ -11310,7 +11463,7 @@ export function refreshDashboardBalance(deps: {
   onBalance: (balance: BalanceInfo) => void;
 }): void {
   const route = deps.readCachedSettingsRoute();
-  if (route?.backendId === "kimi-code") return;
+  if (route?.backendId === "kimi-code" || route?.backendId === "nano-gpt") return;
   void deps.checkBalance().then(deps.onBalance, () => {
     // Best-effort: the Balance row simply stays omitted when this fails.
   });
@@ -11544,7 +11697,7 @@ export async function runDashboard(
       balanceRemainingUsd: balance?.credits
         ? Math.max(0, balance.credits.remaining - spentSinceStart)
         : undefined,
-      balanceProviderManaged: activeRoute?.backendId === "kimi-code",
+      balanceProviderManaged: activeRoute?.backendId === "kimi-code" || activeRoute?.backendId === "nano-gpt",
       // D6 (the cost thread): already-validated config, never a new fetch —
       // `workbenchAlternatives`'s Balance row and the status line's shared
       // balance/day segment both compare `balanceRemainingUsd` against this
@@ -13152,8 +13305,8 @@ export async function transcribeAndInsert(
     const loadTranscribe = dependencies.loadTranscribe ?? (() => import("./transcribe.js"));
     const result = await context.providerRuntime.runWithReadyRoute(
       async (route) => {
-        if ((route as RouteIdentityV1 | undefined)?.backendId === "kimi-code") {
-          throw new Error("Voice and transcription are not yet available with a Kimi Code subscription in Orcode.");
+        if ((route as RouteIdentityV1 | undefined)?.backendId === "kimi-code" || (route as RouteIdentityV1 | undefined)?.backendId === "nano-gpt") {
+          throw new Error("Voice and transcription are not available on this provider route in Orcode.");
         }
         return dependencies.transcribe
           ? dependencies.transcribe({
@@ -13289,6 +13442,11 @@ export function dashboardKimiUnsupportedMessage(
   command: string,
   args: readonly string[],
 ): string | null {
+  if (route.backendId === "nano-gpt") {
+    if (command === "image" || command === "whisper") return "Images, voice and transcription are not available on Nano-GPT routes in Orcode.";
+    if (command === "compress" && (args[0] ?? "").toLowerCase() === "model") return "Nano-GPT compression uses the explicitly selected model; a separate summarizer model is not available.";
+    return null;
+  }
   if (route.backendId !== "kimi-code") return null;
   if (command === "image") return "Images are not yet available with a Kimi Code subscription in Orcode.";
   if (command === "whisper") {
@@ -13381,8 +13539,8 @@ function cachedModelInfoFromDescriptor(model: BackendModelDescriptor): ModelInfo
     name: model.displayName,
     description: "Confirmed provider catalog model",
     contextLength: 0,
-    promptPrice: model.backendId === "kimi-code" ? -1 : 0,
-    completionPrice: model.backendId === "kimi-code" ? -1 : 0,
+    promptPrice: model.backendId === "kimi-code" || model.backendId === "nano-gpt" ? -1 : 0,
+    completionPrice: model.backendId === "kimi-code" || model.backendId === "nano-gpt" ? -1 : 0,
     supportedParameters: [
       ...(model.capabilities.tools ? ["tools"] : []),
       ...(model.capabilities.reasoning ? ["reasoning"] : []),
@@ -13397,6 +13555,10 @@ export async function loadProviderModelSnapshot(
   modelId: string,
 ): Promise<ModelSnapshot> {
   const route = currentDashboardRoute(context as RuntimeContext);
+  if (route?.backendId === "nano-gpt") {
+    const model = context.providerRuntime.readCachedSettingsModels?.().find((entry) => entry.id === modelId) ?? null;
+    return { model, details: model ? "Nano-GPT · cost and context unknown" : "Nano-GPT model metadata unavailable", status: model ? "available" : "missing" };
+  }
   if (route?.backendId !== "kimi-code") {
     return loadModelSnapshot(context.openRouter, modelId);
   }
@@ -13421,7 +13583,7 @@ export async function pickDashboardModel(
 ): Promise<ModelInfo | null> {
   const controller = new AbortController();
   const route = currentDashboardRoute(context);
-  ui.setStatus(route?.backendId === "kimi-code"
+  ui.setStatus(route?.backendId === "nano-gpt" ? "Loading Nano-GPT models" : route?.backendId === "kimi-code"
     ? "Loading Kimi Code models"
     : "Loading tool-capable OpenRouter models");
   ui.setCancelHandler(() => {
@@ -13429,7 +13591,10 @@ export async function pickDashboardModel(
   });
   let models: ModelInfo[];
   try {
-    if (route?.backendId === "kimi-code") {
+    if (route?.backendId === "nano-gpt") {
+      await context.providerCommands.execute({ kind: "models", backendId: "nano-gpt" }, setupSurface ?? "fullscreen");
+      models = [...(context.providerRuntime.readCachedSettingsModels?.() ?? [])].filter((model) => model.supportedParameters.includes("tools"));
+    } else if (route?.backendId === "kimi-code") {
       const result = await context.providerCommands.execute(
         { kind: "models", backendId: "kimi-code" },
         setupSurface ?? "fullscreen",
@@ -13471,8 +13636,8 @@ export async function pickDashboardCompressorModel(
   ui: TerminalUi,
   context: RuntimeContext,
 ): Promise<ModelInfo | null> {
-  if (currentDashboardRoute(context)?.backendId === "kimi-code") {
-    throw new Error("Summarizer model choice is not yet available with a Kimi Code subscription in Orcode.");
+  if (currentDashboardRoute(context)?.backendId === "kimi-code" || currentDashboardRoute(context)?.backendId === "nano-gpt") {
+    throw new Error("Summarizer model choice is not yet available on this provider route in Orcode.");
   }
   const controller = new AbortController();
   ui.setStatus("Loading text models for the summarizer");

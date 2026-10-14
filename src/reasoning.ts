@@ -143,9 +143,15 @@ export function planReasoningRequest(
 export function planRuntimeReasoningRequest(
   setting: ReasoningSetting,
   model: ReasoningModelInfo | null,
-  backendId: "openrouter" | "kimi-code",
+  backendId: "openrouter" | "kimi-code" | "nano-gpt",
 ): ReasoningPlan {
   if (backendId === "openrouter") return planReasoningRequest(setting, model);
+  if (backendId === "nano-gpt") {
+    return setting.mode === "auto" ? { degraded: false } : {
+      degraded: true,
+      note: "Nano-GPT uses the selected model's default reasoning; the stored override is not sent.",
+    };
+  }
   if (setting.mode === "budget") {
     throw new Error("Kimi Code does not support a reasoning token budget.");
   }

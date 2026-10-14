@@ -78,7 +78,7 @@ export interface CodexExecutableIdentity {
   readonly sha256: string;
   readonly machO: true;
   readonly teamIdentifier: "2DC432GLL2";
-  readonly version: "codex-cli 0.142.5";
+  readonly version: "codex-cli 0.159.1";
   readonly provenance: CodexExecutableProvenance;
 }
 
@@ -739,20 +739,20 @@ async function readPinnedJson(
 
 function requireMainPackage(document: Record<string, unknown>): void {
   if (document.name !== "@openai/codex" || document.version !== CODEX_APP_SERVER_RUNTIME_POLICY.cliVersion) {
-    throw trustFailure("Codex package version does not match 0.142.5");
+    throw trustFailure("Codex package version does not match 0.159.1");
   }
   if (!isPlainRecord(document.bin) || document.bin.codex !== "bin/codex.js") {
     throw trustFailure("Codex package wrapper metadata is not official");
   }
   if (!isPlainRecord(document.optionalDependencies)
-    || document.optionalDependencies["@openai/codex-darwin-arm64"] !== "npm:@openai/codex@0.142.5-darwin-arm64") {
-    throw trustFailure("Codex package platform provenance does not match 0.142.5");
+    || document.optionalDependencies["@openai/codex-darwin-arm64"] !== "npm:@openai/codex@0.159.1-darwin-arm64") {
+    throw trustFailure("Codex package platform provenance does not match 0.159.1");
   }
 }
 
 function requirePlatformPackage(document: Record<string, unknown>): void {
-  if (document.name !== "@openai/codex" || document.version !== "0.142.5-darwin-arm64") {
-    throw trustFailure("Codex platform package version does not match 0.142.5-darwin-arm64");
+  if (document.name !== "@openai/codex" || document.version !== "0.159.1-darwin-arm64") {
+    throw trustFailure("Codex platform package version does not match 0.159.1-darwin-arm64");
   }
   if (!Array.isArray(document.os) || document.os.length !== 1 || document.os[0] !== "darwin"
     || !Array.isArray(document.cpu) || document.cpu.length !== 1 || document.cpu[0] !== "arm64") {
@@ -762,7 +762,7 @@ function requirePlatformPackage(document: Record<string, unknown>): void {
 
 async function verifyNativePayload(
   payload: ProvenanceFileIdentity,
-): Promise<{ readonly teamIdentifier: "2DC432GLL2"; readonly version: "codex-cli 0.142.5" }> {
+): Promise<{ readonly teamIdentifier: "2DC432GLL2"; readonly version: "codex-cli 0.159.1" }> {
   const handle = await open(payload.realpath, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
   try {
     const header = Buffer.alloc(8);
@@ -788,7 +788,7 @@ async function verifyNativePayload(
   }
   const version = await runClosed(payload.realpath, ["--version"], "Codex payload version inspection failed");
   if (version.stdout.trim() !== CODEX_APP_SERVER_RUNTIME_POLICY.versionOutput || version.stderr.trim() !== "") {
-    throw trustFailure("Codex payload version is not codex-cli 0.142.5");
+    throw trustFailure("Codex payload version is not codex-cli 0.159.1");
   }
   const after = await inspectProvenanceFile(payload.realpath, "Codex native payload");
   requireIdentity(payload, after, "Codex payload changed during signature or version validation");
@@ -808,7 +808,7 @@ function freezeExecutableIdentity(input: {
   readonly wrapper: ProvenanceFileIdentity | null;
   readonly selected: PathIdentity;
   readonly teamIdentifier: "2DC432GLL2";
-  readonly version: "codex-cli 0.142.5";
+  readonly version: "codex-cli 0.159.1";
 }): CodexExecutableIdentity {
   return Object.freeze({
     selectedPath: input.selectedPath,
@@ -1083,10 +1083,11 @@ function validateInitializeResponse(result: unknown, codexHome: string): void {
   if (result.platformFamily !== "unix" || result.platformOs !== "macos") {
     throw protocolFailure("unsupported Codex App Server platform protocol");
   }
+  const supportedVersion = new RegExp(`(?:^|[^0-9])${CODEX_APP_SERVER_RUNTIME_POLICY.cliVersion.replaceAll(".", "\\.")}(?:[^0-9]|$)`);
   if (typeof result.userAgent !== "string"
     || !/codex/i.test(result.userAgent)
-    || !/(?:^|[^0-9])0\.142\.5(?:[^0-9]|$)/.test(result.userAgent)) {
-    throw protocolFailure("unsupported Codex App Server protocol for required 0.142.5 runtime");
+    || !supportedVersion.test(result.userAgent)) {
+    throw protocolFailure("unsupported Codex App Server protocol for required 0.159.1 runtime");
   }
 }
 

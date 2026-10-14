@@ -19,6 +19,7 @@ class LoginClient implements CodexAccountModelClient {
   onTerminal(listener: () => void) { this.terminalListeners.add(listener); return () => { this.terminalListeners.delete(listener); }; }
   terminate() { for (const listener of this.terminalListeners) listener(); }
   email: string | null = "private-owner@example.invalid";
+  workspaceRouting: unknown = undefined;
   onNotification(method: string, listener: (value: unknown) => void) {
     const listeners = this.listeners.get(method) ?? new Set();
     listeners.add(listener); this.listeners.set(method, listeners);
@@ -39,7 +40,8 @@ class LoginClient implements CodexAccountModelClient {
     if (method === "account/read") {
       assert.deepEqual(params, { refreshToken: false });
       if (this.epochDuringRead) this.emit("account/updated", { authMode: "chatgpt", planType: "pro" });
-      return { account: { type: "chatgpt", email: this.email, planType: "pro" }, requiresOpenaiAuth: true } as T;
+      return { account: { type: "chatgpt", email: this.email, planType: "pro" }, requiresOpenaiAuth: true,
+        ...(this.workspaceRouting === undefined ? {} : {workspaceRouting:this.workspaceRouting}) } as T;
     }
     if (method === "account/login/cancel") return {} as T;
     throw new Error("unexpected request");
@@ -121,6 +123,17 @@ test("login auth epoch changes during verification cannot retain a profile", asy
   await assert.rejects(f.runtime.connectNative("chatgptDeviceCode"), /current|stale|changed/i);
   assert.equal(f.client.closed, true);
   assert.equal(f.stateStore.read().connections.length, 0);
+});
+
+test("official 0.159 native login accepts nullable workspace metadata without publishing identity", async (t) => {
+  const f = await fixture(t);
+  f.client.workspaceRouting = null;
+  const selection = await f.runtime.connectNative('chatgptDeviceCode');
+  const state = await f.coordinator.retainCodexProfile({expectedRevision:0, selection,
+    signal:new AbortController().signal, deadlineAt:Date.now()+10_000});
+  assert.equal(state.connections.length, 1);
+  assert.equal(state.defaultRoute, null);
+  assert.doesNotMatch(JSON.stringify(state), /workspaceRouting|private-owner/);
 });
 
 test("a competing state revision makes first-login retention stale without changing the route", async (t) => {

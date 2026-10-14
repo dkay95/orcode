@@ -599,7 +599,7 @@ export class OrcodeAgent {
       type: "run-start",
       model: this.config.mainModel,
       maxSteps: this.config.maxSteps,
-      ...(this.runtime.backendId === "kimi-code" ? { costKnowledge: "unknown" as const } : {}),
+      ...(this.runtime.backendId !== "openrouter" ? { costKnowledge: "unknown" as const } : {}),
       prompt,
       timestamp: startedAt,
     });

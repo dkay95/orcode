@@ -8,6 +8,20 @@
 > real owner login journeys, and release packaging remain separate gates.
 > See [Development status](DEVELOPMENT.md). The design preview uses demo data only.
 
+The current local GUI checkpoint adds native project selection, manual model
+selection, independent AI-process/Permissions controls, and a real working-copy
+flow with tests and confirmed Apply. That execution boundary is currently
+**macOS-only**. Codex manufacturer login can be detected, but integrated native
+Codex execution remains blocked pending its compatibility and isolation proofs.
+Claude/Kimi manufacturer CLIs are not integrated GUI execution adapters.
+Unsigned local builds do not have verified native installation/login authority.
+
+**Native Windows GUI support is not ready yet.** The existing Windows CLI CI
+does not prove the Rust GUI, process isolation or installer. The proposed port
+targets Windows 11 x64 without WSL; see the
+[Windows architecture draft](docs/superpowers/specs/2026-10-15-windows-native-design.md).
+No Windows installer or completed Windows acceptance is claimed by this branch.
+
 orcode is a local, terminal-based coding agent that runs against any
 tool-capable model available on [OpenRouter](https://openrouter.ai/), rather
 than being locked to a single model vendor. It keeps filesystem access and
@@ -138,6 +152,32 @@ are visible in shell history and process listings. Use `/key set` inside
 the app, or the environment variable, instead.
 
 ## Guided full-screen settings
+
+### Nano-GPT: subscription and pay-as-you-go (preview)
+
+Use `/provider connect nano-gpt`, or choose Nano-GPT in Desktop Settings →
+Accounts. Choose **Abo** or **Guthaben** explicitly, enter the API key in the
+local masked field, then select your model manually. The two modes are stored
+as separate local connections; changing modes never happens automatically.
+
+Subscription mode requires a subscription-only API key with paid-balance
+spending disabled in Nano-GPT's key settings. Use a separate paid-capable key
+for pay-as-you-go. The key is stored only in your native credential store,
+not in configuration, chat history or logs. No environment-key discovery,
+automatic model routing, paid fallback or hosted paid tools are enabled.
+
+The integration uses Nano-GPT's native Responses API for text and function
+tools. Available tool-capable models come from Nano-GPT's catalog. Numeric
+balance, quota and costs are not fabricated when unavailable; unknown costs
+cannot be enforced as a reliable local dollar cap. Separate summarizer,
+panel, transcription and reasoning-override controls remain unavailable.
+Fixture/SDK tests and public catalog verification are not proof of a live
+authenticated request from your account.
+
+See [Nano-GPT billing advice](https://docs.nano-gpt.com/api-reference/endpoint/subscription-usage)
+and [Responses API](https://docs.nano-gpt.com/api-reference/endpoint/responses).
+
+### Terminal settings
 
 Run `/settings` from an owner-controlled interactive session to open the
 guided Settings screen in the same terminal. It has five areas, organized
@@ -336,7 +376,7 @@ provider keep Cross off until an explicit later `/cross` action.
 | `/provider` |  | `/provider [setup\|connect\|login\|logout\|enable\|disable\|disconnect\|reconnect\|status\|models\|sort\|only\|ignore\|clear] \| data allow\|deny \| fallbacks on\|off` | Set up, connect, check, or disconnect provider accounts |
 | `/key` |  | `/key [set\|replace\|save\|status\|forget\|management]` | Manage the OpenRouter key securely |
 | `/balance` | `/credits` | `/balance` | Recheck balance and key limit |
-| `/models` |  | `/models [search]` | List tool-capable OpenRouter models |
+| `/models` |  | `/models [search]` | List tool-capable models for the active provider |
 | `/allow` | `/approval`, `/approvals`, `/permissions` | `/allow [mode\|list\|forget <id>\|forget all]` | Choose approvals; list or forget remembered rules |
 | `/budget` |  | `/budget [day <USD>\|total <USD>\|on-exceed warn\|block]` | Show this folder's budget or set the daily/total limit |
 | `/max-cost` |  | `/max-cost [USD]` | Set the cost limit per main-agent run |

@@ -291,6 +291,30 @@ function snapshot(runActive = false): SettingsAuthoritativeSnapshot {
   };
 }
 
+test("Nano-GPT remains visible in Settings and exposes only supported active-route controls", () => {
+  for (const billingRealm of ["nanogpt-subscription", "nanogpt-payg"] as const) {
+    const source: SettingsAuthoritativeSnapshot = {
+      ...snapshot(),
+      route: {
+        backendId: "nano-gpt", providerLabel: "Nano-GPT", billingRealm,
+        requestedModelId: CURRENT_MODEL_ID, canonicalModelId: CURRENT_MODEL_ID, modelLabel: "Manual model",
+      },
+      providers: [provider({
+        backendId: "nano-gpt", displayName: "Nano-GPT", maturity: "preview", billingRealm,
+        allowedActions: ["connect", "enable", "disable", "disconnect", "reconnect", "models", "logout"],
+      })],
+    };
+    const registry = buildSettingsRegistry(source);
+    const nano = registry.items.filter((row) => row.id.includes(":nano-gpt"));
+    assert.equal(nano.length, 8);
+    assert.match(item(registry, "provider-status:nano-gpt").displayValue, billingRealm === "nanogpt-subscription" ? /Abo/ : /Guthaben/);
+    for (const id of ["compressor-model", "reasoning", "reasoning-compressor", "panel-models", "panel-judge", "transcription-model", "web-mode", "provider-sort", "provider-fallback", "provider-data-collection", "provider-only", "provider-ignore"] as const) {
+      assert.match(item(registry, id).disabledReason!, /Nano-GPT/, id);
+    }
+    assert.equal(item(registry, "main-model").disabledReason, undefined);
+  }
+});
+
 function actionId(item: SettingsItem): SettingsActionId | null {
   return item.editor.kind === "readonly" ? null : item.editor.actionId;
 }

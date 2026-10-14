@@ -132,6 +132,8 @@ test("fails closed for unsafe display and disabled labels while downgrading unsa
     (input) => { input.providers[0]!.providerLabel = "owner@example.test"; },
     (input) => { input.providers[0]!.providerLabel = "PROVIDER_LABEL_CANARY"; },
     (input) => { input.providers[0]!.accountLabel = "owner@example.test"; },
+    (input) => { input.providers[0]!.accountLabel = "acct_nano_" + "q".repeat(43); },
+    (input) => { input.providers[0]!.accountLabel = "v1:nano-gpt:12345678-1234-4123-8123-123456789abc"; },
     (input) => { input.providers[0]!.routes[0]!.accountLabel = "owner@example.test"; },
     (input) => { input.providers[0]!.routes[0]!.displayName = "Error: private-provider-diagnostic"; },
     (input) => { input.activeRoute!.providerLabel = "https://private.example/provider"; },

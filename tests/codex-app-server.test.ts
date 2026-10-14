@@ -248,7 +248,7 @@ class InMemoryProtocolTransport implements CodexAppServerTransport {
         codexHome: this.codexHome,
         platformFamily: "unix",
         platformOs: "macos",
-        userAgent: "codex_cli_rs/0.142.5",
+        userAgent: "codex_cli_rs/0.159.1",
       } });
     }
   }
@@ -416,8 +416,8 @@ test("rejects a temporary executable before the fake transport seam", async () =
 
 test("exposes one immutable backend runtime trust policy", () => {
   assert.deepEqual(CODEX_APP_SERVER_RUNTIME_POLICY, {
-    cliVersion: "0.142.5",
-    versionOutput: "codex-cli 0.142.5",
+    cliVersion: "0.159.1",
+    versionOutput: "codex-cli 0.159.1",
     teamIdentifier: "2DC432GLL2",
   });
   assert.equal(Object.isFrozen(CODEX_APP_SERVER_RUNTIME_POLICY), true);
@@ -433,7 +433,7 @@ test("pins the official npm wrapper, package metadata, and signed native payload
   assert.match(identity.platformPackageMetadataSha256 ?? "", /^[0-9a-f]{64}$/);
   assert.equal(identity.machO, true);
   assert.equal(identity.teamIdentifier, "2DC432GLL2");
-  assert.equal(identity.version, "codex-cli 0.142.5");
+  assert.equal(identity.version, "codex-cli 0.159.1");
 });
 
 test("accepts the signed native payload directly without inventing npm provenance", async () => {

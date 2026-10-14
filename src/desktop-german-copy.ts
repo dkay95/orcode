@@ -65,6 +65,7 @@ export const DESKTOP_COMMAND_DISABLED_COPY = Object.freeze({
   "terminal-only-picker": commandDisabled("terminal-only-picker", "Auswahl ist nur im Terminal verfügbar.", "Lokales Terminal öffnen"),
   "route-stale": commandDisabled("route-stale", "Modellauswahl ist veraltet.", "Modelle neu laden"),
   "provider-unavailable": commandDisabled("provider-unavailable", "Anbieter ist nicht verfügbar.", "Anbieter prüfen"),
+  "local-flow-required": commandDisabled("local-flow-required", "Dieser alte Startweg ist nicht an Arbeitskopien gebunden.", "AI-Prozess wählen und Aufgabe starten"),
 } satisfies Record<DesktopCommandDisabledReasonCode, DesktopCommandDisabledPresentation>);
 
 export const DESKTOP_SETTINGS_DISABLED_COPY = Object.freeze({
@@ -243,9 +244,9 @@ const STATIC_ROW_SCHEMA: Readonly<Record<string, RowSchema>> = Object.freeze({
 });
 
 function dynamicCopy(item: GermanSettingsItem): readonly [string, string] | null {
-  let match = /^provider-status:(openrouter|kimi-code|anthropic)$/.exec(item.id);
+  let match = /^provider-status:(openrouter|kimi-code|nano-gpt|anthropic)$/.exec(item.id);
   if (match) return [`Kontostatus · ${providerName(match[1]!)}`, "Verbindung und Kontozustand anzeigen"];
-  match = /^provider-action:(openrouter|kimi-code|anthropic):(connect|enable|disable|disconnect|reconnect|models|logout)$/.exec(item.id);
+  match = /^provider-action:(openrouter|kimi-code|nano-gpt|anthropic):(connect|enable|disable|disconnect|reconnect|models|logout)$/.exec(item.id);
   if (match) {
     if (match[1] === "anthropic" || (match[1] === "kimi-code" && match[2] === "disconnect")) return null;
     return [`${providerName(match[1]!)} · ${actionName(match[2]!)}`, "Kontoverbindung sicher verwalten"];
@@ -423,7 +424,7 @@ function editorCopy(request: SettingsEditorRequest): readonly [string, string] {
 }
 
 function dynamicEditorSchema(request: SettingsEditorRequest): RowSchema | null {
-  const provider = /^provider-action:(openrouter|kimi-code):(connect|enable|disable|disconnect|reconnect|models|logout)$/.exec(request.itemId);
+  const provider = /^provider-action:(openrouter|kimi-code|nano-gpt):(connect|enable|disable|disconnect|reconnect|models|logout)$/.exec(request.itemId);
   if (provider) return simple("accounts", "invoke", `provider-${provider[2]}` as SettingsActionId);
   if (/^approval-forget:[0-9a-f-]{36}$/.test(request.itemId)) {
     return simple("approvals-costs", "confirm", "approval-forget");
@@ -488,7 +489,7 @@ function editorActionLabel(itemId: string, kind: "confirm" | "invoke"): string {
   const direct = labels[itemId];
   if (direct) return direct;
   if (kind === "confirm" && /^approval-forget:[0-9a-f-]{36}$/.test(itemId)) return "Regel löschen";
-  const provider = /^provider-action:(?:openrouter|kimi-code):([a-z-]+)$/.exec(itemId);
+  const provider = /^provider-action:(?:openrouter|kimi-code|nano-gpt):([a-z-]+)$/.exec(itemId);
   if (kind === "invoke" && provider) return actionName(provider[1]!);
   throw new DesktopSettingsProjectionError();
 }
@@ -530,6 +531,7 @@ export const DESKTOP_SETTINGS_RAW_DISABLED_REASONS: Readonly<Record<string, Desk
     "Choose a model first": "cross-role-unset",
     "Both roles must be set before swapping": "cross-swap-incomplete",
     "Kimi Code doesn't support this external model role; an OpenRouter route is required": "external-model-role-unsupported",
+    "Nano-GPT does not support this control; choose the main model manually": "external-model-role-unsupported",
     "Architect is unavailable on Kimi Code routes": "architect-unavailable",
     "No remembered rules": "no-remembered-rules",
     "No verify commands": "no-verify-commands",
@@ -591,12 +593,12 @@ function validateRowSchema(item: GermanSettingsItem, truth: SettingsDesktopRowTr
 }
 
 function dynamicSchema(item: GermanSettingsItem, truth: SettingsDesktopRowTruth): RowSchema | null {
-  let match = /^provider-status:(openrouter|kimi-code|anthropic)$/.exec(item.id);
+  let match = /^provider-status:(openrouter|kimi-code|nano-gpt|anthropic)$/.exec(item.id);
   if (match) {
     return truth.kind === "provider-status" && truth.provider.backendId === match[1]
       ? simple("accounts", "readonly") : null;
   }
-  match = /^provider-action:(openrouter|kimi-code|anthropic):(connect|enable|disable|disconnect|reconnect|models|logout)$/.exec(item.id);
+  match = /^provider-action:(openrouter|kimi-code|nano-gpt|anthropic):(connect|enable|disable|disconnect|reconnect|models|logout)$/.exec(item.id);
   if (match) {
     const actionId = `provider-${match[2]}` as SettingsActionId;
     return truth.kind === "provider-action" && truth.backendId === match[1] && truth.action === match[2]
@@ -828,9 +830,12 @@ function providerStatusLabel(
     "runtime-missing": "Laufzeit fehlt", "incompatible-runtime": "Laufzeit inkompatibel",
     "policy-unavailable": "Richtlinie nicht verfügbar", unknown: "Nicht geprüft",
   });
-  const billing = exactLabel(provider.billingRealm, {
+  const billing = provider.backendId === "nano-gpt" && provider.billingRealm === "none"
+    ? "Abrechnung: Konto noch nicht gewählt" : exactLabel(provider.billingRealm, {
     "openrouter-payg": "API-Nutzungsabrechnung",
     "kimi-code-membership-provider-managed-overage": "Abo · Mehrkosten vom Anbieter verwaltet",
+    "nanogpt-subscription": "Abo · kein Guthaben-Fallback",
+    "nanogpt-payg": "Guthaben · Pay-as-you-go",
     none: "Keine Abrechnung",
   });
   const selected = provider.selectedRequestedModelId
@@ -975,7 +980,7 @@ function validateTruthShape(truth: unknown): asserts truth is SettingsDesktopRow
       return;
     case "provider-action":
       requireExactKeys(truth, ["kind", "backendId", "action"]);
-      if (!isOneOf(truth.backendId, ["openrouter", "kimi-code", "anthropic"])
+      if (!isOneOf(truth.backendId, ["openrouter", "kimi-code", "nano-gpt", "anthropic"])
         || !isProviderAction(truth.action)) throw new DesktopSettingsProjectionError();
       return;
     case "approval-rule":
@@ -1008,11 +1013,11 @@ function validateProviderTruth(provider: unknown): void {
     "backendId", "availability", "configuration", "maturity", "billingRealm", "headline",
     "isDefault", "selectedRequestedModelId", "allowedActions",
   ]);
-  if (!isOneOf(provider.backendId, ["openrouter", "kimi-code", "anthropic"])
+  if (!isOneOf(provider.backendId, ["openrouter", "kimi-code", "nano-gpt", "anthropic"])
     || !isOneOf(provider.availability, ["connectable", "coming-soon"])
     || !isOneOf(provider.configuration, ["enabled", "disabled", "not-connected"])
     || !isOneOf(provider.maturity, ["stable", "preview", "coming-soon"])
-    || !isOneOf(provider.billingRealm, ["openrouter-payg", "kimi-code-membership-provider-managed-overage", "none"])
+    || !isOneOf(provider.billingRealm, ["openrouter-payg", "kimi-code-membership-provider-managed-overage", "nanogpt-subscription", "nanogpt-payg", "none"])
     || !(provider.headline === null || isOneOf(provider.headline, [
       "ready", "login-required", "auth-rejected", "credential-expired", "offline", "limit-reached",
       "runtime-missing", "incompatible-runtime", "policy-unavailable", "unknown",
@@ -1035,6 +1040,13 @@ function validateProviderTruth(provider: unknown): void {
     if (provider.availability !== "connectable" || provider.maturity !== "preview"
       || provider.billingRealm !== "kimi-code-membership-provider-managed-overage"
       || provider.allowedActions.includes("disconnect")) throw new DesktopSettingsProjectionError();
+    return;
+  }
+  if (provider.backendId === "nano-gpt") {
+    if (provider.availability !== "connectable" || provider.maturity !== "preview"
+      || (provider.billingRealm === "none"
+        ? provider.isDefault || provider.selectedRequestedModelId !== null
+        : !isOneOf(provider.billingRealm, ["nanogpt-subscription", "nanogpt-payg"]))) throw new DesktopSettingsProjectionError();
     return;
   }
   if (provider.availability !== "coming-soon" || provider.configuration !== "not-connected"
@@ -1095,7 +1107,7 @@ function assertNeverTruth(value: never): never {
   throw new DesktopSettingsProjectionError();
 }
 
-function providerName(id: string): string { return id === "kimi-code" ? "Kimi Code" : id === "openrouter" ? "OpenRouter" : "Anthropic"; }
+function providerName(id: string): string { return id === "nano-gpt" ? "Nano-GPT" : id === "kimi-code" ? "Kimi Code" : id === "openrouter" ? "OpenRouter" : "Anthropic"; }
 function actionName(id: string): string {
   const labels: Readonly<Record<string, string>> = Object.freeze({
     connect: "Verbinden", enable: "Aktivieren", disable: "Deaktivieren", disconnect: "Trennen",

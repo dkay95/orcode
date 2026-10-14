@@ -5,7 +5,7 @@ import { setTimeout as delay } from "node:timers/promises";
 import { PrivateStore } from "./private-store.js";
 
 export type CredentialKind = "inference" | "management";
-export type CredentialSlotKind = CredentialKind | "kimi-code";
+export type CredentialSlotKind = CredentialKind | "kimi-code" | "nano-gpt";
 
 export interface CredentialStoreLike {
   readonly location: string;
@@ -518,7 +518,7 @@ export function parseCredentialSlotRef(value: unknown): CredentialSlotRef {
   if (typeof value !== "string") {
     throw new Error("The credential slot is invalid or not canonical.");
   }
-  const match = /^v1:(inference|management|kimi-code):([0-9a-f-]+)$/.exec(value);
+  const match = /^v1:(inference|management|kimi-code|nano-gpt):([0-9a-f-]+)$/.exec(value);
   if (!match || !CANONICAL_UUID.test(match[2] ?? "")) {
     throw new Error("The credential slot is invalid or not canonical.");
   }
@@ -538,7 +538,7 @@ function parseSlotRef(slot: CredentialSlotRef): ParsedSlot {
 }
 
 function isCredentialSlotKind(value: unknown): value is CredentialSlotKind {
-  return value === "inference" || value === "management" || value === "kimi-code";
+  return value === "inference" || value === "management" || value === "kimi-code" || value === "nano-gpt";
 }
 
 function assertLegacyCredentialKind(value: unknown): asserts value is CredentialKind {

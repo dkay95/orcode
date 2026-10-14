@@ -25,7 +25,7 @@ class MetadataTransport implements CodexAppServerTransport {
   async writeLine(line: string) {
     const frame = JSON.parse(line); this.calls.push(frame.method);
     if (frame.method === "initialize") {
-      this.emit({ id: frame.id, result: { codexHome: this.home, platformFamily: "unix", platformOs: "macos", userAgent: "codex_cli_rs/0.142.5" } });
+      this.emit({ id: frame.id, result: { codexHome: this.home, platformFamily: "unix", platformOs: "macos", userAgent: "codex_cli_rs/0.159.1" } });
       if (this.initialEvent) this.emit({ method: "account/updated", params: { authMode: "chatgpt", planType: "pro" } });
     }
     if (frame.method === "account/read") {

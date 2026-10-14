@@ -16,6 +16,16 @@ import type {
   ProviderActivationRequest,
   ProviderActivationResult,
 } from "../src/provider-activation.js";
+import { normalizeModelList } from "../src/setup.js";
+
+test("Nano-GPT manual model descriptors survive setup decoding", () => {
+  const model = { backendId: "nano-gpt", requestedModelId: "vendor/manual", canonicalModelId: "vendor/manual", displayName: "Manual", capabilities: { textInput: true, textOutput: true, tools: true, reasoning: false } };
+  assert.deepEqual(normalizeModelList([model]), [model]);
+});
+
+test("Nano-GPT setup model decoding rejects an implicit alias resolution", () => {
+  assert.deepEqual(normalizeModelList([{ backendId: "nano-gpt", requestedModelId: "vendor/manual", canonicalModelId: "vendor/other", displayName: "Manual", capabilities: { textInput: true, textOutput: true, tools: true, reasoning: false } }]), []);
+});
 import {
   createNeverConfiguredProviderState,
   migrateLegacyOpenRouterState,

@@ -44,6 +44,18 @@ test("the canonical onboarding view can return to its paused Settings owner", ()
   assert.equal(parsed.returnTo, "settings");
 });
 
+test("Nano-GPT's safe local setup method survives the desktop wire parser", () => {
+  const parsed = parseDesktopOnboardingView({
+    revision: 9, generation: 4, step: "provider", returnTo: "chat", candidates: [],
+    providers: [{
+      providerId: "nano-gpt", providerLabel: "Nano-GPT", connectionId: null,
+      accountLabel: null, state: "disconnected", setupMethods: ["nanogpt-owner-connect"],
+      multiProfile: { enabled: true }, routes: [],
+    }],
+  });
+  assert.deepEqual(parsed.providers[0]!.setupMethods, ["nanogpt-owner-connect"]);
+});
+
 test("round-trips a typed boolean Settings mutation without parsing display copy", () => {
   assert.deepEqual(
     parseDesktopSettingsIntent({ kind: "set-boolean", handle: "appearance-large-logo", value: false, revision: 9 }),

@@ -452,7 +452,9 @@ function isBoundedPlainJson(value: unknown, depth: number, budget: { remaining: 
 }
 
 function validateAccountRead(value: unknown, expectedPlan?: unknown): { planType: string } {
-  if (!isPlainObject(value) || !exactKeys(value, ["account", "requiresOpenaiAuth"])
+  if (!isPlainObject(value) || !exactKeys(value, Object.hasOwn(value, "workspaceRouting")
+    ? ["account", "requiresOpenaiAuth", "workspaceRouting"] : ["account", "requiresOpenaiAuth"])
+    || (Object.hasOwn(value, "workspaceRouting") && value.workspaceRouting !== null)
     || value.requiresOpenaiAuth !== true || !isPlainObject(value.account)
     || !exactKeys(value.account, ["type", "email", "planType"])
     || value.account.type !== "chatgpt" || !safePlan(value.account.planType)

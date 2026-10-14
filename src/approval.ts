@@ -128,6 +128,9 @@ export interface OneShotApprovalReceipt {
 const ONE_SHOT_APPROVAL_RECEIPTS = new WeakSet<object>();
 
 export class ApprovalManager {
+  #readOnlyExecutionFence=false;
+  /** Planner boundary: remembered approvals cannot authorize mutations here. */
+  setReadOnlyExecutionFence(enabled:boolean):void {this.#readOnlyExecutionFence=enabled;}
   #mode: ApprovalMode;
   #promptHandler: ApprovalPromptHandler | undefined;
   #denials = new Map<string, number>();
@@ -178,6 +181,9 @@ export class ApprovalManager {
   }
 
   async authorize(request: ApprovalRequest): Promise<void> {
+    if(this.#readOnlyExecutionFence && request.risk!=='read') {
+      throw new PermissionDeniedError('The planning phase cannot perform this action.');
+    }
     const subject = request.subject ? normalizeApprovalSubject(request.subject) : null;
     const subjectDisplay = subject ? approvalSubjectDisplay(subject) : undefined;
     const rememberable = request.rememberable !== false;

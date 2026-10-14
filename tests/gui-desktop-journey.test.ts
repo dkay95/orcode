@@ -98,66 +98,31 @@ class Client {
   }
 }
 
-test("custom fake routes reach the real built GUI projection and Stop settles without fallback", async () => {
-  const client = new Client();
-  try {
-    await client.wait((frame) => frame.t === "hello");
-    await client.request("hello-ack", { protocol: 2, client: "cross-journey" });
-    const desktop = await client.wait((frame) => frame.t === "event" && frame.e === "desktop.snapshot");
-    assert.equal((desktop.snapshot as { generation: number }).generation, 19);
-    const command = client.request("command", { raw: "/cross", draft: "same ContextPacket task" });
-    let gate = await client.wait((frame) => frame.t === "ask" && frame.presentation === "cross-preflight");
-    const answer = async (value: string) => {
-      const previous = gate;
-      const mark = client.frames.length;
-      client.send({ t: "answer", askId: previous.askId, value });
-      gate = await client.waitAfter(mark, (frame) => frame.t === "ask" && frame.presentation === "cross-preflight");
-    };
-    await answer("duration-one-task");
-    for (const [role, model] of [["coding", "custom/gpt-red"], ["review", "custom/kimi-blue"]] as const) {
-      const previous = gate;
-      let mark = client.frames.length;
-      client.send({ t: "answer", askId: previous.askId, value: role });
-      const picker = await client.waitAfter(mark, (frame) => frame.t === "ask" && frame.kind === "choice" && frame.presentation !== "cross-preflight");
-      const item = (picker.items as Array<{ value: string; label: string }>).find(({ label }) => label.includes(model));
-      assert.ok(item, `${model} must come from the injected authority`);
-      mark = client.frames.length;
-      client.send({ t: "answer", askId: picker.askId, value: item.value });
-      gate = await client.waitAfter(mark, (frame) => frame.t === "ask" && frame.presentation === "cross-preflight");
-    }
-    const previous = gate;
-    client.send({ t: "answer", askId: previous.askId, value: "start" });
-    const confirm = await client.wait((frame) => frame.t === "ask" && frame.kind === "confirm");
-    client.send({ t: "answer", askId: confirm.askId, accepted: true });
-    assert.equal((await command).ok, true);
-    const active = await client.wait((frame) => frame.t === "event" && frame.e === "cross"
-      && (frame.state as { active?: boolean; phase?: string } | null)?.active === true
-      && /Review|Challenger|prüft/i.test(String((frame.state as { phase?: string }).phase)));
-    const state = active.state as { lead: { displayName: string; accountLabel: string; canonicalModelId: string }; challenger: { displayName: string; accountLabel: string; canonicalModelId: string }; phase: string };
-    assert.deepEqual(state.lead, { providerLabel: "OpenRouter", accountLabel: "Codex Privat", displayName: "GPT-5.4 Codex", canonicalModelId: "custom/gpt-red", reasoning: "supported", capabilities: ["text", "tools"] });
-    assert.deepEqual(state.challenger, { providerLabel: "OpenRouter", accountLabel: "Kimi Privat", displayName: "Kimi K3", canonicalModelId: "custom/kimi-blue", reasoning: "supported", capabilities: ["text", "tools"] });
-    assert.match(state.phase, /Review|Challenger|prüft/i);
-    const catalog = await client.request("catalog.search", { query: "cross" });
-    const stopRows = (catalog.result as { rows: Array<{ command?: string }> }).rows.filter(({ command }) => command === "/cross stop");
-    assert.equal(stopRows.length, 1);
-    const before = client.frames.length;
-    assert.equal((await client.request("command", { raw: "/cross stop", draft: "" })).ok, true);
-    await client.wait((frame) => client.frames.indexOf(frame) >= before && frame.t === "event" && frame.e === "cross" && (frame.state as { active?: boolean } | null)?.active === false);
-  } finally { await client.close(); }
-  const result = client.result();
-  assert.deepEqual(result.injectedRoutes, routes);
-  assert.equal(result.fakeGenerationSeen, 19);
-  assert.equal(result.counters.external, 0);
-  assert.ok(result.counters.authority >= 4);
-  assert.equal(result.counters.localFake, 4);
-  assert.equal(result.dispatchCallbacks, 4);
-  assert.equal(result.singleModelFallbacks, 0);
-  assert.equal(result.crossWorkersStarted, 4);
-  assert.equal(result.crossWorkersAborted, 1);
-  assert.equal(result.crossWorkersStarted, result.crossWorkersAborted + 3);
-  assert.equal(packetOf(result.fakePrompts[0]), packetOf(result.fakePrompts[1]), "both roles receive the same ContextPacket");
+test("custom fake routes stay explicit while the built GUI refuses legacy Cross without fallback",async()=>{
+  const client=new Client();
+  try{
+    await client.wait(frame=>frame.t==="hello");
+    await client.request("hello-ack",{protocol:2,client:"local-safety-journey"});
+    const desktop=await client.wait(frame=>frame.t==="event"&&frame.e==="desktop.snapshot");
+    const snapshot=desktop.snapshot as {generation:number;providers:{routes:{canonicalModelId:string}[]}[]};
+    assert.equal(snapshot.generation,19);
+    assert.equal(snapshot.providers[0]?.routes[0]?.canonicalModelId,"custom/gpt-red");
+    const refused=await client.request("command",{raw:"/cross",draft:"same ContextPacket task"});
+    assert.equal(refused.ok,false);assert.equal((refused.error as {code:string}).code,"local-flow-required");
+    const catalog=await client.request("catalog.search",{query:"cross"});
+    const rows=(catalog.result as {rows:{command?:string;presentation:{disabled?:{code:string}}}[]}).rows;
+    assert.equal(rows.filter(row=>row.command==="/cross stop").length,1);
+    assert.equal(rows.find(row=>row.command==="/cross run")?.presentation.disabled?.code,"local-flow-required");
+    assert.equal(client.frames.some(frame=>frame.t==="ask"),false);
+    assert.equal(client.frames.some(frame=>frame.t==="event"&&frame.e==="cross"&&(frame.state as {active?:boolean})?.active),false);
+  }finally{await client.close();}
+  const result=client.result();
+  assert.deepEqual(result.injectedRoutes,routes);assert.equal(result.fakeGenerationSeen,19);
+  assert.deepEqual(result.counters,{authority:0,localFake:0,external:0});
+  assert.equal(result.dispatchCallbacks,0);assert.equal(result.singleModelFallbacks,0);
+  assert.equal(result.crossWorkersStarted,0);assert.equal(result.crossWorkersAborted,0);
+  assert.deepEqual(result.fakePrompts,[]);
 });
-
 test("ContextPacket comparison rejects identical malformed or wrong-version suffixes", () => {
   const marker = "The following ContextPacket is the only source of the task.";
   assert.throws(() => packetOf(`${marker} {not-json`), /valid JSON/);

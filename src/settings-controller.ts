@@ -2286,9 +2286,9 @@ function providerAction(
     | "provider-models"
     | "provider-logout">,
 ): InterpretedEditorResult {
-  const match = /^provider-action:(openrouter|kimi-code|anthropic):(connect|enable|disable|disconnect|reconnect|models|logout)$/.exec(item.id);
+  const match = /^provider-action:(openrouter|kimi-code|nano-gpt|anthropic):(connect|enable|disable|disconnect|reconnect|models|logout)$/.exec(item.id);
   if (!match) return invalid(true, "Provider action is invalid");
-  const backendId = match[1] as "openrouter" | "kimi-code" | "anthropic";
+  const backendId = match[1] as SettingsProviderProjection["backendId"];
   const operation = match[2] as ProviderBackendAction;
   if (`provider-${operation}` !== actionId) {
     return invalid(true, "Provider action is invalid");
@@ -2680,7 +2680,7 @@ export function projectSettingsDesktopRowTruth(
       break;
   }
 
-  const providerStatus = /^provider-status:(openrouter|kimi-code|anthropic)$/.exec(item.id);
+  const providerStatus = /^provider-status:(openrouter|kimi-code|nano-gpt|anthropic)$/.exec(item.id);
   if (providerStatus) {
     const provider = snapshot.providers.find(({ backendId }) => backendId === providerStatus[1]);
     if (!provider) throw new Error("Invalid Desktop Settings provider status row.");
@@ -2699,7 +2699,7 @@ export function projectSettingsDesktopRowTruth(
       }),
     });
   }
-  const providerAction = /^provider-action:(openrouter|kimi-code|anthropic):(connect|enable|disable|disconnect|reconnect|models|logout)$/.exec(item.id);
+  const providerAction = /^provider-action:(openrouter|kimi-code|nano-gpt|anthropic):(connect|enable|disable|disconnect|reconnect|models|logout)$/.exec(item.id);
   if (providerAction) {
     const backendId = providerAction[1] as SettingsProviderProjection["backendId"];
     const action = providerAction[2] as ProviderBackendAction;

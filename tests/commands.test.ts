@@ -992,6 +992,59 @@ test("every kimi provider account command dispatches one exact kimi-code intent"
   ]);
 });
 
+test("Nano-GPT account commands preserve their provider and never dispatch OpenRouter", async () => {
+  const intents: Array<Record<string, unknown>> = [];
+  const output: string[] = [];
+  const context = {
+    config: structuredClone(DEFAULT_CONFIG),
+    providerCommands: {
+      async execute(intent: Record<string, unknown>) {
+        intents.push(intent);
+        return { kind: "unchanged", backendId: "nano-gpt", reason: "fixture" };
+      },
+    },
+    out: { text: (value: string) => output.push(value), error: (value: string) => output.push(value) },
+  } as unknown as CommandContext;
+  const actions = ["connect", "enable", "disable", "disconnect", "reconnect", "models", "logout"];
+  for (const action of actions) await handleSlashCommand(`/provider ${action} nano-gpt`, context);
+  assert.deepEqual(intents, actions.map((kind) => ({ kind, backendId: "nano-gpt" })));
+  assert.match(output.join("\n"), /Nano-GPT/);
+  assert.doesNotMatch(output.join("\n"), /OpenRouter/);
+});
+
+test("Nano-GPT /models uses its own filtered catalog, not the OpenRouter service", async () => {
+  const intents: unknown[] = [];
+  const output: string[] = [];
+  const context = {
+    providerRoutes: { currentSessionRoute: () => ({ backendId: "nano-gpt" }) },
+    providerCommands: {
+      async execute(intent: unknown) {
+        intents.push(intent);
+        return { kind: "models", backendId: "nano-gpt", models: [
+          { requestedModelId: "vendor/manual", canonicalModelId: "vendor/manual", displayName: "Manual model" },
+        ] };
+      },
+    },
+    openRouter: { listModels() { throw new Error("wrong provider called"); } },
+    out: { text: (value: string) => output.push(value), error: (value: string) => output.push(value) },
+  } as unknown as CommandContext;
+  await handleSlashCommand("/models manual", context);
+  assert.deepEqual(intents, [{ kind: "models", backendId: "nano-gpt" }]);
+  assert.deepEqual(output, ["Manual model · vendor/manual · vendor/manual"]);
+});
+
+test("Nano-GPT refuses OpenRouter-only paid extras without touching that provider", async () => {
+  const root = await mkdtemp(join(tmpdir(), "orcode-nanogpt-command-"));
+  const context = {
+    configPath: join(root, "config.json"),
+    config: structuredClone(DEFAULT_CONFIG),
+    providerRoutes: { currentSessionRoute: () => ({ backendId: "nano-gpt" }) },
+    out: { text() {}, error() {} },
+  } as unknown as CommandContext;
+  await assert.rejects(handleSlashCommand("/web on", context), /Nano-GPT/);
+  await assert.rejects(handleSlashCommand("/fallback vendor/other", context), /Nano-GPT/);
+});
+
 /**
  * Targeted privacy canaries for rendered provider status. Each canary names one
  * class of private or fabricated data that must never reach the chat surface,

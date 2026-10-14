@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import {isolatedLaunch,isLocalWorkRoot,assertLocalWorkEffect} from './local-process-isolation.js';
 import { constants as fsConstants, type BigIntStats } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { homedir } from "node:os";
@@ -508,6 +509,12 @@ export class WorkspaceGuard {
     return publishGuardedWorkspaceFiles({ guard: this, journal, runId, effects });
   }
 
+  async publishLocalCandidateEffects(authority:object,journal:ChangeJournal,runId:string):Promise<PublishGuardedWorkspaceFilesResult> {
+    const {consumeLocalPublication}=await import('./local-project-run.js');
+    const authorityState=consumeLocalPublication(authority,this);
+    return publishGuardedWorkspaceFiles({guard:this,journal,runId,...authorityState});
+  }
+
   async resolvePath(input = "."): Promise<string> {
     const candidate = resolve(this.root, input);
     this.assertLexical(candidate);
@@ -563,6 +570,7 @@ export interface GuardedWorkspaceFileEffect {
 }
 
 export interface PublishGuardedWorkspaceFilesInput {
+  readonly assertEffectCurrent?:()=>void;
   readonly guard: WorkspaceGuard;
   readonly journal: ChangeJournal;
   readonly runId: string;
@@ -719,6 +727,7 @@ async function publishGuardedWorkspaceFiles(
     }
 
     for (const effect of prepared) {
+      input.assertEffectCurrent?.();
       await input.guard.assertCurrent();
       await assertSameBoundWorkspaceDirectoryChain(effect.parentChain);
       await ensureBoundWorkspaceParents(
@@ -737,6 +746,7 @@ async function publishGuardedWorkspaceFiles(
       }
 
       const backupPath = effect.rollbackPath;
+      input.assertEffectCurrent?.();
       if (effect.before !== null) {
         if (backupPath === null) throw new Error(`Workspace rollback path is missing: ${effect.path}`);
         await rename(effect.target, backupPath);
@@ -751,6 +761,7 @@ async function publishGuardedWorkspaceFiles(
       }
 
       if (effect.after !== null) {
+        input.assertEffectCurrent?.();
         const mode = effect.beforeMode ?? effect.createdMode;
         await writeExclusiveWorkspaceFile(effect.target, effect.after, mode, effect.beforeXattrs);
         const published = await readBoundWorkspaceFile(
@@ -758,9 +769,16 @@ async function publishGuardedWorkspaceFiles(
           input.guard.canonicalRoot,
           rootInfo.dev,
         );
+        // macOS may attach its own provenance to a brand-new file. Unknown
+        // attributes already fail in readBoundWorkspaceFile; existing-file
+        // metadata must still be restored exactly.
+        const attributesMatch=published && (effect.before===null
+          ? Object.keys(published.xattrs).every(name=>name==='com.apple.provenance')
+          : sameExtendedAttributes(published.xattrs,effect.beforeXattrs));
         if (!published || !published.bytes.equals(effect.after) || published.mode !== mode
-          || !sameExtendedAttributes(published.xattrs, effect.beforeXattrs)) {
-          throw new Error(`Workspace post-image verification failed: ${effect.path}`);
+          || !attributesMatch) {
+          const reason=!published?'missing':!published.bytes.equals(effect.after)?'content':published.mode!==mode?'permissions':'metadata';
+          throw new Error(`Workspace post-image verification failed (${reason}): ${effect.path}`);
         }
       }
     }
@@ -1045,6 +1063,11 @@ async function rollbackAppliedWorkspaceEffects(
     try {
       const paths = await resolveBoundRollbackPaths(effect, guard.canonicalRoot, rootDevice);
       await assertExactBoundDirectory(paths.parent, effect.parentChain.at(-1)!);
+      const current=await readBoundWorkspaceFile(paths.target,guard.canonicalRoot,rootDevice);
+      if(current!==null && (effect.after===null || !current.bytes.equals(effect.after)
+        || current.mode!==(effect.beforeMode??effect.createdMode))) {
+        throw new Error(`Workspace rollback preserves a foreign edit and its backup: ${effect.path}`);
+      }
       await unlink(paths.target).catch((error: unknown) => {
         if (!hasCode(error, "ENOENT")) throw error;
       });
@@ -1596,6 +1619,7 @@ export function createCodingTools(
         }),
       );
       await mkdir(dirname(target), { recursive: true });
+      assertLocalWorkEffect(guard.canonicalRoot);signal?.throwIfAborted();
       await atomicWrite(target, content);
       registry.forget(target);
       await journal.record({
@@ -1652,6 +1676,7 @@ export function createCodingTools(
           details: `- ${truncate(oldText, 1_500)}\n+ ${truncate(newText, 1_500)}`,
         }),
       );
+      assertLocalWorkEffect(guard.canonicalRoot);signal?.throwIfAborted();
       await atomicWrite(target, after);
       registry.forget(target);
       await journal.record({ path: target, before, after, createdAt: new Date().toISOString(), runId });
@@ -1829,6 +1854,7 @@ export function createCodingTools(
       truncated: z.boolean(),
     }),
     execute: async ({ url, waitMs, viewport, fullPage }) => {
+      if(isLocalWorkRoot(guard.canonicalRoot))throw new Error('Browser execution is not yet isolated for this working copy.');
       const target = validateBrowserUrl(url);
       const local = await isLocalBrowserTarget(target, guard);
       if (!local) {
@@ -1927,6 +1953,7 @@ export function createCodingTools(
       truncated: z.boolean(),
     }),
     execute: async ({ host, command, timeoutSeconds }) => {
+      if(isLocalWorkRoot(guard.canonicalRoot))throw new Error('Remote execution is outside this local run.');
       const sshOptions = options.ssh ?? {};
       const targetAlias = host ?? sshOptions.session?.active;
       if (!targetAlias) {
@@ -3619,11 +3646,12 @@ function boundedProcessCompletionText(value: string): string {
   return `${value.slice(0, MAX_TOOL_OUTPUT - suffix.length)}${suffix}`;
 }
 
-export function runProcess(
+export async function runProcess(
   executable: string,
   args: string[],
   options: RunProcessOptions,
 ): Promise<ProcessResult> {
+  const launch=await isolatedLaunch(options.cwd,executable,args);
   return new Promise((resolvePromise) => {
     let stdout = "";
     let stderr = "";
@@ -3643,7 +3671,7 @@ export function runProcess(
       return;
     }
 
-    const child = spawn(executable, args, {
+    const child = spawn(launch.executable, launch.args, {
       cwd: options.cwd,
       env: options.env ?? sanitizedEnvironment(),
       stdio: ["ignore", "pipe", "pipe"],

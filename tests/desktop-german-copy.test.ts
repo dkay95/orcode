@@ -95,6 +95,38 @@ test("ordinary editor projection closes Registry authority behind German handles
 });
 const ALL_OPENROUTER_ACTIONS = ["connect", "enable", "disable", "disconnect", "reconnect", "models", "logout"] as const;
 const ALL_KIMI_ACTIONS = ["connect", "enable", "disable", "reconnect", "models", "logout"] as const;
+
+test("German Desktop Settings projects fresh Nano-GPT and both billing realms with every account action", () => {
+  for (const billingRealm of ["nanogpt-subscription", "nanogpt-payg", "none"] as const) {
+    const base = richRegistrySnapshot();
+    const source: SettingsAuthoritativeSnapshot = { ...base, providers: [{
+      ...base.providers[0]!, backendId: "nano-gpt", displayName: "Nano-GPT", maturity: "preview", billingRealm,
+      ...(billingRealm === "none" ? { configuration: "not-connected", health: null, headline: null, selectedModel: null, isDefault: false } as const : {}),
+    }] };
+    const registry = buildSettingsRegistry(source);
+    const runtime: SettingsControllerSnapshot = { ...source, config: projectSettingsConfig(source.config) };
+    const rows = registry.items.filter((row) => row.id.includes(":nano-gpt"));
+    assert.equal(rows.length, 8);
+    for (const row of rows) {
+      const projected = projectGermanSettingsRow(row, `handle-${row.id}`, projectSettingsDesktopRowTruth(runtime, row));
+      assert.match(projected.label, /Nano-GPT/);
+      if (row.id === "provider-status:nano-gpt") assert.match(projected.displayValue, billingRealm === "nanogpt-subscription" ? /Abo/ : billingRealm === "nanogpt-payg" ? /Guthaben/ : /Nicht verbunden/);
+    }
+  }
+});
+
+test("Nano-GPT aggregate account status never invents a billing mode before an exact account is chosen", () => {
+  const base = richRegistrySnapshot();
+  const source: SettingsAuthoritativeSnapshot = { ...base, providers: [{
+    ...base.providers[0]!, backendId: "nano-gpt", displayName: "Nano-GPT", maturity: "preview",
+    billingRealm: "none", isDefault: false, selectedModel: null,
+  }] };
+  const runtime: SettingsControllerSnapshot = { ...source, config: projectSettingsConfig(source.config) };
+  const row = buildSettingsRegistry(source).items.find((item) => item.id === "provider-status:nano-gpt")!;
+  const projected = projectGermanSettingsRow(row, "nano-status", projectSettingsDesktopRowTruth(runtime, row));
+  assert.match(projected.displayValue, /Konto.*gewählt/);
+  assert.doesNotMatch(projected.displayValue, /Keine Abrechnung/);
+});
 const EXPECTED_RAW_REASON_PRESENTATIONS = {
   "Run active": { code: "run-active", label: "Während eines Laufs gesperrt.", recoveryLabel: "Lauf zuerst beenden" },
   "Cross is unavailable": { code: "cross-unavailable", label: "Cross ist nicht verfügbar.", recoveryLabel: "Cross-Konfiguration prüfen" },
@@ -104,6 +136,7 @@ const EXPECTED_RAW_REASON_PRESENTATIONS = {
   "Choose a model first": { code: "cross-role-unset", label: "Cross-Modell fehlt.", recoveryLabel: "Modell wählen" },
   "Both roles must be set before swapping": { code: "cross-swap-incomplete", label: "Beide Cross-Modelle werden benötigt.", recoveryLabel: "Beide Modelle wählen" },
   "Kimi Code doesn't support this external model role; an OpenRouter route is required": { code: "external-model-role-unsupported", label: "Dieses Konto unterstützt die Modellrolle nicht.", recoveryLabel: "OpenRouter-Modell wählen" },
+  "Nano-GPT does not support this control; choose the main model manually": { code: "external-model-role-unsupported", label: "Dieses Konto unterstützt die Modellrolle nicht.", recoveryLabel: "OpenRouter-Modell wählen" },
   "Architect is unavailable on Kimi Code routes": { code: "architect-unavailable", label: "Architect ist für diese Route nicht verfügbar.", recoveryLabel: "Kompatible Route wählen" },
   "No remembered rules": { code: "no-remembered-rules", label: "Keine gemerkten Regeln vorhanden." },
   "No verify commands": { code: "no-verify-commands", label: "Keine Prüf-Befehle vorhanden." },
@@ -334,6 +367,14 @@ function reachableSettingsRegistryMatrix(): readonly MatrixScenario[] {
       "architect-executor-model": { displayValue: "Modell: model/executor", disabledReason: "Architect is unavailable on Kimi Code routes" },
       "cross-pair-swap": { displayValue: "Tauschen", disabledReason: "Cross is unavailable on Kimi Code routes" },
     }),
+    scenario("nano-policy-gates", (snapshot) => {
+      (snapshot as { route: SettingsAuthoritativeSnapshot["route"] }).route = {
+        backendId: "nano-gpt", providerLabel: "Nano-GPT", requestedModelId: "model/main",
+        canonicalModelId: "model/main", modelLabel: "Matrix Main", billingRealm: "nanogpt-subscription",
+      };
+    }, {
+      "compressor-model": { displayValue: "Modell: model/compressor", disabledReason: "Nano-GPT does not support this control; choose the main model manually" },
+    }),
     scenario("rules-absent", (snapshot) => { (snapshot as unknown as { approvalRules: [] }).approvalRules = []; }, {
       "approval-forget-all": { displayValue: "0 Regeln", disabledReason: "No remembered rules" },
     }),
@@ -556,7 +597,8 @@ const EXPECTED_RICH_DYNAMIC_PRESENTATION: Readonly<Record<(typeof EXPECTED_DYNAM
 
 test("German Desktop copy tables are closed and exhaustive at runtime", () => {
   assert.equal(Object.keys(DESKTOP_DISABLED_COPY).length, 17);
-  assert.equal(Object.keys(DESKTOP_COMMAND_DISABLED_COPY).length, 9);
+  assert.equal(Object.keys(DESKTOP_COMMAND_DISABLED_COPY).length, 10);
+  assert.equal(DESKTOP_COMMAND_DISABLED_COPY['local-flow-required'].recoveryLabel,'AI-Prozess wählen und Aufgabe starten');
   assert.equal(Object.keys(DESKTOP_SETTINGS_DISABLED_COPY).length, 19);
   assert.equal(Object.keys(DESKTOP_ACTIVITY_COPY).length, 7);
   assert.equal(Object.keys(DESKTOP_SETTINGS_NOTICE_COPY).length, 4);
@@ -834,7 +876,7 @@ test("the named real Registry matrix has exact contributions IDs reasons choices
   assert.deepEqual(scenarios.map(({ name }) => name), [
     "idle-different-ready-present", "active", "cross-unset", "cross-lead-only", "cross-challenger-only",
     "cross-equal", "cross-unavailable-runtime", "cross-unavailable-generic", "cross-unavailable-no-provider", "catalog-missing",
-    "catalog-present-no-reasoning", "kimi-policy-gates", "rules-absent", "verify-and-voice-absent",
+    "catalog-present-no-reasoning", "kimi-policy-gates", "nano-policy-gates", "rules-absent", "verify-and-voice-absent",
     "provider-disconnected", "provider-degraded", "appearance-on-auto", "appearance-off-unicode",
     "appearance-mixed-ascii",
   ]);
@@ -954,6 +996,7 @@ test("the named real Registry matrix has exact contributions IDs reasons choices
     "Cross is unavailable",
     "Cross is unavailable on Kimi Code routes",
     "Kimi Code doesn't support this external model role; an OpenRouter route is required",
+    "Nano-GPT does not support this control; choose the main model manually",
     "Model catalog not available",
     "Model doesn't support reasoning",
     "No remembered rules",

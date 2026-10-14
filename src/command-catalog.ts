@@ -142,7 +142,7 @@ export const COMMAND_TREE = [
     { kind: "command", group: "accounts", name: "provider", handlerId: "provider", usage: "/provider [setup|connect|login|logout|enable|disable|disconnect|reconnect|status|models|sort|only|ignore|clear] | data allow|deny | fallbacks on|off", description: "Set up, connect, check, or disconnect provider accounts", menuQuickActions: [{ query: "provider setup", args: ["setup"], order: 0 }], acceptsArguments: true },
     { kind: "command", group: "accounts", name: "key", handlerId: "key", usage: "/key [set|replace|save|status|forget|management]", description: "Manage the OpenRouter key securely", acceptsArguments: true },
     { kind: "command", group: "accounts", name: "balance", handlerId: "balance", usage: "/balance", description: "Recheck balance and key limit", aliases: ["credits"] },
-    { kind: "command", group: "accounts", name: "models", handlerId: "models", usage: "/models [search]", description: "List tool-capable OpenRouter models", acceptsArguments: true },
+    { kind: "command", group: "accounts", name: "models", handlerId: "models", usage: "/models [search]", description: "List tool-capable models for the active provider", acceptsArguments: true },
   ] },
   { kind: "branch", name: "Approvals & Costs", description: "Decide what runs without asking, and cap what it may spend", desktopDescription: "Freigaben festlegen und Ausgaben begrenzen", children: [
     { kind: "command", group: "approvals-costs", name: "allow", handlerId: "allow", usage: "/allow [mode|list|forget <id>|forget all]", description: "Choose approvals; list or forget remembered rules", aliases: ["approval", "approvals", "permissions"], acceptsArguments: true },
