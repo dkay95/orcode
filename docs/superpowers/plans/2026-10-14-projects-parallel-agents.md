@@ -2,13 +2,13 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Ein Projekt über die native Ordnerauswahl öffnen und darin bis zu drei unabhängige Coding-Agenten mit eigenen Ansichten, Aufgaben und ausdrücklich manuell gewählten Modellen betreiben.
+**Goal:** Ein Projekt über die native Ordnerauswahl öffnen und darin bis zu drei unabhängige Coding-Agenten mit eigenen Ansichten, Aufgaben und ausdrücklich manuell gewählten Modellen betreiben — einschließlich Codex über das verbundene ChatGPT-Abonnement.
 
 **Architecture:** Die Engine besitzt Projektidentität, Agenten, Routen, Freigaben und Ergebnisse; die GUI zeigt ausschließlich sichere Projektionen und sendet strukturierte Anforderungen. Jeder Agent erhält eine geprüfte Arbeitskopie, eine eigene Sitzung und ein eigenes Abbruchsignal. Der bestehende sichere Veröffentlichungsalgorithmus übernimmt einen exakt freigegebenen Ergebnisdiff erst nach erneuter Prüfung des Originalprojekts.
 
-**Tech Stack:** Node.js >=22, TypeScript, node:test, vorhandenes OpenRouter Agent SDK und Nano-GPT-Laufzeit, PrivateStore, Vanilla-TypeScript-GUI, Vitest, Playwright, Tauri v2 mit installiertem Dialog-Plugin. Keine neue Laufzeitabhängigkeit.
+**Tech Stack:** Node.js >=22, TypeScript, node:test, vorhandenes OpenRouter Agent SDK, Nano-GPT-Laufzeit, offizieller signierter Codex App Server, PrivateStore, Vanilla-TypeScript-GUI, Vitest, Playwright, Tauri v2 mit installiertem Dialog-Plugin. Keine neue JavaScript-Laufzeitabhängigkeit. Codex-Kompatibilität und Payload-Vertrauen werden explizit geprüft, nicht durch einen ungeprüften Versionsbypass ersetzt.
 
-**Spec:** [Freigegebenes Design](../specs/2026-10-14-projects-parallel-agents-design.md), Commit `1467d4a87a0c01dd8004a5b9f1a405d417bf05d2`.
+**Spec:** [Design einschließlich der angeforderten Codex-Ergänzung](../specs/2026-10-14-projects-parallel-agents-design.md). Basisfreigabe in Commit `1467d4a87a0c01dd8004a5b9f1a405d417bf05d2`; Codex-Aboaufnahme vom Nutzer am 14. Oktober 2026 ausdrücklich verlangt. Der ergänzte Plan wird vor Produktimplementierung reviewed.
 
 ## Global Constraints
 
@@ -16,6 +16,9 @@
 - „Konten und Zugangsdaten bleiben ausschließlich beim lokalen Eigentümer.“
 - „Kein Agent wählt automatisch ein anderes Modell, Konto oder einen anderen Abrechnungsmodus.“
 - „Die vorhandene Nano-GPT-Erweiterung bleibt erhalten.“
+- „Codex, OpenRouter und Nano-GPT gehören zur ersten Ausbaustufe.“
+- „Codex ist kein optional auf später verschobener Adapter.“
+- „Alle Codex-Agenten desselben Accounts verbrauchen dessen gemeinsames Kontingent.“
 - „Pro Projekt können zunächst drei Agenten gleichzeitig laufen.“
 - „Weitere Starts werden mit einer verständlichen Meldung abgelehnt; es gibt keine unsichtbare kostenpflichtige Warteschlange.“
 - „Ein Projekt ist in der ersten Ausbaustufe aktiv.“
@@ -34,11 +37,11 @@ Bestehende Aufnahmegrenzen aus `src/codex-staging-workspace.ts` bleiben bei der 
 
 ## Review Focus
 
-1. **Doppelklick und vier gleichzeitige Starts:** atomare Platzreservierung vor jedem `await`, maximal drei Läufe und kein vierter Provideraufruf — Task 4.
+1. **Doppelklick, drei Codex-Children und vier gleichzeitige Starts:** atomare Platzreservierung, getrennte Child-/Auth-Scopes, maximal drei Läufe und kein vierter Provideraufruf — Tasks 3B und 4.
 2. **Ordnerauswahl wird erst nach Engine-/Projektwechsel beantwortet:** den alten Auswahlvorgang ablehnen, niemals das Ersatzprojekt umschalten — Tasks 1 und 8.
 3. **Quellbaum verändert sich während der Aufnahme oder wird per Symlink/Inode ersetzt:** keine Provideranfrage und kein unvollständiger Ausgangsstand — Task 2.
 4. **Übernahme scheitert, danach Neustart und erneute Übernahme:** unveränderte Ergebnisbytes bleiben verfügbar, aktuelle Vorbedingungen werden erneut geprüft, keine automatische Fortsetzung — Tasks 5 und 9.
-5. **Verspätete, doppelte oder fremde Frames/Freigaben:** keine Ausgabe und keine Freigabewirkung im falschen Agenten; bei Sequenzlücken gezielt neu synchronisieren — Tasks 4, 6 und 7.
+5. **Verspätete, doppelte oder fremde Frames/Freigaben:** keine Ausgabe und keine Freigabewirkung im falschen Agenten; auch Codex-Thread-/Turn-/Child-Identität prüfen, bei Sequenzlücken gezielt neu synchronisieren — Tasks 3B, 4, 6 und 7.
 
 ---
 
@@ -60,6 +63,8 @@ Dies ist ein zusammenhängender Plan: Projektöffnung ist ein eigenes nutzbares 
 2 Kopien und dauerhafte Ergebnisse → 3 exakte Task-Routen und Factory
        └───────────────────────────────┬─────────────────────┘
                                      ↓
+                         3B Codex-Abo-Task-Adapter
+                                     ↓
                               4 Agentenmanager
                                      ↓
                          5 Freigabe und Übernahme
@@ -73,7 +78,7 @@ Dies ist ein zusammenhängender Plan: Projektöffnung ist ein eigenes nutzbares 
                        9 echte Engine-/App-Abnahme
 ```
 
-Vor Task 9 dürfen unabhängige Modulprüfungen grün sein, aber das Gesamtprodukt wird noch nicht als fertig bezeichnet. Neue Schnittstellen laufen erst nach Task 8 im tatsächlichen GUI-Engine-Pfad.
+Vor Task 9 dürfen unabhängige Modulprüfungen grün sein, aber das Gesamtprodukt wird noch nicht als fertig bezeichnet. Neue Schnittstellen laufen erst nach Task 8 im tatsächlichen GUI-Engine-Pfad. Task 3B ist das zusätzliche zehnte überprüfbare Paket; seine Bezeichnung erhält die Nummern des schon vorliegenden Plans.
 
 Alle folgenden Node-Testbefehle laufen **ab Task 1** mit dem dort angelegten Home-Preload. Dafür einmal je Testsession einen privaten temporären Ordner erzeugen und taskbezogene Variablen setzen; vorhandene Node-Optionen bleiben erhalten:
 
@@ -96,6 +101,7 @@ Das gilt auch für bestehende Regressionstests und deren Kindprozesse. Kein echt
 | `src/verified-workspace-copy.ts` | Providerneutrale Extraktion der bestehenden Aufnahme-/Scanalgorithmen, ohne Freigabeautorität |
 | `src/task-agents/workspaces.ts`, `result-store.ts` | Task-Kopien, zweite Aufnahmeprüfung, dauerhaft gespeicherte vollständige Ergebniseffekte |
 | `src/task-agents/routes.ts`, `openrouter-runtime.ts`, `factory.ts` | Lesende manuelle Routenauswahl, exakte Credential-Prüfung vor Anfragen, unabhängige Agentenerzeugung |
+| `src/task-agents/codex-auth.ts`, `codex-authority.ts`, `codex.ts` | Ein privater Abo-Auth-Owner, getrennte signierte App-Server-Children, exakte Task-/Modellbindung und Capture-only-Abschluss |
 | `src/task-agents/manager.ts`, `approvals.ts` | Drei Plätze, Lebenszyklus, eigene Ereignisse/Asks, Abbruch und kontrollierter Shutdown |
 | `src/task-agents/apply.ts` | Neue Task-Freigabeautorität, serialisierte Veröffentlichung, Konflikt-/Rollback-/Undo-Verhalten |
 | `src/task-agents/gui-port.ts` | Strukturierte Anforderungen und sichere Protokollprojektion; kein zweiter Manager |
@@ -142,6 +148,16 @@ export interface TaskRunKey {
 export type TaskRunState = "starting" | "running" | "waiting-approval"
   | "stopping" | "stopped" | "completed" | "failed" | "interrupted";
 export type TaskResultState = "unreviewed" | "applying" | "applied" | "conflict";
+export interface TaskSubscriptionUsage {
+  readonly accountHandle: string; // safe opaque grouping handle, not fingerprint
+  readonly sharedAcrossAgents: true;
+  readonly state: "available" | "limit-reached" | "unknown";
+  readonly windows: readonly {
+    readonly label: string;
+    readonly usedPercent: number | null;
+    readonly resetsAt: number | null;
+  }[];
+}
 export interface TaskAgentView extends TaskRunKey {
   readonly name: string;
   readonly task: string;
@@ -151,6 +167,7 @@ export interface TaskAgentView extends TaskRunKey {
   readonly openApprovalCount: number;
   readonly cost: { readonly kind: "known"; readonly usd: number }
     | { readonly kind: "unknown" };
+  readonly subscriptionUsage?: TaskSubscriptionUsage;
 }
 export interface TaskAgentEvent extends TaskRunKey {
   readonly sequence: number;
@@ -283,7 +300,7 @@ Der Sidebar-Handler wird `openProject(): void` statt `run("/folder")`; die produ
 - Produces: `TaskWorkspace` als kernprivates, authentisches Objekt mit `key: TaskRunKey`, `canonicalPath: string`, `baselineDigest: string`, `exclusions: readonly string[]`.
 - Produces: `createTaskWorkspace({project: ProjectBinding, key: TaskRunKey, signal: AbortSignal}): Promise<TaskWorkspace>`; `captureTaskResult(workspace: TaskWorkspace, verification: TaskResultView["verification"]): Promise<TaskStoredResult>`; `discardTaskWorkspace(workspace: TaskWorkspace): Promise<void>`.
 - Produces: `TaskStoredResult` kernprivat mit `key: TaskRunKey`, `digest: string`, `baselineDigest: string`, `projectRootIdentity: {canonicalRoot: string; dev: string; ino: string}`, `effects: readonly GuardedWorkspaceFileEffect[]`, `exclusions: readonly string[]`, `verification: TaskResultView["verification"]`; die bestehenden `GuardedWorkspaceFileEffect`-Vorbedingungen um den ursprünglichen Manifest-/Metadatenstand ergänzen, ohne sie abzuschwächen. Effekte enthalten vollständige Before-/After-Inhalte und Metadaten, niemals nur einen dargestellten Diff.
-- Produces: `TaskResultStore.open(appHome: string): Promise<TaskResultStore>`, `.save(result: TaskStoredResult): Promise<TaskResultView>`, `.read(key: TaskRunKey): Promise<TaskStoredResult>`, `.view(key: TaskRunKey): Promise<TaskResultView>`, `.setState(key: TaskRunKey, state: TaskResultState): Promise<void>`, `.saveRun(view: TaskAgentView): Promise<void>`, `.listRuns(projectId: string): Promise<readonly TaskAgentView[]>`, `.recoverRuns(): Promise<readonly TaskAgentView[]>`.
+- Produces: `TaskResultStore.open(appHome: string): Promise<TaskResultStore>`, `.save(result: TaskStoredResult): Promise<TaskResultView>`, `.read(key: TaskRunKey): Promise<TaskStoredResult>`, `.tryRead(key: TaskRunKey): Promise<TaskStoredResult | null>` nur bei tatsächlich fehlendem Datensatz null, `.view(key: TaskRunKey): Promise<TaskResultView>`, `.setState(key: TaskRunKey, state: TaskResultState): Promise<void>`, `.saveRun(view: TaskAgentView): Promise<void>`, `.listRuns(projectId: string): Promise<readonly TaskAgentView[]>`, `.recoverRuns(): Promise<readonly TaskAgentView[]>`.
 
 - [ ] **1. Aufnahme- und Dauerhaftigkeitstests schreiben.** Der nachstehende Kern prüft aktuelle Arbeitsdateien statt HEAD und Ergebnisverlust nach Aufräumen:
 
@@ -340,11 +357,12 @@ return publicResult;
 **Interfaces:**
 
 - Consumes: `RoutePickerAuthority.view({role: "executor"})`, `.resolve({role: "executor"}, selection: RoutePickerSelectionIntent)`, `ProviderCredentialAuthorityLike.withCredential`, `createNanoGptModelRuntime`, `OrcodeAgent.create`.
-- Produces: `TaskRoutePort.view(): RoutePickerView`, `.resolve(selection: RoutePickerSelectionIntent): TaskRouteProof`, `.assertCurrent(proof: TaskRouteProof): Promise<void>`, `.createRuntime(proof: TaskRouteProof, config: OrcodeConfigWithBudget): Promise<{runtime: ModelRuntime; binding: ModelRuntimeBindingIdentityV1}>`.
+- Produces: `TaskRoutePort.view(): RoutePickerView` aus dem aktuellen Snapshot, `.refreshView(signal: AbortSignal): Promise<RoutePickerView>` lesende Katalogaktualisierung, `.resolve(selection: RoutePickerSelectionIntent): TaskRouteProof`, `.assertCurrent(proof: TaskRouteProof): Promise<void>`, `.read(proof: TaskRouteProof): ResolvedRoutePickerSelection` kernprivat, `.createSdkRuntime(proof: TaskRouteProof, config: OrcodeConfigWithBudget): Promise<{runtime: ModelRuntime; binding: ModelRuntimeBindingIdentityV1}>` ausschließlich für OpenRouter/Nano-GPT.
 - Produces: `TaskRouteProof` authentisches kernprivates Objekt, nur durch `resolve` ausgegeben; enthält exact route, connectionId, revision/generation und sichere Candidate-Projektion in privater WeakMap.
 - Produces: `createTaskConfig(base: OrcodeConfigWithBudget, modelId: string): OrcodeConfigWithBudget`.
-- Produces: `TaskAgentFactory` constructor dependencies `{appHome: string; baseConfig: OrcodeConfigWithBudget; routes: TaskRoutePort}`, `.create({key: TaskRunKey, workspace: TaskWorkspace, task: string, proof: TaskRouteProof, approvals: ApprovalManager}): Promise<TaskAgentInstance>`.
-- Produces: `TaskAgentInstance.run(observer: AgentRunObserver): Promise<AgentRunResult>`; keine erfundene `agent.dispose()`-Methode.
+- Produces: `TaskAgentFactory` constructor dependencies `{appHome: string; baseConfig: OrcodeConfigWithBudget; routes: TaskRoutePort; codex?: CodexTaskFactoryPort}`, `.create({key: TaskRunKey, workspace: TaskWorkspace, task: string, proof: TaskRouteProof, approvals: ApprovalManager, signal: AbortSignal}): Promise<TaskAgentInstance>`.
+- Produces: `CodexTaskFactoryPort` als kleiner typisierter Port im Factory-Modul mit genau derselben `.create(input): Promise<TaskAgentInstance>`-Signatur. Task 3 kann seine SDK-Adapter unabhängig prüfen; die produktive Task-8-Zusammensetzung verlangt zwingend die konkrete Implementierung aus Task 3B.
+- Produces: `TaskAgentInstance.run(observer: AgentRunObserver): Promise<AgentRunResult>`, `.send(text: string): Promise<"sent" | "queued">`, `.close(): Promise<void>`, optional `.subscriptionUsage(): Promise<TaskSubscriptionUsage>`; `close` gehört dem neuen Adapterwrapper, nicht einer erfundenen `OrcodeAgent.dispose()`-Methode. SDK-Adapter brauchen keinen erfundenen Abostand.
 
 **Verifizierte Stolperfalle:** Der aktuelle OpenRouter-`modelRuntime` prüft zwar das Route-Argument, verwendet danach aber `this.openRouter` mit dessen globalem Key und `this.config` mit Default/Fallback-Modellen. Das ist für unabhängige Task-Konten kein ausreichender Nachweis. Ein separater requestautorisierter Adapter gehört deshalb ausdrücklich zu diesem Paket; unverändertes Wiederverwenden ist verboten.
 
@@ -365,7 +383,7 @@ test("task config cannot inherit another model or mutate the default", () => {
 });
 ```
 
-In `tests/route-picker.test.ts` bestehende `pickerFixture`, `candidate`, `snapshot`-Helfer in einen test-only Helper `tests/fixtures/route-picker-fixture.ts` extrahieren und dort exportieren; keine Produktionsautorität exportieren. Neue Tests: zwei ausgewählte Modelle/Konten, unbekannter Handle, stale revision/generation, widerrufene Tool-Fähigkeit, veränderte Billing-Metadaten. Öffnen/Resolve dürfen keinen Config-/Session-/ProviderState-Write auslösen. Kimi/Codex erscheinen ausdrücklich nicht runnable mit Grund; OpenRouter/Nano bleiben exakt gewählte Kandidaten.
+In `tests/route-picker.test.ts` bestehende `pickerFixture`, `candidate`, `snapshot`-Helfer in einen test-only Helper `tests/fixtures/route-picker-fixture.ts` extrahieren und dort exportieren; keine Produktionsautorität exportieren. Neue Tests: zwei ausgewählte Modelle/Konten, unbekannter Handle, stale revision/generation, widerrufene Tool-Fähigkeit, veränderte Billing-Metadaten. Öffnen/Resolve dürfen keinen Config-/Session-/ProviderState-Write auslösen. Kimi bleibt nicht runnable mit Grund. Codex ist nach Task 3B tatsächlich auswählbar; fehlt Login, Modellnachweis oder kompatible offizielle Laufzeit, erscheint genau dieser behebbare Zustand statt einer pauschalen Provider-Sperre.
 - [ ] **2. Rot ausführen.** `env -u FORCE_COLOR node --import tsx --test tests/task-agent-routes.test.ts tests/task-agent-openrouter-runtime.test.ts tests/task-agent-factory.test.ts`.
 - [ ] **3. Konfigurationsklon und authentische Task-Selektion implementieren.**
 
@@ -380,7 +398,7 @@ export function createTaskConfig(base: OrcodeConfigWithBudget, modelId: string) 
 }
 ```
 
-Kein heimlicher zweiter Compressor-Call in V1. `TaskRoutePort` nutzt die lesende Executor-Auswahl, versieht nur OpenRouter und Nano-GPT mit Task-runnable-Status und prüft zusätzlich die Provider-Task-Unterstützung beim Resolve. Jede Proof-Autorität wird in einer privaten WeakMap registriert; JSON-Kopien und selektierte Kandidaten eines anderen Ports bleiben ungültig. `assertCurrent` vergleicht aktuelle Eigentümerschaft, Revision, Generation, Billing und Credential-Pointer.
+Kein heimlicher zweiter Compressor-Call in V1. `TaskRoutePort` nutzt die lesende Executor-Auswahl für SDK-Routen und den eigenen Codex-Task-Katalog aus Task 3B. Es projiziert beide auf `RoutePickerView` mit port-eigenen Handles. Eine private Binding-Map unterscheidet SDK-Selection und Codex-Proof, ohne Credential-Daten zu serialisieren. Resolve prüft die tatsächliche Provider-Task-Unterstützung. Jede Proof-Autorität wird in einer privaten WeakMap registriert; JSON-Kopien und selektierte Kandidaten eines anderen Ports bleiben ungültig. `assertCurrent` vergleicht aktuelle Eigentümerschaft, Revision, Generation, Billing und Credential-/Profilbindung. `createSdkRuntime` verweigert eine Codex-Route, statt sie zu OpenRouter umzudeuten.
 - [ ] **4. OpenRouter vor jeder tatsächlichen Anfrage autorisieren.** `createTaskOpenRouterRuntime(options)` im neuen Modul erzeugt einen eigenen SDK-Client mit injiziertem `HTTPClient`/Fetcher, nicht mit dem globalen `OpenRouterService.client()`. Der Fetcher erlaubt ausschließlich die vorhandenen OpenRouter-Inference-/Spend-/Catalog-Endpunkte und verweigert Redirects. Für jeden autorisierten Request `withCredential({backendId: "openrouter", connectionId: proof.connectionId, purpose: "runtime-bind", credentialKind: "inference", environmentEligibility: "forbidden", deadlineAt, signal}, callback)` aufrufen, aktuelle Bindung im Callback gegen Proof prüfen und erst dann Authorization setzen. SDK-Sentinel-Key nie über das Netzwerk schicken. Keine Management-Credentials, kein gecachter echter Key außerhalb des Callbacks, keine Ersatzverbindung. Auch SDK-Retries und Tool-Follow-up-POSTs gehen erneut durch diese Schranke. Exact-Modellpayload und `allowFallbacks: false` unveränderlich binden; `createClient({scope: "compressor"})` für V1 ablehnen. `safeMessage` liefert ausschließlich ausgegebene sichere Fehlercodes.
 
 Der neue Adapter exportiert:
@@ -403,18 +421,141 @@ Den Nano-GPT-Adapter mit seinem exakten Proof und getrenntem Subscription/PAYG-R
 
 ```ts
 await routes.assertCurrent(proof);
+const resolved = routes.read(proof);
+if (resolved.route.backendId === "codex") {
+  if (!codex) throw new Error("Codex task runtime is not composed.");
+  return codex.create({ key, workspace, task, proof, approvals, signal });
+}
 const config = createTaskConfig(baseConfig, resolved.route.requestedModelId);
-const { runtime, binding } = await routes.createRuntime(proof, config);
+const { runtime, binding } = await routes.createSdkRuntime(proof, config);
 const session = SessionStore.create(workspace.canonicalPath, appHome, task);
 session.setPreferences(config.mainModel, getReasoningSetting(config), resolved.route);
 await session.save();
 const agent = await OrcodeAgent.create({ runtime, runtimeBinding: binding,
   route: resolved.route, approvals, session, config, workspace: workspace.canonicalPath });
-return { run: (observer: AgentRunObserver) => agent.run(task, observer) };
+const interjections = new InterjectionQueue();
+return {
+  run: (observer: AgentRunObserver) => agent.run(task, { ...observer, interjections }),
+  send: async (text: string) => { interjections.enqueue(text); return "queued" as const; },
+  close: async () => {},
+};
 ```
 
-Hier sind `resolved` die intern aus dem authentischen Proof gelesenen Daten, `baseConfig` und `appHome` explizite Factory-Konstruktorabhängigkeiten, `routes: TaskRoutePort`. Keine globalen Defaults speichern. Das bestehende Coding-Tool-Factory-Testseam prüft unterschiedliche Guards/ReadRegistries/Journals je Instance und verweigert Pfade in Geschwisterkopien. Agent-interne Journal-/Run-ID bleibt an seine eigene Session gebunden.
+Hier sind `key`, `workspace`, `task`, `proof`, `approvals` und `signal` die Create-Argumente; `baseConfig`, `appHome`, `codex: CodexTaskFactoryPort | undefined` und `routes: TaskRoutePort` sind explizite Konstruktorabhängigkeiten. Keine globalen Defaults speichern. Das bestehende Coding-Tool-Factory-Testseam prüft unterschiedliche Guards/ReadRegistries/Journals je SDK-Instance und verweigert Pfade in Geschwisterkopien. Agent-interne Journal-/Run-ID bleibt an seine eigene Session gebunden. Task 3B erzeugt die konkrete `CodexTaskFactory`; diese erweitert die Factory-Abnahme um echte Codexfälle. Im isolierten Task-3-Unitstand ist „Port fehlt“ eine explizite Ablehnung, niemals SDK-Fallback; V1 darf nicht ohne den Pflichtport aus Task 3B ausgeliefert werden.
 - [ ] **7. Grün prüfen und committen.** Neue Tests plus `tests/route-picker.test.ts`, `tests/nanogpt-model-runtime.test.ts`, `tests/openrouter.test.ts`, `tests/agent.test.ts`; beide Core-`tsc`-Projekte. Commit: `feat(agents): bind manually selected task runtimes exactly`.
+
+### Task 3B: Codex Abonnement mit getrennten App Server Läufen und manueller Modellwahl
+
+Dieses zusätzliche Paket ist Pflicht für V1 und wird nach den gemeinsamen Workspace-/Routeverträgen, vor der finalen Factory-/Managerintegration abgeschlossen. Codex bleibt ein nativer Managed-Adapter; er wird weder in `ModelRuntime` hineingecastet noch durch einen API-Provider ersetzt.
+
+**Files:**
+
+- Create: `src/task-agents/codex-auth.ts`, `src/task-agents/codex-authority.ts`, `src/task-agents/codex.ts`, `tests/fixtures/codex-task-fixture.ts`
+- Modify: `src/task-agents/routes.ts`, `src/task-agents/factory.ts` nur Codex-Task-Zweig
+- Modify: `src/codex-app-server.ts:200,213` authentischer Task-Startmodus und private Auth-Lane; `src/codex-route-gate.ts:109,204` ausschließlich authentischer Codex-Task-Lease-Zweig
+- Modify: `src/codex-execution.ts:785`, `src/codex-staging-workspace.ts:172`, `src/codex-approval-bridge.ts:541` eng begrenzte Task-Capture-/Retentionsautorität; ursprünglicher Managed-Main-Pfad unverändert
+- Modify: `src/model-runtime.ts:849`, `src/cli.ts:8676` Profil-Auth-Owner-Gate, kein Main-Client für Taskdispatch
+- Test: `tests/task-agent-codex-auth.test.ts`, `tests/task-agent-codex-authority.test.ts`, `tests/task-agent-codex.test.ts`, vorhandene Codex-Trust-/Route-/Session-/Execution-/Approval-Tests
+
+**Interfaces:**
+
+- Consumes: `TaskRunKey`, authentischer `TaskWorkspace`, `TaskRouteProof`, taskeigener `ApprovalManager`, `SessionStore.create`, `ChangeJournal`, `PrivateStore`, bestehende signierte Payload-Prüfung und Codex-App-Server-Transport.
+- Produces: `CodexSubscriptionAuthCoordinator.acquire({connectionId: string, sourceProfileId: string, expectedRevision: number, signal: AbortSignal}): Promise<CodexTaskProfileLease>`, `.refresh(lease: CodexTaskProfileLease, signal: AbortSignal): Promise<void>`, `.release(lease: CodexTaskProfileLease): Promise<void>`, `.usage(lease: CodexTaskProfileLease): Promise<TaskSubscriptionUsage>`, `.hasActiveLeases(): boolean`.
+- Produces: `CodexTaskProfileLease` authentischer privater WeakMap-Handle auf sourceProfile/root/account/billing/authEpoch. Er enthält öffentlich **keinen** Access-/Refresh-Token; Tokenverwendung ist ausschließlich eine private Callback-Lane zwischen Coordinator und gebundenem App-Server-Child.
+- Produces: `CodexTaskCatalog.refresh(signal: AbortSignal): Promise<RoutePickerView>`, `.view(): RoutePickerView`, `.resolve(selection: RoutePickerSelectionIntent): CodexTaskSelection`, `.assertCurrent(selection: CodexTaskSelection): Promise<void>`, `.read(selection: CodexTaskSelection): ResolvedRoutePickerSelection` kernprivat. `CodexTaskSelection` ist ein eigener authentischer WeakMap-Handle. Modelle werden vom verbundenen Profil mit paginiertem `model/list` geladen, nicht von einer statischen Liste. TaskRoutePort remappt die öffentlichen Handles und umhüllt die authentische CodexTaskSelection in seinen eigenen TaskRouteProof; er akzeptiert keinen fremd ausgestellten Proof als eigenen.
+- Produces: `CodexTaskAuthorityFactory.prepare({key: TaskRunKey, proof: TaskRouteProof, signal: AbortSignal}): Promise<CodexTaskLease>`; `CodexTaskLease {authority: CodexManagedTurnAuthority; profileLease: CodexTaskProfileLease; release(): Promise<void>}` kernprivat und authentisch.
+- Produces: `CodexTaskFactory implements CodexTaskFactoryPort` constructor `{appHome: string; baseConfig: OrcodeConfigWithBudget; routes: TaskRoutePort; auth: CodexSubscriptionAuthCoordinator; authorities: CodexTaskAuthorityFactory; results: TaskResultStore}`, `.create({key: TaskRunKey, workspace: TaskWorkspace, task: string, proof: TaskRouteProof, approvals: ApprovalManager, signal: AbortSignal}): Promise<TaskAgentInstance>`.
+- Produces: `prepareCodexTaskExecution({workspace: TaskWorkspace, lease: CodexTaskLease, approvals: ApprovalManager, journal: ChangeJournal}): Promise<PreparedCodexExecution>` und `runCodexTaskTurn({key: TaskRunKey, session: SessionStore, workspace: TaskWorkspace, lease: CodexTaskLease, approvals: ApprovalManager, journal: ChangeJournal, task: string, observer: AgentRunObserver, results: TaskResultStore}): Promise<AgentRunResult>` ohne Original-Publication.
+
+`CodexManagedTurnAuthority` und `PreparedCodexExecution` bleiben ihre vorhandenen Kern-Typen. Neue Task-Leases werden nur in diesem Codex-Pfad ausgegeben und vor nativer Ausführung konsumiert. Keine GUI-/Config-Daten dürfen diese Klassen-/WeakMap-Gates durch strukturell ähnliche Objekte ersetzen.
+
+**Aktuell verifizierte Grenzen:** `currentExecutionAuthority()` setzt die globale Default-Route voraus und schließt den gemeinsam gehaltenen Profilclient vor Erneuerung. `runCodexManagedTurn()` ruft nach Abschluss `operation.publishApproved()` auf; der Fehlerpfad der Freigabebrücke löscht Staging. Diese drei Wege dürfen für Task-Agenten nicht unverändert auf das Original oder andere aktive Läufe angewendet werden. Ein Task-Workspace liegt bereits unter App-Home: ihn dem alten Copy-Constructor als „Originalprojekt“ zu übergeben würde außerdem dessen Disjoint-Tree-Schutz verletzen. Nicht diesen Schutz abschalten, sondern die authentische bereits geprüfte Kopie über den neuen Task-Origin binden.
+
+- [ ] **1. Drei unabhängige Children und exakte Modellpayloads rot testen.** Den existierenden test-only JSONL-Transport/Harness aus `tests/fixtures/codex-app-server-harness.mjs` wiederverwenden. `tests/fixtures/codex-task-fixture.ts` erzeugt ausschließlich Temp-Homes, Fake-Credentials, reale neue Factory-/AppServerClient-/RouteGate-Instanzen und drei unabhängig steuerbare Transports. Sein Testvertrag lautet:
+
+```ts
+interface CodexTaskFixture {
+  prepare(model: string, key: TaskRunKey): Promise<CodexTaskLease>;
+  threadsStarted(): readonly { childGeneration: number; model: string; cwd: string }[];
+  startFixtureTurn(lease: CodexTaskLease): Promise<void>;
+  stopFixtureTurn(lease: CodexTaskLease): Promise<void>;
+  isAlive(lease: CodexTaskLease): boolean;
+  dispose(): Promise<void>;
+}
+export function createCodexTaskFixture(): Promise<CodexTaskFixture>;
+```
+
+Der Fixture-Helper übergibt den tatsächlichen Start-/Interrupt-/Drain-Pfad und injiziert nur Codex-JSONL-Antworten und native Provenance-Doubles. Er ersetzt keine Factory durch Karten-/Promise-Dummies.
+
+```ts
+test("three Codex task children use the exact manually selected models", async () => {
+  const f = await createCodexTaskFixture();
+  const keys = ["a", "b", "c"].map(agentId =>
+    ({ projectId: "p", agentId, runId: `run-${agentId}` }));
+  const leases = await Promise.all(keys.map((key, index) =>
+    f.prepare(`fixture/codex-${index}`, key)));
+  await Promise.all(leases.map(lease => f.startFixtureTurn(lease)));
+  const starts = f.threadsStarted();
+  assert.deepEqual(starts.map(s => s.model).sort(),
+    ["fixture/codex-0", "fixture/codex-1", "fixture/codex-2"]);
+  assert.equal(new Set(starts.map(s => s.childGeneration)).size, 3);
+  assert.equal(new Set(starts.map(s => s.cwd)).size, 3);
+  await f.stopFixtureTurn(leases[0]!);
+  assert.equal(f.isAlive(leases[0]!), false);
+  assert.equal(f.isAlive(leases[1]!), true);
+  assert.equal(f.isAlive(leases[2]!), true);
+  await f.dispose();
+});
+```
+
+Default-Route, Hauptchat-Session-ID und dessen Client-Drain-Zähler vor/nach dem Test vergleichen: unverändert, null Drains. Zwei unterschiedliche Modelle aus derselben Aboverbindung müssen auswählbar bleiben; auch dreimal dasselbe ausdrücklich gewählte Modell ist zulässig.
+
+- [ ] **2. Auth-/Limit-/Privacy-Fehler rot testen.** Quelle ist genau ein retained ChatGPT-Profil. Drei gleichzeitige Refresh-Anforderungen ergeben einen serialisierten Auth-Owner-Refresh, während die Inferenz-Transports weiterhin parallel sind. Token für ein anderes Konto, Konto-/Planwechsel während Renewal, stale lease, falsche Childgeneration, API-Key-Auth und versehentlicher fremder Profilpfad werden vor `turn/start` verweigert. Bei Limit/401/fehlendem Modell keine andere Modell-ID, keine zweite Aboverbindung, keine API-Key-Verwendung, keine Credit-/Reset-Aktivierung. Canary-Access-/Refresh-Tokens, raw accountId, source/run-profile path und private Fingerprints dürfen in GUI, Session-/Runlogs und ResultStore nicht auftauchen.
+- [ ] **3. Rot ausführen.** Mit dem seit Task 1 aktiven isolierten Home: `env -u FORCE_COLOR node --import tsx --test tests/task-agent-codex-auth.test.ts tests/task-agent-codex-authority.test.ts tests/task-agent-codex.test.ts tests/task-agent-factory.test.ts`. Erwartet: fehlende Codex-Task-Module und fehlender nativer Task-Origin, keine reale Login-/Provideranfrage.
+- [ ] **4. Einen privaten Auth-Owner statt drei konkurrierender Refresh-Token-Kopien implementieren.** Coordinator validiert retained Profile/Directory-Claims und aktuelle Connection/Realm. Er nutzt einen eigenen vertrauensgeprüften nativen Auth-Owner, serialisiert `account/read` mit expliziter Renewal und liest anschließend ausschließlich dessen offiziell erzeugten, stabil geprüften Authstand in einer privaten Callback-Lane. Keine Authdatei des globalen `~/.codex`, keine Refreshtokens in Task-Kopien, keine frei übergebbare Token-/Account-ID-Konfiguration. Vor Ausgabe jeder Lease erneute owner/account/plan/state-Prüfung. Geänderte Eigentümerschaft widerruft betroffene Leases; eine reine gültige Erneuerung desselben Accounts gibt neue ephemere Autorität aus, ohne Default-Route/ProviderState zu publizieren.
+
+Jeder Task erstellt mit `createCodexHome({appHome, accountLabel})` ein eigenes privates Laufzeitprofil. Der Task-Child erhält den offiziellen `chatgptAuthTokens`-Login über die **private** Lane, nachdem sein authentischer Task-Startmodus `experimentalApi` ausgehandelt hat. Das ist kein öffentlicher `allowExperimental`-Schalter. Die native Quelle bleibt alleiniger Refresh-Owner; private run-Homes enthalten keinen gemeinsam verwendeten Refresh-Token. Refresh-Serverrequests werden nur für den gebundenen Child/Account angenommen und durch denselben Coordinator bedient. Taskstop löst nur seine Lease, niemals Logout des Quellprofils aus.
+
+Ein alter Main-Codex-Lauf und der Task-Auth-Owner dürfen für dasselbe Profil nicht gleichzeitig Renewal besitzen. `acquire` verweigert einen bereits aktiven alten Mainlauf, statt ihn zu schließen. Während Task-Leases aktiv sind, `currentExecutionAuthority()` des Legacy-Mainpfads mit einem verständlichen Hinweis auf „Agent starten“ schützen. Idle-Hauptchat, dessen Modellpräferenz und gespeicherte Unterhaltung bleiben erhalten. Lesende Statusansichten beziehen den Auth-/Limitstand über den Coordinator, statt einen zweiten Renewal-Schreiber zu öffnen.
+
+- [ ] **5. Eigene native Children, Gate und Modellkatalog implementieren.** `CodexTaskAuthorityFactory` verwendet die bestehenden signierten Payload-/Launchprüfungen, erzeugt aber pro Task einen neuen `CodexAppServerClient`, eine eigene Childgeneration und einen eigenen `CodexRouteGate`. Niemals `providerRuntime.codexRouteAuthority()` oder globales `currentExecutionAuthority()` für Taskdispatch aufrufen. Gate prüft den unveränderten logischen Quellprofil-/Accountfingerprint plus den authentischen Task-Lease, der den separaten Laufzeit-Home und Child bindet. `chatgptAuthTokens` darf nur mit genau dieser WeakMap-Autorität angenommen werden; der bisherige Legacy-Gate akzeptiert weiterhin ausschließlich seinen bisherigen `chatgpt`-Pfad. Gefälschte Lease-Objekte, API-Auth und falsch zugeordnete Homes bleiben abgelehnt.
+
+`CodexTaskCatalog` liest alle sichtbaren `model/list`-Seiten aus dem verbundenen Profil, zeigt dessen echte Namen/IDs und macht keine automatische Auswahl. Auswahlhandle bindet Katalogdigest, Quellprofil, Account, State-Epoch und ausdrücklich ausgewählte Modell-ID. Keine Bindung an globales `defaultRoute`. `thread/start` und `turn/start` bekommen dasselbe exakt ausgewählte Modell; gemeldete Substitution verweigern. Ein Katalogeintrag wird nicht als Entitlement-Beweis angezeigt. Das native Account-/Modell-/Limit-Gate wird direkt vor dem physischen Dispatch erneut geprüft.
+
+Die vorhandene Payload-Policy ist derzeit exakt auf `codex-cli 0.142.5` gepinnt. Den tatsächlich vorgesehenen signierten Payload, dessen Schemas, Authmodus und Task-Methoden gegen die Fixture-/Trust-Suite prüfen. Falls dieser geprüfte Payload den nötigen Modus nicht unterstützt, in diesem Paket eine konkrete getestete offizielle Version samt Package-/Payload-Provenance in der bestehenden Policy festlegen. Team-ID, Mach-O-/Digest-/Package-/Pfadprüfungen erhalten; unbekannte oder nur behauptet aktuelle Versionen bleiben verweigert. Keine Installation/kein Download als Nebenwirkung der Planänderung. Der Codex-Adapter muss das Kompatibilitätsgate bestehen, sonst ist V1 nicht fertig — er wird nicht stillschweigend herausgenommen.
+
+- [ ] **6. Native Vorbereitung an die bereits geprüfte Task-Kopie binden.** `prepareCodexTaskExecution` erhält nicht einen beliebigen Pfad, sondern authentischen `TaskWorkspace` und `CodexTaskLease`. Gemeinsame authorityfreie Snapshotdaten aus Task 2 verwenden und eine eigene native Task-Staging-Autorität mit Quellprojektidentität, baselineDigest, Copy-Directory-Claim, Child, Thread und Modell ausgeben. Der bestehende Main-`prepareCodexExecution` und sein Disjoint-Tree-Schutz bleiben erhalten. Native Sandbox-/Approval-/Operation-Gates bleiben aktiv; Coding-/Shell-Effekte dürfen weder Original noch Geschwisterkopien als normalen Workspace besitzen.
+
+Die Task-Origin-Retentionsautorität ist ebenfalls ein privater WeakMap-Handle. Native Erfolgs-, Abbruch- und Verletzungsbereinigung drainen erst den **eigenen** Child. `discard` des Task-Origin löscht danach nicht physisch vor dem ResultStore-Commit; bei Protokollverletzung bleibt die Kopie privat und inert für Diagnose erhalten. Der Legacy-Origin behält seine bisherigen Cleanupregeln. Ein unbekannter/nicht genehmigter Effekt führt zu failed/unverified und gesperrtem Apply, nicht zu einer neuen „allow unknown effects“-Option.
+
+Der gemeinsame TaskWorkspace-WeakMap-Record wird bei nativer Vorbereitung als Codex-Origin gebunden. `captureTaskResult` verlangt für diesen Origin eine authentische, gefrorene native Completion-/Partial-Capture-Receipt mit exact key, baselineDigest und vollständigen genehmigten Effektdigests. Ein Protokollverletzungspfad stellt diese Receipt nicht aus. Dadurch kann der Manager einen gescheiterten nativen Capture nicht durch einen neutralen SDK-Capture „reparieren“. Die Receipt selbst bleibt prozesslokal; verifizierte Trace-/Snapshot-Digests werden mit dem vollständigen StoredResult dauerhaft gespeichert, ohne Authdaten. Ein Verifierfehler in einem ansonsten vollständig nachgewiesenen Diff ist davon verschieden und bleibt sichtbar als Prüfstatus.
+
+- [ ] **7. Capture-only-Runwrapper und Nachrichten implementieren.**
+
+```ts
+const session = SessionStore.create(workspace.canonicalPath, appHome, task);
+const resolved = routes.read(proof);
+const config = createTaskConfig(baseConfig, resolved.route.requestedModelId);
+const journal = new ChangeJournal({ appHome, chatId: session.data.id });
+session.setPreferences(resolved.route.requestedModelId, getReasoningSetting(config), resolved.route);
+await session.save();
+const lease = await authorities.prepare({ key, proof, signal });
+return {
+  run: (observer: AgentRunObserver) => runCodexTaskTurn({ key, session, workspace,
+    lease, approvals, journal, task, observer, results }),
+  send: (text: string) => sendCodexTaskMessage(lease, text),
+  close: () => lease.release(),
+  subscriptionUsage: () => auth.usage(lease.profileLease),
+};
+```
+
+`baseConfig` und `auth: CodexSubscriptionAuthCoordinator` sind explizite Factory-Abhängigkeiten; Journaloptionen sind die vorhandenen `appHome` und `chatId`. `sendCodexTaskMessage(lease: CodexTaskLease, text: string): Promise<"sent" | "queued">` bleibt privat in `codex.ts`. Vor Threadstart queued, bei aktiver Operation über guarded `turn/steer` mit exact threadId/expectedTurnId senden und die bestätigte Turn-ID prüfen. Ein terminaler oder fremder Scope scheitert; keine Nachricht automatisch als neue Aufgabe starten. Factories schützen Fehler nach `.prepare()` mit idempotentem Lease-Release; ein fehlgeschlagenes `create` hinterlässt weder Child noch Auth-Besitz.
+
+`usage` liest nur den echten Account-RateLimitstand und projiziert ihn als gemeinsamen Accountstand. Fehlende/unklare Werte sind null/unknown, nicht 0; Zeitpunkt und Prozent werden nicht zwischen verschiedenen Konten gemischt. Alle Views desselben Aboaccounts erhalten denselben `accountHandle` und den Hinweis „gemeinsames Kontingent“. Keine Rate-limit-reset-/Credit-/Email-Operation automatisch aufrufen. Fehlender Price-/Costnachweis bleibt trotz vorhandenem Limitstand `cost.kind === "unknown"`.
+
+`runCodexTaskTurn` nutzt `startCodexTurn`, native Notification-/Approval-Bridge und Session-/Runlog-Projektionen des bestehenden `codex-session.ts` als Vorlage. Eigene IDs sind Pflicht. Bei erfolgreichem korreliertem Terminal `completeAndDrain()` ausführen, vollständigen finalen Diff gegen die Ausgangsaufnahme und tatsächlich genehmigte native Effektkette prüfen und `TaskStoredResult` dauerhaft sichern. **Kein** `operation.publishApproved`, **kein** `publishExactStagedEffects`, **kein** Originalprojekt-Write. Wiederholte zulässige Änderungen derselben Textdatei ergeben einen exakt nachgewiesenen finalen Effekt; unprotokollierte zusätzliche Änderungen scheitern. Task 5 stellt die separate neue Apply-Freigabe aus. Abbruch/Fehler sichern zulässige Teilbytes und sichere Hinweise nach nachgewiesenem Drain; unsicher prüfbare Kopien bleiben privat, niemals applyfähig. `AgentRunResult.costKnowledge` ist `unknown`, ausgewähltes und tatsächlich bestätigtes Modell bleiben exakt.
+
+- [ ] **8. Capture-/Stop-/Refresh-/Modelltests grün prüfen.** Fake-Child schreibt in seine Kopie und endet: Original ist bytegleich, ResultStore enthält finalen Diff, keine Publisheraufrufe. Stop A während Ask/Tool lässt B/C weiterstreamen; spät eintreffende A-Frames und Antworten bleiben inert. Zwei genehmigte Änderungen an derselben Datei, zusätzliche heimliche Datei, store-save failure, Abbruch zwischen Terminal und Result-Commit, fehlgeschlagener Drain und Neustart jeweils testen. Der Auth-Owner wird erst nach letzter Lease freigegeben; Release ist idempotent. Alten Mainpfad und vorhandene Codex-Trust-/Profile-/Gate-/Execution-/Approval-/Session-Tests zusätzlich ausführen. Commit ausschließlich dieses Paket: `feat(agents): run manually selected Codex subscription tasks in parallel`.
 
 ### Task 4: Drei echte unabhängige Läufe und eigene Freigaben verwalten
 
@@ -476,18 +617,34 @@ export class TaskAgentSlots {
 ```
 
 Jeder Managerlauf erzeugt **einen neuen** `ApprovalManager` mit Task-Kopien-Workspace und eigenem PromptHandler. Queue beantwortet nur das vollständige Tuple plus aktuelle Ask-ID; ein Ask kann einmal konsumiert werden. Stop/Abort löst ausschließlich die Asks dieses Laufs ablehnend auf. Status `waiting-approval` wird aus seiner eigenen Queue abgeleitet, niemals aus dem Hauptchat-AskQueue.
-- [ ] **4. Startreihenfolge und Statuspersistenz implementieren.** Synchronously Slot und Project-Gate reservieren → typisierten Startdatensatz dauerhaft speichern → Proof prüfen → Snapshot aufnehmen → Proof erneut prüfen → Factory erzeugen → `.run({signal, interjections, onEvent, onText, onStatus})` starten. `start()` wartet nicht auf den kompletten Lauf. Jede Instance besitzt Controller, `InterjectionQueue`, Settlement-Promise und Listener. `onText`/`onStatus` in vorhandene AgentRunEvent-Formen projizieren; doppelte Textevents vermeiden. `run-start` erfasst die interne Run-ID. Fehler-/Abbruchpfad sichert zulässige Teilergebnisse vor Freigabe der Reservierungen. Ein fehlgeschlagener Store-Commit bleibt sichtbarer Fehler, kein angeblich fertiges Ergebnis.
+- [ ] **4. Startreihenfolge und Statuspersistenz implementieren.** Synchronously Slot und Project-Gate reservieren → typisierten Startdatensatz dauerhaft speichern → Proof prüfen → Snapshot aufnehmen → Proof erneut prüfen → Factory erzeugen → `.run({signal, onEvent, onText, onStatus})` starten. `start()` wartet nicht auf den kompletten Lauf. Jeder Managerlauf besitzt Controller, Settlement-Promise und Listener; seine Instance besitzt die adapterspezifische Nachrichtenschlange. `onText`/`onStatus` in vorhandene AgentRunEvent-Formen projizieren; doppelte Textevents vermeiden. `run-start` erfasst die interne Run-ID. Fehler-/Abbruchpfad sichert zulässige Teilergebnisse vor Freigabe der Reservierungen. Ein fehlgeschlagener Store-Commit bleibt sichtbarer Fehler, kein angeblich fertiges Ergebnis.
 
 ```ts
 // After synchronous reservation and durable starting view:
 const workspace = await createTaskWorkspace({ project, key, signal: controller.signal });
 await routes.assertCurrent(proof);
-const instance = await factory.create({ key, workspace, task, proof, approvals });
-const settled = instance.run({ signal: controller.signal, interjections, onEvent });
+const instance = await factory.create({ key, workspace, task, proof, approvals,
+  signal: controller.signal });
+const settled = instance.run({ signal: controller.signal, onEvent });
 // Store settled with this key immediately, before returning the starting view.
 ```
 
-`project: ProjectBinding`, `key: TaskRunKey`, `controller: AbortController`, `interjections: InterjectionQueue` und `approvals: ApprovalManager` werden neu im Start erzeugt. `onEvent` ist der tuplegebundene Callback des Managers. Abbruch während Factory-Erzeugung wird direkt vor `instance.run` nochmals geprüft; dann darf kein Providerrequest beginnen.
+`project: ProjectBinding`, `key: TaskRunKey`, `controller: AbortController` und `approvals: ApprovalManager` werden neu im Start erzeugt. `onEvent` ist der tuplegebundene Callback des Managers. Die Nachrichtenschlange gehört dem Adapter, damit Codex gezielt `turn/steer` statt einer unbeobachteten SDK-Queue verwenden kann. Abbruch während Factory-Erzeugung wird direkt vor `instance.run` nochmals geprüft; dann darf kein Providerrequest beginnen. `.message()` delegiert an `instance.send(text)` des exakten laufenden Tuples. Nach Ergebnissicherung `instance.close()` einmal aufrufen; auch Factory-Fehler lösen ausschließlich ihren eigenen Lease.
+
+Codex muss schon vor nativer Cleanup-Übergabe sichern. Der Manager übernimmt deshalb ein vorhandenes, vollständig verifiziertes Ergebnis, statt es nach gelöschter nativer Staging-Autorität nochmals aufzunehmen:
+
+```ts
+const captured = await results.tryRead(key);
+if (captured === null) {
+  await results.save(await captureTaskResult(workspace, verification));
+} else if (captured.baselineDigest !== workspace.baselineDigest
+  || captured.key.projectId !== key.projectId || captured.key.agentId !== key.agentId
+  || captured.key.runId !== key.runId) {
+  throw new Error("Task result does not belong to this run snapshot.");
+}
+```
+
+`verification: TaskResultView["verification"]` bleibt `unverified`, solange kein strukturierter erfolgreicher Verifierlauf bewiesen ist; ein Modelltext „Tests bestanden“ genügt nicht. Optionalen `instance.subscriptionUsage()`-Stand sicher in die View übernehmen, ohne Kostenkenntnis daraus abzuleiten. Result-Store-Schreibfehler sind keine Capture-Erlaubnis über einen korrupten Datensatz; `tryRead` wirft dann. SDK-Capture ist der null-Zweig, Codex-Completion erzeugt den vorab gespeicherten Datensatz. Cleanup darf erst nach dieser Bestätigung physisch entfernen.
 - [ ] **5. Stop- und Shutdown-Verhalten implementieren.**
 
 ```ts
@@ -497,7 +654,7 @@ approvalQueue.close(owned.key);
 await owned.settled;
 ```
 
-Der vorhandene Coding-Tool-Signalpfad beendet detached Prozessgruppen mit TERM/KILL; kein zweites PID-kill-System bauen. Für `shutdown` alle Controller zuerst abbrechen, dann Asks schließen, danach alle Settlement-Promises mit insgesamt 5.000 ms Drain-Budget beobachten. Nicht erledigte Identitäten melden; Projektwechsel bleibt solange gesperrt. `AgentRunError.result` auch beim Abbruch sichern, Kostenkenntnis erhalten und unbekannte Teilkosten nicht als null ausgeben. Bei Recovery nichtterminal gespeicherte Läufe zu `interrupted` ändern, niemals Factory/Provider aufrufen. `.message()` nutzt ausschließlich die InterjectionQueue eines laufenden exakten Tuples; ein terminaler Lauf erfordert einen ausdrücklich neuen Start.
+Der vorhandene Coding-Tool-Signalpfad beendet detached Prozessgruppen mit TERM/KILL; Codex nutzt seine eigene native Operation-/Child-Drain-Kette aus Task 3B. Kein zweites PID-kill-System bauen. Für `shutdown` alle Controller zuerst abbrechen, dann Asks schließen, danach alle Settlement-Promises mit insgesamt 5.000 ms Drain-Budget beobachten. Nicht erledigte Identitäten melden; Projektwechsel bleibt solange gesperrt. `AgentRunError.result` auch beim Abbruch sichern, Kostenkenntnis erhalten und unbekannte Teilkosten nicht als null ausgeben. Bei Recovery nichtterminal gespeicherte Läufe zu `interrupted` ändern, niemals Factory/Provider aufrufen. Ein terminaler Lauf erfordert für neue Nachrichten einen ausdrücklich neuen Start.
 - [ ] **6. Grün und Prozessverhalten prüfen.** Obige Tests plus `tests/workspace.test.ts`. Ein Fixture-Shellprozess je Agent; Stop A beendet A, B und C bleiben lebend. Listenerzahl nach drei Abschlüssen ist wieder Ausgangswert. Fortgesetzte Nachricht an B landet nicht in A. Commit: `feat(agents): manage three isolated task lifecycles`.
 
 ### Task 5: Ergebnisse gesondert freigeben und sicher übernehmen
@@ -609,7 +766,7 @@ test("no model is selected automatically", () => {
 });
 ```
 
-Ein Runnable-Route-Fixture aus dem vorhandenen Route-Picker-Testhelper hinzufügen: Aufgabe plus **ausdrücklich gewählte** gültige Selection ergibt true; disabled/stale/foreign candidate ergibt false. Dialogöffnung und Overview-Klick rufen weder `onboarding.dispatch` noch `agents.start` noch `/cross` auf. No-tools/Kimi/Codex-Gründe erscheinen als verständliche Zeile, ohne Ersatzmodell vorzuzeigen.
+Ein Runnable-Route-Fixture aus dem vorhandenen Route-Picker-Testhelper hinzufügen: Aufgabe plus **ausdrücklich gewählte** gültige Selection ergibt true; disabled/stale/foreign candidate ergibt false. Dialogöffnung und Overview-Klick rufen weder `onboarding.dispatch` noch `agents.start` noch `/cross` auf. Codex mit verbundenem Abo und Task-Runtime ist wählbar; fehlender Login, Modellzugang und Updatebedarf erscheinen konkret. No-tools-/Kimi-Gründe bleiben verständliche Zeilen, ohne Ersatzmodell vorzuzeigen. Codex zeigt „ChatGPT-Abo · gemeinsames Kontingent“, nicht API-PAYG und keine erfundene Restmenge pro Agent.
 - [ ] **2. Sequenz- und View-Test schreiben.** Store mit Snapshots A und B öffnen; A/2 empfangen während B sichtbar ist. Nur `store.model(a)` ändert sich; B bleibt bytegleich. A/2 erneut ergibt duplicate; fehlende A/3 vor A/4 ergibt resync und **kein** partiell gerenderter A/4-Text. Neuer Lauf mit gleichem Anzeigenamen kann keine alten Tuple-Frames konsumieren. Ein voll abgeschlossener Snapshot wird atomar eingesetzt, anschließend gepufferte Events oberhalb High-Water anwenden.
 - [ ] **3. Rot ausführen.** `npm --prefix gui test -- agent-state.test.ts agent-start.test.ts agent-view.test.ts sidebar.test.ts`.
 - [ ] **4. Getrennten reinen Ansichtsspeicher implementieren.** Die bestehende globale Hauptchat-Instanz behalten; Agenten erhalten eine Map von `JSON.stringify([projectId, agentId, runId])` zu eigenem `ChatModel`, eigenem lastSequence und Ask-Liste. Kein Hauptchat-Sessionwechsel beim Agentenwechsel. Nicht registrierte Tuples verweigern. Der Store projiziert Task-AgentRunEvents auf die vorhandenen ChatModel-Run-Komponenten über einen kleinen Adapter; Core-Instanzen/Proofs bleiben außerhalb der GUI.
@@ -649,13 +806,13 @@ Candidate- und Selection-Epoch werden vom aktuellen RoutePickerView gehalten; ne
 **Interfaces:**
 
 - Consumes: vorherige ProjectPort/Manager/Apply/Routes und alle Protokollhandler.
-- Produces: `TaskAgentServices {projects: ProjectPort; routes: TaskRoutePort; manager: TaskAgentManager; apply: TaskApplyService; asks: TaskAskRouter}` als optionaler expliziter GUI-Session-Composition-Port.
+- Produces: `TaskAgentServices {projects: ProjectPort; routes: TaskRoutePort; manager: TaskAgentManager; apply: TaskApplyService; asks: TaskAskRouter; codexAuth: CodexSubscriptionAuthCoordinator}` als optionaler expliziter GUI-Session-Composition-Port. Wenn der Desktop Agenten unterstützt, müssen Factory und Composition den Codex-Pflichtadapter besitzen; optional bedeutet hier nur Legacy-Surface ohne Agentenfeature.
 - Produces: `switchProjectAfterStop({intent: ProjectOpenIntent, confirmedStopAll: boolean}, services: TaskAgentServices): Promise<ProjectView>`; `assertProviderMutationAllowed(manager: TaskAgentManager): void`.
 
 - [ ] **1. Review-Focus 2 und sichere Interlocks rot testen.** Projektpicker geöffnet → Agent beginnt → Picker antwortet: `project.open` liefert busy, kein ReRoot. Picker geöffnet → Engine ersetzt: native Callback liefert `engine-restarted`, kein GUI-Request an Ersatzengine. Projektwechsel mit Stop-all-Abbruch lässt alles unverändert. Bestätigter Wechsel wartet auf Prozess- und Ask-Settlement; ein drain timeout lässt ursprüngliches Projekt aktiv. Ein in Apply wartender zweiter Job blockiert Wechsel ebenfalls.
-- [ ] **2. Provider-/Command-Schlupflöcher testen.** Während starting/running/waiting-approval/stopping sind connect, logout, account/billing switch und Credentials-Löschung gesperrt; reine Settings-/Catalog-Lektüre funktioniert. Auch Hauptchat-Slash/Onboarding-Pfade dürfen diese Sperre nicht umgehen. Normale Hauptchat-Modellwahl und Cross ändern keine Task-Modelle; konflikthafte globale Provider-State-Mutation bleibt gesperrt. Auch `/folder` und Fremdchat-Öffnung können das Project-Gate nicht umgehen. Aktiver Main-/Cross-/Architect-Lauf blockiert ReRoot zusätzlich zu Task-Agenten.
+- [ ] **2. Provider-/Command-Schlupflöcher testen.** Während starting/running/waiting-approval/stopping sind connect, logout, account/billing switch und Credentials-Löschung gesperrt; reine Settings-/Catalog-Lektüre funktioniert. Auch Hauptchat-Slash/Onboarding-Pfade dürfen diese Sperre nicht umgehen. Normale Hauptchat-Modellwahl und Cross ändern keine Task-Modelle; konflikthafte globale Provider-State-Mutation bleibt gesperrt. Codex-Legacy-Main und Task-Auth-Owner dürfen für denselben Profil-Refresh nicht gleichzeitig Besitzer sein; ein laufender Main wird nicht gestoppt und ein neuer Legacy-Lauf umgeht weder Auth-Gate noch Drei-Agenten-Grenze. Der Hinweis bietet den manuellen Agentenstart an, keine automatische Umleitung. Auch `/folder` und Fremdchat-Öffnung können das Project-Gate nicht umgehen. Aktiver Main-/Cross-/Architect-Lauf blockiert ReRoot zusätzlich zu Task-Agenten.
 - [ ] **3. Rot ausführen.** `env -u FORCE_COLOR node --import tsx --test tests/task-agent-composition.test.ts tests/gui-server-protocol.test.ts tests/settings-controller.test.ts`; GUI-Project-open-Test.
-- [ ] **4. Ports einmal in CLI zusammensetzen.** Die bestehenden Providerinstanzen/Authority und das explizite App-Home als Abhängigkeiten einspeisen. `runGuiSession` erhält den optionalen `TaskAgentServices`-Port und delegiert an `gui-port.ts`; kein zweiter Manager in `gui-server.ts`. `context.reRootWorkspace` mit Project-Gate verbinden, der weiterhin den bisherigen runtime-cache-reset und Session-Handoff verwendet. Kein `providerRuntime.selectSessionRoute`, keine Default-/Config-Aktivierung im Task-Picker.
+- [ ] **4. Ports einmal in CLI zusammensetzen.** Die bestehenden Providerinstanzen/Authority und das explizite App-Home als Abhängigkeiten einspeisen, plus genau ein CodexSubscriptionAuthCoordinator, CodexTaskCatalog, CodexTaskAuthorityFactory und CodexTaskFactory. Den konkreten CodexTaskFactory-Port zwingend in die TaskAgentFactory injizieren. Ein Compositiontest muss einen Codex-Start aus dem GUI-Port bis zum nativen Fixture-`turn/start` verfolgen; ein versehentlich fehlender Port ist Bootstrap-/Featurefehler, kein stiller Provider-Ausschluss. `agents.routes` wartet auf `routes.refreshView(signal)` und liefert ausschließlich sichere Views. `runGuiSession` delegiert an `gui-port.ts`; kein zweiter Manager in `gui-server.ts`. `context.reRootWorkspace` mit Project-Gate verbinden, der weiterhin den bisherigen runtime-cache-reset und Session-Handoff verwendet. Kein `providerRuntime.selectSessionRoute`, keine Default-/Config-Aktivierung im Task-Picker.
 - [ ] **5. Stop-all-and-switch implementieren.**
 
 ```ts
@@ -682,7 +839,7 @@ Der letzte Schritt bleibt atomar über `ProjectOperationGate.withSwitch`; neue S
 
 **Interfaces:**
 
-- Consumes: echte TaskAgentFactory/OrcodeAgent/Manager/GUI-Ports mit injiziertem SDK-Fetch und Credential-Doubles; keine Fake-Agentenkarten als Laufzeitbeweis.
+- Consumes: echte TaskAgentFactory/OrcodeAgent/CodexTaskFactory/Manager/GUI-Ports mit injiziertem SDK-Fetch, Codex-JSONL-Prozessfixtures und Credential-Doubles; keine Fake-Agentenkarten als Laufzeitbeweis.
 - Produces: `test:task-agents` startet ausschließlich hermetische Tests; die Test-Engine ist nur ein expliziter Fixture-Einstieg unter `tests/fixtures`, nie eine Umgebungsvariable, die den ausgelieferten Providerpfad umschaltet.
 - Fixture-Typ: `FixtureProviderBarrier {entered: Set<string>; release(modelId: string): void; waitForCount(count: number): Promise<void>}`; ankommende SDK-POSTs registrieren exact model und blockieren bis zum expliziten Release. Mock-Fetch lehnt jede nicht fixturedefinierte URL ab.
 
@@ -700,6 +857,7 @@ assert.equal(barrier.entered.size, 3);
 ```
 
 `startA/B/C` sind zuvor mit `manager.start` erzeugte Promises für getrennte Aufgaben und manuell aus Fixture-RoutePickerView gewählte Modelle; `startFourth(): Promise<TaskAgentView>` ist dieselbe Startanforderung mit eigenem requestId. SDK-Antworten erst nach allen drei ankommenden POSTs freigeben. Tool-Follow-up erzeugt echte Textdateiänderung in A-Kopie und einen Ask in B, C streamt weiter. Source-Datei bleibt unverändert. So kann ein serieller Loop nicht fälschlich bestehen.
+- [ ] **2B. Codex und gemischte Provider separat abnehmen.** Drei reale neue CodexTaskFactory-/AppServerClient-Läufe über drei JSONL-Fixture-Kindprozesse starten; deren `turn/start`-Barrier muss drei unterschiedliche Childgenerationen und exakt gewählte Modelle sehen, bevor ein Terminal freigegeben wird. Danach zwei Codex-Tasks mit verschiedenen Modellen plus ein Nano-GPT-Task parallel; vierter Start hat keinen nativen Turn und keinen HTTP-POST. Gleichzeitiger Codex-Ask A/B, `turn/steer` nur B, A-Stop, B/C-Stream und Capture-only ohne Originaländerung prüfen. Account-Ratelimits mit derselben Gruppierungs-ID als geteilt zeigen; unbekannter Stand nicht als 100 % frei oder null Kosten darstellen. Auth-Refresh wird serialisiert, nicht die drei Inferenzläufe. Recovery darf keinen AppServer-Turn von allein starten.
 - [ ] **3. Gesamten Datenpfad und Negativfälle ausführen.** Open/cancel/bad path → zwei Starts → dritter Start → vierter refusal → B ansehen → A-Frame → B-Ask bestätigen → nur A stoppen → B/C abschließen → B-Diff prüfen → ausdrücklich Apply → source bytes prüfen. Danach widersprüchliches C-Result, externes File-Update, Crash, Restart, neuer Apply-Ask, Replay und Undo mit foreign edit. Result-Hashes, Provider-POST-Zähler, Process-PIDs und Log-/View-Canaries als Assertions ausgeben. Keine Testschleife darf ewig warten: Barrier und Drain jeweils Timeout mit Diagnose.
 - [ ] **4. Rot/Grün-Kernlauf und Builds sequenziell prüfen.**
 
@@ -714,12 +872,13 @@ cargo test --manifest-path gui/src-tauri/Cargo.toml
 ```
 
 Build nicht parallel mit Tests betreiben, die `dist` lesen: der vorhandene Build löscht `dist` zuerst. Gesamtsuite separat mit demselben isolierten Guard laufen lassen, Exitcode/Pass/Fail/Skip und konkrete Fehlertitel festhalten. Vorhandene Codex-Trust-/Version-Gates weder lockern noch als neue Agentenregression etikettieren; ein fehlgeschlagener Gate verhindert die Behauptung einer uneingeschränkten Releasefreigabe.
-- [ ] **5. Tatsächliche native App mit Fixture-Engine bedienen.** Erst vorhandenen Desktop-/Engine-Teststartpfad auf seine zugelassenen Fixture-Overrides prüfen und für einen lokalen Debug-Build nutzen; keinen Debugbypass in Release hinzufügen. Native Ordnerauswahl wirklich öffnen, canceln und einen Temp-Projektordner wählen. Zwei Agenten über Buttons mit eigener Modellwahl starten, Ansichten wechseln, Tool-Ask beantworten, A stoppen, B-Ergebnis prüfen und übernehmen. Browser- oder Desktop-Control-Skill vor dem tatsächlichen UI-Test lesen. Native Fenster und Dateiendzustand prüfen; Screenshot allein beweist keinen funktionierenden Provider-/Apply-Pfad. Falls diese Umgebung keine echte native Fixture-App kontrollieren kann, diesen Gate ausdrücklich als ungeprüft ausweisen und nicht als fertig abhaken.
-- [ ] **6. Dokumentation und Abnahme schreiben.** `docs/task-agents.md` erklärt Projektöffnung, drei Plätze, manuelle Auswahl, Original-vs-Kopie, unbekannte Kosten, Stop/Apply/Konflikt, keine Git-Historie in der Kopie und V1-Adaptergrenzen. QA-Datei enthält Version/Revision/Diff-Digest, exakt ausgeführte Befehle, Testzahlen, echte Native-Schritte, pass/fail/unverified und verbliebene Baseline-Gates. Keine Credentials oder private Pfade in Screenshots/Logs publizieren. Commit nur Feature-Dokumentation, Fixture und eigene Hunks: `test(agents): verify parallel desktop task journeys`.
+- [ ] **5. Tatsächliche native App mit Fixture-Engine bedienen.** Erst vorhandenen Desktop-/Engine-Teststartpfad auf seine zugelassenen Fixture-Overrides prüfen und für einen lokalen Debug-Build nutzen; keinen Debugbypass in Release hinzufügen. Native Ordnerauswahl wirklich öffnen, canceln und einen Temp-Projektordner wählen. Im Agentenstart „Codex · ChatGPT-Abo“ wählen, zwei verschiedene Fixture-Modelle ausdrücklich auswählen, zwei Läufe starten und einen dritten Codex-Lauf ergänzen. Ansichten wechseln, Tool-Ask beantworten, A stoppen, B-Ergebnis prüfen und übernehmen. Browser- oder Desktop-Control-Skill vor dem tatsächlichen UI-Test lesen. Native Fenster und Dateiendzustand prüfen; Screenshot allein beweist keinen funktionierenden Provider-/Apply-Pfad. Falls diese Umgebung keine echte native Fixture-App kontrollieren kann, diesen Gate ausdrücklich als ungeprüft ausweisen und nicht als fertig abhaken.
+- [ ] **5B. Echten Abozugang separat belegen.** Ein Testprofil über den echten offiziellen nativen Login und dynamischen Modellkatalog prüfen, getrennt von JSONL-Fixtures. Das echte Eigentümerprofil nie zum hermetischen Testziel machen und dessen Credentials nicht kopieren. Eine tatsächliche Inferenz verbraucht Abo-Kontingent und wird erst nach gesonderter Nutzerfreigabe auf einem ausdrücklich gewählten Modell/Temp-Projekt durchgeführt. Wenn diese Freigabe fehlt, „echte Aboinferenz ungeprüft“ ausweisen, keine erfolgreiche Abofunktion behaupten. Auth-, limit- und Modellabweichungen blockieren diesen Gate; niemals ersatzweise eine OpenAI-API-Inferenz ausführen.
+- [ ] **6. Dokumentation und Abnahme schreiben.** `docs/task-agents.md` erklärt Projektöffnung, drei Plätze, manuelle Codex-/OpenRouter-/Nano-Auswahl, Abo statt API-Key, gemeinsames Accountkontingent, Original-vs-Kopie, unbekannte Kosten, Stop/Apply/Konflikt und keine Git-Historie in der Kopie. Kimi bleibt die ausgewiesene spätere Adaptergrenze. QA-Datei enthält Version/Revision/Diff-Digest, exakt ausgeführte Befehle, Testzahlen, echte Native-Schritte, getrennte Fixture-/Abo-Evidenz, pass/fail/unverified und verbliebene Baseline-Gates. Codex darf nicht als optionaler Baseline-Fehler herausgerechnet werden. Keine Credentials oder private Pfade in Screenshots/Logs publizieren. Commit nur Feature-Dokumentation, Fixture und eigene Hunks: `test(agents): verify parallel desktop task journeys`.
 
 ## Planprüfung und Ausführungshandoff
 
-Zuordnung des freigegebenen Designs: Bedienablauf/Projektöffnung → 1/7/8; Snapshot/Ausschlüsse → 2; private manuelle Providerbindung → 3; drei Läufe/Stop/Crash → 4/8; Ergebnisse/Approve/Apply/Rollback/Undo → 2/5; Protokoll/Privacy/Replay → 6; echte GUI- und Engine-Abnahme → 9. Alle fünf Review-Focus-Fälle besitzen oben einen benannten Test.
+Zuordnung des Designs einschließlich der angeforderten Ergänzung: Bedienablauf/Projektöffnung → 1/7/8; Snapshot/Ausschlüsse → 2; private manuelle Providerbindung → 3; Codex-Abo, eigene Children, Auth-Koordination und Capture-only → 3B; drei Läufe/Stop/Crash → 4/8; Ergebnisse/Approve/Apply/Rollback/Undo → 2/5; Protokoll/Privacy/Replay → 6; echte GUI-, SDK- und Codex-Engine-Abnahme → 9. Alle fünf Review-Focus-Fälle besitzen oben einen benannten Test. Ohne Codex-Task-Gates ist dieser V1-Umfang nicht abgeschlossen.
 
 Ausführungsoptionen nach Planreview:
 

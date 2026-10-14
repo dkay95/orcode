@@ -1,12 +1,14 @@
 # orcode Projekte und parallele Agenten
 
-Entwurf zur Freigabe vom 14. Oktober 2026.
+Design vom 14. Oktober 2026. Ergänzung auf Nutzerwunsch: Codex-Abonnement
+gehört zur ersten Ausbaustufe; der ergänzte Plan bleibt vor Umsetzung zu prüfen.
 
 ## Ziel und vereinbarter Umfang
 
 orcode soll eine einfach bedienbare lokale Coding-GUI sein. Der Nutzer öffnet
 ein Projekt, vergibt mehrere Aufgaben und wählt für jeden Agenten selbst ein
-Modell. Die Agenten arbeiten parallel am selben logischen Projekt und haben
+Modell, einschließlich der über sein Codex-Abonnement verfügbaren Modelle.
+Die Agenten arbeiten parallel am selben logischen Projekt und haben
 eigene Ansichten für Chat, Fortschritt, Freigaben und Änderungen. Normale
 Bedienung verlangt keine Slash-Befehle.
 
@@ -119,8 +121,10 @@ Geltungsbereich. Die bestehenden Codex-Prüfungen bleiben erhalten.
 ## Agentenlaufzeit und Modellbindung
 
 Ein neuer `TaskAgentFactory` erzeugt aus Projekt, Aufgabe und einem gültigen
-Route-Handle einen unabhängigen Agenten. Er nutzt `OrcodeAgent.create()` mit
-eigenem `SessionStore`, `ApprovalManager`, Konfigurationsklon, Journal,
+Route-Handle einen unabhängigen Agenten. OpenRouter und Nano-GPT nutzen
+`OrcodeAgent.create()`; Codex nutzt einen eigenen Managed-Task-Adapter über den
+offiziellen App Server, nicht den OpenRouter-SDK-Pfad. Jeder Adapter besitzt
+einen eigenen `SessionStore`, `ApprovalManager`, Konfigurationsklon, Journal,
 Arbeitsverzeichnis und Abbruchsignal. Ein Manager begrenzt Parallelität und
 führt Zustand, Ergebnis und Ereignisse je Agent.
 
@@ -137,12 +141,69 @@ nicht durch ein anderes Modell oder Konto ersetzt. Kontoverbindung, Logout
 und Abrechnungsänderung werden während laufender Task-Agenten gesperrt;
 lesende Einstellungen bleiben verfügbar.
 
-Die Oberfläche bietet nur tatsächlich unterstützte Task-Routen an. OpenRouter
-und Nano-GPT sind die ersten Adapter für diesen Laufzeitpfad. Kimi benötigt
-eigene gültige native Freigaben je Task; Codex benötigt einen entsprechend
-gebundenen Managed-Task-Pfad. Bis diese jeweiligen Voraussetzungen implementiert
-und geprüft sind, erklärt der Agenten-Modellwähler deren Sperre. Es gibt keinen
-Ersatzprovider. Ein sichtbares Modell ist nicht automatisch eine lauffähige Route.
+Codex, OpenRouter und Nano-GPT gehören zur ersten Ausbaustufe. Codex ist kein
+optional auf später verschobener Adapter. Kimi bleibt bis zu eigenen gültigen
+nativen Freigaben je Task mit nachvollziehbarer Erklärung gesperrt. Es gibt
+keinen Ersatzprovider. Ein sichtbares Modell ist nicht automatisch eine
+lauffähige beziehungsweise für dieses Konto freigeschaltete Route.
+
+## Codex Abonnement und unabhängige Task Läufe
+
+Codex-Agenten verwenden den ausdrücklich verbundenen lokalen ChatGPT-Account.
+Sie verlangen keinen OpenAI-API-Key und wechseln bei einem Fehler oder Limit
+nicht auf API-Abrechnung, ein anderes Konto oder ein anderes Modell. Drei
+Codex-Agenten dürfen gleichzeitig mit jeweils manuell gewähltem Modell
+laufen. Gemischte Codex-/OpenRouter-/Nano-GPT-Aufgaben sind ebenfalls möglich;
+das gemeinsame Limit bleibt drei Agenten insgesamt.
+
+Der Modellwähler verwendet den aktuellen Codex-Katalog des verbundenen
+Accounts. Es gibt keine fest codierte Modellliste und keine automatische
+Default-Modellwahl. Ein Katalogeintrag allein beweist keinen Modellzugang;
+eine Ablehnung durch Codex wird sichtbar beim gewählten Modell gemeldet.
+Die native Login-/Modellwahl und das Abo-Verfahren sind im offiziellen
+[Authentifizierungsleitfaden](https://learn.chatgpt.com/docs/auth) und
+[App-Server-Protokoll](https://learn.chatgpt.com/docs/app-server) beschrieben.
+
+Jeder Codex-Task erhält einen eigenen App-Server-Child, eigene Thread-/Turn-IDs,
+einen eigenen Route-Gate und eine eigene Freigabebrücke. Die globale
+`currentExecutionAuthority()`-Methode ist dafür ungeeignet: Sie setzt die
+Default-Route voraus und erneuert beziehungsweise schließt den Hauptclient.
+Task-Abbruch und Drain dürfen diesen Hauptclient oder einen Geschwistertask
+nicht erreichen.
+
+Eine private abonnementgebundene Auth-Koordination besitzt allein die
+Erneuerung des verbundenen Profils. Task-Children erhalten eigene private
+Laufzeit-Homes und nur kurzlebige, exakt accountgebundene Auth-Leases, keine
+Kopien gemeinsam verwendeter Refresh-Tokens. Für diese Children wird der
+offizielle hostverwaltete `chatgptAuthTokens`-Modus ausdrücklich ausgehandelt;
+dieser ist experimentell und erfordert einen geprüften kompatiblen App Server.
+Die bestehenden nicht-taskbezogenen Vertrauensprüfungen bleiben unverändert.
+Neue Task-Freigaben akzeptieren diesen Modus nur mit einer authentischen,
+child- und accountgebundenen Autorität, niemals durch ein öffentliches Flag.
+
+Während Task-Auth-Leases aktiv sind, darf der alte Codex-Hauptlauf denselben
+Profil-Refresh nicht parallel besitzen. Ein bestehender alter Hauptlauf wird
+nicht beendet; der Start weist auf dessen Abschluss hin. Weitere Aufgaben
+werden dann über die Agentenverwaltung gestartet. Die gespeicherte
+Hauptchat-Modellroute bleibt erhalten. So konkurrieren keine unabhängigen
+OAuth-Refresh-Schreiber um das Profil, ohne die drei Task-Läufe zu serialisieren.
+
+Die vorhandene Codex-Ausführung veröffentlicht momentan nach Laufabschluss
+ihre genehmigten Effekte. Der neue Task-Adapter erhält deshalb einen eigenen
+Capture-only-Abschluss: Child und Freigabebrücke erst drainen, sämtliche
+zulässigen Ergebnisbytes dauerhaft sichern, später separat über die Task-
+Übernahme freigeben. Er ruft keinen Originalprojekt-Publisher automatisch auf.
+Auch Abbruch-/Fehlerbereinigung darf die einzige Kopie eines Teilergebnisses
+nicht vorher löschen. Die native Codex-Patchautorität bleibt innerhalb des
+Codex-Tasks; Originalprojekt-Apply bekommt die neue Task-Agent-Autorität.
+
+Alle Codex-Agenten desselben Accounts verbrauchen dessen gemeinsames
+Kontingent. Die GUI zeigt diese gemeinsame Zuordnung und nur tatsächlich
+bekannte Limits beziehungsweise „Limit unbekannt“. Es gibt keine behaupteten
+drei unabhängigen Abokontingente und keine erfundenen Kostenwerte. Limit-
+Resets, zusätzliche Credits und kostenpflichtige Ersatzwege werden nicht
+automatisch aktiviert. Bei Auth-/Limitfehlern bleiben Ergebnisse erhalten;
+Fortsetzen ist eine ausdrückliche neue Aktion.
 
 Jeder Agent erhält eine eigene Freigabewarteschlange. Antworten sind an
 `projectId`, `agentId`, `runId` und `askId` gebunden. Eine Freigabe aus einer
@@ -206,6 +267,15 @@ sind keine automatischen Schritte dieser Designfreigabe.
   gewählten Fixture-Modellen parallel. Das ist ein Laufzeittest, keine bloße
   Agentenkarten-Demo. Ein dritter Agent läuft unabhängig; das Parallelitätslimit
   startet keinen weiteren versteckten Job.
+- Drei Codex-Task-Adapter laufen über unabhängige App-Server-Children und
+  manuell gewählte Fixture-Modelle tatsächlich gleichzeitig; A stoppen oder
+  dessen Freigabe schließen lässt B und C weiterlaufen. Der echte native
+  Codex-Abo-/Modellpfad erhält eine eigene Abnahme; ein Fixture allein belegt
+  keinen echten Abozugang. Eine kostenpflichtige Live-Aufgabe gehört nur nach
+  gesonderter Freigabe zur Abnahme.
+- Codex-Modelle kommen aus dem verbundenen Katalog. Auth-Erneuerung ist
+  serialisiert, Inferenz nicht; accountfremde Tokens, fremde Child-IDs,
+  Modellsubstitution und API-Fallback starten keinen Task.
 - Live-Text, Werkzeugausgaben, Freigaben und Kosten landen ausschließlich beim
   jeweiligen Agenten. Ansichtwechsel und verspätete Frames vermischen sie nicht.
 - Stoppen eines Agenten beendet seine Anfragen, Prozesse und Freigaben, nicht
