@@ -1,0 +1,40 @@
+name: Windows GUI foundation
+
+on:
+  push:
+    branches: [codex/orcode-workbench-2026-10-12]
+    paths:
+      - '.github/workflows/windows-gui.yml'
+      - 'gui/**'
+      - 'scripts/gui*.mjs'
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-gui-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  foundation:
+    name: Native Windows compilation (not desktop acceptance)
+    runs-on: windows-2025
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24.22.0
+          cache: npm
+      - name: Build Core and frontend
+        run: |
+          npm ci
+          npm --prefix gui ci
+          npm run build
+          npm --prefix gui run build
+      - name: Check native shell and test compilation
+        run: |
+          cargo --version
+          cargo check --manifest-path gui/src-tauri/Cargo.toml --locked --target x86_64-pc-windows-msvc --tests
