@@ -1,6 +1,6 @@
 # orcode: native Windows-11-x64-App ohne WSL
 
-Status: Architekturentwurf zur Prüfung, keine implementierte Windows-Unterstützung.
+Status: Architektur am 15.10.2026 mit "Kannst loslegen" freigegeben; Windows-Unterstützung noch nicht implementiert.
 Datum: 15.10.2026.
 
 ## Ziel und bestätigte Vorgaben
@@ -196,7 +196,7 @@ Die vorhandenen Auditwarnungen der Produktionsabhängigkeiten werden vor einem
 
 ## Freigabe und nächster Schritt
 
-Die Zielwahl "native Windows-App ohne WSL" ist bestätigt. Dieser konkrete
-Architekturentwurf muss vor Produktänderungen geprüft werden. Danach folgt der
-datei- und testgenaue Umsetzungsplan. Bis dahin wird nur der vorhandene geprüfte
-Entwicklungsstand auf GitHub gesichert, ohne Main-Merge, Tag oder Release.
+Die Zielwahl und dieser Architekturentwurf sind bestätigt. Der datei- und
+testgenaue [Umsetzungsplan](../plans/2026-10-15-windows-native.md) konkretisiert
+die Plattformgrenzen, Tests und Auslieferungsstufen. Seine Freigabe geht den
+Produktänderungen voraus. Kein Main-Merge, Tag oder Release ist damit verbunden.
