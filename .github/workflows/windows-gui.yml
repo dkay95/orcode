@@ -7,6 +7,8 @@ on:
       - '.github/workflows/windows-gui.yml'
       - 'gui/**'
       - 'scripts/gui*.mjs'
+      - 'src/native-*.ts'
+      - 'tests/native-*.test.ts'
   pull_request:
   workflow_dispatch:
 
@@ -39,4 +41,6 @@ jobs:
           cargo --version
           cargo check --manifest-path gui/src-tauri/Cargo.toml --locked --target x86_64-pc-windows-msvc --tests
       - name: Run shared native contracts and fail-closed Windows tests
-        run: cargo test --manifest-path gui/src-tauri/Cargo.toml --locked --lib --test engine_lifecycle
+        run: cargo test --manifest-path gui/src-tauri/Cargo.toml --locked --lib --test engine_lifecycle --test windows_native
+      - name: Run native protocol contracts
+        run: node --import tsx --test tests/native-owner-bootstrap.test.ts tests/native-sidecar-channel.test.ts tests/native-shell-parent*.test.ts
