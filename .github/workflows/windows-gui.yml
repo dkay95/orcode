@@ -55,9 +55,9 @@ jobs:
           cargo --version
           cargo check --manifest-path gui/src-tauri/Cargo.toml --locked --target x86_64-pc-windows-msvc --tests
       - name: Run shared native contracts and fail-closed Windows tests
-        run: cargo test --manifest-path gui/src-tauri/Cargo.toml --locked --target x86_64-pc-windows-msvc --no-fail-fast --lib --test engine_lifecycle --test native_owner_contract --test windows_native --test windows_image --test windows_runtime_manifest --test windows_engine --test private_frames
+        run: cargo test --manifest-path gui/src-tauri/Cargo.toml --locked --target x86_64-pc-windows-msvc --no-fail-fast --lib --test engine_lifecycle --test native_owner_contract --test windows_native --test windows_image --test windows_runtime_manifest --test windows_engine --test private_frames --test windows_host_config --test windows_bridge
       - name: Run native protocol contracts
-        run: node --import tsx --test tests/native-owner-bootstrap.test.ts tests/native-platform-protocol.test.ts tests/native-sidecar-channel.test.ts tests/native-shell-action.test.ts tests/official-cli-native-action.test.ts tests/gui-windows-package.test.ts
+        run: node --import tsx --test tests/native-owner-bootstrap.test.ts tests/native-platform-protocol.test.ts tests/native-sidecar-channel.test.ts tests/native-shell-action.test.ts tests/official-cli-native-action.test.ts tests/gui-windows-package.test.ts tests/native-windows-frames.test.ts
       - uses: actions/cache/save@v5
         if: always() && !cancelled() && steps.rust-cache.outputs.cache-hit != 'true'
         with:
