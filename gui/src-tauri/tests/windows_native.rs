@@ -100,7 +100,7 @@ fn native_child_fixture() {
         "sleep" => loop {
             std::thread::sleep(Duration::from_millis(50));
         },
-        "foreign-peer" => {
+        "foreign-peer" | "owner-bootstrap" => {
             let owner = identity::RetainedProcess::open(
                 std::env::var("ORCODE_TEST_OWNER_PID")
                     .unwrap()
@@ -265,6 +265,34 @@ fn windows_pipe_rejects_foreign_peer() {
 }
 
 #[test]
+fn windows_pipe_accepts_the_retained_job_owned_peer() {
+    let root = temporary_directory();
+    let server = pipe::PrivatePipeServer::new().unwrap();
+    let job = EngineJob::new().unwrap();
+    let mut spec = launch_spec("owner-bootstrap", &root);
+    spec.environment
+        .push(("ORCODE_TEST_PIPE_NAME".into(), server.name().into()));
+    spec.environment.push((
+        "ORCODE_TEST_OWNER_PID".into(),
+        std::process::id().to_string().into(),
+    ));
+    let mut peer = job
+        .create_suspended(&spec, &WindowsStdio::null().unwrap())
+        .unwrap();
+    let retained = identity::RetainedProcess::open(peer.identity().pid).unwrap();
+    peer.resume().unwrap();
+    let connection = server
+        .accept(
+            &std::sync::atomic::AtomicBool::new(false),
+            Instant::now() + Duration::from_secs(5),
+        )
+        .unwrap();
+    connection.verify_client(&retained, &job).unwrap();
+    peer.terminate_and_wait().unwrap();
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn windows_cancelled_pipe_io_joins_boundedly() {
     use std::sync::{
         atomic::{AtomicBool, Ordering},
@@ -402,7 +430,11 @@ fn windows_native_argument_and_environment_roundtrip() {
         "record-args".into(),
         root.as_os_str().to_owned(),
     ];
-    arguments.extend(expected.iter().map(|value| std::ffi::OsString::from(*value)));
+    arguments.extend(
+        expected
+            .iter()
+            .map(|value| std::ffi::OsString::from(*value)),
+    );
     let mut environment = vec![("ORCODE_TEST_UNICODE".into(), "Grüße 日本語".into())];
     if let Some(value) = std::env::var_os("SystemRoot") {
         environment.push(("SystemRoot".into(), value));

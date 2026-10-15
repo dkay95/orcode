@@ -17,9 +17,10 @@ Claude/Kimi manufacturer CLIs are not integrated GUI execution adapters.
 Unsigned local builds do not have verified native installation/login authority.
 
 **Native Windows GUI support is not ready yet.** The existing Windows CLI CI
-does not prove the Rust GUI, process isolation or installer. The proposed port
+does not prove the Rust GUI, process isolation or installer. The approved port
 targets Windows 11 x64 without WSL; see the
-[Windows architecture draft](docs/superpowers/specs/2026-10-15-windows-native-design.md).
+[Windows architecture](docs/superpowers/specs/2026-10-15-windows-native-design.md)
+and [current acceptance evidence](docs/windows-acceptance.md).
 No Windows installer or completed Windows acceptance is claimed by this branch.
 
 orcode is a local, terminal-based coding agent that runs against any
