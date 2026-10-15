@@ -1,9 +1,9 @@
 #![cfg(windows)]
 
-#[path = "../src/platform/windows/identity.rs"]
-mod identity;
 #[path = "../src/platform/windows/filesystem.rs"]
 mod filesystem;
+#[path = "../src/platform/windows/identity.rs"]
+mod identity;
 
 use filesystem::PinnedImage;
 use sha2::{Digest, Sha256};
@@ -12,12 +12,15 @@ use std::path::PathBuf;
 fn fixture() -> PathBuf {
     let mut bytes = [0u8; 16];
     getrandom::fill(&mut bytes).unwrap();
-    let root = std::env::temp_dir().join(format!("orcode-image-{:032x}", u128::from_le_bytes(bytes)));
+    let root =
+        std::env::temp_dir().join(format!("orcode-image-{:032x}", u128::from_le_bytes(bytes)));
     std::fs::create_dir(&root).unwrap();
     root
 }
 
-fn digest(bytes: &[u8]) -> [u8; 32] { Sha256::digest(bytes).into() }
+fn digest(bytes: &[u8]) -> [u8; 32] {
+    Sha256::digest(bytes).into()
+}
 
 #[test]
 fn windows_image_hash_and_identity_come_from_retained_file() {
@@ -46,9 +49,19 @@ fn windows_image_rejects_hardlinks_and_unsupported_namespaces() {
     std::fs::write(&path, b"fixed").unwrap();
     std::fs::hard_link(&path, root.join("alias.exe")).unwrap();
     assert!(PinnedImage::open(&path, digest(b"fixed")).is_err());
-    for path in ["C:relative.exe", "\\\\server\\share\\app.exe", "\\\\?\\GLOBALROOT\\Device\\app.exe",
-        "C:\\path\\app.exe:stream", "C:\\path\\CON.exe", "C:\\path\\name.\\app.exe", "C:\\path\\..\\app.exe"] {
-        assert!(PinnedImage::open(std::path::Path::new(path), [1u8; 32]).is_err(), "{path}");
+    for path in [
+        "C:relative.exe",
+        "\\\\server\\share\\app.exe",
+        "\\\\?\\GLOBALROOT\\Device\\app.exe",
+        "C:\\path\\app.exe:stream",
+        "C:\\path\\CON.exe",
+        "C:\\path\\name.\\app.exe",
+        "C:\\path\\..\\app.exe",
+    ] {
+        assert!(
+            PinnedImage::open(std::path::Path::new(path), [1u8; 32]).is_err(),
+            "{path}"
+        );
     }
     std::fs::remove_dir_all(root).unwrap();
 }

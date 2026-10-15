@@ -1,0 +1,10 @@
+export type WindowsRuntimePin = Readonly<{ version: "24.22.0"; platform: "win32"; arch: "x64";
+  archive: string; archiveSha256: string; nodeSha256: string }>;
+export type RuntimeFile = Readonly<{ path: string; bytes: number; sha256: string }>;
+export type WindowsRuntimeManifest = Readonly<{ schemaVersion: 1; platform: "win32"; arch: "x64";
+  nodeVersion: "24.22.0"; files: readonly RuntimeFile[] }>;
+export function validateWindowsRuntimePin(value: unknown): WindowsRuntimePin;
+export function canonicalRuntimeManifest(value: unknown): WindowsRuntimeManifest;
+export function serializeRuntimeManifest(value: unknown): string;
+export function runtimeManifestDigest(value: unknown): string;
+export function collectWindowsRuntimeManifest(root: string): WindowsRuntimeManifest;
