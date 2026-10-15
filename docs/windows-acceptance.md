@@ -22,6 +22,9 @@ installation or GUI acceptance.
   test isolated primitives, not the unfinished Core/helper integration.
   Counts: 45 library + three lifecycle + two owner contracts + 11 process/pipe
   tests; 42 TypeScript protocol/action contracts, zero failed or skipped.
+- The additional positive retained-peer/Job verification at `2ecfecf` also
+  passed ([run 38657923463](https://github.com/dkay95/orcode/actions/runs/38657923463)):
+  62 native tests and 42 TypeScript contracts, zero failed or skipped.
 - Local account-free protocol/action contracts: 42 passed, zero failed/skipped.
   Root and test TypeScript checks pass. Mac native verification retains all 46
   library tests, 24 lifecycle tests, two new owner-correlation contracts and the
