@@ -282,11 +282,12 @@ fn windows_image_revalidation_refuses_case_sensitive_metadata_change() {
         assert_ne!(set_flag(0), 0, "restore fixture metadata");
         pinned.revalidate().unwrap();
     } else {
-        // Some Windows editions disable this NTFS feature. This is an observed
-        // OS refusal, not a skipped native check or claimed successful flip.
+        // NTFS can refuse this change on a nonempty directory (145), or the
+        // edition can disable it (5/50). This is an observed OS refusal,
+        // not a skipped native check or claimed successful metadata flip.
         let error = std::io::Error::last_os_error();
         assert!(
-            matches!(error.raw_os_error(), Some(5 | 50)),
+            matches!(error.raw_os_error(), Some(5 | 50 | 145)),
             "unexpected metadata failure: {error}"
         );
         pinned.revalidate().unwrap();
