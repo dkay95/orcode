@@ -34,7 +34,7 @@ function safePath(path) {
   const segments = path.split('/');
   for (const segment of segments) {
     if (!segment || segment === '.' || segment === '..' || /[. ]$/.test(segment)
-      || /^(?:CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(?:\.|$)/i.test(segment) || SENSITIVE.test(segment)) invalid('path alias or private data');
+      || /^(?:CON|PRN|AUX|NUL|COM[1-9¹²³]|LPT[1-9¹²³])(?:\.|$)/i.test(segment) || SENSITIVE.test(segment)) invalid('path alias or private data');
   }
   if (!REQUIRED.includes(path) && !path.startsWith('dist/') && !path.startsWith('node_modules/')) invalid('unexpected root file');
   return path;

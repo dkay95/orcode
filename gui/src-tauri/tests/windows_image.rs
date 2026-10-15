@@ -61,6 +61,7 @@ fn windows_image_rejects_hardlinks_and_unsupported_namespaces() {
         "\\\\?\\GLOBALROOT\\Device\\app.exe",
         "C:\\path\\app.exe:stream",
         "C:\\path\\CON.exe",
+        "C:\\path\\COM¹.exe",
         "C:\\path\\name.\\app.exe",
         "C:\\path\\..\\app.exe",
     ] {

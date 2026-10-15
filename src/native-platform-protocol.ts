@@ -78,7 +78,7 @@ const OPERATIONS: Readonly<Record<string, Readonly<Record<string, Validator>>>> 
   "open-ntfs-root": { path: text(2048), purpose: oneOf("project", "app-home", "work", "scratch") },
   "create-private-run": { homeRef: token, runId: text(256) },
   "read-private-journal": { journalRef: token, maxBytes: integer(1, NATIVE_LIMITS.journalBytes) },
-  "write-private-journal": { journalRef: token, revision: integer(1), transferId: token },
+  "write-private-journal": { journalRef: token, revision: integer(0), transferId: token },
   "snapshot-tree": { rootRef: token },
   "copy-workspace": { sourceRef: token, destinationRef: token, lease },
   "inspect-executable": { path: text(2048) },

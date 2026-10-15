@@ -245,8 +245,8 @@ fn valid_component(name: &str) -> bool {
         return false;
     }
     !((base.starts_with("COM") || base.starts_with("LPT"))
-        && base.len() == 4
-        && matches!(base.as_bytes()[3], b'1'..=b'9'))
+        && base.chars().count() == 4
+        && matches!(base.chars().last(), Some('1'..='9' | '¹' | '²' | '³')))
 }
 
 fn open_component(parent: HANDLE, name: &str, directory: bool) -> io::Result<OwnedHandle> {

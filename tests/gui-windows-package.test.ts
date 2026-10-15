@@ -49,7 +49,7 @@ test("runtime manifests refuse app homes, credentials and Windows path aliases",
   const input = manifest();
   for (const path of [".orcode/config.json", ".codex/auth.json", ".devhome/settings.json", "dist/.env",
     "node_modules/pkg/auth.json", "dist/../auth.json", "C:/node.exe", "dist/foo:stream", "dist/CON.txt", "dist/file.",
-    "dist\\gui-server.js", "dist//bad.js", "dist/./bad.js"]) {
+    "dist\\gui-server.js", "dist//bad.js", "dist/./bad.js", "dist/COM¹.txt", "dist/LPT².js"]) {
     assert.throws(() => canonicalRuntimeManifest({ ...input, files: [...input.files, { path, bytes: 1, sha256: "f".repeat(64) }] }), path);
   }
   assert.throws(() => canonicalRuntimeManifest({ ...input, rawHandle: "1" }));

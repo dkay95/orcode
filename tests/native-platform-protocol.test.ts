@@ -10,6 +10,12 @@ const base = { kind: "native-platform-request", version: 1, requestId: "r".repea
 const lease = { ref: "l".repeat(32), runId: "run-1", epoch: 1, generation: "g".repeat(32) };
 const root = "w".repeat(32);
 
+test("the first journal compare-and-replace uses expected revision zero", () => {
+  const request = { ...base, operation: "write-private-journal", journalRef: root, revision: 0, transferId: root };
+  assert.deepEqual(decodeNativePlatformRequest(encodeNativePlatformRequest(request)), request);
+  assert.throws(() => canonicalNativePlatformRequest({ ...request, revision: -1 }));
+});
+
 test("native RPC accepts a closed operation union, never arbitrary methods or raw handles", () => {
   const requests = [
     { ...base, operation: "open-ntfs-root", path: "C:\\project", purpose: "project" },
