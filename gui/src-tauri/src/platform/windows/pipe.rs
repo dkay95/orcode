@@ -84,6 +84,30 @@ impl PrivatePipeServer {
         &self.name
     }
 
+    /// These clients are opened by the shell before spawn. Their connection PID is
+    /// NOT a child/owner attestation; only the exact inherited handle list uses them.
+    pub(crate) fn child_stdio(self, child_reads: bool) -> io::Result<(OwnedHandle, ConnectedPipe)> {
+        let name = wide(&self.name)?;
+        let child = checked_handle(unsafe {
+            CreateFileW(
+                name.as_ptr(),
+                if child_reads {
+                    GENERIC_READ
+                } else {
+                    GENERIC_WRITE
+                },
+                0,
+                std::ptr::null(),
+                OPEN_EXISTING,
+                SECURITY_SQOS_PRESENT | SECURITY_ANONYMOUS,
+                std::ptr::null_mut(),
+            )
+        })?;
+        let cancel = AtomicBool::new(false);
+        let server = self.accept(&cancel, Instant::now() + std::time::Duration::from_secs(1))?;
+        Ok((child, server))
+    }
+
     pub fn accept(self, cancel: &AtomicBool, deadline: Instant) -> io::Result<ConnectedPipe> {
         let mut operation = Operation::new(&self.handle, None)?;
         operation.check_before_start(cancel, deadline)?;
@@ -171,6 +195,34 @@ impl ConnectedPipe {
             #[cfg(test)]
             before_submit: Mutex::new(None),
         }
+    }
+
+    /// None is an actual closed writer, not a fabricated zero-byte snapshot.
+    pub(crate) fn available_bytes(&self) -> io::Result<Option<usize>> {
+        let _gate = self.submission.lock().unwrap_or_else(|p| p.into_inner());
+        if self.retired.load(Ordering::SeqCst) {
+            return Err(io::Error::new(io::ErrorKind::BrokenPipe, "pipe-retired"));
+        }
+        let mut available = 0;
+        if unsafe {
+            PeekNamedPipe(
+                self.handle.as_raw_handle(),
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null_mut(),
+                &mut available,
+                std::ptr::null_mut(),
+            )
+        } == 0
+        {
+            let error = io::Error::last_os_error();
+            return if error.raw_os_error() == Some(ERROR_BROKEN_PIPE as i32) {
+                Ok(None)
+            } else {
+                Err(error)
+            };
+        }
+        Ok(Some(available as usize))
     }
 
     pub fn verify_client(&self, expected: &RetainedProcess, job: &EngineJob) -> io::Result<()> {

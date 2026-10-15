@@ -64,7 +64,7 @@ fn windows_engine_fixture() {
             )
             .unwrap();
         }
-        "sleep" => loop {
+        "sleep" | "unread-stdin" => loop {
             std::thread::sleep(Duration::from_millis(50));
         },
         _ => panic!("unknown fixture"),
@@ -144,5 +144,56 @@ fn windows_engine_natural_exit_reaps_descendants_before_terminal_event() {
         }
     }
     raw.revoke_and_join(Duration::from_secs(2)).unwrap();
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn windows_engine_unread_stdin_and_revoked_idle_readers_remain_bounded() {
+    let root = fixture();
+    let guard = acquire_process_spawn_guard();
+    let mut raw =
+        spawn_native_raw_engine(&guard, &spec(&root, "unread-stdin"), |_, _| Ok(())).unwrap();
+    let start = Instant::now();
+    assert!(raw.write_line(&"x".repeat(8 * 1024 * 1024)).is_err());
+    assert!(start.elapsed() < Duration::from_secs(2));
+    raw.force_kill(Duration::from_secs(1)).unwrap();
+    raw.revoke_and_join(Duration::from_secs(2)).unwrap();
+    assert!(start.elapsed() < Duration::from_secs(4));
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn windows_engine_refusal_happens_while_owned_child_is_suspended() {
+    let root = fixture();
+    let guard = acquire_process_spawn_guard();
+    let mut called = false;
+    let result = spawn_native_raw_engine(&guard, &spec(&root, "grandchild"), |child, job| {
+        assert!(job.contains(child.handle()).unwrap());
+        assert!(child.try_wait().unwrap().is_none());
+        assert!(!root.join("grandchild").exists());
+        called = true;
+        Err(orcode_gui_lib::engine::EngineError::Spawn(
+            "fixture-image-refused".into(),
+        ))
+    });
+    assert!(called);
+    assert!(result.is_err());
+    assert!(!root.join("grandchild").exists());
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn windows_engine_revocation_refuses_late_stdin_even_while_core_is_alive() {
+    let root = fixture();
+    let guard = acquire_process_spawn_guard();
+    let raw = spawn_native_raw_engine(&guard, &spec(&root, "stdin-eof"), |_, _| Ok(())).unwrap();
+    let (mut input, receiver, owner, drain) = raw.into_parts();
+    drain.revoke();
+    assert!(input.write("stale-generation-input").is_err());
+    let _ = input.close();
+    drop(receiver);
+    let _ = owner.force_kill(Duration::from_secs(1));
+    assert!(owner.wait_reaped(Duration::from_secs(2)));
+    assert!(drain.wait(Duration::from_secs(2)));
     std::fs::remove_dir_all(root).unwrap();
 }

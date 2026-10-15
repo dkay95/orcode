@@ -31,6 +31,13 @@ pub use crate::platform::unix::{
 use crate::platform::unix::{pipe_available_bytes, set_nonblocking, write_nonblocking};
 #[cfg(windows)]
 pub use crate::platform::windows::{create_native_sidecar_channels, NativeSidecarChannels};
+#[cfg(windows)]
+pub use crate::platform::windows::job::WindowsLaunchSpec as NativeWindowsLaunchSpec;
+#[cfg(windows)]
+#[path = "native_engine_windows.rs"]
+mod native_windows;
+#[cfg(windows)]
+pub use native_windows::spawn_native_raw_engine;
 use std::io::{Read, Write};
 #[cfg(unix)]
 use std::os::fd::{AsRawFd, RawFd};
